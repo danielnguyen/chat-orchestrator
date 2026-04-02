@@ -10,6 +10,7 @@ Canonical runtime orchestration API for routing + profiles + observability.
 
 - Resolve/create conversation in `basic-memory-store`
 - Retrieve context bundle from memory-store
+- Inject retrieved memory and file snippets into the model prompt
 - Resolve and apply mode profile
 - Evaluate declarative router rules
 - Apply manual override (policy-gated)
@@ -56,3 +57,12 @@ The smoke flow:
 - asserts JSON and `request_id` are present
 - allows either successful response or valid failure JSON
 - on success, verifies trace visibility via `basic-memory-store` `GET /v1/traces/{request_id}`
+
+## File-backed retrieval behavior
+
+When `basic-memory-store` returns `bundle.artifact_refs`, the orchestrator:
+- injects bounded file snippets into the prompt as additive context
+- keeps recent conversation history in the prompt
+- returns `sources` in the `/v1/chat` response using the source refs returned by memory-store
+
+File ingestion remains owned by `basic-memory-store`; `chat-orchestrator` does not own an ingestion pipeline.

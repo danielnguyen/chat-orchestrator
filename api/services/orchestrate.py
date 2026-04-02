@@ -32,6 +32,45 @@ def _compute_signals(payload: dict[str, Any], retrieval_bundle: dict[str, Any]) 
     }
 
 
+def _build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
+    bundle = retrieval_bundle.get("bundle", {})
+    messages: list[dict[str, str]] = []
+
+    recent = bundle.get("recent", []) or []
+    for item in recent:
+        role = item.get("role")
+        content = item.get("content", "")
+        if role in {"user", "assistant", "system", "tool"} and content:
+            messages.append({"role": role, "content": content})
+    return messages
+
+
+def _build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
+    bundle = retrieval_bundle.get("bundle", {})
+    messages: list[dict[str, str]] = []
+
+    semantic = bundle.get("semantic", []) or []
+    if semantic:
+        lines = ["Retrieved memory excerpts:"]
+        for item in semantic:
+            lines.append(
+                f"- [{item.get('created_at', '')}] {item.get('role', '')}: {item.get('content', '')}"
+            )
+        messages.append({"role": "system", "content": "\n".join(lines)})
+
+    artifact_refs = bundle.get("artifact_refs", []) or []
+    if artifact_refs:
+        lines = ["Retrieved file snippets:"]
+        for item in artifact_refs:
+            repo_name = item.get("repo_name")
+            file_path = item.get("file_path", "")
+            label = f"{repo_name}/{file_path}" if repo_name else file_path
+            lines.append(f"- [{label}] {item.get('snippet', '')}")
+        messages.append({"role": "system", "content": "\n".join(lines)})
+
+    return messages
+
+
 def _load_model_registry(path: str) -> dict[str, Any]:
     try:
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
@@ -195,6 +234,8 @@ async def orchestrate_chat(
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
+    messages.extend(_build_retrieval_messages(retrieval_bundle))
+    messages.extend(_build_recent_history(retrieval_bundle))
     messages.extend(effective_payload["messages"])
 
     model_started = perf_counter()
@@ -299,4 +340,5 @@ async def orchestrate_chat(
         "selected_model": selected_model,
         "answer": answer,
         "status": status,
+        "sources": retrieval_bundle.get("bundle", {}).get("artifact_refs", []),
     }
