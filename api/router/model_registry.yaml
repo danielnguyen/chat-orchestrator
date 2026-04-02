@@ -1,0 +1,36 @@
+models:
+  chat_local_fast:
+    provider: local
+    vision: false
+    code: medium
+    max_context_tokens: 16000
+    avg_latency_bucket: fast
+    cost_per_1k_tokens: 0
+  chat_local_best:
+    provider: local
+    vision: false
+    code: strong
+    max_context_tokens: 32000
+    avg_latency_bucket: medium
+    cost_per_1k_tokens: 0
+  chat_local_vision:
+    provider: local
+    vision: true
+    code: medium
+    max_context_tokens: 16000
+    avg_latency_bucket: medium
+    cost_per_1k_tokens: 0
+  chat_voice_openai:
+    provider: cloud
+    vision: false
+    code: medium
+    max_context_tokens: 128000
+    avg_latency_bucket: medium
+    cost_per_1k_tokens: 0.003
+  chat_deep_openai:
+    provider: cloud
+    vision: false
+    code: strong
+    max_context_tokens: 200000
+    avg_latency_bucket: slow
+    cost_per_1k_tokens: 0.01
