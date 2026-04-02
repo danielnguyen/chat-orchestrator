@@ -1,0 +1,49 @@
+rules:
+  - id: local-only
+    when:
+      sensitivity: local_only
+    then:
+      selected_model: chat_local_fast
+      provider: local
+      rationale: sensitivity local_only enforces local provider
+      fallbacks:
+        - selected_model: chat_local_best
+          provider: local
+
+  - id: override
+    when:
+      model_override_present: true
+    then:
+      selected_model_from: model_override
+      provider: cloud
+      rationale: manual override accepted by policy
+      fallbacks:
+        - selected_model: chat_voice_openai
+          provider: cloud
+        - selected_model: chat_local_fast
+          provider: cloud
+
+  - id: code-task
+    when:
+      has_code: true
+    then:
+      selected_model: chat_voice_openai
+      provider: cloud
+      rationale: code-like request prefers code-capable model
+      fallbacks:
+        - selected_model: chat_deep_openai
+          provider: cloud
+        - selected_model: chat_local_best
+          provider: local
+
+  - id: default
+    when: {}
+    then:
+      selected_model: chat_voice_openai
+      provider: cloud
+      rationale: default rule
+      fallbacks:
+        - selected_model: chat_deep_openai
+          provider: cloud
+        - selected_model: chat_local_best
+          provider: local
