@@ -21,9 +21,9 @@ class FakeMemoryStore:
             "request_id": kwargs["request_id"],
             "conversation_id": kwargs["conversation_id"],
             "bundle": {
-                "recent": [],
-                "semantic": [],
-                "artifact_refs": [],
+                "recent": [{"role": "assistant", "content": "prior history"}],
+                "semantic": [{"created_at": "2026-01-01T00:00:00+00:00", "role": "assistant", "content": "semantic note"}],
+                "artifact_refs": [{"artifact_id": "a-1", "file_path": "api/main.py", "snippet": "def entrypoint(): pass", "relevance_score": 0.9}],
                 "observed_metadata": {"has_code_like_content": False},
             },
         }
@@ -102,11 +102,15 @@ async def test_orchestrate_chat_happy_path(tmp_path):
     assert out["request_id"] == "rid-test-1"
     assert out["status"] == "ok"
     assert out["answer"] == "hello"
+    assert out["sources"][0]["file_path"] == "api/main.py"
     assert len(memory_store.added_messages) == 2
     assert memory_store.added_messages[0]["role"] == "user"
     assert memory_store.added_messages[1]["role"] == "assistant"
     assert memory_store.retrieve_calls[0]["request_id"] == "rid-test-1"
     assert litellm.calls[0]["request_id"] == "rid-test-1"
+    assert litellm.calls[0]["messages"][0]["role"] == "system"
+    assert any("Retrieved file snippets:" in msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system")
+    assert any(msg["role"] == "assistant" and msg["content"] == "prior history" for msg in litellm.calls[0]["messages"])
     assert memory_store.trace_calls[0]["request_id"] == "rid-test-1"
 
 

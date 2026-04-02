@@ -37,6 +37,7 @@ class ChatResponse(BaseModel):
     selected_model: str
     answer: str
     status: Literal["ok", "degraded", "failed"]
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class RouteDecision(BaseModel):
