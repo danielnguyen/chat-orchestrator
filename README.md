@@ -21,8 +21,27 @@ Canonical runtime orchestration API for routing + profiles + observability.
 ## Local run
 
 1. Install requirements from `api/requirements.txt`
-2. Set env from `.env.example`
-3. Run `uvicorn main:app --host 0.0.0.0 --port 4361 --reload` from `api/`
+2. Copy `api/.env.example` to `api/.env`, then adjust it for local host-run
+3. Run `make dev-start` from repo root, or `uvicorn main:app --host 0.0.0.0 --port 4361 --reload` from `api/`
+
+For local host-run, `api/.env` is the canonical app config. The repo-root `.env` is reserved for Docker Compose / containerized runs.
+
+Typical local `api/.env` contents:
+
+```bash
+ORCH_API_KEY=dev-key
+MEMORY_STORE_BASE_URL=http://127.0.0.1:4321
+MEMORY_STORE_API_KEY=dev-local
+LITELLM_BASE_URL=http://127.0.0.1:4000
+LITELLM_API_KEY=
+ROUTER_RULES_PATH=router/rules.yaml
+MODEL_REGISTRY_PATH=router/model_registry.yaml
+ALLOW_MANUAL_OVERRIDE=true
+DEFAULT_PROFILE_NAME=dev
+OFFLINE_PROVIDER=litellm-local
+OLLAMA_BASE_URL=
+REQUEST_TIMEOUT_MS=30000
+```
 
 ## Health check
 
@@ -41,8 +60,9 @@ Canonical runtime orchestration API for routing + profiles + observability.
   - `LITELLM_BASE_URL`: `http://127.0.0.1:4000`
 
 - Docker compose mode (`docker-compose.yml` in this repo):
-  - No host `ports` mapping by default (internal-only service).
-  - Access via docker network service name from peer containers.
+  - Use the repo-root `.env` for container-safe values.
+  - Service-to-service URLs should use container hostnames such as `basic-memory-store` and `litellm`.
+  - Router/model paths should use container paths such as `/app/api/router/rules.yaml`.
 
 ## Smoke validation
 

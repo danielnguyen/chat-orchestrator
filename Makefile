@@ -55,21 +55,7 @@ smoke:
 # - memory-store expected on http://127.0.0.1:4321
 # - orchestrator served on APP_PORT (default 4361)
 dev-start:
-	@cd api && \
-	ORCH_API_KEY="$${ORCH_API_KEY:-dev-key}" \
-	MEMORY_STORE_BASE_URL="$${MEMORY_STORE_BASE_URL:-http://127.0.0.1:4321}" \
-	MEMORY_STORE_API_KEY="$${MEMORY_STORE_API_KEY:-change_me}" \
-	LITELLM_BASE_URL="$${LITELLM_BASE_URL:-http://127.0.0.1:4000}" \
-	ROUTER_RULES_PATH="$${ROUTER_RULES_PATH:-$$(pwd)/router/rules.yaml}" \
-	MODEL_REGISTRY_PATH="$${MODEL_REGISTRY_PATH:-$$(pwd)/router/model_registry.yaml}" \
-	./.venv/bin/uvicorn main:app --host 0.0.0.0 --port "$${APP_PORT:-4361}"
+	@cd api && ./.venv/bin/uvicorn main:app --host 0.0.0.0 --port "$${APP_PORT:-4361}"
 
 dev-start-reload:
-	@cd api && \
-	ORCH_API_KEY="$${ORCH_API_KEY:-dev-key}" \
-	MEMORY_STORE_BASE_URL="$${MEMORY_STORE_BASE_URL:-http://127.0.0.1:4321}" \
-	MEMORY_STORE_API_KEY="$${MEMORY_STORE_API_KEY:-change_me}" \
-	LITELLM_BASE_URL="$${LITELLM_BASE_URL:-http://127.0.0.1:4000}" \
-	ROUTER_RULES_PATH="$${ROUTER_RULES_PATH:-$$(pwd)/router/rules.yaml}" \
-	MODEL_REGISTRY_PATH="$${MODEL_REGISTRY_PATH:-$$(pwd)/router/model_registry.yaml}" \
-	./.venv/bin/uvicorn main:app --host 0.0.0.0 --port "$${APP_PORT:-4361}" --reload
+	@cd api && ./.venv/bin/uvicorn main:app --host 0.0.0.0 --port "$${APP_PORT:-4361}" --reload

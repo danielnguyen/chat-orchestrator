@@ -161,15 +161,6 @@ async def orchestrate_chat(
                 metadata={"surface": payload.get("surface", "unknown")},
             )
 
-    last_user_text = _extract_last_user_text(payload["messages"])
-    retrieval_bundle = await memory_store.retrieve_bundle(
-        request_id=request_id,
-        conversation_id=conversation_id,
-        owner_id=payload["owner_id"],
-        query=last_user_text,
-        retrieval=payload.get("retrieval"),
-    )
-
     profile = await memory_store.resolve_profile(
         owner_id=payload["owner_id"],
         surface=payload.get("surface", "unknown"),
@@ -178,6 +169,14 @@ async def orchestrate_chat(
     )
 
     effective_payload = apply_profile_to_request(profile, payload)
+    last_user_text = _extract_last_user_text(payload["messages"])
+    retrieval_bundle = await memory_store.retrieve_bundle(
+        request_id=request_id,
+        conversation_id=conversation_id,
+        owner_id=payload["owner_id"],
+        query=last_user_text,
+        retrieval=effective_payload.get("retrieval"),
+    )
     signals = _compute_signals(effective_payload, retrieval_bundle)
     registry = _load_model_registry(model_registry_path)
     routing_policy = profile.get("routing_policy", {}) or {}
