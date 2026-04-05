@@ -16,6 +16,8 @@ class RetrievalOptions(BaseModel):
     k: int = Field(default=8, ge=1, le=50)
     min_score: float = Field(default=0.25, ge=0.0, le=1.0)
     scope: Literal["conversation", "client", "owner"] = "conversation"
+    time_window: Literal["7d", "30d", "90d", "all"] = "all"
+    retrieval_mode: Literal["recent", "balanced", "historical"] = "balanced"
 
 
 class ChatRequest(BaseModel):

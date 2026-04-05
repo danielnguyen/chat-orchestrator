@@ -115,6 +115,78 @@ async def test_orchestrate_chat_happy_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_applies_spec_shaped_retrieval_policy(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+
+    class RetrievalPolicyStore(FakeMemoryStore):
+        async def resolve_profile(self, **kwargs):
+            return {
+                "profile_name": "dev",
+                "source": "global_default",
+                "profile_version": 1,
+                "effective_profile_ref": "owner:dev:1",
+                "prompt_overlay": "",
+                "retrieval_policy": {
+                    "k": 6,
+                    "min_score": 0.3,
+                    "scope": "owner",
+                    "time_window": "30d",
+                    "retrieval_mode": "historical",
+                },
+                "routing_policy": {},
+                "response_style": {},
+                "safety_policy": {},
+                "tool_policy": {},
+            }
+
+    memory_store = RetrievalPolicyStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-retrieval-1",
+    )
+
+    assert memory_store.retrieve_calls[0]["retrieval"] == {
+        "k": 6,
+        "min_score": 0.3,
+        "scope": "owner",
+        "time_window": "30d",
+        "retrieval_mode": "historical",
+    }
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_rejects_cloud_override_when_profile_is_local_only(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
