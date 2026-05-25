@@ -10,7 +10,9 @@ from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
 from services.fallback import choose_fallback
+from services.prompt_assembly import assemble_prompt
 from services.profile_apply import apply_profile_to_request
+from services.routing_contract import routing_trace_metadata
 
 
 def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
@@ -30,45 +32,6 @@ def _compute_signals(payload: dict[str, Any], retrieval_bundle: dict[str, Any]) 
         "has_code": has_code,
         "model_override_present": bool(payload.get("model_override")),
     }
-
-
-def _build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
-    bundle = retrieval_bundle.get("bundle", {})
-    messages: list[dict[str, str]] = []
-
-    recent = bundle.get("recent", []) or []
-    for item in recent:
-        role = item.get("role")
-        content = item.get("content", "")
-        if role in {"user", "assistant", "system", "tool"} and content:
-            messages.append({"role": role, "content": content})
-    return messages
-
-
-def _build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
-    bundle = retrieval_bundle.get("bundle", {})
-    messages: list[dict[str, str]] = []
-
-    semantic = bundle.get("semantic", []) or []
-    if semantic:
-        lines = ["Retrieved memory excerpts:"]
-        for item in semantic:
-            lines.append(
-                f"- [{item.get('created_at', '')}] {item.get('role', '')}: {item.get('content', '')}"
-            )
-        messages.append({"role": "system", "content": "\n".join(lines)})
-
-    artifact_refs = bundle.get("artifact_refs", []) or []
-    if artifact_refs:
-        lines = ["Retrieved file snippets:"]
-        for item in artifact_refs:
-            repo_name = item.get("repo_name")
-            file_path = item.get("file_path", "")
-            label = f"{repo_name}/{file_path}" if repo_name else file_path
-            lines.append(f"- [{label}] {item.get('snippet', '')}")
-        messages.append({"role": "system", "content": "\n".join(lines)})
-
-    return messages
 
 
 def _load_model_registry(path: str) -> dict[str, Any]:
@@ -180,7 +143,9 @@ async def orchestrate_chat(
     signals = _compute_signals(effective_payload, retrieval_bundle)
     registry = _load_model_registry(model_registry_path)
     routing_policy = profile.get("routing_policy", {}) or {}
-    local_only = bool(routing_policy.get("local_only", False))
+    sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
+    profile_local_only = bool(routing_policy.get("local_only", False))
+    local_only = sensitivity_local_only or profile_local_only
     cost_mode = routing_policy.get("cost_mode")
     latency_mode = routing_policy.get("latency_mode")
 
@@ -229,13 +194,12 @@ async def orchestrate_chat(
     fallback_used = False
     model_error = None
 
-    system_prompt = profile.get("prompt_overlay", "")
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(_build_retrieval_messages(retrieval_bundle))
-    messages.extend(_build_recent_history(retrieval_bundle))
-    messages.extend(effective_payload["messages"])
+    prompt = assemble_prompt(
+        profile=profile,
+        retrieval_bundle=retrieval_bundle,
+        current_messages=effective_payload["messages"],
+    )
+    messages = prompt.messages
 
     model_started = perf_counter()
     try:
@@ -301,6 +265,7 @@ async def orchestrate_chat(
             "retrieval": {
                 "query": last_user_text,
                 "bundle": retrieval_bundle.get("bundle", {}),
+                "prompt_assembly": prompt.trace,
             },
             "router_decision": {
                 "rule_id": route.get("rule_id"),
@@ -308,6 +273,16 @@ async def orchestrate_chat(
                 "provider": selected_provider,
                 "rationale": route.get("rationale"),
                 "fallbacks": route.get("fallbacks", []),
+                "routing_contract": routing_trace_metadata(
+                    sensitivity=effective_payload.get("sensitivity", "private"),
+                    profile_local_only=profile_local_only,
+                    manual_override_requested=override_requested,
+                    manual_override_applied=bool(override),
+                    manual_override_rejection_reason=override_reason,
+                    selected_model=selected_model,
+                    selected_provider=selected_provider,
+                    fallback_used=fallback_used,
+                ),
             },
             "manual_override": {
                 "requested_model": override_requested,
