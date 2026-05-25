@@ -817,3 +817,18 @@ async def test_orchestrate_resets_runtime_after_turn_when_requested(tmp_path):
         "runtime"
     ]
     assert runtime_trace["reset"] == {"attempted": True, "status": "ok", "reset": True}
+
+
+def test_runtime_timeout_setting_is_separate_from_request_timeout(monkeypatch):
+    from settings import Settings
+
+    monkeypatch.setenv("ORCH_API_KEY", "orch")
+    monkeypatch.setenv("MEMORY_STORE_BASE_URL", "http://memory")
+    monkeypatch.setenv("MEMORY_STORE_API_KEY", "memory")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm")
+    monkeypatch.setenv("REQUEST_TIMEOUT_MS", "30000")
+
+    settings = Settings()
+
+    assert settings.request_timeout_ms == 30000
+    assert settings.cognitive_runtime_timeout_ms == 1500

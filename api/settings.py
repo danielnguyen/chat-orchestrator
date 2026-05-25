@@ -14,6 +14,12 @@ class Settings(BaseSettings):
 
     cognitive_runtime_base_url: str | None = Field(default=None, alias="COGNITIVE_RUNTIME_BASE_URL")
     cognitive_runtime_api_key: str | None = Field(default=None, alias="COGNITIVE_RUNTIME_API_KEY")
+    cognitive_runtime_timeout_ms: int = Field(
+        default=1500,
+        alias="COGNITIVE_RUNTIME_TIMEOUT_MS",
+        ge=100,
+        le=30000,
+    )
     enable_runtime_overlays: bool = Field(default=False, alias="ENABLE_RUNTIME_OVERLAYS")
 
     litellm_base_url: str = Field(..., alias="LITELLM_BASE_URL")

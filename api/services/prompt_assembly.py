@@ -109,11 +109,22 @@ def assemble_prompt(
     layers.append(_layer_trace("profile_overlay", profile_messages))
 
     runtime_messages: list[dict[str, str]] = []
+    runtime_trace_out = dict(runtime_trace or {})
+    runtime_omission_reason = runtime_trace_out.get("omission_reason")
     if runtime_overlay and runtime_overlay.get("content"):
         role = runtime_overlay.get("role", "system")
-        if role in VALID_ROLES:
-            runtime_messages.append({"role": role, "content": runtime_overlay["content"]})
+        if role == "system":
+            runtime_messages.append({"role": "system", "content": runtime_overlay["content"]})
             messages.extend(runtime_messages)
+        else:
+            runtime_omission_reason = "invalid_runtime_overlay_role"
+            runtime_trace_out.update(
+                {
+                    "status": "omitted",
+                    "included": False,
+                    "omission_reason": runtime_omission_reason,
+                }
+            )
     layers.append(
         _layer_trace(
             "runtime_overlay",
@@ -127,7 +138,7 @@ def assemble_prompt(
                 "source_fields": runtime_overlay.get("source_fields", [])
                 if runtime_overlay
                 else [],
-                "omission_reason": (runtime_trace or {}).get("omission_reason"),
+                "omission_reason": runtime_omission_reason,
             },
         )
     )
@@ -156,7 +167,7 @@ def assemble_prompt(
             "included_layers": [layer["name"] for layer in layers if layer["included"]],
             "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
             "truncation": {"applied": False, "reason": None},
-            "runtime": runtime_trace or {"attempted": False, "status": "not_requested"},
+            "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
             "message_count": len(messages),
         },
     )

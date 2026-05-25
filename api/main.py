@@ -32,7 +32,7 @@ runtime = (
     RuntimeClient(
         base_url=settings.cognitive_runtime_base_url,
         api_key=settings.cognitive_runtime_api_key,
-        timeout_ms=settings.request_timeout_ms,
+        timeout_ms=settings.cognitive_runtime_timeout_ms,
     )
     if settings.cognitive_runtime_base_url
     else None

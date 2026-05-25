@@ -128,3 +128,34 @@ def test_assemble_prompt_includes_runtime_overlay_after_profile_before_retrieval
     runtime_layer = out.trace["layers"][1]
     assert runtime_layer["metadata"]["runtime_state_id"] == "rtstate_1"
     assert out.trace["runtime"]["status"] == "included"
+
+
+def test_assemble_prompt_omits_runtime_overlay_with_non_system_role():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        runtime_overlay={
+            "runtime_state_id": "rtstate_1",
+            "overlay_id": "rtoverlay_1",
+            "overlay_type": "runtime_state",
+            "role": "user",
+            "content": "Runtime context: scene=planning.",
+            "source_fields": ["active_scene"],
+        },
+        runtime_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "runtime_state_id": "rtstate_1",
+            "overlay_id": "rtoverlay_1",
+        },
+    )
+
+    assert out.messages == [{"role": "user", "content": "hi"}]
+    assert "runtime_overlay" in out.trace["omitted_layers"]
+    runtime_layer = out.trace["layers"][1]
+    assert runtime_layer["metadata"]["omission_reason"] == "invalid_runtime_overlay_role"
+    assert out.trace["runtime"]["status"] == "omitted"
+    assert out.trace["runtime"]["included"] is False
+    assert out.trace["runtime"]["omission_reason"] == "invalid_runtime_overlay_role"

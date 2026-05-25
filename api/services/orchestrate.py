@@ -499,6 +499,7 @@ async def orchestrate_chat(
         conversation_id=conversation_id,
         surface=payload.get("surface", "unknown"),
     )
+    prompt.trace["runtime"] = runtime_trace
 
     await memory_store.create_trace(
         request_id=request_id,
