@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 
@@ -13,7 +12,12 @@ class PromptAssembly:
     trace: dict[str, Any]
 
 
-def _layer_trace(name: str, messages: list[dict[str, str]], *, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+def _layer_trace(
+    name: str,
+    messages: list[dict[str, str]],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "name": name,
         "included": bool(messages),
@@ -43,9 +47,10 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
     if semantic:
         lines = ["Retrieved memory excerpts:"]
         for item in semantic:
-            lines.append(
-                f"- [{item.get('created_at', '')}] {item.get('role', '')}: {item.get('content', '')}"
-            )
+            created_at = item.get("created_at", "")
+            role = item.get("role", "")
+            content = item.get("content", "")
+            lines.append(f"- [{created_at}] {role}: {content}")
         messages.append({"role": "system", "content": "\n".join(lines)})
 
     artifact_refs = bundle.get("artifact_refs", []) or []
@@ -92,6 +97,8 @@ def assemble_prompt(
     profile: dict[str, Any],
     retrieval_bundle: dict[str, Any],
     current_messages: list[dict[str, str]],
+    runtime_overlay: dict[str, Any] | None = None,
+    runtime_trace: dict[str, Any] | None = None,
 ) -> PromptAssembly:
     messages: list[dict[str, str]] = []
     layers: list[dict[str, Any]] = []
@@ -100,6 +107,41 @@ def assemble_prompt(
     profile_messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend(profile_messages)
     layers.append(_layer_trace("profile_overlay", profile_messages))
+
+    runtime_messages: list[dict[str, str]] = []
+    runtime_trace_out = dict(runtime_trace or {})
+    runtime_omission_reason = runtime_trace_out.get("omission_reason")
+    if runtime_overlay and runtime_overlay.get("content"):
+        role = runtime_overlay.get("role", "system")
+        if role == "system":
+            runtime_messages.append({"role": "system", "content": runtime_overlay["content"]})
+            messages.extend(runtime_messages)
+        else:
+            runtime_omission_reason = "invalid_runtime_overlay_role"
+            runtime_trace_out.update(
+                {
+                    "status": "omitted",
+                    "included": False,
+                    "omission_reason": runtime_omission_reason,
+                }
+            )
+    layers.append(
+        _layer_trace(
+            "runtime_overlay",
+            runtime_messages,
+            metadata={
+                "runtime_state_id": runtime_overlay.get("runtime_state_id")
+                if runtime_overlay
+                else None,
+                "overlay_id": runtime_overlay.get("overlay_id") if runtime_overlay else None,
+                "overlay_type": runtime_overlay.get("overlay_type") if runtime_overlay else None,
+                "source_fields": runtime_overlay.get("source_fields", [])
+                if runtime_overlay
+                else [],
+                "omission_reason": runtime_omission_reason,
+            },
+        )
+    )
 
     retrieval_messages = build_retrieval_messages(retrieval_bundle)
     messages.extend(retrieval_messages)
@@ -125,6 +167,7 @@ def assemble_prompt(
             "included_layers": [layer["name"] for layer in layers if layer["included"]],
             "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
             "truncation": {"applied": False, "reason": None},
+            "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
             "message_count": len(messages),
         },
     )
