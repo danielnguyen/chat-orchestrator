@@ -22,8 +22,21 @@ class FakeMemoryStore:
             "conversation_id": kwargs["conversation_id"],
             "bundle": {
                 "recent": [{"role": "assistant", "content": "prior history"}],
-                "semantic": [{"created_at": "2026-01-01T00:00:00+00:00", "role": "assistant", "content": "semantic note"}],
-                "artifact_refs": [{"artifact_id": "a-1", "file_path": "api/main.py", "snippet": "def entrypoint(): pass", "relevance_score": 0.9}],
+                "semantic": [
+                    {
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "role": "assistant",
+                        "content": "semantic note",
+                    }
+                ],
+                "artifact_refs": [
+                    {
+                        "artifact_id": "a-1",
+                        "file_path": "api/main.py",
+                        "snippet": "def entrypoint(): pass",
+                        "relevance_score": 0.9,
+                    }
+                ],
                 "observed_metadata": {"has_code_like_content": False},
             },
         }
@@ -45,6 +58,32 @@ class FakeMemoryStore:
     async def create_trace(self, **kwargs):
         self.trace_calls.append(kwargs)
         return {"trace_id": "t-1", "request_id": kwargs["request_id"]}
+
+
+class FakeRuntime:
+    def __init__(self, *, response=None, fail: bool = False):
+        self.calls = []
+        self.reset_calls = []
+        self.response = response or {
+            "runtime_state": {
+                "runtime_state_id": "rtstate_1",
+                "reset_after_turn": False,
+            },
+            "overlay": None,
+            "omitted": True,
+            "omission_reason": "empty_runtime_state",
+        }
+        self.fail = fail
+
+    async def overlay(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.response
+
+    async def reset(self, **kwargs):
+        self.reset_calls.append(kwargs)
+        return {"reset": True}
 
 
 class FakeLiteLLM:
@@ -112,8 +151,15 @@ async def test_orchestrate_chat_happy_path(tmp_path):
     assert memory_store.retrieve_calls[0]["request_id"] == "rid-test-1"
     assert litellm.calls[0]["request_id"] == "rid-test-1"
     assert litellm.calls[0]["messages"][0]["role"] == "system"
-    assert any("Retrieved file snippets:" in msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system")
-    assert any(msg["role"] == "assistant" and msg["content"] == "prior history" for msg in litellm.calls[0]["messages"])
+    assert any(
+        "Retrieved file snippets:" in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+        if msg["role"] == "system"
+    )
+    assert any(
+        msg["role"] == "assistant" and msg["content"] == "prior history"
+        for msg in litellm.calls[0]["messages"]
+    )
     assert memory_store.trace_calls[0]["request_id"] == "rid-test-1"
     trace_payload = memory_store.trace_calls[0]["payload"]
     assert trace_payload["retrieval"]["prompt_assembly"]["included_layers"] == [
@@ -121,7 +167,15 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "recent_history",
         "current_messages",
     ]
-    assert trace_payload["retrieval"]["prompt_assembly"]["truncation"] == {"applied": False, "reason": None}
+    assert trace_payload["retrieval"]["prompt_assembly"]["runtime"] == {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+    }
+    assert trace_payload["retrieval"]["prompt_assembly"]["truncation"] == {
+        "applied": False,
+        "reason": None,
+    }
     assert trace_payload["router_decision"]["routing_contract"]["selected_model"] == "gpt-4o-mini"
 
 
@@ -534,3 +588,232 @@ async def test_orchestrate_local_only_without_local_model_fails_before_model_cal
     assert contract["selected_model"] == "chat_cloud_primary"
     assert contract["selected_provider"] == "cloud"
     assert contract["failure_reason"] == "no_local_model_available"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_does_not_call_runtime_when_overlays_disabled(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+
+    runtime = FakeRuntime()
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        enable_runtime_overlays=False,
+        request_id="rid-runtime-disabled",
+    )
+
+    assert runtime.calls == []
+    runtime_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "runtime"
+    ]
+    assert runtime_trace == {"attempted": False, "status": "disabled", "included": False}
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    runtime = FakeRuntime(
+        response={
+            "runtime_state": {
+                "runtime_state_id": "rtstate_1",
+                "reset_after_turn": False,
+            },
+            "overlay": {
+                "runtime_state_id": "rtstate_1",
+                "overlay_id": "rtoverlay_1",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": (
+                    "Runtime context: scene=planning; interaction_mode=actionable; "
+                    "constraints=preserve_flow."
+                ),
+                "source_fields": [
+                    "active_scene",
+                    "interaction_mode",
+                    "temporary_constraints",
+                ],
+            },
+            "omitted": False,
+            "omission_reason": None,
+        }
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        enable_runtime_overlays=True,
+        request_id="rid-runtime-included",
+    )
+
+    assert runtime.calls[0]["surface"] == "dev"
+    contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
+    assert contents[0] == (
+        "Runtime context: scene=planning; interaction_mode=actionable; "
+        "constraints=preserve_flow."
+    )
+    assert "preserve flow" not in contents[0]
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["included_layers"] == [
+        "runtime_overlay",
+        "retrieval_augmentation",
+        "recent_history",
+        "current_messages",
+    ]
+    assert prompt_trace["runtime"]["status"] == "included"
+    assert prompt_trace["runtime"]["overlay_id"] == "rtoverlay_1"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(fail=True),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        enable_runtime_overlays=True,
+        request_id="rid-runtime-failed",
+    )
+
+    assert out["status"] == "ok"
+    runtime_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "runtime"
+    ]
+    assert runtime_trace["status"] == "failed"
+    assert runtime_trace["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_resets_runtime_after_turn_when_requested(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    runtime = FakeRuntime(
+        response={
+            "runtime_state": {
+                "runtime_state_id": "rtstate_1",
+                "reset_after_turn": True,
+            },
+            "overlay": None,
+            "omitted": True,
+            "omission_reason": "empty_runtime_state",
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        enable_runtime_overlays=True,
+        request_id="rid-runtime-reset",
+    )
+
+    assert runtime.reset_calls[0]["reason"] == "reset_after_turn"
+    runtime_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "runtime"
+    ]
+    assert runtime_trace["reset"] == {"attempted": True, "status": "ok", "reset": True}

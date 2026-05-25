@@ -10,8 +10,8 @@ from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
 from services.fallback import choose_fallback
-from services.prompt_assembly import assemble_prompt
 from services.profile_apply import apply_profile_to_request
+from services.prompt_assembly import assemble_prompt
 from services.routing_contract import routing_trace_metadata
 
 
@@ -20,6 +20,108 @@ def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
         if msg.get("role") == "user":
             return msg.get("content", "")
     return ""
+
+
+def _runtime_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
+async def _resolve_runtime_overlay(
+    *,
+    runtime: Any | None,
+    enable_runtime_overlays: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not enable_runtime_overlays:
+        return None, _runtime_disabled_trace()
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+        }
+
+    try:
+        response = await runtime.overlay(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+        }
+
+    state = response.get("runtime_state") or {}
+    overlay = response.get("overlay")
+    base_trace = {
+        "attempted": True,
+        "runtime_state_id": state.get("runtime_state_id"),
+        "reset_after_turn": bool(state.get("reset_after_turn", False)),
+    }
+    if response.get("omitted") or not overlay:
+        return None, {
+            **base_trace,
+            "status": "omitted",
+            "included": False,
+            "omission_reason": response.get("omission_reason") or "overlay_missing",
+        }
+
+    return overlay, {
+        **base_trace,
+        "status": "included",
+        "included": True,
+        "overlay_id": overlay.get("overlay_id"),
+        "overlay_type": overlay.get("overlay_type"),
+        "source_fields": overlay.get("source_fields", []),
+    }
+
+
+async def _reset_runtime_after_turn(
+    *,
+    runtime: Any | None,
+    runtime_trace: dict[str, Any],
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> None:
+    if not runtime_trace.get("reset_after_turn"):
+        return
+    if runtime is None:
+        runtime_trace["reset"] = {
+            "attempted": False,
+            "status": "failed",
+            "error_type": "RuntimeClientNotConfigured",
+        }
+        return
+    try:
+        response = await runtime.reset(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            reason="reset_after_turn",
+        )
+        runtime_trace["reset"] = {
+            "attempted": True,
+            "status": "ok",
+            "reset": bool(response.get("reset", False)),
+        }
+    except Exception as e:
+        runtime_trace["reset"] = {
+            "attempted": True,
+            "status": "failed",
+            "error_type": type(e).__name__,
+        }
 
 
 def _compute_signals(payload: dict[str, Any], retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +290,8 @@ async def orchestrate_chat(
     model_registry_path: str,
     allow_manual_override: bool,
     request_id: str,
+    runtime: Any | None = None,
+    enable_runtime_overlays: bool = False,
 ) -> dict[str, Any]:
     started = perf_counter()
 
@@ -224,6 +328,14 @@ async def orchestrate_chat(
         owner_id=payload["owner_id"],
         query=last_user_text,
         retrieval=effective_payload.get("retrieval"),
+    )
+    runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
+        runtime=runtime,
+        enable_runtime_overlays=enable_runtime_overlays,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
     )
     signals = _compute_signals(effective_payload, retrieval_bundle)
     registry = _load_model_registry(model_registry_path)
@@ -280,6 +392,7 @@ async def orchestrate_chat(
                 override_reason=override_reason,
                 failure_reason="no_local_model_available",
                 started=started,
+                prompt_trace={"runtime": runtime_trace},
             )
             raise RuntimeError("local_only policy active but no local model available")
         selected_model = local_candidate
@@ -303,6 +416,8 @@ async def orchestrate_chat(
         profile=profile,
         retrieval_bundle=retrieval_bundle,
         current_messages=effective_payload["messages"],
+        runtime_overlay=runtime_overlay,
+        runtime_trace=runtime_trace,
     )
     messages = prompt.messages
 
@@ -374,6 +489,15 @@ async def orchestrate_chat(
         content=answer,
         client_id=payload.get("client_id"),
         metadata={"request_id": request_id, "selected_model": selected_model},
+    )
+
+    await _reset_runtime_after_turn(
+        runtime=runtime,
+        runtime_trace=runtime_trace,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
     )
 
     await memory_store.create_trace(

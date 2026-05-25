@@ -6,6 +6,7 @@ from uuid import uuid4
 import httpx
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
+from clients.runtime import RuntimeClient
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
@@ -26,6 +27,15 @@ litellm = LiteLLMClient(
     base_url=settings.litellm_base_url,
     api_key=settings.litellm_api_key,
     timeout_ms=settings.request_timeout_ms,
+)
+runtime = (
+    RuntimeClient(
+        base_url=settings.cognitive_runtime_base_url,
+        api_key=settings.cognitive_runtime_api_key,
+        timeout_ms=settings.request_timeout_ms,
+    )
+    if settings.cognitive_runtime_base_url
+    else None
 )
 
 
@@ -67,9 +77,11 @@ async def chat(body: ChatRequest) -> ChatResponse:
             payload=body.model_dump(),
             memory_store=memory_store,
             litellm=litellm,
+            runtime=runtime,
             rules_path=settings.router_rules_path,
             model_registry_path=settings.model_registry_path,
             allow_manual_override=settings.allow_manual_override,
+            enable_runtime_overlays=settings.enable_runtime_overlays,
             request_id=request_id,
         )
         return ChatResponse(**result)
