@@ -94,6 +94,91 @@ def _policy_pick_model(
     return candidates[0][0]
 
 
+async def _create_error_trace(
+    *,
+    memory_store: MemoryStoreClient,
+    request_id: str,
+    conversation_id: str,
+    payload: dict[str, Any],
+    profile: dict[str, Any],
+    retrieval_bundle: dict[str, Any],
+    last_user_text: str,
+    route: dict[str, Any],
+    selected_model: str | None,
+    selected_provider: str | None,
+    sensitivity_local_only: bool,
+    profile_local_only: bool,
+    effective_local_only: bool,
+    override_requested: str | None,
+    override_applied: bool,
+    override_reason: str | None,
+    failure_reason: str,
+    started: float,
+    fallback_used: bool = False,
+    prompt_trace: dict[str, Any] | None = None,
+) -> None:
+    await memory_store.create_trace(
+        request_id=request_id,
+        payload={
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "owner_id": payload["owner_id"],
+            "client_id": payload.get("client_id"),
+            "surface": payload.get("surface", "unknown"),
+            "profile": {
+                "name": profile["profile_name"],
+                "version": profile["profile_version"],
+                "effective_profile_ref": profile["effective_profile_ref"],
+            },
+            "retrieval": {
+                "query": last_user_text,
+                "bundle": retrieval_bundle.get("bundle", {}),
+                "prompt_assembly": prompt_trace or {},
+            },
+            "router_decision": {
+                "rule_id": route.get("rule_id"),
+                "selected_model": selected_model,
+                "provider": selected_provider,
+                "rationale": route.get("rationale"),
+                "fallbacks": route.get("fallbacks", []),
+                "routing_contract": routing_trace_metadata(
+                    sensitivity=payload.get("sensitivity", "private"),
+                    request_local_only=sensitivity_local_only,
+                    profile_local_only=profile_local_only,
+                    effective_local_only=effective_local_only,
+                    manual_override_requested=override_requested,
+                    manual_override_applied=override_applied,
+                    manual_override_rejection_reason=override_reason,
+                    selected_model=selected_model,
+                    selected_provider=selected_provider,
+                    fallback_used=fallback_used,
+                    failure_reason=failure_reason,
+                ),
+            },
+            "manual_override": {
+                "requested_model": override_requested,
+                "applied": override_applied,
+                "rejection_reason": override_reason,
+            },
+            "model_call": {
+                "provider": selected_provider,
+                "model": selected_model,
+                "latency_ms": None,
+                "error": failure_reason,
+            },
+            "fallback": {
+                "triggered": fallback_used,
+                "reason": "provider_error" if fallback_used else None,
+            },
+            "cost": {},
+            "latency_ms": int((perf_counter() - started) * 1000),
+            "status": "failed",
+            "error": failure_reason,
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 async def orchestrate_chat(
     *,
     payload: dict[str, Any],
@@ -176,6 +261,26 @@ async def orchestrate_chat(
             latency_mode=latency_mode,
         )
         if not local_candidate:
+            await _create_error_trace(
+                memory_store=memory_store,
+                request_id=request_id,
+                conversation_id=conversation_id,
+                payload=effective_payload,
+                profile=profile,
+                retrieval_bundle=retrieval_bundle,
+                last_user_text=last_user_text,
+                route=route,
+                selected_model=selected_model,
+                selected_provider=selected_provider,
+                sensitivity_local_only=sensitivity_local_only,
+                profile_local_only=profile_local_only,
+                effective_local_only=local_only,
+                override_requested=override_requested,
+                override_applied=bool(override),
+                override_reason=override_reason,
+                failure_reason="no_local_model_available",
+                started=started,
+            )
             raise RuntimeError("local_only policy active but no local model available")
         selected_model = local_candidate
         selected_provider = "local"
@@ -223,6 +328,28 @@ async def orchestrate_chat(
                     latency_mode=latency_mode,
                 )
                 if not local_fallback:
+                    await _create_error_trace(
+                        memory_store=memory_store,
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        payload=effective_payload,
+                        profile=profile,
+                        retrieval_bundle=retrieval_bundle,
+                        last_user_text=last_user_text,
+                        route=route,
+                        selected_model=fallback_model,
+                        selected_provider=fallback_provider,
+                        sensitivity_local_only=sensitivity_local_only,
+                        profile_local_only=profile_local_only,
+                        effective_local_only=local_only,
+                        override_requested=override_requested,
+                        override_applied=bool(override),
+                        override_reason=override_reason,
+                        failure_reason="no_local_model_available",
+                        started=started,
+                        fallback_used=True,
+                        prompt_trace=prompt.trace,
+                    )
                     raise RuntimeError("local_only policy active but no local fallback available")
                 fallback_model = local_fallback
                 fallback_provider = "local"
@@ -275,7 +402,9 @@ async def orchestrate_chat(
                 "fallbacks": route.get("fallbacks", []),
                 "routing_contract": routing_trace_metadata(
                     sensitivity=effective_payload.get("sensitivity", "private"),
+                    request_local_only=sensitivity_local_only,
                     profile_local_only=profile_local_only,
+                    effective_local_only=local_only,
                     manual_override_requested=override_requested,
                     manual_override_applied=bool(override),
                     manual_override_rejection_reason=override_reason,

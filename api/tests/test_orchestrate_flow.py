@@ -523,4 +523,14 @@ async def test_orchestrate_local_only_without_local_model_fails_before_model_cal
         )
 
     assert litellm.calls == []
-    assert memory_store.trace_calls == []
+    assert len(memory_store.trace_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["status"] == "failed"
+    assert trace["error"] == "no_local_model_available"
+    contract = trace["router_decision"]["routing_contract"]
+    assert contract["request_local_only"] is False
+    assert contract["profile_local_only"] is True
+    assert contract["effective_local_only"] is True
+    assert contract["selected_model"] == "chat_cloud_primary"
+    assert contract["selected_provider"] == "cloud"
+    assert contract["failure_reason"] == "no_local_model_available"
