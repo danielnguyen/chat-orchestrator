@@ -86,3 +86,17 @@ When `basic-memory-store` returns `bundle.artifact_refs`, the orchestrator:
 - returns `sources` in the `/v1/chat` response using the source refs returned by memory-store
 
 File ingestion remains owned by `basic-memory-store`; `chat-orchestrator` does not own an ingestion pipeline.
+
+
+## Cluster 7.5 prompt and routing contract
+
+Prompt assembly is explicit but behavior-preserving. The orchestrator assembles:
+
+1. profile prompt overlay, when present
+2. retrieved memory and file snippet system messages
+3. recent conversation history from memory-store
+4. current request messages
+
+Trace metadata records included/omitted prompt layers, retrieval snippet refs, and truncation status. Current behavior applies no additional truncation in the orchestrator layer.
+
+Local/offline routing precedence is additive and traceable: request `sensitivity=local_only`, profile `routing_policy.local_only`, compatible manual override, router rule selection, profile cost/latency policy, then provider fallback. Local-only constraints continue to apply to fallback models.

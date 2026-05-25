@@ -48,11 +48,14 @@ class FakeMemoryStore:
 
 
 class FakeLiteLLM:
-    def __init__(self):
+    def __init__(self, *, fail_first: bool = False):
         self.calls = []
+        self.fail_first = fail_first
 
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
+        if self.fail_first and len(self.calls) == 1:
+            raise RuntimeError("primary failed")
         return {"choices": [{"message": {"content": "hello"}}]}
 
 
@@ -112,6 +115,14 @@ async def test_orchestrate_chat_happy_path(tmp_path):
     assert any("Retrieved file snippets:" in msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system")
     assert any(msg["role"] == "assistant" and msg["content"] == "prior history" for msg in litellm.calls[0]["messages"])
     assert memory_store.trace_calls[0]["request_id"] == "rid-test-1"
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    assert trace_payload["retrieval"]["prompt_assembly"]["included_layers"] == [
+        "retrieval_augmentation",
+        "recent_history",
+        "current_messages",
+    ]
+    assert trace_payload["retrieval"]["prompt_assembly"]["truncation"] == {"applied": False, "reason": None}
+    assert trace_payload["router_decision"]["routing_contract"]["selected_model"] == "gpt-4o-mini"
 
 
 @pytest.mark.asyncio
@@ -356,3 +367,170 @@ async def test_orchestrate_applies_latency_and_cost_policy(tmp_path):
         request_id="rid-cheap-1",
     )
     assert cheap_out["selected_model"] == "chat_cheap_cloud"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_uses_local_route_when_request_sensitivity_is_local_only(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: local-only\n"
+        "    when:\n"
+        "      sensitivity: local_only\n"
+        "    then:\n"
+        "      selected_model: chat_local_fast\n"
+        "      provider: local\n"
+        "      rationale: local only\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_local_fast:\n"
+        "    provider: local\n"
+        "    avg_latency_bucket: fast\n"
+        "    cost_per_1k_tokens: 0\n",
+        encoding="utf-8",
+    )
+
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "local_only",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-request-local-1",
+    )
+
+    assert out["selected_model"] == "chat_local_fast"
+    contract = memory_store.trace_calls[0]["payload"]["router_decision"]["routing_contract"]
+    assert contract["sensitivity"] == "local_only"
+    assert contract["selected_provider"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_fallback_trace_metadata(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: chat_cloud_primary\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: chat_local_fast\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_cloud_primary:\n"
+        "    provider: cloud\n"
+        "  chat_local_fast:\n"
+        "    provider: local\n",
+        encoding="utf-8",
+    )
+
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(fail_first=True)
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-fallback-1",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["selected_model"] == "chat_local_fast"
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["fallback"] == {"triggered": True, "reason": "provider_error"}
+    assert trace["router_decision"]["routing_contract"]["fallback_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_local_only_without_local_model_fails_before_model_call(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: chat_cloud_primary\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_cloud_primary:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+
+    class LocalOnlyMemoryStore(FakeMemoryStore):
+        async def resolve_profile(self, **kwargs):
+            profile = await super().resolve_profile(**kwargs)
+            profile["routing_policy"] = {"local_only": True}
+            return profile
+
+    memory_store = LocalOnlyMemoryStore()
+    litellm = FakeLiteLLM()
+
+    with pytest.raises(RuntimeError, match="local_only policy active but no local model available"):
+        await orchestrate_chat(
+            payload={
+                "owner_id": "owner",
+                "client_id": "vscode",
+                "surface": "vscode",
+                "messages": [{"role": "user", "content": "hi"}],
+                "sensitivity": "private",
+                "model_override": None,
+            },
+            memory_store=memory_store,
+            litellm=litellm,
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-no-local-1",
+        )
+
+    assert litellm.calls == []
+    assert len(memory_store.trace_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["status"] == "failed"
+    assert trace["error"] == "no_local_model_available"
+    contract = trace["router_decision"]["routing_contract"]
+    assert contract["request_local_only"] is False
+    assert contract["profile_local_only"] is True
+    assert contract["effective_local_only"] is True
+    assert contract["selected_model"] == "chat_cloud_primary"
+    assert contract["selected_provider"] == "cloud"
+    assert contract["failure_reason"] == "no_local_model_available"
