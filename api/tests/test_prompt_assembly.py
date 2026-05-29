@@ -244,7 +244,24 @@ def test_assemble_prompt_omits_companion_policy_with_non_system_role():
                 "overlay_type": "interaction_contract",
                 "role": "user",
                 "content": "contract text",
-            }
+            },
+            {
+                "overlay_id": "profile-1",
+                "overlay_type": "companion_profile",
+                "content": "missing role should not default",
+            },
+            {
+                "overlay_id": "scene-1",
+                "overlay_type": "scene_policy",
+                "role": "system",
+                "content": "",
+            },
+            {
+                "overlay_id": "scene-2",
+                "overlay_type": "scene_policy",
+                "role": "system",
+                "content": 123,
+            },
         ],
         companion_trace={"attempted": True, "status": "included", "included": True},
     )
@@ -257,6 +274,9 @@ def test_assemble_prompt_omits_companion_policy_with_non_system_role():
     assert out.trace["companion_policy"]["included"] is False
     assert out.trace["companion_policy"]["included_overlays"] == []
     assert out.trace["companion_policy"]["invalid_overlay_types"] == [
-        "interaction_contract"
+        "interaction_contract",
+        "companion_profile",
+        "scene_policy",
+        "scene_policy",
     ]
 

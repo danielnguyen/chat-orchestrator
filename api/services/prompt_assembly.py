@@ -116,16 +116,19 @@ def assemble_prompt(
     companion_overlay_metadata: list[dict[str, Any]] = []
     invalid_companion_roles: list[str | None] = []
     for overlay in companion_overlays or []:
+        if not isinstance(overlay, dict):
+            invalid_companion_roles.append(None)
+            continue
         overlay_type = overlay.get("overlay_type")
         overlay_id = overlay.get("overlay_id")
-        role = overlay.get("role", "system")
-        content = overlay.get("content", "")
-        if role == "system" and content:
+        role = overlay.get("role")
+        content = overlay.get("content")
+        if role == "system" and isinstance(content, str) and content:
             companion_messages.append({"role": "system", "content": content})
             companion_overlay_metadata.append(
                 {"overlay_id": overlay_id, "overlay_type": overlay_type}
             )
-        elif content:
+        else:
             invalid_companion_roles.append(overlay_type)
 
     if companion_messages:

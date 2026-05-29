@@ -1057,3 +1057,49 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
     assert companion_trace["error_type"] == "RuntimeError"
     assert companion_trace["omission_reason"] == "companion_policy_unavailable"
 
+@pytest.mark.asyncio
+async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(companion_response=["not", "a", "dict"]),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        request_id="rid-companion-malformed",
+    )
+
+    assert out["status"] == "ok"
+    companion_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "companion_policy"
+    ]
+    assert companion_trace["status"] == "failed"
+    assert companion_trace["included"] is False
+    assert companion_trace["error_type"] == "list"
+    assert companion_trace["omission_reason"] == "malformed_companion_policy_response"
+

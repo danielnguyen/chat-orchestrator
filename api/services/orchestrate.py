@@ -68,7 +68,19 @@ async def _resolve_companion_policy(
             "omission_reason": "companion_policy_unavailable",
         }
 
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_companion_policy_response",
+        }
+
     overlays = response.get("overlays")
+    warnings = response.get("warnings", [])
+    if not isinstance(warnings, list):
+        warnings = ["malformed_companion_policy_warnings"]
     base_trace = {
         "attempted": True,
         "profile_id": response.get("profile_id"),
@@ -78,7 +90,7 @@ async def _resolve_companion_policy(
         "scene_id": response.get("scene_id"),
         "scene_confidence": response.get("scene_confidence"),
         "scene_source": response.get("scene_source"),
-        "warnings": response.get("warnings", []),
+        "warnings": warnings,
     }
     if not isinstance(overlays, list) or not overlays:
         return None, {
@@ -88,17 +100,21 @@ async def _resolve_companion_policy(
             "omission_reason": "companion_overlays_missing",
         }
 
+    included_overlays = []
+    for overlay in overlays:
+        if isinstance(overlay, dict):
+            included_overlays.append(
+                {
+                    "overlay_id": overlay.get("overlay_id"),
+                    "overlay_type": overlay.get("overlay_type"),
+                }
+            )
+
     return overlays, {
         **base_trace,
         "status": "included",
         "included": True,
-        "included_overlays": [
-            {
-                "overlay_id": overlay.get("overlay_id"),
-                "overlay_type": overlay.get("overlay_type"),
-            }
-            for overlay in overlays
-        ],
+        "included_overlays": included_overlays,
     }
 
 
