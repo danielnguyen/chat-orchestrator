@@ -32,7 +32,7 @@ smoke:
 	ORCH_BASE="$${ORCH_BASE:-http://127.0.0.1:4361}"; \
 	ORCH_KEY="$${ORCH_API_KEY:-dev-key}"; \
 	MS_BASE="$${MEMORY_STORE_BASE_URL:-http://127.0.0.1:4321}"; \
-	MS_KEY="$${MEMORY_STORE_API_KEY:-dev-key}"; \
+	MS_KEY="$${MEMORY_STORE_API_KEY:-dev-local}"; \
 	echo "==> POST $$ORCH_BASE/v1/chat"; \
 	RESP="$$(curl -sS -X POST "$$ORCH_BASE/v1/chat" \
 	  -H "X-API-Key: $$ORCH_KEY" \
