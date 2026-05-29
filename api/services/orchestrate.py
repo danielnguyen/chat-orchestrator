@@ -26,6 +26,82 @@ def _runtime_disabled_trace() -> dict[str, Any]:
     return {"attempted": False, "status": "disabled", "included": False}
 
 
+def _companion_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
+async def _resolve_companion_policy(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    requested_scene: str | None = None,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    if not enabled:
+        return None, _companion_disabled_trace()
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+
+    try:
+        response = await runtime.compile_companion_policy(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            requested_scene=requested_scene,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "companion_policy_unavailable",
+        }
+
+    overlays = response.get("overlays")
+    base_trace = {
+        "attempted": True,
+        "profile_id": response.get("profile_id"),
+        "profile_version": response.get("profile_version"),
+        "contract_id": response.get("contract_id"),
+        "contract_version": response.get("contract_version"),
+        "scene_id": response.get("scene_id"),
+        "scene_confidence": response.get("scene_confidence"),
+        "scene_source": response.get("scene_source"),
+        "warnings": response.get("warnings", []),
+    }
+    if not isinstance(overlays, list) or not overlays:
+        return None, {
+            **base_trace,
+            "status": "omitted",
+            "included": False,
+            "omission_reason": "companion_overlays_missing",
+        }
+
+    return overlays, {
+        **base_trace,
+        "status": "included",
+        "included": True,
+        "included_overlays": [
+            {
+                "overlay_id": overlay.get("overlay_id"),
+                "overlay_type": overlay.get("overlay_type"),
+            }
+            for overlay in overlays
+        ],
+    }
+
+
 async def _resolve_runtime_overlay(
     *,
     runtime: Any | None,
@@ -292,6 +368,7 @@ async def orchestrate_chat(
     request_id: str,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
+    companion_policy_enabled: bool = False,
 ) -> dict[str, Any]:
     started = perf_counter()
 
@@ -328,6 +405,15 @@ async def orchestrate_chat(
         owner_id=payload["owner_id"],
         query=last_user_text,
         retrieval=effective_payload.get("retrieval"),
+    )
+    companion_overlays, companion_trace = await _resolve_companion_policy(
+        runtime=runtime,
+        enabled=companion_policy_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
+        requested_scene=payload.get("requested_scene"),
     )
     runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
         runtime=runtime,
@@ -392,7 +478,7 @@ async def orchestrate_chat(
                 override_reason=override_reason,
                 failure_reason="no_local_model_available",
                 started=started,
-                prompt_trace={"runtime": runtime_trace},
+                prompt_trace={"companion_policy": companion_trace, "runtime": runtime_trace},
             )
             raise RuntimeError("local_only policy active but no local model available")
         selected_model = local_candidate
@@ -416,6 +502,8 @@ async def orchestrate_chat(
         profile=profile,
         retrieval_bundle=retrieval_bundle,
         current_messages=effective_payload["messages"],
+        companion_overlays=companion_overlays,
+        companion_trace=companion_trace,
         runtime_overlay=runtime_overlay,
         runtime_trace=runtime_trace,
     )

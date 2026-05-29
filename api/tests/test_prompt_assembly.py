@@ -51,10 +51,10 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
         "recent_history",
         "current_messages",
     ]
-    assert out.trace["omitted_layers"] == ["runtime_overlay"]
+    assert out.trace["omitted_layers"] == ["companion_policy", "runtime_overlay"]
     assert out.trace["truncation"] == {"applied": False, "reason": None}
     assert out.trace["runtime"] == {"attempted": False, "status": "not_requested"}
-    snippets = out.trace["layers"][2]["metadata"]["snippets"]
+    snippets = out.trace["layers"][3]["metadata"]["snippets"]
     assert snippets["semantic"][0]["message_id"] == "m-1"
     assert snippets["artifact_refs"][0]["artifact_id"] == "a-1"
 
@@ -69,6 +69,7 @@ def test_assemble_prompt_marks_empty_layers_omitted():
     assert out.messages == [{"role": "user", "content": "hi"}]
     assert out.trace["omitted_layers"] == [
         "profile_overlay",
+        "companion_policy",
         "runtime_overlay",
         "retrieval_augmentation",
         "recent_history",
@@ -125,7 +126,7 @@ def test_assemble_prompt_includes_runtime_overlay_after_profile_before_retrieval
         "retrieval_augmentation",
         "current_messages",
     ]
-    runtime_layer = out.trace["layers"][1]
+    runtime_layer = out.trace["layers"][2]
     assert runtime_layer["metadata"]["runtime_state_id"] == "rtstate_1"
     assert out.trace["runtime"]["status"] == "included"
 
@@ -154,8 +155,108 @@ def test_assemble_prompt_omits_runtime_overlay_with_non_system_role():
 
     assert out.messages == [{"role": "user", "content": "hi"}]
     assert "runtime_overlay" in out.trace["omitted_layers"]
-    runtime_layer = out.trace["layers"][1]
+    runtime_layer = out.trace["layers"][2]
     assert runtime_layer["metadata"]["omission_reason"] == "invalid_runtime_overlay_role"
     assert out.trace["runtime"]["status"] == "omitted"
     assert out.trace["runtime"]["included"] is False
     assert out.trace["runtime"]["omission_reason"] == "invalid_runtime_overlay_role"
+
+def test_assemble_prompt_includes_companion_policy_before_runtime_overlay():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        companion_overlays=[
+            {
+                "overlay_id": "contract-1",
+                "overlay_type": "interaction_contract",
+                "role": "system",
+                "content": "contract text",
+            },
+            {
+                "overlay_id": "profile-1",
+                "overlay_type": "companion_profile",
+                "role": "system",
+                "content": "profile companion text",
+            },
+            {
+                "overlay_id": "scene-1",
+                "overlay_type": "scene_policy",
+                "role": "system",
+                "content": "scene text",
+            },
+        ],
+        companion_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "profile_id": "companion_profile_r17_mvp",
+            "profile_version": 1,
+            "contract_id": "interaction_contract_r19_mvp",
+            "contract_version": 1,
+            "scene_id": "planning",
+            "scene_confidence": 1.0,
+            "scene_source": "requested_scene",
+            "warnings": ["unknown_requested_scene"],
+        },
+        runtime_overlay={
+            "runtime_state_id": "rtstate_1",
+            "overlay_id": "rtoverlay_1",
+            "overlay_type": "runtime_state",
+            "role": "system",
+            "content": "Runtime context: scene=planning.",
+            "source_fields": ["active_scene"],
+        },
+        runtime_trace={"attempted": True, "status": "included", "included": True},
+    )
+
+    assert [msg["content"] for msg in out.messages[:5]] == [
+        "profile text",
+        "contract text",
+        "profile companion text",
+        "scene text",
+        "Runtime context: scene=planning.",
+    ]
+    assert out.trace["included_layers"] == [
+        "profile_overlay",
+        "companion_policy",
+        "runtime_overlay",
+        "current_messages",
+    ]
+    companion_layer = out.trace["layers"][1]
+    assert companion_layer["metadata"]["scene_id"] == "planning"
+    assert companion_layer["metadata"]["warnings"] == ["unknown_requested_scene"]
+    assert [item["overlay_type"] for item in companion_layer["metadata"]["included_overlays"]] == [
+        "interaction_contract",
+        "companion_profile",
+        "scene_policy",
+    ]
+
+
+def test_assemble_prompt_omits_companion_policy_with_non_system_role():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        companion_overlays=[
+            {
+                "overlay_id": "contract-1",
+                "overlay_type": "interaction_contract",
+                "role": "user",
+                "content": "contract text",
+            }
+        ],
+        companion_trace={"attempted": True, "status": "included", "included": True},
+    )
+
+    assert out.messages == [{"role": "user", "content": "hi"}]
+    assert "companion_policy" in out.trace["omitted_layers"]
+    companion_layer = out.trace["layers"][1]
+    assert companion_layer["metadata"]["omission_reason"] == "invalid_companion_overlay_role"
+    assert out.trace["companion_policy"]["status"] == "omitted"
+    assert out.trace["companion_policy"]["included"] is False
+    assert out.trace["companion_policy"]["included_overlays"] == []
+    assert out.trace["companion_policy"]["invalid_overlay_types"] == [
+        "interaction_contract"
+    ]
+

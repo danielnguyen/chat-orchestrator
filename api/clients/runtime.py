@@ -38,6 +38,25 @@ class RuntimeClient:
             },
         )
 
+    async def compile_companion_policy(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        requested_scene: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if requested_scene is not None:
+            payload["requested_scene"] = requested_scene
+        return await self._post("/v1/companion/policy/compile", json=payload)
+
     async def reset(
         self,
         *,

@@ -21,6 +21,10 @@ class Settings(BaseSettings):
         le=30000,
     )
     enable_runtime_overlays: bool = Field(default=False, alias="ENABLE_RUNTIME_OVERLAYS")
+    cognitive_runtime_companion_enabled: bool = Field(
+        default=False,
+        alias="COGNITIVE_RUNTIME_COMPANION_ENABLED",
+    )
 
     litellm_base_url: str = Field(..., alias="LITELLM_BASE_URL")
     litellm_api_key: str | None = Field(default=None, alias="LITELLM_API_KEY")

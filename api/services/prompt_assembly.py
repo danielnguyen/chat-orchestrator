@@ -97,6 +97,8 @@ def assemble_prompt(
     profile: dict[str, Any],
     retrieval_bundle: dict[str, Any],
     current_messages: list[dict[str, str]],
+    companion_overlays: list[dict[str, Any]] | None = None,
+    companion_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
 ) -> PromptAssembly:
@@ -107,6 +109,69 @@ def assemble_prompt(
     profile_messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend(profile_messages)
     layers.append(_layer_trace("profile_overlay", profile_messages))
+
+    companion_messages: list[dict[str, str]] = []
+    companion_trace_out = dict(companion_trace or {})
+    companion_omission_reason = companion_trace_out.get("omission_reason")
+    companion_overlay_metadata: list[dict[str, Any]] = []
+    invalid_companion_roles: list[str | None] = []
+    for overlay in companion_overlays or []:
+        overlay_type = overlay.get("overlay_type")
+        overlay_id = overlay.get("overlay_id")
+        role = overlay.get("role", "system")
+        content = overlay.get("content", "")
+        if role == "system" and content:
+            companion_messages.append({"role": "system", "content": content})
+            companion_overlay_metadata.append(
+                {"overlay_id": overlay_id, "overlay_type": overlay_type}
+            )
+        elif content:
+            invalid_companion_roles.append(overlay_type)
+
+    if companion_messages:
+        messages.extend(companion_messages)
+        companion_trace_out.update(
+            {
+                "status": "included",
+                "included": True,
+                "included_overlays": companion_overlay_metadata,
+            }
+        )
+        if invalid_companion_roles:
+            companion_trace_out["omitted_overlay_types"] = invalid_companion_roles
+            companion_trace_out["omission_reason"] = "invalid_companion_overlay_role"
+    elif companion_overlays and invalid_companion_roles:
+        companion_omission_reason = "invalid_companion_overlay_role"
+        companion_trace_out.update(
+            {
+                "status": "omitted",
+                "included": False,
+                "included_overlays": [],
+                "omission_reason": companion_omission_reason,
+                "invalid_overlay_types": invalid_companion_roles,
+            }
+        )
+
+    companion_metadata = {
+        "profile_id": companion_trace_out.get("profile_id"),
+        "profile_version": companion_trace_out.get("profile_version"),
+        "contract_id": companion_trace_out.get("contract_id"),
+        "contract_version": companion_trace_out.get("contract_version"),
+        "scene_id": companion_trace_out.get("scene_id"),
+        "scene_confidence": companion_trace_out.get("scene_confidence"),
+        "scene_source": companion_trace_out.get("scene_source"),
+        "warnings": companion_trace_out.get("warnings", []),
+        "included_overlays": companion_overlay_metadata,
+        "omitted_overlay_types": invalid_companion_roles,
+        "omission_reason": companion_omission_reason,
+    }
+    layers.append(
+        _layer_trace(
+            "companion_policy",
+            companion_messages,
+            metadata=companion_metadata,
+        )
+    )
 
     runtime_messages: list[dict[str, str]] = []
     runtime_trace_out = dict(runtime_trace or {})
@@ -167,6 +232,8 @@ def assemble_prompt(
             "included_layers": [layer["name"] for layer in layers if layer["included"]],
             "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
             "truncation": {"applied": False, "reason": None},
+            "companion_policy": companion_trace_out
+            or {"attempted": False, "status": "not_requested"},
             "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
             "message_count": len(messages),
         },
