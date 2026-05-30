@@ -27,6 +27,7 @@ class ChatRequest(BaseModel):
     surface: str = "unknown"
     messages: List[MessageIn]
     requested_profile: Optional[str] = None
+    requested_scene: Optional[str] = Field(default=None, max_length=64)
     model_override: Optional[str] = None
     sensitivity: Literal["public", "private", "local_only"] = "private"
     retrieval: Optional[RetrievalOptions] = None

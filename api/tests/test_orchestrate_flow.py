@@ -61,8 +61,9 @@ class FakeMemoryStore:
 
 
 class FakeRuntime:
-    def __init__(self, *, response=None, fail: bool = False):
+    def __init__(self, *, response=None, companion_response=None, fail: bool = False):
         self.calls = []
+        self.companion_calls = []
         self.reset_calls = []
         self.response = response or {
             "runtime_state": {
@@ -73,7 +74,44 @@ class FakeRuntime:
             "omitted": True,
             "omission_reason": "empty_runtime_state",
         }
+        self.companion_response = companion_response or {
+            "profile_id": "companion_profile_r17_mvp",
+            "profile_version": 1,
+            "contract_id": "interaction_contract_r19_mvp",
+            "contract_version": 1,
+            "scene_id": "planning",
+            "scene_confidence": 1.0,
+            "scene_source": "requested_scene",
+            "warnings": [],
+            "runtime_state": {"runtime_state_id": "rtstate_1"},
+            "overlays": [
+                {
+                    "overlay_id": "contract-1",
+                    "overlay_type": "interaction_contract",
+                    "role": "system",
+                    "content": "contract text",
+                },
+                {
+                    "overlay_id": "profile-1",
+                    "overlay_type": "companion_profile",
+                    "role": "system",
+                    "content": "profile companion text",
+                },
+                {
+                    "overlay_id": "scene-1",
+                    "overlay_type": "scene_policy",
+                    "role": "system",
+                    "content": "scene text",
+                },
+            ],
+        }
         self.fail = fail
+
+    async def compile_companion_policy(self, **kwargs):
+        self.companion_calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.companion_response
 
     async def overlay(self, **kwargs):
         self.calls.append(kwargs)
@@ -828,7 +866,240 @@ def test_runtime_timeout_setting_is_separate_from_request_timeout(monkeypatch):
     monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm")
     monkeypatch.setenv("REQUEST_TIMEOUT_MS", "30000")
 
+    monkeypatch.setenv("COGNITIVE_RUNTIME_COMPANION_ENABLED", "true")
+
     settings = Settings()
 
     assert settings.request_timeout_ms == 30000
     assert settings.cognitive_runtime_timeout_ms == 1500
+    assert settings.cognitive_runtime_companion_enabled is True
+
+@pytest.mark.asyncio
+async def test_orchestrate_does_not_call_companion_policy_when_disabled(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+
+    runtime = FakeRuntime()
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=False,
+        request_id="rid-companion-disabled",
+    )
+
+    assert runtime.companion_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["companion_policy"] == {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    runtime = FakeRuntime(
+        companion_response={
+            "profile_id": "companion_profile_r17_mvp",
+            "profile_version": 1,
+            "contract_id": "interaction_contract_r19_mvp",
+            "contract_version": 1,
+            "scene_id": "general",
+            "scene_confidence": 0.0,
+            "scene_source": "fallback_general",
+            "warnings": ["unknown_requested_scene"],
+            "runtime_state": {"runtime_state_id": "rtstate_1"},
+            "overlays": [
+                {
+                    "overlay_id": "contract-1",
+                    "overlay_type": "interaction_contract",
+                    "role": "system",
+                    "content": "contract text",
+                },
+                {
+                    "overlay_id": "profile-1",
+                    "overlay_type": "companion_profile",
+                    "role": "system",
+                    "content": "profile companion text",
+                },
+                {
+                    "overlay_id": "scene-1",
+                    "overlay_type": "scene_policy",
+                    "role": "system",
+                    "content": "scene text",
+                },
+            ],
+        }
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "requested_scene": "unknown_scene",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        request_id="rid-companion-included",
+    )
+
+    assert runtime.companion_calls[0]["requested_scene"] == "unknown_scene"
+    contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
+    assert contents[:3] == ["contract text", "profile companion text", "scene text"]
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["included_layers"] == [
+        "companion_policy",
+        "retrieval_augmentation",
+        "recent_history",
+        "current_messages",
+    ]
+    companion_trace = prompt_trace["companion_policy"]
+    assert companion_trace["status"] == "included"
+    assert companion_trace["profile_id"] == "companion_profile_r17_mvp"
+    assert companion_trace["contract_id"] == "interaction_contract_r19_mvp"
+    assert companion_trace["scene_id"] == "general"
+    assert companion_trace["warnings"] == ["unknown_requested_scene"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(fail=True),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        request_id="rid-companion-failed",
+    )
+
+    assert out["status"] == "ok"
+    companion_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "companion_policy"
+    ]
+    assert companion_trace["status"] == "failed"
+    assert companion_trace["error_type"] == "RuntimeError"
+    assert companion_trace["omission_reason"] == "companion_policy_unavailable"
+
+@pytest.mark.asyncio
+async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(companion_response=["not", "a", "dict"]),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        request_id="rid-companion-malformed",
+    )
+
+    assert out["status"] == "ok"
+    companion_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "companion_policy"
+    ]
+    assert companion_trace["status"] == "failed"
+    assert companion_trace["included"] is False
+    assert companion_trace["error_type"] == "list"
+    assert companion_trace["omission_reason"] == "malformed_companion_policy_response"
+

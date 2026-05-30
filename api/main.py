@@ -82,6 +82,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
             model_registry_path=settings.model_registry_path,
             allow_manual_override=settings.allow_manual_override,
             enable_runtime_overlays=settings.enable_runtime_overlays,
+            companion_policy_enabled=settings.cognitive_runtime_companion_enabled,
             request_id=request_id,
         )
         return ChatResponse(**result)
