@@ -9,6 +9,7 @@ import yaml
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
+from services.briefing import generate_brief
 from services.fallback import choose_fallback
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
@@ -585,7 +586,25 @@ async def orchestrate_chat(
 
     model_latency_ms = int((perf_counter() - model_started) * 1000)
 
-    answer = completion["choices"][0]["message"]["content"]
+    raw_answer = completion["choices"][0]["message"]["content"]
+    answer = raw_answer
+    brief_metadata = {"enabled": False}
+    if effective_payload.get("response_mode") == "brief":
+        brief_result = generate_brief(
+            content=raw_answer,
+            brief_type=effective_payload.get("brief_type", "general"),
+            depth_level=effective_payload.get("brief_depth") or 1,
+            surface=effective_payload.get("surface", payload.get("surface", "chat")),
+            source="explicit_user_request",
+            explicit_request=True,
+        )
+        answer = brief_result.rendered
+        brief_metadata = {
+            **brief_result.debug,
+            "raw_model_answer": raw_answer,
+            "shaped_answer": answer,
+        }
+
     await memory_store.add_message(
         conversation_id=conversation_id,
         owner_id=payload["owner_id"],
@@ -652,6 +671,7 @@ async def orchestrate_chat(
                 "model": selected_model,
                 "latency_ms": model_latency_ms,
                 "error": model_error,
+                "brief": brief_metadata,
             },
             "fallback": {
                 "triggered": fallback_used,
