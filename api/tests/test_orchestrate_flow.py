@@ -125,15 +125,16 @@ class FakeRuntime:
 
 
 class FakeLiteLLM:
-    def __init__(self, *, fail_first: bool = False):
+    def __init__(self, *, fail_first: bool = False, content: str = "hello"):
         self.calls = []
         self.fail_first = fail_first
+        self.content = content
 
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
         if self.fail_first and len(self.calls) == 1:
             raise RuntimeError("primary failed")
-        return {"choices": [{"message": {"content": "hello"}}]}
+        return {"choices": [{"message": {"content": self.content}}]}
 
 
 @pytest.mark.asyncio
@@ -1103,3 +1104,119 @@ async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
     assert companion_trace["error_type"] == "list"
     assert companion_trace["omission_reason"] == "malformed_companion_policy_response"
 
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_answer(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+
+    raw = (
+        "Net: ship the deterministic brief layer first. "
+        "Risk: output could feel rigid. "
+        "Recommendation: keep brief mode opt-in. "
+        "Next: add tests and trace metadata."
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content=raw)
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "telegram",
+            "messages": [{"role": "user", "content": "brief this"}],
+            "sensitivity": "private",
+            "model_override": None,
+            "response_mode": "brief",
+            "brief_depth": 1,
+            "brief_type": "recommendation",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-brief-1",
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"] != raw
+    assert out["answer"].startswith("Net: ship the deterministic brief layer first")
+    assert memory_store.added_messages[-1]["role"] == "assistant"
+    assert memory_store.added_messages[-1]["content"] == out["answer"]
+
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    brief = trace_payload["model_call"]["brief"]
+    assert brief["enabled"] is True
+    assert brief["brief_type"] == "recommendation"
+    assert brief["depth_level"] == 1
+    assert brief["surface"] == "telegram"
+    assert brief["source"] == "explicit_user_request"
+    assert brief["explicit_request"] is True
+    assert brief["raw_model_answer"] == raw
+    assert brief["shaped_answer"] == out["answer"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_normal_mode_does_not_shape_or_add_raw_answer_trace(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="Net: raw answer should pass through.")
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-normal-brief-metadata",
+    )
+
+    assert out["answer"] == "Net: raw answer should pass through."
+    brief = memory_store.trace_calls[0]["payload"]["model_call"]["brief"]
+    assert brief == {"enabled": False}

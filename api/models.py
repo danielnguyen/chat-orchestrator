@@ -5,6 +5,15 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 Role = Literal["user", "assistant", "system", "tool"]
+BriefType = Literal[
+    "project_status",
+    "risk_review",
+    "recommendation",
+    "implementation_plan",
+    "general",
+]
+ResponseMode = Literal["normal", "brief"]
+BriefDepth = Literal[0, 1, 2, 3]
 
 
 class MessageIn(BaseModel):
@@ -31,6 +40,9 @@ class ChatRequest(BaseModel):
     model_override: Optional[str] = None
     sensitivity: Literal["public", "private", "local_only"] = "private"
     retrieval: Optional[RetrievalOptions] = None
+    response_mode: ResponseMode = "normal"
+    brief_depth: Optional[BriefDepth] = None
+    brief_type: BriefType = "general"
 
 
 class ChatResponse(BaseModel):
@@ -41,6 +53,30 @@ class ChatResponse(BaseModel):
     answer: str
     status: Literal["ok", "degraded", "failed"]
     sources: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class BriefStructuredInput(BaseModel):
+    status: Optional[str] = None
+    net_assessment: Optional[str] = None
+    top_risk: Optional[str] = None
+    primary_recommendation: Optional[str] = None
+    next_step: Optional[str] = None
+    optional_depth_sections: List[Dict[str, str]] = Field(default_factory=list)
+
+
+class BriefGenerateRequest(BaseModel):
+    content: Optional[str] = None
+    structured: Optional[BriefStructuredInput] = None
+    brief_type: BriefType = "general"
+    depth_level: BriefDepth = 1
+    surface: str = "chat"
+    source_context: Dict[str, Any] = Field(default_factory=dict)
+
+
+class BriefGenerateResponse(BaseModel):
+    rendered: str
+    brief: Dict[str, Any]
+    debug: Dict[str, Any]
 
 
 class RouteDecision(BaseModel):

@@ -10,7 +10,8 @@ from clients.runtime import RuntimeClient
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from models import ChatRequest, ChatResponse
+from models import BriefGenerateRequest, BriefGenerateResponse, ChatRequest, ChatResponse
+from services.briefing import generate_brief
 from services.orchestrate import orchestrate_chat
 from settings import get_settings
 
@@ -63,6 +64,30 @@ async def healthz() -> dict[str, object]:
         "time": datetime.now(UTC).isoformat(),
         "dependencies": dependency_status,
     }
+
+
+@app.post(
+    "/v1/brief/generate",
+    response_model=BriefGenerateResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def brief_generate(body: BriefGenerateRequest) -> BriefGenerateResponse:
+    structured = body.structured.model_dump() if body.structured else None
+    result = generate_brief(
+        content=body.content,
+        structured=structured,
+        brief_type=body.brief_type,
+        depth_level=body.depth_level,
+        surface=body.surface,
+        source="explicit_user_request",
+        explicit_request=True,
+    )
+    debug = {**result.debug, "source_context": body.source_context}
+    return BriefGenerateResponse(
+        rendered=result.rendered,
+        brief=result.brief.to_dict(),
+        debug=debug,
+    )
 
 
 @app.post(
