@@ -192,12 +192,26 @@ def test_assemble_prompt_includes_companion_policy_before_runtime_overlay():
             "included": True,
             "profile_id": "companion_profile_r17_mvp",
             "profile_version": 1,
-            "contract_id": "interaction_contract_r19_mvp",
-            "contract_version": 1,
+            "contract_id": "interaction_contract_r19_default_static",
+            "contract_version": 2,
+            "contract_trace": {
+                "contract_id": "interaction_contract_r19_default_static",
+                "contract_version": 2,
+                "source": "default_static",
+                "scope": "global_default",
+                "selected_rule_groups": ["trust_rules", "repair_rules"],
+                "warnings": ["default_static_contract"],
+            },
+            "interaction_contract": {
+                "contract_id": "interaction_contract_r19_default_static",
+                "contract_version": 2,
+                "source": "default_static",
+                "scope": "global_default",
+            },
             "scene_id": "planning",
             "scene_confidence": 1.0,
             "scene_source": "requested_scene",
-            "warnings": ["unknown_requested_scene"],
+            "warnings": ["unknown_requested_scene", "default_static_contract"],
         },
         runtime_overlay={
             "runtime_state_id": "rtstate_1",
@@ -225,7 +239,13 @@ def test_assemble_prompt_includes_companion_policy_before_runtime_overlay():
     ]
     companion_layer = out.trace["layers"][1]
     assert companion_layer["metadata"]["scene_id"] == "planning"
-    assert companion_layer["metadata"]["warnings"] == ["unknown_requested_scene"]
+    assert companion_layer["metadata"]["warnings"] == [
+        "unknown_requested_scene",
+        "default_static_contract",
+    ]
+    assert companion_layer["metadata"]["contract_trace"]["source"] == "default_static"
+    assert companion_layer["metadata"]["interaction_contract"]["scope"] == "global_default"
+    assert out.trace["companion_policy"]["contract_trace"]["contract_version"] == 2
     assert [item["overlay_type"] for item in companion_layer["metadata"]["included_overlays"]] == [
         "interaction_contract",
         "companion_profile",

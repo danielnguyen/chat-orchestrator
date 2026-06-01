@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 ROUTING_PRECEDENCE = [
     "request_sensitivity_local_only",
     "profile_routing_policy_local_only",
