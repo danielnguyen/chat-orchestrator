@@ -160,6 +160,8 @@ def assemble_prompt(
         "profile_version": companion_trace_out.get("profile_version"),
         "contract_id": companion_trace_out.get("contract_id"),
         "contract_version": companion_trace_out.get("contract_version"),
+        "contract_trace": companion_trace_out.get("contract_trace"),
+        "interaction_contract": companion_trace_out.get("interaction_contract"),
         "scene_id": companion_trace_out.get("scene_id"),
         "scene_confidence": companion_trace_out.get("scene_confidence"),
         "scene_source": companion_trace_out.get("scene_source"),

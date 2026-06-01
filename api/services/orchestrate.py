@@ -93,6 +93,12 @@ async def _resolve_companion_policy(
         "scene_source": response.get("scene_source"),
         "warnings": warnings,
     }
+    interaction_contract = response.get("interaction_contract")
+    if isinstance(interaction_contract, dict):
+        base_trace["interaction_contract"] = interaction_contract
+    contract_trace = response.get("contract_trace")
+    if isinstance(contract_trace, dict):
+        base_trace["contract_trace"] = contract_trace
     if not isinstance(overlays, list) or not overlays:
         return None, {
             **base_trace,
