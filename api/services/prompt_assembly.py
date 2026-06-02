@@ -99,6 +99,8 @@ def assemble_prompt(
     current_messages: list[dict[str, str]],
     style_guidance: str | None = None,
     style_trace: dict[str, Any] | None = None,
+    response_shape_guidance: str | None = None,
+    response_shape_trace: dict[str, Any] | None = None,
     companion_overlays: list[dict[str, Any]] | None = None,
     companion_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
@@ -131,6 +133,28 @@ def assemble_prompt(
                 "guidance_flags": style_trace_out.get("guidance_flags", {}),
                 "resolved_envelope": style_trace_out.get("resolved_envelope", {}),
                 "omission_reason": style_trace_out.get("omission_reason"),
+            },
+        )
+    )
+
+    response_shape_trace_out = dict(response_shape_trace or {})
+    response_shape_messages = (
+        [{"role": "system", "content": response_shape_guidance}]
+        if response_shape_guidance
+        else []
+    )
+    messages.extend(response_shape_messages)
+    layers.append(
+        _layer_trace(
+            "response_shape",
+            response_shape_messages,
+            metadata={
+                "source_fields": response_shape_trace_out.get("source_fields", []),
+                "guidance_flags": response_shape_trace_out.get("guidance_flags", {}),
+                "resolved_shape": response_shape_trace_out.get("resolved_shape", {}),
+                "continuation_state": response_shape_trace_out.get("continuation_state"),
+                "abbreviation_reason": response_shape_trace_out.get("abbreviation_reason"),
+                "omission_reason": response_shape_trace_out.get("omission_reason"),
             },
         )
     )
@@ -261,6 +285,8 @@ def assemble_prompt(
         "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
         "truncation": {"applied": False, "reason": None},
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
+        "response_shape": response_shape_trace_out
+        or {"attempted": False, "status": "not_requested"},
         "companion_policy": companion_trace_out
         or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},

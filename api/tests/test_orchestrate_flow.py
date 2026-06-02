@@ -2,6 +2,23 @@ import pytest
 from services.orchestrate import orchestrate_chat
 
 
+BANNED_TRACE_TOKENS = ["R26", "R27", "Cluster11", "11C"]
+
+
+def _collect_keys(value):
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        for nested in value.values():
+            keys.extend(_collect_keys(nested))
+        return keys
+    if isinstance(value, list):
+        keys = []
+        for nested in value:
+            keys.extend(_collect_keys(nested))
+        return keys
+    return []
+
+
 class FakeMemoryStore:
     def __init__(self):
         self.added_messages = []
@@ -238,6 +255,10 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "applied": False,
         "reason": None,
     }
+    response_shape_trace = trace_payload["retrieval"]["prompt_assembly"]["response_shape"]
+    assert response_shape_trace["attempted"] is True
+    assert response_shape_trace["status"] == "not_requested"
+    assert response_shape_trace["resolved_shape"]["continuation_state"] == "none"
     assert trace_payload["router_decision"]["routing_contract"]["selected_model"] == "gpt-4o-mini"
 
 
@@ -650,6 +671,9 @@ async def test_orchestrate_local_only_without_local_model_fails_before_model_cal
     assert contract["selected_model"] == "chat_cloud_primary"
     assert contract["selected_provider"] == "cloud"
     assert contract["failure_reason"] == "no_local_model_available"
+    response_shape = trace["retrieval"]["prompt_assembly"]["response_shape"]
+    assert response_shape["attempted"] is True
+    assert response_shape["status"] == "not_requested"
 
 
 @pytest.mark.asyncio
@@ -1488,9 +1512,14 @@ async def test_orchestrate_default_chat_does_not_emit_style_guidance(tmp_path):
         msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
     ]
     assert all("Style guidance:" not in content for content in system_messages)
-    style_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["style"]
+    assert all("Response shape guidance:" not in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    style_trace = prompt_trace["style"]
+    response_shape_trace = prompt_trace["response_shape"]
     assert style_trace["status"] == "not_requested"
     assert style_trace["included"] is False
+    assert response_shape_trace["status"] == "not_requested"
+    assert response_shape_trace["included"] is False
 
 
 @pytest.mark.asyncio
@@ -1562,9 +1591,13 @@ async def test_orchestrate_spoken_surface_emits_speakable_guidance(tmp_path):
         msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
     ]
     assert any("spoken delivery" in content for content in system_messages)
+    assert any("Response shape guidance:" in content for content in system_messages)
+    assert any("one or two short sentences" in content for content in system_messages)
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["style"]["resolved_envelope"]["sentence_length"] == "short"
     assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "low"
+    assert prompt_trace["response_shape"]["guidance_flags"]["spoken_output"] is True
+    assert prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "abbreviated"
 
 
 @pytest.mark.asyncio
@@ -1600,9 +1633,117 @@ async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load
         "Lead with the answer, keep cognitive load low" in content
         for content in system_messages
     )
+    assert any(
+        "Response shape guidance:" in content and "Lead with the answer before any supporting detail." in content
+        for content in system_messages
+    )
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["style"]["resolved_envelope"]["directness"] == "high"
     assert prompt_trace["style"]["guidance_flags"]["active_task_mode"] is True
+    assert prompt_trace["response_shape"]["guidance_flags"]["active_task_mode"] is True
+    assert prompt_trace["response_shape"]["resolved_shape"]["concise_first_answer"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_spoken_surface_suppresses_optional_expansion_marker_when_disallowed(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "spoken_output": True,
+                "allows_expansion": False,
+                "latency_preference": "low",
+                "verbosity_target": "short",
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-shape-no-expand",
+    )
+
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
+    assert all("more detail is available" not in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "abbreviated"
+    assert prompt_trace["response_shape"]["resolved_shape"]["expansion_marker_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_spoken_surface_allows_expandable_continuation_without_forcing_it_globally(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "spoken_output": True,
+                "allows_expansion": True,
+                "latency_preference": "low",
+                "verbosity_target": "short",
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-shape-expand",
+    )
+
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
+    assert any("more detail is available" in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "expandable"
+    assert prompt_trace["response_shape"]["resolved_shape"]["expansion_marker_allowed"] is True
+
+    second_memory_store = FakeMemoryStore()
+    second_litellm = FakeLiteLLM()
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "surface_context": {"allows_expansion": True},
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=second_memory_store,
+        litellm=second_litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-shape-expand-default",
+    )
+
+    default_prompt_trace = second_memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert default_prompt_trace["response_shape"]["status"] == "not_requested"
+    assert default_prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "none"
 
 
 @pytest.mark.asyncio
@@ -1652,3 +1793,41 @@ async def test_orchestrate_style_envelope_override_uses_recognized_fields_only(t
     assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "high"
     assert prompt_trace["style"]["resolved_envelope"]["formality_range"] == "formal"
     assert "ignored_field" not in prompt_trace["style"]["recognized_request_fields"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_response_shape_trace_keys_do_not_use_banned_identifiers(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "spoken_output": True,
+                "active_task_mode": True,
+                "allows_expansion": True,
+                "latency_preference": "low",
+                "verbosity_target": "short",
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-shape-banned-keys",
+    )
+
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    keys = _collect_keys(prompt_trace["response_shape"])
+    assert keys
+    for token in BANNED_TRACE_TOKENS:
+        assert all(token not in key for key in keys)
