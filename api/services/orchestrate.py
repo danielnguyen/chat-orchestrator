@@ -588,7 +588,11 @@ async def orchestrate_chat(
                 override_reason=override_reason,
                 failure_reason="no_local_model_available",
                 started=started,
-                prompt_trace={"style": style_trace, "companion_policy": companion_trace, "runtime": runtime_trace},
+                prompt_trace={
+                    "style": style_trace,
+                    "companion_policy": companion_trace,
+                    "runtime": runtime_trace,
+                },
             )
             raise RuntimeError("local_only policy active but no local model available")
         selected_model = local_candidate

@@ -1484,7 +1484,9 @@ async def test_orchestrate_default_chat_does_not_emit_style_guidance(tmp_path):
         request_id="rid-style-default",
     )
 
-    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
     assert all("Style guidance:" not in content for content in system_messages)
     style_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["style"]
     assert style_trace["status"] == "not_requested"
@@ -1518,7 +1520,9 @@ async def test_orchestrate_telegram_surface_emits_compact_text_guidance(tmp_path
         request_id="rid-style-telegram",
     )
 
-    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
     assert any("compact and easy to scan in text" in content for content in system_messages)
     assert all("spoken delivery" not in content for content in system_messages)
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
@@ -1554,7 +1558,9 @@ async def test_orchestrate_spoken_surface_emits_speakable_guidance(tmp_path):
         request_id="rid-style-spoken",
     )
 
-    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
     assert any("spoken delivery" in content for content in system_messages)
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["style"]["resolved_envelope"]["sentence_length"] == "short"
@@ -1587,8 +1593,13 @@ async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load
         request_id="rid-style-active-task",
     )
 
-    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
-    assert any("Lead with the answer, keep cognitive load low" in content for content in system_messages)
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
+    assert any(
+        "Lead with the answer, keep cognitive load low" in content
+        for content in system_messages
+    )
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["style"]["resolved_envelope"]["directness"] == "high"
     assert prompt_trace["style"]["guidance_flags"]["active_task_mode"] is True
@@ -1626,10 +1637,18 @@ async def test_orchestrate_style_envelope_override_uses_recognized_fields_only(t
         request_id="rid-style-override",
     )
 
-    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
-    assert any("Include technical detail when it materially helps." in content for content in system_messages)
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
+    assert any(
+        "Include technical detail when it materially helps." in content
+        for content in system_messages
+    )
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
-    assert prompt_trace["style"]["recognized_request_fields"] == ["formality_range", "technical_density"]
+    assert prompt_trace["style"]["recognized_request_fields"] == [
+        "formality_range",
+        "technical_density",
+    ]
     assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "high"
     assert prompt_trace["style"]["resolved_envelope"]["formality_range"] == "formal"
     assert "ignored_field" not in prompt_trace["style"]["recognized_request_fields"]

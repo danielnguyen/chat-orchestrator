@@ -139,7 +139,8 @@ def build_style_guidance_block(envelope: StyleEnvelope, trace: dict[str, Any]) -
 
     if flags.get("text_compact"):
         lines.append(
-            "- Keep the response compact and easy to scan in text without using speech-style phrasing."
+            "- Keep the response compact and easy to scan in text without using "
+            "speech-style phrasing."
         )
     if flags.get("spoken_output"):
         lines.append(
