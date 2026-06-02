@@ -66,7 +66,6 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
     assert snippets["artifact_refs"][0]["artifact_id"] == "a-1"
 
 
-
 def test_assemble_prompt_marks_empty_layers_omitted():
     out = assemble_prompt(
         profile={"prompt_overlay": ""},
@@ -85,7 +84,6 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "recent_history",
     ]
     assert "interrupt_policy" not in out.trace
-
 
 
 def test_assemble_prompt_includes_style_guidance_after_profile_overlay():
@@ -119,7 +117,6 @@ def test_assemble_prompt_includes_style_guidance_after_profile_overlay():
     assert style_layer["metadata"]["source_fields"] == ["surface_context.active_task_mode"]
     assert style_layer["metadata"]["resolved_envelope"] == {"directness": "high"}
     assert out.trace["style"]["status"] == "included"
-
 
 
 def test_assemble_prompt_includes_response_shape_after_style_guidance():
@@ -175,7 +172,6 @@ def test_assemble_prompt_includes_response_shape_after_style_guidance():
     assert out.trace["response_shape"]["status"] == "included"
 
 
-
 def test_assemble_prompt_includes_interrupt_trace_without_changing_messages():
     out = assemble_prompt(
         profile={"prompt_overlay": "profile text"},
@@ -196,7 +192,6 @@ def test_assemble_prompt_includes_interrupt_trace_without_changing_messages():
     ]
     assert out.trace["interrupt_policy"]["mode"] == "evaluate_only"
     assert out.trace["interrupt_policy"]["trigger_class"] == "repetitive_branching"
-
 
 
 def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_retrieval():

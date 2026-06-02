@@ -7,7 +7,6 @@ from services.response_shape import (
 BANNED_TOKENS = ["R26", "R27", "Cluster11", "11C"]
 
 
-
 def _collect_keys(value):
     if isinstance(value, dict):
         keys = list(value.keys())
@@ -20,7 +19,6 @@ def _collect_keys(value):
             keys.extend(_collect_keys(nested))
         return keys
     return []
-
 
 
 def test_resolve_response_shape_defaults_without_emitting_guidance():
@@ -48,7 +46,6 @@ def test_resolve_response_shape_defaults_without_emitting_guidance():
     assert build_response_shape_guidance_block(shape, trace) == ""
 
 
-
 def test_resolve_response_shape_text_surface_does_not_receive_spoken_constraints():
     shape, trace = resolve_response_shape(
         {
@@ -64,7 +61,6 @@ def test_resolve_response_shape_text_surface_does_not_receive_spoken_constraints
     assert shape.spoken_output is False
     assert trace["included"] is False
     assert "spoken delivery" not in guidance
-
 
 
 def test_resolve_response_shape_spoken_output_emits_speakable_guidance():
@@ -87,7 +83,6 @@ def test_resolve_response_shape_spoken_output_emits_speakable_guidance():
     assert "one or two short sentences" in guidance
 
 
-
 def test_resolve_response_shape_voice_mediated_emits_spoken_guidance_without_explicit_spoken_output(
 ):
     shape, trace = resolve_response_shape(
@@ -104,7 +99,6 @@ def test_resolve_response_shape_voice_mediated_emits_spoken_guidance_without_exp
     assert shape.spoken_output is True
     assert trace["guidance_flags"]["spoken_output"] is True
     assert "spoken delivery" in guidance
-
 
 
 def test_resolve_response_shape_active_task_emits_concise_first_guidance():
@@ -124,7 +118,6 @@ def test_resolve_response_shape_active_task_emits_concise_first_guidance():
     assert shape.continuation_state == "none"
     assert "Lead with the answer" in guidance
     assert "Keep cognitive load low" in guidance
-
 
 
 def test_resolve_response_shape_allows_expansion_false_suppresses_marker_guidance():
@@ -147,7 +140,6 @@ def test_resolve_response_shape_allows_expansion_false_suppresses_marker_guidanc
     assert shape.expansion_marker_allowed is False
     assert shape.continuation_state == "abbreviated"
     assert "more detail is available" not in guidance
-
 
 
 def test_resolve_response_shape_allows_expansion_true_permits_but_does_not_force_expandable_state():
@@ -181,7 +173,6 @@ def test_resolve_response_shape_allows_expansion_true_permits_but_does_not_force
     assert "more detail is available" in guidance
     assert default_shape.continuation_state == "none"
     assert default_trace["included"] is False
-
 
 
 def test_response_shape_trace_keys_do_not_use_banned_identifiers():
