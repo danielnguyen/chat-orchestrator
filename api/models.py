@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Role = Literal["user", "assistant", "system", "tool"]
 BriefType = Literal[
@@ -15,6 +15,19 @@ BriefType = Literal[
 ResponseMode = Literal["normal", "brief"]
 BriefDepth = Literal[0, 1, 2, 3]
 InterruptPolicyMode = Literal["off", "evaluate_only"]
+InteractionMode = Literal["text", "voice_mediated"]
+LatencyPreference = Literal["normal", "low", "lowest"]
+VerbosityTarget = Literal["short", "normal", "detailed"]
+OutputFormat = Literal["plain_text", "markdown", "speech"]
+StyleDirectness = Literal["low", "balanced", "high"]
+StyleWarmth = Literal["low", "medium", "high"]
+StylePlayfulnessBudget = Literal["none", "low", "medium"]
+StyleChallengeSharpness = Literal["soft", "balanced", "direct"]
+StyleSentenceLength = Literal["short", "medium", "flexible"]
+StyleAnalogyDensity = Literal["none", "low", "medium"]
+StyleTechnicalDensity = Literal["low", "adaptive", "high"]
+StyleFormalityRange = Literal["casual", "neutral", "formal"]
+StyleRepetitionSensitivity = Literal["normal", "high"]
 
 
 class MessageIn(BaseModel):
@@ -30,11 +43,52 @@ class RetrievalOptions(BaseModel):
     retrieval_mode: Literal["recent", "balanced", "historical"] = "balanced"
 
 
+class StyleEnvelope(BaseModel):
+    directness: StyleDirectness = "balanced"
+    warmth: StyleWarmth = "medium"
+    playfulness_budget: StylePlayfulnessBudget = "low"
+    challenge_sharpness: StyleChallengeSharpness = "balanced"
+    sentence_length: StyleSentenceLength = "flexible"
+    analogy_density: StyleAnalogyDensity = "low"
+    technical_density: StyleTechnicalDensity = "adaptive"
+    formality_range: StyleFormalityRange = "neutral"
+    repetition_sensitivity: StyleRepetitionSensitivity = "normal"
+
+
+class StyleEnvelopeOverride(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    directness: Optional[StyleDirectness] = None
+    warmth: Optional[StyleWarmth] = None
+    playfulness_budget: Optional[StylePlayfulnessBudget] = None
+    challenge_sharpness: Optional[StyleChallengeSharpness] = None
+    sentence_length: Optional[StyleSentenceLength] = None
+    analogy_density: Optional[StyleAnalogyDensity] = None
+    technical_density: Optional[StyleTechnicalDensity] = None
+    formality_range: Optional[StyleFormalityRange] = None
+    repetition_sensitivity: Optional[StyleRepetitionSensitivity] = None
+
+
+class SurfaceContext(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    surface_type: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    interaction_mode: Optional[InteractionMode] = None
+    spoken_output: Optional[bool] = None
+    active_task_mode: Optional[bool] = None
+    latency_preference: Optional[LatencyPreference] = None
+    verbosity_target: Optional[VerbosityTarget] = None
+    allows_expansion: Optional[bool] = None
+    output_format: Optional[OutputFormat] = None
+    style_envelope: StyleEnvelopeOverride = Field(default_factory=StyleEnvelopeOverride)
+
+
 class ChatRequest(BaseModel):
     owner_id: str
     client_id: Optional[str] = None
     conversation_id: Optional[str] = None
     surface: str = "unknown"
+    surface_context: Optional[SurfaceContext] = None
     messages: List[MessageIn]
     requested_profile: Optional[str] = None
     requested_scene: Optional[str] = Field(default=None, max_length=64)

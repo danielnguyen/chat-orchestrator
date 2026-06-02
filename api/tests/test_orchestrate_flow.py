@@ -1435,3 +1435,201 @@ async def test_orchestrate_normal_mode_does_not_shape_or_add_raw_answer_trace(tm
     assert out["answer"] == "Net: raw answer should pass through."
     brief = memory_store.trace_calls[0]["payload"]["model_call"]["brief"]
     assert brief == {"enabled": False}
+
+
+
+def _write_default_route_files(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    return rules, models
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_default_chat_does_not_emit_style_guidance(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-style-default",
+    )
+
+    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    assert all("Style guidance:" not in content for content in system_messages)
+    style_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["style"]
+    assert style_trace["status"] == "not_requested"
+    assert style_trace["included"] is False
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_telegram_surface_emits_compact_text_guidance(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "telegram",
+            "surface": "telegram",
+            "surface_context": {
+                "surface_type": "telegram",
+                "interaction_mode": "text",
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-style-telegram",
+    )
+
+    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    assert any("compact and easy to scan in text" in content for content in system_messages)
+    assert all("spoken delivery" not in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert "style_guidance" in prompt_trace["included_layers"]
+    assert prompt_trace["style"]["guidance_flags"]["text_compact"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_spoken_surface_emits_speakable_guidance(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "interaction_mode": "voice_mediated",
+                "spoken_output": True,
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-style-spoken",
+    )
+
+    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    assert any("spoken delivery" in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["style"]["resolved_envelope"]["sentence_length"] == "short"
+    assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load_guidance(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "surface_context": {
+                "active_task_mode": True,
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-style-active-task",
+    )
+
+    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    assert any("Lead with the answer, keep cognitive load low" in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["style"]["resolved_envelope"]["directness"] == "high"
+    assert prompt_trace["style"]["guidance_flags"]["active_task_mode"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_style_envelope_override_uses_recognized_fields_only(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "spoken_output": True,
+                "style_envelope": {
+                    "technical_density": "high",
+                    "formality_range": "formal",
+                    "ignored_field": "nope",
+                },
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-style-override",
+    )
+
+    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    assert any("Include technical detail when it materially helps." in content for content in system_messages)
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["style"]["recognized_request_fields"] == ["formality_range", "technical_density"]
+    assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "high"
+    assert prompt_trace["style"]["resolved_envelope"]["formality_range"] == "formal"
+    assert "ignored_field" not in prompt_trace["style"]["recognized_request_fields"]

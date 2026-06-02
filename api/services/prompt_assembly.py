@@ -97,6 +97,8 @@ def assemble_prompt(
     profile: dict[str, Any],
     retrieval_bundle: dict[str, Any],
     current_messages: list[dict[str, str]],
+    style_guidance: str | None = None,
+    style_trace: dict[str, Any] | None = None,
     companion_overlays: list[dict[str, Any]] | None = None,
     companion_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
@@ -110,6 +112,28 @@ def assemble_prompt(
     profile_messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend(profile_messages)
     layers.append(_layer_trace("profile_overlay", profile_messages))
+
+    style_trace_out = dict(style_trace or {})
+    style_messages = [{"role": "system", "content": style_guidance}] if style_guidance else []
+    messages.extend(style_messages)
+    layers.append(
+        _layer_trace(
+            "style_guidance",
+            style_messages,
+            metadata={
+                "source_fields": style_trace_out.get("source_fields", []),
+                "recognized_profile_fields": style_trace_out.get(
+                    "recognized_profile_fields", []
+                ),
+                "recognized_request_fields": style_trace_out.get(
+                    "recognized_request_fields", []
+                ),
+                "guidance_flags": style_trace_out.get("guidance_flags", {}),
+                "resolved_envelope": style_trace_out.get("resolved_envelope", {}),
+                "omission_reason": style_trace_out.get("omission_reason"),
+            },
+        )
+    )
 
     companion_messages: list[dict[str, str]] = []
     companion_trace_out = dict(companion_trace or {})
@@ -236,6 +260,7 @@ def assemble_prompt(
         "included_layers": [layer["name"] for layer in layers if layer["included"]],
         "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
         "truncation": {"applied": False, "reason": None},
+        "style": style_trace_out or {"attempted": False, "status": "not_requested"},
         "companion_policy": companion_trace_out
         or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
