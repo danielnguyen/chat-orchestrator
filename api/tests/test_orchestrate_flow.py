@@ -64,6 +64,7 @@ class FakeRuntime:
     def __init__(self, *, response=None, companion_response=None, fail: bool = False):
         self.calls = []
         self.companion_calls = []
+        self.interrupt_calls = []
         self.reset_calls = []
         self.response = response or {
             "runtime_state": {
@@ -105,6 +106,22 @@ class FakeRuntime:
                 },
             ],
         }
+        self.interrupt_response = {
+            "request_id": "rid-interrupt",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "requested_scene": None,
+            "trigger_class": "repetitive_branching",
+            "confidence": 0.84,
+            "style_selected": "next_step_forcing",
+            "should_interrupt": True,
+            "should_defer": False,
+            "reason_json": {"defer_reasons": [], "trigger_class": "repetitive_branching"},
+            "contract_constraints_applied": {"matched_contract_style": "soft_redirect"},
+            "warnings": [],
+            "debug": {"detector_signals": {"branch_count": 4}, "user_visible_suppressed": True},
+        }
         self.fail = fail
 
     async def compile_companion_policy(self, **kwargs):
@@ -118,6 +135,12 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.response
+
+    async def evaluate_interrupt(self, **kwargs):
+        self.interrupt_calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.interrupt_response
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
@@ -921,6 +944,164 @@ async def test_orchestrate_does_not_call_companion_policy_when_disabled(tmp_path
         "status": "disabled",
         "included": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_does_not_call_interrupt_policy_when_mode_off(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+
+    runtime = FakeRuntime()
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interrupt_policy_mode="off",
+        request_id="rid-interrupt-off",
+    )
+
+    assert runtime.interrupt_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert "interrupt_policy" not in trace
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_includes_interrupt_trace_only_when_explicitly_enabled(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+
+    runtime = FakeRuntime()
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="assistant result")
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [
+                {"role": "assistant", "content": "prior"},
+                {
+                    "role": "user",
+                    "content": (
+                        "Should I rewrite this or add an abstraction or split the module "
+                        "or compare options?"
+                    ),
+                },
+            ],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interrupt_policy_mode="evaluate_only",
+        request_id="rid-interrupt-on",
+    )
+
+    assert out["answer"] == "assistant result"
+    assert runtime.interrupt_calls[0]["current_user_text"].startswith("Should I rewrite this")
+    prompt_messages = litellm.calls[0]["messages"]
+    assert prompt_messages[-2:] == [
+        {"role": "assistant", "content": "prior"},
+        {
+            "role": "user",
+            "content": (
+                "Should I rewrite this or add an abstraction or split the module or "
+                "compare options?"
+            ),
+        },
+    ]
+    assert memory_store.added_messages[-1]["content"] == "assistant result"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["interrupt_policy"]["status"] == "included"
+    assert trace["interrupt_policy"]["mode"] == "evaluate_only"
+    assert trace["interrupt_policy"]["trigger_class"] == "repetitive_branching"
+    assert trace["interrupt_policy"]["user_visible_suppressed"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_interrupt_runtime_failure_is_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(fail=True),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interrupt_policy_mode="evaluate_only",
+        request_id="rid-interrupt-failed",
+    )
+
+    assert out["status"] == "ok"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["interrupt_policy"]["status"] == "failed"
+    assert trace["interrupt_policy"]["error_type"] == "RuntimeError"
+    assert trace["interrupt_policy"]["omission_reason"] == "interrupt_policy_unavailable"
 
 
 @pytest.mark.asyncio

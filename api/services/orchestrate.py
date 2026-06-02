@@ -184,6 +184,78 @@ async def _resolve_runtime_overlay(
     }
 
 
+async def _resolve_interrupt_policy(
+    *,
+    runtime: Any | None,
+    interrupt_policy_mode: str,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    current_user_text: str,
+    recent_messages: list[dict[str, str]],
+    requested_scene: str | None = None,
+) -> dict[str, Any] | None:
+    if interrupt_policy_mode != "evaluate_only":
+        return None
+    if runtime is None:
+        return {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "mode": interrupt_policy_mode,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+
+    try:
+        response = await runtime.evaluate_interrupt(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            current_user_text=current_user_text,
+            recent_messages=recent_messages,
+            requested_scene=requested_scene,
+        )
+    except Exception as e:
+        return {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "mode": interrupt_policy_mode,
+            "error_type": type(e).__name__,
+            "omission_reason": "interrupt_policy_unavailable",
+        }
+
+    if not isinstance(response, dict):
+        return {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "mode": interrupt_policy_mode,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_interrupt_policy_response",
+        }
+
+    return {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "mode": interrupt_policy_mode,
+        "trigger_class": response.get("trigger_class"),
+        "confidence": response.get("confidence"),
+        "style_selected": response.get("style_selected"),
+        "should_interrupt": bool(response.get("should_interrupt", False)),
+        "should_defer": bool(response.get("should_defer", True)),
+        "reason_json": response.get("reason_json", {}),
+        "contract_constraints_applied": response.get("contract_constraints_applied", {}),
+        "warnings": response.get("warnings", []),
+        "debug": response.get("debug", {}),
+        "user_visible_suppressed": True,
+    }
+
+
 async def _reset_runtime_after_turn(
     *,
     runtime: Any | None,
@@ -392,6 +464,7 @@ async def orchestrate_chat(
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
+    interrupt_policy_mode: str = "off",
 ) -> dict[str, Any]:
     started = perf_counter()
 
@@ -436,6 +509,17 @@ async def orchestrate_chat(
         owner_id=payload["owner_id"],
         conversation_id=conversation_id,
         surface=payload.get("surface", "unknown"),
+        requested_scene=payload.get("requested_scene"),
+    )
+    interrupt_trace = await _resolve_interrupt_policy(
+        runtime=runtime,
+        interrupt_policy_mode=interrupt_policy_mode,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
+        current_user_text=last_user_text,
+        recent_messages=effective_payload["messages"],
         requested_scene=payload.get("requested_scene"),
     )
     runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
@@ -529,6 +613,7 @@ async def orchestrate_chat(
         companion_trace=companion_trace,
         runtime_overlay=runtime_overlay,
         runtime_trace=runtime_trace,
+        interrupt_trace=interrupt_trace,
     )
     messages = prompt.messages
 
