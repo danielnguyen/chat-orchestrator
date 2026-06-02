@@ -88,7 +88,8 @@ def test_resolve_response_shape_spoken_output_emits_speakable_guidance():
 
 
 
-def test_resolve_response_shape_voice_mediated_emits_spoken_guidance_without_explicit_spoken_output():
+def test_resolve_response_shape_voice_mediated_emits_spoken_guidance_without_explicit_spoken_output(
+):
     shape, trace = resolve_response_shape(
         {
             "surface": "car",
@@ -120,7 +121,7 @@ def test_resolve_response_shape_active_task_emits_concise_first_guidance():
     guidance = build_response_shape_guidance_block(shape, trace)
     assert shape.active_task_mode is True
     assert shape.concise_first_answer is True
-    assert shape.continuation_state == "abbreviated"
+    assert shape.continuation_state == "none"
     assert "Lead with the answer" in guidance
     assert "Keep cognitive load low" in guidance
 

@@ -157,7 +157,10 @@ def test_assemble_prompt_includes_response_shape_after_style_guidance():
         {"role": "system", "content": "Style guidance:\n- Prefer short sentences."},
         {
             "role": "system",
-            "content": "Response shape guidance:\n- Write for spoken delivery with plain, speakable text.",
+            "content": (
+                "Response shape guidance:\n"
+                "- Write for spoken delivery with plain, speakable text."
+            ),
         },
     ]
     assert out.trace["included_layers"] == [
@@ -223,7 +226,10 @@ def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_re
             "guidance_flags": {"spoken_output": True},
             "resolved_envelope": {"sentence_length": "short"},
         },
-        response_shape_guidance="Response shape guidance:\n- Lead with the answer before any supporting detail.",
+        response_shape_guidance=(
+            "Response shape guidance:\n"
+            "- Lead with the answer before any supporting detail."
+        ),
         response_shape_trace={
             "attempted": True,
             "status": "included",
@@ -323,7 +329,10 @@ def test_assemble_prompt_includes_companion_policy_after_response_shape_before_r
             "guidance_flags": {},
             "resolved_envelope": {"analogy_density": "low"},
         },
-        response_shape_guidance="Response shape guidance:\n- Lead with the answer before any supporting detail.",
+        response_shape_guidance=(
+            "Response shape guidance:\n"
+            "- Lead with the answer before any supporting detail."
+        ),
         response_shape_trace={
             "attempted": True,
             "status": "included",

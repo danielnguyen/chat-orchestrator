@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
-
 from models import StyleEnvelope
+from pydantic import BaseModel
 
 VOICE_SURFACES = {"voice", "car", "alexa"}
 
@@ -124,22 +123,25 @@ def resolve_response_shape(
     elif spoken_output:
         confirmation_style = "brief"
 
-    should_abbreviate = concise_first_answer and (
+    compression_signal = (
         spoken_output
-        or active_task_mode
+        or interaction_mode == "voice_mediated"
+        or output_format == "speech"
         or latency_preference in {"low", "lowest"}
         or verbosity_target == "short"
-        or style_envelope.sentence_length == "short"
     )
+    should_abbreviate = concise_first_answer and compression_signal
 
     if should_abbreviate:
         continuation_state = "abbreviated"
         if active_task_mode and spoken_output:
             abbreviation_reason = "spoken_active_task"
-        elif active_task_mode:
-            abbreviation_reason = "active_task_mode"
         elif spoken_output:
             abbreviation_reason = "spoken_output"
+        elif interaction_mode == "voice_mediated":
+            abbreviation_reason = "voice_mediated"
+        elif output_format == "speech":
+            abbreviation_reason = "speech_output"
         elif latency_preference in {"low", "lowest"}:
             abbreviation_reason = "latency_preference"
         elif verbosity_target == "short":
@@ -219,7 +221,10 @@ def build_response_shape_guidance_block(shape: ResponseShape, trace: dict[str, A
         )
 
     if shape.expansion_marker_allowed and shape.continuation_state == "expandable":
-        lines.append("- If the answer is intentionally abbreviated, you may mention that more detail is available if needed.")
+        lines.append(
+            "- If the answer is intentionally abbreviated, you may mention that more "
+            "detail is available if needed."
+        )
 
     if not lines:
         return ""

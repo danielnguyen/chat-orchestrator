@@ -1,7 +1,6 @@
 import pytest
 from services.orchestrate import orchestrate_chat
 
-
 BANNED_TRACE_TOKENS = ["R26", "R27", "Cluster11", "11C"]
 
 
@@ -1634,7 +1633,8 @@ async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load
         for content in system_messages
     )
     assert any(
-        "Response shape guidance:" in content and "Lead with the answer before any supporting detail." in content
+        "Response shape guidance:" in content
+        and "Lead with the answer before any supporting detail." in content
         for content in system_messages
     )
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
@@ -1642,10 +1642,13 @@ async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load
     assert prompt_trace["style"]["guidance_flags"]["active_task_mode"] is True
     assert prompt_trace["response_shape"]["guidance_flags"]["active_task_mode"] is True
     assert prompt_trace["response_shape"]["resolved_shape"]["concise_first_answer"] is True
+    assert prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "none"
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_spoken_surface_suppresses_optional_expansion_marker_when_disallowed(tmp_path):
+async def test_orchestrate_spoken_surface_suppresses_optional_expansion_marker_when_disallowed(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
@@ -1684,7 +1687,9 @@ async def test_orchestrate_spoken_surface_suppresses_optional_expansion_marker_w
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_spoken_surface_allows_expandable_continuation_without_forcing_it_globally(tmp_path):
+async def test_orchestrate_spoken_surface_allows_expandable_continuation(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
@@ -1741,7 +1746,9 @@ async def test_orchestrate_spoken_surface_allows_expandable_continuation_without
         request_id="rid-shape-expand-default",
     )
 
-    default_prompt_trace = second_memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    default_prompt_trace = second_memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]
     assert default_prompt_trace["response_shape"]["status"] == "not_requested"
     assert default_prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "none"
 
