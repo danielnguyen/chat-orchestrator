@@ -76,9 +76,9 @@ class FakeRuntime:
             "omission_reason": "empty_runtime_state",
         }
         self.companion_response = companion_response or {
-            "profile_id": "companion_profile_r17_mvp",
+            "profile_id": "default_companion_profile",
             "profile_version": 1,
-            "contract_id": "interaction_contract_r19_mvp",
+            "contract_id": "default_interaction_contract",
             "contract_version": 1,
             "scene_id": "planning",
             "scene_confidence": 1.0,
@@ -1122,16 +1122,16 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
     models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
     runtime = FakeRuntime(
         companion_response={
-            "profile_id": "companion_profile_r17_mvp",
+            "profile_id": "default_companion_profile",
             "profile_version": 1,
-            "contract_id": "interaction_contract_r19_default_static",
+            "contract_id": "default_interaction_contract",
             "contract_version": 2,
             "interaction_contract": {
-                "contract_id": "interaction_contract_r19_default_static",
+                "contract_id": "default_interaction_contract",
                 "contract_version": 2,
                 "owner_id": "owner",
                 "scope": "global_default",
-                "source": "default_static",
+                "source": "default_compiled",
                 "trust_rules": ["Be explicit when uncertainty is material."],
                 "interaction_boundaries": ["No guilt language."],
                 "repair_rules": ["Acknowledge misses clearly."],
@@ -1143,19 +1143,19 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
                 "defer_conditions": ["Defer when the user harmlessly chooses another path."],
             },
             "contract_trace": {
-                "contract_id": "interaction_contract_r19_default_static",
+                "contract_id": "default_interaction_contract",
                 "contract_version": 2,
-                "source": "default_static",
+                "source": "default_compiled",
                 "scope": "global_default",
                 "selected_rule_groups": ["trust_rules", "repair_rules"],
                 "selected_boundary_rules": ["No guilt language."],
                 "selected_repair_rules": ["Acknowledge misses clearly."],
-                "warnings": ["default_static_contract"],
+                "warnings": ["default_contract_applied"],
             },
             "scene_id": "general",
             "scene_confidence": 0.0,
             "scene_source": "fallback_general",
-            "warnings": ["unknown_requested_scene", "default_static_contract"],
+            "warnings": ["unknown_requested_scene", "default_contract_applied"],
             "runtime_state": {"runtime_state_id": "rtstate_1"},
             "overlays": [
                 {
@@ -1214,17 +1214,17 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
     ]
     companion_trace = prompt_trace["companion_policy"]
     assert companion_trace["status"] == "included"
-    assert companion_trace["profile_id"] == "companion_profile_r17_mvp"
-    assert companion_trace["contract_id"] == "interaction_contract_r19_default_static"
+    assert companion_trace["profile_id"] == "default_companion_profile"
+    assert companion_trace["contract_id"] == "default_interaction_contract"
     assert companion_trace["contract_version"] == 2
-    assert companion_trace["contract_trace"]["source"] == "default_static"
+    assert companion_trace["contract_trace"]["source"] == "default_compiled"
     assert companion_trace["interaction_contract"]["memory_or_recall_boundaries"] == [
         "Mention memory only when useful."
     ]
     assert companion_trace["scene_id"] == "general"
     assert companion_trace["warnings"] == [
         "unknown_requested_scene",
-        "default_static_contract",
+        "default_contract_applied",
     ]
 
 
