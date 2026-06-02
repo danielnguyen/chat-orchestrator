@@ -94,9 +94,10 @@ Prompt assembly is explicit but behavior-preserving. The orchestrator assembles:
 
 1. profile prompt overlay, when present
 2. additive style guidance, when surface/profile inputs require it
-3. retrieved memory and file snippet system messages
-4. recent conversation history from memory-store
-5. current request messages
+3. additive response-shape guidance, when spoken-output or active-task inputs require it
+4. retrieved memory and file snippet system messages
+5. recent conversation history from memory-store
+6. current request messages
 
 Trace metadata records included/omitted prompt layers, retrieval snippet refs, and truncation status. Current behavior applies no additional truncation in the orchestrator layer.
 

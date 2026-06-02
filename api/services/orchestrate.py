@@ -13,6 +13,10 @@ from services.briefing import generate_brief
 from services.fallback import choose_fallback
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
+from services.response_shape import (
+    build_response_shape_guidance_block,
+    resolve_response_shape,
+)
 from services.routing_contract import routing_trace_metadata
 from services.style_envelope import build_style_guidance_block, resolve_style_envelope
 
@@ -497,6 +501,14 @@ async def orchestrate_chat(
     effective_payload = apply_profile_to_request(profile, payload)
     style_envelope, style_trace = resolve_style_envelope(effective_payload, profile)
     style_guidance = build_style_guidance_block(style_envelope, style_trace)
+    response_shape, response_shape_trace = resolve_response_shape(
+        effective_payload,
+        style_envelope,
+        style_trace,
+    )
+    response_shape_guidance = build_response_shape_guidance_block(
+        response_shape, response_shape_trace
+    )
     last_user_text = _extract_last_user_text(payload["messages"])
     retrieval_bundle = await memory_store.retrieve_bundle(
         request_id=request_id,
@@ -590,6 +602,7 @@ async def orchestrate_chat(
                 started=started,
                 prompt_trace={
                     "style": style_trace,
+                    "response_shape": response_shape_trace,
                     "companion_policy": companion_trace,
                     "runtime": runtime_trace,
                 },
@@ -618,6 +631,8 @@ async def orchestrate_chat(
         current_messages=effective_payload["messages"],
         style_guidance=style_guidance,
         style_trace=style_trace,
+        response_shape_guidance=response_shape_guidance,
+        response_shape_trace=response_shape_trace,
         companion_overlays=companion_overlays,
         companion_trace=companion_trace,
         runtime_overlay=runtime_overlay,
