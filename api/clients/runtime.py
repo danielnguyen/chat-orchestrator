@@ -57,6 +57,31 @@ class RuntimeClient:
             payload["requested_scene"] = requested_scene
         return await self._post("/v1/companion/policy/compile", json=payload)
 
+    async def evaluate_interrupt(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        current_user_text: str | None = None,
+        recent_messages: list[dict[str, Any]] | None = None,
+        requested_scene: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if current_user_text is not None:
+            payload["current_user_text"] = current_user_text
+        if recent_messages is not None:
+            payload["recent_messages"] = recent_messages
+        if requested_scene is not None:
+            payload["requested_scene"] = requested_scene
+        return await self._post("/v1/interrupt/evaluate", json=payload)
+
     async def reset(
         self,
         *,

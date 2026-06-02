@@ -108,6 +108,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
             allow_manual_override=settings.allow_manual_override,
             enable_runtime_overlays=settings.enable_runtime_overlays,
             companion_policy_enabled=settings.cognitive_runtime_companion_enabled,
+            interrupt_policy_mode=body.interrupt_policy_mode,
             request_id=request_id,
         )
         return ChatResponse(**result)

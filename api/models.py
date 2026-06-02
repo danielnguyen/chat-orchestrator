@@ -14,6 +14,7 @@ BriefType = Literal[
 ]
 ResponseMode = Literal["normal", "brief"]
 BriefDepth = Literal[0, 1, 2, 3]
+InterruptPolicyMode = Literal["off", "evaluate_only"]
 
 
 class MessageIn(BaseModel):
@@ -43,6 +44,7 @@ class ChatRequest(BaseModel):
     response_mode: ResponseMode = "normal"
     brief_depth: Optional[BriefDepth] = None
     brief_type: BriefType = "general"
+    interrupt_policy_mode: InterruptPolicyMode = "off"
 
 
 class ChatResponse(BaseModel):

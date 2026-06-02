@@ -101,6 +101,7 @@ def assemble_prompt(
     companion_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
+    interrupt_trace: dict[str, Any] | None = None,
 ) -> PromptAssembly:
     messages: list[dict[str, str]] = []
     layers: list[dict[str, Any]] = []
@@ -230,16 +231,17 @@ def assemble_prompt(
     messages.extend(current_messages)
     layers.append(_layer_trace("current_messages", current_messages))
 
-    return PromptAssembly(
-        messages=messages,
-        trace={
-            "layers": layers,
-            "included_layers": [layer["name"] for layer in layers if layer["included"]],
-            "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
-            "truncation": {"applied": False, "reason": None},
-            "companion_policy": companion_trace_out
-            or {"attempted": False, "status": "not_requested"},
-            "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
-            "message_count": len(messages),
-        },
-    )
+    trace = {
+        "layers": layers,
+        "included_layers": [layer["name"] for layer in layers if layer["included"]],
+        "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
+        "truncation": {"applied": False, "reason": None},
+        "companion_policy": companion_trace_out
+        or {"attempted": False, "status": "not_requested"},
+        "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
+        "message_count": len(messages),
+    }
+    if interrupt_trace is not None:
+        trace["interrupt_policy"] = interrupt_trace
+
+    return PromptAssembly(messages=messages, trace=trace)

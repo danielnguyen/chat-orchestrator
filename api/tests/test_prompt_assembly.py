@@ -74,6 +74,29 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "retrieval_augmentation",
         "recent_history",
     ]
+    assert "interrupt_policy" not in out.trace
+
+
+def test_assemble_prompt_includes_interrupt_trace_without_changing_messages():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        interrupt_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "mode": "evaluate_only",
+            "trigger_class": "repetitive_branching",
+        },
+    )
+
+    assert out.messages == [
+        {"role": "system", "content": "profile text"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert out.trace["interrupt_policy"]["mode"] == "evaluate_only"
+    assert out.trace["interrupt_policy"]["trigger_class"] == "repetitive_branching"
 
 
 def test_assemble_prompt_includes_runtime_overlay_after_profile_before_retrieval():
@@ -299,4 +322,3 @@ def test_assemble_prompt_omits_companion_policy_with_non_system_role():
         "scene_policy",
         "scene_policy",
     ]
-
