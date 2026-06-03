@@ -4,12 +4,17 @@ from typing import Any
 
 import httpx
 
+_PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
+_COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
+_COMPANION_ENDPOINT_KEY = "_cognitive_runtime_compile_endpoint"
+
 
 class RuntimeClient:
     def __init__(self, base_url: str, api_key: str | None, timeout_ms: int = 30000) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout_ms / 1000
+        self.last_companion_compile_endpoint: str | None = None
 
     async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
         headers = {}
@@ -55,7 +60,19 @@ class RuntimeClient:
         }
         if requested_scene is not None:
             payload["requested_scene"] = requested_scene
-        return await self._post("/v1/companion/policy/compile", json=payload)
+
+        self.last_companion_compile_endpoint = _PREFERRED_COMPANION_COMPILE_PATH
+        try:
+            response = await self._post(_PREFERRED_COMPANION_COMPILE_PATH, json=payload)
+            return _with_compile_endpoint(response, _PREFERRED_COMPANION_COMPILE_PATH)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code not in {404, 405}:
+                raise
+
+        self.last_companion_compile_endpoint = _COMPAT_COMPANION_COMPILE_PATH
+        response = await self._post(_COMPAT_COMPANION_COMPILE_PATH, json=payload)
+        return _with_compile_endpoint(response, _COMPAT_COMPANION_COMPILE_PATH)
 
     async def evaluate_interrupt(
         self,
@@ -101,3 +118,11 @@ class RuntimeClient:
                 "reason": reason,
             },
         )
+
+
+def _with_compile_endpoint(response: Any, endpoint: str) -> Any:
+    if isinstance(response, dict):
+        enriched = dict(response)
+        enriched[_COMPANION_ENDPOINT_KEY] = endpoint
+        return enriched
+    return response

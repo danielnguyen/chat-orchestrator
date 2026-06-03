@@ -205,6 +205,33 @@ def assemble_prompt(
             }
         )
 
+    runtime_overlay_ids = []
+    if runtime_overlay and runtime_overlay.get("overlay_id"):
+        runtime_overlay_ids.append(runtime_overlay["overlay_id"])
+
+    companion_trace_out.setdefault("companion_profile_id", companion_trace_out.get("profile_id"))
+    companion_trace_out.setdefault(
+        "companion_profile_version", companion_trace_out.get("profile_version")
+    )
+    companion_trace_out.setdefault(
+        "interaction_contract_id", companion_trace_out.get("contract_id")
+    )
+    companion_trace_out.setdefault(
+        "interaction_contract_version", companion_trace_out.get("contract_version")
+    )
+    companion_trace_out.setdefault(
+        "companion_policy_warnings", companion_trace_out.get("warnings", [])
+    )
+    companion_trace_out["companion_overlay_ids"] = [
+        item.get("overlay_id") for item in companion_overlay_metadata if item.get("overlay_id")
+    ]
+    companion_trace_out["runtime_overlay_ids"] = runtime_overlay_ids
+    companion_trace_out.setdefault(
+        "cognitive_runtime_compile_status", companion_trace_out.get("status")
+    )
+    companion_trace_out.setdefault("cognitive_runtime_compile_error", None)
+    companion_trace_out.setdefault("cognitive_runtime_compile_endpoint", None)
+
     companion_metadata = {
         "profile_id": companion_trace_out.get("profile_id"),
         "profile_version": companion_trace_out.get("profile_version"),
@@ -216,6 +243,28 @@ def assemble_prompt(
         "scene_confidence": companion_trace_out.get("scene_confidence"),
         "scene_source": companion_trace_out.get("scene_source"),
         "warnings": companion_trace_out.get("warnings", []),
+        "companion_profile_id": companion_trace_out.get("companion_profile_id"),
+        "companion_profile_version": companion_trace_out.get(
+            "companion_profile_version"
+        ),
+        "interaction_contract_id": companion_trace_out.get("interaction_contract_id"),
+        "interaction_contract_version": companion_trace_out.get(
+            "interaction_contract_version"
+        ),
+        "companion_policy_warnings": companion_trace_out.get(
+            "companion_policy_warnings", []
+        ),
+        "companion_overlay_ids": companion_trace_out.get("companion_overlay_ids", []),
+        "runtime_overlay_ids": companion_trace_out.get("runtime_overlay_ids", []),
+        "cognitive_runtime_compile_status": companion_trace_out.get(
+            "cognitive_runtime_compile_status"
+        ),
+        "cognitive_runtime_compile_error": companion_trace_out.get(
+            "cognitive_runtime_compile_error"
+        ),
+        "cognitive_runtime_compile_endpoint": companion_trace_out.get(
+            "cognitive_runtime_compile_endpoint"
+        ),
         "included_overlays": companion_overlay_metadata,
         "omitted_overlay_types": invalid_companion_roles,
         "omission_reason": companion_omission_reason,

@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import httpx
+import pytest
+from clients.runtime import RuntimeClient
+
+
+def _status_error(path: str, status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", f"http://runtime.local{path}")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"status {status_code}",
+        request=request,
+        response=response,
+    )
+
+
+@pytest.mark.asyncio
+async def test_compile_companion_policy_prefers_profile_endpoint_then_falls_back_on_404():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[str] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append(path)
+        if path == "/v1/companion/profile/compile":
+            raise _status_error(path, 404)
+        return {"overlays": []}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.compile_companion_policy(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+    )
+
+    assert calls == [
+        "/v1/companion/profile/compile",
+        "/v1/companion/policy/compile",
+    ]
+    assert client.last_companion_compile_endpoint == "/v1/companion/policy/compile"
+    assert response["_cognitive_runtime_compile_endpoint"] == "/v1/companion/policy/compile"
+
+
+@pytest.mark.asyncio
+async def test_compile_companion_policy_falls_back_on_405():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[str] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append(path)
+        if path == "/v1/companion/profile/compile":
+            raise _status_error(path, 405)
+        return {"overlays": []}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.compile_companion_policy(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+    )
+
+    assert calls == [
+        "/v1/companion/profile/compile",
+        "/v1/companion/policy/compile",
+    ]
+    assert client.last_companion_compile_endpoint == "/v1/companion/policy/compile"
+    assert response["_cognitive_runtime_compile_endpoint"] == "/v1/companion/policy/compile"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422, 500])
+async def test_compile_companion_policy_does_not_fall_back_on_other_statuses(status_code: int):
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[str] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append(path)
+        raise _status_error(path, status_code)
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.compile_companion_policy(
+            request_id="rid",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+        )
+
+    assert calls == ["/v1/companion/profile/compile"]
+    assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"
+
+
+@pytest.mark.asyncio
+async def test_compile_companion_policy_does_not_fall_back_on_timeout():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[str] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append(path)
+        raise httpx.ReadTimeout("timed out")
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(httpx.ReadTimeout):
+        await client.compile_companion_policy(
+            request_id="rid",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+        )
+
+    assert calls == ["/v1/companion/profile/compile"]
+    assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"
+
+
+@pytest.mark.asyncio
+async def test_compile_companion_policy_does_not_fall_back_on_connection_failure():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[str] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append(path)
+        raise httpx.ConnectError("offline")
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(httpx.ConnectError):
+        await client.compile_companion_policy(
+            request_id="rid",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+        )
+
+    assert calls == ["/v1/companion/profile/compile"]
+    assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"
