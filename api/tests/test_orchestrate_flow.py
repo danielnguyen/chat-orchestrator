@@ -77,11 +77,20 @@ class FakeMemoryStore:
 
 
 class FakeRuntime:
-    def __init__(self, *, response=None, companion_response=None, fail: bool = False):
+    def __init__(
+        self,
+        *,
+        response=None,
+        companion_response=None,
+        fail: bool = False,
+        companion_error: Exception | None = None,
+        companion_endpoint: str = "/v1/companion/profile/compile",
+    ):
         self.calls = []
         self.companion_calls = []
         self.interrupt_calls = []
         self.reset_calls = []
+        self.last_companion_compile_endpoint = None
         self.response = response or {
             "runtime_state": {
                 "runtime_state_id": "rtstate_1",
@@ -139,11 +148,23 @@ class FakeRuntime:
             "debug": {"detector_signals": {"branch_count": 4}, "user_visible_suppressed": True},
         }
         self.fail = fail
+        self.companion_error = companion_error
+        self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
         self.companion_calls.append(kwargs)
+        self.last_companion_compile_endpoint = self.companion_endpoint
+        if self.companion_error is not None:
+            raise self.companion_error
         if self.fail:
             raise RuntimeError("runtime unavailable")
+        if isinstance(self.companion_response, dict):
+            response = dict(self.companion_response)
+            response.setdefault(
+                "_cognitive_runtime_compile_endpoint",
+                self.companion_endpoint,
+            )
+            return response
         return self.companion_response
 
     async def overlay(self, **kwargs):
@@ -967,11 +988,15 @@ async def test_orchestrate_does_not_call_companion_policy_when_disabled(tmp_path
 
     assert runtime.companion_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
-    assert trace["companion_policy"] == {
-        "attempted": False,
-        "status": "disabled",
-        "included": False,
-    }
+    companion_trace = trace["companion_policy"]
+    assert companion_trace["attempted"] is False
+    assert companion_trace["status"] == "disabled"
+    assert companion_trace["included"] is False
+    assert companion_trace["cognitive_runtime_compile_status"] == "disabled"
+    assert companion_trace["cognitive_runtime_compile_error"] is None
+    assert companion_trace["cognitive_runtime_compile_endpoint"] is None
+    assert companion_trace["companion_overlay_ids"] == []
+    assert companion_trace["runtime_overlay_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -1254,6 +1279,22 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
         "unknown_requested_scene",
         "default_contract_applied",
     ]
+    assert companion_trace["companion_profile_id"] == "default_companion_profile"
+    assert companion_trace["companion_profile_version"] == 1
+    assert companion_trace["interaction_contract_id"] == "default_interaction_contract"
+    assert companion_trace["interaction_contract_version"] == 2
+    assert companion_trace["companion_policy_warnings"] == [
+        "unknown_requested_scene",
+        "default_contract_applied",
+    ]
+    assert companion_trace["companion_overlay_ids"] == ["contract-1", "profile-1", "scene-1"]
+    assert companion_trace["runtime_overlay_ids"] == []
+    assert companion_trace["cognitive_runtime_compile_status"] == "included"
+    assert companion_trace["cognitive_runtime_compile_error"] is None
+    assert (
+        companion_trace["cognitive_runtime_compile_endpoint"]
+        == "/v1/companion/profile/compile"
+    )
 
 
 @pytest.mark.asyncio
@@ -1300,7 +1341,66 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
     assert companion_trace["status"] == "failed"
     assert companion_trace["error_type"] == "RuntimeError"
     assert companion_trace["omission_reason"] == "companion_policy_unavailable"
+    assert companion_trace["cognitive_runtime_compile_status"] == "failed"
+    assert companion_trace["cognitive_runtime_compile_error"] == "runtime unavailable"
+    assert companion_trace["cognitive_runtime_compile_endpoint"] == (
+        "/v1/companion/profile/compile"
+    )
 
+@pytest.mark.asyncio
+async def test_orchestrate_companion_runtime_400_failure_does_not_trigger_alias_semantics(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime(
+        companion_error=RuntimeError("400 Bad Request"),
+        companion_endpoint="/v1/companion/profile/compile",
+    )
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        request_id="rid-companion-400",
+    )
+
+    assert out["status"] == "ok"
+    companion_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "companion_policy"
+    ]
+    assert companion_trace["status"] == "failed"
+    assert companion_trace["cognitive_runtime_compile_status"] == "failed"
+    assert companion_trace["cognitive_runtime_compile_error"] == "400 Bad Request"
+    assert companion_trace["cognitive_runtime_compile_endpoint"] == (
+        "/v1/companion/profile/compile"
+    )
 @pytest.mark.asyncio
 async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
     rules = tmp_path / "rules.yaml"
@@ -1346,6 +1446,9 @@ async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
     assert companion_trace["included"] is False
     assert companion_trace["error_type"] == "list"
     assert companion_trace["omission_reason"] == "malformed_companion_policy_response"
+    assert companion_trace["cognitive_runtime_compile_status"] == "failed"
+    assert companion_trace["cognitive_runtime_compile_error"] == "list"
+    assert companion_trace["cognitive_runtime_compile_endpoint"] is None
 
 
 

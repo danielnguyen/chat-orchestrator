@@ -34,7 +34,14 @@ def _runtime_disabled_trace() -> dict[str, Any]:
 
 
 def _companion_disabled_trace() -> dict[str, Any]:
-    return {"attempted": False, "status": "disabled", "included": False}
+    return {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+        "cognitive_runtime_compile_status": "disabled",
+        "cognitive_runtime_compile_error": None,
+        "cognitive_runtime_compile_endpoint": None,
+    }
 
 
 async def _resolve_companion_policy(
@@ -56,6 +63,9 @@ async def _resolve_companion_policy(
             "included": False,
             "error_type": "RuntimeClientNotConfigured",
             "omission_reason": "runtime_client_not_configured",
+            "cognitive_runtime_compile_status": "failed",
+            "cognitive_runtime_compile_error": "RuntimeClientNotConfigured",
+            "cognitive_runtime_compile_endpoint": None,
         }
 
     try:
@@ -73,6 +83,13 @@ async def _resolve_companion_policy(
             "included": False,
             "error_type": type(e).__name__,
             "omission_reason": "companion_policy_unavailable",
+            "cognitive_runtime_compile_status": "failed",
+            "cognitive_runtime_compile_error": str(e) or type(e).__name__,
+            "cognitive_runtime_compile_endpoint": getattr(
+                runtime,
+                "last_companion_compile_endpoint",
+                None,
+            ),
         }
 
     if not isinstance(response, dict):
@@ -82,8 +99,12 @@ async def _resolve_companion_policy(
             "included": False,
             "error_type": type(response).__name__,
             "omission_reason": "malformed_companion_policy_response",
+            "cognitive_runtime_compile_status": "failed",
+            "cognitive_runtime_compile_error": type(response).__name__,
+            "cognitive_runtime_compile_endpoint": None,
         }
 
+    compile_endpoint = response.get("_cognitive_runtime_compile_endpoint")
     overlays = response.get("overlays")
     warnings = response.get("warnings", [])
     if not isinstance(warnings, list):
@@ -98,6 +119,14 @@ async def _resolve_companion_policy(
         "scene_confidence": response.get("scene_confidence"),
         "scene_source": response.get("scene_source"),
         "warnings": warnings,
+        "companion_profile_id": response.get("profile_id"),
+        "companion_profile_version": response.get("profile_version"),
+        "interaction_contract_id": response.get("contract_id"),
+        "interaction_contract_version": response.get("contract_version"),
+        "companion_policy_warnings": warnings,
+        "cognitive_runtime_compile_status": "included",
+        "cognitive_runtime_compile_error": None,
+        "cognitive_runtime_compile_endpoint": compile_endpoint,
     }
     interaction_contract = response.get("interaction_contract")
     if isinstance(interaction_contract, dict):
@@ -110,6 +139,8 @@ async def _resolve_companion_policy(
             **base_trace,
             "status": "omitted",
             "included": False,
+            "cognitive_runtime_compile_status": "omitted",
+            "cognitive_runtime_compile_error": "companion_overlays_missing",
             "omission_reason": "companion_overlays_missing",
         }
 
@@ -128,6 +159,9 @@ async def _resolve_companion_policy(
         "status": "included",
         "included": True,
         "included_overlays": included_overlays,
+        "companion_overlay_ids": [
+            item["overlay_id"] for item in included_overlays if item.get("overlay_id")
+        ],
     }
 
 

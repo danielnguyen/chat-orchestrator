@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-
 from services.response_shape import ResponseShape
 
 PresenceState = Literal["idle", "briefing", "fallback", "unavailable"]

@@ -450,6 +450,22 @@ def test_assemble_prompt_includes_companion_policy_after_response_shape_before_r
     ]
     assert companion_layer["metadata"]["contract_trace"]["source"] == "default_compiled"
     assert companion_layer["metadata"]["interaction_contract"]["scope"] == "global_default"
+    assert companion_layer["metadata"]["companion_profile_id"] == "default_companion_profile"
+    assert companion_layer["metadata"]["interaction_contract_id"] == (
+        "default_interaction_contract"
+    )
+    assert companion_layer["metadata"]["companion_policy_warnings"] == [
+        "unknown_requested_scene",
+        "default_contract_applied",
+    ]
+    assert companion_layer["metadata"]["companion_overlay_ids"] == [
+        "contract-1",
+        "profile-1",
+        "scene-1",
+    ]
+    assert companion_layer["metadata"]["runtime_overlay_ids"] == ["rtoverlay_1"]
+    assert companion_layer["metadata"]["cognitive_runtime_compile_status"] == "included"
+    assert companion_layer["metadata"]["cognitive_runtime_compile_error"] is None
     assert out.trace["companion_policy"]["contract_trace"]["contract_version"] == 2
     assert [item["overlay_type"] for item in companion_layer["metadata"]["included_overlays"]] == [
         "interaction_contract",
