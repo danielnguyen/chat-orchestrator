@@ -1,7 +1,7 @@
 import pytest
 from services.orchestrate import orchestrate_chat
 
-BANNED_TRACE_TOKENS = ["R26", "R27", "Cluster11", "11C"]
+BANNED_TRACE_TOKENS = ["R26", "R27", "Cluster11", "11C", "11D"]
 
 
 def _collect_keys(value):
@@ -607,6 +607,8 @@ async def test_orchestrate_fallback_trace_metadata(tmp_path):
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["fallback"] == {"triggered": True, "reason": "provider_error"}
     assert trace["router_decision"]["routing_contract"]["fallback_used"] is True
+    assert trace["retrieval"]["prompt_assembly"]["surface_presence"]["presence_state"] == "fallback"
+    assert trace["retrieval"]["prompt_assembly"]["surface_presence"]["fallback_active"] is True
 
 
 @pytest.mark.asyncio
@@ -671,8 +673,11 @@ async def test_orchestrate_local_only_without_local_model_fails_before_model_cal
     assert contract["selected_provider"] == "cloud"
     assert contract["failure_reason"] == "no_local_model_available"
     response_shape = trace["retrieval"]["prompt_assembly"]["response_shape"]
+    surface_presence = trace["retrieval"]["prompt_assembly"]["surface_presence"]
     assert response_shape["attempted"] is True
     assert response_shape["status"] == "not_requested"
+    assert surface_presence["presence_state"] == "unavailable"
+    assert surface_presence["reason"] == "request_failed"
 
 
 @pytest.mark.asyncio
@@ -1515,10 +1520,13 @@ async def test_orchestrate_default_chat_does_not_emit_style_guidance(tmp_path):
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     style_trace = prompt_trace["style"]
     response_shape_trace = prompt_trace["response_shape"]
+    surface_presence_trace = prompt_trace["surface_presence"]
     assert style_trace["status"] == "not_requested"
     assert style_trace["included"] is False
     assert response_shape_trace["status"] == "not_requested"
     assert response_shape_trace["included"] is False
+    assert surface_presence_trace["presence_state"] == "idle"
+    assert surface_presence_trace["fallback_active"] is False
 
 
 @pytest.mark.asyncio
@@ -1597,6 +1605,7 @@ async def test_orchestrate_spoken_surface_emits_speakable_guidance(tmp_path):
     assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "low"
     assert prompt_trace["response_shape"]["guidance_flags"]["spoken_output"] is True
     assert prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "abbreviated"
+    assert prompt_trace["surface_presence"]["presence_state"] == "briefing"
 
 
 @pytest.mark.asyncio
@@ -1643,6 +1652,8 @@ async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load
     assert prompt_trace["response_shape"]["guidance_flags"]["active_task_mode"] is True
     assert prompt_trace["response_shape"]["resolved_shape"]["concise_first_answer"] is True
     assert prompt_trace["response_shape"]["resolved_shape"]["continuation_state"] == "none"
+    assert prompt_trace["surface_presence"]["presence_state"] == "idle"
+    assert prompt_trace["surface_presence"]["active_task_mode"] is True
 
 
 @pytest.mark.asyncio
