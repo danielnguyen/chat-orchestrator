@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from services.response_shape import ResponseShape
 
@@ -17,7 +17,7 @@ class SurfacePresence(BaseModel):
     active_task_mode: bool = False
     fallback_active: bool = False
     reason: str | None = None
-    source_fields: list[str] = []
+    source_fields: list[str] = Field(default_factory=list)
 
 
 def _normalize_surface_type(value: str | None) -> str | None:
