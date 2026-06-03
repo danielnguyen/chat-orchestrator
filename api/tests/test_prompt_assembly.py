@@ -60,6 +60,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
     assert out.trace["truncation"] == {"applied": False, "reason": None}
     assert out.trace["style"]["status"] == "not_requested"
     assert out.trace["response_shape"]["status"] == "not_requested"
+    assert out.trace["surface_presence"] == {"attempted": False, "status": "not_requested"}
     assert out.trace["runtime"] == {"attempted": False, "status": "not_requested"}
     snippets = out.trace["layers"][5]["metadata"]["snippets"]
     assert snippets["semantic"][0]["message_id"] == "m-1"
@@ -117,6 +118,34 @@ def test_assemble_prompt_includes_style_guidance_after_profile_overlay():
     assert style_layer["metadata"]["source_fields"] == ["surface_context.active_task_mode"]
     assert style_layer["metadata"]["resolved_envelope"] == {"directness": "high"}
     assert out.trace["style"]["status"] == "included"
+
+
+def test_assemble_prompt_includes_surface_presence_in_top_level_trace_only():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        surface_presence_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "presence_state": "idle",
+            "reason": "default_completed_turn",
+            "source_fields": ["surface", "response_shape.resolved_shape"],
+            "surface_type": "vscode",
+            "spoken_output": False,
+            "active_task_mode": False,
+            "fallback_active": False,
+        },
+    )
+
+    assert out.messages == [
+        {"role": "system", "content": "profile text"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert out.trace["surface_presence"]["presence_state"] == "idle"
+    assert "surface_presence" not in out.trace["included_layers"]
+    assert "surface_presence" not in out.trace["omitted_layers"]
 
 
 def test_assemble_prompt_includes_response_shape_after_style_guidance():

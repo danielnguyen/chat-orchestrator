@@ -101,6 +101,7 @@ def assemble_prompt(
     style_trace: dict[str, Any] | None = None,
     response_shape_guidance: str | None = None,
     response_shape_trace: dict[str, Any] | None = None,
+    surface_presence_trace: dict[str, Any] | None = None,
     companion_overlays: list[dict[str, Any]] | None = None,
     companion_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
@@ -286,6 +287,8 @@ def assemble_prompt(
         "truncation": {"applied": False, "reason": None},
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
         "response_shape": response_shape_trace_out
+        or {"attempted": False, "status": "not_requested"},
+        "surface_presence": surface_presence_trace
         or {"attempted": False, "status": "not_requested"},
         "companion_policy": companion_trace_out
         or {"attempted": False, "status": "not_requested"},

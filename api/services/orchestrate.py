@@ -19,6 +19,7 @@ from services.response_shape import (
 )
 from services.routing_contract import routing_trace_metadata
 from services.style_envelope import build_style_guidance_block, resolve_style_envelope
+from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
 
 
 def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
@@ -394,6 +395,7 @@ async def _create_error_trace(
     started: float,
     fallback_used: bool = False,
     prompt_trace: dict[str, Any] | None = None,
+    surface_presence_trace: dict[str, Any] | None = None,
 ) -> None:
     await memory_store.create_trace(
         request_id=request_id,
@@ -411,7 +413,14 @@ async def _create_error_trace(
             "retrieval": {
                 "query": last_user_text,
                 "bundle": retrieval_bundle.get("bundle", {}),
-                "prompt_assembly": prompt_trace or {},
+                "prompt_assembly": {
+                    **(prompt_trace or {}),
+                    "surface_presence": apply_surface_presence_outcome(
+                        surface_presence_trace,
+                        fallback_active=fallback_used,
+                        unavailable=True,
+                    ),
+                },
             },
             "router_decision": {
                 "rule_id": route.get("rule_id"),
@@ -509,6 +518,7 @@ async def orchestrate_chat(
     response_shape_guidance = build_response_shape_guidance_block(
         response_shape, response_shape_trace
     )
+    surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
     last_user_text = _extract_last_user_text(payload["messages"])
     retrieval_bundle = await memory_store.retrieve_bundle(
         request_id=request_id,
@@ -606,6 +616,7 @@ async def orchestrate_chat(
                     "companion_policy": companion_trace,
                     "runtime": runtime_trace,
                 },
+                surface_presence_trace=surface_presence_trace,
             )
             raise RuntimeError("local_only policy active but no local model available")
         selected_model = local_candidate
@@ -633,6 +644,7 @@ async def orchestrate_chat(
         style_trace=style_trace,
         response_shape_guidance=response_shape_guidance,
         response_shape_trace=response_shape_trace,
+        surface_presence_trace=surface_presence_trace,
         companion_overlays=companion_overlays,
         companion_trace=companion_trace,
         runtime_overlay=runtime_overlay,
@@ -684,6 +696,7 @@ async def orchestrate_chat(
                         started=started,
                         fallback_used=True,
                         prompt_trace=prompt.trace,
+                        surface_presence_trace=surface_presence_trace,
                     )
                     raise RuntimeError("local_only policy active but no local fallback available")
                 fallback_model = local_fallback
@@ -738,6 +751,10 @@ async def orchestrate_chat(
         surface=payload.get("surface", "unknown"),
     )
     prompt.trace["runtime"] = runtime_trace
+    prompt.trace["surface_presence"] = apply_surface_presence_outcome(
+        surface_presence_trace,
+        fallback_active=fallback_used,
+    )
 
     await memory_store.create_trace(
         request_id=request_id,
