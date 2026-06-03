@@ -38,6 +38,7 @@ async def test_compile_companion_policy_prefers_profile_endpoint_then_falls_back
         "/v1/companion/profile/compile",
         "/v1/companion/policy/compile",
     ]
+    assert client.last_companion_compile_endpoint == "/v1/companion/policy/compile"
     assert response["_cognitive_runtime_compile_endpoint"] == "/v1/companion/policy/compile"
 
 
@@ -64,6 +65,7 @@ async def test_compile_companion_policy_falls_back_on_405():
         "/v1/companion/profile/compile",
         "/v1/companion/policy/compile",
     ]
+    assert client.last_companion_compile_endpoint == "/v1/companion/policy/compile"
     assert response["_cognitive_runtime_compile_endpoint"] == "/v1/companion/policy/compile"
 
 
@@ -87,6 +89,7 @@ async def test_compile_companion_policy_does_not_fall_back_on_other_statuses(sta
         )
 
     assert calls == ["/v1/companion/profile/compile"]
+    assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"
 
 
 @pytest.mark.asyncio
@@ -108,6 +111,7 @@ async def test_compile_companion_policy_does_not_fall_back_on_timeout():
         )
 
     assert calls == ["/v1/companion/profile/compile"]
+    assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"
 
 
 @pytest.mark.asyncio
@@ -129,3 +133,4 @@ async def test_compile_companion_policy_does_not_fall_back_on_connection_failure
         )
 
     assert calls == ["/v1/companion/profile/compile"]
+    assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"

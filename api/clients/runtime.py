@@ -14,6 +14,7 @@ class RuntimeClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout_ms / 1000
+        self.last_companion_compile_endpoint: str | None = None
 
     async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
         headers = {}
@@ -60,6 +61,7 @@ class RuntimeClient:
         if requested_scene is not None:
             payload["requested_scene"] = requested_scene
 
+        self.last_companion_compile_endpoint = _PREFERRED_COMPANION_COMPILE_PATH
         try:
             response = await self._post(_PREFERRED_COMPANION_COMPILE_PATH, json=payload)
             return _with_compile_endpoint(response, _PREFERRED_COMPANION_COMPILE_PATH)
@@ -68,6 +70,7 @@ class RuntimeClient:
             if status_code not in {404, 405}:
                 raise
 
+        self.last_companion_compile_endpoint = _COMPAT_COMPANION_COMPILE_PATH
         response = await self._post(_COMPAT_COMPANION_COMPILE_PATH, json=payload)
         return _with_compile_endpoint(response, _COMPAT_COMPANION_COMPILE_PATH)
 
