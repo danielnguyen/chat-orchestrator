@@ -17,6 +17,18 @@ BANNED_TRACE_TOKENS = [
     "spec",
 ]
 
+BANNED_RUNTIME_KEY_TOKENS = [
+    "gate",
+    "gating",
+    "block",
+    "rewrite",
+    "R30",
+    "Cluster",
+    "phase",
+    "milestone",
+    "spec",
+]
+
 
 def _collect_keys(value):
     if isinstance(value, dict):
@@ -311,6 +323,25 @@ async def test_orchestrate_chat_happy_path(tmp_path):
     assert response_shape_trace["attempted"] is True
     assert response_shape_trace["status"] == "not_requested"
     assert response_shape_trace["resolved_shape"]["continuation_state"] == "none"
+    response_review = trace_payload["retrieval"]["prompt_assembly"]["response_review"]
+    assert response_review == {
+        "status": "clear",
+        "finding_count": 0,
+        "highest_severity": "clear",
+        "findings": [],
+        "checked_categories": [
+            "empty_response",
+            "unsupported_memory_claim",
+            "apology_loop",
+            "pseudo_attachment",
+            "pressure_language",
+            "response_shape_mismatch",
+            "excessive_length",
+        ],
+        "diagnostic_only": True,
+        "action_taken": "none",
+        "reviewed_text_source": "raw_model_output",
+    }
     assert trace_payload["router_decision"]["routing_contract"]["selected_model"] == "gpt-4o-mini"
 
 
@@ -1575,6 +1606,9 @@ async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_ans
     assert brief["explicit_request"] is True
     assert brief["raw_model_answer"] == raw
     assert brief["shaped_answer"] == out["answer"]
+    response_review = trace_payload["retrieval"]["prompt_assembly"]["response_review"]
+    assert response_review["reviewed_text_source"] == "raw_model_output"
+    assert response_review["action_taken"] == "none"
 
 
 @pytest.mark.asyncio
@@ -1970,6 +2004,99 @@ async def test_orchestrate_style_envelope_override_uses_recognized_fields_only(t
     assert prompt_trace["style"]["resolved_envelope"]["technical_density"] == "high"
     assert prompt_trace["style"]["resolved_envelope"]["formality_range"] == "formal"
     assert "ignored_field" not in prompt_trace["style"]["recognized_request_fields"]
+
+
+class NoSupportMemoryStore(FakeMemoryStore):
+    async def retrieve_bundle(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "bundle": {
+                "recent": [],
+                "semantic": [],
+                "artifact_refs": [],
+                "observed_metadata": {"has_code_like_content": False},
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_response_review_trace_can_record_concern_without_changing_answer(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = NoSupportMemoryStore()
+    litellm = FakeLiteLLM(
+        content="I remember from our last conversation that your deploy failed yesterday."
+    )
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "what happened?"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-review-concern",
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"] == litellm.content
+    assert memory_store.added_messages[-1]["content"] == litellm.content
+    response_review = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "response_review"
+    ]
+    assert response_review["status"] == "concern"
+    assert response_review["diagnostic_only"] is True
+    assert response_review["action_taken"] == "none"
+    assert response_review["reviewed_text_source"] == "raw_model_output"
+    assert response_review["findings"][0]["type"] == "unsupported_memory_claim"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_response_review_trace_keys_do_not_use_banned_runtime_terms(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = NoSupportMemoryStore()
+    litellm = FakeLiteLLM(content="I remember from our last conversation that this broke.")
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "spoken_output": True,
+                "active_task_mode": True,
+                "allows_expansion": True,
+                "latency_preference": "low",
+                "verbosity_target": "short",
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-review-banned-keys",
+    )
+
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    keys = _collect_keys(prompt_trace["response_review"])
+    assert keys
+    for token in BANNED_RUNTIME_KEY_TOKENS:
+        assert all(token not in key for key in keys)
 
 
 @pytest.mark.asyncio
