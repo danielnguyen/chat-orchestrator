@@ -1,4 +1,48 @@
+from services.assistant_handoff import build_assistant_handoff
 from services.prompt_assembly import assemble_prompt
+
+
+def _build_handoff(**overrides):
+    base = dict(
+        request_id="rid-1",
+        owner_id="owner",
+        conversation_id="conv-1",
+        surface="vscode",
+        route={"rule_id": "default", "fallbacks": []},
+        selected_model="gpt-4o-mini",
+        selected_provider="cloud",
+        effective_local_only=False,
+        manual_override_requested=None,
+        manual_override_applied=False,
+        manual_override_rejection_reason=None,
+        style_trace={"attempted": True, "status": "included", "included": True},
+        response_shape_trace={"attempted": True, "status": "included", "included": True},
+        surface_presence_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "presence_state": "idle",
+            "reason": "default_completed_turn",
+        },
+        companion_overlays=[],
+        companion_trace={"attempted": False, "status": "disabled", "included": False},
+        runtime_overlay=None,
+        runtime_trace={"attempted": False, "status": "disabled", "included": False},
+        retrieval_query="hi",
+        retrieval_bundle={
+            "bundle": {
+                "recent": [],
+                "semantic": [],
+                "artifact_refs": [],
+                "observed_metadata": {"has_code_like_content": False},
+            }
+        },
+        interrupt_trace=None,
+        fallback_active=False,
+        model_error=None,
+    )
+    base.update(overrides)
+    return build_assistant_handoff(**base)
 
 
 def test_assemble_prompt_preserves_existing_layer_order_and_wording():
@@ -520,4 +564,92 @@ def test_assemble_prompt_omits_companion_policy_with_non_system_role():
         "companion_profile",
         "scene_policy",
         "scene_policy",
+    ]
+
+
+def test_assemble_prompt_adds_summary_only_handoff_trace_in_parallel():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        handoff=_build_handoff(
+            companion_overlays=[
+                {
+                    "overlay_id": "contract-1",
+                    "overlay_type": "interaction_contract",
+                    "role": "system",
+                    "content": "contract text",
+                }
+            ],
+            companion_trace={
+                "attempted": True,
+                "status": "included",
+                "included": True,
+                "cognitive_runtime_compile_status": "included",
+                "cognitive_runtime_compile_endpoint": "/v1/companion/profile/compile",
+            },
+            runtime_overlay={
+                "overlay_id": "runtime-1",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": "Runtime context",
+                "source_fields": ["active_scene"],
+            },
+            runtime_trace={
+                "attempted": True,
+                "status": "included",
+                "included": True,
+                "runtime_state_id": "rtstate_1",
+            },
+            retrieval_bundle={
+                "bundle": {
+                    "recent": [{"role": "assistant", "content": "prior history"}],
+                    "semantic": [
+                        {
+                            "message_id": "m-1",
+                            "created_at": "2026-01-01T00:00:00+00:00",
+                            "role": "assistant",
+                            "content": "semantic note",
+                        }
+                    ],
+                    "artifact_refs": [
+                        {
+                            "artifact_id": "a-1",
+                            "repo_name": "repo",
+                            "file_path": "api/main.py",
+                            "snippet": "def entrypoint(): pass",
+                        }
+                    ],
+                    "observed_metadata": {"has_code_like_content": False},
+                }
+            },
+        ),
+    )
+
+    assert "handoff" in out.trace
+    assert out.trace["handoff"]["request"]["request_id"] == "rid-1"
+    assert out.trace["handoff"]["companion"]["overlay_refs"] == [
+        {"overlay_id": "contract-1", "overlay_type": "interaction_contract"}
+    ]
+    assert out.trace["handoff"]["runtime"]["overlay_ref"] == {
+        "overlay_id": "runtime-1",
+        "overlay_type": "runtime_state",
+    }
+    assert out.trace["handoff"]["retrieval"]["semantic_count"] == 1
+    assert out.trace["handoff"]["retrieval"]["artifact_ref_count"] == 1
+    assert out.trace["handoff"]["companion"].get("content") is None
+    assert out.trace["handoff"]["runtime"].get("content") is None
+    assert out.trace["handoff"]["retrieval"]["semantic_refs"] == [
+        {
+            "message_id": "m-1",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "role": "assistant",
+        }
+    ]
+    assert out.trace["handoff"]["retrieval"]["artifact_refs"] == [
+        {
+            "artifact_id": "a-1",
+            "file_path": "api/main.py",
+            "repo_name": "repo",
+        }
     ]
