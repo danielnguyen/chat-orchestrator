@@ -61,6 +61,21 @@ def test_response_action_shadow_mode_keeps_candidate_unchanged():
     assert result.to_trace()["mode"] == "shadow"
 
 
+def test_response_action_unknown_mode_keeps_candidate_unchanged():
+    result = apply_response_action(
+        ResponseActionInput(
+            mode="enabled",
+            candidate_text="hello",
+            response_review=_review(_finding("empty_response", "candidate_text_empty")),
+        )
+    )
+
+    assert result.candidate_text == "hello"
+    assert result.action_taken == "none"
+    assert result.diagnostic_only is True
+    assert result.to_trace()["mode"] == "enabled"
+
+
 def test_response_action_template_fallback_replaces_empty_response():
     result = apply_response_action(
         ResponseActionInput(

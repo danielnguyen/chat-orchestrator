@@ -68,7 +68,11 @@ def apply_response_action(action_input: ResponseActionInput) -> ResponseActionRe
         ]
     )
 
-    if action_input.mode == "shadow" or not actionable_findings or review.status != "concern":
+    if (
+        action_input.mode != "template_fallback"
+        or not actionable_findings
+        or review.status != "concern"
+    ):
         return ResponseActionResult(
             mode=action_input.mode,
             action_taken="none",
