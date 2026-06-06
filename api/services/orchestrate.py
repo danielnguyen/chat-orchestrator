@@ -15,6 +15,7 @@ from services.companion_presentation import build_companion_presentation
 from services.fallback import choose_fallback
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
+from services.response_review import ResponseReviewInput, review_response
 from services.response_shape import (
     build_response_shape_guidance_block,
     resolve_response_shape,
@@ -779,6 +780,15 @@ async def orchestrate_chat(
     model_latency_ms = int((perf_counter() - model_started) * 1000)
 
     raw_answer = completion["choices"][0]["message"]["content"]
+    response_review = review_response(
+        ResponseReviewInput(
+            candidate_text=raw_answer,
+            handoff=handoff,
+            presentation=presentation,
+            prompt_trace=prompt.trace,
+        )
+    )
+    prompt.trace["response_review"] = response_review.to_trace()
     answer = raw_answer
     brief_metadata = {"enabled": False}
     if effective_payload.get("response_mode") == "brief":
