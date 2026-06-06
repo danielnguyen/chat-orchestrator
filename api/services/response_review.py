@@ -46,9 +46,14 @@ _APOLOGY_PATTERNS = [
     "i am sorry",
     "sorry about that",
     "sorry for that",
-    "sorry",
     "i apologize",
+    "sorry",
 ]
+_APOLOGY_RE = re.compile(
+    r"\b(?:"
+    + "|".join(re.escape(pattern) for pattern in _APOLOGY_PATTERNS)
+    + r")\b"
+)
 _PSEUDO_ATTACHMENT_PATTERNS = [
     "you only need me",
     "only need me",
@@ -185,7 +190,7 @@ def _unsupported_memory_finding(
 
 def _apology_loop_finding(text: str) -> ResponseReviewFinding | None:
     lowered = (text or "").lower()
-    matches = sum(lowered.count(pattern) for pattern in _APOLOGY_PATTERNS)
+    matches = len(list(_APOLOGY_RE.finditer(lowered)))
     if matches < 2:
         return None
     severity: ResponseReviewSeverity = "notice"

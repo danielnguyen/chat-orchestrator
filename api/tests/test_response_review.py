@@ -109,12 +109,26 @@ def test_review_response_does_not_flag_useful_disagreement():
     assert review.status == "clear"
 
 
+def test_review_response_single_apology_phrase_does_not_trigger_loop():
+    review = review_response(_make_review_input("Sorry about that."))
+
+    assert all(finding.type != "apology_loop" for finding in review.findings)
+    assert review.status == "clear"
+
+
 def test_review_response_flags_repeated_apology_language():
     review = review_response(
         _make_review_input("I'm sorry. Sorry about that. I apologize for the confusion.")
     )
 
-    assert review.status in {"notice", "concern"}
+    assert review.status == "concern"
+    assert any(finding.type == "apology_loop" for finding in review.findings)
+
+
+def test_review_response_two_distinct_apologies_produce_notice():
+    review = review_response(_make_review_input("I'm sorry. I apologize for the delay."))
+
+    assert review.status == "notice"
     assert any(finding.type == "apology_loop" for finding in review.findings)
 
 
