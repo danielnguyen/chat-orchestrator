@@ -1,4 +1,5 @@
 from services.assistant_handoff import build_assistant_handoff
+from services.companion_presentation import build_companion_presentation
 from services.prompt_assembly import assemble_prompt
 
 
@@ -43,6 +44,10 @@ def _build_handoff(**overrides):
     )
     base.update(overrides)
     return build_assistant_handoff(**base)
+
+
+def _build_presentation(**overrides):
+    return build_companion_presentation(_build_handoff(**overrides))
 
 
 def test_assemble_prompt_preserves_existing_layer_order_and_wording():
@@ -653,3 +658,100 @@ def test_assemble_prompt_adds_summary_only_handoff_trace_in_parallel():
             "repo_name": "repo",
         }
     ]
+
+
+def test_assemble_prompt_accepts_presentation_adapter_and_adds_summary_trace():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        presentation=_build_presentation(
+            companion_overlays=[
+                {
+                    "overlay_id": "contract-1",
+                    "overlay_type": "interaction_contract",
+                    "role": "system",
+                    "content": "contract text",
+                }
+            ],
+            companion_trace={
+                "attempted": True,
+                "status": "included",
+                "included": True,
+                "scene_id": "planning",
+                "profile_id": "default_companion_profile",
+                "contract_id": "default_interaction_contract",
+            },
+            runtime_overlay={
+                "overlay_id": "runtime-1",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": "Runtime context",
+            },
+            runtime_trace={
+                "attempted": True,
+                "status": "included",
+                "included": True,
+                "runtime_state_id": "rtstate_1",
+            },
+            retrieval_bundle={
+                "bundle": {
+                    "recent": [],
+                    "semantic": [
+                        {
+                            "message_id": "m-1",
+                            "created_at": "2026-01-01T00:00:00+00:00",
+                            "role": "assistant",
+                            "content": "semantic note",
+                        }
+                    ],
+                    "artifact_refs": [
+                        {
+                            "artifact_id": "a-1",
+                            "repo_name": "repo",
+                            "file_path": "api/main.py",
+                            "snippet": "def entrypoint(): pass",
+                        }
+                    ],
+                    "observed_metadata": {"has_code_like_content": False},
+                }
+            },
+        ),
+        companion_trace={"attempted": True, "status": "included", "included": True},
+        runtime_trace={"attempted": True, "status": "included", "included": True},
+    )
+
+    assert [msg["content"] for msg in out.messages[:3]] == [
+        "profile text",
+        "contract text",
+        "Runtime context",
+    ]
+    assert out.trace["included_layers"] == [
+        "profile_overlay",
+        "companion_policy",
+        "runtime_overlay",
+        "current_messages",
+    ]
+    assert out.trace["presentation"]["companion"]["overlay_refs"] == [
+        {"overlay_id": "contract-1", "overlay_type": "interaction_contract"}
+    ]
+    assert out.trace["presentation"]["runtime"]["overlay_ref"] == {
+        "overlay_id": "runtime-1",
+        "overlay_type": "runtime_state",
+    }
+    assert out.trace["presentation"]["retrieval"]["semantic_refs"] == [
+        {
+            "message_id": "m-1",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "role": "assistant",
+        }
+    ]
+    assert out.trace["presentation"]["retrieval"]["artifact_refs"] == [
+        {
+            "artifact_id": "a-1",
+            "file_path": "api/main.py",
+            "repo_name": "repo",
+        }
+    ]
+    assert out.trace["presentation"]["companion"].get("content") is None
+    assert out.trace["presentation"]["runtime"].get("content") is None

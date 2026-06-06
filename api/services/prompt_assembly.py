@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from services.assistant_handoff import AssistantHandoff
+from services.companion_presentation import CompanionPresentation
 
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 
@@ -100,6 +101,7 @@ def assemble_prompt(
     retrieval_bundle: dict[str, Any],
     current_messages: list[dict[str, str]],
     handoff: AssistantHandoff | None = None,
+    presentation: CompanionPresentation | None = None,
     style_guidance: str | None = None,
     style_trace: dict[str, Any] | None = None,
     response_shape_guidance: str | None = None,
@@ -163,12 +165,22 @@ def assemble_prompt(
         )
     )
 
+    presentation_input = presentation.prompt_input if presentation is not None else None
+    companion_overlays_in = (
+        presentation_input.companion_overlays
+        if presentation_input is not None
+        else companion_overlays
+    )
+    runtime_overlay_in = (
+        presentation_input.runtime_overlay if presentation_input is not None else runtime_overlay
+    )
+
     companion_messages: list[dict[str, str]] = []
     companion_trace_out = dict(companion_trace or {})
     companion_omission_reason = companion_trace_out.get("omission_reason")
     companion_overlay_metadata: list[dict[str, Any]] = []
     invalid_companion_roles: list[str | None] = []
-    for overlay in companion_overlays or []:
+    for overlay in companion_overlays_in or []:
         if not isinstance(overlay, dict):
             invalid_companion_roles.append(None)
             continue
@@ -196,7 +208,7 @@ def assemble_prompt(
         if invalid_companion_roles:
             companion_trace_out["omitted_overlay_types"] = invalid_companion_roles
             companion_trace_out["omission_reason"] = "invalid_companion_overlay_role"
-    elif companion_overlays and invalid_companion_roles:
+    elif companion_overlays_in and invalid_companion_roles:
         companion_omission_reason = "invalid_companion_overlay_role"
         companion_trace_out.update(
             {
@@ -209,8 +221,8 @@ def assemble_prompt(
         )
 
     runtime_overlay_ids = []
-    if runtime_overlay and runtime_overlay.get("overlay_id"):
-        runtime_overlay_ids.append(runtime_overlay["overlay_id"])
+    if runtime_overlay_in and runtime_overlay_in.get("overlay_id"):
+        runtime_overlay_ids.append(runtime_overlay_in["overlay_id"])
 
     companion_trace_out.setdefault("companion_profile_id", companion_trace_out.get("profile_id"))
     companion_trace_out.setdefault(
@@ -283,10 +295,10 @@ def assemble_prompt(
     runtime_messages: list[dict[str, str]] = []
     runtime_trace_out = dict(runtime_trace or {})
     runtime_omission_reason = runtime_trace_out.get("omission_reason")
-    if runtime_overlay and runtime_overlay.get("content"):
-        role = runtime_overlay.get("role", "system")
+    if runtime_overlay_in and runtime_overlay_in.get("content"):
+        role = runtime_overlay_in.get("role", "system")
         if role == "system":
-            runtime_messages.append({"role": "system", "content": runtime_overlay["content"]})
+            runtime_messages.append({"role": "system", "content": runtime_overlay_in["content"]})
             messages.extend(runtime_messages)
         else:
             runtime_omission_reason = "invalid_runtime_overlay_role"
@@ -302,13 +314,17 @@ def assemble_prompt(
             "runtime_overlay",
             runtime_messages,
             metadata={
-                "runtime_state_id": runtime_overlay.get("runtime_state_id")
-                if runtime_overlay
+                "runtime_state_id": runtime_overlay_in.get("runtime_state_id")
+                if runtime_overlay_in
                 else None,
-                "overlay_id": runtime_overlay.get("overlay_id") if runtime_overlay else None,
-                "overlay_type": runtime_overlay.get("overlay_type") if runtime_overlay else None,
-                "source_fields": runtime_overlay.get("source_fields", [])
-                if runtime_overlay
+                "overlay_id": runtime_overlay_in.get("overlay_id") if runtime_overlay_in else None,
+                "overlay_type": (
+                    runtime_overlay_in.get("overlay_type")
+                    if runtime_overlay_in
+                    else None
+                ),
+                "source_fields": runtime_overlay_in.get("source_fields", [])
+                if runtime_overlay_in
                 else [],
                 "omission_reason": runtime_omission_reason,
             },
@@ -338,6 +354,7 @@ def assemble_prompt(
         "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
         "truncation": {"applied": False, "reason": None},
         "handoff": handoff.trace_summary() if handoff is not None else None,
+        "presentation": presentation.trace_summary() if presentation is not None else None,
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
         "response_shape": response_shape_trace_out
         or {"attempted": False, "status": "not_requested"},
