@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from services.assistant_handoff import AssistantHandoff
+
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 
@@ -97,6 +99,7 @@ def assemble_prompt(
     profile: dict[str, Any],
     retrieval_bundle: dict[str, Any],
     current_messages: list[dict[str, str]],
+    handoff: AssistantHandoff | None = None,
     style_guidance: str | None = None,
     style_trace: dict[str, Any] | None = None,
     response_shape_guidance: str | None = None,
@@ -334,6 +337,7 @@ def assemble_prompt(
         "included_layers": [layer["name"] for layer in layers if layer["included"]],
         "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
         "truncation": {"applied": False, "reason": None},
+        "handoff": handoff.trace_summary() if handoff is not None else None,
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
         "response_shape": response_shape_trace_out
         or {"attempted": False, "status": "not_requested"},

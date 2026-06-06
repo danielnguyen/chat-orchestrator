@@ -1,7 +1,21 @@
 import pytest
 from services.orchestrate import orchestrate_chat
 
-BANNED_TRACE_TOKENS = ["R26", "R27", "Cluster11", "11C", "11D"]
+BANNED_TRACE_TOKENS = [
+    "R26",
+    "R27",
+    "R29",
+    "R30",
+    "Cluster11",
+    "Cluster12",
+    "11C",
+    "11D",
+    "12A",
+    "12B",
+    "phase",
+    "milestone",
+    "spec",
+]
 
 
 def _collect_keys(value):
@@ -271,6 +285,16 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "status": "disabled",
         "included": False,
     }
+    handoff = trace_payload["retrieval"]["prompt_assembly"]["handoff"]
+    assert handoff["request"]["request_id"] == "rid-test-1"
+    assert handoff["routing"]["selected_model"] == "gpt-4o-mini"
+    assert handoff["routing"]["selected_provider"] == "cloud"
+    assert handoff["retrieval"]["semantic_count"] == 1
+    assert handoff["retrieval"]["artifact_ref_count"] == 1
+    assert handoff["runtime"]["status"] == "disabled"
+    assert handoff["companion"]["status"] == "disabled"
+    assert "snippet" not in str(handoff)
+    assert "prior history" not in str(handoff)
     assert trace_payload["retrieval"]["prompt_assembly"]["truncation"] == {
         "applied": False,
         "reason": None,
@@ -827,6 +851,13 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     ]
     assert prompt_trace["runtime"]["status"] == "included"
     assert prompt_trace["runtime"]["overlay_id"] == "rtoverlay_1"
+    handoff = prompt_trace["handoff"]
+    assert handoff["runtime"]["status"] == "included"
+    assert handoff["runtime"]["overlay_ref"] == {
+        "overlay_id": "rtoverlay_1",
+        "overlay_type": "runtime_state",
+    }
+    assert handoff["companion"]["status"] == "disabled"
 
 
 @pytest.mark.asyncio
@@ -1289,6 +1320,11 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
     ]
     assert companion_trace["companion_overlay_ids"] == ["contract-1", "profile-1", "scene-1"]
     assert companion_trace["runtime_overlay_ids"] == []
+    handoff = prompt_trace["handoff"]
+    assert handoff["companion"]["status"] == "included"
+    assert handoff["companion"]["overlay_ids"] == ["contract-1", "profile-1", "scene-1"]
+    assert handoff["runtime"]["status"] == "disabled"
+    assert handoff["routing"]["selected_model"] == "gpt-4o-mini"
     assert companion_trace["cognitive_runtime_compile_status"] == "included"
     assert companion_trace["cognitive_runtime_compile_error"] is None
     assert (
@@ -1952,3 +1988,37 @@ async def test_orchestrate_response_shape_trace_keys_do_not_use_banned_identifie
     assert keys
     for token in BANNED_TRACE_TOKENS:
         assert all(token not in key for key in keys)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_live_chat_flow_only_uses_existing_runtime_calls_for_handoff(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        runtime=runtime,
+        companion_policy_enabled=True,
+        enable_runtime_overlays=True,
+        interrupt_policy_mode="off",
+        request_id="rid-handoff-live-flow",
+    )
+
+    assert len(runtime.companion_calls) == 1
+    assert len(runtime.calls) == 1
+    assert runtime.interrupt_calls == []
+    assert len(runtime.reset_calls) == 0
+    handoff = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["handoff"]
+    assert handoff["warnings"]["interrupt_status"] is None

@@ -9,6 +9,7 @@ import yaml
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
+from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.fallback import choose_fallback
 from services.profile_apply import apply_profile_to_request
@@ -670,10 +671,35 @@ async def orchestrate_chat(
     fallback_used = False
     model_error = None
 
+    handoff = build_assistant_handoff(
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
+        route=route,
+        selected_model=selected_model,
+        selected_provider=selected_provider,
+        effective_local_only=local_only,
+        manual_override_requested=override_requested,
+        manual_override_applied=bool(override),
+        manual_override_rejection_reason=override_reason,
+        style_trace=style_trace,
+        response_shape_trace=response_shape_trace,
+        surface_presence_trace=surface_presence_trace,
+        companion_overlays=companion_overlays,
+        companion_trace=companion_trace,
+        runtime_overlay=runtime_overlay,
+        runtime_trace=runtime_trace,
+        retrieval_query=last_user_text,
+        retrieval_bundle=retrieval_bundle,
+        interrupt_trace=interrupt_trace,
+    )
+
     prompt = assemble_prompt(
         profile=profile,
         retrieval_bundle=retrieval_bundle,
         current_messages=effective_payload["messages"],
+        handoff=handoff,
         style_guidance=style_guidance,
         style_trace=style_trace,
         response_shape_guidance=response_shape_guidance,
