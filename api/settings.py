@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -37,6 +38,10 @@ class Settings(BaseSettings):
 
     allow_manual_override: bool = Field(default=True, alias="ALLOW_MANUAL_OVERRIDE")
     default_profile_name: str = Field(default="dev", alias="DEFAULT_PROFILE_NAME")
+    response_action_mode: Literal["shadow", "template_fallback"] = Field(
+        default="shadow",
+        alias="RESPONSE_ACTION_MODE",
+    )
 
     offline_provider: str = Field(default="litellm-local", alias="OFFLINE_PROVIDER")
     ollama_base_url: str | None = Field(default=None, alias="OLLAMA_BASE_URL")
