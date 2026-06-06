@@ -285,6 +285,14 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "status": "disabled",
         "included": False,
     }
+    presentation = trace_payload["retrieval"]["prompt_assembly"]["presentation"]
+    assert presentation["routing"]["selected_model"] == "gpt-4o-mini"
+    assert presentation["companion"]["status"] == "disabled"
+    assert presentation["runtime"]["status"] == "disabled"
+    assert presentation["retrieval"]["semantic_count"] == 1
+    assert presentation["retrieval"]["artifact_ref_count"] == 1
+    assert "snippet" not in str(presentation)
+    assert "prior history" not in str(presentation)
     handoff = trace_payload["retrieval"]["prompt_assembly"]["handoff"]
     assert handoff["request"]["request_id"] == "rid-test-1"
     assert handoff["routing"]["selected_model"] == "gpt-4o-mini"
@@ -851,6 +859,13 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     ]
     assert prompt_trace["runtime"]["status"] == "included"
     assert prompt_trace["runtime"]["overlay_id"] == "rtoverlay_1"
+    presentation = prompt_trace["presentation"]
+    assert presentation["runtime"]["status"] == "included"
+    assert presentation["runtime"]["overlay_ref"] == {
+        "overlay_id": "rtoverlay_1",
+        "overlay_type": "runtime_state",
+    }
+    assert presentation["companion"]["status"] == "disabled"
     handoff = prompt_trace["handoff"]
     assert handoff["runtime"]["status"] == "included"
     assert handoff["runtime"]["overlay_ref"] == {
@@ -1320,6 +1335,11 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
     ]
     assert companion_trace["companion_overlay_ids"] == ["contract-1", "profile-1", "scene-1"]
     assert companion_trace["runtime_overlay_ids"] == []
+    presentation = prompt_trace["presentation"]
+    assert presentation["companion"]["status"] == "included"
+    assert presentation["companion"]["overlay_ids"] == ["contract-1", "profile-1", "scene-1"]
+    assert presentation["runtime"]["status"] == "disabled"
+    assert presentation["routing"]["selected_model"] == "gpt-4o-mini"
     handoff = prompt_trace["handoff"]
     assert handoff["companion"]["status"] == "included"
     assert handoff["companion"]["overlay_ids"] == ["contract-1", "profile-1", "scene-1"]
@@ -2020,5 +2040,8 @@ async def test_orchestrate_live_chat_flow_only_uses_existing_runtime_calls_for_h
     assert len(runtime.calls) == 1
     assert runtime.interrupt_calls == []
     assert len(runtime.reset_calls) == 0
-    handoff = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["handoff"]
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    presentation = prompt_trace["presentation"]
+    assert presentation["warnings"]["companion_warning_count"] == 0
+    handoff = prompt_trace["handoff"]
     assert handoff["warnings"]["interrupt_status"] is None

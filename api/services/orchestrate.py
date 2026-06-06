@@ -11,6 +11,7 @@ from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
 from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
+from services.companion_presentation import build_companion_presentation
 from services.fallback import choose_fallback
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
@@ -695,11 +696,14 @@ async def orchestrate_chat(
         interrupt_trace=interrupt_trace,
     )
 
+    presentation = build_companion_presentation(handoff)
+
     prompt = assemble_prompt(
         profile=profile,
         retrieval_bundle=retrieval_bundle,
         current_messages=effective_payload["messages"],
         handoff=handoff,
+        presentation=presentation,
         style_guidance=style_guidance,
         style_trace=style_trace,
         response_shape_guidance=response_shape_guidance,
