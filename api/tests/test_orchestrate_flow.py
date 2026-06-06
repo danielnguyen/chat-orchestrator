@@ -2081,6 +2081,62 @@ async def test_orchestrate_response_review_trace_can_record_concern_without_chan
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_shadow_mode_keeps_answer_unchanged_without_extra_runtime_calls(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = NoSupportMemoryStore()
+    runtime = FakeRuntime()
+    litellm = FakeLiteLLM(
+        content="I remember from our last conversation that your deploy failed yesterday."
+    )
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "what happened?"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        enable_runtime_overlays=False,
+        interrupt_policy_mode="off",
+        request_id="rid-shadow-default",
+    )
+
+    assert out["answer"] == litellm.content
+    assert memory_store.added_messages[-1]["content"] == litellm.content
+    assert len(litellm.calls) == 1
+    assert len(runtime.companion_calls) == 1
+    assert runtime.calls == []
+    assert runtime.interrupt_calls == []
+    assert runtime.reset_calls == []
+
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_review"]["findings"][0]["type"] == "unsupported_memory_claim"
+    assert prompt_trace["response_action"] == {
+        "mode": "shadow",
+        "action_taken": "none",
+        "action_reason_codes": [],
+        "action_source": "response_review",
+        "affected_finding_types": [],
+        "diagnostic_only": True,
+        "original_review_status": "concern",
+    }
+    assert prompt_trace["companion_policy"]["cognitive_runtime_compile_endpoint"] == (
+        "/v1/companion/profile/compile"
+    )
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_template_fallback_replaces_empty_response_and_persists_final_answer(
     tmp_path,
 ):

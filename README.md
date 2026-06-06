@@ -102,3 +102,13 @@ Prompt assembly is explicit but behavior-preserving. The orchestrator assembles:
 Trace metadata records included/omitted prompt layers, retrieval snippet refs, and truncation status. Current behavior applies no additional truncation in the orchestrator layer.
 
 Local/offline routing precedence is additive and traceable: request `sensitivity=local_only`, profile `routing_policy.local_only`, compatible manual override, router rule selection, profile cost/latency policy, then provider fallback. Local-only constraints continue to apply to fallback models.
+
+## Cluster 12 closeout boundaries
+
+- `cognitive-runtime` owns companion contracts and diagnostic surfaces.
+- `chat-orchestrator` consumes compiled companion policy overlays and does not own companion contract definition.
+- `AssistantHandoff` captures orchestration output as refs, counts, statuses, and warning summaries.
+- `CompanionPresentation` prepares prompt-facing presentation input from the handoff summary.
+- `response_review` is a deterministic shadow review over model output and trace context.
+- `response_action` remains opt-in `template_fallback` only; default behavior stays `shadow`.
+- `basic-memory-store` remains outside companion/runtime contract ownership and continues to provide conversation, retrieval, and trace persistence only.
