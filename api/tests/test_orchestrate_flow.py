@@ -342,6 +342,16 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "action_taken": "none",
         "reviewed_text_source": "raw_model_output",
     }
+    response_action = trace_payload["retrieval"]["prompt_assembly"]["response_action"]
+    assert response_action == {
+        "mode": "shadow",
+        "action_taken": "none",
+        "action_reason_codes": [],
+        "action_source": "response_review",
+        "affected_finding_types": [],
+        "diagnostic_only": True,
+        "original_review_status": "clear",
+    }
     assert trace_payload["router_decision"]["routing_contract"]["selected_model"] == "gpt-4o-mini"
 
 
@@ -1609,6 +1619,9 @@ async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_ans
     response_review = trace_payload["retrieval"]["prompt_assembly"]["response_review"]
     assert response_review["reviewed_text_source"] == "raw_model_output"
     assert response_review["action_taken"] == "none"
+    response_action = trace_payload["retrieval"]["prompt_assembly"]["response_action"]
+    assert response_action["mode"] == "shadow"
+    assert response_action["action_taken"] == "none"
 
 
 @pytest.mark.asyncio
@@ -2059,6 +2072,197 @@ async def test_orchestrate_response_review_trace_can_record_concern_without_chan
     assert response_review["action_taken"] == "none"
     assert response_review["reviewed_text_source"] == "raw_model_output"
     assert response_review["findings"][0]["type"] == "unsupported_memory_claim"
+    response_action = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "response_action"
+    ]
+    assert response_action["mode"] == "shadow"
+    assert response_action["action_taken"] == "none"
+    assert response_action["diagnostic_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_template_fallback_replaces_empty_response_and_persists_final_answer(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="")
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        response_action_mode="template_fallback",
+        request_id="rid-action-empty",
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"] == "I couldn’t produce a useful answer there."
+    assert memory_store.added_messages[-1]["content"] == out["answer"]
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_review"]["action_taken"] == "none"
+    assert prompt_trace["response_action"]["mode"] == "template_fallback"
+    assert prompt_trace["response_action"]["action_taken"] == "template_fallback"
+    assert prompt_trace["response_action"]["affected_finding_types"] == ["empty_response"]
+    assert prompt_trace["response_action"]["diagnostic_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_template_fallback_replaces_dependency_or_pressure_language(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="You only need me for this. Don't let me down.")
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "help"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        response_action_mode="template_fallback",
+        request_id="rid-action-pressure",
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"] == (
+        "I can help with the task, but I should not pressure you or create dependency. "
+        "Let’s keep this grounded."
+    )
+    assert memory_store.added_messages[-1]["content"] == out["answer"]
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_action"]["affected_finding_types"] == [
+        "pseudo_attachment",
+        "pressure_language",
+    ]
+    assert "You only need me for this" not in str(prompt_trace["response_action"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_template_fallback_does_not_act_on_unsupported_memory_claim(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = NoSupportMemoryStore()
+    litellm = FakeLiteLLM(
+        content="I remember from our last conversation that your deploy failed yesterday."
+    )
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "what happened?"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        response_action_mode="template_fallback",
+        request_id="rid-action-memory",
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"] == litellm.content
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_action"]["action_taken"] == "none"
+    assert prompt_trace["response_action"]["diagnostic_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_brief_mode_shapes_replacement_only_when_action_occurs(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="")
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "telegram",
+            "messages": [{"role": "user", "content": "brief this"}],
+            "sensitivity": "private",
+            "model_override": None,
+            "response_mode": "brief",
+            "brief_depth": 1,
+            "brief_type": "general",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        response_action_mode="template_fallback",
+        request_id="rid-action-brief",
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"].startswith("Net: I couldn’t produce a useful answer there.")
+    assert memory_store.added_messages[-1]["content"] == out["answer"]
+    brief = memory_store.trace_calls[0]["payload"]["model_call"]["brief"]
+    assert brief["enabled"] is True
+    assert brief["raw_model_answer"] == ""
+    assert brief["shaped_answer"] == out["answer"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_response_action_trace_keys_do_not_use_banned_runtime_terms(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="You only need me for this.")
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "car",
+            "surface": "car",
+            "surface_context": {
+                "surface_type": "car",
+                "spoken_output": True,
+                "active_task_mode": True,
+                "allows_expansion": True,
+                "latency_preference": "low",
+                "verbosity_target": "short",
+            },
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        response_action_mode="template_fallback",
+        request_id="rid-action-banned-keys",
+    )
+
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    keys = _collect_keys(prompt_trace["response_action"])
+    assert keys
+    for token in BANNED_RUNTIME_KEY_TOKENS:
+        assert all(token not in key for key in keys)
 
 
 @pytest.mark.asyncio

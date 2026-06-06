@@ -15,6 +15,7 @@ from services.companion_presentation import build_companion_presentation
 from services.fallback import choose_fallback
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
+from services.response_action import ResponseActionInput, apply_response_action
 from services.response_review import ResponseReviewInput, review_response
 from services.response_shape import (
     build_response_shape_guidance_block,
@@ -515,6 +516,7 @@ async def orchestrate_chat(
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
+    response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
 ) -> dict[str, Any]:
     started = perf_counter()
@@ -788,12 +790,21 @@ async def orchestrate_chat(
             prompt_trace=prompt.trace,
         )
     )
+    response_action = apply_response_action(
+        ResponseActionInput(
+            mode=response_action_mode,
+            candidate_text=raw_answer,
+            response_review=response_review,
+        )
+    )
     prompt.trace["response_review"] = response_review.to_trace()
-    answer = raw_answer
+    prompt.trace["response_action"] = response_action.to_trace()
+    candidate_answer = response_action.candidate_text
+    answer = candidate_answer
     brief_metadata = {"enabled": False}
     if effective_payload.get("response_mode") == "brief":
         brief_result = generate_brief(
-            content=raw_answer,
+            content=candidate_answer,
             brief_type=effective_payload.get("brief_type", "general"),
             depth_level=effective_payload.get("brief_depth") or 1,
             surface=effective_payload.get("surface", payload.get("surface", "chat")),
