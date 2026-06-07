@@ -286,6 +286,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         for msg in litellm.calls[0]["messages"]
     )
     assert memory_store.trace_calls[0]["request_id"] == "rid-test-1"
+    assert len(memory_store.retrieve_calls) == 1
     trace_payload = memory_store.trace_calls[0]["payload"]
     assert trace_payload["retrieval"]["prompt_assembly"]["included_layers"] == [
         "retrieval_augmentation",
@@ -885,6 +886,7 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     )
 
     assert runtime.calls[0]["surface"] == "dev"
+    assert len(runtime.calls) == 1
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
     assert contents[0] == (
         "Runtime context: scene=planning; interaction_mode=actionable; "
@@ -898,6 +900,20 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "recent_history",
         "current_messages",
     ]
+    assert prompt_trace["runtime"] == {
+        "attempted": True,
+        "runtime_state_id": "rtstate_1",
+        "reset_after_turn": False,
+        "status": "included",
+        "included": True,
+        "overlay_id": "rtoverlay_1",
+        "overlay_type": "runtime_state",
+        "source_fields": [
+            "active_scene",
+            "interaction_mode",
+            "temporary_constraints",
+        ],
+    }
     assert prompt_trace["runtime"]["status"] == "included"
     assert prompt_trace["runtime"]["overlay_id"] == "rtoverlay_1"
     presentation = prompt_trace["presentation"]
@@ -1412,6 +1428,11 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
     models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
     memory_store = FakeMemoryStore()
 
+    runtime = FakeRuntime(
+        companion_error=RuntimeError("sqlite3.OperationalError: unable to open database file"),
+        companion_endpoint="/v1/companion/profile/compile",
+    )
+
     out = await orchestrate_chat(
         payload={
             "owner_id": "owner",
@@ -1423,7 +1444,7 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
         },
         memory_store=memory_store,
         litellm=FakeLiteLLM(),
-        runtime=FakeRuntime(fail=True),
+        runtime=runtime,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -1432,6 +1453,9 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
     )
 
     assert out["status"] == "ok"
+    assert out["answer"] == "hello"
+    assert "unable to open database file" not in out["answer"]
+    assert len(runtime.companion_calls) == 1
     companion_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "companion_policy"
     ]
@@ -1439,10 +1463,16 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
     assert companion_trace["error_type"] == "RuntimeError"
     assert companion_trace["omission_reason"] == "companion_policy_unavailable"
     assert companion_trace["cognitive_runtime_compile_status"] == "failed"
-    assert companion_trace["cognitive_runtime_compile_error"] == "runtime unavailable"
+    assert companion_trace["cognitive_runtime_compile_error"] == (
+        "sqlite3.OperationalError: unable to open database file"
+    )
     assert companion_trace["cognitive_runtime_compile_endpoint"] == (
         "/v1/companion/profile/compile"
     )
+    assert memory_store.trace_calls[0]["payload"]["fallback"] == {
+        "triggered": False,
+        "reason": None,
+    }
 
 @pytest.mark.asyncio
 async def test_orchestrate_companion_runtime_400_failure_does_not_trigger_alias_semantics(tmp_path):
