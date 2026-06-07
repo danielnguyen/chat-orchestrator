@@ -6,6 +6,14 @@ Canonical runtime orchestration API for routing + profiles + observability.
 
 - `POST /v1/chat`
 
+## Request flow
+
+Normal request flow:
+
+`surface/client -> chat-orchestrator POST /v1/chat -> basic-memory-store/cognitive-runtime/LiteLLM as downstream services`
+
+`basic-memory-store` remains the durable memory, retrieval, and trace substrate. It is not the normal chat entrypoint.
+
 ## Responsibilities
 
 - Resolve/create conversation in `basic-memory-store`
@@ -77,6 +85,13 @@ The smoke flow:
 - asserts JSON and `request_id` are present
 - allows either successful response or valid failure JSON
 - on success, verifies trace visibility via `basic-memory-store` `GET /v1/traces/{request_id}`
+- keeps normal chat ownership on `chat-orchestrator` while treating `basic-memory-store`, `cognitive-runtime`, and LiteLLM as downstream services
+
+Operator checks when runtime behavior looks wrong:
+- confirm `basic-memory-store` is reachable for conversation, retrieval, and trace writes
+- confirm `cognitive-runtime` companion compile failures stay traceable and non-fatal to normal chat
+- confirm user-facing answers do not include raw runtime exception text
+- confirm `POST /v1/runtime/overlay` is reachable when runtime overlays are enabled
 
 ## File-backed retrieval behavior
 
