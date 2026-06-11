@@ -91,12 +91,19 @@ async def _resolve_external_context(
     dsa: DataSourceAggregatorClient | None,
     dsa_enabled: bool,
     external_context_enabled: bool,
+    external_calls_allowed: bool,
     query: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not dsa_enabled:
         return None, _dsa_disabled_trace(False)
     if not external_context_enabled:
         return None, _dsa_disabled_trace(True)
+    if not external_calls_allowed:
+        return None, {
+            "enabled": True,
+            "called": False,
+            "status": "skipped_local_only",
+        }
     if dsa is None:
         return None, {
             "enabled": True,
@@ -655,10 +662,18 @@ async def orchestrate_chat(
     )
     surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
     last_user_text = _extract_last_user_text(payload["messages"])
+    routing_policy = profile.get("routing_policy", {}) or {}
+    sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
+    profile_local_only = bool(routing_policy.get("local_only", False))
+    local_only = sensitivity_local_only or profile_local_only
+    cost_mode = routing_policy.get("cost_mode")
+    latency_mode = routing_policy.get("latency_mode")
+
     external_context_pack, dsa_trace = await _resolve_external_context(
         dsa=dsa,
         dsa_enabled=dsa_enabled,
         external_context_enabled=bool(effective_payload.get("external_context_enabled", False)),
+        external_calls_allowed=not local_only,
         query=last_user_text,
     )
     retrieval_bundle = await memory_store.retrieve_bundle(
@@ -698,12 +713,6 @@ async def orchestrate_chat(
     )
     signals = _compute_signals(effective_payload, retrieval_bundle)
     registry = _load_model_registry(model_registry_path)
-    routing_policy = profile.get("routing_policy", {}) or {}
-    sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
-    profile_local_only = bool(routing_policy.get("local_only", False))
-    local_only = sensitivity_local_only or profile_local_only
-    cost_mode = routing_policy.get("cost_mode")
-    latency_mode = routing_policy.get("latency_mode")
 
     override_requested = effective_payload.get("model_override")
     override = override_requested if allow_manual_override else None

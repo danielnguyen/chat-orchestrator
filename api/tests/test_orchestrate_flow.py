@@ -2633,3 +2633,127 @@ async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_cont
         "status": "error",
         "error_code": "timeout",
     }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_local_fast:\n"
+        "    provider: local\n"
+        "    avg_latency_bucket: fast\n"
+        "    cost_per_1k_tokens: 0\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
+            "external_context_enabled": True,
+            "sensitivity": "local_only",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-request-local-only",
+    )
+
+    assert out["status"] == "ok"
+    assert dsa.calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "enabled": True,
+        "called": False,
+        "status": "skipped_local_only",
+    }
+    assert trace["retrieval"]["prompt_assembly"]["dsa"] == trace["dsa"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_local_fast:\n"
+        "    provider: local\n"
+        "    avg_latency_bucket: fast\n"
+        "    cost_per_1k_tokens: 0\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+
+    class LocalOnlyMemoryStore(FakeMemoryStore):
+        async def resolve_profile(self, **kwargs):
+            profile = await super().resolve_profile(**kwargs)
+            profile["routing_policy"] = {"local_only": True}
+            return profile
+
+    memory_store = LocalOnlyMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "What is on my calendar?"}],
+            "external_context_enabled": True,
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-profile-local-only",
+    )
+
+    assert out["status"] == "ok"
+    assert dsa.calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "enabled": True,
+        "called": False,
+        "status": "skipped_local_only",
+    }
