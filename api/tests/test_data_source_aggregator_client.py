@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import httpx
 from clients.data_source_aggregator import DataSourceAggregatorClient
 
 
@@ -35,3 +36,43 @@ async def test_context_pack_posts_expected_payload():
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_client_includes_api_key_header_when_configured(monkeypatch):
+    client = DataSourceAggregatorClient(
+        "http://dsa.local",
+        timeout_ms=5000,
+        api_key="dsa-secret",
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_post(self, url, *, json=None, headers=None, **kwargs):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return httpx.Response(200, json={"items": []}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    response = await client.context_pack(query="battery replacement")
+
+    assert response == {"items": []}
+    assert captured["url"] == "http://dsa.local/v1/context-pack"
+    assert captured["headers"] == {"X-API-Key": "dsa-secret"}
+
+
+@pytest.mark.asyncio
+async def test_client_omits_api_key_header_when_not_configured(monkeypatch):
+    client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=5000)
+    captured: dict[str, object] = {}
+
+    async def fake_post(self, url, *, json=None, headers=None, **kwargs):
+        captured["headers"] = headers
+        return httpx.Response(200, json={"items": []}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    await client.context_pack(query="battery replacement")
+
+    assert captured["headers"] is None

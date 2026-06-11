@@ -45,7 +45,8 @@ LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_API_KEY=
 DSA_ENABLED=false
 DSA_BASE_URL=http://localhost:5174
-DSA_TIMEOUT_MS=1500
+DSA_TIMEOUT_MS=5000
+DSA_API_KEY=
 ROUTER_RULES_PATH=router/rules.yaml
 MODEL_REGISTRY_PATH=router/model_registry.yaml
 ALLOW_MANUAL_OVERRIDE=true
@@ -114,15 +115,17 @@ The Data Source Aggregator integration is optional and disabled by default.
 
 - `DSA_ENABLED=false` keeps existing behavior unchanged.
 - `DSA_BASE_URL` is the base URL for the Data Source Aggregator service.
-- `DSA_TIMEOUT_MS` is the request timeout for Data Source Aggregator calls.
+- `DSA_TIMEOUT_MS=5000` is the recommended request timeout for Data Source Aggregator calls. `1500` can be too short when DSA fans out across multiple sources.
+- `DSA_API_KEY` is optional for local development. When set, the orchestrator sends `X-API-Key: <DSA_API_KEY>` on DSA requests.
 - The current integration uses `POST /v1/context-pack`.
 - This path is read-only evidence retrieval; memory writes remain separate and continue to belong to `basic-memory-store`.
 - The request must opt in with `external_context_enabled=true` on `POST /v1/chat`.
+- The DSA API key is not included in orchestrator traces.
 
 Manual smoke note:
 
 1. Start Data Source Aggregator locally on port `5174` with vehicle/calendar configs.
-2. Start `chat-orchestrator` with `DSA_ENABLED=true` and `DSA_BASE_URL=http://localhost:5174`.
+2. Start `chat-orchestrator` with `DSA_ENABLED=true`, `DSA_BASE_URL=http://localhost:5174`, and `DSA_API_KEY` if DSA auth is enabled.
 3. Send a chat request with `external_context_enabled=true` and ask a vehicle or calendar question.
 4. Confirm the response can use source-backed context and still succeeds if DSA is stopped.
 

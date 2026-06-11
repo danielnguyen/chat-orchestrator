@@ -43,6 +43,7 @@ dsa = (
     DataSourceAggregatorClient(
         base_url=settings.dsa_base_url,
         timeout_ms=settings.dsa_timeout_ms,
+        api_key=settings.dsa_api_key,
     )
     if settings.dsa_enabled
     else None

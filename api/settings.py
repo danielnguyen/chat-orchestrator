@@ -27,8 +27,9 @@ class Settings(BaseSettings):
         alias="COGNITIVE_RUNTIME_COMPANION_ENABLED",
     )
     dsa_base_url: str = Field(default="http://localhost:5174", alias="DSA_BASE_URL")
-    dsa_timeout_ms: int = Field(default=1500, alias="DSA_TIMEOUT_MS", ge=100, le=30000)
+    dsa_timeout_ms: int = Field(default=5000, alias="DSA_TIMEOUT_MS", ge=100, le=30000)
     dsa_enabled: bool = Field(default=False, alias="DSA_ENABLED")
+    dsa_api_key: str | None = Field(default=None, alias="DSA_API_KEY")
 
     litellm_base_url: str = Field(..., alias="LITELLM_BASE_URL")
     litellm_api_key: str | None = Field(default=None, alias="LITELLM_API_KEY")
