@@ -58,6 +58,51 @@ def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     }
 
 
+def _normalize_external_context_config(
+    external_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(external_context, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+
+    source_ids = external_context.get("source_ids")
+    if isinstance(source_ids, list):
+        cleaned_source_ids = [item for item in source_ids if isinstance(item, str) and item]
+        if cleaned_source_ids:
+            normalized["source_ids"] = cleaned_source_ids
+
+    domain_tags = external_context.get("domain_tags")
+    if isinstance(domain_tags, list):
+        cleaned_domain_tags = [item for item in domain_tags if isinstance(item, str) and item]
+        if cleaned_domain_tags:
+            normalized["domain_tags"] = cleaned_domain_tags
+
+    if external_context.get("enabled") is not None:
+        normalized["enabled"] = bool(external_context.get("enabled"))
+
+    allowed_sensitivity = external_context.get("allowed_sensitivity")
+    if isinstance(allowed_sensitivity, str) and allowed_sensitivity:
+        normalized["allowed_sensitivity"] = allowed_sensitivity
+
+    max_results = external_context.get("max_results")
+    if isinstance(max_results, int):
+        normalized["max_results"] = max_results
+
+    return normalized
+
+
+def _build_dsa_budget(max_results: int | None) -> dict[str, int]:
+    budget = {
+        "max_results": 5,
+        "max_bytes": 50000,
+        "max_text_chars": 12000,
+    }
+    if max_results is not None:
+        budget["max_results"] = max_results
+    return budget
+
+
 def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
     items_out = []
     for item in response.get("items") or []:
@@ -91,31 +136,44 @@ async def _resolve_external_context(
     dsa: DataSourceAggregatorClient | None,
     dsa_enabled: bool,
     external_context_enabled: bool,
+    external_context: dict[str, Any] | None,
     external_calls_allowed: bool,
     query: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    external_context_config = _normalize_external_context_config(external_context)
+    allowed_sensitivity = external_context_config.get("allowed_sensitivity", "medium")
+    max_results = external_context_config.get("max_results")
+    dsa_trace_base: dict[str, Any] = {
+        "enabled": external_context_enabled,
+        "requested_source_ids": external_context_config.get("source_ids", []),
+        "requested_domain_tags": external_context_config.get("domain_tags", []),
+        "allowed_sensitivity": allowed_sensitivity,
+        "max_results": max_results if max_results is not None else 5,
+    }
     if not dsa_enabled:
         return None, _dsa_disabled_trace(False)
     if not external_context_enabled:
         return None, _dsa_disabled_trace(True)
     if not external_calls_allowed:
-        return None, {
-            "enabled": True,
-            "called": False,
-            "status": "skipped_local_only",
-        }
+        return None, {**dsa_trace_base, "called": False, "status": "skipped_local_only"}
     if dsa is None:
         return None, {
-            "enabled": True,
+            **dsa_trace_base,
             "called": False,
             "status": "error",
             "error_code": "client_not_configured",
         }
     try:
-        response = await dsa.context_pack(query=query)
+        response = await dsa.context_pack(
+            query=query,
+            source_ids=external_context_config.get("source_ids"),
+            domain_tags=external_context_config.get("domain_tags"),
+            allowed_sensitivity=allowed_sensitivity,
+            budget=_build_dsa_budget(max_results),
+        )
         context_pack = _sanitize_context_pack(response if isinstance(response, dict) else {})
         return context_pack, {
-            "enabled": True,
+            **dsa_trace_base,
             "called": True,
             "status": "success",
             "item_count": len(context_pack.get("items", [])),
@@ -123,7 +181,7 @@ async def _resolve_external_context(
         }
     except httpx.TimeoutException:
         return None, {
-            "enabled": True,
+            **dsa_trace_base,
             "called": True,
             "status": "error",
             "error_code": "timeout",
@@ -133,14 +191,14 @@ async def _resolve_external_context(
         if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
             error_code = f"http_{exc.response.status_code}"
         return None, {
-            "enabled": True,
+            **dsa_trace_base,
             "called": True,
             "status": "error",
             "error_code": error_code,
         }
     except Exception:
         return None, {
-            "enabled": True,
+            **dsa_trace_base,
             "called": True,
             "status": "error",
             "error_code": "unexpected_error",
@@ -668,11 +726,16 @@ async def orchestrate_chat(
     local_only = sensitivity_local_only or profile_local_only
     cost_mode = routing_policy.get("cost_mode")
     latency_mode = routing_policy.get("latency_mode")
+    external_context_request = effective_payload.get("external_context")
+    external_context_enabled = bool(effective_payload.get("external_context_enabled", False)) or bool(
+        isinstance(external_context_request, dict) and external_context_request.get("enabled") is True
+    )
 
     external_context_pack, dsa_trace = await _resolve_external_context(
         dsa=dsa,
         dsa_enabled=dsa_enabled,
-        external_context_enabled=bool(effective_payload.get("external_context_enabled", False)),
+        external_context_enabled=external_context_enabled,
+        external_context=external_context_request if isinstance(external_context_request, dict) else None,
         external_calls_allowed=not local_only,
         query=last_user_text,
     )

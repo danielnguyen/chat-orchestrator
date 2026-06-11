@@ -2560,7 +2560,19 @@ async def test_orchestrate_dsa_enabled_calls_client_and_includes_prompt_context(
         request_id="rid-dsa-success",
     )
 
-    assert dsa.calls == [{"query": "When was the battery replaced?"}]
+    assert dsa.calls == [
+        {
+            "query": "When was the battery replaced?",
+            "source_ids": None,
+            "domain_tags": None,
+            "allowed_sensitivity": "medium",
+            "budget": {
+                "max_results": 5,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
     system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
     assert any("External source context:" in msg for msg in system_messages)
     trace = memory_store.trace_calls[0]["payload"]
@@ -2570,6 +2582,10 @@ async def test_orchestrate_dsa_enabled_calls_client_and_includes_prompt_context(
         "status": "success",
         "item_count": 1,
         "sources_used": ["vehicle_log_primary"],
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
     }
     assert "should not persist" not in str(trace)
     assert "Battery replacement. Date: 2025-07-12." not in str(trace["dsa"])
@@ -2609,6 +2625,113 @@ async def test_orchestrate_dsa_no_items_does_not_add_external_context_message(tm
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_external_context_object_alone_enables_dsa(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
+            "external_context_enabled": False,
+            "external_context": {"enabled": True},
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-object-enabled",
+    )
+
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["allowed_sensitivity"] == "medium"
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"]["called"] is True
+    assert trace["dsa"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_passes_request_targeting_and_budget(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "vehicle_log_primary:1",
+                    "source_name": "Vehicle Log",
+                    "title": "Oil change",
+                    "text": "Oil service completed.",
+                }
+            ],
+        }
+    )
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "What Jeep maintenance records do you have about oil?"}],
+            "external_context": {
+                "enabled": True,
+                "source_ids": ["vehicle_log_primary"],
+                "domain_tags": ["vehicle", "maintenance"],
+                "allowed_sensitivity": "low",
+                "max_results": 2,
+            },
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-targeting",
+    )
+
+    assert dsa.calls == [
+        {
+            "query": "What Jeep maintenance records do you have about oil?",
+            "source_ids": ["vehicle_log_primary"],
+            "domain_tags": ["vehicle", "maintenance"],
+            "allowed_sensitivity": "low",
+            "budget": {
+                "max_results": 2,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "enabled": True,
+        "called": True,
+        "status": "success",
+        "item_count": 1,
+        "sources_used": ["vehicle_log_primary"],
+        "requested_source_ids": ["vehicle_log_primary"],
+        "requested_domain_tags": ["vehicle", "maintenance"],
+        "allowed_sensitivity": "low",
+        "max_results": 2,
+    }
+    assert "Oil service completed." not in str(trace["dsa"])
+    assert "X-API-Key" not in str(trace["dsa"])
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_context(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
@@ -2642,6 +2765,10 @@ async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_cont
         "called": True,
         "status": "error",
         "error_code": "timeout",
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
     }
 
 
@@ -2691,6 +2818,10 @@ async def test_orchestrate_dsa_401_degrades_gracefully_without_leaking_key(tmp_p
         "called": True,
         "status": "error",
         "error_code": "http_401",
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
     }
     assert dsa_api_key not in str(trace)
 
@@ -2730,6 +2861,12 @@ async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
             "surface": "chat",
             "messages": [{"role": "user", "content": "When was the battery replaced?"}],
             "external_context_enabled": True,
+            "external_context": {
+                "enabled": True,
+                "source_ids": ["vehicle_log_primary"],
+                "domain_tags": ["vehicle", "maintenance"],
+                "max_results": 2,
+            },
             "sensitivity": "local_only",
             "model_override": None,
         },
@@ -2750,6 +2887,10 @@ async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
         "enabled": True,
         "called": False,
         "status": "skipped_local_only",
+        "requested_source_ids": ["vehicle_log_primary"],
+        "requested_domain_tags": ["vehicle", "maintenance"],
+        "allowed_sensitivity": "medium",
+        "max_results": 2,
     }
     assert trace["retrieval"]["prompt_assembly"]["dsa"] == trace["dsa"]
 
@@ -2816,4 +2957,8 @@ async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
         "enabled": True,
         "called": False,
         "status": "skipped_local_only",
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
     }

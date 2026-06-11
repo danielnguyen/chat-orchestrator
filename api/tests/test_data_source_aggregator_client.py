@@ -39,6 +39,48 @@ async def test_context_pack_posts_expected_payload():
 
 
 @pytest.mark.asyncio
+async def test_context_pack_posts_targeting_and_budget_overrides():
+    client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"items": []}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.context_pack(
+        query="battery replacement",
+        source_ids=["vehicle_log_primary"],
+        domain_tags=["vehicle", "maintenance"],
+        allowed_sensitivity="low",
+        budget={
+            "max_results": 2,
+            "max_bytes": 50000,
+            "max_text_chars": 12000,
+        },
+    )
+
+    assert calls == [
+        (
+            "/v1/context-pack",
+            {
+                "query": "battery replacement",
+                "source_ids": ["vehicle_log_primary"],
+                "domain_tags": ["vehicle", "maintenance"],
+                "retrieval_mode": "targeted",
+                "allowed_sensitivity": "low",
+                "budget": {
+                    "max_results": 2,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_client_includes_api_key_header_when_configured(monkeypatch):
     client = DataSourceAggregatorClient(
         "http://dsa.local",

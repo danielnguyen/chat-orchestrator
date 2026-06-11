@@ -41,12 +41,14 @@ class DataSourceAggregatorClient:
         allowed_sensitivity: str = "medium",
         budget: dict[str, int] | None = None,
     ) -> dict[str, Any]:
+        normalized_source_ids = source_ids or None
+        normalized_domain_tags = domain_tags or None
         return await self._post(
             "/v1/context-pack",
             json={
                 "query": query,
-                "source_ids": source_ids,
-                "domain_tags": domain_tags,
+                "source_ids": normalized_source_ids,
+                "domain_tags": normalized_domain_tags,
                 "retrieval_mode": retrieval_mode,
                 "allowed_sensitivity": allowed_sensitivity,
                 "budget": budget
