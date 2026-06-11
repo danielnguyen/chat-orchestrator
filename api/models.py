@@ -83,6 +83,16 @@ class SurfaceContext(BaseModel):
     style_envelope: StyleEnvelopeOverride = Field(default_factory=StyleEnvelopeOverride)
 
 
+class ExternalContextRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: Optional[bool] = None
+    source_ids: Optional[List[str]] = None
+    domain_tags: Optional[List[str]] = None
+    allowed_sensitivity: Optional[str] = None
+    max_results: Optional[int] = Field(default=None, ge=1, le=20)
+
+
 class ChatRequest(BaseModel):
     owner_id: str
     client_id: Optional[str] = None
@@ -93,6 +103,7 @@ class ChatRequest(BaseModel):
     requested_profile: Optional[str] = None
     requested_scene: Optional[str] = Field(default=None, max_length=64)
     external_context_enabled: bool = False
+    external_context: Optional[ExternalContextRequest] = None
     model_override: Optional[str] = None
     sensitivity: Literal["public", "private", "local_only"] = "private"
     retrieval: Optional[RetrievalOptions] = None

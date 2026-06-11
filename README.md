@@ -119,14 +119,17 @@ The Data Source Aggregator integration is optional and disabled by default.
 - `DSA_API_KEY` is optional for local development. When set, the orchestrator sends `X-API-Key: <DSA_API_KEY>` on DSA requests.
 - The current integration uses `POST /v1/context-pack`.
 - This path is read-only evidence retrieval; memory writes remain separate and continue to belong to `basic-memory-store`.
-- The request must opt in with `external_context_enabled=true` on `POST /v1/chat`.
+- Requests can opt in with `external_context_enabled=true` for the simple default behavior.
+- Requests can also opt in with `external_context.enabled=true` and optionally target `source_ids`, `domain_tags`, `allowed_sensitivity`, and `max_results`.
+- If both fields are present, either one being `true` enables DSA retrieval.
+- `sensitivity=local_only` still wins and skips DSA even if external context is requested.
 - The DSA API key is not included in orchestrator traces.
 
 Manual smoke note:
 
 1. Start Data Source Aggregator locally on port `5174` with vehicle/calendar configs.
 2. Start `chat-orchestrator` with `DSA_ENABLED=true`, `DSA_BASE_URL=http://localhost:5174`, and `DSA_API_KEY` if DSA auth is enabled.
-3. Send a chat request with `external_context_enabled=true` and ask a vehicle or calendar question.
+3. Send a chat request with `external_context_enabled=true` or a targeted `external_context` object and ask a vehicle or calendar question.
 4. Confirm the response can use source-backed context and still succeeds if DSA is stopped.
 
 
