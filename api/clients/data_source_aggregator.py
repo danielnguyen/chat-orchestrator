@@ -6,13 +6,28 @@ import httpx
 
 
 class DataSourceAggregatorClient:
-    def __init__(self, base_url: str, timeout_ms: int = 1500) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout_ms: int = 5000,
+        api_key: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout_ms / 1000
+        self.api_key = api_key
+
+    def _build_headers(self) -> dict[str, str] | None:
+        if not self.api_key:
+            return None
+        return {"X-API-Key": self.api_key}
 
     async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(f"{self.base_url}{path}", json=json)
+            resp = await client.post(
+                f"{self.base_url}{path}",
+                json=json,
+                headers=self._build_headers(),
+            )
             resp.raise_for_status()
             return resp.json()
 
