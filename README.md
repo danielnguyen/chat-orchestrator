@@ -132,10 +132,9 @@ Manual smoke note:
 3. Send a chat request with `external_context_enabled=true` or a targeted `external_context` object and ask a vehicle or calendar question.
 4. Confirm the response can use source-backed context and still succeeds if DSA is stopped.
 
+## Prompt Assembly And Routing
 
-## Cluster 7.5 prompt and routing contract
-
-Prompt assembly is explicit but behavior-preserving. The orchestrator assembles:
+Prompt assembly is explicit. The orchestrator assembles:
 
 1. profile prompt overlay, when present
 2. additive style guidance, when surface/profile inputs require it
@@ -148,7 +147,7 @@ Trace metadata records included/omitted prompt layers, retrieval snippet refs, a
 
 Local/offline routing precedence is additive and traceable: request `sensitivity=local_only`, profile `routing_policy.local_only`, compatible manual override, router rule selection, profile cost/latency policy, then provider fallback. Local-only constraints continue to apply to fallback models.
 
-## Cluster 12 closeout boundaries
+## Integration Boundaries
 
 - `cognitive-runtime` owns companion contracts and diagnostic surfaces.
 - `chat-orchestrator` consumes compiled companion policy overlays and does not own companion contract definition.
