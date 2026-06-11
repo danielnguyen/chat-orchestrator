@@ -1,4 +1,5 @@
 import pytest
+import httpx
 from services.orchestrate import orchestrate_chat
 
 BANNED_TRACE_TOKENS = [
@@ -221,6 +222,19 @@ class FakeLiteLLM:
         if self.fail_first and len(self.calls) == 1:
             raise RuntimeError("primary failed")
         return {"choices": [{"message": {"content": self.content}}]}
+
+
+class FakeDSA:
+    def __init__(self, *, response=None, error: Exception | None = None):
+        self.calls = []
+        self.response = response or {"sources_used": [], "items": []}
+        self.error = error
+
+    async def context_pack(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.response
 
 
 @pytest.mark.asyncio
@@ -2462,3 +2476,160 @@ async def test_orchestrate_live_chat_flow_only_uses_existing_runtime_calls_for_h
     assert presentation["warnings"]["companion_warning_count"] == 0
     handoff = prompt_trace["handoff"]
     assert handoff["warnings"]["interrupt_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_disabled_skips_external_context_call(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
+            "external_context_enabled": True,
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=False,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-disabled",
+    )
+
+    assert dsa.calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {"enabled": False, "called": False, "status": "disabled"}
+    assert trace["retrieval"]["prompt_assembly"]["dsa"] == trace["dsa"]
+    assert "External source context:" not in str(litellm.calls[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_enabled_calls_client_and_includes_prompt_context(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "google_sheets:jeep_wj_maintenance:Maintenance!A44:H44",
+                    "source_name": "Jeep WJ Maintenance Log",
+                    "title": "Battery replacement",
+                    "text": "Battery replacement. Date: 2025-07-12.",
+                    "raw": {"hidden": "should not persist"},
+                }
+            ],
+        }
+    )
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
+            "external_context_enabled": True,
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-success",
+    )
+
+    assert dsa.calls == [{"query": "When was the battery replaced?"}]
+    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    assert any("External source context:" in msg for msg in system_messages)
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "enabled": True,
+        "called": True,
+        "status": "success",
+        "item_count": 1,
+        "sources_used": ["vehicle_log_primary"],
+    }
+    assert "should not persist" not in str(trace)
+    assert "Battery replacement. Date: 2025-07-12." not in str(trace["dsa"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_no_items_does_not_add_external_context_message(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="I don't see any external source evidence here.")
+    dsa = FakeDSA(response={"sources_used": [], "items": []})
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "Anything on my calendar?"}],
+            "external_context_enabled": True,
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-empty",
+    )
+
+    assert out["status"] == "ok"
+    assert "External source context:" not in str(litellm.calls[0]["messages"])
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"]["status"] == "success"
+    assert trace["dsa"]["item_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_context(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(error=httpx.ReadTimeout("timed out"))
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
+            "external_context_enabled": True,
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-timeout",
+    )
+
+    assert out["status"] == "ok"
+    assert "External source context:" not in str(litellm.calls[0]["messages"])
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "enabled": True,
+        "called": True,
+        "status": "error",
+        "error_code": "timeout",
+    }

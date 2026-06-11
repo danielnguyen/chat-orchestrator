@@ -105,13 +105,14 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
         "response_shape",
         "companion_policy",
         "runtime_overlay",
+        "external_source_context",
     ]
     assert out.trace["truncation"] == {"applied": False, "reason": None}
     assert out.trace["style"]["status"] == "not_requested"
     assert out.trace["response_shape"]["status"] == "not_requested"
     assert out.trace["surface_presence"] == {"attempted": False, "status": "not_requested"}
     assert out.trace["runtime"] == {"attempted": False, "status": "not_requested"}
-    snippets = out.trace["layers"][5]["metadata"]["snippets"]
+    snippets = out.trace["layers"][6]["metadata"]["snippets"]
     assert snippets["semantic"][0]["message_id"] == "m-1"
     assert snippets["artifact_refs"][0]["artifact_id"] == "a-1"
 
@@ -130,6 +131,7 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "response_shape",
         "companion_policy",
         "runtime_overlay",
+        "external_source_context",
         "retrieval_augmentation",
         "recent_history",
     ]
@@ -167,6 +169,48 @@ def test_assemble_prompt_includes_style_guidance_after_profile_overlay():
     assert style_layer["metadata"]["source_fields"] == ["surface_context.active_task_mode"]
     assert style_layer["metadata"]["resolved_envelope"] == {"directness": "high"}
     assert out.trace["style"]["status"] == "included"
+
+
+def test_assemble_prompt_includes_compact_external_source_context_without_text_in_trace():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "When was the battery replaced?"}],
+        external_context_pack={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "google_sheets:jeep_wj_maintenance:Maintenance!A44:H44",
+                    "source_name": "Jeep WJ Maintenance Log",
+                    "title": "Battery replacement",
+                    "text": "Battery replacement. Date: 2025-07-12.",
+                }
+            ],
+        },
+        dsa_trace={
+            "enabled": True,
+            "called": True,
+            "status": "success",
+            "item_count": 1,
+            "sources_used": ["vehicle_log_primary"],
+        },
+    )
+
+    assert out.messages[1]["content"] == (
+        "External source context:\n"
+        "[1] Jeep WJ Maintenance Log — Battery replacement\n"
+        "source_ref: google_sheets:jeep_wj_maintenance:Maintenance!A44:H44\n"
+        "Battery replacement. Date: 2025-07-12."
+    )
+    assert "external_source_context" in out.trace["included_layers"]
+    layer = next(layer for layer in out.trace["layers"] if layer["name"] == "external_source_context")
+    assert layer["metadata"] == {
+        "item_count": 1,
+        "sources_used": ["vehicle_log_primary"],
+        "source_refs": ["google_sheets:jeep_wj_maintenance:Maintenance!A44:H44"],
+    }
+    assert "Battery replacement. Date: 2025-07-12." not in str(layer["metadata"])
+    assert out.trace["dsa"]["status"] == "success"
 
 
 def test_assemble_prompt_includes_surface_presence_in_top_level_trace_only():
