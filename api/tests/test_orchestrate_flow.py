@@ -237,6 +237,16 @@ class FakeDSA:
         return self.response
 
 
+def _http_status_error(status_code: int, body: dict[str, object] | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://dsa.local/v1/context-pack")
+    response = httpx.Response(status_code, json=body or {}, request=request)
+    return httpx.HTTPStatusError(
+        f"Client error '{status_code}' for url '{request.url}'",
+        request=request,
+        response=response,
+    )
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_chat_happy_path(tmp_path):
     rules = tmp_path / "rules.yaml"
@@ -2633,6 +2643,56 @@ async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_cont
         "status": "error",
         "error_code": "timeout",
     }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_401_degrades_gracefully_without_leaking_key(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa_api_key = "super-secret-dsa-key"
+    dsa = FakeDSA(
+        error=_http_status_error(
+            401,
+            {
+                "error": {
+                    "code": "unauthorized",
+                    "message": "Invalid or missing API key",
+                    "details": {},
+                }
+            },
+        )
+    )
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "chat",
+            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
+            "external_context_enabled": True,
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-401",
+    )
+
+    assert out["status"] == "ok"
+    assert "External source context:" not in str(litellm.calls[0]["messages"])
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "enabled": True,
+        "called": True,
+        "status": "error",
+        "error_code": "http_401",
+    }
+    assert dsa_api_key not in str(trace)
 
 
 @pytest.mark.asyncio
