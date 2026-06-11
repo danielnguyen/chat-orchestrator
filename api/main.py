@@ -6,6 +6,7 @@ from uuid import uuid4
 import httpx
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
+from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.runtime import RuntimeClient
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
@@ -36,6 +37,14 @@ runtime = (
         timeout_ms=settings.cognitive_runtime_timeout_ms,
     )
     if settings.cognitive_runtime_base_url
+    else None
+)
+dsa = (
+    DataSourceAggregatorClient(
+        base_url=settings.dsa_base_url,
+        timeout_ms=settings.dsa_timeout_ms,
+    )
+    if settings.dsa_enabled
     else None
 )
 
@@ -110,6 +119,8 @@ async def chat(body: ChatRequest) -> ChatResponse:
             companion_policy_enabled=settings.cognitive_runtime_companion_enabled,
             response_action_mode=settings.response_action_mode,
             interrupt_policy_mode=body.interrupt_policy_mode,
+            dsa=dsa,
+            dsa_enabled=settings.dsa_enabled,
             request_id=request_id,
         )
         return ChatResponse(**result)

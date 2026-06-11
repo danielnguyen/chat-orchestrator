@@ -18,6 +18,7 @@ Normal request flow:
 
 - Resolve/create conversation in `basic-memory-store`
 - Retrieve context bundle from memory-store
+- Optionally retrieve read-only external evidence from Data Source Aggregator via `/v1/context-pack`
 - Inject retrieved memory and file snippets into the model prompt
 - Resolve and apply mode profile
 - Evaluate declarative router rules
@@ -42,6 +43,9 @@ MEMORY_STORE_BASE_URL=http://127.0.0.1:4321
 MEMORY_STORE_API_KEY=dev-local
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_API_KEY=
+DSA_ENABLED=false
+DSA_BASE_URL=http://localhost:5174
+DSA_TIMEOUT_MS=1500
 ROUTER_RULES_PATH=router/rules.yaml
 MODEL_REGISTRY_PATH=router/model_registry.yaml
 ALLOW_MANUAL_OVERRIDE=true
@@ -101,6 +105,26 @@ When `basic-memory-store` returns `bundle.artifact_refs`, the orchestrator:
 - returns `sources` in the `/v1/chat` response using the source refs returned by memory-store
 
 File ingestion remains owned by `basic-memory-store`; `chat-orchestrator` does not own an ingestion pipeline.
+
+## Optional Data Source Aggregator evidence retrieval
+
+The Data Source Aggregator integration is optional and disabled by default.
+
+`DSA` in the environment variable names stands for `Data Source Aggregator`.
+
+- `DSA_ENABLED=false` keeps existing behavior unchanged.
+- `DSA_BASE_URL` is the base URL for the Data Source Aggregator service.
+- `DSA_TIMEOUT_MS` is the request timeout for Data Source Aggregator calls.
+- The current integration uses `POST /v1/context-pack`.
+- This path is read-only evidence retrieval; memory writes remain separate and continue to belong to `basic-memory-store`.
+- The request must opt in with `external_context_enabled=true` on `POST /v1/chat`.
+
+Manual smoke note:
+
+1. Start Data Source Aggregator locally on port `5174` with vehicle/calendar configs.
+2. Start `chat-orchestrator` with `DSA_ENABLED=true` and `DSA_BASE_URL=http://localhost:5174`.
+3. Send a chat request with `external_context_enabled=true` and ask a vehicle or calendar question.
+4. Confirm the response can use source-backed context and still succeeds if DSA is stopped.
 
 
 ## Cluster 7.5 prompt and routing contract

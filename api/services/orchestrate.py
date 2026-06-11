@@ -5,7 +5,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+import httpx
 import yaml
+from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
@@ -46,6 +48,103 @@ def _companion_disabled_trace() -> dict[str, Any]:
         "cognitive_runtime_compile_error": None,
         "cognitive_runtime_compile_endpoint": None,
     }
+
+
+def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "called": False,
+        "status": "disabled" if not enabled else "not_requested",
+    }
+
+
+def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
+    items_out = []
+    for item in response.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        items_out.append(
+            {
+                "source_ref": item.get("source_ref"),
+                "source_name": item.get("source_name"),
+                "title": item.get("title"),
+                "text": text,
+                "retrieved_at": item.get("retrieved_at"),
+                "warnings": item.get("warnings", []),
+            }
+        )
+
+    return {
+        "query": response.get("query"),
+        "sources_used": response.get("sources_used", []) or [],
+        "items": items_out,
+        "errors": response.get("errors", []) or [],
+        "budget": response.get("budget", {}) or {},
+    }
+
+
+async def _resolve_external_context(
+    *,
+    dsa: DataSourceAggregatorClient | None,
+    dsa_enabled: bool,
+    external_context_enabled: bool,
+    external_calls_allowed: bool,
+    query: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not dsa_enabled:
+        return None, _dsa_disabled_trace(False)
+    if not external_context_enabled:
+        return None, _dsa_disabled_trace(True)
+    if not external_calls_allowed:
+        return None, {
+            "enabled": True,
+            "called": False,
+            "status": "skipped_local_only",
+        }
+    if dsa is None:
+        return None, {
+            "enabled": True,
+            "called": False,
+            "status": "error",
+            "error_code": "client_not_configured",
+        }
+    try:
+        response = await dsa.context_pack(query=query)
+        context_pack = _sanitize_context_pack(response if isinstance(response, dict) else {})
+        return context_pack, {
+            "enabled": True,
+            "called": True,
+            "status": "success",
+            "item_count": len(context_pack.get("items", [])),
+            "sources_used": context_pack.get("sources_used", []),
+        }
+    except httpx.TimeoutException:
+        return None, {
+            "enabled": True,
+            "called": True,
+            "status": "error",
+            "error_code": "timeout",
+        }
+    except httpx.HTTPError as exc:
+        error_code = "http_error"
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            error_code = f"http_{exc.response.status_code}"
+        return None, {
+            "enabled": True,
+            "called": True,
+            "status": "error",
+            "error_code": error_code,
+        }
+    except Exception:
+        return None, {
+            "enabled": True,
+            "called": True,
+            "status": "error",
+            "error_code": "unexpected_error",
+        }
 
 
 async def _resolve_companion_policy(
@@ -434,6 +533,7 @@ async def _create_error_trace(
     fallback_used: bool = False,
     prompt_trace: dict[str, Any] | None = None,
     surface_presence_trace: dict[str, Any] | None = None,
+    dsa_trace: dict[str, Any] | None = None,
 ) -> None:
     await memory_store.create_trace(
         request_id=request_id,
@@ -495,6 +595,7 @@ async def _create_error_trace(
                 "triggered": fallback_used,
                 "reason": "provider_error" if fallback_used else None,
             },
+            "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
             "cost": {},
             "latency_ms": int((perf_counter() - started) * 1000),
             "status": "failed",
@@ -518,6 +619,8 @@ async def orchestrate_chat(
     companion_policy_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
+    dsa: DataSourceAggregatorClient | None = None,
+    dsa_enabled: bool = False,
 ) -> dict[str, Any]:
     started = perf_counter()
 
@@ -559,6 +662,20 @@ async def orchestrate_chat(
     )
     surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
     last_user_text = _extract_last_user_text(payload["messages"])
+    routing_policy = profile.get("routing_policy", {}) or {}
+    sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
+    profile_local_only = bool(routing_policy.get("local_only", False))
+    local_only = sensitivity_local_only or profile_local_only
+    cost_mode = routing_policy.get("cost_mode")
+    latency_mode = routing_policy.get("latency_mode")
+
+    external_context_pack, dsa_trace = await _resolve_external_context(
+        dsa=dsa,
+        dsa_enabled=dsa_enabled,
+        external_context_enabled=bool(effective_payload.get("external_context_enabled", False)),
+        external_calls_allowed=not local_only,
+        query=last_user_text,
+    )
     retrieval_bundle = await memory_store.retrieve_bundle(
         request_id=request_id,
         conversation_id=conversation_id,
@@ -596,12 +713,6 @@ async def orchestrate_chat(
     )
     signals = _compute_signals(effective_payload, retrieval_bundle)
     registry = _load_model_registry(model_registry_path)
-    routing_policy = profile.get("routing_policy", {}) or {}
-    sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
-    profile_local_only = bool(routing_policy.get("local_only", False))
-    local_only = sensitivity_local_only or profile_local_only
-    cost_mode = routing_policy.get("cost_mode")
-    latency_mode = routing_policy.get("latency_mode")
 
     override_requested = effective_payload.get("model_override")
     override = override_requested if allow_manual_override else None
@@ -654,8 +765,10 @@ async def orchestrate_chat(
                     "response_shape": response_shape_trace,
                     "companion_policy": companion_trace,
                     "runtime": runtime_trace,
+                    "dsa": dsa_trace,
                 },
                 surface_presence_trace=surface_presence_trace,
+                dsa_trace=dsa_trace,
             )
             raise RuntimeError("local_only policy active but no local model available")
         selected_model = local_candidate
@@ -717,6 +830,8 @@ async def orchestrate_chat(
         runtime_overlay=runtime_overlay,
         runtime_trace=runtime_trace,
         interrupt_trace=interrupt_trace,
+        external_context_pack=external_context_pack,
+        dsa_trace=dsa_trace,
     )
     messages = prompt.messages
 
@@ -764,6 +879,7 @@ async def orchestrate_chat(
                         fallback_used=True,
                         prompt_trace=prompt.trace,
                         surface_presence_trace=surface_presence_trace,
+                        dsa_trace=dsa_trace,
                     )
                     raise RuntimeError("local_only policy active but no local fallback available")
                 fallback_model = local_fallback
@@ -894,6 +1010,7 @@ async def orchestrate_chat(
                 "triggered": fallback_used,
                 "reason": "provider_error" if fallback_used else None,
             },
+            "dsa": dsa_trace,
             "cost": {},
             "latency_ms": int((perf_counter() - started) * 1000),
             "status": status,

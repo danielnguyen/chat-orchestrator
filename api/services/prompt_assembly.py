@@ -95,6 +95,53 @@ def retrieval_snippet_trace(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_external_context_messages(context_pack: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(context_pack, dict):
+        return []
+
+    items = context_pack.get("items") or []
+    lines = ["External source context:"]
+    included = 0
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        source_name = item.get("source_name") or "Unknown source"
+        title = item.get("title") or "Untitled"
+        source_ref = item.get("source_ref") or "unknown"
+        lines.extend(
+            [
+                f"[{index}] {source_name} — {title}",
+                f"source_ref: {source_ref}",
+                text,
+            ]
+        )
+        included += 1
+
+    if included == 0:
+        return []
+    return [{"role": "system", "content": "\n".join(lines)}]
+
+
+def external_context_trace(context_pack: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context_pack, dict):
+        return {"item_count": 0, "sources_used": [], "source_refs": []}
+
+    items = context_pack.get("items") or []
+    source_refs = []
+    for item in items:
+        if isinstance(item, dict) and item.get("source_ref"):
+            source_refs.append(item["source_ref"])
+
+    return {
+        "item_count": len(source_refs),
+        "sources_used": context_pack.get("sources_used", []) or [],
+        "source_refs": source_refs,
+    }
+
+
 def assemble_prompt(
     *,
     profile: dict[str, Any],
@@ -112,6 +159,8 @@ def assemble_prompt(
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
+    external_context_pack: dict[str, Any] | None = None,
+    dsa_trace: dict[str, Any] | None = None,
 ) -> PromptAssembly:
     messages: list[dict[str, str]] = []
     layers: list[dict[str, Any]] = []
@@ -331,6 +380,16 @@ def assemble_prompt(
         )
     )
 
+    external_context_messages = build_external_context_messages(external_context_pack)
+    messages.extend(external_context_messages)
+    layers.append(
+        _layer_trace(
+            "external_source_context",
+            external_context_messages,
+            metadata=external_context_trace(external_context_pack),
+        )
+    )
+
     retrieval_messages = build_retrieval_messages(retrieval_bundle)
     messages.extend(retrieval_messages)
     layers.append(
@@ -363,6 +422,7 @@ def assemble_prompt(
         "companion_policy": companion_trace_out
         or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
+        "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
         "message_count": len(messages),
     }
     if interrupt_trace is not None:
