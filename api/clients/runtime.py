@@ -199,37 +199,6 @@ class RuntimeClient:
             payload["relationship_types"] = relationship_types
         return await self._post("/v1/relationships/select", json=payload)
 
-    async def relationship_select(
-        self,
-        *,
-        request_id: str,
-        owner_id: str,
-        conversation_id: str,
-        surface: str,
-        runtime_session_id: str | None = None,
-        active_persona_id: str | None = None,
-        requested_scopes: list[str] | None = None,
-        entity_ids: list[str] | None = None,
-        relationship_types: list[str] | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "request_id": request_id,
-            "owner_id": owner_id,
-            "conversation_id": conversation_id,
-            "surface": surface,
-        }
-        if runtime_session_id is not None:
-            payload["runtime_session_id"] = runtime_session_id
-        if active_persona_id is not None:
-            payload["active_persona_id"] = active_persona_id
-        if requested_scopes:
-            payload["requested_scopes"] = requested_scopes
-        if entity_ids:
-            payload["entity_ids"] = entity_ids
-        if relationship_types:
-            payload["relationship_types"] = relationship_types
-        return await self._post("/v1/relationships/select", json=payload)
-
     async def compile_companion_policy(
         self,
         *,
