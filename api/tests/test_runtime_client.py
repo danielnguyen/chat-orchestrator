@@ -134,3 +134,55 @@ async def test_compile_companion_policy_does_not_fall_back_on_connection_failure
 
     assert calls == ["/v1/companion/profile/compile"]
     assert client.last_companion_compile_endpoint == "/v1/companion/profile/compile"
+
+
+@pytest.mark.asyncio
+async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"ok": True}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.resolve_session(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+    )
+    await client.start_turn(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        input_message_id="m-1",
+    )
+    await client.update_turn(
+        request_id="rid",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        turn_status="retrieving",
+    )
+    await client.complete_turn(
+        request_id="rid",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        turn_status="completed",
+    )
+    await client.resolve_identity(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+    )
+
+    assert [path for path, _ in calls] == [
+        "/v1/runtime/sessions/resolve",
+        "/v1/runtime/turns/start",
+        "/v1/runtime/turns/update",
+        "/v1/runtime/turns/complete",
+        "/v1/runtime/identity/resolve",
+    ]

@@ -43,6 +43,105 @@ class RuntimeClient:
             },
         )
 
+    async def resolve_session(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        surface_session_id: str | None = None,
+        active_mode: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if surface_session_id is not None:
+            payload["surface_session_id"] = surface_session_id
+        if active_mode is not None:
+            payload["active_mode"] = active_mode
+        return await self._post("/v1/runtime/sessions/resolve", json=payload)
+
+    async def start_turn(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        input_message_id: str | None = None,
+        intent_class: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if input_message_id is not None:
+            payload["input_message_id"] = input_message_id
+        if intent_class is not None:
+            payload["intent_class"] = intent_class
+        return await self._post("/v1/runtime/turns/start", json=payload)
+
+    async def update_turn(
+        self,
+        *,
+        request_id: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        turn_status: str,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/runtime/turns/update",
+            json={
+                "request_id": request_id,
+                "runtime_session_id": runtime_session_id,
+                "runtime_turn_id": runtime_turn_id,
+                "turn_status": turn_status,
+            },
+        )
+
+    async def complete_turn(
+        self,
+        *,
+        request_id: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        turn_status: str,
+        continuation_state: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "turn_status": turn_status,
+        }
+        if continuation_state is not None:
+            payload["continuation_state"] = continuation_state
+        return await self._post("/v1/runtime/turns/complete", json=payload)
+
+    async def resolve_identity(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/runtime/identity/resolve",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "surface": surface,
+            },
+        )
+
     async def compile_companion_policy(
         self,
         *,

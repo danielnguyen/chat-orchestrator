@@ -50,6 +50,18 @@ def _companion_disabled_trace() -> dict[str, Any]:
     }
 
 
+def _runtime_session_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
+def _turn_state_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
+def _runtime_identity_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
 def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -323,6 +335,227 @@ async def _resolve_companion_policy(
         "companion_overlay_ids": [
             item["overlay_id"] for item in included_overlays if item.get("overlay_id")
         ],
+    }
+
+
+async def _resolve_runtime_session(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.resolve_session(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "runtime_session_unavailable",
+        }
+    session = response.get("runtime_session") if isinstance(response, dict) else None
+    if not isinstance(session, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_session_response",
+        }
+    return session, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": session.get("runtime_session_id"),
+        "session_status": session.get("status"),
+        "surface": session.get("surface"),
+    }
+
+
+async def _start_runtime_turn(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    input_message_id: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.start_turn(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            input_message_id=input_message_id,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "runtime_turn_unavailable",
+        }
+    turn = response.get("runtime_turn") if isinstance(response, dict) else None
+    session = response.get("runtime_session") if isinstance(response, dict) else None
+    if not isinstance(turn, dict) or not isinstance(session, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_turn_response",
+        }
+    return response, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": session.get("runtime_session_id"),
+        "runtime_turn_id": turn.get("runtime_turn_id"),
+        "turn_status": turn.get("turn_status"),
+    }
+
+
+async def _advance_runtime_turn(
+    *,
+    runtime: Any | None,
+    turn_state_trace: dict[str, Any],
+    request_id: str,
+    turn_status: str,
+) -> None:
+    runtime_session_id = turn_state_trace.get("runtime_session_id")
+    runtime_turn_id = turn_state_trace.get("runtime_turn_id")
+    if runtime is None or not runtime_session_id or not runtime_turn_id:
+        return
+    try:
+        response = await runtime.update_turn(
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            turn_status=turn_status,
+        )
+        if isinstance(response, dict):
+            turn = response.get("runtime_turn", {}) or {}
+            turn_state_trace["turn_status"] = turn.get("turn_status", turn_status)
+    except Exception as e:
+        turn_state_trace.setdefault("warnings", []).append(type(e).__name__)
+
+
+async def _complete_runtime_turn(
+    *,
+    runtime: Any | None,
+    turn_state_trace: dict[str, Any],
+    request_id: str,
+    turn_status: str,
+) -> None:
+    runtime_session_id = turn_state_trace.get("runtime_session_id")
+    runtime_turn_id = turn_state_trace.get("runtime_turn_id")
+    if runtime is None or not runtime_session_id or not runtime_turn_id:
+        return
+    try:
+        response = await runtime.complete_turn(
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            turn_status=turn_status,
+        )
+        if isinstance(response, dict):
+            turn = response.get("runtime_turn", {}) or {}
+            turn_state_trace["turn_status"] = turn.get("turn_status", turn_status)
+            turn_state_trace["completed"] = True
+    except Exception as e:
+        turn_state_trace.setdefault("warnings", []).append(type(e).__name__)
+
+
+async def _resolve_runtime_identity(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.resolve_identity(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "runtime_identity_unavailable",
+        }
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_identity_response",
+        }
+    identity = response.get("runtime_identity")
+    trace = response.get("trace") or {}
+    if not isinstance(identity, dict) or not isinstance(trace, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": "malformed_identity_payload",
+            "omission_reason": "malformed_runtime_identity_response",
+        }
+    return identity, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": trace.get("runtime_session_id"),
+        "active_persona_id": trace.get("active_persona_id"),
+        "persona_resolution_reason": trace.get("persona_resolution_reason"),
+        "persona_override_source": trace.get("persona_override_source"),
+        "surface_id": trace.get("surface_id"),
+        "surface_type": trace.get("surface_type"),
+        "surface_display_name": trace.get("surface_display_name"),
+        "advisory_memory_scope_summary": trace.get("advisory_memory_scope_summary", []),
+        "advisory_tool_permission_summary": trace.get(
+            "advisory_tool_permission_summary", []
+        ),
     }
 
 
@@ -689,9 +922,10 @@ async def orchestrate_chat(
     conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
 
     # Persist incoming user messages first.
+    last_user_message_id = None
     for msg in payload["messages"]:
         if msg["role"] == "user":
-            await memory_store.add_message(
+            saved = await memory_store.add_message(
                 conversation_id=conversation_id,
                 owner_id=payload["owner_id"],
                 role="user",
@@ -699,6 +933,7 @@ async def orchestrate_chat(
                 client_id=payload.get("client_id"),
                 metadata={"surface": payload.get("surface", "unknown")},
             )
+            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
 
     profile = await memory_store.resolve_profile(
         owner_id=payload["owner_id"],
@@ -739,6 +974,29 @@ async def orchestrate_chat(
         external_calls_allowed=not local_only,
         query=last_user_text,
     )
+    runtime_session, runtime_session_trace = await _resolve_runtime_session(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
+    )
+    turn_response, turn_state_trace = await _start_runtime_turn(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
+        input_message_id=last_user_message_id,
+    )
+    if isinstance(turn_response, dict):
+        runtime_session = turn_response.get("runtime_session") or runtime_session
+    await _advance_runtime_turn(
+        runtime=runtime,
+        turn_state_trace=turn_state_trace,
+        request_id=request_id,
+        turn_status="retrieving",
+    )
     retrieval_bundle = await memory_store.retrieve_bundle(
         request_id=request_id,
         conversation_id=conversation_id,
@@ -765,6 +1023,13 @@ async def orchestrate_chat(
         current_user_text=last_user_text,
         recent_messages=effective_payload["messages"],
         requested_scene=payload.get("requested_scene"),
+    )
+    runtime_identity, runtime_identity_trace = await _resolve_runtime_identity(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=payload.get("surface", "unknown"),
     )
     runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
         runtime=runtime,
@@ -890,6 +1155,8 @@ async def orchestrate_chat(
         surface_presence_trace=surface_presence_trace,
         companion_overlays=companion_overlays,
         companion_trace=companion_trace,
+        runtime_identity=runtime_identity,
+        runtime_identity_trace=runtime_identity_trace,
         runtime_overlay=runtime_overlay,
         runtime_trace=runtime_trace,
         interrupt_trace=interrupt_trace,
@@ -899,6 +1166,12 @@ async def orchestrate_chat(
     messages = prompt.messages
 
     model_started = perf_counter()
+    await _advance_runtime_turn(
+        runtime=runtime,
+        turn_state_trace=turn_state_trace,
+        request_id=request_id,
+        turn_status="responding",
+    )
     try:
         completion = await litellm.chat(
             request_id=request_id,
@@ -944,6 +1217,12 @@ async def orchestrate_chat(
                         surface_presence_trace=surface_presence_trace,
                         dsa_trace=dsa_trace,
                     )
+                    await _complete_runtime_turn(
+                        runtime=runtime,
+                        turn_state_trace=turn_state_trace,
+                        request_id=request_id,
+                        turn_status="abandoned",
+                    )
                     raise RuntimeError("local_only policy active but no local fallback available")
                 fallback_model = local_fallback
                 fallback_provider = "local"
@@ -956,6 +1235,12 @@ async def orchestrate_chat(
             )
             model_error = str(e)
         else:
+            await _complete_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="abandoned",
+            )
             raise
 
     model_latency_ms = int((perf_counter() - model_started) * 1000)
@@ -1014,7 +1299,16 @@ async def orchestrate_chat(
         conversation_id=conversation_id,
         surface=payload.get("surface", "unknown"),
     )
+    await _complete_runtime_turn(
+        runtime=runtime,
+        turn_state_trace=turn_state_trace,
+        request_id=request_id,
+        turn_status="completed",
+    )
     prompt.trace["runtime"] = runtime_trace
+    prompt.trace["runtime_session"] = runtime_session_trace
+    prompt.trace["turn_state"] = turn_state_trace
+    prompt.trace["runtime_identity"] = runtime_identity_trace
     prompt.trace["surface_presence"] = apply_surface_presence_outcome(
         surface_presence_trace,
         fallback_active=fallback_used,

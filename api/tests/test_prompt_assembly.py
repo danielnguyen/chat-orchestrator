@@ -104,6 +104,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
         "style_guidance",
         "response_shape",
         "companion_policy",
+        "runtime_identity",
         "runtime_overlay",
         "external_source_context",
     ]
@@ -112,7 +113,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
     assert out.trace["response_shape"]["status"] == "not_requested"
     assert out.trace["surface_presence"] == {"attempted": False, "status": "not_requested"}
     assert out.trace["runtime"] == {"attempted": False, "status": "not_requested"}
-    snippets = out.trace["layers"][6]["metadata"]["snippets"]
+    snippets = out.trace["layers"][7]["metadata"]["snippets"]
     assert snippets["semantic"][0]["message_id"] == "m-1"
     assert snippets["artifact_refs"][0]["artifact_id"] == "a-1"
 
@@ -130,6 +131,7 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "style_guidance",
         "response_shape",
         "companion_policy",
+        "runtime_identity",
         "runtime_overlay",
         "external_source_context",
         "retrieval_augmentation",
@@ -392,7 +394,7 @@ def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_re
         "retrieval_augmentation",
         "current_messages",
     ]
-    runtime_layer = out.trace["layers"][4]
+    runtime_layer = out.trace["layers"][5]
     assert runtime_layer["metadata"]["runtime_state_id"] == "rtstate_1"
     assert out.trace["runtime"]["status"] == "included"
 
@@ -422,7 +424,7 @@ def test_assemble_prompt_omits_runtime_overlay_with_non_system_role():
 
     assert out.messages == [{"role": "user", "content": "hi"}]
     assert "runtime_overlay" in out.trace["omitted_layers"]
-    runtime_layer = out.trace["layers"][4]
+    runtime_layer = out.trace["layers"][5]
     assert runtime_layer["metadata"]["omission_reason"] == "invalid_runtime_overlay_role"
     assert out.trace["runtime"]["status"] == "omitted"
     assert out.trace["runtime"]["included"] is False
@@ -565,6 +567,73 @@ def test_assemble_prompt_includes_companion_policy_after_response_shape_before_r
         "companion_profile",
         "scene_policy",
     ]
+
+
+def test_assemble_prompt_places_runtime_identity_after_companion_policy_before_runtime_overlay():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        companion_overlays=[
+            {
+                "overlay_id": "contract-1",
+                "overlay_type": "interaction_contract",
+                "role": "system",
+                "content": "contract text",
+            }
+        ],
+        companion_trace={"attempted": True, "status": "included", "included": True},
+        runtime_identity={
+            "active_persona_id": "technical_architect",
+            "surface_id": "vscode",
+            "capability_domain": "software_architecture",
+            "advisory_memory_scope_summary": ["technical_context"],
+            "advisory_tool_permission_summary": ["inspect_repository"],
+            "content": (
+                "Runtime identity: persona=technical_architect; surface=vscode; "
+                "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
+                "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
+            ),
+        },
+        runtime_identity_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "active_persona_id": "technical_architect",
+            "surface_id": "vscode",
+        },
+        runtime_overlay={
+            "runtime_state_id": "rtstate_1",
+            "overlay_id": "rtoverlay_1",
+            "overlay_type": "runtime_state",
+            "role": "system",
+            "content": "Runtime context: scene=planning.",
+            "source_fields": ["active_scene"],
+        },
+        runtime_trace={"attempted": True, "status": "included", "included": True},
+    )
+
+    assert [msg["content"] for msg in out.messages[:4]] == [
+        "profile text",
+        "contract text",
+        (
+            "Runtime identity: persona=technical_architect; surface=vscode; "
+            "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
+            "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
+        ),
+        "Runtime context: scene=planning.",
+    ]
+    assert out.trace["included_layers"] == [
+        "profile_overlay",
+        "companion_policy",
+        "runtime_identity",
+        "runtime_overlay",
+        "current_messages",
+    ]
+    identity_layer = out.trace["layers"][4]
+    assert identity_layer["name"] == "runtime_identity"
+    assert identity_layer["metadata"]["active_persona_id"] == "technical_architect"
+    assert out.trace["runtime_identity"]["status"] == "included"
 
 
 
