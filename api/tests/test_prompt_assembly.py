@@ -114,7 +114,10 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
     assert out.trace["response_shape"]["status"] == "not_requested"
     assert out.trace["surface_presence"] == {"attempted": False, "status": "not_requested"}
     assert out.trace["runtime"] == {"attempted": False, "status": "not_requested"}
-    snippets = out.trace["layers"][7]["metadata"]["snippets"]
+    retrieval_layer = next(
+        layer for layer in out.trace["layers"] if layer["name"] == "retrieval_augmentation"
+    )
+    snippets = retrieval_layer["metadata"]["snippets"]
     assert snippets["semantic"][0]["message_id"] == "m-1"
     assert snippets["artifact_refs"][0]["artifact_id"] == "a-1"
 
@@ -396,7 +399,7 @@ def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_re
         "retrieval_augmentation",
         "current_messages",
     ]
-    runtime_layer = out.trace["layers"][5]
+    runtime_layer = next(layer for layer in out.trace["layers"] if layer["name"] == "runtime_overlay")
     assert runtime_layer["metadata"]["runtime_state_id"] == "rtstate_1"
     assert out.trace["runtime"]["status"] == "included"
 
@@ -426,7 +429,7 @@ def test_assemble_prompt_omits_runtime_overlay_with_non_system_role():
 
     assert out.messages == [{"role": "user", "content": "hi"}]
     assert "runtime_overlay" in out.trace["omitted_layers"]
-    runtime_layer = out.trace["layers"][5]
+    runtime_layer = next(layer for layer in out.trace["layers"] if layer["name"] == "runtime_overlay")
     assert runtime_layer["metadata"]["omission_reason"] == "invalid_runtime_overlay_role"
     assert out.trace["runtime"]["status"] == "omitted"
     assert out.trace["runtime"]["included"] is False
