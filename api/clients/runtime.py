@@ -131,16 +131,17 @@ class RuntimeClient:
         owner_id: str,
         conversation_id: str,
         surface: str,
+        runtime_session_id: str | None = None,
     ) -> dict[str, Any]:
-        return await self._post(
-            "/v1/runtime/identity/resolve",
-            json={
-                "request_id": request_id,
-                "owner_id": owner_id,
-                "conversation_id": conversation_id,
-                "surface": surface,
-            },
-        )
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        return await self._post("/v1/runtime/identity/resolve", json=payload)
 
     async def compile_companion_policy(
         self,

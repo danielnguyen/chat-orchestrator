@@ -908,6 +908,40 @@ async def test_orchestrate_local_only_without_local_model_fails_before_model_cal
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_abandons_turn_on_retrieval_failure_after_turn_start(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = RetrievalFailureMemoryStore()
+    runtime = FakeRuntime()
+
+    with pytest.raises(RuntimeError, match="retrieval exploded"):
+        await orchestrate_chat(
+            payload={
+                "owner_id": "owner",
+                "client_id": "vscode",
+                "surface": "vscode",
+                "messages": [{"role": "user", "content": "what happened?"}],
+                "sensitivity": "private",
+                "model_override": None,
+            },
+            memory_store=memory_store,
+            litellm=FakeLiteLLM(),
+            runtime=runtime,
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-retrieval-fail",
+        )
+
+    assert len(runtime.session_calls) == 0
+    assert len(runtime.turn_start_calls) == 1
+    assert len(runtime.turn_update_calls) == 1
+    assert runtime.turn_update_calls[0]["turn_status"] == "retrieving"
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == "abandoned"
+    assert runtime.identity_calls == []
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_does_not_call_runtime_when_overlays_disabled(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
@@ -2203,6 +2237,12 @@ class NoSupportMemoryStore(FakeMemoryStore):
         }
 
 
+class RetrievalFailureMemoryStore(FakeMemoryStore):
+    async def retrieve_bundle(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        raise RuntimeError("retrieval exploded")
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_response_review_trace_can_record_concern_without_changing_answer(
     tmp_path,
@@ -2285,7 +2325,7 @@ async def test_orchestrate_shadow_mode_keeps_answer_unchanged_without_extra_runt
     assert memory_store.added_messages[-1]["content"] == litellm.content
     assert len(litellm.calls) == 1
     assert len(runtime.companion_calls) == 1
-    assert len(runtime.session_calls) == 1
+    assert len(runtime.session_calls) == 0
     assert len(runtime.turn_start_calls) == 1
     assert len(runtime.turn_update_calls) == 2
     assert len(runtime.turn_complete_calls) == 1
@@ -2293,6 +2333,7 @@ async def test_orchestrate_shadow_mode_keeps_answer_unchanged_without_extra_runt
     assert runtime.calls == []
     assert runtime.interrupt_calls == []
     assert runtime.reset_calls == []
+    assert runtime.identity_calls[0]["runtime_session_id"] == "rtsession_1"
 
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["response_review"]["findings"][0]["type"] == "unsupported_memory_claim"
@@ -2600,7 +2641,7 @@ async def test_orchestrate_live_chat_flow_threads_runtime_identity_and_turn_stat
     )
 
     assert len(runtime.companion_calls) == 1
-    assert len(runtime.session_calls) == 1
+    assert len(runtime.session_calls) == 0
     assert len(runtime.turn_start_calls) == 1
     assert len(runtime.turn_update_calls) == 2
     assert len(runtime.turn_complete_calls) == 1
@@ -2608,6 +2649,7 @@ async def test_orchestrate_live_chat_flow_threads_runtime_identity_and_turn_stat
     assert len(runtime.calls) == 1
     assert runtime.interrupt_calls == []
     assert len(runtime.reset_calls) == 0
+    assert runtime.identity_calls[0]["runtime_session_id"] == "rtsession_1"
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["runtime_session"]["runtime_session_id"] == "rtsession_1"
     assert prompt_trace["runtime_identity"]["active_persona_id"] == "technical_architect"

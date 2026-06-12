@@ -177,6 +177,7 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         owner_id="owner",
         conversation_id="conv",
         surface="dev",
+        runtime_session_id="rtsession_1",
     )
 
     assert [path for path, _ in calls] == [
@@ -186,3 +187,4 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         "/v1/runtime/turns/complete",
         "/v1/runtime/identity/resolve",
     ]
+    assert calls[-1][1]["runtime_session_id"] == "rtsession_1"
