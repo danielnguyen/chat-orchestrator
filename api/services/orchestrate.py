@@ -50,6 +50,18 @@ def _companion_disabled_trace() -> dict[str, Any]:
     }
 
 
+def _runtime_session_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
+def _turn_state_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
+def _runtime_identity_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
 def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -323,6 +335,256 @@ async def _resolve_companion_policy(
         "companion_overlay_ids": [
             item["overlay_id"] for item in included_overlays if item.get("overlay_id")
         ],
+    }
+
+
+async def _resolve_runtime_session(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.resolve_session(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "runtime_session_unavailable",
+        }
+    session = response.get("runtime_session") if isinstance(response, dict) else None
+    if not isinstance(session, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_session_response",
+        }
+    return session, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": session.get("runtime_session_id"),
+        "session_status": session.get("status"),
+        "surface": session.get("surface"),
+    }
+
+
+def _runtime_session_trace_from_session(
+    session: dict[str, Any] | None,
+    *,
+    attempted: bool,
+    omission_reason: str,
+    error_type: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(session, dict):
+        trace = {
+            "attempted": attempted,
+            "status": "failed",
+            "included": False,
+            "omission_reason": omission_reason,
+        }
+        if error_type is not None:
+            trace["error_type"] = error_type
+        return trace
+    return {
+        "attempted": attempted,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": session.get("runtime_session_id"),
+        "session_status": session.get("status"),
+        "surface": session.get("surface"),
+    }
+
+
+async def _start_runtime_turn(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    input_message_id: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.start_turn(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            input_message_id=input_message_id,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "runtime_turn_unavailable",
+        }
+    turn = response.get("runtime_turn") if isinstance(response, dict) else None
+    session = response.get("runtime_session") if isinstance(response, dict) else None
+    if not isinstance(turn, dict) or not isinstance(session, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_turn_response",
+        }
+    return response, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": session.get("runtime_session_id"),
+        "runtime_turn_id": turn.get("runtime_turn_id"),
+        "turn_status": turn.get("turn_status"),
+    }
+
+
+async def _advance_runtime_turn(
+    *,
+    runtime: Any | None,
+    turn_state_trace: dict[str, Any],
+    request_id: str,
+    turn_status: str,
+) -> None:
+    runtime_session_id = turn_state_trace.get("runtime_session_id")
+    runtime_turn_id = turn_state_trace.get("runtime_turn_id")
+    if runtime is None or not runtime_session_id or not runtime_turn_id:
+        return
+    try:
+        response = await runtime.update_turn(
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            turn_status=turn_status,
+        )
+        if isinstance(response, dict):
+            turn = response.get("runtime_turn", {}) or {}
+            turn_state_trace["turn_status"] = turn.get("turn_status", turn_status)
+    except Exception as e:
+        turn_state_trace.setdefault("warnings", []).append(type(e).__name__)
+
+
+async def _complete_runtime_turn(
+    *,
+    runtime: Any | None,
+    turn_state_trace: dict[str, Any],
+    request_id: str,
+    turn_status: str,
+) -> None:
+    runtime_session_id = turn_state_trace.get("runtime_session_id")
+    runtime_turn_id = turn_state_trace.get("runtime_turn_id")
+    if runtime is None or not runtime_session_id or not runtime_turn_id:
+        return
+    try:
+        response = await runtime.complete_turn(
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            turn_status=turn_status,
+        )
+        if isinstance(response, dict):
+            turn = response.get("runtime_turn", {}) or {}
+            turn_state_trace["turn_status"] = turn.get("turn_status", turn_status)
+            turn_state_trace["completed"] = True
+    except Exception as e:
+        turn_state_trace.setdefault("warnings", []).append(type(e).__name__)
+
+
+async def _resolve_runtime_identity(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.resolve_identity(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "runtime_identity_unavailable",
+        }
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_identity_response",
+        }
+    identity = response.get("runtime_identity")
+    trace = response.get("trace") or {}
+    if not isinstance(identity, dict) or not isinstance(trace, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": "malformed_identity_payload",
+            "omission_reason": "malformed_runtime_identity_response",
+        }
+    return identity, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_session_id": trace.get("runtime_session_id"),
+        "active_persona_id": trace.get("active_persona_id"),
+        "persona_resolution_reason": trace.get("persona_resolution_reason"),
+        "persona_override_source": trace.get("persona_override_source"),
+        "surface_id": trace.get("surface_id"),
+        "surface_type": trace.get("surface_type"),
+        "surface_display_name": trace.get("surface_display_name"),
+        "advisory_memory_scope_summary": trace.get("advisory_memory_scope_summary", []),
+        "advisory_tool_permission_summary": trace.get(
+            "advisory_tool_permission_summary", []
+        ),
     }
 
 
@@ -689,9 +951,10 @@ async def orchestrate_chat(
     conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
 
     # Persist incoming user messages first.
+    last_user_message_id = None
     for msg in payload["messages"]:
         if msg["role"] == "user":
-            await memory_store.add_message(
+            saved = await memory_store.add_message(
                 conversation_id=conversation_id,
                 owner_id=payload["owner_id"],
                 role="user",
@@ -699,6 +962,7 @@ async def orchestrate_chat(
                 client_id=payload.get("client_id"),
                 metadata={"surface": payload.get("surface", "unknown")},
             )
+            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
 
     profile = await memory_store.resolve_profile(
         owner_id=payload["owner_id"],
@@ -739,355 +1003,430 @@ async def orchestrate_chat(
         external_calls_allowed=not local_only,
         query=last_user_text,
     )
-    retrieval_bundle = await memory_store.retrieve_bundle(
-        request_id=request_id,
-        conversation_id=conversation_id,
-        owner_id=payload["owner_id"],
-        query=last_user_text,
-        retrieval=effective_payload.get("retrieval"),
-    )
-    companion_overlays, companion_trace = await _resolve_companion_policy(
+    turn_response, turn_state_trace = await _start_runtime_turn(
         runtime=runtime,
-        enabled=companion_policy_enabled,
         request_id=request_id,
         owner_id=payload["owner_id"],
         conversation_id=conversation_id,
         surface=payload.get("surface", "unknown"),
-        requested_scene=payload.get("requested_scene"),
+        input_message_id=last_user_message_id,
     )
-    interrupt_trace = await _resolve_interrupt_policy(
-        runtime=runtime,
-        interrupt_policy_mode=interrupt_policy_mode,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=payload.get("surface", "unknown"),
-        current_user_text=last_user_text,
-        recent_messages=effective_payload["messages"],
-        requested_scene=payload.get("requested_scene"),
+    runtime_session = turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
+    runtime_session_trace = _runtime_session_trace_from_session(
+        runtime_session,
+        attempted=bool(turn_state_trace.get("attempted")),
+        omission_reason=turn_state_trace.get(
+            "omission_reason",
+            "runtime_session_missing_from_turn_response",
+        ),
+        error_type=turn_state_trace.get("error_type"),
     )
-    runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
-        runtime=runtime,
-        enable_runtime_overlays=enable_runtime_overlays,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=payload.get("surface", "unknown"),
-    )
-    signals = _compute_signals(effective_payload, retrieval_bundle)
-    registry = _load_model_registry(model_registry_path)
+    try:
+        await _advance_runtime_turn(
+            runtime=runtime,
+            turn_state_trace=turn_state_trace,
+            request_id=request_id,
+            turn_status="retrieving",
+        )
+        retrieval_bundle = await memory_store.retrieve_bundle(
+            request_id=request_id,
+            conversation_id=conversation_id,
+            owner_id=payload["owner_id"],
+            query=last_user_text,
+            retrieval=effective_payload.get("retrieval"),
+        )
+        companion_overlays, companion_trace = await _resolve_companion_policy(
+            runtime=runtime,
+            enabled=companion_policy_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+            requested_scene=payload.get("requested_scene"),
+        )
+        interrupt_trace = await _resolve_interrupt_policy(
+            runtime=runtime,
+            interrupt_policy_mode=interrupt_policy_mode,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+            current_user_text=last_user_text,
+            recent_messages=effective_payload["messages"],
+            requested_scene=payload.get("requested_scene"),
+        )
+        runtime_identity, runtime_identity_trace = await _resolve_runtime_identity(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        )
+        runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
+            runtime=runtime,
+            enable_runtime_overlays=enable_runtime_overlays,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+        )
+        signals = _compute_signals(effective_payload, retrieval_bundle)
+        registry = _load_model_registry(model_registry_path)
 
-    override_requested = effective_payload.get("model_override")
-    override = override_requested if allow_manual_override else None
-    override_reason = None
-    if override_requested and not allow_manual_override:
-        override_reason = "disabled"
-    if override and local_only and _model_provider(override, registry, None) != "local":
-        override = None
-        override_reason = "rejected_local_only"
+        override_requested = effective_payload.get("model_override")
+        override = override_requested if allow_manual_override else None
+        override_reason = None
+        if override_requested and not allow_manual_override:
+            override_reason = "disabled"
+        if override and local_only and _model_provider(override, registry, None) != "local":
+            override = None
+            override_reason = "rejected_local_only"
 
-    route = evaluate_route(
-        rules_path=rules_path,
-        model_registry_path=model_registry_path,
-        signals=signals,
-        model_override=override,
-    )
+        route = evaluate_route(
+            rules_path=rules_path,
+            model_registry_path=model_registry_path,
+            signals=signals,
+            model_override=override,
+        )
 
-    selected_model = route["selected_model"]
-    selected_provider = _model_provider(selected_model, registry, route.get("provider"))
+        selected_model = route["selected_model"]
+        selected_provider = _model_provider(selected_model, registry, route.get("provider"))
 
-    if local_only and selected_provider != "local":
-        local_candidate = _policy_pick_model(
+        if local_only and selected_provider != "local":
+            local_candidate = _policy_pick_model(
+                registry,
+                provider="local",
+                cost_mode=cost_mode,
+                latency_mode=latency_mode,
+            )
+            if not local_candidate:
+                await _create_error_trace(
+                    memory_store=memory_store,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    payload=effective_payload,
+                    profile=profile,
+                    retrieval_bundle=retrieval_bundle,
+                    last_user_text=last_user_text,
+                    route=route,
+                    selected_model=selected_model,
+                    selected_provider=selected_provider,
+                    sensitivity_local_only=sensitivity_local_only,
+                    profile_local_only=profile_local_only,
+                    effective_local_only=local_only,
+                    override_requested=override_requested,
+                    override_applied=bool(override),
+                    override_reason=override_reason,
+                    failure_reason="no_local_model_available",
+                    started=started,
+                    prompt_trace={
+                        "style": style_trace,
+                        "response_shape": response_shape_trace,
+                        "companion_policy": companion_trace,
+                        "runtime": runtime_trace,
+                        "dsa": dsa_trace,
+                    },
+                    surface_presence_trace=surface_presence_trace,
+                    dsa_trace=dsa_trace,
+                )
+                raise RuntimeError("local_only policy active but no local model available")
+            selected_model = local_candidate
+            selected_provider = "local"
+
+        policy_candidate = _policy_pick_model(
             registry,
-            provider="local",
+            provider=selected_provider,
             cost_mode=cost_mode,
             latency_mode=latency_mode,
         )
-        if not local_candidate:
-            await _create_error_trace(
-                memory_store=memory_store,
-                request_id=request_id,
-                conversation_id=conversation_id,
-                payload=effective_payload,
-                profile=profile,
-                retrieval_bundle=retrieval_bundle,
-                last_user_text=last_user_text,
-                route=route,
-                selected_model=selected_model,
-                selected_provider=selected_provider,
-                sensitivity_local_only=sensitivity_local_only,
-                profile_local_only=profile_local_only,
-                effective_local_only=local_only,
-                override_requested=override_requested,
-                override_applied=bool(override),
-                override_reason=override_reason,
-                failure_reason="no_local_model_available",
-                started=started,
-                prompt_trace={
-                    "style": style_trace,
-                    "response_shape": response_shape_trace,
-                    "companion_policy": companion_trace,
-                    "runtime": runtime_trace,
-                    "dsa": dsa_trace,
-                },
-                surface_presence_trace=surface_presence_trace,
-                dsa_trace=dsa_trace,
-            )
-            raise RuntimeError("local_only policy active but no local model available")
-        selected_model = local_candidate
-        selected_provider = "local"
+        if policy_candidate:
+            selected_model = policy_candidate
+            selected_provider = _model_provider(selected_model, registry, selected_provider)
 
-    policy_candidate = _policy_pick_model(
-        registry,
-        provider=selected_provider,
-        cost_mode=cost_mode,
-        latency_mode=latency_mode,
-    )
-    if policy_candidate:
-        selected_model = policy_candidate
-        selected_provider = _model_provider(selected_model, registry, selected_provider)
+        status = "ok"
+        fallback_used = False
+        model_error = None
 
-    status = "ok"
-    fallback_used = False
-    model_error = None
-
-    handoff = build_assistant_handoff(
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=payload.get("surface", "unknown"),
-        route=route,
-        selected_model=selected_model,
-        selected_provider=selected_provider,
-        effective_local_only=local_only,
-        manual_override_requested=override_requested,
-        manual_override_applied=bool(override),
-        manual_override_rejection_reason=override_reason,
-        style_trace=style_trace,
-        response_shape_trace=response_shape_trace,
-        surface_presence_trace=surface_presence_trace,
-        companion_overlays=companion_overlays,
-        companion_trace=companion_trace,
-        runtime_overlay=runtime_overlay,
-        runtime_trace=runtime_trace,
-        retrieval_query=last_user_text,
-        retrieval_bundle=retrieval_bundle,
-        interrupt_trace=interrupt_trace,
-    )
-
-    presentation = build_companion_presentation(handoff)
-
-    prompt = assemble_prompt(
-        profile=profile,
-        retrieval_bundle=retrieval_bundle,
-        current_messages=effective_payload["messages"],
-        handoff=handoff,
-        presentation=presentation,
-        style_guidance=style_guidance,
-        style_trace=style_trace,
-        response_shape_guidance=response_shape_guidance,
-        response_shape_trace=response_shape_trace,
-        surface_presence_trace=surface_presence_trace,
-        companion_overlays=companion_overlays,
-        companion_trace=companion_trace,
-        runtime_overlay=runtime_overlay,
-        runtime_trace=runtime_trace,
-        interrupt_trace=interrupt_trace,
-        external_context_pack=external_context_pack,
-        dsa_trace=dsa_trace,
-    )
-    messages = prompt.messages
-
-    model_started = perf_counter()
-    try:
-        completion = await litellm.chat(
+        handoff = build_assistant_handoff(
             request_id=request_id,
-            model=selected_model,
-            messages=messages,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+            route=route,
+            selected_model=selected_model,
+            selected_provider=selected_provider,
+            effective_local_only=local_only,
+            manual_override_requested=override_requested,
+            manual_override_applied=bool(override),
+            manual_override_rejection_reason=override_reason,
+            style_trace=style_trace,
+            response_shape_trace=response_shape_trace,
+            surface_presence_trace=surface_presence_trace,
+            companion_overlays=companion_overlays,
+            companion_trace=companion_trace,
+            runtime_overlay=runtime_overlay,
+            runtime_trace=runtime_trace,
+            retrieval_query=last_user_text,
+            retrieval_bundle=retrieval_bundle,
+            interrupt_trace=interrupt_trace,
         )
-    except Exception as e:  # pragma: no cover
-        fallback = choose_fallback(route)
-        if fallback:
-            fallback_used = True
-            status = "degraded"
-            fallback_model = fallback["selected_model"]
-            fallback_provider = _model_provider(fallback_model, registry, fallback.get("provider"))
-            if local_only and fallback_provider != "local":
-                local_fallback = _policy_pick_model(
-                    registry,
-                    provider="local",
-                    cost_mode=cost_mode,
-                    latency_mode=latency_mode,
-                )
-                if not local_fallback:
-                    await _create_error_trace(
-                        memory_store=memory_store,
-                        request_id=request_id,
-                        conversation_id=conversation_id,
-                        payload=effective_payload,
-                        profile=profile,
-                        retrieval_bundle=retrieval_bundle,
-                        last_user_text=last_user_text,
-                        route=route,
-                        selected_model=fallback_model,
-                        selected_provider=fallback_provider,
-                        sensitivity_local_only=sensitivity_local_only,
-                        profile_local_only=profile_local_only,
-                        effective_local_only=local_only,
-                        override_requested=override_requested,
-                        override_applied=bool(override),
-                        override_reason=override_reason,
-                        failure_reason="no_local_model_available",
-                        started=started,
-                        fallback_used=True,
-                        prompt_trace=prompt.trace,
-                        surface_presence_trace=surface_presence_trace,
-                        dsa_trace=dsa_trace,
-                    )
-                    raise RuntimeError("local_only policy active but no local fallback available")
-                fallback_model = local_fallback
-                fallback_provider = "local"
-            selected_model = fallback_model
-            selected_provider = fallback_provider
+
+        presentation = build_companion_presentation(handoff)
+
+        prompt = assemble_prompt(
+            profile=profile,
+            retrieval_bundle=retrieval_bundle,
+            current_messages=effective_payload["messages"],
+            handoff=handoff,
+            presentation=presentation,
+            style_guidance=style_guidance,
+            style_trace=style_trace,
+            response_shape_guidance=response_shape_guidance,
+            response_shape_trace=response_shape_trace,
+            surface_presence_trace=surface_presence_trace,
+            companion_overlays=companion_overlays,
+            companion_trace=companion_trace,
+            runtime_identity=runtime_identity,
+            runtime_identity_trace=runtime_identity_trace,
+            runtime_overlay=runtime_overlay,
+            runtime_trace=runtime_trace,
+            interrupt_trace=interrupt_trace,
+            external_context_pack=external_context_pack,
+            dsa_trace=dsa_trace,
+        )
+        messages = prompt.messages
+
+        model_started = perf_counter()
+        await _advance_runtime_turn(
+            runtime=runtime,
+            turn_state_trace=turn_state_trace,
+            request_id=request_id,
+            turn_status="responding",
+        )
+        try:
             completion = await litellm.chat(
                 request_id=request_id,
                 model=selected_model,
                 messages=messages,
             )
-            model_error = str(e)
-        else:
-            raise
+        except Exception as e:  # pragma: no cover
+            fallback = choose_fallback(route)
+            if fallback:
+                fallback_used = True
+                status = "degraded"
+                fallback_model = fallback["selected_model"]
+                fallback_provider = _model_provider(
+                    fallback_model,
+                    registry,
+                    fallback.get("provider"),
+                )
+                if local_only and fallback_provider != "local":
+                    local_fallback = _policy_pick_model(
+                        registry,
+                        provider="local",
+                        cost_mode=cost_mode,
+                        latency_mode=latency_mode,
+                    )
+                    if not local_fallback:
+                        await _create_error_trace(
+                            memory_store=memory_store,
+                            request_id=request_id,
+                            conversation_id=conversation_id,
+                            payload=effective_payload,
+                            profile=profile,
+                            retrieval_bundle=retrieval_bundle,
+                            last_user_text=last_user_text,
+                            route=route,
+                            selected_model=fallback_model,
+                            selected_provider=fallback_provider,
+                            sensitivity_local_only=sensitivity_local_only,
+                            profile_local_only=profile_local_only,
+                            effective_local_only=local_only,
+                            override_requested=override_requested,
+                            override_applied=bool(override),
+                            override_reason=override_reason,
+                            failure_reason="no_local_model_available",
+                            started=started,
+                            fallback_used=True,
+                            prompt_trace=prompt.trace,
+                            surface_presence_trace=surface_presence_trace,
+                            dsa_trace=dsa_trace,
+                        )
+                        await _complete_runtime_turn(
+                            runtime=runtime,
+                            turn_state_trace=turn_state_trace,
+                            request_id=request_id,
+                            turn_status="abandoned",
+                        )
+                        raise RuntimeError("local_only policy active but no local fallback available")
+                    fallback_model = local_fallback
+                    fallback_provider = "local"
+                selected_model = fallback_model
+                selected_provider = fallback_provider
+                completion = await litellm.chat(
+                    request_id=request_id,
+                    model=selected_model,
+                    messages=messages,
+                )
+                model_error = str(e)
+            else:
+                await _complete_runtime_turn(
+                    runtime=runtime,
+                    turn_state_trace=turn_state_trace,
+                    request_id=request_id,
+                    turn_status="abandoned",
+                )
+                raise
 
-    model_latency_ms = int((perf_counter() - model_started) * 1000)
+        model_latency_ms = int((perf_counter() - model_started) * 1000)
 
-    raw_answer = completion["choices"][0]["message"]["content"]
-    response_review = review_response(
-        ResponseReviewInput(
-            candidate_text=raw_answer,
-            handoff=handoff,
-            presentation=presentation,
-            prompt_trace=prompt.trace,
+        raw_answer = completion["choices"][0]["message"]["content"]
+        response_review = review_response(
+            ResponseReviewInput(
+                candidate_text=raw_answer,
+                handoff=handoff,
+                presentation=presentation,
+                prompt_trace=prompt.trace,
+            )
         )
-    )
-    response_action = apply_response_action(
-        ResponseActionInput(
-            mode=response_action_mode,
-            candidate_text=raw_answer,
-            response_review=response_review,
+        response_action = apply_response_action(
+            ResponseActionInput(
+                mode=response_action_mode,
+                candidate_text=raw_answer,
+                response_review=response_review,
+            )
         )
-    )
-    prompt.trace["response_review"] = response_review.to_trace()
-    prompt.trace["response_action"] = response_action.to_trace()
-    candidate_answer = response_action.candidate_text
-    answer = candidate_answer
-    brief_metadata = {"enabled": False}
-    if effective_payload.get("response_mode") == "brief":
-        brief_result = generate_brief(
-            content=candidate_answer,
-            brief_type=effective_payload.get("brief_type", "general"),
-            depth_level=effective_payload.get("brief_depth") or 1,
-            surface=effective_payload.get("surface", payload.get("surface", "chat")),
-            source="explicit_user_request",
-            explicit_request=True,
+        prompt.trace["response_review"] = response_review.to_trace()
+        prompt.trace["response_action"] = response_action.to_trace()
+        candidate_answer = response_action.candidate_text
+        answer = candidate_answer
+        brief_metadata = {"enabled": False}
+        if effective_payload.get("response_mode") == "brief":
+            brief_result = generate_brief(
+                content=candidate_answer,
+                brief_type=effective_payload.get("brief_type", "general"),
+                depth_level=effective_payload.get("brief_depth") or 1,
+                surface=effective_payload.get("surface", payload.get("surface", "chat")),
+                source="explicit_user_request",
+                explicit_request=True,
+            )
+            answer = brief_result.rendered
+            brief_metadata = {
+                **brief_result.debug,
+                "raw_model_answer": raw_answer,
+                "shaped_answer": answer,
+            }
+
+        await memory_store.add_message(
+            conversation_id=conversation_id,
+            owner_id=payload["owner_id"],
+            role="assistant",
+            content=answer,
+            client_id=payload.get("client_id"),
+            metadata={"request_id": request_id, "selected_model": selected_model},
         )
-        answer = brief_result.rendered
-        brief_metadata = {
-            **brief_result.debug,
-            "raw_model_answer": raw_answer,
-            "shaped_answer": answer,
-        }
 
-    await memory_store.add_message(
-        conversation_id=conversation_id,
-        owner_id=payload["owner_id"],
-        role="assistant",
-        content=answer,
-        client_id=payload.get("client_id"),
-        metadata={"request_id": request_id, "selected_model": selected_model},
-    )
+        await _reset_runtime_after_turn(
+            runtime=runtime,
+            runtime_trace=runtime_trace,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+        )
+        await _complete_runtime_turn(
+            runtime=runtime,
+            turn_state_trace=turn_state_trace,
+            request_id=request_id,
+            turn_status="completed",
+        )
+        prompt.trace["runtime"] = runtime_trace
+        prompt.trace["runtime_session"] = runtime_session_trace
+        prompt.trace["turn_state"] = turn_state_trace
+        prompt.trace["runtime_identity"] = runtime_identity_trace
+        prompt.trace["surface_presence"] = apply_surface_presence_outcome(
+            surface_presence_trace,
+            fallback_active=fallback_used,
+        )
 
-    await _reset_runtime_after_turn(
-        runtime=runtime,
-        runtime_trace=runtime_trace,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=payload.get("surface", "unknown"),
-    )
-    prompt.trace["runtime"] = runtime_trace
-    prompt.trace["surface_presence"] = apply_surface_presence_outcome(
-        surface_presence_trace,
-        fallback_active=fallback_used,
-    )
+        await memory_store.create_trace(
+            request_id=request_id,
+            payload={
+                "request_id": request_id,
+                "conversation_id": conversation_id,
+                "owner_id": payload["owner_id"],
+                "client_id": payload.get("client_id"),
+                "surface": payload.get("surface", "unknown"),
+                "profile": {
+                    "name": profile["profile_name"],
+                    "version": profile["profile_version"],
+                    "effective_profile_ref": profile["effective_profile_ref"],
+                },
+                "retrieval": {
+                    "query": last_user_text,
+                    "bundle": retrieval_bundle.get("bundle", {}),
+                    "prompt_assembly": prompt.trace,
+                },
+                "router_decision": {
+                    "rule_id": route.get("rule_id"),
+                    "selected_model": selected_model,
+                    "provider": selected_provider,
+                    "rationale": route.get("rationale"),
+                    "fallbacks": route.get("fallbacks", []),
+                    "routing_contract": routing_trace_metadata(
+                        sensitivity=effective_payload.get("sensitivity", "private"),
+                        request_local_only=sensitivity_local_only,
+                        profile_local_only=profile_local_only,
+                        effective_local_only=local_only,
+                        manual_override_requested=override_requested,
+                        manual_override_applied=bool(override),
+                        manual_override_rejection_reason=override_reason,
+                        selected_model=selected_model,
+                        selected_provider=selected_provider,
+                        fallback_used=fallback_used,
+                    ),
+                },
+                "manual_override": {
+                    "requested_model": override_requested,
+                    "applied": bool(override),
+                    "rejection_reason": override_reason,
+                },
+                "model_call": {
+                    "provider": selected_provider,
+                    "model": selected_model,
+                    "latency_ms": model_latency_ms,
+                    "error": model_error,
+                    "brief": brief_metadata,
+                },
+                "fallback": {
+                    "triggered": fallback_used,
+                    "reason": "provider_error" if fallback_used else None,
+                },
+                "dsa": dsa_trace,
+                "cost": {},
+                "latency_ms": int((perf_counter() - started) * 1000),
+                "status": status,
+                "error": model_error,
+                "created_at": datetime.now(UTC).isoformat(),
+            },
+        )
 
-    await memory_store.create_trace(
-        request_id=request_id,
-        payload={
+        return {
             "request_id": request_id,
             "conversation_id": conversation_id,
-            "owner_id": payload["owner_id"],
-            "client_id": payload.get("client_id"),
-            "surface": payload.get("surface", "unknown"),
-            "profile": {
-                "name": profile["profile_name"],
-                "version": profile["profile_version"],
-                "effective_profile_ref": profile["effective_profile_ref"],
-            },
-            "retrieval": {
-                "query": last_user_text,
-                "bundle": retrieval_bundle.get("bundle", {}),
-                "prompt_assembly": prompt.trace,
-            },
-            "router_decision": {
-                "rule_id": route.get("rule_id"),
-                "selected_model": selected_model,
-                "provider": selected_provider,
-                "rationale": route.get("rationale"),
-                "fallbacks": route.get("fallbacks", []),
-                "routing_contract": routing_trace_metadata(
-                    sensitivity=effective_payload.get("sensitivity", "private"),
-                    request_local_only=sensitivity_local_only,
-                    profile_local_only=profile_local_only,
-                    effective_local_only=local_only,
-                    manual_override_requested=override_requested,
-                    manual_override_applied=bool(override),
-                    manual_override_rejection_reason=override_reason,
-                    selected_model=selected_model,
-                    selected_provider=selected_provider,
-                    fallback_used=fallback_used,
-                ),
-            },
-            "manual_override": {
-                "requested_model": override_requested,
-                "applied": bool(override),
-                "rejection_reason": override_reason,
-            },
-            "model_call": {
-                "provider": selected_provider,
-                "model": selected_model,
-                "latency_ms": model_latency_ms,
-                "error": model_error,
-                "brief": brief_metadata,
-            },
-            "fallback": {
-                "triggered": fallback_used,
-                "reason": "provider_error" if fallback_used else None,
-            },
-            "dsa": dsa_trace,
-            "cost": {},
-            "latency_ms": int((perf_counter() - started) * 1000),
+            "profile_name": profile["profile_name"],
+            "selected_model": selected_model,
+            "answer": answer,
             "status": status,
-            "error": model_error,
-            "created_at": datetime.now(UTC).isoformat(),
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "conversation_id": conversation_id,
-        "profile_name": profile["profile_name"],
-        "selected_model": selected_model,
-        "answer": answer,
-        "status": status,
-        "sources": retrieval_bundle.get("bundle", {}).get("artifact_refs", []),
-    }
+            "sources": retrieval_bundle.get("bundle", {}).get("artifact_refs", []),
+        }
+    except Exception:
+        if turn_state_trace.get("runtime_turn_id") and not turn_state_trace.get("completed"):
+            await _complete_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="abandoned",
+            )
+        raise
