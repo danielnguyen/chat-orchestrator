@@ -106,6 +106,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
         "companion_policy",
         "runtime_identity",
         "world_state",
+        "relationship_context",
         "runtime_overlay",
         "external_source_context",
     ]
@@ -137,6 +138,7 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "companion_policy",
         "runtime_identity",
         "world_state",
+        "relationship_context",
         "runtime_overlay",
         "external_source_context",
         "retrieval_augmentation",
@@ -299,6 +301,83 @@ def test_assemble_prompt_includes_response_shape_after_style_guidance():
     assert response_shape_layer["metadata"]["continuation_state"] == "abbreviated"
     assert response_shape_layer["metadata"]["abbreviation_reason"] == "spoken_output"
     assert out.trace["response_shape"]["status"] == "included"
+
+
+def test_assemble_prompt_includes_relationship_context_between_world_state_and_runtime_overlay():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        runtime_identity={
+            "active_persona_id": "technical_architect",
+            "surface_id": "dev",
+            "capability_domain": "software_architecture",
+            "advisory_memory_scope_summary": ["technical_context"],
+            "advisory_tool_permission_summary": ["inspect_repository"],
+            "content": "Runtime identity: persona=technical_architect;",
+        },
+        runtime_identity_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "active_persona_id": "technical_architect",
+        },
+        world_state={"prompt_content": "World state:\n- active_repository/branch_status: ok"},
+        world_state_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "included_claim_count": 1,
+        },
+        relationship_context={
+            "prompt_content": "Relationship context:\n- Project Alpha works_on Repo Alpha",
+        },
+        relationship_context_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "selected_relationship_count": 1,
+            "excluded_relationship_count": 0,
+            "relationship_edges_used": ["rel_1"],
+            "relationship_edges_excluded": [],
+            "relationship_exclusion_reasons": {},
+            "relationship_context_overlay_applied": True,
+            "relationship_conflicts": [],
+            "relationship_confirmation_required": False,
+            "active_persona_id": "technical_architect",
+            "allowed_relationship_scopes": ["project_context"],
+        },
+        runtime_overlay={
+            "runtime_state_id": "rtstate_1",
+            "overlay_id": "rtoverlay_1",
+            "overlay_type": "runtime_state",
+            "role": "system",
+            "content": "Runtime context: scene=planning.",
+            "source_fields": ["active_scene"],
+        },
+        runtime_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+        },
+    )
+
+    assert out.trace["included_layers"] == [
+        "profile_overlay",
+        "runtime_identity",
+        "world_state",
+        "relationship_context",
+        "runtime_overlay",
+        "current_messages",
+    ]
+    assert out.messages[3]["content"] == (
+        "Relationship context:\n- Project Alpha works_on Repo Alpha"
+    )
+    relationship_layer = next(
+        layer for layer in out.trace["layers"] if layer["name"] == "relationship_context"
+    )
+    assert relationship_layer["metadata"]["relationship_edges_used"] == ["rel_1"]
+    assert out.trace["relationship_context"]["selected_relationship_count"] == 1
 
 
 def test_assemble_prompt_includes_interrupt_trace_without_changing_messages():

@@ -160,6 +160,8 @@ def assemble_prompt(
     runtime_identity_trace: dict[str, Any] | None = None,
     world_state: dict[str, Any] | None = None,
     world_state_trace: dict[str, Any] | None = None,
+    relationship_context: dict[str, Any] | None = None,
+    relationship_context_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
@@ -405,6 +407,56 @@ def assemble_prompt(
         )
     )
 
+    relationship_context_messages: list[dict[str, str]] = []
+    relationship_context_trace_out = dict(relationship_context_trace or {})
+    relationship_context_omission_reason = relationship_context_trace_out.get(
+        "omission_reason"
+    )
+    if relationship_context and relationship_context.get("prompt_content"):
+        relationship_context_messages.append(
+            {"role": "system", "content": relationship_context["prompt_content"]}
+        )
+        messages.extend(relationship_context_messages)
+    layers.append(
+        _layer_trace(
+            "relationship_context",
+            relationship_context_messages,
+            metadata={
+                "selected_relationship_count": relationship_context_trace_out.get(
+                    "selected_relationship_count", 0
+                ),
+                "excluded_relationship_count": relationship_context_trace_out.get(
+                    "excluded_relationship_count", 0
+                ),
+                "relationship_edges_used": relationship_context_trace_out.get(
+                    "relationship_edges_used", []
+                ),
+                "relationship_edges_excluded": relationship_context_trace_out.get(
+                    "relationship_edges_excluded", []
+                ),
+                "relationship_exclusion_reasons": relationship_context_trace_out.get(
+                    "relationship_exclusion_reasons", {}
+                ),
+                "relationship_context_overlay_applied": relationship_context_trace_out.get(
+                    "relationship_context_overlay_applied", False
+                ),
+                "relationship_conflicts": relationship_context_trace_out.get(
+                    "relationship_conflicts", []
+                ),
+                "relationship_confirmation_required": relationship_context_trace_out.get(
+                    "relationship_confirmation_required", False
+                ),
+                "active_persona_id": relationship_context_trace_out.get(
+                    "active_persona_id"
+                ),
+                "allowed_relationship_scopes": relationship_context_trace_out.get(
+                    "allowed_relationship_scopes", []
+                ),
+                "omission_reason": relationship_context_omission_reason,
+            },
+        )
+    )
+
     runtime_messages: list[dict[str, str]] = []
     runtime_trace_out = dict(runtime_trace or {})
     runtime_omission_reason = runtime_trace_out.get("omission_reason")
@@ -488,6 +540,8 @@ def assemble_prompt(
         "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},
         "world_state": world_state_trace_out or {"attempted": False, "status": "not_requested"},
+        "relationship_context": relationship_context_trace_out
+        or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
         "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
         "message_count": len(messages),

@@ -66,6 +66,10 @@ def _world_state_disabled_trace() -> dict[str, Any]:
     return {"attempted": False, "status": "disabled", "included": False}
 
 
+def _relationship_context_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
 def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -739,6 +743,93 @@ async def _resolve_world_state(
     }
 
 
+async def _resolve_relationship_context(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    active_persona_id: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.relationship_select(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "relationship_context_unavailable",
+        }
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_relationship_context_response",
+        }
+    trace = response.get("trace")
+    selected_relationships = response.get("selected_relationships")
+    prompt_content = response.get("prompt_content")
+    if not isinstance(trace, dict) or not isinstance(selected_relationships, list):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": "malformed_relationship_context_payload",
+            "omission_reason": "malformed_relationship_context_response",
+        }
+    base_trace = {
+        "attempted": True,
+        "selected_relationship_count": trace.get("selected_relationship_count", 0),
+        "excluded_relationship_count": trace.get("excluded_relationship_count", 0),
+        "relationship_edges_used": trace.get("relationship_edges_used", []),
+        "relationship_edges_excluded": trace.get("relationship_edges_excluded", []),
+        "relationship_exclusion_reasons": trace.get(
+            "relationship_exclusion_reasons", {}
+        ),
+        "relationship_context_overlay_applied": bool(
+            trace.get("relationship_context_overlay_applied", False)
+        ),
+        "relationship_conflicts": trace.get("relationship_conflicts", []),
+        "relationship_confirmation_required": bool(
+            trace.get("relationship_confirmation_required", False)
+        ),
+        "active_persona_id": trace.get("active_persona_id"),
+        "allowed_relationship_scopes": trace.get("allowed_relationship_scopes", []),
+    }
+    if not isinstance(prompt_content, str) or not prompt_content:
+        return None, {
+            **base_trace,
+            "status": "omitted",
+            "included": False,
+            "omission_reason": "empty_relationship_context",
+        }
+    return {"prompt_content": prompt_content}, {
+        **base_trace,
+        "status": "included",
+        "included": True,
+    }
+
+
 async def _resolve_interrupt_policy(
     *,
     runtime: Any | None,
@@ -1164,6 +1255,17 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
+        relationship_context, relationship_context_trace = (
+            await _resolve_relationship_context(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=payload.get("surface", "unknown"),
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            )
+        )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -1226,6 +1328,7 @@ async def orchestrate_chat(
                         "response_shape": response_shape_trace,
                         "companion_policy": companion_trace,
                         "world_state": world_state_trace,
+                        "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
                         "dsa": dsa_trace,
                     },
@@ -1293,6 +1396,8 @@ async def orchestrate_chat(
             runtime_identity_trace=runtime_identity_trace,
             world_state=world_state,
             world_state_trace=world_state_trace,
+            relationship_context=relationship_context,
+            relationship_context_trace=relationship_context_trace,
             runtime_overlay=runtime_overlay,
             runtime_trace=runtime_trace,
             interrupt_trace=interrupt_trace,
@@ -1449,6 +1554,7 @@ async def orchestrate_chat(
         prompt.trace["runtime_session"] = runtime_session_trace
         prompt.trace["turn_state"] = turn_state_trace
         prompt.trace["runtime_identity"] = runtime_identity_trace
+        prompt.trace["relationship_context"] = relationship_context_trace
         prompt.trace["surface_presence"] = apply_surface_presence_outcome(
             surface_presence_trace,
             fallback_active=fallback_used,

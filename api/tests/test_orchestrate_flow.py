@@ -121,8 +121,10 @@ class FakeRuntime:
         self.turn_complete_calls = []
         self.identity_calls = []
         self.world_state_calls = []
+        self.relationship_calls = []
         self.interrupt_calls = []
         self.reset_calls = []
+        self.call_order = []
         self.last_companion_compile_endpoint = None
         self.session_response = {
             "runtime_session": {
@@ -203,6 +205,24 @@ class FakeRuntime:
                 "confirmation_required": False,
             },
         }
+        self.relationship_response = {
+            "selected_entities": [],
+            "selected_relationships": [],
+            "excluded_relationship_summaries": [],
+            "prompt_content": None,
+            "trace": {
+                "relationship_edges_used": [],
+                "relationship_edges_excluded": [],
+                "relationship_exclusion_reasons": {},
+                "relationship_context_overlay_applied": False,
+                "relationship_conflicts": [],
+                "relationship_confirmation_required": False,
+                "selected_relationship_count": 0,
+                "excluded_relationship_count": 0,
+                "active_persona_id": "technical_architect",
+                "allowed_relationship_scopes": ["project_context"],
+            },
+        }
         self.companion_response = companion_response or {
             "profile_id": "default_companion_profile",
             "profile_version": 1,
@@ -256,6 +276,7 @@ class FakeRuntime:
 
     async def compile_companion_policy(self, **kwargs):
         self.companion_calls.append(kwargs)
+        self.call_order.append("companion_policy")
         self.last_companion_compile_endpoint = self.companion_endpoint
         if self.companion_error is not None:
             raise self.companion_error
@@ -272,18 +293,21 @@ class FakeRuntime:
 
     async def resolve_session(self, **kwargs):
         self.session_calls.append(kwargs)
+        self.call_order.append("resolve_session")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.session_response
 
     async def start_turn(self, **kwargs):
         self.turn_start_calls.append(kwargs)
+        self.call_order.append("start_turn")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.turn_response
 
     async def update_turn(self, **kwargs):
         self.turn_update_calls.append(kwargs)
+        self.call_order.append(f"update_turn:{kwargs['turn_status']}")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return {
@@ -296,6 +320,7 @@ class FakeRuntime:
 
     async def complete_turn(self, **kwargs):
         self.turn_complete_calls.append(kwargs)
+        self.call_order.append(f"complete_turn:{kwargs['turn_status']}")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return {
@@ -308,30 +333,42 @@ class FakeRuntime:
 
     async def resolve_identity(self, **kwargs):
         self.identity_calls.append(kwargs)
+        self.call_order.append("resolve_identity")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.identity_response
 
     async def overlay(self, **kwargs):
         self.calls.append(kwargs)
+        self.call_order.append("runtime_overlay")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.response
 
     async def world_state_resolve(self, **kwargs):
         self.world_state_calls.append(kwargs)
+        self.call_order.append("world_state")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.world_state_response
 
+    async def relationship_select(self, **kwargs):
+        self.relationship_calls.append(kwargs)
+        self.call_order.append("relationship_context")
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.relationship_response
+
     async def evaluate_interrupt(self, **kwargs):
         self.interrupt_calls.append(kwargs)
+        self.call_order.append("interrupt")
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.interrupt_response
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
+        self.call_order.append("reset")
         return {"reset": True}
 
 
@@ -447,6 +484,13 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "included": False,
     }
     assert trace_payload["retrieval"]["prompt_assembly"]["runtime_identity"] == {
+        "attempted": False,
+        "status": "failed",
+        "included": False,
+        "error_type": "RuntimeClientNotConfigured",
+        "omission_reason": "runtime_client_not_configured",
+    }
+    assert trace_payload["retrieval"]["prompt_assembly"]["relationship_context"] == {
         "attempted": False,
         "status": "failed",
         "included": False,
@@ -1068,6 +1112,24 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
             "confirmation_required": False,
         },
     }
+    runtime.relationship_response = {
+        "selected_entities": [{"entity_id": "project:alpha"}],
+        "selected_relationships": [{"relationship_id": "rel_1"}],
+        "excluded_relationship_summaries": [{"relationship_id": "rel_2"}],
+        "prompt_content": "Relationship context:\n- Project Alpha works_on Repo Alpha (scope=project_context; confidence=0.90)",
+        "trace": {
+            "relationship_edges_used": ["rel_1"],
+            "relationship_edges_excluded": ["rel_2"],
+            "relationship_exclusion_reasons": {"rel_2": "use_for_routing_only"},
+            "relationship_context_overlay_applied": True,
+            "relationship_conflicts": [],
+            "relationship_confirmation_required": False,
+            "selected_relationship_count": 1,
+            "excluded_relationship_count": 1,
+            "active_persona_id": "technical_architect",
+            "allowed_relationship_scopes": ["project_context"],
+        },
+    }
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
 
@@ -1093,6 +1155,13 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     assert runtime.calls[0]["surface"] == "dev"
     assert len(runtime.calls) == 1
     assert len(runtime.world_state_calls) == 1
+    assert len(runtime.relationship_calls) == 1
+    assert runtime.call_order.index("world_state") < runtime.call_order.index(
+        "relationship_context"
+    )
+    assert runtime.call_order.index("relationship_context") < runtime.call_order.index(
+        "runtime_overlay"
+    )
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
     assert contents[0] == (
         "Runtime identity: persona=technical_architect; surface=dev; "
@@ -1101,6 +1170,10 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     )
     assert contents[1] == 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)'
     assert contents[2] == (
+        "Relationship context:\n"
+        "- Project Alpha works_on Repo Alpha (scope=project_context; confidence=0.90)"
+    )
+    assert contents[3] == (
         "Runtime context: scene=planning; interaction_mode=actionable; "
         "constraints=preserve_flow."
     )
@@ -1109,6 +1182,7 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     assert prompt_trace["included_layers"] == [
         "runtime_identity",
         "world_state",
+        "relationship_context",
         "runtime_overlay",
         "retrieval_augmentation",
         "recent_history",
@@ -1128,6 +1202,9 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "status": "included",
         "included": True,
     }
+    assert prompt_trace["relationship_context"]["status"] == "included"
+    assert prompt_trace["relationship_context"]["selected_relationship_count"] == 1
+    assert prompt_trace["relationship_context"]["relationship_edges_used"] == ["rel_1"]
     assert prompt_trace["runtime"] == {
         "attempted": True,
         "runtime_state_id": "rtstate_1",
@@ -1252,6 +1329,176 @@ async def test_orchestrate_world_state_malformed_response_is_non_fatal(tmp_path)
     ]
     assert world_state_trace["status"] == "failed"
     assert world_state_trace["omission_reason"] == "malformed_world_state_response"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_relationship_context_malformed_response_is_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    runtime = FakeRuntime()
+    runtime.relationship_response = ["not", "a", "dict"]
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        enable_runtime_overlays=True,
+        request_id="rid-relationship-context-malformed",
+    )
+
+    assert out["status"] == "ok"
+    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["relationship_context"]
+    assert relationship_trace["status"] == "failed"
+    assert (
+        relationship_trace["omission_reason"]
+        == "malformed_relationship_context_response"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_relationship_context_layer_order_when_all_relevant_layers_present(
+    tmp_path,
+):
+    class MinimalRetrievalMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            return {
+                "request_id": kwargs["request_id"],
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [{"role": "assistant", "content": "prior history"}],
+                    "semantic": [],
+                    "artifact_refs": [],
+                    "observed_metadata": {"has_code_like_content": False},
+                },
+            }
+
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    runtime = FakeRuntime(
+        response={
+            "runtime_state": {
+                "runtime_state_id": "rtstate_1",
+                "reset_after_turn": False,
+            },
+            "overlay": {
+                "runtime_state_id": "rtstate_1",
+                "overlay_id": "rtoverlay_1",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": "Runtime context: scene=planning.",
+                "source_fields": ["active_scene"],
+            },
+            "omitted": False,
+            "omission_reason": None,
+        }
+    )
+    runtime.world_state_response = {
+        "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
+        "excluded_claim_summaries": [],
+        "prompt_content": 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)',
+        "trace": {
+            "active_persona_id": "technical_architect",
+            "allowed_domains": ["active_repository"],
+            "included_claim_count": 1,
+            "excluded_claim_count": 0,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 0,
+            "confirmation_required": False,
+        },
+    }
+    runtime.relationship_response = {
+        "selected_entities": [{"entity_id": "project:alpha"}],
+        "selected_relationships": [{"relationship_id": "rel_1"}],
+        "excluded_relationship_summaries": [],
+        "prompt_content": "Relationship context:\n- Project Alpha works_on Repo Alpha (scope=project_context; confidence=0.90)",
+        "trace": {
+            "relationship_edges_used": ["rel_1"],
+            "relationship_edges_excluded": [],
+            "relationship_exclusion_reasons": {},
+            "relationship_context_overlay_applied": True,
+            "relationship_conflicts": [],
+            "relationship_confirmation_required": False,
+            "selected_relationship_count": 1,
+            "excluded_relationship_count": 0,
+            "active_persona_id": "technical_architect",
+            "allowed_relationship_scopes": ["project_context"],
+        },
+    }
+    memory_store = MinimalRetrievalMemoryStore()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        companion_policy_enabled=True,
+        enable_runtime_overlays=True,
+        request_id="rid-relationship-layer-order",
+    )
+
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["included_layers"][:7] == [
+        "companion_policy",
+        "runtime_identity",
+        "world_state",
+        "relationship_context",
+        "runtime_overlay",
+        "recent_history",
+        "current_messages",
+    ]
 
 
 @pytest.mark.asyncio
