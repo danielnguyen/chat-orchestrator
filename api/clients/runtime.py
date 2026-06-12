@@ -143,6 +143,31 @@ class RuntimeClient:
             payload["runtime_session_id"] = runtime_session_id
         return await self._post("/v1/runtime/identity/resolve", json=payload)
 
+    async def world_state_resolve(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str | None = None,
+        active_persona_id: str | None = None,
+        requested_domains: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if active_persona_id is not None:
+            payload["active_persona_id"] = active_persona_id
+        if requested_domains:
+            payload["requested_domains"] = requested_domains
+        return await self._post("/v1/world-state/resolve", json=payload)
+
     async def compile_companion_policy(
         self,
         *,

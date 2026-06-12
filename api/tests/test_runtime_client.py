@@ -179,6 +179,14 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         surface="dev",
         runtime_session_id="rtsession_1",
     )
+    await client.world_state_resolve(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        active_persona_id="technical_architect",
+    )
 
     assert [path for path, _ in calls] == [
         "/v1/runtime/sessions/resolve",
@@ -186,5 +194,7 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         "/v1/runtime/turns/update",
         "/v1/runtime/turns/complete",
         "/v1/runtime/identity/resolve",
+        "/v1/world-state/resolve",
     ]
-    assert calls[-1][1]["runtime_session_id"] == "rtsession_1"
+    assert calls[-2][1]["runtime_session_id"] == "rtsession_1"
+    assert calls[-1][1]["active_persona_id"] == "technical_architect"

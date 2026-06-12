@@ -62,6 +62,10 @@ def _runtime_identity_disabled_trace() -> dict[str, Any]:
     return {"attempted": False, "status": "disabled", "included": False}
 
 
+def _world_state_disabled_trace() -> dict[str, Any]:
+    return {"attempted": False, "status": "disabled", "included": False}
+
+
 def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -647,6 +651,94 @@ async def _resolve_runtime_overlay(
     }
 
 
+async def _resolve_world_state(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    active_persona_id: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+    try:
+        response = await runtime.world_state_resolve(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(e).__name__,
+            "omission_reason": "world_state_unavailable",
+        }
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_world_state_response",
+        }
+    trace = response.get("trace")
+    if not isinstance(trace, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": "malformed_world_state_trace",
+            "omission_reason": "malformed_world_state_response",
+        }
+    included_claims = response.get("included_claims")
+    prompt_content = response.get("prompt_content")
+    if not isinstance(included_claims, list):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": "malformed_world_state_claims",
+            "omission_reason": "malformed_world_state_response",
+        }
+    base_trace = {
+        "attempted": True,
+        "active_persona_id": trace.get("active_persona_id"),
+        "allowed_domains": trace.get("allowed_domains", []),
+        "included_claim_count": trace.get("included_claim_count", 0),
+        "excluded_claim_count": trace.get("excluded_claim_count", 0),
+        "stale_count": trace.get("stale_count", 0),
+        "aging_count": trace.get("aging_count", 0),
+        "expired_count": trace.get("expired_count", 0),
+        "conflicted_count": trace.get("conflicted_count", 0),
+        "confirmation_required": bool(trace.get("confirmation_required", False)),
+    }
+    if not isinstance(prompt_content, str) or not prompt_content:
+        return None, {
+            **base_trace,
+            "status": "omitted",
+            "included": False,
+            "omission_reason": "empty_world_state",
+        }
+    return {"prompt_content": prompt_content}, {
+        **base_trace,
+        "status": "included",
+        "included": True,
+    }
+
+
 async def _resolve_interrupt_policy(
     *,
     runtime: Any | None,
@@ -1063,6 +1155,15 @@ async def orchestrate_chat(
             surface=payload.get("surface", "unknown"),
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
         )
+        world_state, world_state_trace = await _resolve_world_state(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=payload.get("surface", "unknown"),
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            active_persona_id=runtime_identity_trace.get("active_persona_id"),
+        )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -1124,6 +1225,7 @@ async def orchestrate_chat(
                         "style": style_trace,
                         "response_shape": response_shape_trace,
                         "companion_policy": companion_trace,
+                        "world_state": world_state_trace,
                         "runtime": runtime_trace,
                         "dsa": dsa_trace,
                     },
@@ -1189,6 +1291,8 @@ async def orchestrate_chat(
             companion_trace=companion_trace,
             runtime_identity=runtime_identity,
             runtime_identity_trace=runtime_identity_trace,
+            world_state=world_state,
+            world_state_trace=world_state_trace,
             runtime_overlay=runtime_overlay,
             runtime_trace=runtime_trace,
             interrupt_trace=interrupt_trace,

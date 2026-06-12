@@ -120,6 +120,7 @@ class FakeRuntime:
         self.turn_update_calls = []
         self.turn_complete_calls = []
         self.identity_calls = []
+        self.world_state_calls = []
         self.interrupt_calls = []
         self.reset_calls = []
         self.last_companion_compile_endpoint = None
@@ -185,6 +186,22 @@ class FakeRuntime:
             "overlay": None,
             "omitted": True,
             "omission_reason": "empty_runtime_state",
+        }
+        self.world_state_response = {
+            "included_claims": [],
+            "excluded_claim_summaries": [],
+            "prompt_content": None,
+            "trace": {
+                "active_persona_id": "technical_architect",
+                "allowed_domains": ["active_repository"],
+                "included_claim_count": 0,
+                "excluded_claim_count": 0,
+                "stale_count": 0,
+                "aging_count": 0,
+                "expired_count": 0,
+                "conflicted_count": 0,
+                "confirmation_required": False,
+            },
         }
         self.companion_response = companion_response or {
             "profile_id": "default_companion_profile",
@@ -300,6 +317,12 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.response
+
+    async def world_state_resolve(self, **kwargs):
+        self.world_state_calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.world_state_response
 
     async def evaluate_interrupt(self, **kwargs):
         self.interrupt_calls.append(kwargs)
@@ -1029,6 +1052,22 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
             "omission_reason": None,
         }
     )
+    runtime.world_state_response = {
+        "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
+        "excluded_claim_summaries": [{"world_state_claim_id": "wsclaim_2"}],
+        "prompt_content": 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)',
+        "trace": {
+            "active_persona_id": "technical_architect",
+            "allowed_domains": ["active_repository"],
+            "included_claim_count": 1,
+            "excluded_claim_count": 1,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 1,
+            "confirmation_required": False,
+        },
+    }
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
 
@@ -1053,13 +1092,15 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
 
     assert runtime.calls[0]["surface"] == "dev"
     assert len(runtime.calls) == 1
+    assert len(runtime.world_state_calls) == 1
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
     assert contents[0] == (
         "Runtime identity: persona=technical_architect; surface=dev; "
         "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
         "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
     )
-    assert contents[1] == (
+    assert contents[1] == 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)'
+    assert contents[2] == (
         "Runtime context: scene=planning; interaction_mode=actionable; "
         "constraints=preserve_flow."
     )
@@ -1067,11 +1108,26 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["included_layers"] == [
         "runtime_identity",
+        "world_state",
         "runtime_overlay",
         "retrieval_augmentation",
         "recent_history",
         "current_messages",
     ]
+    assert prompt_trace["world_state"] == {
+        "attempted": True,
+        "active_persona_id": "technical_architect",
+        "allowed_domains": ["active_repository"],
+        "included_claim_count": 1,
+        "excluded_claim_count": 1,
+        "stale_count": 0,
+        "aging_count": 0,
+        "expired_count": 0,
+        "conflicted_count": 1,
+        "confirmation_required": False,
+        "status": "included",
+        "included": True,
+    }
     assert prompt_trace["runtime"] == {
         "attempted": True,
         "runtime_state_id": "rtstate_1",
@@ -1148,6 +1204,54 @@ async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tm
     ]
     assert runtime_trace["status"] == "failed"
     assert runtime_trace["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_world_state_malformed_response_is_non_fatal(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    runtime = FakeRuntime()
+    runtime.world_state_response = ["not", "a", "dict"]
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "dev",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        enable_runtime_overlays=True,
+        request_id="rid-world-state-malformed",
+    )
+
+    assert out["status"] == "ok"
+    world_state_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "world_state"
+    ]
+    assert world_state_trace["status"] == "failed"
+    assert world_state_trace["omission_reason"] == "malformed_world_state_response"
 
 
 @pytest.mark.asyncio
