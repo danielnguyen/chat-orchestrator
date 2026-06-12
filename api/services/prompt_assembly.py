@@ -156,6 +156,8 @@ def assemble_prompt(
     surface_presence_trace: dict[str, Any] | None = None,
     companion_overlays: list[dict[str, Any]] | None = None,
     companion_trace: dict[str, Any] | None = None,
+    runtime_identity: dict[str, Any] | None = None,
+    runtime_identity_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
@@ -341,6 +343,41 @@ def assemble_prompt(
         )
     )
 
+    runtime_identity_messages: list[dict[str, str]] = []
+    runtime_identity_trace_out = dict(runtime_identity_trace or {})
+    runtime_identity_omission_reason = runtime_identity_trace_out.get("omission_reason")
+    if runtime_identity and runtime_identity.get("content"):
+        runtime_identity_messages.append(
+            {"role": "system", "content": runtime_identity["content"]}
+        )
+        messages.extend(runtime_identity_messages)
+    layers.append(
+        _layer_trace(
+            "runtime_identity",
+            runtime_identity_messages,
+            metadata={
+                "active_persona_id": runtime_identity.get("active_persona_id")
+                if runtime_identity
+                else None,
+                "surface_id": runtime_identity.get("surface_id") if runtime_identity else None,
+                "capability_domain": runtime_identity.get("capability_domain")
+                if runtime_identity
+                else None,
+                "advisory_memory_scope_summary": runtime_identity.get(
+                    "advisory_memory_scope_summary", []
+                )
+                if runtime_identity
+                else [],
+                "advisory_tool_permission_summary": runtime_identity.get(
+                    "advisory_tool_permission_summary", []
+                )
+                if runtime_identity
+                else [],
+                "omission_reason": runtime_identity_omission_reason,
+            },
+        )
+    )
+
     runtime_messages: list[dict[str, str]] = []
     runtime_trace_out = dict(runtime_trace or {})
     runtime_omission_reason = runtime_trace_out.get("omission_reason")
@@ -420,6 +457,8 @@ def assemble_prompt(
         "surface_presence": surface_presence_trace
         or {"attempted": False, "status": "not_requested"},
         "companion_policy": companion_trace_out
+        or {"attempted": False, "status": "not_requested"},
+        "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
         "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
