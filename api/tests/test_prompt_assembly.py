@@ -105,6 +105,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
         "response_shape",
         "companion_policy",
         "runtime_identity",
+        "world_state",
         "runtime_overlay",
         "external_source_context",
     ]
@@ -132,6 +133,7 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "response_shape",
         "companion_policy",
         "runtime_identity",
+        "world_state",
         "runtime_overlay",
         "external_source_context",
         "retrieval_augmentation",
@@ -569,7 +571,7 @@ def test_assemble_prompt_includes_companion_policy_after_response_shape_before_r
     ]
 
 
-def test_assemble_prompt_places_runtime_identity_after_companion_policy_before_runtime_overlay():
+def test_assemble_prompt_places_world_state_after_runtime_identity_before_runtime_overlay():
     out = assemble_prompt(
         profile={"prompt_overlay": "profile text"},
         retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
@@ -602,6 +604,17 @@ def test_assemble_prompt_places_runtime_identity_after_companion_policy_before_r
             "active_persona_id": "technical_architect",
             "surface_id": "vscode",
         },
+        world_state={
+            "prompt_content": "World state:\n- active_repository/branch_status: {\"branch\": \"main\"} (fresh)",
+        },
+        world_state_trace={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "active_persona_id": "technical_architect",
+            "included_claim_count": 1,
+            "excluded_claim_count": 0,
+        },
         runtime_overlay={
             "runtime_state_id": "rtstate_1",
             "overlay_id": "rtoverlay_1",
@@ -613,7 +626,7 @@ def test_assemble_prompt_places_runtime_identity_after_companion_policy_before_r
         runtime_trace={"attempted": True, "status": "included", "included": True},
     )
 
-    assert [msg["content"] for msg in out.messages[:4]] == [
+    assert [msg["content"] for msg in out.messages[:5]] == [
         "profile text",
         "contract text",
         (
@@ -621,12 +634,14 @@ def test_assemble_prompt_places_runtime_identity_after_companion_policy_before_r
             "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
             "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
         ),
+        "World state:\n- active_repository/branch_status: {\"branch\": \"main\"} (fresh)",
         "Runtime context: scene=planning.",
     ]
     assert out.trace["included_layers"] == [
         "profile_overlay",
         "companion_policy",
         "runtime_identity",
+        "world_state",
         "runtime_overlay",
         "current_messages",
     ]
@@ -634,6 +649,7 @@ def test_assemble_prompt_places_runtime_identity_after_companion_policy_before_r
     assert identity_layer["name"] == "runtime_identity"
     assert identity_layer["metadata"]["active_persona_id"] == "technical_architect"
     assert out.trace["runtime_identity"]["status"] == "included"
+    assert out.trace["world_state"]["included_claim_count"] == 1
 
 
 

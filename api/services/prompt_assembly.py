@@ -158,6 +158,8 @@ def assemble_prompt(
     companion_trace: dict[str, Any] | None = None,
     runtime_identity: dict[str, Any] | None = None,
     runtime_identity_trace: dict[str, Any] | None = None,
+    world_state: dict[str, Any] | None = None,
+    world_state_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
@@ -378,6 +380,31 @@ def assemble_prompt(
         )
     )
 
+    world_state_messages: list[dict[str, str]] = []
+    world_state_trace_out = dict(world_state_trace or {})
+    world_state_omission_reason = world_state_trace_out.get("omission_reason")
+    if world_state and world_state.get("prompt_content"):
+        world_state_messages.append({"role": "system", "content": world_state["prompt_content"]})
+        messages.extend(world_state_messages)
+    layers.append(
+        _layer_trace(
+            "world_state",
+            world_state_messages,
+            metadata={
+                "included_claim_count": world_state_trace_out.get("included_claim_count", 0),
+                "excluded_claim_count": world_state_trace_out.get("excluded_claim_count", 0),
+                "stale_count": world_state_trace_out.get("stale_count", 0),
+                "aging_count": world_state_trace_out.get("aging_count", 0),
+                "expired_count": world_state_trace_out.get("expired_count", 0),
+                "conflicted_count": world_state_trace_out.get("conflicted_count", 0),
+                "active_persona_id": world_state_trace_out.get("active_persona_id"),
+                "allowed_domains": world_state_trace_out.get("allowed_domains", []),
+                "confirmation_required": world_state_trace_out.get("confirmation_required", False),
+                "omission_reason": world_state_omission_reason,
+            },
+        )
+    )
+
     runtime_messages: list[dict[str, str]] = []
     runtime_trace_out = dict(runtime_trace or {})
     runtime_omission_reason = runtime_trace_out.get("omission_reason")
@@ -460,6 +487,7 @@ def assemble_prompt(
         or {"attempted": False, "status": "not_requested"},
         "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},
+        "world_state": world_state_trace_out or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
         "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
         "message_count": len(messages),
