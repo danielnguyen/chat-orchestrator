@@ -17,6 +17,7 @@ Normal request flow:
 ## Responsibilities
 
 - Resolve/create conversation in `basic-memory-store`
+- Optionally consume Cognitive Runtime interaction governance before downstream response shaping
 - Retrieve context bundle from memory-store
 - Optionally retrieve read-only external evidence from Data Source Aggregator via `/v1/context-pack`
 - Inject retrieved memory and file snippets into the model prompt
@@ -41,6 +42,11 @@ Typical local `api/.env` contents:
 ORCH_API_KEY=dev-key
 MEMORY_STORE_BASE_URL=http://127.0.0.1:4321
 MEMORY_STORE_API_KEY=dev-local
+COGNITIVE_RUNTIME_BASE_URL=http://127.0.0.1:4371
+COGNITIVE_RUNTIME_API_KEY=
+COGNITIVE_RUNTIME_TIMEOUT_MS=1500
+COGNITIVE_RUNTIME_COMPANION_ENABLED=false
+COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=false
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_API_KEY=
 DSA_ENABLED=false
@@ -90,13 +96,27 @@ The smoke flow:
 - asserts JSON and `request_id` are present
 - allows either successful response or valid failure JSON
 - on success, verifies trace visibility via `basic-memory-store` `GET /v1/traces/{request_id}`
+- optionally verifies summarized governance trace fields when `EXPECT_GOVERNANCE_STATUS` or `EXPECT_GOVERNANCE_POSTURE` are provided
 - keeps normal chat ownership on `chat-orchestrator` while treating `basic-memory-store`, `cognitive-runtime`, and LiteLLM as downstream services
+
+Optional smoke env vars:
+- `CHAT_PAYLOAD_JSON` overrides the default chat request payload
+- `EXPECT_GOVERNANCE_STATUS` checks `payload.retrieval.prompt_assembly.interaction_governance.status`
+- `EXPECT_GOVERNANCE_POSTURE` checks `payload.retrieval.prompt_assembly.interaction_governance.response_posture`
 
 Operator checks when runtime behavior looks wrong:
 - confirm `basic-memory-store` is reachable for conversation, retrieval, and trace writes
+- confirm `cognitive-runtime` `GET /healthz` succeeds before enabling governance consumption
+- confirm `cognitive-runtime` `POST /v1/runtime/interaction-governance/evaluate` returns a typed result
+- confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=false` leaves normal `/v1/chat` behavior unchanged
+- confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true` records a safe governance summary when `cognitive-runtime` is reachable
+- confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true` remains non-fatal and traces governance as failed or omitted when `cognitive-runtime` is unavailable
+- confirm tense debugging inputs produce tactical governance posture with humor and commentary suppressed in the trace summary
+- confirm malformed or malicious governance results do not leak raw prompt-facing guidance into traces or user-visible output
 - confirm `cognitive-runtime` companion compile failures stay traceable and non-fatal to normal chat
 - confirm user-facing answers do not include raw runtime exception text
 - confirm `POST /v1/runtime/overlay` is reachable when runtime overlays are enabled
+- confirm governance traces stay summarized and do not expose raw prompt text, raw private memory, hidden reasoning, raw runtime event payloads, raw runtime exception text, or implementation-planning identifiers
 
 ## File-backed retrieval behavior
 
@@ -150,7 +170,9 @@ Local/offline routing precedence is additive and traceable: request `sensitivity
 ## Integration Boundaries
 
 - `cognitive-runtime` owns companion contracts and diagnostic surfaces.
+- `cognitive-runtime` owns interaction classification policy and the interaction governance evaluation endpoint.
 - `chat-orchestrator` consumes compiled companion policy overlays and does not own companion contract definition.
+- `chat-orchestrator` can optionally consume Cognitive Runtime interaction governance when `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true`; the default remains `false`.
 - `AssistantHandoff` captures orchestration output as refs, counts, statuses, and warning summaries.
 - `CompanionPresentation` prepares prompt-facing presentation input from the handoff summary.
 - `response_review` is a deterministic shadow review over model output and trace context.
