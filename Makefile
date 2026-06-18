@@ -33,11 +33,14 @@ smoke:
 	ORCH_KEY="$${ORCH_API_KEY:-dev-key}"; \
 	MS_BASE="$${MEMORY_STORE_BASE_URL:-http://127.0.0.1:4321}"; \
 	MS_KEY="$${MEMORY_STORE_API_KEY:-dev-local}"; \
+	CHAT_PAYLOAD_JSON="$${CHAT_PAYLOAD_JSON:-{\"owner_id\":\"daniel\",\"client_id\":\"vscode\",\"surface\":\"vscode\",\"messages\":[{\"role\":\"user\",\"content\":\"smoke check\"}]}}"; \
+	EXPECT_GOVERNANCE_STATUS="$${EXPECT_GOVERNANCE_STATUS:-}"; \
+	EXPECT_GOVERNANCE_POSTURE="$${EXPECT_GOVERNANCE_POSTURE:-}"; \
 	echo "==> POST $$ORCH_BASE/v1/chat"; \
 	RESP="$$(curl -sS -X POST "$$ORCH_BASE/v1/chat" \
 	  -H "X-API-Key: $$ORCH_KEY" \
 	  -H "Content-Type: application/json" \
-	  -d '{"owner_id":"daniel","client_id":"vscode","surface":"vscode","messages":[{"role":"user","content":"smoke check"}]}')"; \
+	  -d "$$CHAT_PAYLOAD_JSON")"; \
 	echo "$$RESP" | jq . >/dev/null; \
 	RID="$$(echo "$$RESP" | jq -r '.request_id // empty')"; \
 	test -n "$$RID"; \
@@ -48,7 +51,16 @@ smoke:
 	  exit 0; \
 	fi; \
 	echo "==> GET $$MS_BASE/v1/traces/$$RID"; \
-	curl -sS "$$MS_BASE/v1/traces/$$RID" -H "X-API-Key: $$MS_KEY" | jq -e '.request_id == "'$$RID'"' >/dev/null; \
+	TRACE="$$(curl -sS "$$MS_BASE/v1/traces/$$RID" -H "X-API-Key: $$MS_KEY")"; \
+	echo "$$TRACE" | jq -e '.request_id == "'$$RID'"' >/dev/null; \
+	if [ -n "$$EXPECT_GOVERNANCE_STATUS" ]; then \
+	  echo "==> CHECK governance trace summary"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.interaction_governance.status == "'$$EXPECT_GOVERNANCE_STATUS'"' >/dev/null; \
+	fi; \
+	if [ -n "$$EXPECT_GOVERNANCE_POSTURE" ]; then \
+	  echo "==> CHECK governance posture"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.interaction_governance.response_posture == "'$$EXPECT_GOVERNANCE_POSTURE'"' >/dev/null; \
+	fi; \
 	echo "Smoke passed."
 
 # Non-docker local defaults:
