@@ -70,6 +70,15 @@ def _relationship_context_disabled_trace() -> dict[str, Any]:
     return {"attempted": False, "status": "disabled", "included": False}
 
 
+def _interaction_governance_disabled_trace() -> dict[str, Any]:
+    return {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+        "runtime_call_status": "disabled",
+    }
+
+
 def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -110,6 +119,18 @@ def _normalize_external_context_config(
         normalized["max_results"] = max_results
 
     return normalized
+
+
+def _bounded_recent_messages(
+    messages: list[dict[str, Any]], limit: int = 12
+) -> list[dict[str, str]]:
+    bounded: list[dict[str, str]] = []
+    for item in messages[-limit:]:
+        role = item.get("role")
+        content = item.get("content")
+        if isinstance(role, str) and isinstance(content, str) and role and content:
+            bounded.append({"role": role, "content": content})
+    return bounded
 
 
 def _build_dsa_budget(max_results: int | None) -> dict[str, int]:
@@ -902,6 +923,100 @@ async def _resolve_interrupt_policy(
     }
 
 
+async def _resolve_interaction_governance(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    surface_session_id: str | None,
+    active_mode: str | None,
+    current_user_text: str,
+    recent_messages: list[dict[str, str]],
+    surface_metadata_json: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not enabled:
+        return None, _interaction_governance_disabled_trace()
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "runtime_call_status": "unavailable",
+            "error_type": "RuntimeClientNotConfigured",
+            "omission_reason": "runtime_client_not_configured",
+        }
+
+    try:
+        response = await runtime.evaluate_interaction_governance(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=current_user_text or None,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "runtime_call_status": "failed",
+            "error_type": type(e).__name__,
+            "omission_reason": "interaction_governance_unavailable",
+        }
+
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "runtime_call_status": "malformed",
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_interaction_governance_response",
+        }
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "runtime_call_status": "malformed",
+            "error_type": "malformed_interaction_governance_payload",
+            "omission_reason": "malformed_interaction_governance_response",
+        }
+
+    reason_summary = result.get("reason_summary", [])
+    if not isinstance(reason_summary, list):
+        reason_summary = []
+
+    return result, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_call_status": "included",
+        "interaction_kind": result.get("interaction_kind"),
+        "response_posture": result.get("response_posture"),
+        "commentary_allowed": result.get("commentary_allowed"),
+        "humor_allowed": result.get("humor_allowed"),
+        "action_allowed": result.get("action_allowed"),
+        "requires_confirmation": result.get("requires_confirmation"),
+        "privacy_sensitivity_hint": result.get("privacy_sensitivity_hint"),
+        "confidence": result.get("confidence"),
+        "reason_summary": reason_summary,
+    }
+
+
 async def _reset_runtime_after_turn(
     *,
     runtime: Any | None,
@@ -1120,12 +1235,14 @@ async def orchestrate_chat(
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
+    interaction_governance_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
     dsa_enabled: bool = False,
 ) -> dict[str, Any]:
     started = perf_counter()
+    surface = payload.get("surface", "unknown")
 
     resolved = await memory_store.resolve_conversation(
         owner_id=payload["owner_id"],
@@ -1143,13 +1260,66 @@ async def orchestrate_chat(
                 role="user",
                 content=msg["content"],
                 client_id=payload.get("client_id"),
-                metadata={"surface": payload.get("surface", "unknown")},
+                metadata={"surface": surface},
             )
             last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
 
+    last_user_text = _extract_last_user_text(payload["messages"])
+    recent_messages = _bounded_recent_messages(payload["messages"])
+    surface_context = payload.get("surface_context")
+    surface_metadata_json = surface_context if isinstance(surface_context, dict) else None
+    active_mode = (
+        surface_context.get("active_mode")
+        if isinstance(surface_context, dict) and isinstance(surface_context.get("active_mode"), str)
+        else None
+    )
+    surface_session_id = (
+        payload.get("surface_session_id")
+        if isinstance(payload.get("surface_session_id"), str)
+        else None
+    )
+
+    turn_response, turn_state_trace = await _start_runtime_turn(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        input_message_id=last_user_message_id,
+    )
+    runtime_session = (
+        turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
+    )
+    runtime_session_trace = _runtime_session_trace_from_session(
+        runtime_session,
+        attempted=bool(turn_state_trace.get("attempted")),
+        omission_reason=turn_state_trace.get(
+            "omission_reason",
+            "runtime_session_missing_from_turn_response",
+        ),
+        error_type=turn_state_trace.get("error_type"),
+    )
+    interaction_governance, interaction_governance_trace = (
+        await _resolve_interaction_governance(
+            runtime=runtime,
+            enabled=interaction_governance_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+    )
+
     profile = await memory_store.resolve_profile(
         owner_id=payload["owner_id"],
-        surface=payload.get("surface", "unknown"),
+        surface=surface,
         requested_profile=payload.get("requested_profile"),
         client_id=payload.get("client_id"),
     )
@@ -1166,7 +1336,6 @@ async def orchestrate_chat(
         response_shape, response_shape_trace
     )
     surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
-    last_user_text = _extract_last_user_text(payload["messages"])
     routing_policy = profile.get("routing_policy", {}) or {}
     sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
     profile_local_only = bool(routing_policy.get("local_only", False))
@@ -1174,36 +1343,13 @@ async def orchestrate_chat(
     cost_mode = routing_policy.get("cost_mode")
     latency_mode = routing_policy.get("latency_mode")
     external_context_request = effective_payload.get("external_context")
-    external_context_enabled = bool(effective_payload.get("external_context_enabled", False)) or bool(
-        isinstance(external_context_request, dict) and external_context_request.get("enabled") is True
+    external_context_enabled = bool(
+        effective_payload.get("external_context_enabled", False)
+    ) or bool(
+        isinstance(external_context_request, dict)
+        and external_context_request.get("enabled") is True
     )
 
-    external_context_pack, dsa_trace = await _resolve_external_context(
-        dsa=dsa,
-        dsa_enabled=dsa_enabled,
-        external_context_enabled=external_context_enabled,
-        external_context=external_context_request if isinstance(external_context_request, dict) else None,
-        external_calls_allowed=not local_only,
-        query=last_user_text,
-    )
-    turn_response, turn_state_trace = await _start_runtime_turn(
-        runtime=runtime,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=payload.get("surface", "unknown"),
-        input_message_id=last_user_message_id,
-    )
-    runtime_session = turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
-    runtime_session_trace = _runtime_session_trace_from_session(
-        runtime_session,
-        attempted=bool(turn_state_trace.get("attempted")),
-        omission_reason=turn_state_trace.get(
-            "omission_reason",
-            "runtime_session_missing_from_turn_response",
-        ),
-        error_type=turn_state_trace.get("error_type"),
-    )
     try:
         await _advance_runtime_turn(
             runtime=runtime,
@@ -1218,13 +1364,25 @@ async def orchestrate_chat(
             query=last_user_text,
             retrieval=effective_payload.get("retrieval"),
         )
+        external_context_pack, dsa_trace = await _resolve_external_context(
+            dsa=dsa,
+            dsa_enabled=dsa_enabled,
+            external_context_enabled=external_context_enabled,
+            external_context=(
+                external_context_request
+                if isinstance(external_context_request, dict)
+                else None
+            ),
+            external_calls_allowed=not local_only,
+            query=last_user_text,
+        )
         companion_overlays, companion_trace = await _resolve_companion_policy(
             runtime=runtime,
             enabled=companion_policy_enabled,
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
             requested_scene=payload.get("requested_scene"),
         )
         interrupt_trace = await _resolve_interrupt_policy(
@@ -1233,7 +1391,7 @@ async def orchestrate_chat(
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
             current_user_text=last_user_text,
             recent_messages=effective_payload["messages"],
             requested_scene=payload.get("requested_scene"),
@@ -1243,7 +1401,7 @@ async def orchestrate_chat(
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
         )
         world_state, world_state_trace = await _resolve_world_state(
@@ -1251,7 +1409,7 @@ async def orchestrate_chat(
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
@@ -1261,7 +1419,7 @@ async def orchestrate_chat(
                 request_id=request_id,
                 owner_id=payload["owner_id"],
                 conversation_id=conversation_id,
-                surface=payload.get("surface", "unknown"),
+                surface=surface,
                 runtime_session_id=runtime_session_trace.get("runtime_session_id"),
                 active_persona_id=runtime_identity_trace.get("active_persona_id"),
             )
@@ -1272,7 +1430,7 @@ async def orchestrate_chat(
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
         )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
@@ -1327,6 +1485,7 @@ async def orchestrate_chat(
                         "style": style_trace,
                         "response_shape": response_shape_trace,
                         "companion_policy": companion_trace,
+                        "interaction_governance": interaction_governance_trace,
                         "world_state": world_state_trace,
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
@@ -1357,7 +1516,7 @@ async def orchestrate_chat(
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
             route=route,
             selected_model=selected_model,
             selected_provider=selected_provider,
@@ -1392,6 +1551,8 @@ async def orchestrate_chat(
             surface_presence_trace=surface_presence_trace,
             companion_overlays=companion_overlays,
             companion_trace=companion_trace,
+            interaction_governance=interaction_governance,
+            interaction_governance_trace_data=interaction_governance_trace,
             runtime_identity=runtime_identity,
             runtime_identity_trace=runtime_identity_trace,
             world_state=world_state,
@@ -1468,7 +1629,9 @@ async def orchestrate_chat(
                             request_id=request_id,
                             turn_status="abandoned",
                         )
-                        raise RuntimeError("local_only policy active but no local fallback available")
+                        raise RuntimeError(
+                            "local_only policy active but no local fallback available"
+                        )
                     fallback_model = local_fallback
                     fallback_provider = "local"
                 selected_model = fallback_model
@@ -1542,7 +1705,7 @@ async def orchestrate_chat(
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
-            surface=payload.get("surface", "unknown"),
+            surface=surface,
         )
         await _complete_runtime_turn(
             runtime=runtime,
@@ -1567,7 +1730,7 @@ async def orchestrate_chat(
                 "conversation_id": conversation_id,
                 "owner_id": payload["owner_id"],
                 "client_id": payload.get("client_id"),
-                "surface": payload.get("surface", "unknown"),
+                "surface": surface,
                 "profile": {
                     "name": profile["profile_name"],
                     "version": profile["profile_version"],

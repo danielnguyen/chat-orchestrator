@@ -195,6 +195,22 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         runtime_session_id="rtsession_1",
         active_persona_id="technical_architect",
     )
+    await client.evaluate_interaction_governance(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        surface_session_id="surface-session-1",
+        active_mode="focused",
+        current_user_text="rename this variable to count",
+        recent_messages=[
+            {"role": "assistant", "content": "prior"},
+            {"role": "user", "content": "rename this variable to count"},
+        ],
+        surface_metadata_json={"surface_type": "developer_surface"},
+    )
 
     assert [path for path, _ in calls] == [
         "/v1/runtime/sessions/resolve",
@@ -204,7 +220,12 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         "/v1/runtime/identity/resolve",
         "/v1/world-state/resolve",
         "/v1/relationships/select",
+        "/v1/runtime/interaction-governance/evaluate",
     ]
     assert calls[-2][1]["active_persona_id"] == "technical_architect"
     assert calls[-1][1]["runtime_session_id"] == "rtsession_1"
-    assert calls[-1][1]["active_persona_id"] == "technical_architect"
+    assert calls[-1][1]["runtime_turn_id"] == "rtturn_1"
+    assert calls[-1][1]["surface_session_id"] == "surface-session-1"
+    assert calls[-1][1]["active_mode"] == "focused"
+    assert calls[-1][1]["recent_messages"][1]["content"] == "rename this variable to count"
+    assert calls[-1][1]["surface_metadata_json"] == {"surface_type": "developer_surface"}
