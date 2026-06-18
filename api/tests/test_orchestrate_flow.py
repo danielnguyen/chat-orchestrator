@@ -109,8 +109,10 @@ class FakeRuntime:
         *,
         response=None,
         companion_response=None,
+        interaction_governance_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
+        interaction_governance_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -123,6 +125,7 @@ class FakeRuntime:
         self.world_state_calls = []
         self.relationship_calls = []
         self.interrupt_calls = []
+        self.interaction_governance_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -254,6 +257,29 @@ class FakeRuntime:
                 },
             ],
         }
+        self.interaction_governance_response = interaction_governance_response or {
+            "request_id": "rid-governance",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "interaction_kind": "question",
+                "tension_level": "low",
+                "literal_command_confidence": 0.11,
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "clarifying_question_allowed": True,
+                "action_allowed": False,
+                "requires_confirmation": False,
+                "persona_scope_hint": None,
+                "privacy_sensitivity_hint": "normal",
+                "response_posture": "direct",
+                "confidence": 0.76,
+                "reason_summary": ["question_markers"],
+            },
+        }
         self.interrupt_response = {
             "request_id": "rid-interrupt",
             "owner_id": "owner",
@@ -272,6 +298,7 @@ class FakeRuntime:
         }
         self.fail = fail
         self.companion_error = companion_error
+        self.interaction_governance_error = interaction_governance_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -365,6 +392,15 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.interrupt_response
+
+    async def evaluate_interaction_governance(self, **kwargs):
+        self.interaction_governance_calls.append(kwargs)
+        self.call_order.append("interaction_governance")
+        if self.interaction_governance_error is not None:
+            raise self.interaction_governance_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.interaction_governance_response
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
@@ -1572,6 +1608,264 @@ def test_runtime_timeout_setting_is_separate_from_request_timeout(monkeypatch):
     assert settings.request_timeout_ms == 30000
     assert settings.cognitive_runtime_timeout_ms == 1500
     assert settings.cognitive_runtime_companion_enabled is True
+    assert settings.cognitive_runtime_interaction_governance_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_interaction_governance_runs_after_turn_start_and_before_retrieval(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+
+    class OrderedMemoryStore(FakeMemoryStore):
+        def __init__(self, runtime):
+            super().__init__()
+            self.runtime = runtime
+
+        async def retrieve_bundle(self, **kwargs):
+            self.runtime.call_order.append("retrieval_bundle")
+            return await super().retrieve_bundle(**kwargs)
+
+    runtime = FakeRuntime()
+    memory_store = OrderedMemoryStore(runtime)
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "rename this variable to count"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        request_id="rid-governance-order",
+    )
+
+    assert runtime.call_order.index("start_turn") < runtime.call_order.index(
+        "interaction_governance"
+    )
+    assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
+        "retrieval_bundle"
+    )
+    assert runtime.interaction_governance_calls[0]["runtime_session_id"] == "rtsession_1"
+    assert runtime.interaction_governance_calls[0]["runtime_turn_id"] == "rtturn_1"
+    assert runtime.interaction_governance_calls[0]["current_user_text"] == (
+        "rename this variable to count"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_interaction_governance_injects_tactical_prompt_guidance(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime(
+        interaction_governance_response={
+            "request_id": "rid-governance",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "interaction_kind": "tense_debugging",
+                "tension_level": "high",
+                "literal_command_confidence": 0.18,
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "clarifying_question_allowed": True,
+                "action_allowed": False,
+                "requires_confirmation": True,
+                "persona_scope_hint": "technical_architect",
+                "privacy_sensitivity_hint": "private",
+                "response_posture": "tactical",
+                "confidence": 0.94,
+                "reason_summary": [
+                    "tense_debugging_markers",
+                    "possible_production_failure",
+                ],
+            },
+        }
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [
+                {"role": "user", "content": "I think I broke the server and prod is failing"}
+            ],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        request_id="rid-governance-tactical",
+    )
+
+    assert out["status"] == "ok"
+    prompt_messages = litellm.calls[0]["messages"]
+    assert prompt_messages[0]["content"] == (
+        "Interaction guidance:\n"
+        "- Adopt a tactical response posture.\n"
+        "- Prefer direct operational help and next concrete steps.\n"
+        "- Do not add jokes or playful commentary.\n"
+        "- Avoid extra meta-commentary.\n"
+        "- Ask a clarifying question when needed to move the task forward safely.\n"
+        "- Do not imply that any external action has been performed.\n"
+        "- Confirm before treating this turn as an action command.\n"
+        "- Avoid unnecessary disclosure or over-specific sensitive details.\n"
+        "- Stay within the hinted scope: technical_architect."
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["interaction_governance"] == {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_call_status": "included",
+        "interaction_kind": "tense_debugging",
+        "response_posture": "tactical",
+        "commentary_allowed": False,
+        "humor_allowed": False,
+        "action_allowed": False,
+        "requires_confirmation": True,
+        "privacy_sensitivity_hint": "private",
+        "confidence": 0.94,
+        "reason_summary": [
+            "tense_debugging_markers",
+            "possible_production_failure",
+        ],
+        "omission_reason": None,
+    }
+    assert "interaction_governance" in trace["included_layers"]
+    assert "I think I broke the server and prod is failing" not in str(
+        trace["interaction_governance"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_interaction_governance_failure_is_non_fatal_and_traceable(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(interaction_governance_error=RuntimeError("runtime offline")),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        request_id="rid-governance-failed",
+    )
+
+    assert out["status"] == "ok"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "interaction_governance"
+    ]
+    assert trace["status"] == "failed"
+    assert trace["runtime_call_status"] == "failed"
+    assert trace["omission_reason"] == "interaction_governance_unavailable"
+    assert "runtime offline" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_interaction_governance_malformed_response_is_non_fatal(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(interaction_governance_response={"request_id": "rid"}),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        request_id="rid-governance-malformed",
+    )
+
+    assert out["status"] == "ok"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "interaction_governance"
+    ]
+    assert trace["status"] == "failed"
+    assert trace["runtime_call_status"] == "malformed"
+    assert trace["omission_reason"] == "malformed_interaction_governance_response"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_chat_works_when_interaction_governance_disabled(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=False,
+        request_id="rid-governance-disabled",
+    )
+
+    assert out["status"] == "ok"
+    assert runtime.interaction_governance_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "interaction_governance"
+    ]
+    assert trace == {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+        "runtime_call_status": "disabled",
+        "interaction_kind": None,
+        "response_posture": None,
+        "commentary_allowed": None,
+        "humor_allowed": None,
+        "action_allowed": None,
+        "requires_confirmation": None,
+        "privacy_sensitivity_hint": None,
+        "confidence": None,
+        "reason_summary": [],
+        "omission_reason": None,
+    }
 
 @pytest.mark.asyncio
 async def test_orchestrate_does_not_call_companion_policy_when_disabled(tmp_path):

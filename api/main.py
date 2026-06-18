@@ -4,9 +4,9 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
+from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
-from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.runtime import RuntimeClient
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
@@ -118,6 +118,9 @@ async def chat(body: ChatRequest) -> ChatResponse:
             allow_manual_override=settings.allow_manual_override,
             enable_runtime_overlays=settings.enable_runtime_overlays,
             companion_policy_enabled=settings.cognitive_runtime_companion_enabled,
+            interaction_governance_enabled=(
+                settings.cognitive_runtime_interaction_governance_enabled
+            ),
             response_action_mode=settings.response_action_mode,
             interrupt_policy_mode=body.interrupt_policy_mode,
             dsa=dsa,

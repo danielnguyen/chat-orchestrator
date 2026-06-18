@@ -255,6 +255,43 @@ class RuntimeClient:
             payload["requested_scene"] = requested_scene
         return await self._post("/v1/interrupt/evaluate", json=payload)
 
+    async def evaluate_interaction_governance(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        surface_session_id: str | None = None,
+        active_mode: str | None = None,
+        current_user_text: str | None = None,
+        recent_messages: list[dict[str, Any]] | None = None,
+        surface_metadata_json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if surface_session_id is not None:
+            payload["surface_session_id"] = surface_session_id
+        if active_mode is not None:
+            payload["active_mode"] = active_mode
+        if current_user_text is not None:
+            payload["current_user_text"] = current_user_text
+        if recent_messages is not None:
+            payload["recent_messages"] = recent_messages
+        if surface_metadata_json is not None:
+            payload["surface_metadata_json"] = surface_metadata_json
+        return await self._post("/v1/runtime/interaction-governance/evaluate", json=payload)
+
     async def reset(
         self,
         *,

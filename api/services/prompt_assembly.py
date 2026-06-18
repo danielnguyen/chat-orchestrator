@@ -142,6 +142,66 @@ def external_context_trace(context_pack: dict[str, Any] | None) -> dict[str, Any
     }
 
 
+def build_interaction_governance_messages(
+    governance: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    if not isinstance(governance, dict):
+        return []
+
+    lines = ["Interaction guidance:"]
+
+    response_posture = governance.get("response_posture")
+    if isinstance(response_posture, str) and response_posture:
+        lines.append(f"- Adopt a {response_posture} response posture.")
+        if response_posture == "tactical":
+            lines.append("- Prefer direct operational help and next concrete steps.")
+
+    if governance.get("humor_allowed") is False:
+        lines.append("- Do not add jokes or playful commentary.")
+    if governance.get("commentary_allowed") is False:
+        lines.append("- Avoid extra meta-commentary.")
+    if governance.get("clarifying_question_allowed") is True:
+        lines.append("- Ask a clarifying question when needed to move the task forward safely.")
+    if governance.get("action_allowed") is False:
+        lines.append("- Do not imply that any external action has been performed.")
+    if governance.get("requires_confirmation") is True:
+        lines.append("- Confirm before treating this turn as an action command.")
+
+    privacy_hint = governance.get("privacy_sensitivity_hint")
+    if privacy_hint in {"private", "sensitive"}:
+        lines.append("- Avoid unnecessary disclosure or over-specific sensitive details.")
+
+    persona_scope_hint = governance.get("persona_scope_hint")
+    if isinstance(persona_scope_hint, str) and persona_scope_hint:
+        lines.append(f"- Stay within the hinted scope: {persona_scope_hint}.")
+
+    if len(lines) == 1:
+        return []
+    return [{"role": "system", "content": "\n".join(lines)}]
+
+
+def interaction_governance_trace(governance_trace: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(governance_trace, dict):
+        governance_trace = {}
+
+    return {
+        "attempted": governance_trace.get("attempted", False),
+        "status": governance_trace.get("status", "not_requested"),
+        "included": governance_trace.get("included", False),
+        "runtime_call_status": governance_trace.get("runtime_call_status"),
+        "interaction_kind": governance_trace.get("interaction_kind"),
+        "response_posture": governance_trace.get("response_posture"),
+        "commentary_allowed": governance_trace.get("commentary_allowed"),
+        "humor_allowed": governance_trace.get("humor_allowed"),
+        "action_allowed": governance_trace.get("action_allowed"),
+        "requires_confirmation": governance_trace.get("requires_confirmation"),
+        "privacy_sensitivity_hint": governance_trace.get("privacy_sensitivity_hint"),
+        "confidence": governance_trace.get("confidence"),
+        "reason_summary": governance_trace.get("reason_summary", []),
+        "omission_reason": governance_trace.get("omission_reason"),
+    }
+
+
 def assemble_prompt(
     *,
     profile: dict[str, Any],
@@ -164,6 +224,8 @@ def assemble_prompt(
     relationship_context_trace: dict[str, Any] | None = None,
     runtime_overlay: dict[str, Any] | None = None,
     runtime_trace: dict[str, Any] | None = None,
+    interaction_governance: dict[str, Any] | None = None,
+    interaction_governance_trace_data: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
@@ -344,6 +406,36 @@ def assemble_prompt(
             "companion_policy",
             companion_messages,
             metadata=companion_metadata,
+        )
+    )
+
+    interaction_governance_messages = build_interaction_governance_messages(
+        interaction_governance
+    )
+    if interaction_governance_messages:
+        messages.extend(interaction_governance_messages)
+    governance_trace_out = interaction_governance_trace(interaction_governance_trace_data)
+    layers.append(
+        _layer_trace(
+            "interaction_governance",
+            interaction_governance_messages,
+            metadata={
+                "runtime_call_status": governance_trace_out.get("runtime_call_status"),
+                "interaction_kind": governance_trace_out.get("interaction_kind"),
+                "response_posture": governance_trace_out.get("response_posture"),
+                "commentary_allowed": governance_trace_out.get("commentary_allowed"),
+                "humor_allowed": governance_trace_out.get("humor_allowed"),
+                "action_allowed": governance_trace_out.get("action_allowed"),
+                "requires_confirmation": governance_trace_out.get(
+                    "requires_confirmation"
+                ),
+                "privacy_sensitivity_hint": governance_trace_out.get(
+                    "privacy_sensitivity_hint"
+                ),
+                "confidence": governance_trace_out.get("confidence"),
+                "reason_summary": governance_trace_out.get("reason_summary", []),
+                "omission_reason": governance_trace_out.get("omission_reason"),
+            },
         )
     )
 
@@ -537,6 +629,8 @@ def assemble_prompt(
         or {"attempted": False, "status": "not_requested"},
         "companion_policy": companion_trace_out
         or {"attempted": False, "status": "not_requested"},
+        "interaction_governance": governance_trace_out
+        or {"attempted": False, "status": "not_requested", "included": False},
         "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},
         "world_state": world_state_trace_out or {"attempted": False, "status": "not_requested"},
