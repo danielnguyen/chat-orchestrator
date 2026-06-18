@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from services.assistant_handoff import AssistantHandoff
 from services.companion_presentation import CompanionPresentation
 
 VALID_ROLES = {"user", "assistant", "system", "tool"}
+VALID_GOVERNANCE_RESPONSE_POSTURES = {
+    "direct",
+    "supportive",
+    "tactical",
+    "brief",
+    "reflective",
+    "playful",
+    "silent_or_minimal",
+}
+VALID_GOVERNANCE_PRIVACY_HINTS = {"normal", "private", "sensitive"}
+SAFE_GOVERNANCE_LABEL = re.compile(r"^[a-zA-Z0-9_.:-]+$")
 
 
 @dataclass(frozen=True)
@@ -142,37 +154,94 @@ def external_context_trace(context_pack: dict[str, Any] | None) -> dict[str, Any
     }
 
 
+def _validated_governance_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _validated_governance_label(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if not SAFE_GOVERNANCE_LABEL.fullmatch(value):
+        return None
+    return value
+
+
+def _sanitize_interaction_governance(governance: dict[str, Any] | None) -> dict[str, Any]:
+    governance = governance if isinstance(governance, dict) else {}
+    response_posture = governance.get("response_posture")
+    privacy_hint = governance.get("privacy_sensitivity_hint")
+    reason_summary = governance.get("reason_summary", [])
+    safe_reason_summary: list[str] = []
+    if isinstance(reason_summary, list):
+        safe_reason_summary = [
+            item
+            for item in reason_summary
+            if isinstance(item, str) and SAFE_GOVERNANCE_LABEL.fullmatch(item)
+        ]
+
+    return {
+        "interaction_kind": governance.get("interaction_kind"),
+        "response_posture": (
+            response_posture
+            if isinstance(response_posture, str)
+            and response_posture in VALID_GOVERNANCE_RESPONSE_POSTURES
+            else None
+        ),
+        "commentary_allowed": _validated_governance_bool(
+            governance.get("commentary_allowed")
+        ),
+        "humor_allowed": _validated_governance_bool(governance.get("humor_allowed")),
+        "clarifying_question_allowed": _validated_governance_bool(
+            governance.get("clarifying_question_allowed")
+        ),
+        "action_allowed": _validated_governance_bool(governance.get("action_allowed")),
+        "requires_confirmation": _validated_governance_bool(
+            governance.get("requires_confirmation")
+        ),
+        "persona_scope_hint": _validated_governance_label(
+            governance.get("persona_scope_hint")
+        ),
+        "privacy_sensitivity_hint": (
+            privacy_hint
+            if isinstance(privacy_hint, str)
+            and privacy_hint in VALID_GOVERNANCE_PRIVACY_HINTS
+            else None
+        ),
+        "confidence": governance.get("confidence"),
+        "reason_summary": safe_reason_summary,
+    }
+
+
 def build_interaction_governance_messages(
     governance: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    if not isinstance(governance, dict):
-        return []
+    sanitized = _sanitize_interaction_governance(governance)
 
     lines = ["Interaction guidance:"]
 
-    response_posture = governance.get("response_posture")
-    if isinstance(response_posture, str) and response_posture:
+    response_posture = sanitized.get("response_posture")
+    if isinstance(response_posture, str):
         lines.append(f"- Adopt a {response_posture} response posture.")
         if response_posture == "tactical":
             lines.append("- Prefer direct operational help and next concrete steps.")
 
-    if governance.get("humor_allowed") is False:
+    if sanitized.get("humor_allowed") is False:
         lines.append("- Do not add jokes or playful commentary.")
-    if governance.get("commentary_allowed") is False:
+    if sanitized.get("commentary_allowed") is False:
         lines.append("- Avoid extra meta-commentary.")
-    if governance.get("clarifying_question_allowed") is True:
+    if sanitized.get("clarifying_question_allowed") is True:
         lines.append("- Ask a clarifying question when needed to move the task forward safely.")
-    if governance.get("action_allowed") is False:
+    if sanitized.get("action_allowed") is False:
         lines.append("- Do not imply that any external action has been performed.")
-    if governance.get("requires_confirmation") is True:
+    if sanitized.get("requires_confirmation") is True:
         lines.append("- Confirm before treating this turn as an action command.")
 
-    privacy_hint = governance.get("privacy_sensitivity_hint")
+    privacy_hint = sanitized.get("privacy_sensitivity_hint")
     if privacy_hint in {"private", "sensitive"}:
         lines.append("- Avoid unnecessary disclosure or over-specific sensitive details.")
 
-    persona_scope_hint = governance.get("persona_scope_hint")
-    if isinstance(persona_scope_hint, str) and persona_scope_hint:
+    persona_scope_hint = sanitized.get("persona_scope_hint")
+    if isinstance(persona_scope_hint, str):
         lines.append(f"- Stay within the hinted scope: {persona_scope_hint}.")
 
     if len(lines) == 1:
@@ -184,20 +253,22 @@ def interaction_governance_trace(governance_trace: dict[str, Any] | None) -> dic
     if not isinstance(governance_trace, dict):
         governance_trace = {}
 
+    sanitized = _sanitize_interaction_governance(governance_trace)
+
     return {
         "attempted": governance_trace.get("attempted", False),
         "status": governance_trace.get("status", "not_requested"),
         "included": governance_trace.get("included", False),
         "runtime_call_status": governance_trace.get("runtime_call_status"),
         "interaction_kind": governance_trace.get("interaction_kind"),
-        "response_posture": governance_trace.get("response_posture"),
-        "commentary_allowed": governance_trace.get("commentary_allowed"),
-        "humor_allowed": governance_trace.get("humor_allowed"),
-        "action_allowed": governance_trace.get("action_allowed"),
-        "requires_confirmation": governance_trace.get("requires_confirmation"),
-        "privacy_sensitivity_hint": governance_trace.get("privacy_sensitivity_hint"),
-        "confidence": governance_trace.get("confidence"),
-        "reason_summary": governance_trace.get("reason_summary", []),
+        "response_posture": sanitized.get("response_posture"),
+        "commentary_allowed": sanitized.get("commentary_allowed"),
+        "humor_allowed": sanitized.get("humor_allowed"),
+        "action_allowed": sanitized.get("action_allowed"),
+        "requires_confirmation": sanitized.get("requires_confirmation"),
+        "privacy_sensitivity_hint": sanitized.get("privacy_sensitivity_hint"),
+        "confidence": sanitized.get("confidence"),
+        "reason_summary": sanitized.get("reason_summary", []),
         "omission_reason": governance_trace.get("omission_reason"),
     }
 
@@ -412,9 +483,18 @@ def assemble_prompt(
     interaction_governance_messages = build_interaction_governance_messages(
         interaction_governance
     )
+    governance_trace_out = interaction_governance_trace(interaction_governance_trace_data)
     if interaction_governance_messages:
         messages.extend(interaction_governance_messages)
-    governance_trace_out = interaction_governance_trace(interaction_governance_trace_data)
+    elif governance_trace_out.get("attempted") and governance_trace_out.get("status") == "included":
+        governance_trace_out.update(
+            {
+                "status": "failed",
+                "included": False,
+                "runtime_call_status": "unusable",
+                "omission_reason": "unusable_interaction_governance_response",
+            }
+        )
     layers.append(
         _layer_trace(
             "interaction_governance",
