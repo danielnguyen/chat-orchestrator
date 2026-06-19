@@ -255,7 +255,7 @@ async def _resolve_external_context(
             "status": "error",
             "error_code": error_code,
         }
-    except Exception as e:
+    except Exception:
         return None, {
             **dsa_trace_base,
             "called": True,
@@ -408,7 +408,7 @@ async def _resolve_runtime_session(
             conversation_id=conversation_id,
             surface=surface,
         )
-    except Exception:
+    except Exception as e:
         return None, {
             "attempted": True,
             "status": "failed",
@@ -1077,7 +1077,7 @@ async def _resolve_persona_containment(
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
         )
-    except Exception as e:
+    except Exception:
         return None, {
             "attempted": True,
             "status": "failed",
@@ -1178,7 +1178,7 @@ async def _resolve_restraint(
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
         )
-    except Exception as e:
+    except Exception:
         return None, {
             "attempted": True,
             "status": "failed",
