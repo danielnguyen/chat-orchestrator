@@ -47,6 +47,8 @@ COGNITIVE_RUNTIME_API_KEY=
 COGNITIVE_RUNTIME_TIMEOUT_MS=1500
 COGNITIVE_RUNTIME_COMPANION_ENABLED=false
 COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=false
+COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=false
+COGNITIVE_RUNTIME_RESTRAINT_ENABLED=false
 LITELLM_BASE_URL=http://127.0.0.1:4000
 LITELLM_API_KEY=
 DSA_ENABLED=false
@@ -108,11 +110,17 @@ Operator checks when runtime behavior looks wrong:
 - confirm `basic-memory-store` is reachable for conversation, retrieval, and trace writes
 - confirm `cognitive-runtime` `GET /healthz` succeeds before enabling governance consumption
 - confirm `cognitive-runtime` `POST /v1/runtime/interaction-governance/evaluate` returns a typed result
+- confirm `cognitive-runtime` `POST /v1/runtime/persona-containment/evaluate` returns a typed result before enabling containment consumption
+- confirm `cognitive-runtime` `POST /v1/runtime/restraint/evaluate` returns a typed result before enabling restraint consumption
 - confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=false` leaves normal `/v1/chat` behavior unchanged
 - confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true` records a safe governance summary when `cognitive-runtime` is reachable
 - confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true` remains non-fatal and traces governance as failed or omitted when `cognitive-runtime` is unavailable
+- confirm `COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=false` and `COGNITIVE_RUNTIME_RESTRAINT_ENABLED=false` leave normal `/v1/chat` behavior unchanged
+- confirm enabling persona containment or restraint remains non-fatal and records safe trace summaries when `cognitive-runtime` is reachable
+- confirm persona containment and restraint guidance stay additive only and do not claim retrieval or tool filtering unless that enforcement is actually implemented
 - confirm tense debugging inputs produce tactical governance posture with humor and commentary suppressed in the trace summary
 - confirm malformed or malicious governance results do not leak raw prompt-facing guidance into traces or user-visible output
+- confirm malformed or malicious persona containment and restraint results do not leak raw prompt-facing guidance into traces or user-visible output
 - confirm `cognitive-runtime` companion compile failures stay traceable and non-fatal to normal chat
 - confirm user-facing answers do not include raw runtime exception text
 - confirm `POST /v1/runtime/overlay` is reachable when runtime overlays are enabled
@@ -171,8 +179,11 @@ Local/offline routing precedence is additive and traceable: request `sensitivity
 
 - `cognitive-runtime` owns companion contracts and diagnostic surfaces.
 - `cognitive-runtime` owns interaction classification policy and the interaction governance evaluation endpoint.
+- `cognitive-runtime` owns persona containment and restraint evaluation endpoints.
 - `chat-orchestrator` consumes compiled companion policy overlays and does not own companion contract definition.
 - `chat-orchestrator` can optionally consume Cognitive Runtime interaction governance when `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true`; the default remains `false`.
+- `chat-orchestrator` can optionally consume Cognitive Runtime persona containment and restraint when `COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=true` or `COGNITIVE_RUNTIME_RESTRAINT_ENABLED=true`; both defaults remain `false`.
+- persona containment and restraint consumption are additive, non-fatal, and traceable; this integration does not claim retrieval or tool enforcement unless a downstream scoped interface actually exists.
 - `AssistantHandoff` captures orchestration output as refs, counts, statuses, and warning summaries.
 - `CompanionPresentation` prepares prompt-facing presentation input from the handoff summary.
 - `response_review` is a deterministic shadow review over model output and trace context.
