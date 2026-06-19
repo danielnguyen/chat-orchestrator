@@ -79,6 +79,24 @@ def _interaction_governance_disabled_trace() -> dict[str, Any]:
     }
 
 
+def _persona_containment_disabled_trace() -> dict[str, Any]:
+    return {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+        "retrieval_scope_status": "not_enforced",
+        "retrieval_scope_reason": "retrieval_scope_not_enforced",
+    }
+
+
+def _restraint_disabled_trace() -> dict[str, Any]:
+    return {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+    }
+
+
 def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -237,7 +255,7 @@ async def _resolve_external_context(
             "status": "error",
             "error_code": error_code,
         }
-    except Exception:
+    except Exception as e:
         return None, {
             **dsa_trace_base,
             "called": True,
@@ -390,7 +408,7 @@ async def _resolve_runtime_session(
             conversation_id=conversation_id,
             surface=surface,
         )
-    except Exception as e:
+    except Exception:
         return None, {
             "attempted": True,
             "status": "failed",
@@ -1017,6 +1035,195 @@ async def _resolve_interaction_governance(
     }
 
 
+async def _resolve_persona_containment(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    persona_scope_hint: str | None,
+    interaction_kind: str | None,
+    current_user_text: str,
+    recent_messages: list[dict[str, str]],
+    surface_metadata_json: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not enabled:
+        return None, _persona_containment_disabled_trace()
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "runtime_client_not_configured",
+            "retrieval_scope_status": "not_enforced",
+            "retrieval_scope_reason": "retrieval_scope_not_enforced",
+        }
+
+    try:
+        response = await runtime.evaluate_persona_containment(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            persona_scope_hint=persona_scope_hint,
+            interaction_kind=interaction_kind,
+            current_user_text=current_user_text or None,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "persona_containment_unavailable",
+            "retrieval_scope_status": "not_enforced",
+            "retrieval_scope_reason": "retrieval_scope_not_enforced",
+        }
+
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "malformed_persona_containment_response",
+            "retrieval_scope_status": "not_enforced",
+            "retrieval_scope_reason": "retrieval_scope_not_enforced",
+        }
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "malformed_persona_containment_response",
+            "retrieval_scope_status": "not_enforced",
+            "retrieval_scope_reason": "retrieval_scope_not_enforced",
+        }
+
+    reason_summary = result.get("reason_summary", [])
+    if not isinstance(reason_summary, list):
+        reason_summary = []
+
+    return result, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "active_persona_id": result.get("active_persona_id"),
+        "capability_domain": result.get("capability_domain"),
+        "allowed_memory_domains": result.get("allowed_memory_domains", []),
+        "blocked_memory_domains": result.get("blocked_memory_domains", []),
+        "allowed_world_state_domains": result.get("allowed_world_state_domains", []),
+        "allowed_relationship_domains": result.get(
+            "allowed_relationship_domains", []
+        ),
+        "allowed_tool_domains": result.get("allowed_tool_domains", []),
+        "cross_scope_access_allowed": result.get("cross_scope_access_allowed"),
+        "cross_scope_reason": result.get("cross_scope_reason"),
+        "confidence": result.get("confidence"),
+        "reason_summary": reason_summary,
+        "retrieval_scope_status": "not_enforced",
+        "retrieval_scope_reason": "retrieval_scope_not_enforced",
+    }
+
+
+async def _resolve_restraint(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    interaction_kind: str | None,
+    response_posture: str | None,
+    active_persona_id: str | None,
+    capability_domain: str | None,
+    current_user_text: str,
+    recent_messages: list[dict[str, str]],
+    surface_metadata_json: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not enabled:
+        return None, _restraint_disabled_trace()
+    if runtime is None:
+        return None, {
+            "attempted": False,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "runtime_client_not_configured",
+        }
+
+    try:
+        response = await runtime.evaluate_restraint(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            interaction_kind=interaction_kind,
+            response_posture=response_posture,
+            active_persona_id=active_persona_id,
+            capability_domain=capability_domain,
+            current_user_text=current_user_text or None,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+    except Exception as e:
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "restraint_unavailable",
+        }
+
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "malformed_restraint_response",
+        }
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "omission_reason": "malformed_restraint_response",
+        }
+
+    reason_summary = result.get("reason_summary", [])
+    if not isinstance(reason_summary, list):
+        reason_summary = []
+
+    return result, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "restraint_policy": result.get("restraint_policy"),
+        "domains": result.get("domains", []),
+        "reason": result.get("reason"),
+        "confidence": result.get("confidence"),
+        "reason_summary": reason_summary,
+        "retrieval_suppressed": result.get("retrieval_suppressed"),
+        "personalization_suppressed": result.get("personalization_suppressed"),
+        "proactive_output_suppressed": result.get("proactive_output_suppressed"),
+        "brevity_preferred": result.get("brevity_preferred"),
+        "clarification_preferred": result.get("clarification_preferred"),
+    }
+
+
 async def _reset_runtime_after_turn(
     *,
     runtime: Any | None,
@@ -1236,6 +1443,8 @@ async def orchestrate_chat(
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
     interaction_governance_enabled: bool = False,
+    persona_containment_enabled: bool = False,
+    restraint_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -1315,6 +1524,62 @@ async def orchestrate_chat(
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
         )
+    )
+    persona_containment, persona_containment_trace = await _resolve_persona_containment(
+        runtime=runtime,
+        enabled=persona_containment_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        persona_scope_hint=(
+            interaction_governance.get("persona_scope_hint")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        interaction_kind=(
+            interaction_governance.get("interaction_kind")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        current_user_text=last_user_text,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
+    )
+    restraint, restraint_trace = await _resolve_restraint(
+        runtime=runtime,
+        enabled=restraint_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        interaction_kind=(
+            interaction_governance.get("interaction_kind")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        response_posture=(
+            interaction_governance.get("response_posture")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        active_persona_id=(
+            persona_containment.get("active_persona_id")
+            if isinstance(persona_containment, dict)
+            else None
+        ),
+        capability_domain=(
+            persona_containment.get("capability_domain")
+            if isinstance(persona_containment, dict)
+            else None
+        ),
+        current_user_text=last_user_text,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
     )
 
     profile = await memory_store.resolve_profile(
@@ -1486,6 +1751,8 @@ async def orchestrate_chat(
                         "response_shape": response_shape_trace,
                         "companion_policy": companion_trace,
                         "interaction_governance": interaction_governance_trace,
+                        "persona_containment": persona_containment_trace,
+                        "restraint": restraint_trace,
                         "world_state": world_state_trace,
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
@@ -1553,6 +1820,10 @@ async def orchestrate_chat(
             companion_trace=companion_trace,
             interaction_governance=interaction_governance,
             interaction_governance_trace_data=interaction_governance_trace,
+            persona_containment=persona_containment,
+            persona_containment_trace_data=persona_containment_trace,
+            restraint=restraint,
+            restraint_trace_data=restraint_trace,
             runtime_identity=runtime_identity,
             runtime_identity_trace=runtime_identity_trace,
             world_state=world_state,

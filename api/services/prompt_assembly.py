@@ -19,6 +19,28 @@ VALID_GOVERNANCE_RESPONSE_POSTURES = {
 }
 VALID_GOVERNANCE_PRIVACY_HINTS = {"normal", "private", "sensitive"}
 SAFE_GOVERNANCE_LABEL = re.compile(r"^[a-zA-Z0-9_.:-]+$")
+VALID_RESTRAINT_POLICIES = {
+    "answer_normally",
+    "short_answer",
+    "defer_expansion",
+    "ask_clarifying_question",
+    "do_not_retrieve",
+    "do_not_personalize",
+    "suppress_proactive_output",
+}
+PROMPT_OVERLAY_MAX_CHARS = 240
+PROMPT_INJECTION_MARKERS = (
+    "ignore system",
+    "ignore developer",
+    "ignore prior",
+    "ignore previous",
+    "system prompt",
+    "developer prompt",
+    "developer message",
+    "developer instructions",
+    "prior instructions",
+    "previous instructions",
+)
 
 
 @dataclass(frozen=True)
@@ -166,6 +188,36 @@ def _validated_governance_label(value: Any) -> str | None:
     return value
 
 
+def _validated_label_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, str) and SAFE_GOVERNANCE_LABEL.fullmatch(item)
+    ]
+
+
+def _validated_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _validated_confidence(value: Any) -> float | int | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _sanitize_prompt_overlay(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    overlay = value.strip()
+    if not overlay or len(overlay) > PROMPT_OVERLAY_MAX_CHARS:
+        return None
+    lowered = overlay.lower()
+    if any(marker in lowered for marker in PROMPT_INJECTION_MARKERS):
+        return None
+    return overlay
+
+
 def _sanitize_interaction_governance(governance: dict[str, Any] | None) -> dict[str, Any]:
     governance = governance if isinstance(governance, dict) else {}
     response_posture = governance.get("response_posture")
@@ -273,6 +325,203 @@ def interaction_governance_trace(governance_trace: dict[str, Any] | None) -> dic
     }
 
 
+def _sanitize_persona_containment(
+    persona_containment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    persona_containment = persona_containment if isinstance(persona_containment, dict) else {}
+    return {
+        "active_persona_id": _validated_governance_label(
+            persona_containment.get("active_persona_id")
+        ),
+        "capability_domain": _validated_governance_label(
+            persona_containment.get("capability_domain")
+        ),
+        "allowed_memory_domains": _validated_label_list(
+            persona_containment.get("allowed_memory_domains")
+        ),
+        "blocked_memory_domains": _validated_label_list(
+            persona_containment.get("blocked_memory_domains")
+        ),
+        "allowed_world_state_domains": _validated_label_list(
+            persona_containment.get("allowed_world_state_domains")
+        ),
+        "allowed_relationship_domains": _validated_label_list(
+            persona_containment.get("allowed_relationship_domains")
+        ),
+        "allowed_tool_domains": _validated_label_list(
+            persona_containment.get("allowed_tool_domains")
+        ),
+        "cross_scope_access_allowed": _validated_bool(
+            persona_containment.get("cross_scope_access_allowed")
+        ),
+        "cross_scope_reason": _validated_governance_label(
+            persona_containment.get("cross_scope_reason")
+        ),
+        "confidence": _validated_confidence(persona_containment.get("confidence")),
+        "reason_summary": _validated_label_list(persona_containment.get("reason_summary")),
+    }
+
+
+def build_persona_containment_messages(
+    persona_containment: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    sanitized = _sanitize_persona_containment(persona_containment)
+    lines = ["Persona containment guidance:"]
+
+    active_persona_id = sanitized.get("active_persona_id")
+    capability_domain = sanitized.get("capability_domain")
+    if isinstance(active_persona_id, str):
+        lines.append(f"- Stay within the active persona: {active_persona_id}.")
+    if isinstance(capability_domain, str):
+        lines.append(f"- Keep the response within the capability domain: {capability_domain}.")
+
+    if sanitized.get("allowed_memory_domains"):
+        domains = ", ".join(sanitized["allowed_memory_domains"])
+        lines.append(f"- Memory scope hints for this turn: {domains}.")
+    if sanitized.get("blocked_memory_domains"):
+        domains = ", ".join(sanitized["blocked_memory_domains"])
+        lines.append(f"- Treat these memory domains as blocked scope hints: {domains}.")
+    if sanitized.get("allowed_tool_domains"):
+        domains = ", ".join(sanitized["allowed_tool_domains"])
+        lines.append(f"- Tool scope hints for this turn: {domains}.")
+
+    if (
+        sanitized.get("allowed_memory_domains")
+        or sanitized.get("blocked_memory_domains")
+        or sanitized.get("allowed_world_state_domains")
+        or sanitized.get("allowed_relationship_domains")
+        or sanitized.get("allowed_tool_domains")
+    ):
+        lines.append(
+            "- Treat domain lists as scope guidance only; do not imply retrieval, tool access, world-state access, or relationship access occurred."
+        )
+
+    if sanitized.get("cross_scope_access_allowed") is True:
+        lines.append("- Cross-scope bridging is allowed only for this turn.")
+    elif sanitized.get("cross_scope_access_allowed") is False:
+        lines.append(
+            "- Do not bridge blocked or unrelated domains unless the user explicitly requests it."
+        )
+
+    if len(lines) == 1:
+        return []
+    return [{"role": "system", "content": "\n".join(lines)}]
+
+
+def persona_containment_trace(persona_trace: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(persona_trace, dict):
+        persona_trace = {}
+
+    sanitized = _sanitize_persona_containment(persona_trace)
+    return {
+        "attempted": persona_trace.get("attempted", False),
+        "status": persona_trace.get("status", "not_requested"),
+        "included": persona_trace.get("included", False),
+        "active_persona_id": sanitized.get("active_persona_id"),
+        "capability_domain": sanitized.get("capability_domain"),
+        "allowed_memory_domains": sanitized.get("allowed_memory_domains", []),
+        "blocked_memory_domains": sanitized.get("blocked_memory_domains", []),
+        "allowed_world_state_domains": sanitized.get("allowed_world_state_domains", []),
+        "allowed_relationship_domains": sanitized.get(
+            "allowed_relationship_domains", []
+        ),
+        "allowed_tool_domains": sanitized.get("allowed_tool_domains", []),
+        "cross_scope_access_allowed": sanitized.get("cross_scope_access_allowed"),
+        "cross_scope_reason": sanitized.get("cross_scope_reason"),
+        "confidence": sanitized.get("confidence"),
+        "reason_summary": sanitized.get("reason_summary", []),
+        "retrieval_scope_status": persona_trace.get("retrieval_scope_status"),
+        "retrieval_scope_reason": persona_trace.get("retrieval_scope_reason"),
+        "omission_reason": persona_trace.get("omission_reason"),
+    }
+
+
+def _sanitize_restraint(restraint: dict[str, Any] | None) -> dict[str, Any]:
+    restraint = restraint if isinstance(restraint, dict) else {}
+    policy = restraint.get("restraint_policy")
+    return {
+        "restraint_policy": (
+            policy
+            if isinstance(policy, str) and policy in VALID_RESTRAINT_POLICIES
+            else None
+        ),
+        "domains": _validated_label_list(restraint.get("domains")),
+        "reason": _validated_governance_label(restraint.get("reason")),
+        "prompt_overlay": _sanitize_prompt_overlay(restraint.get("prompt_overlay")),
+        "confidence": _validated_confidence(restraint.get("confidence")),
+        "reason_summary": _validated_label_list(restraint.get("reason_summary")),
+        "retrieval_suppressed": _validated_bool(restraint.get("retrieval_suppressed")),
+        "personalization_suppressed": _validated_bool(
+            restraint.get("personalization_suppressed")
+        ),
+        "proactive_output_suppressed": _validated_bool(
+            restraint.get("proactive_output_suppressed")
+        ),
+        "brevity_preferred": _validated_bool(restraint.get("brevity_preferred")),
+        "clarification_preferred": _validated_bool(
+            restraint.get("clarification_preferred")
+        ),
+    }
+
+
+def build_restraint_messages(restraint: dict[str, Any] | None) -> list[dict[str, str]]:
+    sanitized = _sanitize_restraint(restraint)
+    lines = ["Restraint guidance:"]
+
+    prompt_overlay = sanitized.get("prompt_overlay")
+    if isinstance(prompt_overlay, str):
+        lines.append(f"- {prompt_overlay}")
+
+    restraint_policy = sanitized.get("restraint_policy")
+    if isinstance(restraint_policy, str) and restraint_policy != "answer_normally":
+        lines.append(f"- Apply the {restraint_policy} restraint policy.")
+
+    if sanitized.get("domains"):
+        lines.append(
+            f"- Affected restraint domains: {', '.join(sanitized['domains'])}."
+        )
+
+    if sanitized.get("retrieval_suppressed") is True:
+        lines.append("- Do not assume retrieval or prior context should be surfaced.")
+    if sanitized.get("personalization_suppressed") is True:
+        lines.append("- Avoid unnecessary personal framing.")
+    if sanitized.get("proactive_output_suppressed") is True:
+        lines.append("- Do not add unsolicited follow-ups or proactive nudges.")
+    if sanitized.get("brevity_preferred") is True and restraint_policy != "short_answer":
+        lines.append("- Keep the response brief.")
+    if sanitized.get("clarification_preferred") is True and (
+        restraint_policy != "ask_clarifying_question"
+    ):
+        lines.append("- Ask one clarifying question instead of assuming details.")
+
+    if len(lines) == 1:
+        return []
+    return [{"role": "system", "content": "\n".join(lines)}]
+
+
+def restraint_trace(restraint_trace_data: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(restraint_trace_data, dict):
+        restraint_trace_data = {}
+
+    sanitized = _sanitize_restraint(restraint_trace_data)
+    return {
+        "attempted": restraint_trace_data.get("attempted", False),
+        "status": restraint_trace_data.get("status", "not_requested"),
+        "included": restraint_trace_data.get("included", False),
+        "restraint_policy": sanitized.get("restraint_policy"),
+        "domains": sanitized.get("domains", []),
+        "reason": sanitized.get("reason"),
+        "confidence": sanitized.get("confidence"),
+        "reason_summary": sanitized.get("reason_summary", []),
+        "retrieval_suppressed": sanitized.get("retrieval_suppressed"),
+        "personalization_suppressed": sanitized.get("personalization_suppressed"),
+        "proactive_output_suppressed": sanitized.get("proactive_output_suppressed"),
+        "brevity_preferred": sanitized.get("brevity_preferred"),
+        "clarification_preferred": sanitized.get("clarification_preferred"),
+        "omission_reason": restraint_trace_data.get("omission_reason"),
+    }
+
+
 def assemble_prompt(
     *,
     profile: dict[str, Any],
@@ -297,6 +546,10 @@ def assemble_prompt(
     runtime_trace: dict[str, Any] | None = None,
     interaction_governance: dict[str, Any] | None = None,
     interaction_governance_trace_data: dict[str, Any] | None = None,
+    persona_containment: dict[str, Any] | None = None,
+    persona_containment_trace_data: dict[str, Any] | None = None,
+    restraint: dict[str, Any] | None = None,
+    restraint_trace_data: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
@@ -519,6 +772,102 @@ def assemble_prompt(
         )
     )
 
+    persona_containment_messages = build_persona_containment_messages(persona_containment)
+    persona_containment_trace_out = persona_containment_trace(
+        persona_containment_trace_data
+    )
+    if persona_containment_messages:
+        messages.extend(persona_containment_messages)
+    elif (
+        persona_containment_trace_out.get("attempted")
+        and persona_containment_trace_out.get("status") == "included"
+    ):
+        persona_containment_trace_out.update(
+            {
+                "status": "failed",
+                "included": False,
+                "omission_reason": "unusable_persona_containment_response",
+            }
+        )
+    layers.append(
+        _layer_trace(
+            "persona_containment",
+            persona_containment_messages,
+            metadata={
+                "active_persona_id": persona_containment_trace_out.get("active_persona_id"),
+                "capability_domain": persona_containment_trace_out.get("capability_domain"),
+                "allowed_memory_domains": persona_containment_trace_out.get(
+                    "allowed_memory_domains", []
+                ),
+                "blocked_memory_domains": persona_containment_trace_out.get(
+                    "blocked_memory_domains", []
+                ),
+                "allowed_world_state_domains": persona_containment_trace_out.get(
+                    "allowed_world_state_domains", []
+                ),
+                "allowed_relationship_domains": persona_containment_trace_out.get(
+                    "allowed_relationship_domains", []
+                ),
+                "allowed_tool_domains": persona_containment_trace_out.get(
+                    "allowed_tool_domains", []
+                ),
+                "cross_scope_access_allowed": persona_containment_trace_out.get(
+                    "cross_scope_access_allowed"
+                ),
+                "cross_scope_reason": persona_containment_trace_out.get(
+                    "cross_scope_reason"
+                ),
+                "confidence": persona_containment_trace_out.get("confidence"),
+                "reason_summary": persona_containment_trace_out.get("reason_summary", []),
+                "retrieval_scope_status": persona_containment_trace_out.get(
+                    "retrieval_scope_status"
+                ),
+                "retrieval_scope_reason": persona_containment_trace_out.get(
+                    "retrieval_scope_reason"
+                ),
+                "omission_reason": persona_containment_trace_out.get("omission_reason"),
+            },
+        )
+    )
+
+    restraint_messages = build_restraint_messages(restraint)
+    restraint_trace_out = restraint_trace(restraint_trace_data)
+    if restraint_messages:
+        messages.extend(restraint_messages)
+    elif restraint_trace_out.get("attempted") and restraint_trace_out.get("status") == "included":
+        restraint_trace_out.update(
+            {
+                "status": "failed",
+                "included": False,
+                "omission_reason": "unusable_restraint_response",
+            }
+        )
+    layers.append(
+        _layer_trace(
+            "restraint",
+            restraint_messages,
+            metadata={
+                "restraint_policy": restraint_trace_out.get("restraint_policy"),
+                "domains": restraint_trace_out.get("domains", []),
+                "reason": restraint_trace_out.get("reason"),
+                "confidence": restraint_trace_out.get("confidence"),
+                "reason_summary": restraint_trace_out.get("reason_summary", []),
+                "retrieval_suppressed": restraint_trace_out.get("retrieval_suppressed"),
+                "personalization_suppressed": restraint_trace_out.get(
+                    "personalization_suppressed"
+                ),
+                "proactive_output_suppressed": restraint_trace_out.get(
+                    "proactive_output_suppressed"
+                ),
+                "brevity_preferred": restraint_trace_out.get("brevity_preferred"),
+                "clarification_preferred": restraint_trace_out.get(
+                    "clarification_preferred"
+                ),
+                "omission_reason": restraint_trace_out.get("omission_reason"),
+            },
+        )
+    )
+
     runtime_identity_messages: list[dict[str, str]] = []
     runtime_identity_trace_out = dict(runtime_identity_trace or {})
     runtime_identity_omission_reason = runtime_identity_trace_out.get("omission_reason")
@@ -710,6 +1059,10 @@ def assemble_prompt(
         "companion_policy": companion_trace_out
         or {"attempted": False, "status": "not_requested"},
         "interaction_governance": governance_trace_out
+        or {"attempted": False, "status": "not_requested", "included": False},
+        "persona_containment": persona_containment_trace_out
+        or {"attempted": False, "status": "not_requested", "included": False},
+        "restraint": restraint_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},

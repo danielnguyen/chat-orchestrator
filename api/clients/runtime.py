@@ -292,6 +292,92 @@ class RuntimeClient:
             payload["surface_metadata_json"] = surface_metadata_json
         return await self._post("/v1/runtime/interaction-governance/evaluate", json=payload)
 
+    async def evaluate_persona_containment(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        active_persona_id: str | None = None,
+        requested_persona_id: str | None = None,
+        persona_scope_hint: str | None = None,
+        interaction_kind: str | None = None,
+        current_user_text: str | None = None,
+        recent_messages: list[dict[str, Any]] | None = None,
+        surface_metadata_json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if active_persona_id is not None:
+            payload["active_persona_id"] = active_persona_id
+        if requested_persona_id is not None:
+            payload["requested_persona_id"] = requested_persona_id
+        if persona_scope_hint is not None:
+            payload["persona_scope_hint"] = persona_scope_hint
+        if interaction_kind is not None:
+            payload["interaction_kind"] = interaction_kind
+        if current_user_text is not None:
+            payload["current_user_text"] = current_user_text
+        if recent_messages is not None:
+            payload["recent_messages"] = recent_messages
+        if surface_metadata_json is not None:
+            payload["surface_metadata_json"] = surface_metadata_json
+        return await self._post("/v1/runtime/persona-containment/evaluate", json=payload)
+
+    async def evaluate_restraint(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        interaction_kind: str | None = None,
+        response_posture: str | None = None,
+        active_persona_id: str | None = None,
+        capability_domain: str | None = None,
+        current_user_text: str | None = None,
+        recent_messages: list[dict[str, Any]] | None = None,
+        surface_metadata_json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if interaction_kind is not None:
+            payload["interaction_kind"] = interaction_kind
+        if response_posture is not None:
+            payload["response_posture"] = response_posture
+        if active_persona_id is not None:
+            payload["active_persona_id"] = active_persona_id
+        if capability_domain is not None:
+            payload["capability_domain"] = capability_domain
+        if current_user_text is not None:
+            payload["current_user_text"] = current_user_text
+        if recent_messages is not None:
+            payload["recent_messages"] = recent_messages
+        if surface_metadata_json is not None:
+            payload["surface_metadata_json"] = surface_metadata_json
+        return await self._post("/v1/runtime/restraint/evaluate", json=payload)
+
     async def reset(
         self,
         *,
