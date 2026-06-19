@@ -430,8 +430,25 @@ def persona_containment_trace(persona_trace: dict[str, Any] | None) -> dict[str,
         "cross_scope_reason": sanitized.get("cross_scope_reason"),
         "confidence": sanitized.get("confidence"),
         "reason_summary": sanitized.get("reason_summary", []),
+        "retrieval_scope_requested": persona_trace.get("retrieval_scope_requested"),
+        "retrieval_scope_used": persona_trace.get("retrieval_scope_used"),
         "retrieval_scope_status": persona_trace.get("retrieval_scope_status"),
         "retrieval_scope_reason": persona_trace.get("retrieval_scope_reason"),
+        "artifact_request_status": persona_trace.get("artifact_request_status"),
+        "artifact_request_reason": persona_trace.get("artifact_request_reason"),
+        "artifact_result_status": persona_trace.get("artifact_result_status"),
+        "artifact_result_reason": persona_trace.get("artifact_result_reason"),
+        "artifact_result_count_omitted": persona_trace.get(
+            "artifact_result_count_omitted"
+        ),
+        "domain_retrieval_scope_status": persona_trace.get(
+            "domain_retrieval_scope_status"
+        ),
+        "domain_retrieval_scope_reason": persona_trace.get(
+            "domain_retrieval_scope_reason"
+        ),
+        "tool_scope_status": persona_trace.get("tool_scope_status"),
+        "tool_scope_reason": persona_trace.get("tool_scope_reason"),
         "omission_reason": persona_trace.get("omission_reason"),
     }
 
@@ -819,11 +836,44 @@ def assemble_prompt(
                 ),
                 "confidence": persona_containment_trace_out.get("confidence"),
                 "reason_summary": persona_containment_trace_out.get("reason_summary", []),
+                "retrieval_scope_requested": persona_containment_trace_out.get(
+                    "retrieval_scope_requested"
+                ),
+                "retrieval_scope_used": persona_containment_trace_out.get(
+                    "retrieval_scope_used"
+                ),
                 "retrieval_scope_status": persona_containment_trace_out.get(
                     "retrieval_scope_status"
                 ),
                 "retrieval_scope_reason": persona_containment_trace_out.get(
                     "retrieval_scope_reason"
+                ),
+                "artifact_request_status": persona_containment_trace_out.get(
+                    "artifact_request_status"
+                ),
+                "artifact_request_reason": persona_containment_trace_out.get(
+                    "artifact_request_reason"
+                ),
+                "artifact_result_status": persona_containment_trace_out.get(
+                    "artifact_result_status"
+                ),
+                "artifact_result_reason": persona_containment_trace_out.get(
+                    "artifact_result_reason"
+                ),
+                "artifact_result_count_omitted": persona_containment_trace_out.get(
+                    "artifact_result_count_omitted"
+                ),
+                "domain_retrieval_scope_status": persona_containment_trace_out.get(
+                    "domain_retrieval_scope_status"
+                ),
+                "domain_retrieval_scope_reason": persona_containment_trace_out.get(
+                    "domain_retrieval_scope_reason"
+                ),
+                "tool_scope_status": persona_containment_trace_out.get(
+                    "tool_scope_status"
+                ),
+                "tool_scope_reason": persona_containment_trace_out.get(
+                    "tool_scope_reason"
                 ),
                 "omission_reason": persona_containment_trace_out.get("omission_reason"),
             },
