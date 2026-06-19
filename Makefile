@@ -36,6 +36,11 @@ smoke:
 	CHAT_PAYLOAD_JSON="$${CHAT_PAYLOAD_JSON:-{\"owner_id\":\"daniel\",\"client_id\":\"vscode\",\"surface\":\"vscode\",\"messages\":[{\"role\":\"user\",\"content\":\"smoke check\"}]}}"; \
 	EXPECT_GOVERNANCE_STATUS="$${EXPECT_GOVERNANCE_STATUS:-}"; \
 	EXPECT_GOVERNANCE_POSTURE="$${EXPECT_GOVERNANCE_POSTURE:-}"; \
+	EXPECT_PERSONA_STATUS="$${EXPECT_PERSONA_STATUS:-}"; \
+	EXPECT_PERSONA_DOMAIN="$${EXPECT_PERSONA_DOMAIN:-}"; \
+	EXPECT_PERSONA_RETRIEVAL_SCOPE_REASON="$${EXPECT_PERSONA_RETRIEVAL_SCOPE_REASON:-}"; \
+	EXPECT_RESTRAINT_STATUS="$${EXPECT_RESTRAINT_STATUS:-}"; \
+	EXPECT_RESTRAINT_POLICY="$${EXPECT_RESTRAINT_POLICY:-}"; \
 	echo "==> POST $$ORCH_BASE/v1/chat"; \
 	RESP="$$(curl -sS -X POST "$$ORCH_BASE/v1/chat" \
 	  -H "X-API-Key: $$ORCH_KEY" \
@@ -60,6 +65,26 @@ smoke:
 	if [ -n "$$EXPECT_GOVERNANCE_POSTURE" ]; then \
 	  echo "==> CHECK governance posture"; \
 	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.interaction_governance.response_posture == "'$$EXPECT_GOVERNANCE_POSTURE'"' >/dev/null; \
+	fi; \
+	if [ -n "$$EXPECT_PERSONA_STATUS" ]; then \
+	  echo "==> CHECK persona containment trace summary"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.persona_containment.status == "'$$EXPECT_PERSONA_STATUS'"' >/dev/null; \
+	fi; \
+	if [ -n "$$EXPECT_PERSONA_DOMAIN" ]; then \
+	  echo "==> CHECK persona containment capability domain"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.persona_containment.capability_domain == "'$$EXPECT_PERSONA_DOMAIN'"' >/dev/null; \
+	fi; \
+	if [ -n "$$EXPECT_PERSONA_RETRIEVAL_SCOPE_REASON" ]; then \
+	  echo "==> CHECK persona containment retrieval scope note"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.persona_containment.retrieval_scope_reason == "'$$EXPECT_PERSONA_RETRIEVAL_SCOPE_REASON'"' >/dev/null; \
+	fi; \
+	if [ -n "$$EXPECT_RESTRAINT_STATUS" ]; then \
+	  echo "==> CHECK restraint trace summary"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.restraint.status == "'$$EXPECT_RESTRAINT_STATUS'"' >/dev/null; \
+	fi; \
+	if [ -n "$$EXPECT_RESTRAINT_POLICY" ]; then \
+	  echo "==> CHECK restraint policy"; \
+	  echo "$$TRACE" | jq -e '.payload.retrieval.prompt_assembly.restraint.restraint_policy == "'$$EXPECT_RESTRAINT_POLICY'"' >/dev/null; \
 	fi; \
 	echo "Smoke passed."
 

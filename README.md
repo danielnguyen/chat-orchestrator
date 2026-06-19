@@ -98,13 +98,29 @@ The smoke flow:
 - asserts JSON and `request_id` are present
 - allows either successful response or valid failure JSON
 - on success, verifies trace visibility via `basic-memory-store` `GET /v1/traces/{request_id}`
-- optionally verifies summarized governance trace fields when `EXPECT_GOVERNANCE_STATUS` or `EXPECT_GOVERNANCE_POSTURE` are provided
+- optionally verifies summarized runtime-policy trace fields when governance or persona/restraint assertion env vars are provided
 - keeps normal chat ownership on `chat-orchestrator` while treating `basic-memory-store`, `cognitive-runtime`, and LiteLLM as downstream services
 
 Optional smoke env vars:
 - `CHAT_PAYLOAD_JSON` overrides the default chat request payload
 - `EXPECT_GOVERNANCE_STATUS` checks `payload.retrieval.prompt_assembly.interaction_governance.status`
 - `EXPECT_GOVERNANCE_POSTURE` checks `payload.retrieval.prompt_assembly.interaction_governance.response_posture`
+- `EXPECT_PERSONA_STATUS` checks `payload.retrieval.prompt_assembly.persona_containment.status`
+- `EXPECT_PERSONA_DOMAIN` checks `payload.retrieval.prompt_assembly.persona_containment.capability_domain`
+- `EXPECT_PERSONA_RETRIEVAL_SCOPE_REASON` checks `payload.retrieval.prompt_assembly.persona_containment.retrieval_scope_reason`
+- `EXPECT_RESTRAINT_STATUS` checks `payload.retrieval.prompt_assembly.restraint.status`
+- `EXPECT_RESTRAINT_POLICY` checks `payload.retrieval.prompt_assembly.restraint.restraint_policy`
+
+Example opt-in containment/restraint smoke invocation:
+
+```bash
+COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=true \
+COGNITIVE_RUNTIME_RESTRAINT_ENABLED=true \
+EXPECT_PERSONA_STATUS=included \
+EXPECT_PERSONA_RETRIEVAL_SCOPE_REASON=retrieval_scope_not_enforced \
+EXPECT_RESTRAINT_STATUS=included \
+make smoke
+```
 
 Operator checks when runtime behavior looks wrong:
 - confirm `basic-memory-store` is reachable for conversation, retrieval, and trace writes
@@ -116,15 +132,16 @@ Operator checks when runtime behavior looks wrong:
 - confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true` records a safe governance summary when `cognitive-runtime` is reachable
 - confirm `COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=true` remains non-fatal and traces governance as failed or omitted when `cognitive-runtime` is unavailable
 - confirm `COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=false` and `COGNITIVE_RUNTIME_RESTRAINT_ENABLED=false` leave normal `/v1/chat` behavior unchanged
-- confirm enabling persona containment or restraint remains non-fatal and records safe trace summaries when `cognitive-runtime` is reachable
+- confirm enabling persona containment or restraint remains non-fatal and records safe summarized trace and prompt guidance when `cognitive-runtime` is reachable
 - confirm persona containment and restraint guidance stay additive only and do not claim retrieval or tool filtering unless that enforcement is actually implemented
+- confirm `retrieval_scope_not_enforced` is visible when persona containment is guidance-only
 - confirm tense debugging inputs produce tactical governance posture with humor and commentary suppressed in the trace summary
 - confirm malformed or malicious governance results do not leak raw prompt-facing guidance into traces or user-visible output
 - confirm malformed or malicious persona containment and restraint results do not leak raw prompt-facing guidance into traces or user-visible output
 - confirm `cognitive-runtime` companion compile failures stay traceable and non-fatal to normal chat
 - confirm user-facing answers do not include raw runtime exception text
 - confirm `POST /v1/runtime/overlay` is reachable when runtime overlays are enabled
-- confirm governance traces stay summarized and do not expose raw prompt text, raw private memory, hidden reasoning, raw runtime event payloads, raw runtime exception text, or implementation-planning identifiers
+- confirm governance, persona containment, and restraint traces stay summarized and do not expose raw prompt text, raw private memory, hidden reasoning, raw CR exception text, copied-through raw runtime event payloads, or implementation-planning identifiers
 
 ## File-backed retrieval behavior
 
