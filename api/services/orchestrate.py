@@ -89,6 +89,91 @@ def _persona_containment_disabled_trace() -> dict[str, Any]:
     }
 
 
+def _ensure_persona_containment_trace_defaults(
+    persona_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    trace = persona_trace if isinstance(persona_trace, dict) else {}
+    trace.setdefault("artifact_request_status", "not_enforced")
+    trace.setdefault("artifact_request_reason", "artifact_request_not_enforced")
+    trace.setdefault("artifact_result_status", "not_applied")
+    trace.setdefault("artifact_result_reason", "artifact_result_suppression_not_applied")
+    trace.setdefault("domain_retrieval_scope_status", "deferred")
+    trace.setdefault(
+        "domain_retrieval_scope_reason",
+        "domain_aware_retrieval_enforcement_deferred",
+    )
+    trace.setdefault("tool_scope_status", "deferred")
+    trace.setdefault("tool_scope_reason", "tool_enforcement_deferred")
+    return trace
+
+
+def _persona_containment_lock_active(persona_containment: dict[str, Any] | None) -> bool:
+    return (
+        isinstance(persona_containment, dict)
+        and persona_containment.get("cross_scope_access_allowed") is False
+    )
+
+
+def _apply_persona_containment_retrieval_boundary(
+    *,
+    retrieval: dict[str, Any] | None,
+    persona_containment: dict[str, Any] | None,
+    persona_containment_trace: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, bool | None]:
+    trace = _ensure_persona_containment_trace_defaults(persona_containment_trace)
+    requested_scope = retrieval.get("scope") if isinstance(retrieval, dict) else None
+    trace["retrieval_scope_requested"] = requested_scope
+
+    if not _persona_containment_lock_active(persona_containment):
+        trace["retrieval_scope_used"] = requested_scope
+        if (
+            isinstance(persona_containment, dict)
+            and persona_containment.get("cross_scope_access_allowed") is True
+        ):
+            trace["retrieval_scope_reason"] = "cross_scope_access_allowed"
+            trace["artifact_request_reason"] = "cross_scope_access_allowed"
+        return retrieval if isinstance(retrieval, dict) else None, None
+
+    effective_retrieval = dict(retrieval) if isinstance(retrieval, dict) else {}
+    effective_retrieval["scope"] = "conversation"
+    trace["retrieval_scope_used"] = "conversation"
+    trace["retrieval_scope_status"] = "request_boundary_enforced"
+    trace["retrieval_scope_reason"] = "conversation_scope_enforced_under_containment_lock"
+    trace["artifact_request_status"] = "request_boundary_enforced"
+    trace["artifact_request_reason"] = "artifact_search_disabled_under_containment_lock"
+    return effective_retrieval, False
+
+
+def _apply_persona_containment_result_boundary(
+    *,
+    retrieval_bundle: dict[str, Any],
+    persona_containment: dict[str, Any] | None,
+    persona_containment_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    trace = _ensure_persona_containment_trace_defaults(persona_containment_trace)
+    if not _persona_containment_lock_active(persona_containment):
+        return retrieval_bundle
+
+    bundle = retrieval_bundle.get("bundle")
+    if not isinstance(bundle, dict):
+        trace["artifact_result_reason"] = "retrieval_bundle_missing"
+        return retrieval_bundle
+
+    artifact_refs = bundle.get("artifact_refs")
+    if not isinstance(artifact_refs, list) or not artifact_refs:
+        trace["artifact_result_reason"] = "no_artifact_results_returned"
+        return retrieval_bundle
+
+    sanitized_bundle = dict(bundle)
+    sanitized_bundle["artifact_refs"] = []
+    trace["artifact_result_status"] = "suppressed"
+    trace["artifact_result_reason"] = (
+        "unexpected_artifact_results_omitted_under_containment_lock"
+    )
+    trace["artifact_result_count_omitted"] = len(artifact_refs)
+    return {**retrieval_bundle, "bundle": sanitized_bundle}
+
+
 def _restraint_disabled_trace() -> dict[str, Any]:
     return {
         "attempted": False,
@@ -1607,6 +1692,15 @@ async def orchestrate_chat(
     local_only = sensitivity_local_only or profile_local_only
     cost_mode = routing_policy.get("cost_mode")
     latency_mode = routing_policy.get("latency_mode")
+    retrieval_request, include_artifacts = _apply_persona_containment_retrieval_boundary(
+        retrieval=(
+            effective_payload.get("retrieval")
+            if isinstance(effective_payload.get("retrieval"), dict)
+            else None
+        ),
+        persona_containment=persona_containment,
+        persona_containment_trace=persona_containment_trace,
+    )
     external_context_request = effective_payload.get("external_context")
     external_context_enabled = bool(
         effective_payload.get("external_context_enabled", False)
@@ -1627,7 +1721,13 @@ async def orchestrate_chat(
             conversation_id=conversation_id,
             owner_id=payload["owner_id"],
             query=last_user_text,
-            retrieval=effective_payload.get("retrieval"),
+            retrieval=retrieval_request,
+            include_artifacts=include_artifacts,
+        )
+        retrieval_bundle = _apply_persona_containment_result_boundary(
+            retrieval_bundle=retrieval_bundle,
+            persona_containment=persona_containment,
+            persona_containment_trace=persona_containment_trace,
         )
         external_context_pack, dsa_trace = await _resolve_external_context(
             dsa=dsa,

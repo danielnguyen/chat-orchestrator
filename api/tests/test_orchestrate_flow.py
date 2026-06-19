@@ -1832,6 +1832,124 @@ async def test_orchestrate_persona_containment_and_restraint_run_before_retrieva
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_scope", ["owner", "client"])
+async def test_orchestrate_containment_lock_clamps_broad_retrieval_scope_and_keeps_same_conversation_context(
+    tmp_path,
+    requested_scope,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "retrieval": {
+                "scope": requested_scope,
+                "k": 4,
+                "min_score": 0.4,
+                "time_window": "30d",
+            },
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        persona_containment_enabled=True,
+        request_id=f"rid-containment-{requested_scope}",
+    )
+
+    assert out["status"] == "ok"
+    assert memory_store.retrieve_calls[0]["retrieval"] == {
+        "scope": "conversation",
+        "k": 4,
+        "min_score": 0.4,
+        "time_window": "30d",
+    }
+    assert memory_store.retrieve_calls[0]["include_artifacts"] is False
+    assert any(
+        msg["role"] == "assistant" and msg["content"] == "prior history"
+        for msg in litellm.calls[0]["messages"]
+    )
+    assert any(
+        msg["role"] == "system" and "semantic note" in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_traces_truthfully(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "retrieval": {"scope": "owner", "k": 4},
+            "sensitivity": "private",
+            "model_override": None,
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        persona_containment_enabled=True,
+        request_id="rid-containment-trace",
+    )
+
+    assert out["sources"] == []
+    assert all(
+        "Retrieved file snippets:" not in message["content"]
+        for message in litellm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    assert trace_payload["retrieval"]["bundle"]["artifact_refs"] == []
+    persona_trace = trace_payload["retrieval"]["prompt_assembly"]["persona_containment"]
+    assert persona_trace["retrieval_scope_requested"] == "owner"
+    assert persona_trace["retrieval_scope_used"] == "conversation"
+    assert persona_trace["retrieval_scope_status"] == "request_boundary_enforced"
+    assert (
+        persona_trace["retrieval_scope_reason"]
+        == "conversation_scope_enforced_under_containment_lock"
+    )
+    assert persona_trace["artifact_request_status"] == "request_boundary_enforced"
+    assert (
+        persona_trace["artifact_request_reason"]
+        == "artifact_search_disabled_under_containment_lock"
+    )
+    assert persona_trace["artifact_result_status"] == "suppressed"
+    assert (
+        persona_trace["artifact_result_reason"]
+        == "unexpected_artifact_results_omitted_under_containment_lock"
+    )
+    assert persona_trace["artifact_result_count_omitted"] == 1
+    assert persona_trace["domain_retrieval_scope_status"] == "deferred"
+    assert (
+        persona_trace["domain_retrieval_scope_reason"]
+        == "domain_aware_retrieval_enforcement_deferred"
+    )
+    assert persona_trace["tool_scope_status"] == "deferred"
+    assert persona_trace["tool_scope_reason"] == "tool_enforcement_deferred"
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_interaction_governance_injects_tactical_prompt_guidance(
     tmp_path,
 ):

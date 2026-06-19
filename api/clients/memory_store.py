@@ -74,16 +74,20 @@ class MemoryStoreClient:
         owner_id: str,
         query: str,
         retrieval: dict[str, Any] | None,
+        include_artifacts: bool | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "query": query,
+            "retrieval": retrieval,
+        }
+        if include_artifacts is not None:
+            payload["include_artifacts"] = include_artifacts
         return await self._post(
             f"/v2/conversations/{conversation_id}/retrieve",
             request_id=request_id,
-            json={
-                "request_id": request_id,
-                "owner_id": owner_id,
-                "query": query,
-                "retrieval": retrieval,
-            },
+            json=payload,
         )
 
     async def resolve_profile(
