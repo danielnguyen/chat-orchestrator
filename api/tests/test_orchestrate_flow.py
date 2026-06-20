@@ -540,6 +540,13 @@ def _http_status_error(
     status_code: int,
     body: dict[str, object] | None = None,
 ) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://dsa.local/v1/context-pack")
+    response = httpx.Response(status_code, json=body or {}, request=request)
+    return httpx.HTTPStatusError(
+        f"Client error '{status_code}' for url '{request.url}'",
+        request=request,
+        response=response,
+    )
 
 
 def _memory_item(
@@ -623,14 +630,6 @@ class BundledMemoryStore(FakeMemoryStore):
     async def retrieve_bundle(self, **kwargs):
         self.retrieve_calls.append(kwargs)
         return self.bundle
-
-    request = httpx.Request("POST", "http://dsa.local/v1/context-pack")
-    response = httpx.Response(status_code, json=body or {}, request=request)
-    return httpx.HTTPStatusError(
-        f"Client error '{status_code}' for url '{request.url}'",
-        request=request,
-        response=response,
-    )
 
 
 @pytest.mark.asyncio
@@ -3290,7 +3289,7 @@ async def test_orchestrate_persona_domains_sanitize_invalid_members_without_muta
         "allowed_memory_domains": ["technical", "", 7, "project"],
         "blocked_memory_domains": [None, "finance", "", {"bad": "value"}],
     }
-    runtime = FakeRuntime(persona_containment_response=original_containment)
+    runtime = FakeRuntime(persona_containment_response={"result": original_containment})
 
     await orchestrate_chat(
         payload={
@@ -3325,9 +3324,11 @@ async def test_orchestrate_persona_domains_omit_all_invalid_lists_from_bms_reque
     memory_store = FakeMemoryStore()
     runtime = FakeRuntime(
         persona_containment_response={
-            "cross_scope_access_allowed": True,
-            "allowed_memory_domains": ["", None, 5],
-            "blocked_memory_domains": [{}, ""],
+            "result": {
+                "cross_scope_access_allowed": True,
+                "allowed_memory_domains": ["", None, 5],
+                "blocked_memory_domains": [{}, ""],
+            }
         }
     )
 
@@ -3656,7 +3657,7 @@ async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decision
                     ref_type="message",
                     ref_id="shared-source",
                     content="semantic copy",
-                    freshness_state="active",
+                    freshness_state="stale",
                     memory_id="memory-1",
                 )
             ]
@@ -3879,7 +3880,7 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_du
                     ref_type="message",
                     ref_id="shared-source",
                     content="semantic copy",
-                    freshness_state="active",
+                    freshness_state="stale",
                     memory_id="memory-1",
                 )
             ]
@@ -3891,14 +3892,14 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_du
                 "decisions": [
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
-                        "freshness_state": "active",
+                        "freshness_state": "stale",
                         "use_allowed": "false",
                         "mention_as_current_allowed": True,
                         "framing": "current",
                     },
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
-                        "freshness_state": "active",
+                        "freshness_state": "stale",
                         "use_allowed": True,
                         "mention_as_current_allowed": True,
                         "framing": "current",
@@ -3928,7 +3929,7 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_du
 
     assert any(
         msg["role"] == "system"
-        and "[freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        and "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
         in msg["content"]
         for msg in litellm.calls[0]["messages"]
     )
@@ -3950,7 +3951,7 @@ async def test_orchestrate_memory_hygiene_valid_runtime_decision_then_invalid_du
                     ref_type="message",
                     ref_id="shared-source",
                     content="semantic copy",
-                    freshness_state="active",
+                    freshness_state="stale",
                     memory_id="memory-1",
                 )
             ]
@@ -3962,14 +3963,14 @@ async def test_orchestrate_memory_hygiene_valid_runtime_decision_then_invalid_du
                 "decisions": [
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
-                        "freshness_state": "active",
+                        "freshness_state": "stale",
                         "use_allowed": True,
                         "mention_as_current_allowed": True,
                         "framing": "current",
                     },
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
-                        "freshness_state": "active",
+                        "freshness_state": "stale",
                         "use_allowed": True,
                         "framing": "current",
                     },
@@ -3998,7 +3999,7 @@ async def test_orchestrate_memory_hygiene_valid_runtime_decision_then_invalid_du
 
     assert any(
         msg["role"] == "system"
-        and "[freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        and "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
         in msg["content"]
         for msg in litellm.calls[0]["messages"]
     )

@@ -441,7 +441,7 @@ async def apply_memory_hygiene(
             missing_decision_keys.add(key)
             continue
         if key in invalid_decision_keys:
-            grouped_decisions[key] = _logical_source_fallback(key_occurrences)
+            grouped_decisions[key] = _fallback_for_payload(key_occurrences[0].payload)
             fallback_applied = True
             missing_decision_keys.add(key)
             continue
