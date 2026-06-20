@@ -64,12 +64,22 @@ class FakeMemoryStore:
             "request_id": kwargs["request_id"],
             "conversation_id": kwargs["conversation_id"],
             "bundle": {
-                "recent": [{"role": "assistant", "content": "prior history"}],
+                "recent": [
+                    {
+                        "role": "assistant",
+                        "content": "prior history",
+                        "source_ref": {"ref_type": "message", "ref_id": "recent-message-1"},
+                        "freshness_state": "active",
+                    }
+                ],
                 "semantic": [
                     {
+                        "message_id": "semantic-message-1",
                         "created_at": "2026-01-01T00:00:00+00:00",
                         "role": "assistant",
                         "content": "semantic note",
+                        "source_ref": {"ref_type": "message", "ref_id": "semantic-message-1"},
+                        "freshness_state": "active",
                     }
                 ],
                 "artifact_refs": [
@@ -78,6 +88,8 @@ class FakeMemoryStore:
                         "file_path": "api/main.py",
                         "snippet": "def entrypoint(): pass",
                         "relevance_score": 0.9,
+                        "source_ref": {"ref_type": "derived_text", "ref_id": "derived-text-1"},
+                        "freshness_state": "active",
                     }
                 ],
                 "observed_metadata": {"has_code_like_content": False},
@@ -112,11 +124,13 @@ class FakeRuntime:
         interaction_governance_response=None,
         persona_containment_response=None,
         restraint_response=None,
+        memory_hygiene_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
         persona_containment_error: Exception | None = None,
         restraint_error: Exception | None = None,
+        memory_hygiene_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -132,6 +146,7 @@ class FakeRuntime:
         self.interaction_governance_calls = []
         self.persona_containment_calls = []
         self.restraint_calls = []
+        self.memory_hygiene_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -344,11 +359,21 @@ class FakeRuntime:
             "warnings": [],
             "debug": {"detector_signals": {"branch_count": 4}, "user_visible_suppressed": True},
         }
+        self.memory_hygiene_response = memory_hygiene_response or {
+            "request_id": "rid-memory-hygiene",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {"decisions": [], "aggregate": {}},
+        }
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
         self.persona_containment_error = persona_containment_error
         self.restraint_error = restraint_error
+        self.memory_hygiene_error = memory_hygiene_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -470,6 +495,15 @@ class FakeRuntime:
             raise RuntimeError("runtime unavailable")
         return self.restraint_response
 
+    async def evaluate_memory_hygiene(self, **kwargs):
+        self.memory_hygiene_calls.append(kwargs)
+        self.call_order.append("memory_hygiene")
+        if self.memory_hygiene_error is not None:
+            raise self.memory_hygiene_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.memory_hygiene_response
+
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
         self.call_order.append("reset")
@@ -513,6 +547,89 @@ def _http_status_error(
         request=request,
         response=response,
     )
+
+
+def _memory_item(
+    *,
+    section: str,
+    ref_type: str,
+    ref_id: str,
+    content: str | None = None,
+    freshness_state: str = "active",
+    memory_id: str | None = None,
+    last_verified_at: str | None = None,
+    source_kind: str | None = None,
+    confidence: float | None = None,
+    supersedes: str | None = None,
+    superseded_by: str | None = None,
+) -> dict[str, object]:
+    base: dict[str, object] = {
+        "source_ref": {"ref_type": ref_type, "ref_id": ref_id},
+        "freshness_state": freshness_state,
+    }
+    if memory_id is not None:
+        base["memory_id"] = memory_id
+    if last_verified_at is not None:
+        base["last_verified_at"] = last_verified_at
+    if source_kind is not None:
+        base["source_kind"] = source_kind
+    if confidence is not None:
+        base["confidence"] = confidence
+    if supersedes is not None:
+        base["supersedes"] = supersedes
+    if superseded_by is not None:
+        base["superseded_by"] = superseded_by
+
+    if section in {"recent", "semantic"}:
+        base.update(
+            {
+                "message_id": f"{ref_id}-message-id",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "role": "assistant",
+                "content": content or f"{ref_id} content",
+            }
+        )
+    else:
+        base.update(
+            {
+                "artifact_id": f"{ref_id}-artifact-id",
+                "repo_name": "repo",
+                "file_path": f"{ref_id}.txt",
+                "snippet": content or f"{ref_id} snippet",
+                "relevance_score": 0.8,
+            }
+        )
+    return base
+
+
+def _retrieval_bundle_for_hygiene(
+    *,
+    recent: list[dict[str, object]] | None = None,
+    semantic: list[dict[str, object]] | None = None,
+    artifact_refs: list[dict[str, object]] | None = None,
+    retrieval_debug: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "request_id": "rid-hygiene-bundle",
+        "conversation_id": "conv-1",
+        "bundle": {
+            "recent": recent or [],
+            "semantic": semantic or [],
+            "artifact_refs": artifact_refs or [],
+            "observed_metadata": {"has_code_like_content": False},
+            "retrieval_debug": retrieval_debug or {},
+        },
+    }
+
+
+class BundledMemoryStore(FakeMemoryStore):
+    def __init__(self, bundle: dict[str, object]):
+        super().__init__()
+        self.bundle = bundle
+
+    async def retrieve_bundle(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        return self.bundle
 
 
 @pytest.mark.asyncio
@@ -1943,10 +2060,10 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
         == "unexpected_artifact_results_omitted_under_containment_lock"
     )
     assert persona_trace["artifact_result_count_omitted"] == 1
-    assert persona_trace["domain_retrieval_scope_status"] == "deferred"
+    assert persona_trace["domain_retrieval_scope_status"] == "requested_tagged_only"
     assert (
         persona_trace["domain_retrieval_scope_reason"]
-        == "domain_aware_retrieval_enforcement_deferred"
+        == "tagged_domain_filters_forwarded_from_persona_containment"
     )
     assert persona_trace["tool_scope_status"] == "deferred"
     assert persona_trace["tool_scope_reason"] == "tool_enforcement_deferred"
@@ -3061,6 +3178,955 @@ async def test_orchestrate_normal_mode_does_not_shape_or_add_raw_answer_trace(tm
     assert out["answer"] == "Net: raw answer should pass through."
     brief = memory_store.trace_calls[0]["payload"]["model_call"]["brief"]
     assert brief == {"enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_disabled_preserves_existing_behavior_and_trace(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            recent=[
+                _memory_item(
+                    section="recent",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="prior history",
+                    freshness_state="parked",
+                )
+            ],
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic note",
+                    freshness_state="stale",
+                )
+            ],
+        )
+    )
+    runtime = FakeRuntime()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-memory-disabled",
+        memory_hygiene_enabled=False,
+    )
+
+    assert out["status"] == "ok"
+    assert runtime.memory_hygiene_calls == []
+    assert any(
+        msg["role"] == "assistant" and msg["content"] == "prior history"
+        for msg in litellm.calls[0]["messages"]
+    )
+    assert any(
+        msg["role"] == "system" and "semantic note" in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace == {
+        "attempted": False,
+        "status": "disabled",
+        "included": False,
+        "runtime_call_status": "disabled",
+        "domain_filters_requested": False,
+        "allowed_filter_count": 0,
+        "blocked_filter_count": 0,
+        "tagged_records_evaluated": 0,
+        "tagged_records_filtered": 0,
+        "untagged_records_not_domain_enforced": 0,
+        "domain_debug_status": "not_requested",
+        "tagged_domain_enforcement_applied": False,
+        "domain_enforcement_mode": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_persona_domains_forward_to_bms_even_when_memory_hygiene_disabled(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        request_id="rid-domain-forwarding",
+        memory_hygiene_enabled=False,
+    )
+
+    assert memory_store.retrieve_calls[0]["allowed_memory_domains"] == ["technical", "project"]
+    assert memory_store.retrieve_calls[0]["blocked_memory_domains"] == ["finance"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_persona_domains_sanitize_invalid_members_without_mutating_source(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    original_containment = {
+        "cross_scope_access_allowed": True,
+        "allowed_memory_domains": ["technical", "", 7, "project"],
+        "blocked_memory_domains": [None, "finance", "", {"bad": "value"}],
+    }
+    runtime = FakeRuntime(persona_containment_response={"result": original_containment})
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        request_id="rid-domain-sanitize",
+        memory_hygiene_enabled=False,
+    )
+
+    assert memory_store.retrieve_calls[0]["allowed_memory_domains"] == ["technical", "project"]
+    assert memory_store.retrieve_calls[0]["blocked_memory_domains"] == ["finance"]
+    assert original_containment == {
+        "cross_scope_access_allowed": True,
+        "allowed_memory_domains": ["technical", "", 7, "project"],
+        "blocked_memory_domains": [None, "finance", "", {"bad": "value"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_persona_domains_omit_all_invalid_lists_from_bms_request(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime(
+        persona_containment_response={
+            "result": {
+                "cross_scope_access_allowed": True,
+                "allowed_memory_domains": ["", None, 5],
+                "blocked_memory_domains": [{}, ""],
+            }
+        }
+    )
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        request_id="rid-domain-all-invalid",
+        memory_hygiene_enabled=False,
+    )
+
+    assert "allowed_memory_domains" not in memory_store.retrieve_calls[0]
+    assert "blocked_memory_domains" not in memory_store.retrieve_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_submits_metadata_only_and_dedupes_shared_source(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            recent=[
+                _memory_item(
+                    section="recent",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="recent copy",
+                    freshness_state="active",
+                    memory_id="memory-1",
+                    last_verified_at="2026-01-01T00:00:00Z",
+                    source_kind="message",
+                    confidence=0.9,
+                    supersedes="memory-0",
+                )
+            ],
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="active",
+                    memory_id="memory-1",
+                    last_verified_at="2026-01-01T00:00:00Z",
+                    source_kind="message",
+                    confidence=0.9,
+                    supersedes="memory-0",
+                )
+            ],
+            artifact_refs=[
+                _memory_item(
+                    section="artifact_refs",
+                    ref_type="derived_text",
+                    ref_id="shared-source",
+                    content="artifact copy",
+                    freshness_state="parked",
+                    memory_id="artifact-memory-1",
+                    last_verified_at="2026-02-01T00:00:00Z",
+                    source_kind="derived_text",
+                )
+            ],
+            retrieval_debug={
+                "domain_filters_requested": True,
+                "allowed_memory_domains": ["technical", "project"],
+                "blocked_memory_domains": ["finance"],
+                "tagged_records_evaluated": 2,
+                "tagged_records_filtered": 1,
+                "untagged_records_not_domain_enforced": 3,
+                "tagged_domain_enforcement_applied": True,
+                "domain_enforcement_mode": "tagged_records_only",
+            },
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "active",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    },
+                    {
+                        "item_ref": {"ref_type": "derived_text", "ref_id": "shared-source"},
+                        "freshness_state": "parked",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": False,
+                        "framing": "parked_or_historical",
+                    },
+                ]
+            }
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-submit",
+    )
+
+    assert runtime.call_order.index("memory_hygiene") < runtime.call_order.index("resolve_identity")
+    submitted = runtime.memory_hygiene_calls[0]["items"]
+    assert len(submitted) == 2
+    assert submitted[0] == {
+        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+        "memory_id": "memory-1",
+        "freshness_state": "active",
+        "last_verified_at": "2026-01-01T00:00:00Z",
+        "source_kind": "message",
+        "confidence": 0.9,
+        "supersedes": "memory-0",
+        "superseded_by": None,
+    }
+    assert submitted[1]["item_ref"] == {"ref_type": "derived_text", "ref_id": "shared-source"}
+    assert "content" not in submitted[0]
+    assert "snippet" not in submitted[1]
+    assert any(
+        msg["role"] == "system"
+        and "[historical/parked context] [repo/shared-source.txt] artifact copy" in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["submitted_unique_item_count"] == 2
+    assert trace["allowed_filter_count"] == 2
+    assert trace["blocked_filter_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_same_ref_id_different_ref_types_do_not_collide(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="message copy",
+                    memory_id="message-memory",
+                )
+            ],
+            artifact_refs=[
+                _memory_item(
+                    section="artifact_refs",
+                    ref_type="derived_text",
+                    ref_id="shared-source",
+                    content="artifact copy",
+                    memory_id="artifact-memory",
+                )
+            ],
+        )
+    )
+    runtime = FakeRuntime()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-distinct-ref-types",
+    )
+
+    assert [item["item_ref"] for item in runtime.memory_hygiene_calls[0]["items"]] == [
+        {"ref_type": "message", "ref_id": "shared-source"},
+        {"ref_type": "derived_text", "ref_id": "shared-source"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_ambiguous_duplicate_metadata_retains_whole_key_as_unknown(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            recent=[
+                _memory_item(
+                    section="recent",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="recent copy",
+                    freshness_state="active",
+                    memory_id="memory-1",
+                )
+            ],
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ],
+        )
+    )
+    runtime = FakeRuntime()
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-ambiguous",
+    )
+
+    assert runtime.memory_hygiene_calls == []
+    assert any(
+        msg["role"] == "assistant"
+        and msg["content"] == "[freshness unknown; do not treat as current] recent copy"
+        for msg in litellm.calls[0]["messages"]
+    )
+    assert any(
+        msg["role"] == "system"
+        and "[freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["duplicate_metadata_conflict_count"] == 1
+    assert trace["retained_non_current_occurrence_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_ambiguous_duplicate_with_superseded_occurrence_omits_whole_key(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            recent=[
+                _memory_item(
+                    section="recent",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="recent copy",
+                    freshness_state="active",
+                )
+            ],
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="superseded",
+                )
+            ],
+        )
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-ambiguous-omit",
+    )
+
+    assert all(
+        "recent copy" not in msg["content"] and "semantic copy" not in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+        if msg["role"] in {"assistant", "system"}
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["omitted_occurrence_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decisions_fall_back(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "active",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    },
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "active",
+                        "use_allowed": False,
+                        "mention_as_current_allowed": False,
+                        "framing": "omit",
+                    },
+                ]
+            }
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-conflicting-decisions",
+    )
+
+    assert any(
+        msg["role"] == "system"
+        and "[freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["conflicting_decision_count"] == 1
+    assert trace["fallback_applied"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision_patch", "remove_keys", "expected_fragment"),
+    [
+        (
+            {"use_allowed": "false"},
+            [],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {},
+            ["use_allowed"],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {},
+            ["mention_as_current_allowed"],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {"framing": "invalid-frame"},
+            [],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {"freshness_state": "invalid-freshness"},
+            [],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+    ],
+)
+async def test_orchestrate_memory_hygiene_invalid_runtime_decision_fields_fall_back(
+    tmp_path,
+    decision_patch,
+    remove_keys,
+    expected_fragment,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    base_decision = {
+        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+        "freshness_state": "active",
+        "use_allowed": True,
+        "mention_as_current_allowed": True,
+        "framing": "current",
+    }
+    base_decision.update(decision_patch)
+    for key in remove_keys:
+        base_decision.pop(key)
+    runtime = FakeRuntime(memory_hygiene_response={"result": {"decisions": [base_decision]}})
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-invalid-decision",
+    )
+
+    assert any(
+        msg["role"] == "system" and expected_fragment in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["invalid_decision_count"] == 1
+    assert "invalid-frame" not in str(trace)
+    assert "invalid-freshness" not in str(trace)
+    assert "\"false\"" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_valid_runtime_decision_still_works(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "stale",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": False,
+                        "framing": "stale_or_unverified",
+                    }
+                ]
+            }
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-valid-decision",
+    )
+
+    assert any(
+        msg["role"] == "system"
+        and "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["invalid_decision_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_duplicate_falls_back_once(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "stale",
+                        "use_allowed": "false",
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    },
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "stale",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    },
+                ]
+            }
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-invalid-then-valid",
+    )
+
+    assert any(
+        msg["role"] == "system"
+        and "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["invalid_decision_count"] == 1
+    assert trace["missing_decision_count"] == 1
+    assert trace["evaluated_decision_count"] == 0
+    assert trace["fallback_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_valid_runtime_decision_then_invalid_duplicate_falls_back_once(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "stale",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    },
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "stale",
+                        "use_allowed": True,
+                        "framing": "current",
+                    },
+                ]
+            }
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-valid-then-invalid",
+    )
+
+    assert any(
+        msg["role"] == "system"
+        and "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["invalid_decision_count"] == 1
+    assert trace["missing_decision_count"] == 1
+    assert trace["evaluated_decision_count"] == 0
+    assert trace["fallback_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_runtime_failure_uses_enabled_mode_fallback(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="parked",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    runtime = FakeRuntime(memory_hygiene_error=RuntimeError("runtime offline"))
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-runtime-failed",
+    )
+
+    assert any(
+        msg["role"] == "system"
+        and "[historical/parked context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["runtime_call_status"] == "failed"
+    assert trace["status"] == "fallback_all"
+    assert trace["fallback_reason"] == "runtime_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_trace_omits_ids_content_and_domain_names(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="secret-source-id",
+                    content="sensitive semantic copy",
+                    freshness_state="active",
+                    memory_id="secret-memory-id",
+                )
+            ],
+            retrieval_debug={
+                "domain_filters_requested": True,
+                "allowed_memory_domains": ["technical", "project"],
+                "blocked_memory_domains": ["finance"],
+                "tagged_records_evaluated": 1,
+                "tagged_records_filtered": 0,
+                "untagged_records_not_domain_enforced": 0,
+                "tagged_domain_enforcement_applied": True,
+                "domain_enforcement_mode": "tagged_records_only",
+            },
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "secret-source-id"},
+                        "freshness_state": "active",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    }
+                ]
+            }
+        }
+    )
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-safe-trace",
+    )
+
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert "secret-source-id" not in str(trace)
+    assert "secret-memory-id" not in str(trace)
+    assert "sensitive semantic copy" not in str(trace)
+    assert "technical" not in str(trace)
+    assert "finance" not in str(trace)
+    assert trace["allowed_filter_count"] == 2
+    assert trace["blocked_filter_count"] == 1
 
 
 

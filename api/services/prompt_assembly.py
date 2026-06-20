@@ -63,6 +63,20 @@ def _layer_trace(
     }
 
 
+def _memory_hygiene_prefix(item: dict[str, Any]) -> str:
+    memory_hygiene = item.get("memory_hygiene")
+    if not isinstance(memory_hygiene, dict):
+        return ""
+    framing = memory_hygiene.get("framing")
+    if framing == "parked_or_historical":
+        return "[historical/parked context] "
+    if framing == "stale_or_unverified":
+        return "[stale or unverified context] "
+    if framing == "unknown_or_unverified":
+        return "[freshness unknown; do not treat as current] "
+    return ""
+
+
 def build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
     bundle = retrieval_bundle.get("bundle", {})
     messages: list[dict[str, str]] = []
@@ -72,7 +86,7 @@ def build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str
         role = item.get("role")
         content = item.get("content", "")
         if role in VALID_ROLES and content:
-            messages.append({"role": role, "content": content})
+            messages.append({"role": role, "content": f"{_memory_hygiene_prefix(item)}{content}"})
     return messages
 
 
@@ -87,7 +101,9 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             created_at = item.get("created_at", "")
             role = item.get("role", "")
             content = item.get("content", "")
-            lines.append(f"- [{created_at}] {role}: {content}")
+            lines.append(
+                f"- {_memory_hygiene_prefix(item)}[{created_at}] {role}: {content}"
+            )
         messages.append({"role": "system", "content": "\n".join(lines)})
 
     artifact_refs = bundle.get("artifact_refs", []) or []
@@ -97,7 +113,9 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             repo_name = item.get("repo_name")
             file_path = item.get("file_path", "")
             label = f"{repo_name}/{file_path}" if repo_name else file_path
-            lines.append(f"- [{label}] {item.get('snippet', '')}")
+            lines.append(
+                f"- {_memory_hygiene_prefix(item)}[{label}] {item.get('snippet', '')}"
+            )
         messages.append({"role": "system", "content": "\n".join(lines)})
 
     return messages
@@ -567,6 +585,7 @@ def assemble_prompt(
     persona_containment_trace_data: dict[str, Any] | None = None,
     restraint: dict[str, Any] | None = None,
     restraint_trace_data: dict[str, Any] | None = None,
+    memory_hygiene_trace_data: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
@@ -1113,6 +1132,8 @@ def assemble_prompt(
         "persona_containment": persona_containment_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "restraint": restraint_trace_out
+        or {"attempted": False, "status": "not_requested", "included": False},
+        "memory_hygiene": memory_hygiene_trace_data
         or {"attempted": False, "status": "not_requested", "included": False},
         "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},

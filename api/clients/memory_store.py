@@ -75,6 +75,8 @@ class MemoryStoreClient:
         query: str,
         retrieval: dict[str, Any] | None,
         include_artifacts: bool | None = None,
+        allowed_memory_domains: list[str] | None = None,
+        blocked_memory_domains: list[str] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -84,6 +86,10 @@ class MemoryStoreClient:
         }
         if include_artifacts is not None:
             payload["include_artifacts"] = include_artifacts
+        if allowed_memory_domains:
+            payload["allowed_memory_domains"] = allowed_memory_domains
+        if blocked_memory_domains:
+            payload["blocked_memory_domains"] = blocked_memory_domains
         return await self._post(
             f"/v2/conversations/{conversation_id}/retrieve",
             request_id=request_id,

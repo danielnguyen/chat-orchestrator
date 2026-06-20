@@ -153,6 +153,76 @@ def test_assemble_prompt_marks_empty_layers_omitted():
     assert "interrupt_policy" not in out.trace
 
 
+def test_assemble_prompt_applies_memory_hygiene_prefixes_without_changing_current_items():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={
+            "bundle": {
+                "recent": [
+                    {
+                        "role": "assistant",
+                        "content": "parked history",
+                        "memory_hygiene": {
+                            "freshness_state": "parked",
+                            "mention_as_current_allowed": False,
+                            "framing": "parked_or_historical",
+                        },
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "current history",
+                    },
+                ],
+                "semantic": [
+                    {
+                        "message_id": "m-1",
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "role": "assistant",
+                        "content": "unknown memory",
+                        "memory_hygiene": {
+                            "freshness_state": "unknown_freshness",
+                            "mention_as_current_allowed": False,
+                            "framing": "unknown_or_unverified",
+                        },
+                    }
+                ],
+                "artifact_refs": [
+                    {
+                        "artifact_id": "a-1",
+                        "repo_name": "repo",
+                        "file_path": "api/main.py",
+                        "snippet": "stale snippet",
+                        "memory_hygiene": {
+                            "freshness_state": "stale",
+                            "mention_as_current_allowed": False,
+                            "framing": "stale_or_unverified",
+                        },
+                    }
+                ],
+            }
+        },
+        current_messages=[{"role": "user", "content": "hi"}],
+        memory_hygiene_trace_data={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "runtime_call_status": "included",
+        },
+    )
+
+    assert out.messages[0]["content"] == (
+        "Retrieved memory excerpts:\n"
+        "- [freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: unknown memory"
+    )
+    assert out.messages[1]["content"] == (
+        "Retrieved file snippets:\n"
+        "- [stale or unverified context] [repo/api/main.py] stale snippet"
+    )
+    assert out.messages[2]["content"] == "[historical/parked context] parked history"
+    assert out.messages[3]["content"] == "current history"
+    assert out.trace["memory_hygiene"]["runtime_call_status"] == "included"
+
+
 def test_assemble_prompt_includes_style_guidance_after_profile_overlay():
     out = assemble_prompt(
         profile={"prompt_overlay": "profile text"},
@@ -778,25 +848,24 @@ def test_assemble_prompt_omits_malicious_persona_containment_labels():
     )
 
     assert out.messages == [{"role": "user", "content": "hi"}]
-    assert out.trace["persona_containment"] == {
-        "attempted": True,
-        "status": "failed",
-        "included": False,
-        "active_persona_id": None,
-        "capability_domain": None,
-        "allowed_memory_domains": [],
-        "blocked_memory_domains": [],
-        "allowed_world_state_domains": [],
-        "allowed_relationship_domains": [],
-        "allowed_tool_domains": [],
-        "cross_scope_access_allowed": None,
-        "cross_scope_reason": None,
-        "confidence": None,
-        "reason_summary": ["safe_label"],
-        "retrieval_scope_status": "not_enforced",
-        "retrieval_scope_reason": "retrieval_scope_not_enforced",
-        "omission_reason": "unusable_persona_containment_response",
-    }
+    trace = out.trace["persona_containment"]
+    assert trace["attempted"] is True
+    assert trace["status"] == "failed"
+    assert trace["included"] is False
+    assert trace["active_persona_id"] is None
+    assert trace["capability_domain"] is None
+    assert trace["allowed_memory_domains"] == []
+    assert trace["blocked_memory_domains"] == []
+    assert trace["allowed_world_state_domains"] == []
+    assert trace["allowed_relationship_domains"] == []
+    assert trace["allowed_tool_domains"] == []
+    assert trace["cross_scope_access_allowed"] is None
+    assert trace["cross_scope_reason"] is None
+    assert trace["confidence"] is None
+    assert trace["reason_summary"] == ["safe_label"]
+    assert trace["retrieval_scope_status"] == "not_enforced"
+    assert trace["retrieval_scope_reason"] == "retrieval_scope_not_enforced"
+    assert trace["omission_reason"] == "unusable_persona_containment_response"
 
 
 def test_assemble_prompt_omits_malicious_restraint_overlay():

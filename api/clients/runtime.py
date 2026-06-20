@@ -378,6 +378,30 @@ class RuntimeClient:
             payload["surface_metadata_json"] = surface_metadata_json
         return await self._post("/v1/runtime/restraint/evaluate", json=payload)
 
+    async def evaluate_memory_hygiene(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "items": items,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        return await self._post("/v1/runtime/memory-hygiene/evaluate", json=payload)
+
     async def reset(
         self,
         *,
