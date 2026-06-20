@@ -4203,6 +4203,76 @@ async def test_orchestrate_dsa_passes_request_targeting_and_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_dsa_trace_bounds_request_targeting_metadata_only(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "vehicle_log_primary:1",
+                    "source_name": "Vehicle Log",
+                    "title": "Oil change",
+                    "text": "Oil service completed.",
+                }
+            ],
+        }
+    )
+    oversized_source_ids = [f"source_{index}" for index in range(25)]
+    oversized_source_ids[0] = "s" * 120
+    oversized_domain_tags = [f"domain_{index}" for index in range(25)]
+    oversized_domain_tags[0] = "d" * 120
+    oversized_allowed_sensitivity = "very_" * 12
+
+    await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What Jeep maintenance records do you have about oil?",
+            external_context={
+                "enabled": True,
+                "source_ids": oversized_source_ids,
+                "domain_tags": oversized_domain_tags,
+                "allowed_sensitivity": oversized_allowed_sensitivity,
+                "max_results": 2,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-targeting-trace-bounds",
+    )
+
+    assert dsa.calls == [
+        {
+            "query": "What Jeep maintenance records do you have about oil?",
+            "source_ids": oversized_source_ids,
+            "domain_tags": oversized_domain_tags,
+            "allowed_sensitivity": oversized_allowed_sensitivity,
+            "budget": {
+                "max_results": 2,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    trace = memory_store.trace_calls[0]["payload"]["dsa"]
+    assert trace["requested_source_ids"] == [
+        "s" * 80,
+        *[f"source_{index}" for index in range(1, 20)],
+    ]
+    assert trace["requested_domain_tags"] == [
+        "d" * 80,
+        *[f"domain_{index}" for index in range(1, 20)],
+    ]
+    assert trace["allowed_sensitivity"] == oversized_allowed_sensitivity[:40]
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_context(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()

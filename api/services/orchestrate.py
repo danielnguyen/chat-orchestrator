@@ -365,9 +365,20 @@ def _build_dsa_trace_base(
         "capability_enabled": capability_enabled,
         "enabled": request_enabled,
         "called": False,
-        "requested_source_ids": external_context_config.get("source_ids", []),
-        "requested_domain_tags": external_context_config.get("domain_tags", []),
-        "allowed_sensitivity": allowed_sensitivity,
+        "requested_source_ids": _sanitize_trace_string_list(
+            external_context_config.get("source_ids"),
+            limit=20,
+            item_max_length=80,
+        ),
+        "requested_domain_tags": _sanitize_trace_string_list(
+            external_context_config.get("domain_tags"),
+            limit=20,
+            item_max_length=80,
+        ),
+        "allowed_sensitivity": _sanitize_trace_string(
+            allowed_sensitivity,
+            max_length=40,
+        ),
         "max_results": max_results if max_results is not None else 5,
     }
 
