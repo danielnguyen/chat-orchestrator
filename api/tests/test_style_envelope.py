@@ -38,6 +38,43 @@ def test_chat_request_accepts_surface_context_and_ignores_unknown_style_fields()
     assert dumped["surface_context"]["style_envelope"] == {"directness": "high"}
 
 
+def test_chat_request_external_context_defaults_to_disabled():
+    request = ChatRequest.model_validate(
+        {
+            "owner_id": "owner",
+            "surface": "node_red",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+
+    dumped = request.model_dump()
+    assert dumped["external_context_enabled"] is False
+    assert dumped["external_context"] is None
+
+
+def test_chat_request_accepts_nested_external_context_enablement():
+    request = ChatRequest.model_validate(
+        {
+            "owner_id": "owner",
+            "surface": "node_red",
+            "messages": [{"role": "user", "content": "hi"}],
+            "external_context": {
+                "enabled": True,
+                "source_ids": ["example_source"],
+                "max_results": 5,
+            },
+        }
+    )
+
+    dumped = request.model_dump(exclude_none=True)
+    assert dumped["external_context_enabled"] is False
+    assert dumped["external_context"] == {
+        "enabled": True,
+        "source_ids": ["example_source"],
+        "max_results": 5,
+    }
+
+
 def test_resolve_style_envelope_defaults_without_emitting_guidance():
     envelope, trace = resolve_style_envelope(
         {"owner_id": "owner", "surface": "vscode", "messages": [{"role": "user", "content": "hi"}]},

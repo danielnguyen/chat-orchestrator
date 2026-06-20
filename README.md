@@ -159,6 +159,8 @@ The Data Source Aggregator integration is optional and disabled by default.
 `DSA` in the environment variable names stands for `Data Source Aggregator`.
 
 - `DSA_ENABLED=false` keeps existing behavior unchanged.
+- `DSA_ENABLED=true` makes the capability available at the service level.
+- A request must still opt in with `external_context_enabled=true` or `external_context.enabled=true`.
 - `DSA_BASE_URL` is the base URL for the Data Source Aggregator service.
 - `DSA_TIMEOUT_MS=5000` is the recommended request timeout for Data Source Aggregator calls. `1500` can be too short when DSA fans out across multiple sources.
 - `DSA_API_KEY` is optional for local development. When set, the orchestrator sends `X-API-Key: <DSA_API_KEY>` on DSA requests.
@@ -168,7 +170,104 @@ The Data Source Aggregator integration is optional and disabled by default.
 - Requests can also opt in with `external_context.enabled=true` and optionally target `source_ids`, `domain_tags`, `allowed_sensitivity`, and `max_results`.
 - If both fields are present, either one being `true` enables DSA retrieval.
 - `sensitivity=local_only` still wins and skips DSA even if external context is requested.
+- Explicit `source_ids` are optional and usually unnecessary for broad assistant queries. Source selection remains owned by Data Source Aggregator.
+- Chat Orchestrator consumes bounded Data Source Aggregator diagnostics when present, including `selection_mode`, selected source IDs, ranking mode, and bounded truncation metadata.
+- DSA failures, timeouts, malformed diagnostics, or zero-item responses remain non-fatal to normal `/v1/chat` execution.
 - The DSA API key is not included in orchestrator traces.
+
+Complete `/v1/chat` request examples:
+
+Basic request without external context:
+
+```json
+{
+  "owner_id": "owner",
+  "client_id": "node-red",
+  "surface": "node_red",
+  "surface_context": {
+    "surface_type": "node_red",
+    "interaction_mode": "text",
+    "spoken_output": false,
+    "active_task_mode": false,
+    "output_format": "markdown"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize the latest conversation context."
+    }
+  ],
+  "requested_profile": "default",
+  "sensitivity": "private"
+}
+```
+
+Simple external-context request:
+
+```json
+{
+  "owner_id": "owner",
+  "client_id": "node-red",
+  "surface": "node_red",
+  "surface_context": {
+    "surface_type": "node_red",
+    "interaction_mode": "text",
+    "spoken_output": false,
+    "active_task_mode": false,
+    "output_format": "markdown"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Do I have any maintenance notes about the battery?"
+    }
+  ],
+  "requested_profile": "default",
+  "sensitivity": "private",
+  "external_context_enabled": true
+}
+```
+
+Targeted external-context request:
+
+```json
+{
+  "owner_id": "owner",
+  "client_id": "node-red",
+  "surface": "node_red",
+  "surface_context": {
+    "surface_type": "node_red",
+    "interaction_mode": "text",
+    "spoken_output": false,
+    "active_task_mode": false,
+    "output_format": "markdown"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Check the maintenance source for recent service history."
+    }
+  ],
+  "requested_profile": "default",
+  "sensitivity": "private",
+  "external_context": {
+    "enabled": true,
+    "source_ids": ["example_source"],
+    "max_results": 5
+  }
+}
+```
+
+Trace behavior:
+
+- `disabled_by_service`: deployment capability is off.
+- `disabled_by_request`: request-level opt-in was absent.
+- `skipped_local_only`: `sensitivity=local_only` or profile `local_only` suppressed DSA.
+- `success`: DSA returned usable items and external context was injected.
+- `success_no_items`: DSA returned no usable items, so chat continued without external context.
+- `error`: DSA was attempted but timed out, returned HTTP failure, lacked client configuration, or failed unexpectedly.
+
+Successful DSA traces record item count, sources used, bounded error codes, whether prompt context was actually injected, budget truncation, and bounded Hardening A diagnostics such as selection mode, selected source IDs, ranking mode, and candidate truncation.
 
 Manual smoke note:
 

@@ -1,5 +1,5 @@
-import pytest
 import httpx
+import pytest
 from services.orchestrate import orchestrate_chat
 
 BANNED_TRACE_TOKENS = [
@@ -502,7 +502,10 @@ class FakeDSA:
         return self.response
 
 
-def _http_status_error(status_code: int, body: dict[str, object] | None = None) -> httpx.HTTPStatusError:
+def _http_status_error(
+    status_code: int,
+    body: dict[str, object] | None = None,
+) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "http://dsa.local/v1/context-pack")
     response = httpx.Response(status_code, json=body or {}, request=request)
     return httpx.HTTPStatusError(
@@ -3084,6 +3087,30 @@ def _write_default_route_files(tmp_path):
     return rules, models
 
 
+def _first_party_chat_payload(
+    user_text: str,
+    **overrides,
+):
+    payload = {
+        "owner_id": "owner",
+        "client_id": "node-red",
+        "surface": "node_red",
+        "surface_context": {
+            "surface_type": "node_red",
+            "interaction_mode": "text",
+            "spoken_output": False,
+            "active_task_mode": False,
+            "output_format": "markdown",
+        },
+        "messages": [{"role": "user", "content": user_text}],
+        "requested_profile": "default",
+        "sensitivity": "private",
+        "model_override": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_default_chat_does_not_emit_style_guidance(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
@@ -3854,14 +3881,10 @@ async def test_orchestrate_dsa_disabled_skips_external_context_call(tmp_path):
     dsa = FakeDSA()
 
     await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
-            "external_context_enabled": True,
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -3874,13 +3897,64 @@ async def test_orchestrate_dsa_disabled_skips_external_context_call(tmp_path):
 
     assert dsa.calls == []
     trace = memory_store.trace_calls[0]["payload"]
-    assert trace["dsa"] == {"enabled": False, "called": False, "status": "disabled"}
+    assert trace["dsa"] == {
+        "capability_enabled": False,
+        "enabled": True,
+        "called": False,
+        "status": "disabled_by_service",
+        "reason": "deployment_capability_disabled",
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
+    }
     assert trace["retrieval"]["prompt_assembly"]["dsa"] == trace["dsa"]
     assert "External source context:" not in str(litellm.calls[0]["messages"])
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_dsa_enabled_calls_client_and_includes_prompt_context(tmp_path):
+async def test_orchestrate_dsa_missing_request_opt_in_skips_call_with_explicit_trace_reason(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Do I have any vehicle maintenance records?"),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-missing-opt-in",
+    )
+
+    assert out["status"] == "ok"
+    assert dsa.calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["dsa"] == {
+        "capability_enabled": True,
+        "enabled": False,
+        "called": False,
+        "status": "disabled_by_request",
+        "reason": "request_opt_in_absent",
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
+    }
+    assert trace["retrieval"]["prompt_assembly"]["dsa"] == trace["dsa"]
+    assert "External source context:" not in str(litellm.calls[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_top_level_opt_in_calls_client_and_includes_prompt_context(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
@@ -3900,14 +3974,10 @@ async def test_orchestrate_dsa_enabled_calls_client_and_includes_prompt_context(
     )
 
     await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
-            "external_context_enabled": True,
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -3931,19 +4001,28 @@ async def test_orchestrate_dsa_enabled_calls_client_and_includes_prompt_context(
             },
         }
     ]
-    system_messages = [msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"]
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
     assert any("External source context:" in msg for msg in system_messages)
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"] == {
+        "capability_enabled": True,
         "enabled": True,
         "called": True,
         "status": "success",
+        "reason": "items_included",
         "item_count": 1,
         "sources_used": ["vehicle_log_primary"],
         "requested_source_ids": [],
         "requested_domain_tags": [],
         "allowed_sensitivity": "medium",
         "max_results": 5,
+        "errors_count": 0,
+        "error_codes": [],
+        "budget_truncated": False,
+        "context_injected": True,
+        "diagnostics_status": "absent",
     }
     assert "should not persist" not in str(trace)
     assert "Battery replacement. Date: 2025-07-12." not in str(trace["dsa"])
@@ -3957,14 +4036,10 @@ async def test_orchestrate_dsa_no_items_does_not_add_external_context_message(tm
     dsa = FakeDSA(response={"sources_used": [], "items": []})
 
     out = await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "Anything on my calendar?"}],
-            "external_context_enabled": True,
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "Anything on my calendar?",
+            external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -3978,8 +4053,47 @@ async def test_orchestrate_dsa_no_items_does_not_add_external_context_message(tm
     assert out["status"] == "ok"
     assert "External source context:" not in str(litellm.calls[0]["messages"])
     trace = memory_store.trace_calls[0]["payload"]
-    assert trace["dsa"]["status"] == "success"
+    assert trace["dsa"]["status"] == "success_no_items"
+    assert trace["dsa"]["reason"] == "no_usable_items"
     assert trace["dsa"]["item_count"] == 0
+    assert trace["dsa"]["context_injected"] is False
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_missing_client_configuration_is_non_fatal(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=None,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-client-missing",
+    )
+
+    assert out["status"] == "ok"
+    trace = memory_store.trace_calls[0]["payload"]["dsa"]
+    assert trace == {
+        "capability_enabled": True,
+        "enabled": True,
+        "called": False,
+        "status": "error",
+        "reason": "client_not_configured",
+        "error_code": "client_not_configured",
+        "requested_source_ids": [],
+        "requested_domain_tags": [],
+        "allowed_sensitivity": "medium",
+        "max_results": 5,
+    }
 
 
 @pytest.mark.asyncio
@@ -3990,15 +4104,11 @@ async def test_orchestrate_external_context_object_alone_enables_dsa(tmp_path):
     dsa = FakeDSA()
 
     await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
-            "external_context_enabled": False,
-            "external_context": {"enabled": True},
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=False,
+            external_context={"enabled": True},
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -4013,7 +4123,7 @@ async def test_orchestrate_external_context_object_alone_enables_dsa(tmp_path):
     assert dsa.calls[0]["allowed_sensitivity"] == "medium"
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"]["called"] is True
-    assert trace["dsa"]["status"] == "success"
+    assert trace["dsa"]["status"] == "success_no_items"
 
 
 @pytest.mark.asyncio
@@ -4036,20 +4146,16 @@ async def test_orchestrate_dsa_passes_request_targeting_and_budget(tmp_path):
     )
 
     await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "What Jeep maintenance records do you have about oil?"}],
-            "external_context": {
+        payload=_first_party_chat_payload(
+            "What Jeep maintenance records do you have about oil?",
+            external_context={
                 "enabled": True,
                 "source_ids": ["vehicle_log_primary"],
                 "domain_tags": ["vehicle", "maintenance"],
                 "allowed_sensitivity": "low",
                 "max_results": 2,
             },
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -4075,18 +4181,95 @@ async def test_orchestrate_dsa_passes_request_targeting_and_budget(tmp_path):
     ]
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"] == {
+        "capability_enabled": True,
         "enabled": True,
         "called": True,
         "status": "success",
+        "reason": "items_included",
         "item_count": 1,
         "sources_used": ["vehicle_log_primary"],
         "requested_source_ids": ["vehicle_log_primary"],
         "requested_domain_tags": ["vehicle", "maintenance"],
         "allowed_sensitivity": "low",
         "max_results": 2,
+        "errors_count": 0,
+        "error_codes": [],
+        "budget_truncated": False,
+        "context_injected": True,
+        "diagnostics_status": "absent",
     }
     assert "Oil service completed." not in str(trace["dsa"])
     assert "X-API-Key" not in str(trace["dsa"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_trace_bounds_request_targeting_metadata_only(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "vehicle_log_primary:1",
+                    "source_name": "Vehicle Log",
+                    "title": "Oil change",
+                    "text": "Oil service completed.",
+                }
+            ],
+        }
+    )
+    oversized_source_ids = [f"source_{index}" for index in range(25)]
+    oversized_source_ids[0] = "s" * 120
+    oversized_domain_tags = [f"domain_{index}" for index in range(25)]
+    oversized_domain_tags[0] = "d" * 120
+    oversized_allowed_sensitivity = "very_" * 12
+
+    await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What Jeep maintenance records do you have about oil?",
+            external_context={
+                "enabled": True,
+                "source_ids": oversized_source_ids,
+                "domain_tags": oversized_domain_tags,
+                "allowed_sensitivity": oversized_allowed_sensitivity,
+                "max_results": 2,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-targeting-trace-bounds",
+    )
+
+    assert dsa.calls == [
+        {
+            "query": "What Jeep maintenance records do you have about oil?",
+            "source_ids": oversized_source_ids,
+            "domain_tags": oversized_domain_tags,
+            "allowed_sensitivity": oversized_allowed_sensitivity,
+            "budget": {
+                "max_results": 2,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    trace = memory_store.trace_calls[0]["payload"]["dsa"]
+    assert trace["requested_source_ids"] == [
+        "s" * 80,
+        *[f"source_{index}" for index in range(1, 20)],
+    ]
+    assert trace["requested_domain_tags"] == [
+        "d" * 80,
+        *[f"domain_{index}" for index in range(1, 20)],
+    ]
+    assert trace["allowed_sensitivity"] == oversized_allowed_sensitivity[:40]
 
 
 @pytest.mark.asyncio
@@ -4097,14 +4280,10 @@ async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_cont
     dsa = FakeDSA(error=httpx.ReadTimeout("timed out"))
 
     out = await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
-            "external_context_enabled": True,
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -4119,15 +4298,18 @@ async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_cont
     assert "External source context:" not in str(litellm.calls[0]["messages"])
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"] == {
+        "capability_enabled": True,
         "enabled": True,
         "called": True,
         "status": "error",
+        "reason": "timeout",
         "error_code": "timeout",
         "requested_source_ids": [],
         "requested_domain_tags": [],
         "allowed_sensitivity": "medium",
         "max_results": 5,
     }
+    assert "timed out" not in str(trace)
 
 
 @pytest.mark.asyncio
@@ -4150,14 +4332,10 @@ async def test_orchestrate_dsa_401_degrades_gracefully_without_leaking_key(tmp_p
     )
 
     out = await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
-            "external_context_enabled": True,
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -4172,9 +4350,11 @@ async def test_orchestrate_dsa_401_degrades_gracefully_without_leaking_key(tmp_p
     assert "External source context:" not in str(litellm.calls[0]["messages"])
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"] == {
+        "capability_enabled": True,
         "enabled": True,
         "called": True,
         "status": "error",
+        "reason": "http_failure",
         "error_code": "http_401",
         "requested_source_ids": [],
         "requested_domain_tags": [],
@@ -4182,6 +4362,136 @@ async def test_orchestrate_dsa_401_degrades_gracefully_without_leaking_key(tmp_p
         "max_results": 5,
     }
     assert dsa_api_key not in str(trace)
+    assert "Invalid or missing API key" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_preserves_safe_hardening_a_diagnostics_in_trace(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(
+        response={
+            "query": "When was the battery replaced?",
+            "sources_used": ["vehicle_source"],
+            "items": [
+                {
+                    "source_ref": "vehicle_source:row-1",
+                    "source_name": "Vehicle Log",
+                    "title": "Battery replacement",
+                    "text": "Battery replacement. Date: 2025-07-12.",
+                }
+            ],
+            "errors": [{"code": "source_warning", "message": "should not persist"}],
+            "budget": {
+                "max_results": 5,
+                "returned_results": 1,
+                "estimated_bytes": 240,
+                "truncated": True,
+            },
+            "diagnostics": {
+                "selection_mode": "query_relevance",
+                "considered_source_ids": ["vehicle_source", "holiday_source"],
+                "selected_source_ids": ["vehicle_source"],
+                "source_diagnostics": [
+                    {
+                        "source_id": "vehicle_source",
+                        "score": 20,
+                        "score_band": "high",
+                        "reasons": ["display_name_match", "domain_tag_match"],
+                        "private_payload": "must not survive",
+                    }
+                ],
+                "ranking_mode": "single_source",
+                "candidate_counts_by_source": {"vehicle_source": 2},
+                "budget_truncated_candidates": False,
+            },
+        }
+    )
+
+    await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-hardening-a-diagnostics",
+    )
+
+    trace = memory_store.trace_calls[0]["payload"]["dsa"]
+    assert trace["selection_mode"] == "query_relevance"
+    assert trace["selected_source_ids"] == ["vehicle_source"]
+    assert trace["ranking_mode"] == "single_source"
+    assert trace["candidate_counts_by_source"] == {"vehicle_source": 2}
+    assert trace["candidate_truncated"] is False
+    assert trace["budget_truncated"] is True
+    assert trace["errors_count"] == 1
+    assert trace["error_codes"] == ["source_warning"]
+    assert trace["context_injected"] is True
+    assert trace["diagnostics_status"] == "included"
+    assert trace["source_diagnostics"] == [
+        {
+            "source_id": "vehicle_source",
+            "score": 20,
+            "score_band": "high",
+            "reasons": ["display_name_match", "domain_tag_match"],
+        }
+    ]
+    assert "private_payload" not in str(trace)
+    assert "should not persist" not in str(trace)
+    assert "Battery replacement. Date: 2025-07-12." not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dsa_malformed_diagnostics_does_not_drop_valid_items(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_source"],
+            "items": [
+                {
+                    "source_ref": "vehicle_source:row-1",
+                    "source_name": "Vehicle Log",
+                    "title": "Battery replacement",
+                    "text": "Battery replacement. Date: 2025-07-12.",
+                }
+            ],
+            "diagnostics": "not-a-dict",
+        }
+    )
+
+    await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-dsa-malformed-diagnostics",
+    )
+
+    system_messages = [
+        msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
+    ]
+    assert any("External source context:" in msg for msg in system_messages)
+    trace = memory_store.trace_calls[0]["payload"]["dsa"]
+    assert trace["status"] == "success"
+    assert trace["context_injected"] is True
+    assert trace["diagnostics_status"] == "invalid"
+    assert "selection_mode" not in trace
 
 
 @pytest.mark.asyncio
@@ -4214,20 +4524,17 @@ async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
     dsa = FakeDSA()
 
     out = await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "When was the battery replaced?"}],
-            "external_context_enabled": True,
-            "external_context": {
+        payload=_first_party_chat_payload(
+            "When was the battery replaced?",
+            external_context_enabled=True,
+            external_context={
                 "enabled": True,
                 "source_ids": ["vehicle_log_primary"],
                 "domain_tags": ["vehicle", "maintenance"],
                 "max_results": 2,
             },
-            "sensitivity": "local_only",
-            "model_override": None,
-        },
+            sensitivity="local_only",
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -4242,9 +4549,11 @@ async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
     assert dsa.calls == []
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"] == {
+        "capability_enabled": True,
         "enabled": True,
         "called": False,
         "status": "skipped_local_only",
+        "reason": "local_only_policy",
         "requested_source_ids": ["vehicle_log_primary"],
         "requested_domain_tags": ["vehicle", "maintenance"],
         "allowed_sensitivity": "medium",
@@ -4290,14 +4599,10 @@ async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
     dsa = FakeDSA()
 
     out = await orchestrate_chat(
-        payload={
-            "owner_id": "owner",
-            "surface": "chat",
-            "messages": [{"role": "user", "content": "What is on my calendar?"}],
-            "external_context_enabled": True,
-            "sensitivity": "private",
-            "model_override": None,
-        },
+        payload=_first_party_chat_payload(
+            "What is on my calendar?",
+            external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         dsa=dsa,
@@ -4312,9 +4617,11 @@ async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
     assert dsa.calls == []
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["dsa"] == {
+        "capability_enabled": True,
         "enabled": True,
         "called": False,
         "status": "skipped_local_only",
+        "reason": "local_only_policy",
         "requested_source_ids": [],
         "requested_domain_tags": [],
         "allowed_sensitivity": "medium",

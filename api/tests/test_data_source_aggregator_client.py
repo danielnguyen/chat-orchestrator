@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import pytest
 import httpx
+import pytest
 from clients.data_source_aggregator import DataSourceAggregatorClient
 
 

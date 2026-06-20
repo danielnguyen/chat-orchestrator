@@ -182,11 +182,204 @@ def _restraint_disabled_trace() -> dict[str, Any]:
     }
 
 
-def _dsa_disabled_trace(enabled: bool) -> dict[str, Any]:
+def _sanitize_trace_string(value: Any, *, max_length: int = 120) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return cleaned[:max_length]
+
+
+def _sanitize_trace_string_list(
+    value: Any,
+    *,
+    limit: int = 20,
+    item_max_length: int = 120,
+) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        cleaned = _sanitize_trace_string(item, max_length=item_max_length)
+        if cleaned:
+            items.append(cleaned)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _sanitize_trace_int(
+    value: Any,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if minimum is not None and value < minimum:
+        return None
+    if maximum is not None and value > maximum:
+        return maximum
+    return value
+
+
+def _sanitize_trace_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _sanitize_context_pack_errors(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    errors_out: list[dict[str, str]] = []
+    for item in value[:10]:
+        if not isinstance(item, dict):
+            continue
+        code = _sanitize_trace_string(item.get("code"), max_length=80)
+        if not code:
+            continue
+        errors_out.append({"code": code})
+    return errors_out
+
+
+def _sanitize_context_pack_budget(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    budget_out: dict[str, Any] = {}
+    max_results = _sanitize_trace_int(value.get("max_results"), minimum=1, maximum=1000)
+    returned_results = _sanitize_trace_int(
+        value.get("returned_results"),
+        minimum=0,
+        maximum=1000,
+    )
+    estimated_bytes = _sanitize_trace_int(
+        value.get("estimated_bytes"),
+        minimum=0,
+        maximum=5_000_000,
+    )
+    truncated = _sanitize_trace_bool(value.get("truncated"))
+    if max_results is not None:
+        budget_out["max_results"] = max_results
+    if returned_results is not None:
+        budget_out["returned_results"] = returned_results
+    if estimated_bytes is not None:
+        budget_out["estimated_bytes"] = estimated_bytes
+    if truncated is not None:
+        budget_out["truncated"] = truncated
+    return budget_out
+
+
+def _sanitize_context_pack_source_diagnostics(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    diagnostics_out: list[dict[str, Any]] = []
+    for item in value[:10]:
+        if not isinstance(item, dict):
+            continue
+        source_id = _sanitize_trace_string(item.get("source_id"), max_length=80)
+        score_band = _sanitize_trace_string(item.get("score_band"), max_length=32)
+        if not source_id:
+            continue
+        entry: dict[str, Any] = {"source_id": source_id}
+        score = _sanitize_trace_int(item.get("score"), minimum=-10_000, maximum=10_000)
+        if score is not None:
+            entry["score"] = score
+        if score_band:
+            entry["score_band"] = score_band
+        reasons = _sanitize_trace_string_list(
+            item.get("reasons"),
+            limit=6,
+            item_max_length=64,
+        )
+        if reasons:
+            entry["reasons"] = reasons
+        diagnostics_out.append(entry)
+    return diagnostics_out
+
+
+def _sanitize_context_pack_diagnostics(value: Any) -> tuple[dict[str, Any] | None, str]:
+    if value is None:
+        return None, "absent"
+    if not isinstance(value, dict):
+        return None, "invalid"
+
+    diagnostics_out: dict[str, Any] = {}
+    selection_mode = _sanitize_trace_string(value.get("selection_mode"), max_length=40)
+    ranking_mode = _sanitize_trace_string(value.get("ranking_mode"), max_length=40)
+    considered_source_ids = _sanitize_trace_string_list(
+        value.get("considered_source_ids"),
+        limit=20,
+        item_max_length=80,
+    )
+    selected_source_ids = _sanitize_trace_string_list(
+        value.get("selected_source_ids"),
+        limit=20,
+        item_max_length=80,
+    )
+    source_diagnostics = _sanitize_context_pack_source_diagnostics(
+        value.get("source_diagnostics")
+    )
+
+    candidate_counts_by_source: dict[str, int] = {}
+    raw_candidate_counts = value.get("candidate_counts_by_source")
+    if isinstance(raw_candidate_counts, dict):
+        for raw_source_id, raw_count in list(raw_candidate_counts.items())[:20]:
+            source_id = _sanitize_trace_string(raw_source_id, max_length=80)
+            count = _sanitize_trace_int(raw_count, minimum=0, maximum=10_000)
+            if source_id and count is not None:
+                candidate_counts_by_source[source_id] = count
+
+    budget_truncated_candidates = _sanitize_trace_bool(
+        value.get("budget_truncated_candidates")
+    )
+
+    if selection_mode:
+        diagnostics_out["selection_mode"] = selection_mode
+    if considered_source_ids:
+        diagnostics_out["considered_source_ids"] = considered_source_ids
+    if selected_source_ids:
+        diagnostics_out["selected_source_ids"] = selected_source_ids
+    if source_diagnostics:
+        diagnostics_out["source_diagnostics"] = source_diagnostics
+    if ranking_mode:
+        diagnostics_out["ranking_mode"] = ranking_mode
+    if candidate_counts_by_source:
+        diagnostics_out["candidate_counts_by_source"] = candidate_counts_by_source
+    if budget_truncated_candidates is not None:
+        diagnostics_out["budget_truncated_candidates"] = budget_truncated_candidates
+
+    if not diagnostics_out:
+        return None, "invalid"
+    return diagnostics_out, "included"
+
+
+def _build_dsa_trace_base(
+    *,
+    capability_enabled: bool,
+    request_enabled: bool,
+    external_context_config: dict[str, Any],
+    allowed_sensitivity: str,
+    max_results: int | None,
+) -> dict[str, Any]:
     return {
-        "enabled": enabled,
+        "capability_enabled": capability_enabled,
+        "enabled": request_enabled,
         "called": False,
-        "status": "disabled" if not enabled else "not_requested",
+        "requested_source_ids": _sanitize_trace_string_list(
+            external_context_config.get("source_ids"),
+            limit=20,
+            item_max_length=80,
+        ),
+        "requested_domain_tags": _sanitize_trace_string_list(
+            external_context_config.get("domain_tags"),
+            limit=20,
+            item_max_length=80,
+        ),
+        "allowed_sensitivity": _sanitize_trace_string(
+            allowed_sensitivity,
+            max_length=40,
+        ),
+        "max_results": max_results if max_results is not None else 5,
     }
 
 
@@ -266,12 +459,24 @@ def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    errors_out = _sanitize_context_pack_errors(response.get("errors"))
+    budget_out = _sanitize_context_pack_budget(response.get("budget"))
+    diagnostics_out, diagnostics_status = _sanitize_context_pack_diagnostics(
+        response.get("diagnostics")
+    )
+
     return {
-        "query": response.get("query"),
-        "sources_used": response.get("sources_used", []) or [],
+        "query": _sanitize_trace_string(response.get("query"), max_length=500),
+        "sources_used": _sanitize_trace_string_list(
+            response.get("sources_used"),
+            limit=20,
+            item_max_length=80,
+        ),
         "items": items_out,
-        "errors": response.get("errors", []) or [],
-        "budget": response.get("budget", {}) or {},
+        "errors": errors_out,
+        "budget": budget_out,
+        "diagnostics": diagnostics_out,
+        "diagnostics_status": diagnostics_status,
     }
 
 
@@ -287,24 +492,36 @@ async def _resolve_external_context(
     external_context_config = _normalize_external_context_config(external_context)
     allowed_sensitivity = external_context_config.get("allowed_sensitivity", "medium")
     max_results = external_context_config.get("max_results")
-    dsa_trace_base: dict[str, Any] = {
-        "enabled": external_context_enabled,
-        "requested_source_ids": external_context_config.get("source_ids", []),
-        "requested_domain_tags": external_context_config.get("domain_tags", []),
-        "allowed_sensitivity": allowed_sensitivity,
-        "max_results": max_results if max_results is not None else 5,
-    }
+    dsa_trace_base = _build_dsa_trace_base(
+        capability_enabled=dsa_enabled,
+        request_enabled=external_context_enabled,
+        external_context_config=external_context_config,
+        allowed_sensitivity=allowed_sensitivity,
+        max_results=max_results,
+    )
     if not dsa_enabled:
-        return None, _dsa_disabled_trace(False)
+        return None, {
+            **dsa_trace_base,
+            "status": "disabled_by_service",
+            "reason": "deployment_capability_disabled",
+        }
     if not external_context_enabled:
-        return None, _dsa_disabled_trace(True)
+        return None, {
+            **dsa_trace_base,
+            "status": "disabled_by_request",
+            "reason": "request_opt_in_absent",
+        }
     if not external_calls_allowed:
-        return None, {**dsa_trace_base, "called": False, "status": "skipped_local_only"}
+        return None, {
+            **dsa_trace_base,
+            "status": "skipped_local_only",
+            "reason": "local_only_policy",
+        }
     if dsa is None:
         return None, {
             **dsa_trace_base,
-            "called": False,
             "status": "error",
+            "reason": "client_not_configured",
             "error_code": "client_not_configured",
         }
     try:
@@ -315,19 +532,70 @@ async def _resolve_external_context(
             allowed_sensitivity=allowed_sensitivity,
             budget=_build_dsa_budget(max_results),
         )
-        context_pack = _sanitize_context_pack(response if isinstance(response, dict) else {})
-        return context_pack, {
+        if not isinstance(response, dict):
+            return None, {
+                **dsa_trace_base,
+                "called": True,
+                "status": "error",
+                "reason": "malformed_response",
+                "error_code": "malformed_response",
+            }
+        context_pack = _sanitize_context_pack(response)
+        diagnostics = context_pack.get("diagnostics")
+        errors = context_pack.get("errors", [])
+        item_count = len(context_pack.get("items", []))
+        sources_used = context_pack.get("sources_used", [])
+        budget = context_pack.get("budget", {})
+        error_codes = [
+            error["code"]
+            for error in errors
+            if isinstance(error, dict) and isinstance(error.get("code"), str)
+        ]
+        dsa_trace = {
             **dsa_trace_base,
             "called": True,
-            "status": "success",
-            "item_count": len(context_pack.get("items", [])),
-            "sources_used": context_pack.get("sources_used", []),
+            "status": "success" if item_count > 0 else "success_no_items",
+            "reason": (
+                "items_included_with_bounded_errors"
+                if item_count > 0 and error_codes
+                else "items_included"
+                if item_count > 0
+                else "bounded_errors_returned"
+                if error_codes
+                else "no_usable_items"
+            ),
+            "item_count": item_count,
+            "sources_used": sources_used,
+            "errors_count": len(error_codes),
+            "error_codes": error_codes,
+            "budget_truncated": bool(budget.get("truncated")),
+            "context_injected": item_count > 0,
+            "diagnostics_status": context_pack.get("diagnostics_status"),
+        }
+        if diagnostics:
+            dsa_trace["selection_mode"] = diagnostics.get("selection_mode")
+            dsa_trace["selected_source_ids"] = diagnostics.get("selected_source_ids", [])
+            dsa_trace["ranking_mode"] = diagnostics.get("ranking_mode")
+            dsa_trace["candidate_counts_by_source"] = diagnostics.get(
+                "candidate_counts_by_source",
+                {},
+            )
+            dsa_trace["candidate_truncated"] = bool(
+                diagnostics.get("budget_truncated_candidates")
+            )
+            if diagnostics.get("considered_source_ids"):
+                dsa_trace["considered_source_ids"] = diagnostics["considered_source_ids"]
+            if diagnostics.get("source_diagnostics"):
+                dsa_trace["source_diagnostics"] = diagnostics["source_diagnostics"]
+        return context_pack, {
+            **dsa_trace,
         }
     except httpx.TimeoutException:
         return None, {
             **dsa_trace_base,
             "called": True,
             "status": "error",
+            "reason": "timeout",
             "error_code": "timeout",
         }
     except httpx.HTTPError as exc:
@@ -338,6 +606,7 @@ async def _resolve_external_context(
             **dsa_trace_base,
             "called": True,
             "status": "error",
+            "reason": "http_failure",
             "error_code": error_code,
         }
     except Exception:
@@ -345,6 +614,7 @@ async def _resolve_external_context(
             **dsa_trace_base,
             "called": True,
             "status": "error",
+            "reason": "unexpected_failure",
             "error_code": "unexpected_error",
         }
 
