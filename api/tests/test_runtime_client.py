@@ -245,6 +245,26 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         ],
         surface_metadata_json={"surface_type": "developer_surface"},
     )
+    await client.evaluate_memory_hygiene(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        items=[
+            {
+                "item_ref": {"ref_type": "message", "ref_id": "msg-1"},
+                "memory_id": "memory-1",
+                "freshness_state": "parked",
+                "last_verified_at": "2026-01-01T00:00:00Z",
+                "source_kind": "message",
+                "confidence": 0.8,
+                "supersedes": "memory-0",
+                "superseded_by": None,
+            }
+        ],
+    )
 
     assert [path for path, _ in calls] == [
         "/v1/runtime/sessions/resolve",
@@ -257,17 +277,21 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         "/v1/runtime/interaction-governance/evaluate",
         "/v1/runtime/persona-containment/evaluate",
         "/v1/runtime/restraint/evaluate",
+        "/v1/runtime/memory-hygiene/evaluate",
     ]
     assert calls[5][1]["active_persona_id"] == "technical_architect"
-    assert calls[-3][1]["runtime_session_id"] == "rtsession_1"
+    assert calls[-4][1]["runtime_session_id"] == "rtsession_1"
+    assert calls[-4][1]["runtime_turn_id"] == "rtturn_1"
+    assert calls[-4][1]["surface_session_id"] == "surface-session-1"
+    assert calls[-4][1]["active_mode"] == "focused"
+    assert calls[-4][1]["recent_messages"][1]["content"] == "rename this variable to count"
+    assert calls[-4][1]["surface_metadata_json"] == {"surface_type": "developer_surface"}
+    assert calls[-3][1]["persona_scope_hint"] == "technical_architect"
+    assert calls[-3][1]["interaction_kind"] == "question"
     assert calls[-3][1]["runtime_turn_id"] == "rtturn_1"
-    assert calls[-3][1]["surface_session_id"] == "surface-session-1"
-    assert calls[-3][1]["active_mode"] == "focused"
-    assert calls[-3][1]["recent_messages"][1]["content"] == "rename this variable to count"
-    assert calls[-3][1]["surface_metadata_json"] == {"surface_type": "developer_surface"}
-    assert calls[-2][1]["persona_scope_hint"] == "technical_architect"
-    assert calls[-2][1]["interaction_kind"] == "question"
-    assert calls[-2][1]["runtime_turn_id"] == "rtturn_1"
-    assert calls[-1][1]["response_posture"] == "direct"
-    assert calls[-1][1]["active_persona_id"] == "technical_architect"
-    assert calls[-1][1]["capability_domain"] == "technical"
+    assert calls[-2][1]["response_posture"] == "direct"
+    assert calls[-2][1]["active_persona_id"] == "technical_architect"
+    assert calls[-2][1]["capability_domain"] == "technical"
+    assert calls[-1][1]["runtime_turn_id"] == "rtturn_1"
+    assert calls[-1][1]["items"][0]["item_ref"] == {"ref_type": "message", "ref_id": "msg-1"}
+    assert "content" not in calls[-1][1]["items"][0]

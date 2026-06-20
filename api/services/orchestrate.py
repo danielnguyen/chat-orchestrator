@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -15,6 +16,7 @@ from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.companion_presentation import build_companion_presentation
 from services.fallback import choose_fallback
+from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
 from services.response_action import ResponseActionInput, apply_response_action
@@ -114,15 +116,49 @@ def _persona_containment_lock_active(persona_containment: dict[str, Any] | None)
     )
 
 
+@dataclass(frozen=True)
+class RetrievalBoundaryResult:
+    retrieval: dict[str, Any] | None
+    include_artifacts: bool | None
+    allowed_memory_domains: list[str] | None
+    blocked_memory_domains: list[str] | None
+
+
+def _sanitize_memory_domain_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    cleaned = [item for item in value if isinstance(item, str) and item]
+    return cleaned or None
+
+
 def _apply_persona_containment_retrieval_boundary(
     *,
     retrieval: dict[str, Any] | None,
     persona_containment: dict[str, Any] | None,
     persona_containment_trace: dict[str, Any] | None,
-) -> tuple[dict[str, Any] | None, bool | None]:
+) -> RetrievalBoundaryResult:
     trace = _ensure_persona_containment_trace_defaults(persona_containment_trace)
     requested_scope = retrieval.get("scope") if isinstance(retrieval, dict) else None
     trace["retrieval_scope_requested"] = requested_scope
+    allowed_memory_domains = (
+        _sanitize_memory_domain_list(persona_containment.get("allowed_memory_domains"))
+        if isinstance(persona_containment, dict)
+        else None
+    )
+    blocked_memory_domains = (
+        _sanitize_memory_domain_list(persona_containment.get("blocked_memory_domains"))
+        if isinstance(persona_containment, dict)
+        else None
+    )
+    has_domain_filters = bool(allowed_memory_domains or blocked_memory_domains)
+    trace["domain_retrieval_scope_status"] = (
+        "requested_tagged_only" if has_domain_filters else "not_requested"
+    )
+    trace["domain_retrieval_scope_reason"] = (
+        "tagged_domain_filters_forwarded_from_persona_containment"
+        if has_domain_filters
+        else "domain_retrieval_filters_not_requested"
+    )
 
     if not _persona_containment_lock_active(persona_containment):
         trace["retrieval_scope_used"] = requested_scope
@@ -132,7 +168,12 @@ def _apply_persona_containment_retrieval_boundary(
         ):
             trace["retrieval_scope_reason"] = "cross_scope_access_allowed"
             trace["artifact_request_reason"] = "cross_scope_access_allowed"
-        return retrieval if isinstance(retrieval, dict) else None, None
+        return RetrievalBoundaryResult(
+            retrieval=retrieval if isinstance(retrieval, dict) else None,
+            include_artifacts=None,
+            allowed_memory_domains=allowed_memory_domains,
+            blocked_memory_domains=blocked_memory_domains,
+        )
 
     effective_retrieval = dict(retrieval) if isinstance(retrieval, dict) else {}
     effective_retrieval["scope"] = "conversation"
@@ -141,7 +182,12 @@ def _apply_persona_containment_retrieval_boundary(
     trace["retrieval_scope_reason"] = "conversation_scope_enforced_under_containment_lock"
     trace["artifact_request_status"] = "request_boundary_enforced"
     trace["artifact_request_reason"] = "artifact_search_disabled_under_containment_lock"
-    return effective_retrieval, False
+    return RetrievalBoundaryResult(
+        retrieval=effective_retrieval,
+        include_artifacts=False,
+        allowed_memory_domains=allowed_memory_domains,
+        blocked_memory_domains=blocked_memory_domains,
+    )
 
 
 def _apply_persona_containment_result_boundary(
@@ -1800,6 +1846,7 @@ async def orchestrate_chat(
     interaction_governance_enabled: bool = False,
     persona_containment_enabled: bool = False,
     restraint_enabled: bool = False,
+    memory_hygiene_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -1962,7 +2009,7 @@ async def orchestrate_chat(
     local_only = sensitivity_local_only or profile_local_only
     cost_mode = routing_policy.get("cost_mode")
     latency_mode = routing_policy.get("latency_mode")
-    retrieval_request, include_artifacts = _apply_persona_containment_retrieval_boundary(
+    retrieval_boundary = _apply_persona_containment_retrieval_boundary(
         retrieval=(
             effective_payload.get("retrieval")
             if isinstance(effective_payload.get("retrieval"), dict)
@@ -1978,6 +2025,7 @@ async def orchestrate_chat(
         isinstance(external_context_request, dict)
         and external_context_request.get("enabled") is True
     )
+    memory_hygiene_result = None
 
     try:
         await _advance_runtime_turn(
@@ -1986,19 +2034,43 @@ async def orchestrate_chat(
             request_id=request_id,
             turn_status="retrieving",
         )
+        retrieve_bundle_kwargs: dict[str, Any] = {
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "owner_id": payload["owner_id"],
+            "query": last_user_text,
+            "retrieval": retrieval_boundary.retrieval,
+            "include_artifacts": retrieval_boundary.include_artifacts,
+        }
+        if retrieval_boundary.allowed_memory_domains is not None:
+            retrieve_bundle_kwargs["allowed_memory_domains"] = (
+                retrieval_boundary.allowed_memory_domains
+            )
+        if retrieval_boundary.blocked_memory_domains is not None:
+            retrieve_bundle_kwargs["blocked_memory_domains"] = (
+                retrieval_boundary.blocked_memory_domains
+            )
+
         retrieval_bundle = await memory_store.retrieve_bundle(
-            request_id=request_id,
-            conversation_id=conversation_id,
-            owner_id=payload["owner_id"],
-            query=last_user_text,
-            retrieval=retrieval_request,
-            include_artifacts=include_artifacts,
+            **retrieve_bundle_kwargs,
         )
         retrieval_bundle = _apply_persona_containment_result_boundary(
             retrieval_bundle=retrieval_bundle,
             persona_containment=persona_containment,
             persona_containment_trace=persona_containment_trace,
         )
+        memory_hygiene_result = await apply_memory_hygiene(
+            runtime=runtime,
+            enabled=memory_hygiene_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            retrieval_bundle=retrieval_bundle,
+        )
+        retrieval_bundle = memory_hygiene_result.retrieval_bundle
         external_context_pack, dsa_trace = await _resolve_external_context(
             dsa=dsa,
             dsa_enabled=dsa_enabled,
@@ -2123,6 +2195,11 @@ async def orchestrate_chat(
                         "interaction_governance": interaction_governance_trace,
                         "persona_containment": persona_containment_trace,
                         "restraint": restraint_trace,
+                        "memory_hygiene": (
+                            memory_hygiene_result.trace
+                            if memory_hygiene_result is not None
+                            else disabled_memory_hygiene_trace(retrieval_bundle)
+                        ),
                         "world_state": world_state_trace,
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
@@ -2194,6 +2271,11 @@ async def orchestrate_chat(
             persona_containment_trace_data=persona_containment_trace,
             restraint=restraint,
             restraint_trace_data=restraint_trace,
+            memory_hygiene_trace_data=(
+                memory_hygiene_result.trace
+                if memory_hygiene_result is not None
+                else disabled_memory_hygiene_trace(retrieval_bundle)
+            ),
             runtime_identity=runtime_identity,
             runtime_identity_trace=runtime_identity_trace,
             world_state=world_state,
@@ -2359,6 +2441,11 @@ async def orchestrate_chat(
         prompt.trace["turn_state"] = turn_state_trace
         prompt.trace["runtime_identity"] = runtime_identity_trace
         prompt.trace["relationship_context"] = relationship_context_trace
+        prompt.trace["memory_hygiene"] = (
+            memory_hygiene_result.trace
+            if memory_hygiene_result is not None
+            else disabled_memory_hygiene_trace(retrieval_bundle)
+        )
         prompt.trace["surface_presence"] = apply_surface_presence_outcome(
             surface_presence_trace,
             fallback_active=fallback_used,
