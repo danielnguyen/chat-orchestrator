@@ -3715,6 +3715,160 @@ async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decision
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision_patch", "remove_keys", "expected_fragment"),
+    [
+        (
+            {"use_allowed": "false"},
+            [],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {},
+            ["use_allowed"],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {},
+            ["mention_as_current_allowed"],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {"framing": "invalid-frame"},
+            [],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+        (
+            {"freshness_state": "invalid-freshness"},
+            [],
+            "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy",
+        ),
+    ],
+)
+async def test_orchestrate_memory_hygiene_invalid_runtime_decision_fields_fall_back(
+    tmp_path,
+    decision_patch,
+    remove_keys,
+    expected_fragment,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    base_decision = {
+        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+        "freshness_state": "active",
+        "use_allowed": True,
+        "mention_as_current_allowed": True,
+        "framing": "current",
+    }
+    base_decision.update(decision_patch)
+    for key in remove_keys:
+        base_decision.pop(key)
+    runtime = FakeRuntime(memory_hygiene_response={"result": {"decisions": [base_decision]}})
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-invalid-decision",
+    )
+
+    assert any(
+        msg["role"] == "system" and expected_fragment in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["invalid_decision_count"] == 1
+    assert "invalid-frame" not in str(trace)
+    assert "invalid-freshness" not in str(trace)
+    assert "\"false\"" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_valid_runtime_decision_still_works(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="shared-source",
+                    content="semantic copy",
+                    freshness_state="stale",
+                    memory_id="memory-1",
+                )
+            ]
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
+                        "freshness_state": "stale",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": False,
+                        "framing": "stale_or_unverified",
+                    }
+                ]
+            }
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-memory-valid-decision",
+    )
+
+    assert any(
+        msg["role"] == "system"
+        and "[stale or unverified context] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        in msg["content"]
+        for msg in litellm.calls[0]["messages"]
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
+    assert trace["invalid_decision_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_duplicate_falls_back_once(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
@@ -3781,6 +3935,7 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_du
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]
     assert trace["invalid_decision_count"] == 1
     assert trace["missing_decision_count"] == 1
+    assert trace["evaluated_decision_count"] == 0
     assert trace["fallback_applied"] is True
 
 
