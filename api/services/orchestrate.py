@@ -24,7 +24,7 @@ from services.privacy_context import (
     privacy_fallback_policy,
     restricted_retrieval_trace_summary,
     sanitize_prompt_trace_for_privacy,
-    validate_privacy_policy_result,
+    validate_privacy_runtime_response,
 )
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
@@ -1719,10 +1719,17 @@ async def _resolve_privacy_context(
     except Exception:
         return _fallback("runtime_unavailable")
 
-    if not isinstance(response, dict):
-        return _fallback("malformed_runtime_response")
-
-    result = validate_privacy_policy_result(response.get("result"))
+    result = validate_privacy_runtime_response(
+        response,
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        surface_category=derived.surface_category,
+        sensitivity_level=derived.sensitivity_level,
+    )
     if result is None:
         return _fallback("invalid_runtime_result")
 

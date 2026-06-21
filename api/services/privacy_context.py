@@ -491,6 +491,13 @@ def sanitize_prompt_trace_for_privacy(
                 "overlay_present": bool(runtime_summary.get("overlay_ref")),
                 "omission_reason": runtime_summary.get("omission_reason"),
             }
+        companion_summary = presentation.get("companion")
+        if isinstance(companion_summary, dict):
+            presentation["companion"] = {
+                "status": companion_summary.get("status"),
+                "overlay_count": companion_summary.get("overlay_count", 0),
+                "omission_reason": companion_summary.get("omission_reason"),
+            }
 
     layers = sanitized.get("layers")
     if isinstance(layers, list):
@@ -512,23 +519,22 @@ def sanitize_prompt_trace_for_privacy(
                     else []
                 )
                 layer["metadata"] = {
-                    "profile_id": metadata.get("profile_id"),
-                    "profile_version": metadata.get("profile_version"),
-                    "contract_id": metadata.get("contract_id"),
-                    "contract_version": metadata.get("contract_version"),
-                    "scene_id": metadata.get("scene_id"),
-                    "scene_confidence": metadata.get("scene_confidence"),
-                    "scene_source": metadata.get("scene_source"),
-                    "warnings": metadata.get("warnings", []),
-                    "companion_profile_id": metadata.get("companion_profile_id"),
-                    "companion_profile_version": metadata.get("companion_profile_version"),
-                    "interaction_contract_id": metadata.get("interaction_contract_id"),
-                    "interaction_contract_version": metadata.get(
-                        "interaction_contract_version"
+                    "profile_present": bool(
+                        metadata.get("profile_id") or metadata.get("companion_profile_id")
                     ),
-                    "companion_policy_warnings": metadata.get(
-                        "companion_policy_warnings",
-                        [],
+                    "profile_version": metadata.get("profile_version"),
+                    "contract_present": bool(
+                        metadata.get("contract_id")
+                        or metadata.get("interaction_contract_id")
+                        or metadata.get("interaction_contract")
+                    ),
+                    "contract_version": metadata.get("contract_version"),
+                    "scene_present": metadata.get("scene_id") is not None,
+                    "scene_confidence_present": metadata.get("scene_confidence") is not None,
+                    "scene_source_present": metadata.get("scene_source") is not None,
+                    "warning_count": len(metadata.get("warnings", []) or []),
+                    "companion_policy_warning_count": len(
+                        metadata.get("companion_policy_warnings", []) or []
                     ),
                     "companion_overlay_count": len(metadata.get("companion_overlay_ids", []) or []),
                     "runtime_overlay_count": len(metadata.get("runtime_overlay_ids", []) or []),
@@ -538,12 +544,6 @@ def sanitize_prompt_trace_for_privacy(
                     ),
                     "cognitive_runtime_compile_status": metadata.get(
                         "cognitive_runtime_compile_status"
-                    ),
-                    "cognitive_runtime_compile_error": metadata.get(
-                        "cognitive_runtime_compile_error"
-                    ),
-                    "cognitive_runtime_compile_endpoint": metadata.get(
-                        "cognitive_runtime_compile_endpoint"
                     ),
                     "omission_reason": metadata.get("omission_reason"),
                 }
@@ -662,12 +662,34 @@ def sanitize_prompt_trace_for_privacy(
     companion_trace = sanitized.get("companion_policy")
     if isinstance(companion_trace, dict):
         sanitized["companion_policy"] = {
-            **companion_trace,
+            "attempted": companion_trace.get("attempted", False),
+            "status": companion_trace.get("status"),
+            "included": companion_trace.get("included"),
+            "profile_present": bool(
+                companion_trace.get("profile_id")
+                or companion_trace.get("companion_profile_id")
+            ),
+            "profile_version": companion_trace.get("profile_version"),
+            "contract_present": bool(
+                companion_trace.get("contract_id")
+                or companion_trace.get("interaction_contract_id")
+                or companion_trace.get("interaction_contract")
+            ),
+            "contract_version": companion_trace.get("contract_version"),
+            "scene_present": companion_trace.get("scene_id") is not None,
+            "scene_confidence_present": companion_trace.get("scene_confidence") is not None,
+            "scene_source_present": companion_trace.get("scene_source") is not None,
+            "warning_count": len(companion_trace.get("warnings", []) or []),
+            "companion_policy_warning_count": len(
+                companion_trace.get("companion_policy_warnings", []) or []
+            ),
+            "cognitive_runtime_compile_status": companion_trace.get(
+                "cognitive_runtime_compile_status"
+            ),
+            "omission_reason": companion_trace.get("omission_reason"),
             "companion_overlay_count": len(companion_trace.get("companion_overlay_ids", []) or []),
             "runtime_overlay_count": len(companion_trace.get("runtime_overlay_ids", []) or []),
         }
-        sanitized["companion_policy"].pop("companion_overlay_ids", None)
-        sanitized["companion_policy"].pop("runtime_overlay_ids", None)
 
     persona_trace = sanitized.get("persona_containment")
     if isinstance(persona_trace, dict):
@@ -791,6 +813,14 @@ def sanitize_prompt_trace_for_privacy(
             "omission_reason": handoff_runtime.get("omission_reason"),
             "reset_after_turn": handoff_runtime.get("reset_after_turn", False),
         }
+    handoff_companion = handoff.get("companion") if isinstance(handoff, dict) else None
+    if isinstance(handoff_companion, dict):
+        handoff["companion"] = {
+            "status": handoff_companion.get("status"),
+            "overlay_count": handoff_companion.get("overlay_count", 0),
+            "omission_reason": handoff_companion.get("omission_reason"),
+            "compile_status": handoff_companion.get("compile_status"),
+        }
     return sanitized
 
 
@@ -835,3 +865,40 @@ def validate_privacy_policy_result(result: Any) -> dict[str, Any] | None:
             return None
         validated[field] = value
     return validated
+
+
+def validate_privacy_runtime_response(
+    response: Any,
+    *,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    surface_category: str,
+    sensitivity_level: str,
+) -> dict[str, Any] | None:
+    if not isinstance(response, dict):
+        return None
+    if response.get("request_id") != request_id:
+        return None
+    if response.get("owner_id") != owner_id:
+        return None
+    if response.get("conversation_id") != conversation_id:
+        return None
+    if response.get("surface") != surface:
+        return None
+    if runtime_session_id is not None and response.get("runtime_session_id") != runtime_session_id:
+        return None
+    if runtime_turn_id is not None and response.get("runtime_turn_id") != runtime_turn_id:
+        return None
+
+    result = validate_privacy_policy_result(response.get("result"))
+    if result is None:
+        return None
+    if result.get("surface_type") != surface_category:
+        return None
+    if _SURFACE_RANK[result["sensitivity_level"]] < _SURFACE_RANK[sensitivity_level]:
+        return None
+    return result

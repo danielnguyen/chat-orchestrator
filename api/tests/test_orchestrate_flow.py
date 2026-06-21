@@ -536,7 +536,20 @@ class FakeRuntime:
             raise self.privacy_context_error
         if self.fail:
             raise RuntimeError("runtime unavailable")
-        return self.privacy_context_response
+        if not isinstance(self.privacy_context_response, dict):
+            return self.privacy_context_response
+        response = dict(self.privacy_context_response)
+        for field in (
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "runtime_session_id",
+            "runtime_turn_id",
+        ):
+            if field not in response and kwargs.get(field) is not None:
+                response[field] = kwargs.get(field)
+        return response
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
@@ -705,6 +718,12 @@ def _base_payload(**overrides):
 def _privacy_runtime_response(
     *,
     surface_type: str,
+    request_id: str | None = None,
+    owner_id: str | None = None,
+    conversation_id: str | None = None,
+    surface: str | None = None,
+    runtime_session_id: str | None = None,
+    runtime_turn_id: str | None = None,
     sensitivity_level: str = "normal",
     privacy_zone: str = "private",
     sensitive_detail_allowed: bool = True,
@@ -715,13 +734,7 @@ def _privacy_runtime_response(
     safe_summary_required: bool = False,
     reason_codes: list[str] | None = None,
 ):
-    return {
-        "request_id": "rid-privacy",
-        "owner_id": "owner",
-        "conversation_id": "conv-1",
-        "surface": "dev",
-        "runtime_session_id": "rtsession_1",
-        "runtime_turn_id": "rtturn_1",
+    response = {
         "result": {
             "privacy_zone": privacy_zone,
             "surface_type": surface_type,
@@ -735,6 +748,19 @@ def _privacy_runtime_response(
             "reason_codes": reason_codes or ["private_surface"],
         },
     }
+    if request_id is not None:
+        response["request_id"] = request_id
+    if owner_id is not None:
+        response["owner_id"] = owner_id
+    if conversation_id is not None:
+        response["conversation_id"] = conversation_id
+    if surface is not None:
+        response["surface"] = surface
+    if runtime_session_id is not None:
+        response["runtime_session_id"] = runtime_session_id
+    if runtime_turn_id is not None:
+        response["runtime_turn_id"] = runtime_turn_id
+    return response
 
 
 @pytest.mark.asyncio
@@ -6025,7 +6051,7 @@ async def test_orchestrate_privacy_guidance_uses_final_policy_result(tmp_path):
     litellm = FakeLiteLLM()
 
     await orchestrate_chat(
-        payload=_base_payload(surface_context={"surface_category": "desktop_private"}),
+        payload=_base_payload(surface_context={"surface_category": "notification_preview"}),
         memory_store=FakeMemoryStore(),
         litellm=litellm,
         runtime=runtime,
@@ -6121,6 +6147,7 @@ async def test_orchestrate_private_desktop_policy_preserves_answer_and_sources(t
     runtime = FakeRuntime(
         privacy_context_response=_privacy_runtime_response(
             surface_type="desktop_private",
+            sensitivity_level="sensitive",
             sensitive_detail_allowed=True,
             screen_detail_allowed=True,
         )
@@ -6307,6 +6334,242 @@ async def test_orchestrate_invalid_privacy_runtime_result_uses_conservative_fall
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("privacy_response", "request_id"),
+    [
+        (
+            _privacy_runtime_response(
+                request_id="rid-privacy-request-mismatch-other",
+                surface_type="desktop_private",
+                sensitivity_level="sensitive",
+            ),
+            "rid-privacy-request-mismatch",
+        ),
+        (
+            _privacy_runtime_response(
+                owner_id="other-owner",
+                surface_type="desktop_private",
+                sensitivity_level="sensitive",
+            ),
+            "rid-privacy-owner-mismatch",
+        ),
+        (
+            _privacy_runtime_response(
+                conversation_id="other-conversation",
+                surface_type="desktop_private",
+                sensitivity_level="sensitive",
+            ),
+            "rid-privacy-conversation-mismatch",
+        ),
+    ],
+)
+async def test_orchestrate_privacy_runtime_identifier_mismatch_uses_conservative_fallback(
+    tmp_path,
+    privacy_response,
+    request_id,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(privacy_context_response=privacy_response)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="vscode",
+            surface_context={"surface_category": "desktop_private"},
+            sensitivity="private",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Sensitive raw output"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+        privacy_context_enabled=True,
+    )
+
+    assert out["sources"] == []
+    assert out["answer"] == "Sensitive details are withheld on this surface."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "fallback"
+    assert trace["fallback_reason"] == "invalid_runtime_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "privacy_response",
+    [
+        _privacy_runtime_response(
+            runtime_session_id="other-session",
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+        ),
+        _privacy_runtime_response(
+            runtime_turn_id="other-turn",
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+        ),
+    ],
+)
+async def test_orchestrate_privacy_runtime_session_or_turn_mismatch_uses_conservative_fallback(
+    tmp_path,
+    privacy_response,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(privacy_context_response=privacy_response)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="vscode",
+            surface_context={"surface_category": "desktop_private"},
+            sensitivity="private",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Sensitive raw output"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-session-turn-mismatch",
+        privacy_context_enabled=True,
+    )
+
+    assert out["sources"] == []
+    assert out["answer"] == "Sensitive details are withheld on this surface."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "fallback"
+    assert trace["fallback_reason"] == "invalid_runtime_result"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_runtime_surface_category_mismatch_uses_conservative_fallback(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="notification_preview",
+            sensitivity_level="sensitive",
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="vscode",
+            surface_context={"surface_category": "desktop_private"},
+            sensitivity="private",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Sensitive raw output"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-surface-category-mismatch",
+        privacy_context_enabled=True,
+    )
+
+    assert out["sources"] == []
+    assert out["answer"] == "Sensitive details are withheld on this surface."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "fallback"
+    assert trace["fallback_reason"] == "invalid_runtime_result"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_runtime_deescalated_sensitivity_uses_conservative_fallback(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitivity_level="normal",
+            sensitive_detail_allowed=True,
+            screen_detail_allowed=True,
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="vscode",
+            surface_context={"surface_category": "desktop_private"},
+            sensitivity="private",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Sensitive raw output"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-sensitivity-deescalated",
+        privacy_context_enabled=True,
+    )
+
+    assert out["sources"] == []
+    assert out["answer"] == "Sensitive details are withheld on this surface."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "fallback"
+    assert trace["fallback_reason"] == "invalid_runtime_result"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_exactly_matching_privacy_runtime_response_is_accepted(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            request_id="rid-privacy-exact-match",
+            owner_id="owner",
+            conversation_id="conv-1",
+            surface="vscode",
+            runtime_session_id="rtsession_1",
+            runtime_turn_id="rtturn_1",
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=True,
+            screen_detail_allowed=True,
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="vscode",
+            surface_context={"surface_category": "desktop_private"},
+            sensitivity="private",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="normal detail"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-exact-match",
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "normal detail"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "runtime"
+    assert trace["fallback_applied"] is False
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_provider_fallback(
     tmp_path,
 ):
@@ -6374,6 +6637,29 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
 
 @pytest.mark.asyncio
 async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references(tmp_path):
+    companion_response = {
+        "profile_id": "COMPANION_PROFILE_ID_SENTINEL",
+        "profile_version": 7,
+        "contract_id": "COMPANION_CONTRACT_ID_SENTINEL",
+        "contract_version": 9,
+        "scene_id": "COMPANION_SCENE_ID_SENTINEL",
+        "scene_confidence": 0.92,
+        "scene_source": "explicit",
+        "warnings": ["COMPANION_WARNING_SENTINEL"],
+        "interaction_contract": {
+            "memory_or_recall_boundaries": ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
+        },
+        "contract_trace": {"id": "COMPANION_CONTRACT_TRACE_SENTINEL"},
+        "overlays": [
+            {
+                "overlay_id": "COMPANION_OVERLAY_SENTINEL",
+                "overlay_type": "interaction_contract",
+                "role": "system",
+                "content": "COMPANION_OVERLAY_TEXT_SENTINEL",
+            }
+        ],
+        "future_identifier": "COMPANION_FUTURE_KEY_SENTINEL",
+    }
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
         response={
@@ -6404,6 +6690,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
             safe_summary_required=True,
             reason_codes=["safe_summary_required"],
         ),
+        companion_response=companion_response,
         persona_containment_response={
             "request_id": "rid-persona",
             "owner_id": "owner",
@@ -6516,6 +6803,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
         allow_manual_override=True,
         request_id="rid-privacy-sentinel-restricted",
         privacy_context_enabled=True,
+        companion_policy_enabled=True,
         enable_runtime_overlays=True,
         persona_containment_enabled=True,
     )
@@ -6560,8 +6848,29 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
         "RUNTIME_IDENTITY_TEXT_SENTINEL",
         "WORLD_STATE_TEXT_SENTINEL",
         "RELATIONSHIP_TEXT_SENTINEL",
+        "COMPANION_PROFILE_ID_SENTINEL",
+        "COMPANION_CONTRACT_ID_SENTINEL",
+        "COMPANION_SCENE_ID_SENTINEL",
+        "COMPANION_OVERLAY_SENTINEL",
+        "COMPANION_OVERLAY_TEXT_SENTINEL",
+        "COMPANION_CONTRACT_OBJECT_SENTINEL",
+        "COMPANION_CONTRACT_TRACE_SENTINEL",
+        "COMPANION_FUTURE_KEY_SENTINEL",
     ]:
         assert sentinel not in serialized
+    for banned_key in [
+        "profile_id",
+        "contract_id",
+        "scene_id",
+        "companion_profile_id",
+        "interaction_contract_id",
+        "interaction_contract",
+        "contract_trace",
+        "companion_overlay_ids",
+        "runtime_overlay_ids",
+        "future_identifier",
+    ]:
+        assert banned_key not in serialized
 
     assert trace_payload["retrieval"]["bundle"] == {
         "privacy_suppressed": True,
@@ -6571,19 +6880,46 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
     }
     prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
     assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
+    assert prompt_trace["companion_policy"] == {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "profile_present": True,
+        "profile_version": 7,
+        "contract_present": True,
+        "contract_version": 9,
+        "scene_present": True,
+        "scene_confidence_present": True,
+        "scene_source_present": True,
+        "warning_count": 1,
+        "companion_policy_warning_count": 1,
+        "cognitive_runtime_compile_status": "included",
+        "omission_reason": None,
+        "companion_overlay_count": 1,
+        "runtime_overlay_count": 1,
+    }
     assert prompt_trace["presentation"]["runtime"] == {
         "status": "included",
         "overlay_present": True,
         "omission_reason": None,
     }
-    assert prompt_trace["companion_policy"]["runtime_overlay_count"] == 1
-    assert "runtime_overlay_ids" not in prompt_trace["companion_policy"]
+    assert prompt_trace["presentation"]["companion"] == {
+        "status": "included",
+        "overlay_count": 1,
+        "omission_reason": None,
+    }
     assert prompt_trace["handoff"]["runtime"] == {
         "status": "included",
         "overlay_present": True,
         "source_field_count": 1,
         "omission_reason": None,
         "reset_after_turn": False,
+    }
+    assert prompt_trace["handoff"]["companion"] == {
+        "status": "included",
+        "overlay_count": 1,
+        "omission_reason": None,
+        "compile_status": "included",
     }
     assert prompt_trace["dsa"]["called"] is True
     assert prompt_trace["dsa"]["item_count"] == 1
@@ -6613,12 +6949,55 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
         "source_count": 1,
         "privacy_suppressed": True,
     }
+    companion_metadata = next(
+        layer["metadata"]
+        for layer in prompt_trace["layers"]
+        if layer.get("name") == "companion_policy"
+    )
+    assert companion_metadata == {
+        "profile_present": True,
+        "profile_version": 7,
+        "contract_present": True,
+        "contract_version": 9,
+        "scene_present": True,
+        "scene_confidence_present": True,
+        "scene_source_present": True,
+        "warning_count": 1,
+        "companion_policy_warning_count": 1,
+        "companion_overlay_count": 1,
+        "runtime_overlay_count": 1,
+        "included_overlay_count": 1,
+        "omitted_overlay_type_count": 0,
+        "cognitive_runtime_compile_status": "included",
+        "omission_reason": None,
+    }
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_detail(
     tmp_path,
 ):
+    companion_response = {
+        "profile_id": "COMPANION_PROFILE_ID_SENTINEL",
+        "profile_version": 7,
+        "contract_id": "COMPANION_CONTRACT_ID_SENTINEL",
+        "contract_version": 9,
+        "scene_id": "COMPANION_SCENE_ID_SENTINEL",
+        "warnings": ["COMPANION_WARNING_SENTINEL"],
+        "interaction_contract": {
+            "memory_or_recall_boundaries": ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
+        },
+        "contract_trace": {"id": "COMPANION_CONTRACT_TRACE_SENTINEL"},
+        "overlays": [
+            {
+                "overlay_id": "COMPANION_OVERLAY_SENTINEL",
+                "overlay_type": "interaction_contract",
+                "role": "system",
+                "content": "COMPANION_OVERLAY_TEXT_SENTINEL",
+            }
+        ],
+        "future_identifier": "COMPANION_FUTURE_KEY_SENTINEL",
+    }
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
         response={
@@ -6639,7 +7018,7 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
         },
         privacy_context_response=_privacy_runtime_response(
             surface_type="desktop_private",
-            sensitivity_level="normal",
+            sensitivity_level="sensitive",
             privacy_zone="private",
             sensitive_detail_allowed=True,
             notification_detail_allowed=False,
@@ -6649,6 +7028,7 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
             safe_summary_required=False,
             reason_codes=["private_detail_allowed"],
         ),
+        companion_response=companion_response,
     )
     runtime.identity_response["trace"].update(
         {
@@ -6703,6 +7083,7 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
         allow_manual_override=True,
         request_id="rid-privacy-sentinel-unrestricted",
         privacy_context_enabled=True,
+        companion_policy_enabled=True,
         enable_runtime_overlays=True,
     )
 
@@ -6713,6 +7094,16 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
     assert prompt_trace["runtime"]["overlay_id"] == "RUNTIME_OVERLAY_SENTINEL"
     assert prompt_trace["runtime_identity"]["surface_id"] == "SURFACE_ID_SENTINEL"
     assert prompt_trace["world_state"]["allowed_domains"] == ["WORLD_DOMAIN_SENTINEL"]
+    assert prompt_trace["companion_policy"]["profile_id"] == "COMPANION_PROFILE_ID_SENTINEL"
+    assert prompt_trace["companion_policy"]["contract_id"] == "COMPANION_CONTRACT_ID_SENTINEL"
+    assert prompt_trace["companion_policy"]["scene_id"] == "COMPANION_SCENE_ID_SENTINEL"
+    assert (
+        prompt_trace["companion_policy"]["interaction_contract"]["memory_or_recall_boundaries"]
+        == ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
+    )
+    assert prompt_trace["companion_policy"]["contract_trace"] == {
+        "id": "COMPANION_CONTRACT_TRACE_SENTINEL"
+    }
     assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
     assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
     assert prompt_trace["privacy_context"]["action_taken"] == "none"
@@ -6722,6 +7113,26 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
 async def test_orchestrate_disabled_privacy_trace_preserves_current_context_detail(
     tmp_path,
 ):
+    companion_response = {
+        "profile_id": "COMPANION_PROFILE_ID_SENTINEL",
+        "profile_version": 7,
+        "contract_id": "COMPANION_CONTRACT_ID_SENTINEL",
+        "contract_version": 9,
+        "scene_id": "COMPANION_SCENE_ID_SENTINEL",
+        "interaction_contract": {
+            "memory_or_recall_boundaries": ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
+        },
+        "contract_trace": {"id": "COMPANION_CONTRACT_TRACE_SENTINEL"},
+        "overlays": [
+            {
+                "overlay_id": "COMPANION_OVERLAY_SENTINEL",
+                "overlay_type": "interaction_contract",
+                "role": "system",
+                "content": "COMPANION_OVERLAY_TEXT_SENTINEL",
+            }
+        ],
+        "future_identifier": "COMPANION_FUTURE_KEY_SENTINEL",
+    }
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
         response={
@@ -6739,7 +7150,8 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
             },
             "omitted": False,
             "omission_reason": None,
-        }
+        },
+        companion_response=companion_response,
     )
     dsa = FakeDSA(
         response={
@@ -6771,6 +7183,7 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
         allow_manual_override=True,
         request_id="rid-privacy-sentinel-disabled",
         privacy_context_enabled=False,
+        companion_policy_enabled=True,
         enable_runtime_overlays=True,
     )
 
@@ -6778,6 +7191,12 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
     trace_payload = memory_store.trace_calls[0]["payload"]
     prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
     assert prompt_trace["runtime"]["overlay_id"] == "RUNTIME_OVERLAY_SENTINEL"
+    assert prompt_trace["companion_policy"]["profile_id"] == "COMPANION_PROFILE_ID_SENTINEL"
+    assert prompt_trace["companion_policy"]["contract_id"] == "COMPANION_CONTRACT_ID_SENTINEL"
+    assert prompt_trace["companion_policy"]["scene_id"] == "COMPANION_SCENE_ID_SENTINEL"
+    assert prompt_trace["companion_policy"]["contract_trace"] == {
+        "id": "COMPANION_CONTRACT_TRACE_SENTINEL"
+    }
     assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
     assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
     assert trace_payload["retrieval"]["prompt_assembly"]["privacy_context"]["status"] == "disabled"
