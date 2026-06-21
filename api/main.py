@@ -126,6 +126,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
             ),
             restraint_enabled=settings.cognitive_runtime_restraint_enabled,
             memory_hygiene_enabled=settings.cognitive_runtime_memory_hygiene_enabled,
+            privacy_context_enabled=settings.cognitive_runtime_privacy_context_enabled,
             response_action_mode=settings.response_action_mode,
             interrupt_policy_mode=body.interrupt_policy_mode,
             dsa=dsa,

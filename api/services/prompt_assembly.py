@@ -4,6 +4,11 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
+from services.privacy_context import (
+    PRIVACY_SENSITIVITY_LEVELS,
+    PRIVACY_SURFACE_CATEGORIES,
+    PRIVACY_ZONES,
+)
 from services.assistant_handoff import AssistantHandoff
 from services.companion_presentation import CompanionPresentation
 
@@ -28,6 +33,7 @@ VALID_RESTRAINT_POLICIES = {
     "do_not_personalize",
     "suppress_proactive_output",
 }
+VALID_PRIVACY_REASON_CODES = re.compile(r"^[a-z0-9_.:-]+$")
 PROMPT_OVERLAY_MAX_CHARS = 240
 PROMPT_INJECTION_MARKERS = (
     "ignore system",
@@ -557,6 +563,127 @@ def restraint_trace(restraint_trace_data: dict[str, Any] | None) -> dict[str, An
     }
 
 
+def _sanitize_privacy_context(privacy_context: dict[str, Any] | None) -> dict[str, Any]:
+    privacy_context = privacy_context if isinstance(privacy_context, dict) else {}
+    surface_type = privacy_context.get("surface_type")
+    privacy_zone = privacy_context.get("privacy_zone")
+    sensitivity_level = privacy_context.get("sensitivity_level")
+    reason_codes = privacy_context.get("reason_codes")
+    sanitized_reason_codes: list[str] = []
+    if isinstance(reason_codes, list):
+        sanitized_reason_codes = [
+            item
+            for item in reason_codes
+            if isinstance(item, str) and VALID_PRIVACY_REASON_CODES.fullmatch(item)
+        ]
+
+    return {
+        "surface_type": (
+            surface_type
+            if isinstance(surface_type, str) and surface_type in PRIVACY_SURFACE_CATEGORIES
+            else None
+        ),
+        "privacy_zone": (
+            privacy_zone if isinstance(privacy_zone, str) and privacy_zone in PRIVACY_ZONES else None
+        ),
+        "sensitivity_level": (
+            sensitivity_level
+            if isinstance(sensitivity_level, str) and sensitivity_level in PRIVACY_SENSITIVITY_LEVELS
+            else None
+        ),
+        "sensitive_detail_allowed": _validated_bool(
+            privacy_context.get("sensitive_detail_allowed")
+        ),
+        "notification_detail_allowed": _validated_bool(
+            privacy_context.get("notification_detail_allowed")
+        ),
+        "voice_detail_allowed": _validated_bool(privacy_context.get("voice_detail_allowed")),
+        "screen_detail_allowed": _validated_bool(privacy_context.get("screen_detail_allowed")),
+        "redaction_required": _validated_bool(privacy_context.get("redaction_required")),
+        "safe_summary_required": _validated_bool(
+            privacy_context.get("safe_summary_required")
+        ),
+        "reason_codes": sanitized_reason_codes,
+    }
+
+
+def build_privacy_context_messages(
+    privacy_context: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    sanitized = _sanitize_privacy_context(privacy_context)
+    surface_type = sanitized.get("surface_type")
+    if not isinstance(surface_type, str):
+        return []
+
+    lines = [f"Privacy context guidance:", f"- Active channel type: {surface_type}."]
+    if sanitized.get("sensitive_detail_allowed") is True:
+        lines.append("- Sensitive detail is allowed on this surface only when otherwise safe.")
+    else:
+        lines.append("- Sensitive detail is not allowed on this surface.")
+
+    if sanitized.get("safe_summary_required") is True or sanitized.get("redaction_required") is True:
+        lines.append("- Use a safe summary or full withholding instead of detailed disclosure.")
+        lines.append("- Never expose raw memory details when a safe summary is required.")
+
+    if surface_type == "notification_preview":
+        lines.append("- Keep notification output minimal and redirect to a private surface.")
+    elif surface_type == "car_voice_possible_passenger":
+        lines.append("- Keep car voice output concise and withhold private detail.")
+    elif surface_type == "glasses_public_or_semi_public":
+        lines.append("- Keep public-display output concise and avoid private specifics.")
+    elif surface_type == "voice_private":
+        lines.append("- Keep voice output concise and avoid oversharing.")
+    elif surface_type == "unknown_surface":
+        lines.append("- Stay conservative because the current surface is not trusted as private.")
+
+    return [{"role": "system", "content": "\n".join(lines)}]
+
+
+def privacy_context_trace(privacy_context_trace_data: dict[str, Any] | None) -> dict[str, Any]:
+    privacy_context_trace_data = (
+        privacy_context_trace_data if isinstance(privacy_context_trace_data, dict) else {}
+    )
+    sanitized = _sanitize_privacy_context(privacy_context_trace_data)
+    return {
+        "attempted": privacy_context_trace_data.get("attempted", False),
+        "status": privacy_context_trace_data.get("status", "not_requested"),
+        "included": privacy_context_trace_data.get("included", False),
+        "runtime_call_status": privacy_context_trace_data.get("runtime_call_status"),
+        "policy_source": privacy_context_trace_data.get("policy_source"),
+        "surface_type": sanitized.get("surface_type"),
+        "privacy_zone": sanitized.get("privacy_zone"),
+        "sensitivity_level": sanitized.get("sensitivity_level"),
+        "sensitivity_domain_count": privacy_context_trace_data.get(
+            "sensitivity_domain_count",
+            0,
+        ),
+        "sensitive_detail_allowed": sanitized.get("sensitive_detail_allowed"),
+        "notification_detail_allowed": sanitized.get("notification_detail_allowed"),
+        "voice_detail_allowed": sanitized.get("voice_detail_allowed"),
+        "screen_detail_allowed": sanitized.get("screen_detail_allowed"),
+        "redaction_required": sanitized.get("redaction_required"),
+        "safe_summary_required": sanitized.get("safe_summary_required"),
+        "reason_codes": sanitized.get("reason_codes", []),
+        "fallback_applied": privacy_context_trace_data.get("fallback_applied"),
+        "fallback_reason": privacy_context_trace_data.get("fallback_reason"),
+        "enforcement_required": privacy_context_trace_data.get("enforcement_required"),
+        "action_taken": privacy_context_trace_data.get("action_taken"),
+        "template_id": privacy_context_trace_data.get("template_id"),
+        "sources_suppressed_count": privacy_context_trace_data.get(
+            "sources_suppressed_count",
+            0,
+        ),
+        "trace_bundle_suppressed": privacy_context_trace_data.get(
+            "trace_bundle_suppressed",
+            False,
+        ),
+        "brief_text_suppressed": privacy_context_trace_data.get(
+            "brief_text_suppressed",
+            False,
+        ),
+    }
+
+
 def assemble_prompt(
     *,
     profile: dict[str, Any],
@@ -586,6 +713,8 @@ def assemble_prompt(
     restraint: dict[str, Any] | None = None,
     restraint_trace_data: dict[str, Any] | None = None,
     memory_hygiene_trace_data: dict[str, Any] | None = None,
+    privacy_context: dict[str, Any] | None = None,
+    privacy_context_trace_data: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
@@ -937,6 +1066,30 @@ def assemble_prompt(
         )
     )
 
+    privacy_context_messages = build_privacy_context_messages(privacy_context)
+    privacy_context_trace_out = privacy_context_trace(privacy_context_trace_data)
+    if privacy_context_messages:
+        messages.extend(privacy_context_messages)
+        layers.append(
+            _layer_trace(
+                "privacy_context",
+                privacy_context_messages,
+                metadata={
+                    "runtime_call_status": privacy_context_trace_out.get("runtime_call_status"),
+                    "policy_source": privacy_context_trace_out.get("policy_source"),
+                    "surface_type": privacy_context_trace_out.get("surface_type"),
+                    "privacy_zone": privacy_context_trace_out.get("privacy_zone"),
+                    "sensitivity_level": privacy_context_trace_out.get("sensitivity_level"),
+                    "sensitive_detail_allowed": privacy_context_trace_out.get(
+                        "sensitive_detail_allowed"
+                    ),
+                    "safe_summary_required": privacy_context_trace_out.get(
+                        "safe_summary_required"
+                    ),
+                },
+            )
+        )
+
     runtime_identity_messages: list[dict[str, str]] = []
     runtime_identity_trace_out = dict(runtime_identity_trace or {})
     runtime_identity_omission_reason = runtime_identity_trace_out.get("omission_reason")
@@ -1134,6 +1287,8 @@ def assemble_prompt(
         "restraint": restraint_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "memory_hygiene": memory_hygiene_trace_data
+        or {"attempted": False, "status": "not_requested", "included": False},
+        "privacy_context": privacy_context_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "runtime_identity": runtime_identity_trace_out
         or {"attempted": False, "status": "not_requested"},
