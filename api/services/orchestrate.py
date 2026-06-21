@@ -515,6 +515,11 @@ def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
                 "text": text,
                 "retrieved_at": item.get("retrieved_at"),
                 "warnings": item.get("warnings", []),
+                "sensitivity": item.get("sensitivity"),
+                "sensitivity_level": item.get("sensitivity_level"),
+                "sensitivity_domains": item.get("sensitivity_domains"),
+                "domain_tags": item.get("domain_tags"),
+                "policy_metadata": item.get("policy_metadata"),
             }
         )
 
@@ -1189,7 +1194,13 @@ async def _resolve_world_state(
             "included": False,
             "omission_reason": "empty_world_state",
         }
-    return {"prompt_content": prompt_content}, {
+    world_state_out: dict[str, Any] = {"prompt_content": prompt_content}
+    for key in ("sensitivity", "sensitivity_level", "sensitivity_domains", "domain_tags", "policy_metadata"):
+        if key in response:
+            world_state_out[key] = response.get(key)
+        elif key in trace:
+            world_state_out[key] = trace.get(key)
+    return world_state_out, {
         **base_trace,
         "status": "included",
         "included": True,
@@ -1276,7 +1287,13 @@ async def _resolve_relationship_context(
             "included": False,
             "omission_reason": "empty_relationship_context",
         }
-    return {"prompt_content": prompt_content}, {
+    relationship_context_out: dict[str, Any] = {"prompt_content": prompt_content}
+    for key in ("sensitivity", "sensitivity_level", "sensitivity_domains", "domain_tags", "policy_metadata"):
+        if key in response:
+            relationship_context_out[key] = response.get(key)
+        elif key in trace:
+            relationship_context_out[key] = trace.get(key)
+    return relationship_context_out, {
         **base_trace,
         "status": "included",
         "included": True,
@@ -1650,11 +1667,24 @@ async def _resolve_privacy_context(
     runtime_turn_id: str | None,
     payload: dict[str, Any],
     retrieval_bundle: dict[str, Any],
+    external_context_pack: dict[str, Any] | None = None,
+    runtime_identity: dict[str, Any] | None = None,
+    runtime_overlay: dict[str, Any] | None = None,
+    world_state: dict[str, Any] | None = None,
+    relationship_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not enabled:
         return None, _privacy_context_disabled_trace()
 
-    derived = derive_privacy_context(payload=payload, retrieval_bundle=retrieval_bundle)
+    derived = derive_privacy_context(
+        payload=payload,
+        retrieval_bundle=retrieval_bundle,
+        external_context_pack=external_context_pack,
+        runtime_identity=runtime_identity,
+        runtime_overlay=runtime_overlay,
+        world_state=world_state,
+        relationship_context=relationship_context,
+    )
 
     def _fallback(fallback_reason: str) -> tuple[dict[str, Any], dict[str, Any]]:
         result, trace = privacy_fallback_policy(
@@ -2173,18 +2203,6 @@ async def orchestrate_chat(
             retrieval_bundle=retrieval_bundle,
         )
         retrieval_bundle = memory_hygiene_result.retrieval_bundle
-        privacy_context, privacy_context_trace = await _resolve_privacy_context(
-            runtime=runtime,
-            enabled=privacy_context_enabled,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            payload=effective_payload,
-            retrieval_bundle=retrieval_bundle,
-        )
         external_context_pack, dsa_trace = await _resolve_external_context(
             dsa=dsa,
             dsa_enabled=dsa_enabled,
@@ -2252,6 +2270,23 @@ async def orchestrate_chat(
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
             surface=surface,
+        )
+        privacy_context, privacy_context_trace = await _resolve_privacy_context(
+            runtime=runtime,
+            enabled=privacy_context_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            payload=effective_payload,
+            retrieval_bundle=retrieval_bundle,
+            external_context_pack=external_context_pack,
+            runtime_identity=runtime_identity,
+            runtime_overlay=runtime_overlay,
+            world_state=world_state,
+            relationship_context=relationship_context,
         )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
@@ -2613,6 +2648,11 @@ async def orchestrate_chat(
             if privacy_boundary.enforced
             else prompt.trace
         )
+        persisted_dsa_trace = (
+            persisted_prompt_trace.get("dsa", {})
+            if privacy_boundary.enforced
+            else dsa_trace
+        )
         persisted_retrieval = (
             {
                 "query_present": bool(last_user_text),
@@ -2676,7 +2716,7 @@ async def orchestrate_chat(
                     "triggered": fallback_used,
                     "reason": "provider_error" if fallback_used else None,
                 },
-                "dsa": dsa_trace,
+                "dsa": persisted_dsa_trace,
                 "cost": {},
                 "latency_ms": int((perf_counter() - started) * 1000),
                 "status": status,

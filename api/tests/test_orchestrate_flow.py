@@ -1,4 +1,5 @@
 import httpx
+import json
 import pytest
 from services.orchestrate import orchestrate_chat
 
@@ -5894,6 +5895,154 @@ async def test_orchestrate_privacy_context_submits_metadata_only_with_session_an
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_dsa_context_escalates_public_request_before_privacy_evaluation(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "vehicle_log_primary:1",
+                    "source_name": "Vehicle Log",
+                    "title": "Private note",
+                    "text": "PRIVATE_DSA_TEXT_SENTINEL",
+                }
+            ],
+        }
+    )
+
+    await orchestrate_chat(
+        payload=_base_payload(
+            surface="web",
+            sensitivity="public",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-dsa-escalation",
+        privacy_context_enabled=True,
+    )
+
+    submitted = runtime.privacy_context_calls[0]
+    assert submitted["sensitivity_level"] == "sensitive"
+    assert "PRIVATE_DSA_TEXT_SENTINEL" not in json.dumps(submitted)
+    assert "text" not in submitted
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_world_state_and_relationship_metadata_escalate_before_privacy_evaluation(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime()
+    runtime.world_state_response = {
+        "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
+        "excluded_claim_summaries": [],
+        "prompt_content": "WORLD_STATE_TEXT_SENTINEL",
+        "sensitivity_level": "highly_sensitive",
+        "sensitivity_domains": ["health", "ignored_domain"],
+        "trace": {
+            "active_persona_id": "technical_architect",
+            "allowed_domains": ["active_repository"],
+            "included_claim_count": 1,
+            "excluded_claim_count": 0,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 0,
+            "confirmation_required": False,
+        },
+    }
+    runtime.relationship_response = {
+        "selected_entities": [{"entity_id": "project:alpha"}],
+        "selected_relationships": [{"relationship_id": "rel_1"}],
+        "excluded_relationship_summaries": [],
+        "prompt_content": "RELATIONSHIP_TEXT_SENTINEL",
+        "sensitivity_domains": ["financial"],
+        "trace": {
+            "relationship_edges_used": ["rel_1"],
+            "relationship_edges_excluded": [],
+            "relationship_exclusion_reasons": {},
+            "relationship_context_overlay_applied": True,
+            "relationship_conflicts": [],
+            "relationship_confirmation_required": False,
+            "selected_relationship_count": 1,
+            "excluded_relationship_count": 0,
+            "active_persona_id": "technical_architect",
+            "allowed_relationship_scopes": ["project_context"],
+        },
+    }
+
+    await orchestrate_chat(
+        payload=_base_payload(surface="web", sensitivity="public"),
+        memory_store=FakeMemoryStore(),
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-runtime-escalation",
+        privacy_context_enabled=True,
+    )
+
+    submitted = runtime.privacy_context_calls[0]
+    assert runtime.call_order.index("world_state") < runtime.call_order.index("privacy_context")
+    assert runtime.call_order.index("relationship_context") < runtime.call_order.index(
+        "privacy_context"
+    )
+    assert submitted["sensitivity_level"] == "highly_sensitive"
+    assert submitted["sensitivity_domains"] == ["health", "financial"]
+    serialized = json.dumps(submitted)
+    assert "WORLD_STATE_TEXT_SENTINEL" not in serialized
+    assert "RELATIONSHIP_TEXT_SENTINEL" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_guidance_uses_final_policy_result(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="notification_preview",
+            sensitivity_level="sensitive",
+            privacy_zone="preview_limited",
+            sensitive_detail_allowed=False,
+            notification_detail_allowed=False,
+            screen_detail_allowed=True,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["notification_preview_limited"],
+        )
+    )
+    litellm = FakeLiteLLM()
+
+    await orchestrate_chat(
+        payload=_base_payload(surface_context={"surface_category": "desktop_private"}),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-guidance-final-policy",
+        privacy_context_enabled=True,
+    )
+
+    system_messages = [
+        message["content"] for message in litellm.calls[0]["messages"] if message["role"] == "system"
+    ]
+    assert any("notification_preview" in message for message in system_messages)
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_privacy_context_explicit_level_cannot_deescalate(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
@@ -6221,3 +6370,414 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
     assert prompt_trace["response_action"]["action_taken"] == "template_fallback"
     assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
     assert trace_payload["model_call"]["brief"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        response={
+            "runtime_state": {
+                "runtime_state_id": "RUNTIME_STATE_SENTINEL",
+                "reset_after_turn": False,
+            },
+            "overlay": {
+                "runtime_state_id": "RUNTIME_STATE_SENTINEL",
+                "overlay_id": "RUNTIME_OVERLAY_SENTINEL",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": "RUNTIME_OVERLAY_TEXT_SENTINEL",
+                "source_fields": ["active_scene"],
+            },
+            "omitted": False,
+            "omission_reason": None,
+        },
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="unknown_surface",
+            sensitivity_level="sensitive",
+            privacy_zone="unknown",
+            sensitive_detail_allowed=False,
+            notification_detail_allowed=False,
+            voice_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        ),
+        persona_containment_response={
+            "request_id": "rid-persona",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "active_persona_id": "PERSONA_SENTINEL",
+                "capability_domain": "CAPABILITY_SENTINEL",
+                "allowed_memory_domains": ["MEMORY_DOMAIN_SENTINEL"],
+                "blocked_memory_domains": ["BLOCKED_DOMAIN_SENTINEL"],
+                "allowed_world_state_domains": ["WORLD_SCOPE_SENTINEL"],
+                "allowed_relationship_domains": ["REL_SCOPE_SENTINEL"],
+                "allowed_tool_domains": ["TOOL_SCOPE_SENTINEL"],
+                "cross_scope_access_allowed": False,
+                "cross_scope_reason": "not_requested",
+                "confidence": 0.81,
+                "reason_summary": ["persona_scope_hint_applied"],
+            },
+        },
+    )
+    runtime.identity_response["trace"].update(
+        {
+            "runtime_session_id": "RUNTIME_SESSION_SENTINEL",
+            "surface_id": "SURFACE_ID_SENTINEL",
+            "advisory_memory_scope_summary": ["ADVISORY_MEMORY_SENTINEL"],
+            "advisory_tool_permission_summary": ["ADVISORY_TOOL_SENTINEL"],
+        }
+    )
+    runtime.identity_response["runtime_identity"]["content"] = "RUNTIME_IDENTITY_TEXT_SENTINEL"
+    runtime.world_state_response = {
+        "included_claims": [{"world_state_claim_id": "WORLD_CLAIM_SENTINEL"}],
+        "excluded_claim_summaries": [{"world_state_claim_id": "WORLD_CLAIM_EXCLUDED_SENTINEL"}],
+        "prompt_content": "WORLD_STATE_TEXT_SENTINEL",
+        "trace": {
+            "active_persona_id": "PERSONA_SENTINEL",
+            "allowed_domains": ["WORLD_DOMAIN_SENTINEL"],
+            "included_claim_count": 1,
+            "excluded_claim_count": 1,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 1,
+            "confirmation_required": False,
+        },
+    }
+    runtime.relationship_response = {
+        "selected_entities": [{"entity_id": "ENTITY_SENTINEL"}],
+        "selected_relationships": [{"relationship_id": "REL_EDGE_SENTINEL"}],
+        "excluded_relationship_summaries": [{"relationship_id": "REL_EDGE_EXCLUDED_SENTINEL"}],
+        "prompt_content": "RELATIONSHIP_TEXT_SENTINEL",
+        "trace": {
+            "relationship_edges_used": ["REL_EDGE_SENTINEL"],
+            "relationship_edges_excluded": ["REL_EDGE_EXCLUDED_SENTINEL"],
+            "relationship_exclusion_reasons": {"REL_EDGE_EXCLUDED_SENTINEL": "CONFLICT_SENTINEL"},
+            "relationship_context_overlay_applied": True,
+            "relationship_conflicts": ["REL_CONFLICT_SENTINEL"],
+            "relationship_confirmation_required": False,
+            "selected_relationship_count": 1,
+            "excluded_relationship_count": 1,
+            "active_persona_id": "PERSONA_SENTINEL",
+            "allowed_relationship_scopes": ["REL_SCOPE_SENTINEL"],
+        },
+    }
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["DSA_SOURCE_SENTINEL"],
+            "items": [
+                {
+                    "source_ref": "DSA_SOURCE_REF_SENTINEL",
+                    "source_name": "Private Source",
+                    "title": "Private Title",
+                    "text": "DSA_TEXT_SENTINEL",
+                }
+            ],
+            "diagnostics": {
+                "selection_mode": "query_relevance",
+                "considered_source_ids": ["DSA_CONSIDERED_SENTINEL"],
+                "selected_source_ids": ["DSA_SELECTED_SENTINEL"],
+                "source_diagnostics": [
+                    {
+                        "source_id": "DSA_DIAGNOSTIC_SOURCE_SENTINEL",
+                        "score": 20,
+                        "score_band": "high",
+                        "reasons": ["display_name_match"],
+                    }
+                ],
+                "ranking_mode": "single_source",
+                "candidate_counts_by_source": {"DSA_CANDIDATE_SOURCE_SENTINEL": 2},
+                "budget_truncated_candidates": False,
+            },
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="web",
+            external_context_enabled=True,
+            external_context={"enabled": True, "source_ids": ["REQUESTED_SOURCE_SENTINEL"]},
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="RAW_ANSWER_SENTINEL"),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-sentinel-restricted",
+        privacy_context_enabled=True,
+        enable_runtime_overlays=True,
+        persona_containment_enabled=True,
+    )
+
+    assert out["answer"] == "Details cannot safely be shown on this surface."
+    assert out["sources"] == []
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    serialized = json.dumps(trace_payload, sort_keys=True)
+
+    for sentinel in [
+        "RUNTIME_STATE_SENTINEL",
+        "RUNTIME_OVERLAY_SENTINEL",
+        "RUNTIME_OVERLAY_TEXT_SENTINEL",
+        "RUNTIME_SESSION_SENTINEL",
+        "SURFACE_ID_SENTINEL",
+        "ADVISORY_MEMORY_SENTINEL",
+        "ADVISORY_TOOL_SENTINEL",
+        "PERSONA_SENTINEL",
+        "CAPABILITY_SENTINEL",
+        "MEMORY_DOMAIN_SENTINEL",
+        "BLOCKED_DOMAIN_SENTINEL",
+        "WORLD_SCOPE_SENTINEL",
+        "REL_SCOPE_SENTINEL",
+        "TOOL_SCOPE_SENTINEL",
+        "WORLD_DOMAIN_SENTINEL",
+        "WORLD_CLAIM_SENTINEL",
+        "WORLD_CLAIM_EXCLUDED_SENTINEL",
+        "REL_EDGE_SENTINEL",
+        "REL_EDGE_EXCLUDED_SENTINEL",
+        "REL_CONFLICT_SENTINEL",
+        "CONFLICT_SENTINEL",
+        "ENTITY_SENTINEL",
+        "DSA_SOURCE_SENTINEL",
+        "DSA_SOURCE_REF_SENTINEL",
+        "DSA_CONSIDERED_SENTINEL",
+        "DSA_SELECTED_SENTINEL",
+        "DSA_DIAGNOSTIC_SOURCE_SENTINEL",
+        "DSA_CANDIDATE_SOURCE_SENTINEL",
+        "REQUESTED_SOURCE_SENTINEL",
+        "DSA_TEXT_SENTINEL",
+        "RAW_ANSWER_SENTINEL",
+        "RUNTIME_IDENTITY_TEXT_SENTINEL",
+        "WORLD_STATE_TEXT_SENTINEL",
+        "RELATIONSHIP_TEXT_SENTINEL",
+    ]:
+        assert sentinel not in serialized
+
+    assert trace_payload["retrieval"]["bundle"] == {
+        "privacy_suppressed": True,
+        "recent_item_count": 1,
+        "semantic_item_count": 1,
+        "artifact_count": 0,
+    }
+    prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
+    assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
+    assert prompt_trace["presentation"]["runtime"] == {
+        "status": "included",
+        "overlay_present": True,
+        "omission_reason": None,
+    }
+    assert prompt_trace["companion_policy"]["runtime_overlay_count"] == 1
+    assert "runtime_overlay_ids" not in prompt_trace["companion_policy"]
+    assert prompt_trace["handoff"]["runtime"] == {
+        "status": "included",
+        "overlay_present": True,
+        "source_field_count": 1,
+        "omission_reason": None,
+        "reset_after_turn": False,
+    }
+    assert prompt_trace["dsa"]["called"] is True
+    assert prompt_trace["dsa"]["item_count"] == 1
+    assert prompt_trace["dsa"]["selected_source_count"] == 1
+    assert prompt_trace["dsa"]["considered_source_count"] == 1
+    assert prompt_trace["dsa"]["source_diagnostics_count"] == 1
+    assert prompt_trace["dsa"]["candidate_source_count"] == 1
+    assert trace_payload["dsa"] == prompt_trace["dsa"]
+    assert prompt_trace["persona_containment"]["allowed_memory_domain_count"] == 1
+    assert prompt_trace["persona_containment"]["blocked_memory_domain_count"] == 1
+    assert prompt_trace["persona_containment"]["allowed_world_state_domain_count"] == 1
+    assert prompt_trace["persona_containment"]["allowed_relationship_domain_count"] == 1
+    assert prompt_trace["persona_containment"]["allowed_tool_domain_count"] == 1
+    assert prompt_trace["world_state"]["allowed_domain_count"] == 1
+    assert prompt_trace["relationship_context"]["allowed_relationship_scope_count"] == 1
+    assert prompt_trace["relationship_context"]["relationship_edges_used_count"] == 1
+    assert prompt_trace["runtime_identity"]["advisory_memory_scope_count"] == 1
+    assert prompt_trace["runtime_identity"]["advisory_tool_permission_count"] == 1
+    assert prompt_trace["runtime"]["source_field_count"] == 1
+    external_metadata = next(
+        layer["metadata"]
+        for layer in prompt_trace["layers"]
+        if layer.get("name") == "external_source_context"
+    )
+    assert external_metadata == {
+        "item_count": 1,
+        "source_count": 1,
+        "privacy_suppressed": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_detail(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        response={
+            "runtime_state": {
+                "runtime_state_id": "RUNTIME_STATE_SENTINEL",
+                "reset_after_turn": False,
+            },
+            "overlay": {
+                "runtime_state_id": "RUNTIME_STATE_SENTINEL",
+                "overlay_id": "RUNTIME_OVERLAY_SENTINEL",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": "RUNTIME_OVERLAY_TEXT_SENTINEL",
+                "source_fields": ["active_scene"],
+            },
+            "omitted": False,
+            "omission_reason": None,
+        },
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitivity_level="normal",
+            privacy_zone="private",
+            sensitive_detail_allowed=True,
+            notification_detail_allowed=False,
+            voice_detail_allowed=False,
+            screen_detail_allowed=True,
+            redaction_required=False,
+            safe_summary_required=False,
+            reason_codes=["private_detail_allowed"],
+        ),
+    )
+    runtime.identity_response["trace"].update(
+        {
+            "runtime_session_id": "RUNTIME_SESSION_SENTINEL",
+            "surface_id": "SURFACE_ID_SENTINEL",
+        }
+    )
+    runtime.world_state_response = {
+        "included_claims": [{"world_state_claim_id": "WORLD_CLAIM_SENTINEL"}],
+        "excluded_claim_summaries": [],
+        "prompt_content": "WORLD_STATE_TEXT_SENTINEL",
+        "trace": {
+            "active_persona_id": "technical_architect",
+            "allowed_domains": ["WORLD_DOMAIN_SENTINEL"],
+            "included_claim_count": 1,
+            "excluded_claim_count": 0,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 0,
+            "confirmation_required": False,
+        },
+    }
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["DSA_SOURCE_SENTINEL"],
+            "items": [
+                {
+                    "source_ref": "DSA_SOURCE_REF_SENTINEL",
+                    "source_name": "Private Source",
+                    "title": "Private Title",
+                    "text": "DSA_TEXT_SENTINEL",
+                }
+            ],
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface_context={"surface_category": "desktop_private"},
+            external_context_enabled=True,
+            external_context={"enabled": True, "source_ids": ["REQUESTED_SOURCE_SENTINEL"]},
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="RAW_ANSWER_SENTINEL"),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-sentinel-unrestricted",
+        privacy_context_enabled=True,
+        enable_runtime_overlays=True,
+    )
+
+    assert out["answer"] == "RAW_ANSWER_SENTINEL"
+    assert len(out["sources"]) == 1
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
+    assert prompt_trace["runtime"]["overlay_id"] == "RUNTIME_OVERLAY_SENTINEL"
+    assert prompt_trace["runtime_identity"]["surface_id"] == "SURFACE_ID_SENTINEL"
+    assert prompt_trace["world_state"]["allowed_domains"] == ["WORLD_DOMAIN_SENTINEL"]
+    assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
+    assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
+    assert prompt_trace["privacy_context"]["action_taken"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_disabled_privacy_trace_preserves_current_context_detail(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        response={
+            "runtime_state": {
+                "runtime_state_id": "RUNTIME_STATE_SENTINEL",
+                "reset_after_turn": False,
+            },
+            "overlay": {
+                "runtime_state_id": "RUNTIME_STATE_SENTINEL",
+                "overlay_id": "RUNTIME_OVERLAY_SENTINEL",
+                "overlay_type": "runtime_state",
+                "role": "system",
+                "content": "RUNTIME_OVERLAY_TEXT_SENTINEL",
+                "source_fields": ["active_scene"],
+            },
+            "omitted": False,
+            "omission_reason": None,
+        }
+    )
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["DSA_SOURCE_SENTINEL"],
+            "items": [
+                {
+                    "source_ref": "DSA_SOURCE_REF_SENTINEL",
+                    "source_name": "Private Source",
+                    "title": "Private Title",
+                    "text": "DSA_TEXT_SENTINEL",
+                }
+            ],
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            external_context_enabled=True,
+            external_context={"enabled": True, "source_ids": ["REQUESTED_SOURCE_SENTINEL"]},
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="RAW_ANSWER_SENTINEL"),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-sentinel-disabled",
+        privacy_context_enabled=False,
+        enable_runtime_overlays=True,
+    )
+
+    assert out["answer"] == "RAW_ANSWER_SENTINEL"
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
+    assert prompt_trace["runtime"]["overlay_id"] == "RUNTIME_OVERLAY_SENTINEL"
+    assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
+    assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
+    assert trace_payload["retrieval"]["prompt_assembly"]["privacy_context"]["status"] == "disabled"
