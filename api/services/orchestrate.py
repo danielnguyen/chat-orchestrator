@@ -17,6 +17,15 @@ from services.briefing import generate_brief
 from services.companion_presentation import build_companion_presentation
 from services.fallback import choose_fallback
 from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
+from services.privacy_context import (
+    apply_privacy_boundary,
+    derive_privacy_context,
+    disabled_privacy_trace,
+    privacy_fallback_policy,
+    restricted_retrieval_trace_summary,
+    sanitize_prompt_trace_for_privacy,
+    validate_privacy_policy_result,
+)
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
 from services.response_action import ResponseActionInput, apply_response_action
@@ -114,6 +123,10 @@ def _persona_containment_lock_active(persona_containment: dict[str, Any] | None)
         isinstance(persona_containment, dict)
         and persona_containment.get("cross_scope_access_allowed") is False
     )
+
+
+def _privacy_context_disabled_trace() -> dict[str, Any]:
+    return disabled_privacy_trace()
 
 
 @dataclass(frozen=True)
@@ -1625,6 +1638,92 @@ async def _resolve_restraint(
     }
 
 
+async def _resolve_privacy_context(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    payload: dict[str, Any],
+    retrieval_bundle: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not enabled:
+        return None, _privacy_context_disabled_trace()
+
+    derived = derive_privacy_context(payload=payload, retrieval_bundle=retrieval_bundle)
+
+    def _fallback(fallback_reason: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        result, trace = privacy_fallback_policy(
+            surface_category=derived.surface_category,
+            sensitivity_level=derived.sensitivity_level,
+            fallback_reason=fallback_reason,
+        )
+        trace["sensitivity_domain_count"] = len(derived.sensitivity_domains)
+        return result, trace
+
+    if runtime is None:
+        return _fallback("runtime_client_not_configured")
+
+    try:
+        response = await runtime.evaluate_privacy_context(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            surface_category=derived.surface_category,
+            sensitivity_level=derived.sensitivity_level,
+            sensitivity_domains=derived.sensitivity_domains,
+        )
+    except httpx.TimeoutException:
+        return _fallback("runtime_timeout")
+    except httpx.HTTPError:
+        return _fallback("runtime_http_failure")
+    except ValueError:
+        return _fallback("invalid_runtime_result")
+    except Exception:
+        return _fallback("runtime_unavailable")
+
+    if not isinstance(response, dict):
+        return _fallback("malformed_runtime_response")
+
+    result = validate_privacy_policy_result(response.get("result"))
+    if result is None:
+        return _fallback("invalid_runtime_result")
+
+    return result, {
+        "attempted": True,
+        "status": "included",
+        "included": True,
+        "runtime_call_status": "included",
+        "policy_source": "runtime",
+        "surface_type": result.get("surface_type"),
+        "privacy_zone": result.get("privacy_zone"),
+        "sensitivity_level": result.get("sensitivity_level"),
+        "sensitivity_domain_count": len(derived.sensitivity_domains),
+        "sensitive_detail_allowed": result.get("sensitive_detail_allowed"),
+        "notification_detail_allowed": result.get("notification_detail_allowed"),
+        "voice_detail_allowed": result.get("voice_detail_allowed"),
+        "screen_detail_allowed": result.get("screen_detail_allowed"),
+        "redaction_required": result.get("redaction_required"),
+        "safe_summary_required": result.get("safe_summary_required"),
+        "reason_codes": result.get("reason_codes", []),
+        "fallback_applied": False,
+        "fallback_reason": None,
+        "enforcement_required": False,
+        "action_taken": "none",
+        "template_id": None,
+        "sources_suppressed_count": 0,
+        "trace_bundle_suppressed": False,
+        "brief_text_suppressed": False,
+    }
+
+
 async def _reset_runtime_after_turn(
     *,
     runtime: Any | None,
@@ -1847,6 +1946,7 @@ async def orchestrate_chat(
     persona_containment_enabled: bool = False,
     restraint_enabled: bool = False,
     memory_hygiene_enabled: bool = False,
+    privacy_context_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -2026,6 +2126,8 @@ async def orchestrate_chat(
         and external_context_request.get("enabled") is True
     )
     memory_hygiene_result = None
+    privacy_context = None
+    privacy_context_trace = _privacy_context_disabled_trace()
 
     try:
         await _advance_runtime_turn(
@@ -2071,6 +2173,18 @@ async def orchestrate_chat(
             retrieval_bundle=retrieval_bundle,
         )
         retrieval_bundle = memory_hygiene_result.retrieval_bundle
+        privacy_context, privacy_context_trace = await _resolve_privacy_context(
+            runtime=runtime,
+            enabled=privacy_context_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            payload=effective_payload,
+            retrieval_bundle=retrieval_bundle,
+        )
         external_context_pack, dsa_trace = await _resolve_external_context(
             dsa=dsa,
             dsa_enabled=dsa_enabled,
@@ -2200,6 +2314,7 @@ async def orchestrate_chat(
                             if memory_hygiene_result is not None
                             else disabled_memory_hygiene_trace(retrieval_bundle)
                         ),
+                        "privacy_context": privacy_context_trace,
                         "world_state": world_state_trace,
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
@@ -2276,6 +2391,8 @@ async def orchestrate_chat(
                 if memory_hygiene_result is not None
                 else disabled_memory_hygiene_trace(retrieval_bundle)
             ),
+            privacy_context=privacy_context,
+            privacy_context_trace_data=privacy_context_trace,
             runtime_identity=runtime_identity,
             runtime_identity_trace=runtime_identity_trace,
             world_state=world_state,
@@ -2413,6 +2530,47 @@ async def orchestrate_chat(
                 "shaped_answer": answer,
             }
 
+        answer_sources = retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+        if not isinstance(answer_sources, list):
+            answer_sources = []
+        if privacy_context_enabled and privacy_context is not None:
+            privacy_boundary = apply_privacy_boundary(
+                policy=privacy_context,
+                answer=answer,
+                sources=answer_sources,
+            )
+        else:
+            privacy_boundary = apply_privacy_boundary(
+                policy={
+                    "sensitive_detail_allowed": True,
+                    "screen_detail_allowed": True,
+                    "redaction_required": False,
+                    "safe_summary_required": False,
+                    "surface_type": "desktop_private",
+                },
+                answer=answer,
+                sources=answer_sources,
+            )
+        answer = privacy_boundary.final_answer
+        if privacy_boundary.enforced:
+            answer_sources = []
+            if brief_metadata.get("enabled") is True:
+                brief_metadata = {
+                    key: value
+                    for key, value in brief_metadata.items()
+                    if key not in {"raw_model_answer", "shaped_answer"}
+                }
+                brief_metadata["text_suppressed"] = True
+        prompt.trace["privacy_context"] = {
+            **prompt.trace.get("privacy_context", privacy_context_trace),
+            "enforcement_required": privacy_boundary.enforced,
+            "action_taken": privacy_boundary.action_taken,
+            "template_id": privacy_boundary.template_id,
+            "sources_suppressed_count": privacy_boundary.sources_suppressed_count,
+            "trace_bundle_suppressed": privacy_boundary.trace_bundle_suppressed,
+            "brief_text_suppressed": privacy_boundary.brief_text_suppressed,
+        }
+
         await memory_store.add_message(
             conversation_id=conversation_id,
             owner_id=payload["owner_id"],
@@ -2450,6 +2608,24 @@ async def orchestrate_chat(
             surface_presence_trace,
             fallback_active=fallback_used,
         )
+        persisted_prompt_trace = (
+            sanitize_prompt_trace_for_privacy(prompt.trace, retrieval_bundle)
+            if privacy_boundary.enforced
+            else prompt.trace
+        )
+        persisted_retrieval = (
+            {
+                "query_present": bool(last_user_text),
+                "bundle": restricted_retrieval_trace_summary(retrieval_bundle),
+                "prompt_assembly": persisted_prompt_trace,
+            }
+            if privacy_boundary.enforced
+            else {
+                "query": last_user_text,
+                "bundle": retrieval_bundle.get("bundle", {}),
+                "prompt_assembly": prompt.trace,
+            }
+        )
 
         await memory_store.create_trace(
             request_id=request_id,
@@ -2464,11 +2640,7 @@ async def orchestrate_chat(
                     "version": profile["profile_version"],
                     "effective_profile_ref": profile["effective_profile_ref"],
                 },
-                "retrieval": {
-                    "query": last_user_text,
-                    "bundle": retrieval_bundle.get("bundle", {}),
-                    "prompt_assembly": prompt.trace,
-                },
+                "retrieval": persisted_retrieval,
                 "router_decision": {
                     "rule_id": route.get("rule_id"),
                     "selected_model": selected_model,
@@ -2520,7 +2692,7 @@ async def orchestrate_chat(
             "selected_model": selected_model,
             "answer": answer,
             "status": status,
-            "sources": retrieval_bundle.get("bundle", {}).get("artifact_refs", []),
+            "sources": answer_sources,
         }
     except Exception:
         if turn_state_trace.get("runtime_turn_id") and not turn_state_trace.get("completed"):

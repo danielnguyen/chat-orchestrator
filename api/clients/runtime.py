@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from services.privacy_context import validate_privacy_policy_result
 
 _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
 _COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
@@ -401,6 +402,44 @@ class RuntimeClient:
         if runtime_turn_id is not None:
             payload["runtime_turn_id"] = runtime_turn_id
         return await self._post("/v1/runtime/memory-hygiene/evaluate", json=payload)
+
+    async def evaluate_privacy_context(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        surface_category: str | None = None,
+        sensitivity_level: str,
+        sensitivity_domains: list[str],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "sensitivity_level": sensitivity_level,
+            "sensitivity_domains": sensitivity_domains,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if surface_category is not None:
+            payload["surface_category"] = surface_category
+
+        response = await self._post("/v1/runtime/privacy-context/evaluate", json=payload)
+        if not isinstance(response, dict):
+            raise ValueError("malformed_privacy_context_response")
+        result = validate_privacy_policy_result(response.get("result"))
+        if result is None:
+            raise ValueError("invalid_privacy_context_result")
+        validated_response = dict(response)
+        validated_response["result"] = result
+        return validated_response
 
     async def reset(
         self,

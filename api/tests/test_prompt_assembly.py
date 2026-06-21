@@ -911,6 +911,78 @@ def test_assemble_prompt_omits_malicious_restraint_overlay():
     }
 
 
+def test_assemble_prompt_includes_privacy_guidance_only_when_enabled():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        privacy_context={
+            "surface_type": "notification_preview",
+            "privacy_zone": "preview_limited",
+            "sensitivity_level": "sensitive",
+            "sensitive_detail_allowed": False,
+            "notification_detail_allowed": False,
+            "voice_detail_allowed": False,
+            "screen_detail_allowed": True,
+            "redaction_required": True,
+            "safe_summary_required": True,
+            "reason_codes": ["notification_preview_limited"],
+        },
+        privacy_context_trace_data={
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "runtime_call_status": "included",
+            "policy_source": "runtime",
+            "surface_type": "notification_preview",
+            "privacy_zone": "preview_limited",
+            "sensitivity_level": "sensitive",
+            "sensitivity_domain_count": 2,
+            "sensitive_detail_allowed": False,
+            "notification_detail_allowed": False,
+            "voice_detail_allowed": False,
+            "screen_detail_allowed": True,
+            "redaction_required": True,
+            "safe_summary_required": True,
+            "reason_codes": ["notification_preview_limited"],
+        },
+    )
+
+    assert out.messages[0]["content"].startswith("Privacy context guidance:")
+    assert "notification_preview" in out.messages[0]["content"]
+    assert "personal" not in out.messages[0]["content"]
+    assert "health" not in out.messages[0]["content"]
+    assert "privacy_context" in out.trace["included_layers"]
+    assert out.trace["privacy_context"]["policy_source"] == "runtime"
+    assert out.trace["privacy_context"]["sensitivity_domain_count"] == 2
+
+
+def test_assemble_prompt_disabled_privacy_trace_adds_no_guidance_message():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hi"}],
+        privacy_context_trace_data={
+            "attempted": False,
+            "status": "disabled",
+            "included": False,
+            "runtime_call_status": "disabled",
+            "policy_source": "disabled",
+            "fallback_applied": False,
+            "enforcement_required": False,
+            "action_taken": "none",
+            "template_id": None,
+            "sources_suppressed_count": 0,
+            "trace_bundle_suppressed": False,
+            "brief_text_suppressed": False,
+        },
+    )
+
+    assert out.messages == [{"role": "user", "content": "hi"}]
+    assert "privacy_context" not in out.trace["included_layers"]
+    assert out.trace["privacy_context"]["status"] == "disabled"
+
+
 def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_retrieval():
     out = assemble_prompt(
         profile={"prompt_overlay": "profile text"},

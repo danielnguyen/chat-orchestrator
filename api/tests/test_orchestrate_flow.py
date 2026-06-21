@@ -125,12 +125,14 @@ class FakeRuntime:
         persona_containment_response=None,
         restraint_response=None,
         memory_hygiene_response=None,
+        privacy_context_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
         persona_containment_error: Exception | None = None,
         restraint_error: Exception | None = None,
         memory_hygiene_error: Exception | None = None,
+        privacy_context_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -147,6 +149,7 @@ class FakeRuntime:
         self.persona_containment_calls = []
         self.restraint_calls = []
         self.memory_hygiene_calls = []
+        self.privacy_context_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -368,12 +371,33 @@ class FakeRuntime:
             "runtime_turn_id": "rtturn_1",
             "result": {"decisions": [], "aggregate": {}},
         }
+        self.privacy_context_response = privacy_context_response or {
+            "request_id": "rid-privacy",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "privacy_zone": "private",
+                "surface_type": "desktop_private",
+                "sensitivity_level": "normal",
+                "sensitive_detail_allowed": True,
+                "notification_detail_allowed": False,
+                "voice_detail_allowed": False,
+                "screen_detail_allowed": True,
+                "redaction_required": False,
+                "safe_summary_required": False,
+                "reason_codes": ["private_surface"],
+            },
+        }
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
         self.persona_containment_error = persona_containment_error
         self.restraint_error = restraint_error
         self.memory_hygiene_error = memory_hygiene_error
+        self.privacy_context_error = privacy_context_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -504,6 +528,15 @@ class FakeRuntime:
             raise RuntimeError("runtime unavailable")
         return self.memory_hygiene_response
 
+    async def evaluate_privacy_context(self, **kwargs):
+        self.privacy_context_calls.append(kwargs)
+        self.call_order.append("privacy_context")
+        if self.privacy_context_error is not None:
+            raise self.privacy_context_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.privacy_context_response
+
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
         self.call_order.append("reset")
@@ -630,6 +663,77 @@ class BundledMemoryStore(FakeMemoryStore):
     async def retrieve_bundle(self, **kwargs):
         self.retrieve_calls.append(kwargs)
         return self.bundle
+
+
+def _write_router_files(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    return rules, models
+
+
+def _base_payload(**overrides):
+    payload = {
+        "owner_id": "owner",
+        "client_id": "vscode",
+        "surface": "vscode",
+        "messages": [{"role": "user", "content": "hi"}],
+        "sensitivity": "private",
+        "model_override": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _privacy_runtime_response(
+    *,
+    surface_type: str,
+    sensitivity_level: str = "normal",
+    privacy_zone: str = "private",
+    sensitive_detail_allowed: bool = True,
+    notification_detail_allowed: bool = False,
+    voice_detail_allowed: bool = False,
+    screen_detail_allowed: bool = True,
+    redaction_required: bool = False,
+    safe_summary_required: bool = False,
+    reason_codes: list[str] | None = None,
+):
+    return {
+        "request_id": "rid-privacy",
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "privacy_zone": privacy_zone,
+            "surface_type": surface_type,
+            "sensitivity_level": sensitivity_level,
+            "sensitive_detail_allowed": sensitive_detail_allowed,
+            "notification_detail_allowed": notification_detail_allowed,
+            "voice_detail_allowed": voice_detail_allowed,
+            "screen_detail_allowed": screen_detail_allowed,
+            "redaction_required": redaction_required,
+            "safe_summary_required": safe_summary_required,
+            "reason_codes": reason_codes or ["private_surface"],
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -1799,6 +1903,7 @@ def test_runtime_timeout_setting_is_separate_from_request_timeout(monkeypatch):
     assert settings.cognitive_runtime_interaction_governance_enabled is False
     assert settings.cognitive_runtime_persona_containment_enabled is False
     assert settings.cognitive_runtime_restraint_enabled is False
+    assert settings.cognitive_runtime_privacy_context_enabled is False
 
 
 @pytest.mark.asyncio
@@ -5693,3 +5798,426 @@ async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
         "allowed_sensitivity": "medium",
         "max_results": 5,
     }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_context_disabled_preserves_behavior_and_skips_runtime(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime()
+    litellm = FakeLiteLLM(content="hello")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-disabled",
+        privacy_context_enabled=False,
+    )
+
+    assert out["answer"] == "hello"
+    assert out["sources"][0]["file_path"] == "api/main.py"
+    assert runtime.privacy_context_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["status"] == "disabled"
+    assert trace["action_taken"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_context_submits_metadata_only_with_session_and_turn_ids(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    bundle = {
+        "request_id": "rid",
+        "conversation_id": "conv-1",
+        "bundle": {
+            "recent": [
+                {
+                    "role": "assistant",
+                    "content": "raw private note",
+                    "source_ref": {"ref_type": "message", "ref_id": "recent-1"},
+                    "policy_metadata": {
+                        "sensitivity": "highly_sensitive",
+                        "memory_domains": ["finance", "health", "project"],
+                    },
+                }
+            ],
+            "semantic": [],
+            "artifact_refs": [],
+            "observed_metadata": {"has_code_like_content": False},
+        },
+    }
+    memory_store = BundledMemoryStore(bundle)
+    runtime = FakeRuntime()
+
+    await orchestrate_chat(
+        payload=_base_payload(
+            surface="web",
+            sensitivity="public",
+            surface_context={
+                "surface_type": "car",
+                "surface_category": "unknown_surface",
+                "sensitivity_level": "normal",
+                "sensitivity_domains": ["personal", "finance", "personal"],
+            },
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-metadata",
+        privacy_context_enabled=True,
+    )
+
+    submitted = runtime.privacy_context_calls[0]
+    assert submitted["runtime_session_id"] == "rtsession_1"
+    assert submitted["runtime_turn_id"] == "rtturn_1"
+    assert submitted["surface_category"] == "unknown_surface"
+    assert submitted["sensitivity_level"] == "highly_sensitive"
+    assert submitted["sensitivity_domains"] == ["personal", "financial", "health"]
+    assert "current_user_text" not in submitted
+    assert "recent_messages" not in submitted
+    assert "content" not in str(submitted)
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["sensitivity_domain_count"] == 3
+    assert "financial" not in str(trace)
+    assert "health" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_context_explicit_level_cannot_deescalate(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: chat_local_fast\n"
+        "      provider: local\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_local_fast:\n"
+        "    provider: local\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime()
+
+    await orchestrate_chat(
+        payload=_base_payload(
+            sensitivity="local_only",
+            surface_context={"sensitivity_level": "normal"},
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-level",
+        privacy_context_enabled=True,
+    )
+
+    assert runtime.privacy_context_calls[0]["sensitivity_level"] == "highly_sensitive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "surface_context", "expected_surface_category"),
+    [
+        ("web", {"surface_type": "voice"}, "unknown_surface"),
+        ("car", None, "car_voice_possible_passenger"),
+    ],
+)
+async def test_orchestrate_privacy_surface_mapping_is_conservative(
+    tmp_path,
+    surface,
+    surface_context,
+    expected_surface_category,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime()
+
+    await orchestrate_chat(
+        payload=_base_payload(surface=surface, surface_context=surface_context),
+        memory_store=FakeMemoryStore(),
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-privacy-surface-{expected_surface_category}",
+        privacy_context_enabled=True,
+    )
+
+    assert runtime.privacy_context_calls[0]["surface_category"] == expected_surface_category
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_private_desktop_policy_preserves_answer_and_sources(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitive_detail_allowed=True,
+            screen_detail_allowed=True,
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(surface_context={"surface_category": "desktop_private"}),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="normal detail"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-pass",
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "normal detail"
+    assert out["sources"][0]["artifact_id"] == "a-1"
+    assert memory_store.added_messages[-1]["content"] == "normal detail"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["action_taken"] == "none"
+    assert trace["policy_source"] == "runtime"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface_type", "expected_answer"),
+    [
+        (
+            "car_voice_possible_passenger",
+            "Relevant private information exists, but details are withheld in the car.",
+        ),
+        (
+            "notification_preview",
+            "A private update is available. Open a private surface for details.",
+        ),
+        (
+            "glasses_public_or_semi_public",
+            "A private update exists. Use a private screen for details.",
+        ),
+        (
+            "voice_private",
+            "Sensitive details are withheld from voice output.",
+        ),
+        (
+            "unknown_surface",
+            "Details cannot safely be shown on this surface.",
+        ),
+    ],
+)
+async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources(
+    tmp_path,
+    surface_type,
+    expected_answer,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type=surface_type,
+            sensitivity_level="sensitive",
+            privacy_zone="shared_or_uncertain",
+            sensitive_detail_allowed=False,
+            notification_detail_allowed=False,
+            voice_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface_context={"surface_category": surface_type},
+            response_mode="brief",
+            brief_depth=1,
+            brief_type="general",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Top secret account number 1234."),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-privacy-restrict-{surface_type}",
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == expected_answer
+    assert out["sources"] == []
+    assert memory_store.added_messages[-1]["content"] == expected_answer
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    privacy_trace = trace_payload["retrieval"]["prompt_assembly"]["privacy_context"]
+    assert privacy_trace["action_taken"] == "replaced_with_safe_template"
+    assert privacy_trace["sources_suppressed_count"] == 1
+    assert privacy_trace["trace_bundle_suppressed"] is True
+    assert privacy_trace["brief_text_suppressed"] is True
+    assert trace_payload["retrieval"]["bundle"] == {
+        "privacy_suppressed": True,
+        "recent_item_count": 1,
+        "semantic_item_count": 1,
+        "artifact_count": 1,
+    }
+    assert "semantic note" not in str(trace_payload)
+    assert "api/main.py" not in str(trace_payload)
+    assert "a-1" not in str(trace_payload)
+    brief = trace_payload["model_call"]["brief"]
+    assert brief["enabled"] is True
+    assert "raw_model_answer" not in brief
+    assert "shaped_answer" not in brief
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_fallback_is_non_fatal_and_conservative(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(privacy_context_error=httpx.ReadTimeout("timed out"))
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(surface="web", sensitivity="private"),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Sensitive raw output"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-fallback",
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "Details cannot safely be shown on this surface."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "fallback"
+    assert trace["fallback_reason"] == "runtime_timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "privacy_response",
+    [
+        _privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitive_detail_allowed="true",  # type: ignore[arg-type]
+        ),
+        _privacy_runtime_response(
+            surface_type="developer_surface",  # type: ignore[arg-type]
+        ),
+    ],
+)
+async def test_orchestrate_invalid_privacy_runtime_result_uses_conservative_fallback(
+    tmp_path,
+    privacy_response,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(privacy_context_response=privacy_response)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(surface="web", sensitivity="private"),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Sensitive raw output"),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-invalid-runtime",
+        privacy_context_enabled=True,
+    )
+
+    assert out["sources"] == []
+    assert out["answer"] == "Details cannot safely be shown on this surface."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "privacy_context"
+    ]
+    assert trace["policy_source"] == "fallback"
+    assert trace["fallback_reason"] == "invalid_runtime_result"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_provider_fallback(
+    tmp_path,
+):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: gpt-4o-mini\n"
+        "          provider: cloud\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="voice_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            voice_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            response_mode="brief",
+            brief_depth=1,
+            brief_type="general",
+            surface_context={"surface_category": "voice_private"},
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(fail_first=True, content=""),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-privacy-ordering",
+        privacy_context_enabled=True,
+        response_action_mode="template_fallback",
+    )
+
+    assert out["answer"] == "Sensitive details are withheld from voice output."
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    assert trace_payload["fallback"] == {"triggered": True, "reason": "provider_error"}
+    prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
+    assert prompt_trace["response_action"]["action_taken"] == "template_fallback"
+    assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
+    assert trace_payload["model_call"]["brief"]["enabled"] is True

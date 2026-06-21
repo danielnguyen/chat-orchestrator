@@ -143,6 +143,21 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
 
     async def fake_post(path: str, *, json: dict[str, object]):
         calls.append((path, json))
+        if path == "/v1/runtime/privacy-context/evaluate":
+            return {
+                "result": {
+                    "privacy_zone": "private",
+                    "surface_type": "desktop_private",
+                    "sensitivity_level": "sensitive",
+                    "sensitive_detail_allowed": True,
+                    "notification_detail_allowed": False,
+                    "voice_detail_allowed": False,
+                    "screen_detail_allowed": True,
+                    "redaction_required": False,
+                    "safe_summary_required": False,
+                    "reason_codes": ["private_surface"],
+                }
+            }
         return {"ok": True}
 
     client._post = fake_post  # type: ignore[method-assign]
@@ -265,6 +280,17 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
             }
         ],
     )
+    await client.evaluate_privacy_context(
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        surface_category="desktop_private",
+        sensitivity_level="sensitive",
+        sensitivity_domains=["personal", "financial"],
+    )
 
     assert [path for path, _ in calls] == [
         "/v1/runtime/sessions/resolve",
@@ -278,20 +304,91 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
         "/v1/runtime/persona-containment/evaluate",
         "/v1/runtime/restraint/evaluate",
         "/v1/runtime/memory-hygiene/evaluate",
+        "/v1/runtime/privacy-context/evaluate",
     ]
     assert calls[5][1]["active_persona_id"] == "technical_architect"
-    assert calls[-4][1]["runtime_session_id"] == "rtsession_1"
+    assert calls[-5][1]["runtime_session_id"] == "rtsession_1"
+    assert calls[-5][1]["runtime_turn_id"] == "rtturn_1"
+    assert calls[-5][1]["surface_session_id"] == "surface-session-1"
+    assert calls[-5][1]["active_mode"] == "focused"
+    assert calls[-5][1]["recent_messages"][1]["content"] == "rename this variable to count"
+    assert calls[-5][1]["surface_metadata_json"] == {"surface_type": "developer_surface"}
+    assert calls[-4][1]["persona_scope_hint"] == "technical_architect"
+    assert calls[-4][1]["interaction_kind"] == "question"
     assert calls[-4][1]["runtime_turn_id"] == "rtturn_1"
-    assert calls[-4][1]["surface_session_id"] == "surface-session-1"
-    assert calls[-4][1]["active_mode"] == "focused"
-    assert calls[-4][1]["recent_messages"][1]["content"] == "rename this variable to count"
-    assert calls[-4][1]["surface_metadata_json"] == {"surface_type": "developer_surface"}
-    assert calls[-3][1]["persona_scope_hint"] == "technical_architect"
-    assert calls[-3][1]["interaction_kind"] == "question"
-    assert calls[-3][1]["runtime_turn_id"] == "rtturn_1"
-    assert calls[-2][1]["response_posture"] == "direct"
-    assert calls[-2][1]["active_persona_id"] == "technical_architect"
-    assert calls[-2][1]["capability_domain"] == "technical"
-    assert calls[-1][1]["runtime_turn_id"] == "rtturn_1"
-    assert calls[-1][1]["items"][0]["item_ref"] == {"ref_type": "message", "ref_id": "msg-1"}
-    assert "content" not in calls[-1][1]["items"][0]
+    assert calls[-3][1]["response_posture"] == "direct"
+    assert calls[-3][1]["active_persona_id"] == "technical_architect"
+    assert calls[-3][1]["capability_domain"] == "technical"
+    assert calls[-2][1]["runtime_turn_id"] == "rtturn_1"
+    assert calls[-2][1]["items"][0]["item_ref"] == {"ref_type": "message", "ref_id": "msg-1"}
+    assert "content" not in calls[-2][1]["items"][0]
+    assert calls[-1][1]["surface_category"] == "desktop_private"
+    assert calls[-1][1]["sensitivity_level"] == "sensitive"
+    assert calls[-1][1]["sensitivity_domains"] == ["personal", "financial"]
+    assert "current_user_text" not in calls[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_evaluate_privacy_context_rejects_malformed_boolean_fields():
+    client = RuntimeClient("http://runtime.local", None)
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        return {
+            "result": {
+                "privacy_zone": "private",
+                "surface_type": "desktop_private",
+                "sensitivity_level": "normal",
+                "sensitive_detail_allowed": "true",
+                "notification_detail_allowed": False,
+                "voice_detail_allowed": False,
+                "screen_detail_allowed": True,
+                "redaction_required": False,
+                "safe_summary_required": False,
+                "reason_codes": ["private_surface"],
+            }
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError):
+        await client.evaluate_privacy_context(
+            request_id="rid",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+            sensitivity_level="normal",
+            sensitivity_domains=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_evaluate_privacy_context_rejects_invalid_enums():
+    client = RuntimeClient("http://runtime.local", None)
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        return {
+            "result": {
+                "privacy_zone": "private",
+                "surface_type": "developer_surface",
+                "sensitivity_level": "normal",
+                "sensitive_detail_allowed": True,
+                "notification_detail_allowed": False,
+                "voice_detail_allowed": False,
+                "screen_detail_allowed": True,
+                "redaction_required": False,
+                "safe_summary_required": False,
+                "reason_codes": ["private_surface"],
+            }
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError):
+        await client.evaluate_privacy_context(
+            request_id="rid",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+            sensitivity_level="normal",
+            sensitivity_domains=[],
+        )

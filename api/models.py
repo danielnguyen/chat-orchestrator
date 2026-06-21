@@ -73,6 +73,9 @@ class SurfaceContext(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     surface_type: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    surface_category: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    sensitivity_level: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    sensitivity_domains: List[str] = Field(default_factory=list, max_length=8)
     interaction_mode: Optional[InteractionMode] = None
     spoken_output: Optional[bool] = None
     active_task_mode: Optional[bool] = None
