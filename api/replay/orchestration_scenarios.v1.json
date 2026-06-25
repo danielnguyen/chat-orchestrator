@@ -1,0 +1,220 @@
+{
+  "schema_version": "orchestration-replay-corpus-v1",
+  "scenarios": [
+    {
+      "scenario": "normal-success",
+      "category": "positive",
+      "expected": {
+        "outcome": {"status": "ok", "error_type": null},
+        "trace": {
+          "persisted": true,
+          "status": "ok",
+          "budget_enforcement": "not_enforced"
+        },
+        "runtime_terminal_status": "completed"
+      }
+    },
+    {
+      "scenario": "runtime-overlay-included",
+      "category": "runtime_overlay_included",
+      "runtime": "included",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "runtime_overlay": {"included": true, "status": "included"}
+        }
+      }
+    },
+    {
+      "scenario": "runtime-overlay-omitted",
+      "category": "runtime_overlay_omitted",
+      "runtime": "omitted",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "runtime_overlay": {
+            "included": false,
+            "status": "omitted",
+            "omission_reason": "empty_runtime_state"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "developer-surface",
+      "category": "surface_variant",
+      "surface": "dev",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {"persisted": true}
+      }
+    },
+    {
+      "scenario": "missing-derivative-source",
+      "category": "missing_derivative",
+      "retrieval": "missing_derivative",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "retrieval": {
+            "degraded": true,
+            "fallback_reason": "missing_derivative_source"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "contradicted-derivative",
+      "category": "stale_derivative",
+      "retrieval": "stale_derivative",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "retrieval": {
+            "degraded": true,
+            "fallback_reason": "contradicted_derivative"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "malformed-retrieval-metadata",
+      "category": "malformed_retrieval",
+      "retrieval": "malformed_metadata",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "retrieval": {
+            "degraded": true,
+            "fallback_reason": "malformed_retrieval_metadata"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "vector-unavailable",
+      "category": "vector_unavailable",
+      "retrieval": "vector_unavailable",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "retrieval": {
+            "degraded": true,
+            "fallback_reason": "vector_unavailable",
+            "vector_status": "unavailable"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "artifact-unavailable",
+      "category": "artifact_unavailable",
+      "retrieval": "artifact_unavailable",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "artifacts": {
+            "status": "degraded",
+            "artifact_count": 0,
+            "reason": "artifact_unavailable"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "malformed-runtime-overlay",
+      "category": "malformed_runtime",
+      "runtime": "malformed",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "runtime_overlay": {
+            "included": false,
+            "status": "failed",
+            "omission_reason": "malformed_runtime_overlay_response"
+          }
+        }
+      }
+    },
+    {
+      "scenario": "runtime-unavailable",
+      "category": "runtime_unavailable",
+      "runtime": "unavailable",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "runtime_overlay": {"included": false, "status": "failed"}
+        },
+        "runtime_terminal_status": null
+      }
+    },
+    {
+      "scenario": "primary-failure-fallback-success",
+      "category": "provider_fallback",
+      "provider": "fallback_success",
+      "expected": {
+        "outcome": {"status": "degraded"},
+        "trace": {
+          "persisted": true,
+          "status": "degraded",
+          "fallback": {"triggered": true, "reason": "provider_error"}
+        },
+        "runtime_terminal_status": "completed"
+      }
+    },
+    {
+      "scenario": "provider-exhaustion",
+      "category": "provider_exhaustion",
+      "provider": "exhausted",
+      "expected": {
+        "outcome": {"status": "failed", "error_type": "HTTPStatusError"},
+        "trace": {"persisted": true, "status": "failed"},
+        "runtime_terminal_status": "abandoned"
+      }
+    },
+    {
+      "scenario": "no-fallback-available",
+      "category": "no_fallback",
+      "provider": "no_fallback",
+      "expected": {
+        "outcome": {"status": "failed", "error_type": "HTTPStatusError"},
+        "trace": {"persisted": true, "status": "failed"},
+        "runtime_terminal_status": "abandoned"
+      }
+    },
+    {
+      "scenario": "request-id-mismatch",
+      "category": "request_id_mismatch",
+      "retrieval": "request_id_mismatch",
+      "expected": {
+        "outcome": {
+          "status": "failed",
+          "error_type": "RuntimeError",
+          "error_code": "retrieval_request_id_mismatch"
+        },
+        "trace": {"persisted": false},
+        "runtime_terminal_status": "abandoned"
+      }
+    },
+    {
+      "scenario": "bms-unavailable-before-retrieval",
+      "category": "bms_unavailable",
+      "retrieval": "unavailable",
+      "expected": {
+        "outcome": {"status": "failed", "error_type": "BoundaryFailure"},
+        "trace": {"persisted": false},
+        "runtime_terminal_status": "abandoned"
+      }
+    },
+    {
+      "scenario": "trace-persistence-failure",
+      "category": "trace_persistence_failure",
+      "trace_persistence": "failure",
+      "expected": {
+        "outcome": {"status": "failed", "error_type": "BoundaryFailure"},
+        "trace": {"persisted": false},
+        "runtime_terminal_status": "completed"
+      }
+    }
+  ]
+}

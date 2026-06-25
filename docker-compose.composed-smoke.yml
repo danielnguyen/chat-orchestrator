@@ -1,0 +1,136 @@
+name: chat-orchestrator-composed-smoke
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: smoke
+      POSTGRES_PASSWORD: smoke
+      POSTGRES_DB: memory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smoke -d memory"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  qdrant:
+    image: qdrant/qdrant:latest-unprivileged
+    healthcheck:
+      test: ["CMD-SHELL", "grep -Eq ':18BD .* 0A' /proc/net/tcp"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  provider:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    command: ["uvicorn", "tools.composed_provider_stub:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "14381:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  bms-migrate:
+    build:
+      context: ../basic-memory-store
+      dockerfile: api/Dockerfile
+    command: ["python", "-m", "tools.schema_migrations", "upgrade"]
+    environment:
+      PG_DSN: postgresql://smoke:smoke@postgres:5432/memory
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bms:
+    build:
+      context: ../basic-memory-store
+      dockerfile: api/Dockerfile
+    environment:
+      MEMORY_API_KEY: smoke-memory-key
+      PG_DSN: postgresql://smoke:smoke@postgres:5432/memory
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: messages
+      LITELLM_BASE_URL: http://provider:8000
+      CHAT_MODEL: chat_voice_openai
+      EMBED_MODEL: embed
+      OBJECT_STORE_ENABLED: "false"
+      REQUIRE_REQUEST_ID: "true"
+      ENFORCE_REQUEST_ID_HEADER_BODY_MATCH: "true"
+      ENABLE_TRACE_STORAGE: "true"
+      INDEX_USER_QUESTIONS: "false"
+      INDEX_ASSISTANT_MESSAGES: "false"
+    ports:
+      - "14321:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      provider:
+        condition: service_healthy
+      bms-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  runtime:
+    build:
+      context: ../cognitive-runtime/api
+      dockerfile: Dockerfile
+    environment:
+      COGNITIVE_RUNTIME_DB_PATH: /data/runtime_state.sqlite3
+      COMPANION_CONTRACTS_DB_PATH: /data/companion_contracts.sqlite3
+    ports:
+      - "14371:8000"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  orchestrator:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      ORCH_API_KEY: smoke-orchestrator-key
+      MEMORY_STORE_BASE_URL: http://bms:8000
+      MEMORY_STORE_API_KEY: smoke-memory-key
+      COGNITIVE_RUNTIME_BASE_URL: http://runtime:8000
+      COGNITIVE_RUNTIME_TIMEOUT_MS: "5000"
+      ENABLE_RUNTIME_OVERLAYS: "true"
+      LITELLM_BASE_URL: http://provider:8000
+      ROUTER_RULES_PATH: /app/router/rules.yaml
+      MODEL_REGISTRY_PATH: /app/router/model_registry.yaml
+      ALLOW_MANUAL_OVERRIDE: "false"
+      DSA_ENABLED: "false"
+    ports:
+      - "14361:8000"
+    depends_on:
+      bms:
+        condition: service_healthy
+      runtime:
+        condition: service_healthy
+      provider:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  qdrant-data:

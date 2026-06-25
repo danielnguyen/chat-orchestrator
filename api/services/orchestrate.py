@@ -287,6 +287,247 @@ def _sanitize_trace_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _safe_error_summary(error: BaseException) -> dict[str, str]:
+    error_type = type(error).__name__[:80]
+    status_code = None
+    if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+        status_code = error.response.status_code
+    return {
+        "error_type": error_type,
+        "error_code": f"http_{status_code}" if status_code is not None else error_type,
+    }
+
+
+def _model_attempt(
+    *,
+    provider: str | None,
+    model: str | None,
+    status: str,
+    latency_ms: int,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    attempt: dict[str, Any] = {
+        "provider": _sanitize_trace_string(provider, max_length=80),
+        "model": _sanitize_trace_string(model, max_length=160),
+        "status": status,
+        "latency_ms": max(0, latency_ms),
+    }
+    if error is not None:
+        attempt.update(_safe_error_summary(error))
+    return attempt
+
+
+def _bounded_source_ref(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    ref_type = _sanitize_trace_string(value.get("ref_type"), max_length=80)
+    ref_id = _sanitize_trace_string(value.get("ref_id"), max_length=160)
+    if not ref_type or not ref_id:
+        return None
+    return {"ref_type": ref_type, "ref_id": ref_id}
+
+
+def _trace_references(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
+    bundle = retrieval_bundle.get("bundle")
+    if not isinstance(bundle, dict):
+        return []
+    references: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for collection_name in ("recent", "semantic", "artifact_refs"):
+        collection = bundle.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            source_ref = _bounded_source_ref(item.get("source_ref"))
+            if source_ref is None:
+                continue
+            key = (source_ref["ref_type"], source_ref["ref_id"])
+            if key in seen:
+                continue
+            references.append(source_ref)
+            seen.add(key)
+            if len(references) >= 20:
+                return references
+    return references
+
+
+def _trace_artifacts(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
+    bundle = retrieval_bundle.get("bundle")
+    bundle = bundle if isinstance(bundle, dict) else {}
+    artifact_refs = bundle.get("artifact_refs")
+    artifact_refs = artifact_refs if isinstance(artifact_refs, list) else []
+    retrieval_debug = bundle.get("retrieval_debug")
+    retrieval_debug = retrieval_debug if isinstance(retrieval_debug, dict) else {}
+    artifact_ids = [
+        artifact_id
+        for item in artifact_refs[:20]
+        if isinstance(item, dict)
+        and (
+            artifact_id := _sanitize_trace_string(
+                item.get("artifact_id"),
+                max_length=160,
+            )
+        )
+    ]
+    reason = _sanitize_trace_string(
+        retrieval_debug.get("artifact_fallback_reason")
+        or retrieval_debug.get("fallback"),
+        max_length=120,
+    )
+    status = "included" if artifact_ids else ("degraded" if reason else "omitted")
+    return {
+        "status": status,
+        "artifact_count": len(artifact_refs),
+        "included_ids": artifact_ids,
+        "source_reference_count": len(
+            [
+                item
+                for item in artifact_refs
+                if isinstance(item, dict) and _bounded_source_ref(item.get("source_ref"))
+            ]
+        ),
+        "reason": reason or ("no_artifacts_returned" if not artifact_ids else None),
+    }
+
+
+def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
+    trace = prompt_trace if isinstance(prompt_trace, dict) else {}
+    layers = trace.get("layers")
+    layers = layers if isinstance(layers, list) else []
+    structural_layers = []
+    for layer in layers[:30]:
+        if not isinstance(layer, dict):
+            continue
+        structural_layers.append(
+            {
+                "name": _sanitize_trace_string(layer.get("name"), max_length=80),
+                "included": bool(layer.get("included")),
+                "message_count": _sanitize_trace_int(
+                    layer.get("message_count"),
+                    minimum=0,
+                    maximum=1000,
+                )
+                or 0,
+            }
+        )
+    runtime = trace.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    retrieval_layer = next(
+        (layer for layer in structural_layers if layer.get("name") == "retrieval_augmentation"),
+        None,
+    )
+    message_count = _sanitize_trace_int(
+        trace.get("message_count"),
+        minimum=0,
+        maximum=5000,
+    )
+    return {
+        "layers": structural_layers,
+        "ordered_layer_names": [
+            layer["name"] for layer in structural_layers if layer.get("name")
+        ],
+        "included_layers": [
+            layer["name"]
+            for layer in structural_layers
+            if layer.get("name") and layer["included"]
+        ],
+        "omitted_layers": [
+            layer["name"]
+            for layer in structural_layers
+            if layer.get("name") and not layer["included"]
+        ],
+        "message_count": message_count or 0,
+        "layer_count": len(structural_layers),
+        "runtime_overlay": {
+            "included": bool(runtime.get("included")),
+            "status": _sanitize_trace_string(runtime.get("status"), max_length=80),
+            "omission_reason": _sanitize_trace_string(
+                runtime.get("omission_reason"),
+                max_length=120,
+            ),
+        },
+        "retrieval": {
+            "included": bool(retrieval_layer and retrieval_layer["included"]),
+        },
+        "token_accounting": {
+            "status": "estimate_unavailable",
+            "budget_enforcement": "not_enforced",
+        },
+    }
+
+
+def _trace_retrieval(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
+    bundle = retrieval_bundle.get("bundle")
+    bundle = bundle if isinstance(bundle, dict) else {}
+    recent = bundle.get("recent")
+    semantic = bundle.get("semantic")
+    artifact_refs = bundle.get("artifact_refs")
+    debug = bundle.get("retrieval_debug")
+    debug = debug if isinstance(debug, dict) else {}
+
+    def structural_items(value: Any, *, artifact: bool = False) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        output: list[dict[str, Any]] = []
+        for item in value[:50]:
+            if not isinstance(item, dict):
+                continue
+            structural: dict[str, Any] = {
+                "source_ref": _bounded_source_ref(item.get("source_ref")),
+                "freshness_state": _sanitize_trace_string(
+                    item.get("freshness_state"),
+                    max_length=80,
+                ),
+            }
+            if artifact:
+                structural["artifact_id"] = _sanitize_trace_string(
+                    item.get("artifact_id"),
+                    max_length=160,
+                )
+                structural["file_path"] = _sanitize_trace_string(
+                    item.get("file_path"),
+                    max_length=240,
+                )
+                structural["relevance_score"] = item.get("relevance_score")
+            else:
+                structural["message_id"] = _sanitize_trace_string(
+                    item.get("message_id"),
+                    max_length=160,
+                )
+                structural["role"] = _sanitize_trace_string(
+                    item.get("role"),
+                    max_length=40,
+                )
+                structural["created_at"] = _sanitize_trace_string(
+                    item.get("created_at"),
+                    max_length=80,
+                )
+                structural["score"] = item.get("score")
+            output.append({key: value for key, value in structural.items() if value is not None})
+        return output
+
+    return {
+        "recent": structural_items(recent),
+        "semantic": structural_items(semantic),
+        "artifact_refs": structural_items(artifact_refs, artifact=True),
+        "recent_count": len(recent) if isinstance(recent, list) else 0,
+        "semantic_count": len(semantic) if isinstance(semantic, list) else 0,
+        "artifact_count": len(artifact_refs) if isinstance(artifact_refs, list) else 0,
+        "degraded": bool(debug.get("degraded") or debug.get("fallback")),
+        "fallback_reason": _sanitize_trace_string(
+            debug.get("fallback_reason") or debug.get("fallback"),
+            max_length=120,
+        ),
+        "vector_status": _sanitize_trace_string(
+            debug.get("vector_status"),
+            max_length=80,
+        ),
+        "references": _trace_references(retrieval_bundle),
+    }
+
+
 def _sanitize_context_pack_errors(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
@@ -1088,8 +1329,18 @@ async def _resolve_runtime_overlay(
             "error_type": type(e).__name__,
         }
 
+    if not isinstance(response, dict):
+        return None, {
+            "attempted": True,
+            "status": "failed",
+            "included": False,
+            "error_type": type(response).__name__,
+            "omission_reason": "malformed_runtime_overlay_response",
+        }
     state = response.get("runtime_state") or {}
     overlay = response.get("overlay")
+    if not isinstance(state, dict):
+        state = {}
     base_trace = {
         "attempted": True,
         "runtime_state_id": state.get("runtime_state_id"),
@@ -1101,6 +1352,14 @@ async def _resolve_runtime_overlay(
             "status": "omitted",
             "included": False,
             "omission_reason": response.get("omission_reason") or "overlay_missing",
+        }
+    if not isinstance(overlay, dict):
+        return None, {
+            **base_trace,
+            "status": "failed",
+            "included": False,
+            "error_type": type(overlay).__name__,
+            "omission_reason": "malformed_runtime_overlay_response",
         }
 
     return overlay, {
@@ -1896,7 +2155,10 @@ async def _create_error_trace(
     prompt_trace: dict[str, Any] | None = None,
     surface_presence_trace: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
+    model_calls: list[dict[str, Any]] | None = None,
+    model_call: dict[str, Any] | None = None,
 ) -> None:
+    references = _trace_references(retrieval_bundle)
     await memory_store.create_trace(
         request_id=request_id,
         payload={
@@ -1911,8 +2173,8 @@ async def _create_error_trace(
                 "effective_profile_ref": profile["effective_profile_ref"],
             },
             "retrieval": {
-                "query": last_user_text,
-                "bundle": retrieval_bundle.get("bundle", {}),
+                "query_present": bool(last_user_text),
+                "bundle": _trace_retrieval(retrieval_bundle),
                 "prompt_assembly": {
                     **(prompt_trace or {}),
                     "surface_presence": apply_surface_presence_outcome(
@@ -1922,6 +2184,7 @@ async def _create_error_trace(
                     ),
                 },
             },
+            "prompt": _trace_prompt(prompt_trace),
             "router_decision": {
                 "rule_id": route.get("rule_id"),
                 "selected_model": selected_model,
@@ -1947,17 +2210,22 @@ async def _create_error_trace(
                 "applied": override_applied,
                 "rejection_reason": override_reason,
             },
-            "model_call": {
+            "model_call": model_call
+            or {
                 "provider": selected_provider,
                 "model": selected_model,
+                "status": "failed",
                 "latency_ms": None,
-                "error": failure_reason,
+                "error_code": failure_reason,
             },
+            "model_calls": model_calls or [],
             "fallback": {
                 "triggered": fallback_used,
                 "reason": "provider_error" if fallback_used else None,
             },
             "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
+            "artifacts": _trace_artifacts(retrieval_bundle),
+            "references": references,
             "cost": {},
             "latency_ms": int((perf_counter() - started) * 1000),
             "status": "failed",
@@ -2193,6 +2461,8 @@ async def orchestrate_chat(
         retrieval_bundle = await memory_store.retrieve_bundle(
             **retrieve_bundle_kwargs,
         )
+        if not isinstance(retrieval_bundle, dict):
+            raise RuntimeError("malformed_retrieval_response")
         retrieval_bundle = _apply_persona_containment_result_boundary(
             retrieval_bundle=retrieval_bundle,
             persona_containment=persona_containment,
@@ -2382,6 +2652,7 @@ async def orchestrate_chat(
         status = "ok"
         fallback_used = False
         model_error = None
+        model_calls: list[dict[str, Any]] = []
 
         handoff = build_assistant_handoff(
             request_id=request_id,
@@ -2449,20 +2720,37 @@ async def orchestrate_chat(
         )
         messages = prompt.messages
 
-        model_started = perf_counter()
         await _advance_runtime_turn(
             runtime=runtime,
             turn_state_trace=turn_state_trace,
             request_id=request_id,
             turn_status="responding",
         )
+        model_started = perf_counter()
         try:
             completion = await litellm.chat(
                 request_id=request_id,
                 model=selected_model,
                 messages=messages,
             )
-        except Exception as e:  # pragma: no cover
+            model_calls.append(
+                _model_attempt(
+                    provider=selected_provider,
+                    model=selected_model,
+                    status="ok",
+                    latency_ms=int((perf_counter() - model_started) * 1000),
+                )
+            )
+        except Exception as e:
+            model_calls.append(
+                _model_attempt(
+                    provider=selected_provider,
+                    model=selected_model,
+                    status="failed",
+                    latency_ms=int((perf_counter() - model_started) * 1000),
+                    error=e,
+                )
+            )
             fallback = choose_fallback(route)
             if fallback:
                 fallback_used = True
@@ -2518,13 +2806,87 @@ async def orchestrate_chat(
                     fallback_provider = "local"
                 selected_model = fallback_model
                 selected_provider = fallback_provider
-                completion = await litellm.chat(
-                    request_id=request_id,
-                    model=selected_model,
-                    messages=messages,
-                )
-                model_error = str(e)
+                fallback_started = perf_counter()
+                try:
+                    completion = await litellm.chat(
+                        request_id=request_id,
+                        model=selected_model,
+                        messages=messages,
+                    )
+                    model_calls.append(
+                        _model_attempt(
+                            provider=selected_provider,
+                            model=selected_model,
+                            status="ok",
+                            latency_ms=int((perf_counter() - fallback_started) * 1000),
+                        )
+                    )
+                    model_error = model_calls[0].get("error_code")
+                except Exception as fallback_error:
+                    model_calls.append(
+                        _model_attempt(
+                            provider=selected_provider,
+                            model=selected_model,
+                            status="failed",
+                            latency_ms=int((perf_counter() - fallback_started) * 1000),
+                            error=fallback_error,
+                        )
+                    )
+                    final_attempt = dict(model_calls[-1])
+                    await _create_error_trace(
+                        memory_store=memory_store,
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        payload=effective_payload,
+                        profile=profile,
+                        retrieval_bundle=retrieval_bundle,
+                        last_user_text=last_user_text,
+                        route=route,
+                        selected_model=selected_model,
+                        selected_provider=selected_provider,
+                        sensitivity_local_only=sensitivity_local_only,
+                        profile_local_only=profile_local_only,
+                        effective_local_only=local_only,
+                        override_requested=override_requested,
+                        override_applied=bool(override),
+                        override_reason=override_reason,
+                        failure_reason=final_attempt["error_code"],
+                        started=started,
+                        fallback_used=True,
+                        prompt_trace=prompt.trace,
+                        surface_presence_trace=surface_presence_trace,
+                        dsa_trace=dsa_trace,
+                        model_calls=model_calls,
+                        model_call=final_attempt,
+                    )
+                    raise
             else:
+                final_attempt = dict(model_calls[-1])
+                await _create_error_trace(
+                    memory_store=memory_store,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    payload=effective_payload,
+                    profile=profile,
+                    retrieval_bundle=retrieval_bundle,
+                    last_user_text=last_user_text,
+                    route=route,
+                    selected_model=selected_model,
+                    selected_provider=selected_provider,
+                    sensitivity_local_only=sensitivity_local_only,
+                    profile_local_only=profile_local_only,
+                    effective_local_only=local_only,
+                    override_requested=override_requested,
+                    override_applied=bool(override),
+                    override_reason=override_reason,
+                    failure_reason=final_attempt["error_code"],
+                    started=started,
+                    prompt_trace=prompt.trace,
+                    surface_presence_trace=surface_presence_trace,
+                    dsa_trace=dsa_trace,
+                    model_calls=model_calls,
+                    model_call=final_attempt,
+                )
                 await _complete_runtime_turn(
                     runtime=runtime,
                     turn_state_trace=turn_state_trace,
@@ -2532,8 +2894,6 @@ async def orchestrate_chat(
                     turn_status="abandoned",
                 )
                 raise
-
-        model_latency_ms = int((perf_counter() - model_started) * 1000)
 
         raw_answer = completion["choices"][0]["message"]["content"]
         response_review = review_response(
@@ -2660,19 +3020,24 @@ async def orchestrate_chat(
             if privacy_boundary.enforced
             else dsa_trace
         )
-        persisted_retrieval = (
-            {
-                "query_present": bool(last_user_text),
-                "bundle": restricted_retrieval_trace_summary(retrieval_bundle),
-                "prompt_assembly": persisted_prompt_trace,
-            }
-            if privacy_boundary.enforced
-            else {
-                "query": last_user_text,
-                "bundle": retrieval_bundle.get("bundle", {}),
-                "prompt_assembly": prompt.trace,
-            }
-        )
+        persisted_retrieval = {
+            "query_present": bool(last_user_text),
+            "bundle": (
+                restricted_retrieval_trace_summary(retrieval_bundle)
+                if privacy_boundary.enforced
+                else _trace_retrieval(retrieval_bundle)
+            ),
+            "prompt_assembly": persisted_prompt_trace,
+        }
+        effective_model_call = {
+            **model_calls[-1],
+            "brief": {
+                key: value
+                for key, value in brief_metadata.items()
+                if key not in {"raw_model_answer", "shaped_answer"}
+            },
+        }
+        references = _trace_references(retrieval_bundle)
 
         await memory_store.create_trace(
             request_id=request_id,
@@ -2688,6 +3053,7 @@ async def orchestrate_chat(
                     "effective_profile_ref": profile["effective_profile_ref"],
                 },
                 "retrieval": persisted_retrieval,
+                "prompt": _trace_prompt(persisted_prompt_trace),
                 "router_decision": {
                     "rule_id": route.get("rule_id"),
                     "selected_model": selected_model,
@@ -2712,18 +3078,27 @@ async def orchestrate_chat(
                     "applied": bool(override),
                     "rejection_reason": override_reason,
                 },
-                "model_call": {
-                    "provider": selected_provider,
-                    "model": selected_model,
-                    "latency_ms": model_latency_ms,
-                    "error": model_error,
-                    "brief": brief_metadata,
-                },
+                "model_call": effective_model_call,
+                "model_calls": model_calls,
                 "fallback": {
                     "triggered": fallback_used,
                     "reason": "provider_error" if fallback_used else None,
                 },
                 "dsa": persisted_dsa_trace,
+                "artifacts": (
+                    {
+                        "status": "omitted",
+                        "artifact_count": len(
+                            retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+                        ),
+                        "included_ids": [],
+                        "source_reference_count": 0,
+                        "reason": "privacy_suppressed",
+                    }
+                    if privacy_boundary.enforced
+                    else _trace_artifacts(retrieval_bundle)
+                ),
+                "references": [] if privacy_boundary.enforced else references,
                 "cost": {},
                 "latency_ms": int((perf_counter() - started) * 1000),
                 "status": status,

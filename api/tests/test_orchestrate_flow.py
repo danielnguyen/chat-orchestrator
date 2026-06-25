@@ -3255,8 +3255,8 @@ async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_ans
     assert brief["surface"] == "telegram"
     assert brief["source"] == "explicit_user_request"
     assert brief["explicit_request"] is True
-    assert brief["raw_model_answer"] == raw
-    assert brief["shaped_answer"] == out["answer"]
+    assert "raw_model_answer" not in brief
+    assert "shaped_answer" not in brief
     response_review = trace_payload["retrieval"]["prompt_assembly"]["response_review"]
     assert response_review["reviewed_text_source"] == "raw_model_output"
     assert response_review["action_taken"] == "none"
@@ -4906,8 +4906,8 @@ async def test_orchestrate_brief_mode_shapes_replacement_only_when_action_occurs
     assert memory_store.added_messages[-1]["content"] == out["answer"]
     brief = memory_store.trace_calls[0]["payload"]["model_call"]["brief"]
     assert brief["enabled"] is True
-    assert brief["raw_model_answer"] == ""
-    assert brief["shaped_answer"] == out["answer"]
+    assert "raw_model_answer" not in brief
+    assert "shaped_answer" not in brief
 
 
 @pytest.mark.asyncio

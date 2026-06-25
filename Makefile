@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 
 DEV_COMPOSE := docker-compose.yml
 
-.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint smoke dev-start dev-start-reload
+.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test composed-smoke smoke dev-start dev-start-reload
 
 dev-up:
 	@docker compose -f $(DEV_COMPOSE) up -d
@@ -25,7 +25,13 @@ dev-install:
 	@cd api && ./.venv/bin/python -m pip install -r requirements.txt
 
 dev-lint:
-	@cd api && ./.venv/bin/python -m ruff check .
+	@cd api && RUFF_CACHE_DIR="$${RUFF_CACHE_DIR:-/tmp/chat-orchestrator-ruff-cache}" ./.venv/bin/python -m ruff check .
+
+replay-test:
+	@cd api && ./.venv/bin/python -m pytest -q tests/test_orchestration_replay.py
+
+composed-smoke:
+	@./scripts/composed_smoke.sh
 
 smoke:
 	@set -euo pipefail; \
