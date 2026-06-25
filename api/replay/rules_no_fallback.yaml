@@ -1,0 +1,8 @@
+rules:
+  - id: default
+    when: {}
+    then:
+      selected_model: chat_voice_openai
+      provider: cloud
+      rationale: deterministic replay rule without fallback
+      fallbacks: []

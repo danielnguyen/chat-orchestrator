@@ -143,6 +143,46 @@ Operator checks when runtime behavior looks wrong:
 - confirm `POST /v1/runtime/overlay` is reachable when runtime overlays are enabled
 - confirm governance, persona containment, and restraint traces stay summarized and do not expose raw prompt text, raw private memory, hidden reasoning, raw CR exception text, copied-through raw runtime event payloads, or implementation-planning identifiers
 
+## Deterministic orchestration replay
+
+Run the versioned repository-local replay corpus with:
+
+```bash
+make replay-test
+```
+
+The corpus executes the real `orchestrate_chat` path with deterministic boundary
+adapters. It covers successful composition, runtime overlay inclusion and
+omission, two surfaces, retrieval degradation, malformed and unavailable
+dependencies, provider fallback/exhaustion, request-ID mismatch, and trace
+persistence failure. Snapshots contain structural evidence only; full prompts,
+provider responses, artifact contents, credentials, and unrestricted exception
+text are excluded.
+
+## Disposable composed smoke
+
+Run:
+
+```bash
+make composed-smoke
+```
+
+Prerequisites:
+
+- Docker with Compose support
+- `git`, `curl`, and `jq`
+- sibling checkouts at `../basic-memory-store` and `../cognitive-runtime`
+- `basic-memory-store/main` containing merge `59b910f8024eac252eb1e99d65e4b1458996670b`
+- `cognitive-runtime/main` containing merge `1404a77f9c9d1a13df3246f1e98401d9680d653e`
+
+The smoke builds Chat Orchestrator from the current branch, both sibling services
+from their current `main` worktrees, a deterministic local OpenAI-compatible
+provider stub, PostgreSQL 16, and Qdrant. PostgreSQL, Qdrant, and Cognitive
+Runtime SQLite storage are disposable. It uses no external provider,
+production database, production object store, production credentials, or
+deployed user data. The command fails with an explicit prerequisite message
+when a sibling repository or required merge is unavailable.
+
 ## File-backed retrieval behavior
 
 When `basic-memory-store` returns `bundle.artifact_refs`, the orchestrator:

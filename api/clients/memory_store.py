@@ -90,11 +90,15 @@ class MemoryStoreClient:
             payload["allowed_memory_domains"] = allowed_memory_domains
         if blocked_memory_domains:
             payload["blocked_memory_domains"] = blocked_memory_domains
-        return await self._post(
+        response = await self._post(
             f"/v2/conversations/{conversation_id}/retrieve",
             request_id=request_id,
             json=payload,
         )
+        response_request_id = response.get("request_id")
+        if response_request_id is not None and response_request_id != request_id:
+            raise RuntimeError("retrieval_request_id_mismatch")
+        return response
 
     async def resolve_profile(
         self,
