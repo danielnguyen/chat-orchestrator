@@ -17,6 +17,8 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest-unprivileged
+    ports:
+      - "14391:6333"
     healthcheck:
       test: ["CMD-SHELL", "grep -Eq ':18BD .* 0A' /proc/net/tcp"]
       interval: 1s

@@ -153,11 +153,14 @@
       "category": "provider_fallback",
       "provider": "fallback_success",
       "expected": {
-        "outcome": {"status": "degraded"},
+        "outcome": {"status": "degraded", "answer_category": "neutral"},
         "trace": {
           "persisted": true,
           "status": "degraded",
-          "fallback": {"triggered": true, "reason": "provider_error"}
+          "fallback": {"triggered": true, "reason": "provider_error"},
+          "provider_fallback_context": {
+            "same_sanitized_messages_reused": true
+          }
         },
         "runtime_terminal_status": "completed"
       }
@@ -167,7 +170,7 @@
       "category": "truth_active_parked",
       "retrieval": "truth_active_parked",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
         "trace": {
           "memory_hygiene": {
             "truth_selection": {
@@ -180,11 +183,28 @@
       }
     },
     {
+      "scenario": "truth-active-stale",
+      "category": "truth_active_stale",
+      "retrieval": "truth_active_stale",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "stale_or_unverified_context_count": 1,
+              "no_safe_current_evidence": false
+            }
+          }
+        }
+      }
+    },
+    {
       "scenario": "truth-stale-only",
       "category": "truth_stale_only",
       "retrieval": "truth_stale_only",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
         "trace": {
           "memory_hygiene": {
             "truth_selection": {
@@ -201,7 +221,7 @@
       "category": "truth_missing_source",
       "retrieval": "truth_missing_source",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
         "trace": {
           "memory_hygiene": {
             "truth_selection": {
@@ -214,11 +234,96 @@
       }
     },
     {
+      "scenario": "truth-malformed-source-ref",
+      "category": "truth_malformed_source_ref",
+      "retrieval": "truth_malformed_source_ref",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"derived_source_ref_invalid": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-incomplete-source-check",
+      "category": "truth_incomplete_source_check",
+      "retrieval": "truth_incomplete_source_check",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"derived_source_checks_invalid": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-missing-provenance-identity",
+      "category": "truth_missing_provenance_identity",
+      "retrieval": "truth_missing_provenance_identity",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"derived_provenance_invalid": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-missing-provenance-type",
+      "category": "truth_missing_provenance_type",
+      "retrieval": "truth_missing_provenance_type",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"derived_provenance_invalid": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-unknown-durable-status",
+      "category": "truth_unknown_durable_status",
+      "retrieval": "truth_unknown_durable_status",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"derived_durable_status_invalid": 1}
+            }
+          }
+        }
+      }
+    },
+    {
       "scenario": "truth-cross-owner",
       "category": "truth_cross_owner",
       "retrieval": "truth_cross_owner",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "neutral"},
         "trace": {
           "memory_hygiene": {
             "truth_selection": {
@@ -236,7 +341,7 @@
       "retrieval": "truth_active_parked",
       "memory_hygiene": "unavailable",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
         "trace": {
           "memory_hygiene": {
             "runtime_call_status": "failed",
@@ -255,7 +360,7 @@
       "retrieval": "truth_active_parked",
       "memory_hygiene": "malformed",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
         "trace": {
           "memory_hygiene": {
             "runtime_call_status": "malformed",
@@ -274,7 +379,7 @@
       "retrieval": "truth_stale_only",
       "memory_hygiene": "conflicting",
       "expected": {
-        "outcome": {"status": "ok"},
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
         "trace": {
           "memory_hygiene": {
             "conflicting_decision_count": 1,

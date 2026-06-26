@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from difflib import unified_diff
@@ -93,6 +94,7 @@ class ReplayMemoryStore:
                 "source_ref": {"ref_type": "message", "ref_id": "memory-1"},
                 "source_availability": "not_applicable",
                 "freshness_state": "active",
+                "durable_status": "active",
             }
         ]
         artifacts: list[dict[str, Any]] = [
@@ -125,6 +127,7 @@ class ReplayMemoryStore:
                     ],
                 },
                 "freshness_state": "active",
+                "durable_status": "active",
             }
         ]
         if mode == "missing_derivative":
@@ -155,9 +158,16 @@ class ReplayMemoryStore:
             semantic[0]["content"] = "Current plan is Alpha."
             artifacts[0]["snippet"] = "Old plan was Beta."
             artifacts[0]["freshness_state"] = "parked"
+            artifacts[0]["durable_status"] = "parked"
+        elif mode == "truth_active_stale":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Old plan was Beta."
+            artifacts[0]["freshness_state"] = "stale"
+            artifacts[0]["durable_status"] = "stale"
         elif mode == "truth_stale_only":
             semantic[0]["content"] = "Old plan was Beta."
             semantic[0]["freshness_state"] = "stale"
+            semantic[0]["durable_status"] = "stale"
             artifacts = []
         elif mode == "truth_missing_source":
             semantic[0]["content"] = "Current plan is Alpha."
@@ -167,6 +177,26 @@ class ReplayMemoryStore:
             semantic = []
             artifacts[0]["owner_id"] = "other-owner"
             artifacts[0]["snippet"] = "Cross-owner derivative says Beta."
+        elif mode == "truth_malformed_source_ref":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Malformed derivative says Beta."
+            artifacts[0]["source_ref"] = {"ref_type": "", "ref_id": "derived-1"}
+        elif mode == "truth_incomplete_source_check":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Incomplete-check derivative says Beta."
+            artifacts[0]["source_checks"] = [{"availability": "available"}]
+        elif mode == "truth_missing_provenance_identity":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Missing-provenance-id derivative says Beta."
+            artifacts[0]["provenance"].pop("derived_id", None)
+        elif mode == "truth_missing_provenance_type":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Missing-provenance-type derivative says Beta."
+            artifacts[0]["provenance"].pop("derivation_type", None)
+        elif mode == "truth_unknown_durable_status":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Unknown-durable derivative says Beta."
+            artifacts[0]["durable_status"] = "mysterious"
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
@@ -364,6 +394,12 @@ class ReplayProvider:
                 "request_id": kwargs["request_id"],
                 "attempt": self.attempt,
                 "model": kwargs["model"],
+                "prompt_fingerprint": _message_fingerprint(kwargs.get("messages")),
+                "has_beta": "Beta" in "\n".join(
+                    message.get("content", "")
+                    for message in kwargs.get("messages", [])
+                    if isinstance(message, dict)
+                ),
             }
         )
         provider_mode = self.scenario.get("provider", "success")
@@ -386,6 +422,32 @@ class ReplayProvider:
         else:
             content = "neutral response"
         return {"choices": [{"message": {"content": content}}]}
+
+
+def _message_fingerprint(messages: Any) -> str:
+    normalized = [
+        {
+            "role": str(message.get("role", "")),
+            "content": str(message.get("content", "")),
+        }
+        for message in messages
+        if isinstance(message, dict)
+    ]
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _answer_category(result: dict[str, Any] | None) -> str | None:
+    if not result:
+        return None
+    answer = result.get("answer")
+    if answer == "Current plan is Alpha.":
+        return "current_alpha"
+    if answer == "I only have historical or unverified memory context.":
+        return "historical_or_unverified"
+    if answer == "neutral response":
+        return "neutral"
+    return "other"
 
 
 def load_corpus(path: Path = DEFAULT_CORPUS_PATH) -> list[dict[str, Any]]:
@@ -429,6 +491,7 @@ def _normalize(
             "error_type": type(error).__name__ if error else None,
             "error_code": str(error) if isinstance(error, RuntimeError) else None,
             "selected_model": result.get("selected_model") if result else None,
+            "answer_category": _answer_category(result),
         },
         "call_order": [call["name"] for call in calls],
         "request_ids": [

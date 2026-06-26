@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 RetrievalKey = tuple[str, str]
 _NON_CURRENT_FRAMINGS = {
     "parked_or_historical",
@@ -28,6 +27,19 @@ _VALID_RUNTIME_FRAMINGS = {
     "unknown_or_unverified",
 }
 _VALID_EVIDENCE_ROLES = {"canonical", "derived"}
+_VALID_DURABLE_STATUSES = {
+    "active",
+    "parked",
+    "stale",
+    "contradicted",
+    "corrected",
+    "invalidated",
+    "superseded",
+    "expired",
+    "retracted",
+    "forgotten_or_demoted",
+    "rebuilding",
+}
 _VALID_SOURCE_AVAILABILITY = {
     "available",
     "missing",
@@ -49,6 +61,7 @@ _DERIVED_OMIT_DURABLE_STATUSES = {
     "superseded",
 }
 _CURRENT_FRAMINGS = {"current", "corrected_replacement"}
+_MAX_STRUCTURAL_VALUE_LENGTH = 200
 _FRESHNESS_FALLBACKS: dict[str, tuple[bool, bool, str, str]] = {
     "active": (True, True, "current", "active_fallback"),
     "parked": (True, False, "parked_or_historical", "parked_fallback"),
@@ -183,15 +196,22 @@ def _normalize_freshness_state(value: Any) -> str:
     return "unknown_freshness"
 
 
+def _bounded_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped) > _MAX_STRUCTURAL_VALUE_LENGTH:
+        return None
+    return stripped
+
+
 def _normalize_source_key(item: dict[str, Any]) -> RetrievalKey | None:
     source_ref = item.get("source_ref")
     if not isinstance(source_ref, dict):
         return None
-    ref_type = source_ref.get("ref_type")
-    ref_id = source_ref.get("ref_id")
-    if not isinstance(ref_type, str) or not isinstance(ref_id, str):
-        return None
-    if not ref_type or not ref_id:
+    ref_type = _bounded_string(source_ref.get("ref_type"))
+    ref_id = _bounded_string(source_ref.get("ref_id"))
+    if ref_type is None or ref_id is None:
         return None
     return (ref_type, ref_id)
 
@@ -210,9 +230,34 @@ def _normalize_source_availability(value: Any) -> str | None:
     return normalized if normalized in _VALID_SOURCE_AVAILABILITY else None
 
 
+def _normalize_durable_status(value: Any) -> str | None:
+    normalized = _bounded_string(value)
+    if normalized is None:
+        return None
+    normalized = normalized.lower()
+    return normalized if normalized in _VALID_DURABLE_STATUSES else None
+
+
 def _owner_matches(item: dict[str, Any], owner_id: str) -> bool:
     item_owner = item.get("owner_id")
     return isinstance(item_owner, str) and item_owner == owner_id
+
+
+def _valid_item_identity(item: dict[str, Any], *, section: str) -> bool:
+    if section in {"recent", "semantic"}:
+        return _bounded_string(item.get("message_id")) is not None
+    if section == "artifact_refs":
+        return _bounded_string(item.get("artifact_id")) is not None
+    return False
+
+
+def _valid_source_check(check: Any) -> bool:
+    if not isinstance(check, dict):
+        return False
+    return all(
+        _bounded_string(check.get(key)) is not None
+        for key in ("ref_type", "ref_id", "support_kind", "availability")
+    ) and check.get("availability") == "available"
 
 
 def _source_checks_available(item: dict[str, Any]) -> bool:
@@ -221,27 +266,52 @@ def _source_checks_available(item: dict[str, Any]) -> bool:
         return False
     if not isinstance(checks, list) or not checks:
         return False
-    return all(
-        isinstance(check, dict) and check.get("availability") == "available"
-        for check in checks
-    )
+    return all(_valid_source_check(check) for check in checks)
+
+
+def _valid_source_refs(source_refs: Any) -> bool:
+    if not isinstance(source_refs, list) or not source_refs:
+        return False
+    for ref in source_refs:
+        if not isinstance(ref, dict):
+            return False
+        if not all(
+            _bounded_string(ref.get(key)) is not None
+            for key in ("ref_type", "ref_id", "support_kind")
+        ):
+            return False
+    return True
 
 
 def _valid_provenance(item: dict[str, Any], owner_id: str) -> bool:
     provenance = item.get("provenance")
     if not isinstance(provenance, dict):
         return False
-    if provenance.get("owner_id") != owner_id:
+    if _bounded_string(provenance.get("derived_id")) is None:
         return False
-    source_refs = provenance.get("source_refs")
-    if not isinstance(source_refs, list) or not source_refs:
+    if _bounded_string(provenance.get("owner_id")) != owner_id:
         return False
-    for ref in source_refs:
-        if not isinstance(ref, dict):
-            return False
-        if not all(isinstance(ref.get(key), str) and ref.get(key) for key in ("ref_type", "ref_id", "support_kind")):
-            return False
-    return True
+    if _bounded_string(provenance.get("derivation_type")) is None:
+        return False
+    return _valid_source_refs(provenance.get("source_refs"))
+
+
+def _canonical_unknown(reason: str, freshness_state: str) -> dict[str, Any]:
+    return _decision_dict(
+        freshness_state=freshness_state,
+        use_allowed=True,
+        mention_as_current_allowed=False,
+        framing="unknown_or_unverified",
+    ) | {"reason": reason}
+
+
+def _omit(reason: str, freshness_state: str = "unknown_freshness") -> dict[str, Any]:
+    return _decision_dict(
+        freshness_state=freshness_state,
+        use_allowed=False,
+        mention_as_current_allowed=False,
+        framing="omit",
+    ) | {"reason": reason}
 
 
 def _pre_cr_decision(
@@ -253,65 +323,90 @@ def _pre_cr_decision(
     evidence_role = _normalize_evidence_role(item.get("evidence_role"))
     source_availability = _normalize_source_availability(item.get("source_availability"))
     freshness_state = _normalize_freshness_state(item.get("freshness_state"))
-    durable_status = (
-        item.get("durable_status") if isinstance(item.get("durable_status"), str) else None
-    )
+    durable_status = _normalize_durable_status(item.get("durable_status"))
 
     if not _owner_matches(item, owner_id):
-        return evidence_role, source_availability, _decision_dict(
-            freshness_state="unknown_freshness",
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ) | {"reason": "owner_mismatch"}
+        return evidence_role, source_availability, _omit("owner_mismatch")
 
     expected_role = "derived" if section == "artifact_refs" else "canonical"
     if evidence_role != expected_role:
-        return evidence_role, source_availability, _decision_dict(
-            freshness_state="unknown_freshness",
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ) | {"reason": "invalid_evidence_role"}
+        return evidence_role, source_availability, _omit("invalid_evidence_role")
+
+    if _normalize_source_key(item) is None:
+        if evidence_role == "canonical":
+            return (
+                evidence_role,
+                source_availability,
+                _canonical_unknown("canonical_source_ref_invalid", freshness_state),
+            )
+        return (
+            evidence_role,
+            source_availability,
+            _omit("derived_source_ref_invalid", freshness_state),
+        )
+
+    if not _valid_item_identity(item, section=section):
+        if evidence_role == "canonical":
+            return (
+                evidence_role,
+                source_availability,
+                _canonical_unknown("canonical_identity_invalid", freshness_state),
+            )
+        return (
+            evidence_role,
+            source_availability,
+            _omit("derived_identity_invalid", freshness_state),
+        )
+
+    if durable_status is None:
+        if evidence_role == "canonical":
+            return (
+                evidence_role,
+                source_availability,
+                _canonical_unknown("canonical_durable_status_invalid", freshness_state),
+            )
+        return (
+            evidence_role,
+            source_availability,
+            _omit("derived_durable_status_invalid", freshness_state),
+        )
 
     if evidence_role == "canonical":
         if source_availability != "not_applicable":
-            return evidence_role, source_availability, _decision_dict(
-                freshness_state=freshness_state,
-                use_allowed=True,
-                mention_as_current_allowed=False,
-                framing="unknown_or_unverified",
-            ) | {"reason": "canonical_source_availability_malformed"}
+            return (
+                evidence_role,
+                source_availability,
+                _canonical_unknown("canonical_source_availability_malformed", freshness_state),
+            )
         return evidence_role, source_availability, None
 
     if source_availability != "available":
-        return evidence_role, source_availability, _decision_dict(
-            freshness_state=freshness_state,
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ) | {"reason": f"derived_source_{source_availability or 'malformed'}"}
+        return (
+            evidence_role,
+            source_availability,
+            _omit(f"derived_source_{source_availability or 'malformed'}", freshness_state),
+        )
     if not _source_checks_available(item):
-        return evidence_role, source_availability, _decision_dict(
-            freshness_state=freshness_state,
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ) | {"reason": "derived_source_checks_invalid"}
+        return (
+            evidence_role,
+            source_availability,
+            _omit("derived_source_checks_invalid", freshness_state),
+        )
     if not _valid_provenance(item, owner_id):
-        return evidence_role, source_availability, _decision_dict(
-            freshness_state=freshness_state,
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ) | {"reason": "derived_provenance_invalid"}
-    if freshness_state in _DERIVED_OMIT_FRESHNESS_STATES or durable_status in _DERIVED_OMIT_DURABLE_STATUSES:
-        return evidence_role, source_availability, _decision_dict(
-            freshness_state=freshness_state,
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ) | {"reason": "derived_lifecycle_omitted"}
+        return (
+            evidence_role,
+            source_availability,
+            _omit("derived_provenance_invalid", freshness_state),
+        )
+    if (
+        freshness_state in _DERIVED_OMIT_FRESHNESS_STATES
+        or durable_status in _DERIVED_OMIT_DURABLE_STATUSES
+    ):
+        return (
+            evidence_role,
+            source_availability,
+            _omit("derived_lifecycle_omitted", freshness_state),
+        )
     return evidence_role, source_availability, None
 
 
@@ -500,7 +595,7 @@ async def apply_memory_hygiene(
     grouped: dict[RetrievalKey, list[MemoryHygieneOccurrence]] = {}
     invalid_occurrences: list[MemoryHygieneOccurrence] = []
     for occurrence in occurrences:
-        if occurrence.pre_cr_decision is not None and not occurrence.pre_cr_decision["use_allowed"]:
+        if occurrence.pre_cr_decision is not None:
             continue
         key = _normalize_source_key(occurrence.item)
         if key is None:
@@ -649,10 +744,16 @@ async def apply_memory_hygiene(
 
             key = _normalize_source_key(item)
             if matching_occurrence.pre_cr_decision is not None:
+                allowed_decision_fields = {
+                    "freshness_state",
+                    "use_allowed",
+                    "mention_as_current_allowed",
+                    "framing",
+                }
                 decision = {
                     key: value
                     for key, value in matching_occurrence.pre_cr_decision.items()
-                    if key in {"freshness_state", "use_allowed", "mention_as_current_allowed", "framing"}
+                    if key in allowed_decision_fields
                 }
                 fallback_applied = True
             elif key is None:
@@ -721,7 +822,12 @@ async def apply_memory_hygiene(
     trace = {
         "attempted": True,
         "status": status,
-        "included": bool(evaluated_decision_count or fallback_applied or ambiguous_keys or invalid_occurrences),
+        "included": bool(
+            evaluated_decision_count
+            or fallback_applied
+            or ambiguous_keys
+            or invalid_occurrences
+        ),
         "runtime_call_status": runtime_call_status,
         "submitted_unique_item_count": len(runtime_items),
         "evaluated_decision_count": evaluated_decision_count,

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Any
 
+from services.assistant_handoff import AssistantHandoff
+from services.companion_presentation import CompanionPresentation
 from services.privacy_context import (
     PRIVACY_SENSITIVITY_LEVELS,
     PRIVACY_SURFACE_CATEGORIES,
     PRIVACY_ZONES,
 )
-from services.assistant_handoff import AssistantHandoff
-from services.companion_presentation import CompanionPresentation
 
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 VALID_GOVERNANCE_RESPONSE_POSTURES = {
@@ -180,19 +180,26 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
         guidance = ["Memory truth guidance:"]
         if current_count:
             guidance.append(
-                "- Use current canonical evidence as the primary basis for current-state or next-action claims."
+                "- Use current canonical evidence as the primary basis for "
+                "current-state or next-action claims."
             )
             guidance.append("- Use supported active derived context only as augmentation.")
         if historical_count:
             guidance.append(
-                "- Do not use historical, parked, stale, expired, or unknown context as proof of what is current."
+                "- Do not use historical, parked, stale, expired, or unknown "
+                "context as proof of what is current."
             )
             guidance.append(
-                "- When only historical or unverified memory context is available, state uncertainty or describe it historically."
+                "- When only historical or unverified memory context is available, "
+                "state uncertainty or describe it historically."
             )
         if current_count == 0 and historical_count:
-            guidance.append("- The current state is not established by memory context in this turn.")
-        guidance.append("- Do not mention internal freshness, provider, fallback, or orchestration mechanics.")
+            guidance.append(
+                "- The current state is not established by memory context in this turn."
+            )
+        guidance.append(
+            "- Do not mention internal freshness, provider, fallback, or orchestration mechanics."
+        )
         messages.append({"role": "system", "content": "\n".join(guidance)})
 
     if current_count:
