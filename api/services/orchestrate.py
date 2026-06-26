@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
+import json
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -451,11 +453,56 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         "retrieval": {
             "included": bool(retrieval_layer and retrieval_layer["included"]),
         },
+        "provider_prompt": trace.get("provider_prompt", {}),
+        "provider_fallback_context": trace.get("provider_fallback_context", {}),
         "token_accounting": {
             "status": "estimate_unavailable",
             "budget_enforcement": "not_enforced",
         },
     }
+
+
+def _prompt_fingerprint(messages: list[dict[str, str]]) -> dict[str, Any]:
+    normalized = [
+        {
+            "role": str(message.get("role", "")),
+            "content": str(message.get("content", "")),
+        }
+        for message in messages
+        if isinstance(message, dict)
+    ]
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return {
+        "algorithm": "sha256",
+        "fingerprint": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "message_count": len(normalized),
+        "role_sequence": [item["role"] for item in normalized],
+    }
+
+
+def _public_answer_sources(sources: Any) -> list[dict[str, Any]]:
+    if not isinstance(sources, list):
+        return []
+    private_keys = {
+        "memory_hygiene",
+        "provenance",
+        "qualification_reasons",
+        "source_checks",
+    }
+    public_sources: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        public_sources.append(
+            {
+                key: value
+                for key, value in source.items()
+                if isinstance(key, str)
+                and not key.startswith("_")
+                and key not in private_keys
+            }
+        )
+    return public_sources
 
 
 def _trace_retrieval(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
@@ -520,6 +567,13 @@ def _trace_retrieval(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
             debug.get("fallback_reason") or debug.get("fallback"),
             max_length=120,
         ),
+        "retrieval_debug": {
+            "truth_qualification": (
+                debug.get("truth_qualification")
+                if isinstance(debug.get("truth_qualification"), dict)
+                else {}
+            )
+        },
         "vector_status": _sanitize_trace_string(
             debug.get("vector_status"),
             max_length=80,
@@ -2719,6 +2773,11 @@ async def orchestrate_chat(
             dsa_trace=dsa_trace,
         )
         messages = prompt.messages
+        prompt_fingerprint = _prompt_fingerprint(messages)
+        prompt.trace["provider_prompt"] = {
+            **prompt_fingerprint,
+            "rebuilt_between_attempts": False,
+        }
 
         await _advance_runtime_turn(
             runtime=runtime,
@@ -2755,6 +2814,11 @@ async def orchestrate_chat(
             if fallback:
                 fallback_used = True
                 status = "degraded"
+                prompt.trace["provider_fallback_context"] = {
+                    "same_sanitized_messages_reused": True,
+                    "prompt_fingerprint": prompt_fingerprint["fingerprint"],
+                    "message_count": prompt_fingerprint["message_count"],
+                }
                 fallback_model = fallback["selected_model"]
                 fallback_provider = _model_provider(
                     fallback_model,
@@ -2932,9 +2996,9 @@ async def orchestrate_chat(
                 "shaped_answer": answer,
             }
 
-        answer_sources = retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
-        if not isinstance(answer_sources, list):
-            answer_sources = []
+        answer_sources = _public_answer_sources(
+            retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+        )
         if privacy_context_enabled and privacy_context is not None:
             privacy_boundary = apply_privacy_boundary(
                 policy=privacy_context,
@@ -2981,6 +3045,10 @@ async def orchestrate_chat(
             client_id=payload.get("client_id"),
             metadata={"request_id": request_id, "selected_model": selected_model},
         )
+        prompt.trace["answer_persistence"] = {
+            "returned_and_persisted_answer_match": True,
+            "persisted_role": "assistant",
+        }
 
         await _reset_runtime_after_turn(
             runtime=runtime,

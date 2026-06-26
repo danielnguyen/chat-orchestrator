@@ -163,6 +163,130 @@
       }
     },
     {
+      "scenario": "truth-active-parked",
+      "category": "truth_active_parked",
+      "retrieval": "truth_active_parked",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "historical_or_parked_context_count": 1,
+              "no_safe_current_evidence": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-stale-only",
+      "category": "truth_stale_only",
+      "retrieval": "truth_stale_only",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 0,
+              "stale_or_unverified_context_count": 1,
+              "no_safe_current_evidence": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-missing-source",
+      "category": "truth_missing_source",
+      "retrieval": "truth_missing_source",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"derived_source_missing": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-cross-owner",
+      "category": "truth_cross_owner",
+      "retrieval": "truth_cross_owner",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "omitted_context_count": 1,
+              "pre_cr_rejection_reasons": {"owner_mismatch": 1},
+              "no_safe_current_evidence": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-cr-unavailable",
+      "category": "truth_cr_unavailable",
+      "retrieval": "truth_active_parked",
+      "memory_hygiene": "unavailable",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "runtime_call_status": "failed",
+            "fallback_reason": "runtime_unavailable",
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "historical_or_parked_context_count": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-cr-malformed",
+      "category": "truth_cr_malformed",
+      "retrieval": "truth_active_parked",
+      "memory_hygiene": "malformed",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "runtime_call_status": "malformed",
+            "fallback_reason": "malformed_memory_hygiene_response",
+            "truth_selection": {
+              "current_canonical_evidence_count": 1,
+              "historical_or_parked_context_count": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-cr-conflicting",
+      "category": "truth_cr_conflicting",
+      "retrieval": "truth_stale_only",
+      "memory_hygiene": "conflicting",
+      "expected": {
+        "outcome": {"status": "ok"},
+        "trace": {
+          "memory_hygiene": {
+            "conflicting_decision_count": 1,
+            "truth_selection": {
+              "stale_or_unverified_context_count": 1,
+              "no_safe_current_evidence": true
+            }
+          }
+        }
+      }
+    },
+    {
       "scenario": "provider-exhaustion",
       "category": "provider_exhaustion",
       "provider": "exhausted",

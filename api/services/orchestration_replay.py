@@ -84,20 +84,46 @@ class ReplayMemoryStore:
         debug: dict[str, Any] = {"vector_status": "ok"}
         semantic: list[dict[str, Any]] = [
             {
+                "owner_id": "owner-replay",
+                "evidence_role": "canonical",
                 "message_id": "memory-1",
                 "created_at": "2026-01-01T00:00:00+00:00",
                 "role": "assistant",
                 "content": "neutral memory fixture",
                 "source_ref": {"ref_type": "message", "ref_id": "memory-1"},
+                "source_availability": "not_applicable",
                 "freshness_state": "active",
             }
         ]
         artifacts: list[dict[str, Any]] = [
             {
+                "owner_id": "owner-replay",
+                "evidence_role": "derived",
                 "artifact_id": "artifact-1",
                 "file_path": "fixture.txt",
                 "snippet": "neutral artifact fixture",
                 "source_ref": {"ref_type": "derived_text", "ref_id": "derived-1"},
+                "source_availability": "available",
+                "source_checks": [
+                    {
+                        "ref_type": "message",
+                        "ref_id": "memory-1",
+                        "support_kind": "direct",
+                        "availability": "available",
+                    }
+                ],
+                "provenance": {
+                    "derived_id": "derived-1",
+                    "owner_id": "owner-replay",
+                    "derivation_type": "derived_text",
+                    "source_refs": [
+                        {
+                            "ref_type": "message",
+                            "ref_id": "memory-1",
+                            "support_kind": "direct",
+                        }
+                    ],
+                },
                 "freshness_state": "active",
             }
         ]
@@ -125,6 +151,22 @@ class ReplayMemoryStore:
         elif mode == "artifact_unavailable":
             artifacts = []
             debug.update({"degraded": True, "fallback": "artifact_unavailable"})
+        elif mode == "truth_active_parked":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Old plan was Beta."
+            artifacts[0]["freshness_state"] = "parked"
+        elif mode == "truth_stale_only":
+            semantic[0]["content"] = "Old plan was Beta."
+            semantic[0]["freshness_state"] = "stale"
+            artifacts = []
+        elif mode == "truth_missing_source":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Missing-source derivative says Beta."
+            artifacts[0]["source_availability"] = "missing"
+        elif mode == "truth_cross_owner":
+            semantic = []
+            artifacts[0]["owner_id"] = "other-owner"
+            artifacts[0]["snippet"] = "Cross-owner derivative says Beta."
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
@@ -259,6 +301,50 @@ class ReplayRuntime:
             "omission_reason": "empty_runtime_state",
         }
 
+    async def evaluate_memory_hygiene(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_memory_hygiene", kwargs["request_id"])
+        if self.scenario.get("memory_hygiene") == "unavailable":
+            raise BoundaryFailure("memory_hygiene_unavailable")
+        if self.scenario.get("memory_hygiene") == "malformed":
+            return {"result": {"decisions": "invalid"}}
+        decisions: list[dict[str, Any]] = []
+        for item in kwargs.get("items", []):
+            freshness = item.get("freshness_state", "unknown_freshness")
+            item_ref = item.get("item_ref")
+            if freshness == "active":
+                decision = (True, True, "current")
+            elif freshness == "corrected":
+                decision = (True, True, "corrected_replacement")
+            elif freshness == "parked":
+                decision = (True, False, "parked_or_historical")
+            elif freshness == "stale":
+                decision = (True, False, "stale_or_unverified")
+            elif freshness == "unknown_freshness":
+                decision = (True, False, "unknown_or_unverified")
+            else:
+                decision = (False, False, "omit")
+            decisions.append(
+                {
+                    "item_ref": item_ref,
+                    "freshness_state": freshness,
+                    "use_allowed": decision[0],
+                    "mention_as_current_allowed": decision[1],
+                    "framing": decision[2],
+                }
+            )
+            if self.scenario.get("memory_hygiene") == "conflicting":
+                decisions.append(
+                    {
+                        "item_ref": item_ref,
+                        "freshness_state": freshness,
+                        "use_allowed": not decision[0],
+                        "mention_as_current_allowed": False,
+                        "framing": "omit",
+                    }
+                )
+                break
+        return {"result": {"decisions": decisions, "aggregate": {}}}
+
 
 class ReplayProvider:
     def __init__(self, scenario: dict[str, Any], calls: list[dict[str, Any]]) -> None:
@@ -292,7 +378,14 @@ class ReplayProvider:
                 request=request,
                 response=response,
             )
-        return {"choices": [{"message": {"content": "neutral response"}}]}
+        joined = "\n".join(message.get("content", "") for message in kwargs["messages"])
+        if "Current memory evidence:" in joined and "Current plan is Alpha." in joined:
+            content = "Current plan is Alpha."
+        elif "Historical or unverified memory context:" in joined:
+            content = "I only have historical or unverified memory context."
+        else:
+            content = "neutral response"
+        return {"choices": [{"message": {"content": content}}]}
 
 
 def load_corpus(path: Path = DEFAULT_CORPUS_PATH) -> list[dict[str, Any]]:
@@ -356,6 +449,13 @@ def _normalize(
             "artifacts": artifacts,
             "references": trace.get("references", []),
             "retrieval": (trace.get("retrieval") or {}).get("bundle", {}),
+            "memory_hygiene": (
+                (trace.get("retrieval") or {})
+                .get("prompt_assembly", {})
+                .get("memory_hygiene", {})
+            ),
+            "provider_prompt": prompt.get("provider_prompt", {}),
+            "provider_fallback_context": prompt.get("provider_fallback_context", {}),
         },
         "runtime_terminal_status": runtime.terminal_status,
     }
@@ -383,6 +483,7 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
             model_registry_path=str(REGISTRY_PATH),
             allow_manual_override=False,
             enable_runtime_overlays=True,
+            memory_hygiene_enabled=True,
             request_id=request_id,
         )
     except Exception as exc:  # replay snapshots intentionally cover failures

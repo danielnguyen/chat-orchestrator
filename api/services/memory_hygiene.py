@@ -27,6 +27,28 @@ _VALID_RUNTIME_FRAMINGS = {
     "omit",
     "unknown_or_unverified",
 }
+_VALID_EVIDENCE_ROLES = {"canonical", "derived"}
+_VALID_SOURCE_AVAILABILITY = {
+    "available",
+    "missing",
+    "malformed",
+    "unavailable",
+    "owner_mismatch",
+    "not_applicable",
+}
+_DERIVED_OMIT_FRESHNESS_STATES = {
+    "superseded",
+    "forgotten_or_demoted",
+}
+_DERIVED_OMIT_DURABLE_STATUSES = {
+    "contradicted",
+    "invalidated",
+    "retracted",
+    "forgotten_or_demoted",
+    "rebuilding",
+    "superseded",
+}
+_CURRENT_FRAMINGS = {"current", "corrected_replacement"}
 _FRESHNESS_FALLBACKS: dict[str, tuple[bool, bool, str, str]] = {
     "active": (True, True, "current", "active_fallback"),
     "parked": (True, False, "parked_or_historical", "parked_fallback"),
@@ -77,6 +99,9 @@ class MemoryHygieneOccurrence:
     index: int
     item: dict[str, Any]
     payload: NormalizedMemoryHygienePayload
+    evidence_role: str | None
+    source_availability: str | None
+    pre_cr_decision: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +196,125 @@ def _normalize_source_key(item: dict[str, Any]) -> RetrievalKey | None:
     return (ref_type, ref_id)
 
 
+def _normalize_evidence_role(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in _VALID_EVIDENCE_ROLES else None
+
+
+def _normalize_source_availability(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in _VALID_SOURCE_AVAILABILITY else None
+
+
+def _owner_matches(item: dict[str, Any], owner_id: str) -> bool:
+    item_owner = item.get("owner_id")
+    return isinstance(item_owner, str) and item_owner == owner_id
+
+
+def _source_checks_available(item: dict[str, Any]) -> bool:
+    checks = item.get("source_checks")
+    if checks is None:
+        return False
+    if not isinstance(checks, list) or not checks:
+        return False
+    return all(
+        isinstance(check, dict) and check.get("availability") == "available"
+        for check in checks
+    )
+
+
+def _valid_provenance(item: dict[str, Any], owner_id: str) -> bool:
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if provenance.get("owner_id") != owner_id:
+        return False
+    source_refs = provenance.get("source_refs")
+    if not isinstance(source_refs, list) or not source_refs:
+        return False
+    for ref in source_refs:
+        if not isinstance(ref, dict):
+            return False
+        if not all(isinstance(ref.get(key), str) and ref.get(key) for key in ("ref_type", "ref_id", "support_kind")):
+            return False
+    return True
+
+
+def _pre_cr_decision(
+    *,
+    item: dict[str, Any],
+    owner_id: str,
+    section: str,
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    evidence_role = _normalize_evidence_role(item.get("evidence_role"))
+    source_availability = _normalize_source_availability(item.get("source_availability"))
+    freshness_state = _normalize_freshness_state(item.get("freshness_state"))
+    durable_status = (
+        item.get("durable_status") if isinstance(item.get("durable_status"), str) else None
+    )
+
+    if not _owner_matches(item, owner_id):
+        return evidence_role, source_availability, _decision_dict(
+            freshness_state="unknown_freshness",
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ) | {"reason": "owner_mismatch"}
+
+    expected_role = "derived" if section == "artifact_refs" else "canonical"
+    if evidence_role != expected_role:
+        return evidence_role, source_availability, _decision_dict(
+            freshness_state="unknown_freshness",
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ) | {"reason": "invalid_evidence_role"}
+
+    if evidence_role == "canonical":
+        if source_availability != "not_applicable":
+            return evidence_role, source_availability, _decision_dict(
+                freshness_state=freshness_state,
+                use_allowed=True,
+                mention_as_current_allowed=False,
+                framing="unknown_or_unverified",
+            ) | {"reason": "canonical_source_availability_malformed"}
+        return evidence_role, source_availability, None
+
+    if source_availability != "available":
+        return evidence_role, source_availability, _decision_dict(
+            freshness_state=freshness_state,
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ) | {"reason": f"derived_source_{source_availability or 'malformed'}"}
+    if not _source_checks_available(item):
+        return evidence_role, source_availability, _decision_dict(
+            freshness_state=freshness_state,
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ) | {"reason": "derived_source_checks_invalid"}
+    if not _valid_provenance(item, owner_id):
+        return evidence_role, source_availability, _decision_dict(
+            freshness_state=freshness_state,
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ) | {"reason": "derived_provenance_invalid"}
+    if freshness_state in _DERIVED_OMIT_FRESHNESS_STATES or durable_status in _DERIVED_OMIT_DURABLE_STATUSES:
+        return evidence_role, source_availability, _decision_dict(
+            freshness_state=freshness_state,
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ) | {"reason": "derived_lifecycle_omitted"}
+    return evidence_role, source_availability, None
+
+
 def _normalize_payload(item: dict[str, Any]) -> NormalizedMemoryHygienePayload:
     confidence = item.get("confidence")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
@@ -196,6 +340,8 @@ def _normalize_payload(item: dict[str, Any]) -> NormalizedMemoryHygienePayload:
 
 def _iter_occurrences(
     retrieval_bundle: dict[str, Any],
+    *,
+    owner_id: str,
 ) -> list[MemoryHygieneOccurrence]:
     bundle = retrieval_bundle.get("bundle", {})
     occurrences: list[MemoryHygieneOccurrence] = []
@@ -206,12 +352,20 @@ def _iter_occurrences(
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
+            evidence_role, source_availability, pre_cr_decision = _pre_cr_decision(
+                item=item,
+                owner_id=owner_id,
+                section=section,
+            )
             occurrences.append(
                 MemoryHygieneOccurrence(
                     section=section,
                     index=index,
                     item=item,
                     payload=_normalize_payload(item),
+                    evidence_role=evidence_role,
+                    source_availability=source_availability,
+                    pre_cr_decision=pre_cr_decision,
                 )
             )
     return occurrences
@@ -311,7 +465,17 @@ def _annotate_item(item: dict[str, Any], decision: dict[str, Any]) -> dict[str, 
         }
     else:
         framed_item.pop("memory_hygiene", None)
+    framed_item["_truth_framing"] = framing
     return framed_item
+
+
+def _reason_counts(occurrences: list[MemoryHygieneOccurrence]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for occurrence in occurrences:
+        reason = (occurrence.pre_cr_decision or {}).get("reason")
+        if isinstance(reason, str):
+            counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 async def apply_memory_hygiene(
@@ -332,10 +496,12 @@ async def apply_memory_hygiene(
             trace=disabled_memory_hygiene_trace(retrieval_bundle),
         )
 
-    occurrences = _iter_occurrences(retrieval_bundle)
+    occurrences = _iter_occurrences(retrieval_bundle, owner_id=owner_id)
     grouped: dict[RetrievalKey, list[MemoryHygieneOccurrence]] = {}
     invalid_occurrences: list[MemoryHygieneOccurrence] = []
     for occurrence in occurrences:
+        if occurrence.pre_cr_decision is not None and not occurrence.pre_cr_decision["use_allowed"]:
+            continue
         key = _normalize_source_key(occurrence.item)
         if key is None:
             invalid_occurrences.append(occurrence)
@@ -482,7 +648,14 @@ async def apply_memory_hygiene(
                 continue
 
             key = _normalize_source_key(item)
-            if key is None:
+            if matching_occurrence.pre_cr_decision is not None:
+                decision = {
+                    key: value
+                    for key, value in matching_occurrence.pre_cr_decision.items()
+                    if key in {"freshness_state", "use_allowed", "mention_as_current_allowed", "framing"}
+                }
+                fallback_applied = True
+            elif key is None:
                 decision = _fallback_for_payload(matching_occurrence.payload)
                 fallback_applied = True
             else:
@@ -500,6 +673,35 @@ async def apply_memory_hygiene(
                 retained_non_current_occurrence_count += 1
             updated_items.append(_annotate_item(item, decision))
         sanitized_bundle[section] = updated_items
+
+    current_count = 0
+    historical_count = 0
+    current_canonical_count = 0
+    current_supported_derived_count = 0
+    corrected_replacement_count = 0
+    stale_or_unverified_count = 0
+    for section in ("recent", "semantic", "artifact_refs"):
+        items = sanitized_bundle.get(section)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            framing = item.get("_truth_framing", "current")
+            role = item.get("evidence_role")
+            if framing in _CURRENT_FRAMINGS:
+                current_count += 1
+                if role == "canonical":
+                    current_canonical_count += 1
+                elif role == "derived":
+                    current_supported_derived_count += 1
+                if framing == "corrected_replacement":
+                    corrected_replacement_count += 1
+            else:
+                historical_count += 1
+                if framing in {"stale_or_unverified", "unknown_or_unverified"}:
+                    stale_or_unverified_count += 1
+    no_safe_current_evidence = current_count == 0
 
     if runtime_items:
         evaluated_decision_count = len(valid_runtime_decisions)
@@ -534,6 +736,18 @@ async def apply_memory_hygiene(
         "conflicting_decision_count": conflicting_decision_count,
         "invalid_decision_count": invalid_decision_count,
         "missing_decision_count": missing_decision_count,
+        "truth_selection": {
+            "current_canonical_evidence_count": current_canonical_count,
+            "current_supported_derivative_count": current_supported_derived_count,
+            "historical_or_parked_context_count": historical_count,
+            "stale_or_unverified_context_count": stale_or_unverified_count,
+            "omitted_context_count": omitted_occurrence_count,
+            "corrected_replacement_count": corrected_replacement_count,
+            "no_safe_current_evidence": no_safe_current_evidence,
+            "pre_cr_rejection_reasons": _reason_counts(occurrences),
+            "provider_visible_current_count": current_count,
+            "provider_visible_historical_count": historical_count,
+        },
         **_domain_debug_summary(retrieval_bundle),
     }
 

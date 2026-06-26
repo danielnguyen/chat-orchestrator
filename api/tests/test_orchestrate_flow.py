@@ -67,29 +67,58 @@ class FakeMemoryStore:
             "bundle": {
                 "recent": [
                     {
+                        "owner_id": "owner",
+                        "evidence_role": "canonical",
                         "role": "assistant",
                         "content": "prior history",
                         "source_ref": {"ref_type": "message", "ref_id": "recent-message-1"},
+                        "source_availability": "not_applicable",
                         "freshness_state": "active",
                     }
                 ],
                 "semantic": [
                     {
+                        "owner_id": "owner",
+                        "evidence_role": "canonical",
                         "message_id": "semantic-message-1",
                         "created_at": "2026-01-01T00:00:00+00:00",
                         "role": "assistant",
                         "content": "semantic note",
                         "source_ref": {"ref_type": "message", "ref_id": "semantic-message-1"},
+                        "source_availability": "not_applicable",
                         "freshness_state": "active",
                     }
                 ],
                 "artifact_refs": [
                     {
+                        "owner_id": "owner",
+                        "evidence_role": "derived",
                         "artifact_id": "a-1",
                         "file_path": "api/main.py",
                         "snippet": "def entrypoint(): pass",
                         "relevance_score": 0.9,
                         "source_ref": {"ref_type": "derived_text", "ref_id": "derived-text-1"},
+                        "source_availability": "available",
+                        "source_checks": [
+                            {
+                                "ref_type": "message",
+                                "ref_id": "semantic-message-1",
+                                "support_kind": "direct",
+                                "availability": "available",
+                            }
+                        ],
+                        "provenance": {
+                            "derived_id": "derived-text-1",
+                            "owner_id": "owner",
+                            "derivation_type": "derived_text",
+                            "source_refs": [
+                                {
+                                    "ref_type": "message",
+                                    "ref_id": "semantic-message-1",
+                                    "support_kind": "direct",
+                                }
+                            ],
+                        },
                         "freshness_state": "active",
                     }
                 ],
@@ -570,6 +599,22 @@ class FakeLiteLLM:
         return {"choices": [{"message": {"content": self.content}}]}
 
 
+class TruthAwareLiteLLM(FakeLiteLLM):
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail_first and len(self.calls) == 1:
+            raise RuntimeError("primary failed")
+        joined = "\n".join(message["content"] for message in kwargs["messages"])
+        current_section = joined.split("Historical or unverified memory context:")[0]
+        if "Current memory evidence:" in current_section and "Current plan is Alpha." in current_section:
+            content = "Current plan is Alpha."
+        elif "Historical or unverified memory context:" in joined:
+            content = "I only have historical or unverified context; the current plan is uncertain."
+        else:
+            content = "I do not have safe current memory evidence."
+        return {"choices": [{"message": {"content": content}}]}
+
+
 class FakeDSA:
     def __init__(self, *, response=None, error: Exception | None = None):
         self.calls = []
@@ -609,11 +654,26 @@ def _memory_item(
     confidence: float | None = None,
     supersedes: str | None = None,
     superseded_by: str | None = None,
+    owner_id: str | None = "owner",
+    evidence_role: str | None = None,
+    source_availability: str | None = None,
+    source_checks: list[dict[str, object]] | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     base: dict[str, object] = {
         "source_ref": {"ref_type": ref_type, "ref_id": ref_id},
         "freshness_state": freshness_state,
     }
+    if owner_id is not None:
+        base["owner_id"] = owner_id
+    role = evidence_role or ("derived" if section == "artifact_refs" else "canonical")
+    if role is not None:
+        base["evidence_role"] = role
+    availability = source_availability or (
+        "available" if section == "artifact_refs" else "not_applicable"
+    )
+    if availability is not None:
+        base["source_availability"] = availability
     if memory_id is not None:
         base["memory_id"] = memory_id
     if last_verified_at is not None:
@@ -637,6 +697,26 @@ def _memory_item(
             }
         )
     else:
+        source_check_items = source_checks or [
+            {
+                "ref_type": "message",
+                "ref_id": f"{ref_id}-source",
+                "support_kind": "direct",
+                "availability": "available",
+            }
+        ]
+        provenance_item = provenance or {
+            "derived_id": ref_id,
+            "owner_id": owner_id or "owner",
+            "derivation_type": "derived_text",
+            "source_refs": [
+                {
+                    "ref_type": "message",
+                    "ref_id": f"{ref_id}-source",
+                    "support_kind": "direct",
+                }
+            ],
+        }
         base.update(
             {
                 "artifact_id": f"{ref_id}-artifact-id",
@@ -644,6 +724,8 @@ def _memory_item(
                 "file_path": f"{ref_id}.txt",
                 "snippet": content or f"{ref_id} snippet",
                 "relevance_score": 0.8,
+                "source_checks": source_check_items,
+                "provenance": provenance_item,
             }
         )
     return base
@@ -4259,6 +4341,243 @@ async def test_orchestrate_memory_hygiene_trace_omits_ids_content_and_domain_nam
     assert "finance" not in str(trace)
     assert trace["allowed_filter_count"] == 2
     assert trace["blocked_filter_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_truth_selection_prefers_active_canonical_over_parked_derivative(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="plan-alpha",
+                    content="Current plan is Alpha.",
+                    freshness_state="active",
+                    memory_id="memory-alpha",
+                )
+            ],
+            artifact_refs=[
+                _memory_item(
+                    section="artifact_refs",
+                    ref_type="derived_text",
+                    ref_id="plan-beta",
+                    content="Old plan was Beta.",
+                    freshness_state="parked",
+                    memory_id="memory-beta",
+                )
+            ],
+        )
+    )
+    litellm = TruthAwareLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is the current plan?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-truth-alpha",
+    )
+
+    assert out["answer"] == "Current plan is Alpha."
+    assert memory_store.added_messages[-1]["role"] == "assistant"
+    assert memory_store.added_messages[-1]["content"] == out["answer"]
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    assert "Current memory evidence:\n- [2026-01-01T00:00:00+00:00] assistant: Current plan is Alpha." in prompt_text
+    assert "Historical or unverified memory context:\n- [historical/parked context] [repo/plan-beta.txt] Old plan was Beta." in prompt_text
+    truth = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]["truth_selection"]
+    assert truth["current_canonical_evidence_count"] == 1
+    assert truth["historical_or_parked_context_count"] == 1
+    assert truth["no_safe_current_evidence"] is False
+    assert memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["answer_persistence"] == {
+        "returned_and_persisted_answer_match": True,
+        "persisted_role": "assistant",
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_truth_selection_omits_missing_source_derivative_before_provider(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="plan-alpha",
+                    content="Current plan is Alpha.",
+                    freshness_state="active",
+                )
+            ],
+            artifact_refs=[
+                _memory_item(
+                    section="artifact_refs",
+                    ref_type="derived_text",
+                    ref_id="unsafe-beta",
+                    content="Unsafe derivative says Beta.",
+                    source_availability="missing",
+                    freshness_state="active",
+                )
+            ],
+        )
+    )
+    runtime = FakeRuntime()
+    litellm = TruthAwareLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is current?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-truth-missing-source",
+    )
+
+    assert out["answer"] == "Current plan is Alpha."
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    assert "Unsafe derivative says Beta." not in prompt_text
+    assert all(
+        item["item_ref"] != {"ref_type": "derived_text", "ref_id": "unsafe-beta"}
+        for item in runtime.memory_hygiene_calls[0]["items"]
+    )
+    truth = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]["truth_selection"]
+    assert truth["omitted_context_count"] == 1
+    assert truth["pre_cr_rejection_reasons"] == {"derived_source_missing": 1}
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_truth_selection_only_stale_context_returns_uncertainty(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="plan-beta",
+                    content="Old plan was Beta.",
+                    freshness_state="stale",
+                )
+            ],
+        )
+    )
+    litellm = TruthAwareLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is the current plan?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-truth-stale-only",
+    )
+
+    assert out["answer"] == "I only have historical or unverified context; the current plan is uncertain."
+    truth = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["memory_hygiene"]["truth_selection"]
+    assert truth["no_safe_current_evidence"] is True
+    assert truth["stale_or_unverified_context_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_provider_fallback_reuses_identical_truth_qualified_messages(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: local-llm\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "  local-llm:\n"
+        "    provider: local\n",
+        encoding="utf-8",
+    )
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="plan-alpha",
+                    content="Current plan is Alpha.",
+                    freshness_state="active",
+                )
+            ],
+            artifact_refs=[
+                _memory_item(
+                    section="artifact_refs",
+                    ref_type="derived_text",
+                    ref_id="unsafe-beta",
+                    content="Unsafe derivative says Beta.",
+                    source_availability="owner_mismatch",
+                    freshness_state="active",
+                )
+            ],
+        )
+    )
+    litellm = TruthAwareLiteLLM(fail_first=True)
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is current?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-truth-fallback",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
+    assert "Unsafe derivative says Beta." not in str(litellm.calls[1]["messages"])
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+    assert prompt_trace["provider_fallback_context"]["prompt_fingerprint"] == prompt_trace["provider_prompt"]["fingerprint"]
 
 
 

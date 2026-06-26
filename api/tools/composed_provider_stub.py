@@ -20,11 +20,29 @@ async def chat_completions(
     x_request_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     request_id = x_request_id or "unscoped"
+    messages = body.get("messages")
+    messages = messages if isinstance(messages, list) else []
+    prompt_text = "\n".join(
+        message.get("content", "")
+        for message in messages
+        if isinstance(message, dict) and isinstance(message.get("content"), str)
+    )
+    has_current = "Current memory evidence:" in prompt_text
+    has_historical = "Historical or unverified memory context:" in prompt_text
+    if has_current and "Current plan is Alpha." in prompt_text:
+        answer = "Current plan is Alpha."
+    elif has_historical:
+        answer = "I only have historical or unverified memory context."
+    else:
+        answer = "neutral smoke response"
     _calls[request_id].append(
         {
             "kind": "chat",
             "request_id": x_request_id,
             "model": body.get("model"),
+            "message_count": len(messages),
+            "has_current_memory_evidence": has_current,
+            "has_historical_memory_context": has_historical,
         }
     )
     return {
@@ -32,7 +50,7 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": "neutral smoke response"},
+                "message": {"role": "assistant", "content": answer},
                 "finish_reason": "stop",
             }
         ],

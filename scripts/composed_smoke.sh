@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="59b910f8024eac252eb1e99d65e4b1458996670b"
+BMS_COMMIT="3c10de23160822a3da3fec5ab71570ce93ab568c"
 CR_COMMIT="1404a77f9c9d1a13df3246f1e98401d9680d653e"
 
 for command in git docker curl jq; do
@@ -58,6 +58,9 @@ jq -e --arg request_id "$request_id" '
   .request_id == $request_id
   and .status == "ok"
   and (.retrieval.bundle | type == "object")
+  and (.retrieval.bundle.retrieval_debug.truth_qualification | type == "object")
+  and .retrieval.prompt_assembly.memory_hygiene.attempted == true
+  and (.prompt.provider_prompt.fingerprint | type == "string")
   and (.prompt.ordered_layer_names | length > 0)
   and .prompt.token_accounting.budget_enforcement == "not_enforced"
   and (.model_calls | length == 1)
@@ -91,6 +94,7 @@ provider_calls="$(curl -fsS "http://127.0.0.1:14381/calls/$request_id")"
 jq -e --arg request_id "$request_id" '
   (.calls | map(select(.kind == "chat")) | length) == 1
   and (.calls | map(select(.kind == "chat")) | all(.request_id == $request_id))
+  and (.calls | map(select(.kind == "chat")) | all(.message_count >= 1))
 ' <<<"$provider_calls" >/dev/null
 
 echo "Composed smoke passed: request_id=$request_id status=$status"
