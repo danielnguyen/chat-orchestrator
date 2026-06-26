@@ -141,6 +141,34 @@ INSERT INTO memory_items (
 SQL
 }
 
+insert_memory_item_with_relationship() {
+  local owner="$1" ref_type="$2" ref_id="$3" status="$4" memory_id="$5" supersedes="$6" superseded_by="$7"
+  local hash supersedes_sql superseded_by_sql
+  hash="$(source_hash "$ref_type" "$ref_id")"
+  if [ -n "$supersedes" ]; then
+    supersedes_sql="'$supersedes'"
+  else
+    supersedes_sql="NULL"
+  fi
+  if [ -n "$superseded_by" ]; then
+    superseded_by_sql="'$superseded_by'"
+  else
+    superseded_by_sql="NULL"
+  fi
+  psql_exec >/dev/null <<SQL
+INSERT INTO memory_items (
+  id, owner_id, memory_type, summary, source_refs_json, source_ref_hash,
+  scores_json, promotion_state, status, confidence, explanation_json,
+  generation_trace_id, supersedes_memory_id, superseded_by_memory_id
+) VALUES (
+  '$memory_id', '$owner', 'fact', 'neutral smoke fixture',
+  '[{"ref_type":"$ref_type","ref_id":"$ref_id","support_kind":"direct"}]'::jsonb,
+  '$hash', '{}'::jsonb, 'promoted', '$status', 0.9, '{}'::jsonb,
+  'smoke-fixture', $supersedes_sql, $superseded_by_sql
+);
+SQL
+}
+
 resolve_conversation() {
   local owner="$1" client="$2" title="$3"
   bms_post "/v1/conversations/resolve" \
@@ -160,6 +188,15 @@ seed_canonical() {
   local message_id
   message_id="$(add_message "$conversation_id" "$owner" "$client" "assistant" "$content")"
   insert_memory_item "$owner" "message" "$message_id" "$status"
+  qdrant_upsert_message "$message_id" "$owner" "$conversation_id" "$client" "assistant"
+  echo "$message_id"
+}
+
+seed_canonical_with_memory_id() {
+  local conversation_id="$1" owner="$2" client="$3" content="$4" status="$5" memory_id="$6" supersedes="$7" superseded_by="$8"
+  local message_id
+  message_id="$(add_message "$conversation_id" "$owner" "$client" "assistant" "$content")"
+  insert_memory_item_with_relationship "$owner" "message" "$message_id" "$status" "$memory_id" "$supersedes" "$superseded_by"
   qdrant_upsert_message "$message_id" "$owner" "$conversation_id" "$client" "assistant"
   echo "$message_id"
 }
@@ -388,5 +425,40 @@ jq -e '
   and (.calls | map(select(.kind == "chat")) | all(.has_forbidden_beta_in_current == false))
 ' <<<"$provider_calls" >/dev/null
 
-echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback"
+# Scenario E: valid corrected replacement Alpha supersedes older Beta.
+owner="owner-smoke-e"
+client="client-smoke-e"
+conversation_id="$(resolve_conversation "$owner" "$client" "smoke-e")"
+old_memory_id="40000000-0000-4000-8000-000000000001"
+new_memory_id="40000000-0000-4000-8000-000000000002"
+seed_canonical_with_memory_id "$conversation_id" "$owner" "$client" "Old plan was Beta." "superseded" "$old_memory_id" "" "" >/dev/null
+seed_canonical_with_memory_id "$conversation_id" "$owner" "$client" "Current plan is Alpha." "corrected" "$new_memory_id" "$old_memory_id" "" >/dev/null
+psql_exec >/dev/null <<SQL
+UPDATE memory_items
+SET superseded_by_memory_id = '$new_memory_id'
+WHERE id = '$old_memory_id';
+SQL
+response="$(run_chat "$owner" "$client" "$conversation_id" "What is the current plan?")"
+request_id="$(jq -r '.request_id' <<<"$response")"
+answer="$(jq -r '.answer' <<<"$response")"
+test "$answer" = "Current plan is Alpha."
+trace="$(fetch_trace "$request_id")"
+provider_calls="$(fetch_provider_calls "$request_id")"
+assert_common_trace "$trace" "$request_id"
+assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+assert_runtime_memory_hygiene_count "$trace" "$request_id" 2
+jq -e '
+  .retrieval.prompt_assembly.memory_hygiene.truth_selection.corrected_replacement_count >= 1
+  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.valid_corrected_relationship_count >= 1
+  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.superseded_predecessor_omission_count >= 1
+  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.no_safe_current_evidence == false
+' <<<"$trace" >/dev/null
+jq -e '
+  (.calls | map(select(.kind == "chat")) | length) == 1
+  and (.calls | map(select(.kind == "chat")) | all(.has_current_memory_evidence == true))
+  and (.calls | map(select(.kind == "chat")) | all(.has_beta_marker == false))
+  and (.calls | map(select(.kind == "chat")) | all(.has_forbidden_beta_in_current == false))
+' <<<"$provider_calls" >/dev/null
+
+echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement"
 echo "Topology: CO branch -> deterministic provider stub; BMS main -> PostgreSQL 16 + Qdrant; CR main -> disposable SQLite."

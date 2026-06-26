@@ -3046,7 +3046,8 @@ async def orchestrate_chat(
             metadata={"request_id": request_id, "selected_model": selected_model},
         )
         prompt.trace["answer_persistence"] = {
-            "returned_and_persisted_answer_match": True,
+            "assistant_message_persisted": True,
+            "persistence_acknowledged": True,
             "persisted_role": "assistant",
         }
 

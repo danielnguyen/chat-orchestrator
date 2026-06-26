@@ -13,9 +13,14 @@ _VALID_FRESHNESS_STATES = {
     "active",
     "parked",
     "stale",
+    "contradicted",
     "superseded",
     "corrected",
+    "invalidated",
+    "expired",
+    "retracted",
     "forgotten_or_demoted",
+    "rebuilding",
     "unknown_freshness",
 }
 _VALID_RUNTIME_FRAMINGS = {
@@ -49,8 +54,12 @@ _VALID_SOURCE_AVAILABILITY = {
     "not_applicable",
 }
 _DERIVED_OMIT_FRESHNESS_STATES = {
+    "contradicted",
     "superseded",
+    "invalidated",
+    "retracted",
     "forgotten_or_demoted",
+    "rebuilding",
 }
 _DERIVED_OMIT_DURABLE_STATUSES = {
     "contradicted",
@@ -66,7 +75,12 @@ _FRESHNESS_FALLBACKS: dict[str, tuple[bool, bool, str, str]] = {
     "active": (True, True, "current", "active_fallback"),
     "parked": (True, False, "parked_or_historical", "parked_fallback"),
     "stale": (True, False, "stale_or_unverified", "stale_fallback"),
-    "corrected": (True, True, "corrected_replacement", "corrected_fallback"),
+    "corrected": (True, False, "unknown_or_unverified", "corrected_unverified_fallback"),
+    "contradicted": (False, False, "omit", "contradicted_fallback"),
+    "invalidated": (False, False, "omit", "invalidated_fallback"),
+    "expired": (True, False, "stale_or_unverified", "expired_fallback"),
+    "retracted": (False, False, "omit", "retracted_fallback"),
+    "rebuilding": (False, False, "omit", "rebuilding_fallback"),
     "superseded": (False, False, "omit", "superseded_fallback"),
     "forgotten_or_demoted": (
         False,
@@ -87,6 +101,7 @@ _FRESHNESS_FALLBACKS: dict[str, tuple[bool, bool, str, str]] = {
 class NormalizedMemoryHygienePayload:
     memory_id: str | None
     freshness_state: str
+    durable_status: str | None
     last_verified_at: str | None
     source_kind: str | None
     confidence: float | None
@@ -115,6 +130,13 @@ class MemoryHygieneOccurrence:
     evidence_role: str | None
     source_availability: str | None
     pre_cr_decision: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class CorrectedRelationshipState:
+    valid_keys: frozenset[tuple[str, int]]
+    invalid_keys: frozenset[tuple[str, int]]
+    predecessor_keys: frozenset[tuple[str, int]]
 
 
 @dataclass(frozen=True)
@@ -296,6 +318,88 @@ def _valid_provenance(item: dict[str, Any], owner_id: str) -> bool:
     return _valid_source_refs(provenance.get("source_refs"))
 
 
+def _item_identity_values(occurrence: MemoryHygieneOccurrence) -> set[str]:
+    values: set[str] = set()
+    memory_id = _bounded_string(occurrence.payload.memory_id)
+    if memory_id is not None:
+        values.add(memory_id)
+    source_key = _normalize_source_key(occurrence.item)
+    if source_key is not None:
+        values.add(source_key[1])
+    if occurrence.section in {"recent", "semantic"}:
+        message_id = _bounded_string(occurrence.item.get("message_id"))
+        if message_id is not None:
+            values.add(message_id)
+    elif occurrence.section == "artifact_refs":
+        artifact_id = _bounded_string(occurrence.item.get("artifact_id"))
+        if artifact_id is not None:
+            values.add(artifact_id)
+    return values
+
+
+def _stable_item_identity(occurrence: MemoryHygieneOccurrence) -> str | None:
+    memory_id = _bounded_string(occurrence.payload.memory_id)
+    if memory_id is not None:
+        return memory_id
+    source_key = _normalize_source_key(occurrence.item)
+    if source_key is not None:
+        return source_key[1]
+    return None
+
+
+def _corrected_relationship_state(
+    occurrences: list[MemoryHygieneOccurrence],
+) -> CorrectedRelationshipState:
+    identity_index: dict[str, list[MemoryHygieneOccurrence]] = {}
+    for occurrence in occurrences:
+        for identity in _item_identity_values(occurrence):
+            identity_index.setdefault(identity, []).append(occurrence)
+
+    valid_keys: set[tuple[str, int]] = set()
+    invalid_keys: set[tuple[str, int]] = set()
+    predecessor_keys: set[tuple[str, int]] = set()
+    for occurrence in occurrences:
+        durable_status = occurrence.payload.durable_status
+        if occurrence.payload.freshness_state != "corrected" and durable_status != "corrected":
+            continue
+        occurrence_key = (occurrence.section, occurrence.index)
+        identity = _stable_item_identity(occurrence)
+        supersedes = _bounded_string(occurrence.payload.supersedes)
+        superseded_by = _bounded_string(occurrence.payload.superseded_by)
+        if identity is None or supersedes is None or supersedes == identity or superseded_by:
+            invalid_keys.add(occurrence_key)
+            continue
+        predecessors = [
+            candidate
+            for candidate in identity_index.get(supersedes, [])
+            if (candidate.section, candidate.index) != occurrence_key
+        ]
+        if not predecessors:
+            invalid_keys.add(occurrence_key)
+            continue
+        if any(
+            candidate.item.get("owner_id") != occurrence.item.get("owner_id")
+            for candidate in predecessors
+        ):
+            invalid_keys.add(occurrence_key)
+            continue
+        if any(
+            _bounded_string(candidate.payload.superseded_by) not in {None, identity}
+            for candidate in predecessors
+        ):
+            invalid_keys.add(occurrence_key)
+            continue
+        valid_keys.add(occurrence_key)
+        for predecessor in predecessors:
+            predecessor_keys.add((predecessor.section, predecessor.index))
+
+    return CorrectedRelationshipState(
+        valid_keys=frozenset(valid_keys),
+        invalid_keys=frozenset(invalid_keys),
+        predecessor_keys=frozenset(predecessor_keys),
+    )
+
+
 def _canonical_unknown(reason: str, freshness_state: str) -> dict[str, Any]:
     return _decision_dict(
         freshness_state=freshness_state,
@@ -419,6 +523,7 @@ def _normalize_payload(item: dict[str, Any]) -> NormalizedMemoryHygienePayload:
     return NormalizedMemoryHygienePayload(
         memory_id=item.get("memory_id") if isinstance(item.get("memory_id"), str) else None,
         freshness_state=_normalize_freshness_state(item.get("freshness_state")),
+        durable_status=_normalize_durable_status(item.get("durable_status")),
         last_verified_at=(
             item.get("last_verified_at")
             if isinstance(item.get("last_verified_at"), str)
@@ -493,6 +598,93 @@ def _fallback_for_payload(payload: NormalizedMemoryHygienePayload) -> dict[str, 
     )
 
 
+def _local_permission_ceiling(
+    occurrence: MemoryHygieneOccurrence,
+    *,
+    corrected_relationships: CorrectedRelationshipState,
+) -> dict[str, Any]:
+    occurrence_key = (occurrence.section, occurrence.index)
+    freshness_state = occurrence.payload.freshness_state
+    durable_status = occurrence.payload.durable_status
+
+    if occurrence_key in corrected_relationships.predecessor_keys:
+        return _omit("superseded_predecessor_omitted", freshness_state)
+
+    if occurrence_key in corrected_relationships.invalid_keys:
+        if occurrence.evidence_role == "canonical":
+            return _canonical_unknown("invalid_corrected_relationship", freshness_state)
+        return _omit("invalid_corrected_relationship", freshness_state)
+
+    if occurrence_key in corrected_relationships.valid_keys:
+        return _decision_dict(
+            freshness_state="corrected",
+            use_allowed=True,
+            mention_as_current_allowed=True,
+            framing="corrected_replacement",
+        ) | {"reason": "valid_corrected_relationship"}
+
+    if durable_status in {
+        "contradicted",
+        "superseded",
+        "invalidated",
+        "retracted",
+        "forgotten_or_demoted",
+        "rebuilding",
+    } or freshness_state in {
+        "contradicted",
+        "superseded",
+        "invalidated",
+        "retracted",
+        "forgotten_or_demoted",
+        "rebuilding",
+    }:
+        return _omit("lifecycle_omitted", freshness_state)
+
+    if durable_status == "expired" or freshness_state == "expired":
+        return _decision_dict(
+            freshness_state="expired",
+            use_allowed=True,
+            mention_as_current_allowed=False,
+            framing="stale_or_unverified",
+        ) | {"reason": "expired_non_current"}
+
+    if durable_status == "parked" or freshness_state == "parked":
+        return _decision_dict(
+            freshness_state="parked",
+            use_allowed=True,
+            mention_as_current_allowed=False,
+            framing="parked_or_historical",
+        ) | {"reason": "parked_non_current"}
+
+    if durable_status == "stale" or freshness_state == "stale":
+        return _decision_dict(
+            freshness_state="stale",
+            use_allowed=True,
+            mention_as_current_allowed=False,
+            framing="stale_or_unverified",
+        ) | {"reason": "stale_non_current"}
+
+    if durable_status == "corrected" or freshness_state == "corrected":
+        if occurrence.evidence_role == "canonical":
+            return _canonical_unknown("corrected_relationship_unverified", freshness_state)
+        return _omit("corrected_relationship_unverified", freshness_state)
+
+    if freshness_state == "unknown_freshness":
+        return _decision_dict(
+            freshness_state="unknown_freshness",
+            use_allowed=True,
+            mention_as_current_allowed=False,
+            framing="unknown_or_unverified",
+        ) | {"reason": "unknown_non_current"}
+
+    return _decision_dict(
+        freshness_state="active",
+        use_allowed=True,
+        mention_as_current_allowed=True,
+        framing="current",
+    ) | {"reason": "active_current"}
+
+
 def _logical_source_fallback(
     occurrences: list[MemoryHygieneOccurrence],
 ) -> dict[str, Any]:
@@ -540,6 +732,16 @@ def _strict_runtime_decision(decision: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not isinstance(framing, str) or framing not in _VALID_RUNTIME_FRAMINGS:
         return None
+    if framing == "omit" and (use_allowed or mention_as_current_allowed):
+        return None
+    if not use_allowed and framing != "omit":
+        return None
+    if mention_as_current_allowed and framing not in _CURRENT_FRAMINGS:
+        return None
+    if framing in _CURRENT_FRAMINGS and not (use_allowed and mention_as_current_allowed):
+        return None
+    if framing in _NON_CURRENT_FRAMINGS and (not use_allowed or mention_as_current_allowed):
+        return None
 
     return _decision_dict(
         freshness_state=normalized_freshness_state,
@@ -547,6 +749,129 @@ def _strict_runtime_decision(decision: dict[str, Any]) -> dict[str, Any] | None:
         mention_as_current_allowed=mention_as_current_allowed,
         framing=framing,
     )
+
+
+def _freshness_restriction_rank(freshness_state: str) -> int:
+    if freshness_state in {
+        "contradicted",
+        "superseded",
+        "invalidated",
+        "retracted",
+        "forgotten_or_demoted",
+        "rebuilding",
+    }:
+        return 0
+    if freshness_state in {"parked", "stale", "expired", "unknown_freshness"}:
+        return 1
+    return 2
+
+
+def _framing_rank(framing: str) -> int:
+    if framing == "omit":
+        return 0
+    if framing in _NON_CURRENT_FRAMINGS:
+        return 1
+    return 2
+
+
+def _freshness_for_intersection(
+    local_decision: dict[str, Any],
+    runtime_decision: dict[str, Any],
+) -> str:
+    local_freshness = local_decision["freshness_state"]
+    runtime_freshness = runtime_decision["freshness_state"]
+    if _freshness_restriction_rank(runtime_freshness) < _freshness_restriction_rank(
+        local_freshness
+    ):
+        return runtime_freshness
+    return local_freshness
+
+
+def _intersect_decisions(
+    *,
+    local_decision: dict[str, Any],
+    runtime_decision: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    reasons: list[str] = []
+    local_framing = local_decision["framing"]
+    runtime_framing = runtime_decision["framing"]
+
+    if not local_decision["use_allowed"]:
+        if runtime_decision["use_allowed"] or runtime_framing != "omit":
+            reasons.append("runtime_exceeded_local_omit")
+        return {
+            key: local_decision[key]
+            for key in ("freshness_state", "use_allowed", "mention_as_current_allowed", "framing")
+        }, reasons
+
+    if not runtime_decision["use_allowed"]:
+        return _decision_dict(
+            freshness_state=_freshness_for_intersection(local_decision, runtime_decision),
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ), reasons
+
+    if local_framing == "corrected_replacement":
+        if runtime_framing == "omit":
+            return _decision_dict(
+                freshness_state="corrected",
+                use_allowed=False,
+                mention_as_current_allowed=False,
+                framing="omit",
+            ), reasons
+        if runtime_framing in _NON_CURRENT_FRAMINGS:
+            return _decision_dict(
+                freshness_state=runtime_decision["freshness_state"],
+                use_allowed=True,
+                mention_as_current_allowed=False,
+                framing=runtime_framing,
+            ), reasons
+        if runtime_framing == "current":
+            reasons.append("runtime_current_for_corrected_replacement")
+        return _decision_dict(
+            freshness_state="corrected",
+            use_allowed=True,
+            mention_as_current_allowed=True,
+            framing="corrected_replacement",
+        ), reasons
+
+    if runtime_framing == "corrected_replacement":
+        reasons.append("runtime_corrected_without_local_relationship")
+        runtime_framing = "current"
+
+    local_rank = _framing_rank(local_framing)
+    runtime_rank = _framing_rank(runtime_framing)
+    if runtime_rank > local_rank:
+        reasons.append("runtime_exceeded_local_currentness")
+        framing = local_framing
+    else:
+        framing = runtime_framing
+
+    freshness_state = _freshness_for_intersection(
+        local_decision,
+        {**runtime_decision, "framing": runtime_framing},
+    )
+    if framing == "omit":
+        return _decision_dict(
+            freshness_state=freshness_state,
+            use_allowed=False,
+            mention_as_current_allowed=False,
+            framing="omit",
+        ), reasons
+    if framing in _NON_CURRENT_FRAMINGS:
+        return _decision_dict(
+            freshness_state=freshness_state,
+            use_allowed=True,
+            mention_as_current_allowed=False,
+            framing=framing,
+        ), reasons
+    return _decision_dict(
+        freshness_state=freshness_state,
+        use_allowed=True,
+        mention_as_current_allowed=True,
+        framing="current",
+    ), reasons
 
 
 def _annotate_item(item: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
@@ -592,6 +917,7 @@ async def apply_memory_hygiene(
         )
 
     occurrences = _iter_occurrences(retrieval_bundle, owner_id=owner_id)
+    corrected_relationships = _corrected_relationship_state(occurrences)
     grouped: dict[RetrievalKey, list[MemoryHygieneOccurrence]] = {}
     invalid_occurrences: list[MemoryHygieneOccurrence] = []
     for occurrence in occurrences:
@@ -605,11 +931,16 @@ async def apply_memory_hygiene(
 
     ambiguous_keys: set[RetrievalKey] = set()
     runtime_items: list[dict[str, Any]] = []
+    local_permission_ceilings: dict[RetrievalKey, dict[str, Any]] = {}
     for key, key_occurrences in grouped.items():
         first_payload = key_occurrences[0].payload
         if any(occurrence.payload != first_payload for occurrence in key_occurrences[1:]):
             ambiguous_keys.add(key)
             continue
+        local_permission_ceilings[key] = _local_permission_ceiling(
+            key_occurrences[0],
+            corrected_relationships=corrected_relationships,
+        )
         runtime_items.append(first_payload.to_runtime_item(key=key))
 
     runtime_call_status = "skipped_no_submittable_items"
@@ -691,27 +1022,65 @@ async def apply_memory_hygiene(
     grouped_decisions: dict[RetrievalKey, dict[str, Any]] = {}
     fallback_applied = False
     missing_decision_keys: set[RetrievalKey] = set()
+    runtime_decision_narrowed_count = 0
+    runtime_decision_narrowing_reasons: dict[str, int] = {}
+
+    def intersect_for_key(
+        key: RetrievalKey,
+        runtime_decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal runtime_decision_narrowed_count
+        local_ceiling = local_permission_ceilings.get(key)
+        if local_ceiling is None:
+            local_ceiling = _local_permission_ceiling(
+                grouped[key][0],
+                corrected_relationships=corrected_relationships,
+            )
+        intersected, reasons = _intersect_decisions(
+            local_decision=local_ceiling,
+            runtime_decision=runtime_decision,
+        )
+        if reasons or _decision_key(intersected) != _decision_key(runtime_decision):
+            runtime_decision_narrowed_count += 1
+        for reason in reasons:
+            runtime_decision_narrowing_reasons[reason] = (
+                runtime_decision_narrowing_reasons.get(reason, 0) + 1
+            )
+        return intersected
+
     for key, key_occurrences in grouped.items():
         if key in ambiguous_keys:
-            grouped_decisions[key] = _logical_source_fallback(key_occurrences)
+            grouped_decisions[key] = intersect_for_key(
+                key,
+                _logical_source_fallback(key_occurrences),
+            )
             fallback_applied = True
             continue
         if key in conflicting_keys:
-            grouped_decisions[key] = _logical_source_fallback(key_occurrences)
+            grouped_decisions[key] = intersect_for_key(
+                key,
+                _logical_source_fallback(key_occurrences),
+            )
             fallback_applied = True
             missing_decision_keys.add(key)
             continue
         if key in invalid_decision_keys:
-            grouped_decisions[key] = _fallback_for_payload(key_occurrences[0].payload)
+            grouped_decisions[key] = intersect_for_key(
+                key,
+                _fallback_for_payload(key_occurrences[0].payload),
+            )
             fallback_applied = True
             missing_decision_keys.add(key)
             continue
         decision = valid_runtime_decisions.get(key)
         if decision is not None:
-            grouped_decisions[key] = decision
+            grouped_decisions[key] = intersect_for_key(key, decision)
             continue
         if runtime_items:
-            grouped_decisions[key] = _fallback_for_payload(key_occurrences[0].payload)
+            grouped_decisions[key] = intersect_for_key(
+                key,
+                _fallback_for_payload(key_occurrences[0].payload),
+            )
             fallback_applied = True
             missing_decision_keys.add(key)
 
@@ -762,7 +1131,7 @@ async def apply_memory_hygiene(
             else:
                 decision = grouped_decisions.get(key)
                 if decision is None:
-                    decision = _logical_source_fallback(grouped[key])
+                    decision = intersect_for_key(key, _logical_source_fallback(grouped[key]))
                     fallback_applied = True
 
             framing = decision["framing"]
@@ -808,6 +1177,11 @@ async def apply_memory_hygiene(
         evaluated_decision_count = len(valid_runtime_decisions)
     else:
         evaluated_decision_count = 0
+    local_permission_ceiling_applied_count = sum(
+        1
+        for decision in grouped_decisions.values()
+        if decision.get("framing") != "current" or decision.get("freshness_state") != "active"
+    )
 
     if runtime_call_status == "included":
         if fallback_applied:
@@ -842,6 +1216,9 @@ async def apply_memory_hygiene(
         "conflicting_decision_count": conflicting_decision_count,
         "invalid_decision_count": invalid_decision_count,
         "missing_decision_count": missing_decision_count,
+        "local_permission_ceiling_applied_count": local_permission_ceiling_applied_count,
+        "runtime_decision_narrowed_count": runtime_decision_narrowed_count,
+        "runtime_decision_narrowing_reasons": runtime_decision_narrowing_reasons,
         "truth_selection": {
             "current_canonical_evidence_count": current_canonical_count,
             "current_supported_derivative_count": current_supported_derived_count,
@@ -849,6 +1226,11 @@ async def apply_memory_hygiene(
             "stale_or_unverified_context_count": stale_or_unverified_count,
             "omitted_context_count": omitted_occurrence_count,
             "corrected_replacement_count": corrected_replacement_count,
+            "valid_corrected_relationship_count": len(corrected_relationships.valid_keys),
+            "invalid_corrected_relationship_count": len(corrected_relationships.invalid_keys),
+            "superseded_predecessor_omission_count": len(
+                corrected_relationships.predecessor_keys
+            ),
             "no_safe_current_evidence": no_safe_current_evidence,
             "pre_cr_rejection_reasons": _reason_counts(occurrences),
             "provider_visible_current_count": current_count,

@@ -197,6 +197,80 @@ class ReplayMemoryStore:
             semantic[0]["content"] = "Current plan is Alpha."
             artifacts[0]["snippet"] = "Unknown-durable derivative says Beta."
             artifacts[0]["durable_status"] = "mysterious"
+        elif mode == "truth_stale_overpermissive":
+            semantic[0]["content"] = "Old plan was Beta."
+            semantic[0]["freshness_state"] = "stale"
+            semantic[0]["durable_status"] = "stale"
+            artifacts = []
+        elif mode == "truth_parked_overpermissive":
+            semantic[0]["content"] = "Old plan was Beta."
+            semantic[0]["freshness_state"] = "parked"
+            semantic[0]["durable_status"] = "parked"
+            artifacts = []
+        elif mode == "truth_corrected_valid":
+            semantic[0].update(
+                {
+                    "message_id": "plan-beta-message",
+                    "content": "Old plan was Beta.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-beta"},
+                    "freshness_state": "superseded",
+                    "durable_status": "superseded",
+                    "memory_id": "memory-beta",
+                    "superseded_by": "memory-alpha",
+                }
+            )
+            semantic.append(
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "plan-alpha-message",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_missing_relationship":
+            semantic[0].update(
+                {
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_self_supersession":
+            semantic[0].update(
+                {
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-alpha",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_dangling":
+            semantic[0].update(
+                {
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                }
+            )
+            artifacts = []
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
@@ -341,7 +415,10 @@ class ReplayRuntime:
         for item in kwargs.get("items", []):
             freshness = item.get("freshness_state", "unknown_freshness")
             item_ref = item.get("item_ref")
-            if freshness == "active":
+            if self.scenario.get("memory_hygiene") == "overpermissive_current":
+                decision = (True, True, "current")
+                freshness = "active"
+            elif freshness == "active":
                 decision = (True, True, "current")
             elif freshness == "corrected":
                 decision = (True, True, "corrected_replacement")

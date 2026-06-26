@@ -392,6 +392,114 @@
       }
     },
     {
+      "scenario": "truth-stale-overpermissive-runtime",
+      "category": "truth_policy_ceiling",
+      "retrieval": "truth_stale_overpermissive",
+      "memory_hygiene": "overpermissive_current",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
+        "trace": {
+          "memory_hygiene": {
+            "runtime_decision_narrowed_count": 1,
+            "truth_selection": {
+              "stale_or_unverified_context_count": 1,
+              "provider_visible_current_count": 0,
+              "no_safe_current_evidence": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-parked-overpermissive-runtime",
+      "category": "truth_policy_ceiling",
+      "retrieval": "truth_parked_overpermissive",
+      "memory_hygiene": "overpermissive_current",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
+        "trace": {
+          "memory_hygiene": {
+            "runtime_decision_narrowed_count": 1,
+            "truth_selection": {
+              "historical_or_parked_context_count": 1,
+              "provider_visible_current_count": 0,
+              "no_safe_current_evidence": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-corrected-valid",
+      "category": "truth_corrected_relationship",
+      "retrieval": "truth_corrected_valid",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "current_alpha"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "corrected_replacement_count": 1,
+              "valid_corrected_relationship_count": 1,
+              "superseded_predecessor_omission_count": 1,
+              "omitted_context_count": 1,
+              "provider_visible_current_count": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-corrected-missing-relationship",
+      "category": "truth_corrected_invalid",
+      "retrieval": "truth_corrected_missing_relationship",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "corrected_replacement_count": 0,
+              "invalid_corrected_relationship_count": 1,
+              "provider_visible_current_count": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-corrected-self-supersession",
+      "category": "truth_corrected_invalid",
+      "retrieval": "truth_corrected_self_supersession",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "corrected_replacement_count": 0,
+              "invalid_corrected_relationship_count": 1,
+              "provider_visible_current_count": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "scenario": "truth-corrected-dangling",
+      "category": "truth_corrected_invalid",
+      "retrieval": "truth_corrected_dangling",
+      "expected": {
+        "outcome": {"status": "ok", "answer_category": "historical_or_unverified"},
+        "trace": {
+          "memory_hygiene": {
+            "truth_selection": {
+              "corrected_replacement_count": 0,
+              "invalid_corrected_relationship_count": 1,
+              "provider_visible_current_count": 0
+            }
+          }
+        }
+      }
+    },
+    {
       "scenario": "provider-exhaustion",
       "category": "provider_exhaustion",
       "provider": "exhausted",
