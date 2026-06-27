@@ -615,6 +615,11 @@ class TruthAwareLiteLLM(FakeLiteLLM):
             and "Current plan is Alpha." in current_section
         ):
             content = "Current plan is Alpha."
+        elif (
+            "Current memory evidence:" in current_section
+            and "Current fallback plan is Beta." in current_section
+        ):
+            content = "Current fallback plan is Beta."
         elif "Historical or unverified memory context:" in joined:
             content = "I only have historical or unverified context; the current plan is uncertain."
         else:
@@ -3893,14 +3898,14 @@ async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decision
                 "decisions": [
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
-                        "freshness_state": "active",
+                        "freshness_state": "stale",
                         "use_allowed": True,
-                        "mention_as_current_allowed": True,
-                        "framing": "current",
+                        "mention_as_current_allowed": False,
+                        "framing": "stale_or_unverified",
                     },
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
-                        "freshness_state": "active",
+                        "freshness_state": "invalidated",
                         "use_allowed": False,
                         "mention_as_current_allowed": False,
                         "framing": "omit",
@@ -4093,6 +4098,139 @@ async def test_orchestrate_memory_hygiene_valid_runtime_decision_still_works(tmp
     assert trace["invalid_decision_count"] == 0
 
 
+@pytest.mark.parametrize(
+    ("runtime_patch", "expected_fragment"),
+    [
+        (
+            {
+                "freshness_state": "stale",
+                "use_allowed": True,
+                "mention_as_current_allowed": True,
+                "framing": "current",
+            },
+            "Current memory evidence:",
+        ),
+        (
+            {
+                "freshness_state": "parked",
+                "use_allowed": True,
+                "mention_as_current_allowed": True,
+                "framing": "current",
+            },
+            "Current memory evidence:",
+        ),
+        (
+            {
+                "freshness_state": "unknown_freshness",
+                "use_allowed": True,
+                "mention_as_current_allowed": True,
+                "framing": "current",
+            },
+            "Current memory evidence:",
+        ),
+        (
+            {
+                "freshness_state": "active",
+                "use_allowed": True,
+                "mention_as_current_allowed": False,
+                "framing": "stale_or_unverified",
+            },
+            "Current memory evidence:",
+        ),
+        (
+            {
+                "freshness_state": "active",
+                "use_allowed": True,
+                "mention_as_current_allowed": False,
+                "framing": "parked_or_historical",
+            },
+            "Current memory evidence:",
+        ),
+        (
+            {
+                "freshness_state": "active",
+                "use_allowed": True,
+                "mention_as_current_allowed": True,
+                "framing": "corrected_replacement",
+            },
+            "Current memory evidence:",
+        ),
+        (
+            {
+                "freshness_state": "active",
+                "use_allowed": False,
+                "mention_as_current_allowed": False,
+                "framing": "omit",
+            },
+            "Current memory evidence:",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrate_memory_hygiene_runtime_freshness_framing_conflicts_fall_back(
+    tmp_path,
+    runtime_patch,
+    expected_fragment,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                _memory_item(
+                    section="semantic",
+                    ref_type="message",
+                    ref_id="plan-alpha",
+                    content="Current plan is Alpha.",
+                    freshness_state="active",
+                    durable_status="active",
+                    memory_id="memory-alpha",
+                )
+            ],
+        )
+    )
+    runtime = FakeRuntime(
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                        **runtime_patch,
+                    }
+                ]
+            }
+        }
+    )
+    litellm = TruthAwareLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is current?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id="rid-runtime-freshness-framing-conflict",
+    )
+
+    assert out["answer"] == "Current plan is Alpha."
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    assert expected_fragment in prompt_text
+    memory_hygiene = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "memory_hygiene"
+    ]
+    assert memory_hygiene["invalid_decision_count"] == 1
+    assert memory_hygiene["counts_by_framing"] == {"current": 1}
+    assert memory_hygiene["truth_selection"]["provider_visible_current_count"] == 1
+    assert "Current plan is Alpha." not in str(memory_hygiene)
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_duplicate_falls_back_once(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
@@ -4125,8 +4263,8 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_du
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
                         "freshness_state": "stale",
                         "use_allowed": True,
-                        "mention_as_current_allowed": True,
-                        "framing": "current",
+                        "mention_as_current_allowed": False,
+                        "framing": "stale_or_unverified",
                     },
                 ]
             }
@@ -4189,8 +4327,8 @@ async def test_orchestrate_memory_hygiene_valid_runtime_decision_then_invalid_du
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
                         "freshness_state": "stale",
                         "use_allowed": True,
-                        "mention_as_current_allowed": True,
-                        "framing": "current",
+                        "mention_as_current_allowed": False,
+                        "framing": "stale_or_unverified",
                     },
                     {
                         "item_ref": {"ref_type": "message", "ref_id": "shared-source"},
@@ -4724,7 +4862,7 @@ async def test_orchestrate_memory_hygiene_restricted_lifecycle_omits_even_if_run
         ),
         (
             {
-                "freshness_state": "active",
+                "freshness_state": "invalidated",
                 "use_allowed": False,
                 "mention_as_current_allowed": False,
                 "framing": "omit",
@@ -4958,6 +5096,202 @@ async def test_orchestrate_truth_selection_valid_corrected_replacement_omits_pre
     assert truth["valid_corrected_relationship_count"] == 1
     assert truth["superseded_predecessor_omission_count"] == 1
     assert truth["omitted_context_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("variant", "reason"),
+    [
+        ("malformed_source_ref", "derived_source_ref_invalid"),
+        ("missing_source", "derived_source_missing"),
+        ("cross_owner", "owner_mismatch"),
+        ("invalid_identity", "derived_identity_invalid"),
+        ("invalid_durable_status", "derived_durable_status_invalid"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrate_rejected_corrected_derivative_cannot_suppress_predecessor(
+    tmp_path,
+    variant,
+    reason,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    predecessor = _memory_item(
+        section="semantic",
+        ref_type="message",
+        ref_id="plan-beta",
+        content="Current fallback plan is Beta.",
+        freshness_state="active",
+        durable_status="active",
+        memory_id="memory-beta",
+    )
+    replacement = _memory_item(
+        section="artifact_refs",
+        ref_type="derived_text",
+        ref_id="plan-alpha",
+        content="Replacement plan is Alpha.",
+        freshness_state="corrected",
+        durable_status="corrected",
+        memory_id="memory-alpha",
+        supersedes="memory-beta",
+    )
+    if variant == "malformed_source_ref":
+        replacement["source_ref"] = {"ref_type": "", "ref_id": "plan-alpha"}
+    elif variant == "missing_source":
+        replacement["source_availability"] = "missing"
+    elif variant == "cross_owner":
+        replacement["owner_id"] = "other-owner"
+        replacement["provenance"]["owner_id"] = "other-owner"
+    elif variant == "invalid_identity":
+        replacement.pop("artifact_id")
+    elif variant == "invalid_durable_status":
+        replacement["durable_status"] = "mysterious"
+
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[predecessor],
+            artifact_refs=[replacement],
+        )
+    )
+    runtime = FakeRuntime()
+    litellm = TruthAwareLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is the current plan?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id=f"rid-rejected-corrected-{variant}",
+    )
+
+    assert out["answer"] == "Current fallback plan is Beta."
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    assert "Current fallback plan is Beta." in prompt_text
+    assert "Replacement plan is Alpha." not in prompt_text
+    assert all(
+        item["item_ref"] != {"ref_type": "derived_text", "ref_id": "plan-alpha"}
+        for item in runtime.memory_hygiene_calls[0]["items"]
+    )
+    memory_hygiene = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "memory_hygiene"
+    ]
+    truth = memory_hygiene["truth_selection"]
+    assert truth["valid_corrected_relationship_count"] == 0
+    assert truth["superseded_predecessor_omission_count"] == 0
+    assert truth["corrected_replacement_count"] == 0
+    assert truth["provider_visible_current_count"] == 1
+    assert truth["pre_cr_rejection_reasons"] == {reason: 1}
+
+
+@pytest.mark.parametrize(
+    ("variant", "reason"),
+    [
+        ("malformed_predecessor", "canonical_identity_invalid"),
+        ("cross_owner_predecessor", "owner_mismatch"),
+        ("missing_source_predecessor", "derived_source_missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrate_rejected_predecessor_cannot_validate_corrected_replacement(
+    tmp_path,
+    variant,
+    reason,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    replacement = _memory_item(
+        section="semantic",
+        ref_type="message",
+        ref_id="plan-alpha",
+        content="Replacement plan is Alpha.",
+        freshness_state="corrected",
+        durable_status="corrected",
+        memory_id="memory-alpha",
+        supersedes="memory-beta",
+    )
+    unrelated = _memory_item(
+        section="semantic",
+        ref_type="message",
+        ref_id="plan-gamma",
+        content="Unrelated current evidence remains present.",
+        freshness_state="active",
+        durable_status="active",
+        memory_id="memory-gamma",
+    )
+    semantic = [replacement, unrelated]
+    artifacts = []
+    if variant == "missing_source_predecessor":
+        artifacts.append(
+            _memory_item(
+                section="artifact_refs",
+                ref_type="derived_text",
+                ref_id="plan-beta",
+                content="Malformed predecessor Beta.",
+                freshness_state="active",
+                durable_status="active",
+                memory_id="memory-beta",
+                source_availability="missing",
+            )
+        )
+    else:
+        predecessor = _memory_item(
+            section="semantic",
+            ref_type="message",
+            ref_id="plan-beta",
+            content="Malformed predecessor Beta.",
+            freshness_state="active",
+            durable_status="active",
+            memory_id="memory-beta",
+        )
+        if variant == "malformed_predecessor":
+            predecessor.pop("message_id")
+        elif variant == "cross_owner_predecessor":
+            predecessor["owner_id"] = "other-owner"
+        semantic.insert(0, predecessor)
+
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(semantic=semantic, artifact_refs=artifacts)
+    )
+    litellm = TruthAwareLiteLLM()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "What is current?"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        memory_hygiene_enabled=True,
+        request_id=f"rid-rejected-predecessor-{variant}",
+    )
+
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    current_section = prompt_text.split("Historical or unverified memory context:")[0]
+    assert "Replacement plan is Alpha." not in current_section
+    assert "Unrelated current evidence remains present." in current_section
+    memory_hygiene = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "memory_hygiene"
+    ]
+    truth = memory_hygiene["truth_selection"]
+    assert truth["corrected_replacement_count"] == 0
+    assert truth["valid_corrected_relationship_count"] == 0
+    assert truth["invalid_corrected_relationship_count"] == 1
+    assert truth["superseded_predecessor_omission_count"] == 0
+    assert truth["provider_visible_current_count"] == 1
+    assert truth["pre_cr_rejection_reasons"] == {reason: 1}
 
 
 @pytest.mark.parametrize(

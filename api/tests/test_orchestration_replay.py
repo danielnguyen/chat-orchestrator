@@ -84,6 +84,8 @@ def test_required_orchestration_replay_categories_are_present():
         "truth_policy_ceiling",
         "truth_corrected_relationship",
         "truth_corrected_invalid",
+        "truth_relationship_authority",
+        "truth_cr_consistency",
         "provider_exhaustion",
         "no_fallback",
         "request_id_mismatch",

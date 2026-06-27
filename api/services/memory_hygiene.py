@@ -350,15 +350,18 @@ def _stable_item_identity(occurrence: MemoryHygieneOccurrence) -> str | None:
 def _corrected_relationship_state(
     occurrences: list[MemoryHygieneOccurrence],
 ) -> CorrectedRelationshipState:
+    relationship_eligible_occurrences = [
+        occurrence for occurrence in occurrences if occurrence.pre_cr_decision is None
+    ]
     identity_index: dict[str, list[MemoryHygieneOccurrence]] = {}
-    for occurrence in occurrences:
+    for occurrence in relationship_eligible_occurrences:
         for identity in _item_identity_values(occurrence):
             identity_index.setdefault(identity, []).append(occurrence)
 
     valid_keys: set[tuple[str, int]] = set()
     invalid_keys: set[tuple[str, int]] = set()
     predecessor_keys: set[tuple[str, int]] = set()
-    for occurrence in occurrences:
+    for occurrence in relationship_eligible_occurrences:
         durable_status = occurrence.payload.durable_status
         if occurrence.payload.freshness_state != "corrected" and durable_status != "corrected":
             continue
@@ -742,6 +745,38 @@ def _strict_runtime_decision(decision: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if framing in _NON_CURRENT_FRAMINGS and (not use_allowed or mention_as_current_allowed):
         return None
+    if framing == "current" and (
+        normalized_freshness_state != "active"
+        or not use_allowed
+        or not mention_as_current_allowed
+    ):
+        return None
+    if framing == "corrected_replacement" and (
+        normalized_freshness_state != "corrected"
+        or not use_allowed
+        or not mention_as_current_allowed
+    ):
+        return None
+    if framing == "parked_or_historical" and (
+        normalized_freshness_state != "parked"
+        or not use_allowed
+        or mention_as_current_allowed
+    ):
+        return None
+    if framing == "stale_or_unverified" and (
+        normalized_freshness_state not in {"stale", "expired"}
+        or not use_allowed
+        or mention_as_current_allowed
+    ):
+        return None
+    if framing == "unknown_or_unverified" and (
+        normalized_freshness_state != "unknown_freshness"
+        or not use_allowed
+        or mention_as_current_allowed
+    ):
+        return None
+    if framing == "omit" and normalized_freshness_state == "active":
+        return None
 
     return _decision_dict(
         freshness_state=normalized_freshness_state,
@@ -751,40 +786,12 @@ def _strict_runtime_decision(decision: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
-def _freshness_restriction_rank(freshness_state: str) -> int:
-    if freshness_state in {
-        "contradicted",
-        "superseded",
-        "invalidated",
-        "retracted",
-        "forgotten_or_demoted",
-        "rebuilding",
-    }:
+def _decision_rank(decision: dict[str, Any]) -> int:
+    if not decision["use_allowed"] or decision["framing"] == "omit":
         return 0
-    if freshness_state in {"parked", "stale", "expired", "unknown_freshness"}:
+    if not decision["mention_as_current_allowed"] or decision["framing"] in _NON_CURRENT_FRAMINGS:
         return 1
     return 2
-
-
-def _framing_rank(framing: str) -> int:
-    if framing == "omit":
-        return 0
-    if framing in _NON_CURRENT_FRAMINGS:
-        return 1
-    return 2
-
-
-def _freshness_for_intersection(
-    local_decision: dict[str, Any],
-    runtime_decision: dict[str, Any],
-) -> str:
-    local_freshness = local_decision["freshness_state"]
-    runtime_freshness = runtime_decision["freshness_state"]
-    if _freshness_restriction_rank(runtime_freshness) < _freshness_restriction_rank(
-        local_freshness
-    ):
-        return runtime_freshness
-    return local_freshness
 
 
 def _intersect_decisions(
@@ -805,12 +812,10 @@ def _intersect_decisions(
         }, reasons
 
     if not runtime_decision["use_allowed"]:
-        return _decision_dict(
-            freshness_state=_freshness_for_intersection(local_decision, runtime_decision),
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ), reasons
+        return {
+            key: runtime_decision[key]
+            for key in ("freshness_state", "use_allowed", "mention_as_current_allowed", "framing")
+        }, reasons
 
     if local_framing == "corrected_replacement":
         if runtime_framing == "omit":
@@ -839,39 +844,25 @@ def _intersect_decisions(
     if runtime_framing == "corrected_replacement":
         reasons.append("runtime_corrected_without_local_relationship")
         runtime_framing = "current"
+        runtime_decision = _decision_dict(
+            freshness_state="active",
+            use_allowed=True,
+            mention_as_current_allowed=True,
+            framing="current",
+        )
 
-    local_rank = _framing_rank(local_framing)
-    runtime_rank = _framing_rank(runtime_framing)
+    local_rank = _decision_rank(local_decision)
+    runtime_rank = _decision_rank(runtime_decision)
     if runtime_rank > local_rank:
         reasons.append("runtime_exceeded_local_currentness")
-        framing = local_framing
+        selected = local_decision
     else:
-        framing = runtime_framing
+        selected = runtime_decision
 
-    freshness_state = _freshness_for_intersection(
-        local_decision,
-        {**runtime_decision, "framing": runtime_framing},
-    )
-    if framing == "omit":
-        return _decision_dict(
-            freshness_state=freshness_state,
-            use_allowed=False,
-            mention_as_current_allowed=False,
-            framing="omit",
-        ), reasons
-    if framing in _NON_CURRENT_FRAMINGS:
-        return _decision_dict(
-            freshness_state=freshness_state,
-            use_allowed=True,
-            mention_as_current_allowed=False,
-            framing=framing,
-        ), reasons
-    return _decision_dict(
-        freshness_state=freshness_state,
-        use_allowed=True,
-        mention_as_current_allowed=True,
-        framing="current",
-    ), reasons
+    return {
+        key: selected[key]
+        for key in ("freshness_state", "use_allowed", "mention_as_current_allowed", "framing")
+    }, reasons
 
 
 def _annotate_item(item: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:

@@ -271,6 +271,56 @@ class ReplayMemoryStore:
                 }
             )
             artifacts = []
+        elif mode == "truth_corrected_rejected_replacement":
+            semantic[0].update(
+                {
+                    "content": "Current fallback plan is Beta.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-beta"},
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                    "memory_id": "memory-beta",
+                }
+            )
+            artifacts[0].update(
+                {
+                    "snippet": "Replacement plan is Alpha.",
+                    "source_ref": {"ref_type": "derived_text", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                    "source_availability": "missing",
+                }
+            )
+        elif mode == "truth_corrected_rejected_predecessor":
+            semantic[0].update(
+                {
+                    "message_id": "plan-beta-message",
+                    "content": "Malformed predecessor Beta.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-beta"},
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                    "memory_id": "memory-beta",
+                }
+            )
+            semantic[0].pop("message_id", None)
+            semantic.append(
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "plan-alpha-message",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Replacement plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                }
+            )
+            artifacts = []
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
@@ -418,6 +468,12 @@ class ReplayRuntime:
             if self.scenario.get("memory_hygiene") == "overpermissive_current":
                 decision = (True, True, "current")
                 freshness = "active"
+            elif self.scenario.get("memory_hygiene") == "stale_current_conflict":
+                decision = (True, True, "current")
+                freshness = "stale"
+            elif self.scenario.get("memory_hygiene") == "active_stale_framing_conflict":
+                decision = (True, False, "stale_or_unverified")
+                freshness = "active"
             elif freshness == "active":
                 decision = (True, True, "current")
             elif freshness == "corrected":
@@ -494,6 +550,8 @@ class ReplayProvider:
         joined = "\n".join(message.get("content", "") for message in kwargs["messages"])
         if "Current memory evidence:" in joined and "Current plan is Alpha." in joined:
             content = "Current plan is Alpha."
+        elif "Current memory evidence:" in joined and "Current fallback plan is Beta." in joined:
+            content = "Current fallback plan is Beta."
         elif "Historical or unverified memory context:" in joined:
             content = "I only have historical or unverified memory context."
         else:
@@ -520,6 +578,8 @@ def _answer_category(result: dict[str, Any] | None) -> str | None:
     answer = result.get("answer")
     if answer == "Current plan is Alpha.":
         return "current_alpha"
+    if answer == "Current fallback plan is Beta.":
+        return "current_beta"
     if answer == "I only have historical or unverified memory context.":
         return "historical_or_unverified"
     if answer == "neutral response":
