@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Any
 
+from services.assistant_handoff import AssistantHandoff
+from services.companion_presentation import CompanionPresentation
 from services.privacy_context import (
     PRIVACY_SENSITIVITY_LEVELS,
     PRIVACY_SURFACE_CATEGORIES,
     PRIVACY_ZONES,
 )
-from services.assistant_handoff import AssistantHandoff
-from services.companion_presentation import CompanionPresentation
 
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 VALID_GOVERNANCE_RESPONSE_POSTURES = {
@@ -83,6 +83,20 @@ def _memory_hygiene_prefix(item: dict[str, Any]) -> str:
     return ""
 
 
+def _truth_framing(item: dict[str, Any]) -> str:
+    framing = item.get("_truth_framing")
+    if isinstance(framing, str) and framing:
+        return framing
+    memory_hygiene = item.get("memory_hygiene")
+    if isinstance(memory_hygiene, dict) and isinstance(memory_hygiene.get("framing"), str):
+        return memory_hygiene["framing"]
+    return "current"
+
+
+def _is_current_truth_item(item: dict[str, Any]) -> bool:
+    return _truth_framing(item) in {"current", "corrected_replacement"}
+
+
 def build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
     bundle = retrieval_bundle.get("bundle", {})
     messages: list[dict[str, str]] = []
@@ -101,7 +115,43 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
     messages: list[dict[str, str]] = []
 
     semantic = bundle.get("semantic", []) or []
-    if semantic:
+    artifact_refs = bundle.get("artifact_refs", []) or []
+    truth_annotated = any(
+        isinstance(item, dict) and ("_truth_framing" in item or "memory_hygiene" in item)
+        for item in [*semantic, *artifact_refs]
+    )
+
+    current_lines: list[str] = ["Current memory evidence:"]
+    historical_lines: list[str] = ["Historical or unverified memory context:"]
+    current_count = 0
+    historical_count = 0
+
+    if truth_annotated:
+        for item in semantic:
+            target = current_lines if _is_current_truth_item(item) else historical_lines
+            if target is current_lines:
+                current_count += 1
+            else:
+                historical_count += 1
+            created_at = item.get("created_at", "")
+            role = item.get("role", "")
+            content = item.get("content", "")
+            target.append(f"- {_memory_hygiene_prefix(item)}[{created_at}] {role}: {content}")
+
+        for item in artifact_refs:
+            target = current_lines if _is_current_truth_item(item) else historical_lines
+            if target is current_lines:
+                current_count += 1
+            else:
+                historical_count += 1
+            repo_name = item.get("repo_name")
+            file_path = item.get("file_path", "")
+            label = f"{repo_name}/{file_path}" if repo_name else file_path
+            target.append(
+                f"- {_memory_hygiene_prefix(item)}[{label}] {item.get('snippet', '')}"
+            )
+
+    if not truth_annotated and semantic:
         lines = ["Retrieved memory excerpts:"]
         for item in semantic:
             created_at = item.get("created_at", "")
@@ -112,8 +162,7 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             )
         messages.append({"role": "system", "content": "\n".join(lines)})
 
-    artifact_refs = bundle.get("artifact_refs", []) or []
-    if artifact_refs:
+    if not truth_annotated and artifact_refs:
         lines = ["Retrieved file snippets:"]
         for item in artifact_refs:
             repo_name = item.get("repo_name")
@@ -124,6 +173,40 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             )
         messages.append({"role": "system", "content": "\n".join(lines)})
 
+    if not truth_annotated:
+        return messages
+
+    if current_count or historical_count:
+        guidance = ["Memory truth guidance:"]
+        if current_count:
+            guidance.append(
+                "- Use current canonical evidence as the primary basis for "
+                "current-state or next-action claims."
+            )
+            guidance.append("- Use supported active derived context only as augmentation.")
+        if historical_count:
+            guidance.append(
+                "- Do not use historical, parked, stale, expired, or unknown "
+                "context as proof of what is current."
+            )
+            guidance.append(
+                "- When only historical or unverified memory context is available, "
+                "state uncertainty or describe it historically."
+            )
+        if current_count == 0 and historical_count:
+            guidance.append(
+                "- The current state is not established by memory context in this turn."
+            )
+        guidance.append(
+            "- Do not mention internal freshness, provider, fallback, or orchestration mechanics."
+        )
+        messages.append({"role": "system", "content": "\n".join(guidance)})
+
+    if current_count:
+        messages.append({"role": "system", "content": "\n".join(current_lines)})
+    if historical_count:
+        messages.append({"role": "system", "content": "\n".join(historical_lines)})
+
     return messages
 
 
@@ -132,12 +215,23 @@ def retrieval_snippet_trace(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
     semantic = bundle.get("semantic", []) or []
     artifact_refs = bundle.get("artifact_refs", []) or []
     return {
+        "current_count": sum(
+            1
+            for item in [*semantic, *artifact_refs]
+            if isinstance(item, dict) and _is_current_truth_item(item)
+        ),
+        "historical_or_unverified_count": sum(
+            1
+            for item in [*semantic, *artifact_refs]
+            if isinstance(item, dict) and not _is_current_truth_item(item)
+        ),
         "semantic": [
             {
                 "message_id": item.get("message_id"),
                 "created_at": item.get("created_at"),
                 "role": item.get("role"),
                 "score": item.get("score"),
+                "truth_framing": _truth_framing(item),
             }
             for item in semantic
         ],
@@ -147,6 +241,7 @@ def retrieval_snippet_trace(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
                 "file_path": item.get("file_path"),
                 "repo_name": item.get("repo_name"),
                 "relevance_score": item.get("relevance_score"),
+                "truth_framing": _truth_framing(item),
             }
             for item in artifact_refs
         ],

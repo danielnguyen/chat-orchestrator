@@ -17,6 +17,8 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest-unprivileged
+    ports:
+      - "14391:6333"
     healthcheck:
       test: ["CMD-SHELL", "grep -Eq ':18BD .* 0A' /proc/net/tcp"]
       interval: 1s
@@ -112,6 +114,7 @@ services:
       COGNITIVE_RUNTIME_BASE_URL: http://runtime:8000
       COGNITIVE_RUNTIME_TIMEOUT_MS: "5000"
       ENABLE_RUNTIME_OVERLAYS: "true"
+      COGNITIVE_RUNTIME_MEMORY_HYGIENE_ENABLED: "true"
       LITELLM_BASE_URL: http://provider:8000
       ROUTER_RULES_PATH: /app/router/rules.yaml
       MODEL_REGISTRY_PATH: /app/router/model_registry.yaml

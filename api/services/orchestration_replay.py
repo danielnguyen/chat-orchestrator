@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from difflib import unified_diff
@@ -84,21 +85,49 @@ class ReplayMemoryStore:
         debug: dict[str, Any] = {"vector_status": "ok"}
         semantic: list[dict[str, Any]] = [
             {
+                "owner_id": "owner-replay",
+                "evidence_role": "canonical",
                 "message_id": "memory-1",
                 "created_at": "2026-01-01T00:00:00+00:00",
                 "role": "assistant",
                 "content": "neutral memory fixture",
                 "source_ref": {"ref_type": "message", "ref_id": "memory-1"},
+                "source_availability": "not_applicable",
                 "freshness_state": "active",
+                "durable_status": "active",
             }
         ]
         artifacts: list[dict[str, Any]] = [
             {
+                "owner_id": "owner-replay",
+                "evidence_role": "derived",
                 "artifact_id": "artifact-1",
                 "file_path": "fixture.txt",
                 "snippet": "neutral artifact fixture",
                 "source_ref": {"ref_type": "derived_text", "ref_id": "derived-1"},
+                "source_availability": "available",
+                "source_checks": [
+                    {
+                        "ref_type": "message",
+                        "ref_id": "memory-1",
+                        "support_kind": "direct",
+                        "availability": "available",
+                    }
+                ],
+                "provenance": {
+                    "derived_id": "derived-1",
+                    "owner_id": "owner-replay",
+                    "derivation_type": "derived_text",
+                    "source_refs": [
+                        {
+                            "ref_type": "message",
+                            "ref_id": "memory-1",
+                            "support_kind": "direct",
+                        }
+                    ],
+                },
                 "freshness_state": "active",
+                "durable_status": "active",
             }
         ]
         if mode == "missing_derivative":
@@ -125,6 +154,173 @@ class ReplayMemoryStore:
         elif mode == "artifact_unavailable":
             artifacts = []
             debug.update({"degraded": True, "fallback": "artifact_unavailable"})
+        elif mode == "truth_active_parked":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Old plan was Beta."
+            artifacts[0]["freshness_state"] = "parked"
+            artifacts[0]["durable_status"] = "parked"
+        elif mode == "truth_active_stale":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Old plan was Beta."
+            artifacts[0]["freshness_state"] = "stale"
+            artifacts[0]["durable_status"] = "stale"
+        elif mode == "truth_stale_only":
+            semantic[0]["content"] = "Old plan was Beta."
+            semantic[0]["freshness_state"] = "stale"
+            semantic[0]["durable_status"] = "stale"
+            artifacts = []
+        elif mode == "truth_missing_source":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Missing-source derivative says Beta."
+            artifacts[0]["source_availability"] = "missing"
+        elif mode == "truth_cross_owner":
+            semantic = []
+            artifacts[0]["owner_id"] = "other-owner"
+            artifacts[0]["snippet"] = "Cross-owner derivative says Beta."
+        elif mode == "truth_malformed_source_ref":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Malformed derivative says Beta."
+            artifacts[0]["source_ref"] = {"ref_type": "", "ref_id": "derived-1"}
+        elif mode == "truth_incomplete_source_check":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Incomplete-check derivative says Beta."
+            artifacts[0]["source_checks"] = [{"availability": "available"}]
+        elif mode == "truth_missing_provenance_identity":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Missing-provenance-id derivative says Beta."
+            artifacts[0]["provenance"].pop("derived_id", None)
+        elif mode == "truth_missing_provenance_type":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Missing-provenance-type derivative says Beta."
+            artifacts[0]["provenance"].pop("derivation_type", None)
+        elif mode == "truth_unknown_durable_status":
+            semantic[0]["content"] = "Current plan is Alpha."
+            artifacts[0]["snippet"] = "Unknown-durable derivative says Beta."
+            artifacts[0]["durable_status"] = "mysterious"
+        elif mode == "truth_stale_overpermissive":
+            semantic[0]["content"] = "Old plan was Beta."
+            semantic[0]["freshness_state"] = "stale"
+            semantic[0]["durable_status"] = "stale"
+            artifacts = []
+        elif mode == "truth_parked_overpermissive":
+            semantic[0]["content"] = "Old plan was Beta."
+            semantic[0]["freshness_state"] = "parked"
+            semantic[0]["durable_status"] = "parked"
+            artifacts = []
+        elif mode == "truth_corrected_valid":
+            semantic[0].update(
+                {
+                    "message_id": "plan-beta-message",
+                    "content": "Old plan was Beta.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-beta"},
+                    "freshness_state": "superseded",
+                    "durable_status": "superseded",
+                    "memory_id": "memory-beta",
+                    "superseded_by": "memory-alpha",
+                }
+            )
+            semantic.append(
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "plan-alpha-message",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_missing_relationship":
+            semantic[0].update(
+                {
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_self_supersession":
+            semantic[0].update(
+                {
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-alpha",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_dangling":
+            semantic[0].update(
+                {
+                    "content": "Current plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                }
+            )
+            artifacts = []
+        elif mode == "truth_corrected_rejected_replacement":
+            semantic[0].update(
+                {
+                    "content": "Current fallback plan is Beta.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-beta"},
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                    "memory_id": "memory-beta",
+                }
+            )
+            artifacts[0].update(
+                {
+                    "snippet": "Replacement plan is Alpha.",
+                    "source_ref": {"ref_type": "derived_text", "ref_id": "plan-alpha"},
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                    "source_availability": "missing",
+                }
+            )
+        elif mode == "truth_corrected_rejected_predecessor":
+            semantic[0].update(
+                {
+                    "message_id": "plan-beta-message",
+                    "content": "Malformed predecessor Beta.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-beta"},
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                    "memory_id": "memory-beta",
+                }
+            )
+            semantic[0].pop("message_id", None)
+            semantic.append(
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "plan-alpha-message",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Replacement plan is Alpha.",
+                    "source_ref": {"ref_type": "message", "ref_id": "plan-alpha"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "corrected",
+                    "durable_status": "corrected",
+                    "memory_id": "memory-alpha",
+                    "supersedes": "memory-beta",
+                }
+            )
+            artifacts = []
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
@@ -259,6 +455,59 @@ class ReplayRuntime:
             "omission_reason": "empty_runtime_state",
         }
 
+    async def evaluate_memory_hygiene(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_memory_hygiene", kwargs["request_id"])
+        if self.scenario.get("memory_hygiene") == "unavailable":
+            raise BoundaryFailure("memory_hygiene_unavailable")
+        if self.scenario.get("memory_hygiene") == "malformed":
+            return {"result": {"decisions": "invalid"}}
+        decisions: list[dict[str, Any]] = []
+        for item in kwargs.get("items", []):
+            freshness = item.get("freshness_state", "unknown_freshness")
+            item_ref = item.get("item_ref")
+            if self.scenario.get("memory_hygiene") == "overpermissive_current":
+                decision = (True, True, "current")
+                freshness = "active"
+            elif self.scenario.get("memory_hygiene") == "stale_current_conflict":
+                decision = (True, True, "current")
+                freshness = "stale"
+            elif self.scenario.get("memory_hygiene") == "active_stale_framing_conflict":
+                decision = (True, False, "stale_or_unverified")
+                freshness = "active"
+            elif freshness == "active":
+                decision = (True, True, "current")
+            elif freshness == "corrected":
+                decision = (True, True, "corrected_replacement")
+            elif freshness == "parked":
+                decision = (True, False, "parked_or_historical")
+            elif freshness == "stale":
+                decision = (True, False, "stale_or_unverified")
+            elif freshness == "unknown_freshness":
+                decision = (True, False, "unknown_or_unverified")
+            else:
+                decision = (False, False, "omit")
+            decisions.append(
+                {
+                    "item_ref": item_ref,
+                    "freshness_state": freshness,
+                    "use_allowed": decision[0],
+                    "mention_as_current_allowed": decision[1],
+                    "framing": decision[2],
+                }
+            )
+            if self.scenario.get("memory_hygiene") == "conflicting":
+                decisions.append(
+                    {
+                        "item_ref": item_ref,
+                        "freshness_state": freshness,
+                        "use_allowed": not decision[0],
+                        "mention_as_current_allowed": False,
+                        "framing": "omit",
+                    }
+                )
+                break
+        return {"result": {"decisions": decisions, "aggregate": {}}}
+
 
 class ReplayProvider:
     def __init__(self, scenario: dict[str, Any], calls: list[dict[str, Any]]) -> None:
@@ -278,6 +527,12 @@ class ReplayProvider:
                 "request_id": kwargs["request_id"],
                 "attempt": self.attempt,
                 "model": kwargs["model"],
+                "prompt_fingerprint": _message_fingerprint(kwargs.get("messages")),
+                "has_beta": "Beta" in "\n".join(
+                    message.get("content", "")
+                    for message in kwargs.get("messages", [])
+                    if isinstance(message, dict)
+                ),
             }
         )
         provider_mode = self.scenario.get("provider", "success")
@@ -292,7 +547,44 @@ class ReplayProvider:
                 request=request,
                 response=response,
             )
-        return {"choices": [{"message": {"content": "neutral response"}}]}
+        joined = "\n".join(message.get("content", "") for message in kwargs["messages"])
+        if "Current memory evidence:" in joined and "Current plan is Alpha." in joined:
+            content = "Current plan is Alpha."
+        elif "Current memory evidence:" in joined and "Current fallback plan is Beta." in joined:
+            content = "Current fallback plan is Beta."
+        elif "Historical or unverified memory context:" in joined:
+            content = "I only have historical or unverified memory context."
+        else:
+            content = "neutral response"
+        return {"choices": [{"message": {"content": content}}]}
+
+
+def _message_fingerprint(messages: Any) -> str:
+    normalized = [
+        {
+            "role": str(message.get("role", "")),
+            "content": str(message.get("content", "")),
+        }
+        for message in messages
+        if isinstance(message, dict)
+    ]
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _answer_category(result: dict[str, Any] | None) -> str | None:
+    if not result:
+        return None
+    answer = result.get("answer")
+    if answer == "Current plan is Alpha.":
+        return "current_alpha"
+    if answer == "Current fallback plan is Beta.":
+        return "current_beta"
+    if answer == "I only have historical or unverified memory context.":
+        return "historical_or_unverified"
+    if answer == "neutral response":
+        return "neutral"
+    return "other"
 
 
 def load_corpus(path: Path = DEFAULT_CORPUS_PATH) -> list[dict[str, Any]]:
@@ -336,6 +628,7 @@ def _normalize(
             "error_type": type(error).__name__ if error else None,
             "error_code": str(error) if isinstance(error, RuntimeError) else None,
             "selected_model": result.get("selected_model") if result else None,
+            "answer_category": _answer_category(result),
         },
         "call_order": [call["name"] for call in calls],
         "request_ids": [
@@ -356,6 +649,13 @@ def _normalize(
             "artifacts": artifacts,
             "references": trace.get("references", []),
             "retrieval": (trace.get("retrieval") or {}).get("bundle", {}),
+            "memory_hygiene": (
+                (trace.get("retrieval") or {})
+                .get("prompt_assembly", {})
+                .get("memory_hygiene", {})
+            ),
+            "provider_prompt": prompt.get("provider_prompt", {}),
+            "provider_fallback_context": prompt.get("provider_fallback_context", {}),
         },
         "runtime_terminal_status": runtime.terminal_status,
     }
@@ -383,6 +683,7 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
             model_registry_path=str(REGISTRY_PATH),
             allow_manual_override=False,
             enable_runtime_overlays=True,
+            memory_hygiene_enabled=True,
             request_id=request_id,
         )
     except Exception as exc:  # replay snapshots intentionally cover failures

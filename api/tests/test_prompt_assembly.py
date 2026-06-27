@@ -210,12 +210,11 @@ def test_assemble_prompt_applies_memory_hygiene_prefixes_without_changing_curren
         },
     )
 
-    assert out.messages[0]["content"] == (
-        "Retrieved memory excerpts:\n"
-        "- [freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: unknown memory"
-    )
+    assert out.messages[0]["content"].startswith("Memory truth guidance:\n")
+    assert "The current state is not established by memory context" in out.messages[0]["content"]
     assert out.messages[1]["content"] == (
-        "Retrieved file snippets:\n"
+        "Historical or unverified memory context:\n"
+        "- [freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: unknown memory\n"
         "- [stale or unverified context] [repo/api/main.py] stale snippet"
     )
     assert out.messages[2]["content"] == "[historical/parked context] parked history"
