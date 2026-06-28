@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,15 @@ from services.privacy_context import (
     PRIVACY_SENSITIVITY_LEVELS,
     PRIVACY_SURFACE_CATEGORIES,
     PRIVACY_ZONES,
+)
+from services.prompt_budget import (
+    PromptBudgetContract,
+    PromptBudgetError,
+    PromptBudgetResult,
+    estimate_prompt_tokens,
+    prompt_budget_failure_trace,
+    prompt_budget_trace,
+    validate_budget_contract,
 )
 
 VALID_ROLES = {"user", "assistant", "system", "tool"}
@@ -67,6 +77,14 @@ def _layer_trace(
         "message_count": len(messages),
         "metadata": metadata or {},
     }
+
+
+def _layer_with_messages(layer: dict[str, Any], messages: list[dict[str, str]]) -> dict[str, Any]:
+    return {**layer, "_messages": messages}
+
+
+def _strip_layer_messages(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in layer.items() if key != "_messages"} for layer in layers]
 
 
 def _memory_hygiene_prefix(item: dict[str, Any]) -> str:
@@ -147,9 +165,7 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             repo_name = item.get("repo_name")
             file_path = item.get("file_path", "")
             label = f"{repo_name}/{file_path}" if repo_name else file_path
-            target.append(
-                f"- {_memory_hygiene_prefix(item)}[{label}] {item.get('snippet', '')}"
-            )
+            target.append(f"- {_memory_hygiene_prefix(item)}[{label}] {item.get('snippet', '')}")
 
     if not truth_annotated and semantic:
         lines = ["Retrieved memory excerpts:"]
@@ -157,9 +173,7 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             created_at = item.get("created_at", "")
             role = item.get("role", "")
             content = item.get("content", "")
-            lines.append(
-                f"- {_memory_hygiene_prefix(item)}[{created_at}] {role}: {content}"
-            )
+            lines.append(f"- {_memory_hygiene_prefix(item)}[{created_at}] {role}: {content}")
         messages.append({"role": "system", "content": "\n".join(lines)})
 
     if not truth_annotated and artifact_refs:
@@ -168,9 +182,7 @@ def build_retrieval_messages(retrieval_bundle: dict[str, Any]) -> list[dict[str,
             repo_name = item.get("repo_name")
             file_path = item.get("file_path", "")
             label = f"{repo_name}/{file_path}" if repo_name else file_path
-            lines.append(
-                f"- {_memory_hygiene_prefix(item)}[{label}] {item.get('snippet', '')}"
-            )
+            lines.append(f"- {_memory_hygiene_prefix(item)}[{label}] {item.get('snippet', '')}")
         messages.append({"role": "system", "content": "\n".join(lines)})
 
     if not truth_annotated:
@@ -295,6 +307,295 @@ def external_context_trace(context_pack: dict[str, Any] | None) -> dict[str, Any
     }
 
 
+def _score_value(item: dict[str, Any]) -> float:
+    value = item.get("relevance_score", item.get("score", 0))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 0.0
+
+
+def _split_current_turn(
+    messages: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    final_user_index = None
+    for index, message in enumerate(messages):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            final_user_index = index
+    if final_user_index is None:
+        return messages[:], []
+    return messages[:final_user_index], messages[final_user_index:]
+
+
+def _retained_retrieval_ids(retrieval_bundle: dict[str, Any]) -> dict[str, list[str]]:
+    bundle = retrieval_bundle.get("bundle", {})
+    semantic = bundle.get("semantic", []) or []
+    artifacts = bundle.get("artifact_refs", []) or []
+    return {
+        "semantic_message_ids": [
+            item.get("message_id")
+            for item in semantic
+            if isinstance(item, dict) and isinstance(item.get("message_id"), str)
+        ],
+        "artifact_ids": [
+            item.get("artifact_id")
+            for item in artifacts
+            if isinstance(item, dict) and isinstance(item.get("artifact_id"), str)
+        ],
+    }
+
+
+def _apply_prompt_budget(
+    *,
+    contract: PromptBudgetContract,
+    base_layers: list[dict[str, Any]],
+    profile_messages: list[dict[str, str]],
+    style_messages: list[dict[str, str]],
+    response_shape_messages: list[dict[str, str]],
+    companion_messages: list[dict[str, str]],
+    interaction_governance_messages: list[dict[str, str]],
+    persona_containment_messages: list[dict[str, str]],
+    restraint_messages: list[dict[str, str]],
+    privacy_context_messages: list[dict[str, str]],
+    runtime_identity_messages: list[dict[str, str]],
+    world_state_messages: list[dict[str, str]],
+    relationship_context_messages: list[dict[str, str]],
+    runtime_messages: list[dict[str, str]],
+    retrieval_bundle: dict[str, Any],
+    external_context_pack: dict[str, Any] | None,
+    current_messages: list[dict[str, str]],
+) -> PromptBudgetResult:
+    effective_budget, profile_trace = validate_budget_contract(contract)
+    working_retrieval = deepcopy(retrieval_bundle)
+    working_external = (
+        deepcopy(external_context_pack) if isinstance(external_context_pack, dict) else None
+    )
+    request_history, current_turn = _split_current_turn(current_messages)
+    dropped: list[dict[str, Any]] = []
+    omitted_whole_layers: set[str] = set()
+
+    base_by_name = {layer.get("name"): layer for layer in base_layers}
+
+    def build() -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        ordered: list[tuple[str, list[dict[str, str]], dict[str, Any]]] = [
+            ("profile_overlay", profile_messages, {}),
+            (
+                "style_guidance",
+                [] if "style_guidance" in omitted_whole_layers else style_messages,
+                {},
+            ),
+            (
+                "response_shape",
+                [] if "response_shape" in omitted_whole_layers else response_shape_messages,
+                {},
+            ),
+            ("companion_policy", companion_messages, {}),
+            ("interaction_governance", interaction_governance_messages, {}),
+            ("persona_containment", persona_containment_messages, {}),
+            ("restraint", restraint_messages, {}),
+        ]
+        if privacy_context_messages:
+            ordered.append(("privacy_context", privacy_context_messages, {}))
+        ordered.extend(
+            [
+                ("runtime_identity", runtime_identity_messages, {}),
+                (
+                    "world_state",
+                    [] if "world_state" in omitted_whole_layers else world_state_messages,
+                    {},
+                ),
+                (
+                    "relationship_context",
+                    []
+                    if "relationship_context" in omitted_whole_layers
+                    else relationship_context_messages,
+                    {},
+                ),
+                (
+                    "runtime_overlay",
+                    [] if "runtime_overlay" in omitted_whole_layers else runtime_messages,
+                    {},
+                ),
+                (
+                    "external_source_context",
+                    build_external_context_messages(working_external),
+                    external_context_trace(working_external),
+                ),
+                (
+                    "retrieval_augmentation",
+                    build_retrieval_messages(working_retrieval),
+                    {"snippets": retrieval_snippet_trace(working_retrieval)},
+                ),
+                ("recent_history", build_recent_history(working_retrieval), {}),
+                ("current_messages", [*request_history, *current_turn], {}),
+            ]
+        )
+        messages_out: list[dict[str, str]] = []
+        layers_out: list[dict[str, Any]] = []
+        for name, layer_messages, metadata in ordered:
+            base_layer = base_by_name.get(name, {})
+            layer = _layer_trace(
+                name,
+                layer_messages,
+                metadata=metadata or base_layer.get("metadata", {}),
+            )
+            if name in omitted_whole_layers and not layer_messages:
+                layer["metadata"] = {
+                    **layer.get("metadata", {}),
+                    "omission_reason": "prompt_budget_layer_omitted",
+                }
+            messages_out.extend(layer_messages)
+            layers_out.append(_layer_with_messages(layer, layer_messages))
+        return messages_out, layers_out
+
+    before_messages, before_layers = build()
+    if estimate_prompt_tokens(before_messages) <= effective_budget:
+        after_layers = _strip_layer_messages(before_layers)
+        return PromptBudgetResult(
+            messages=before_messages,
+            layers=after_layers,
+            trace=prompt_budget_trace(
+                contract=contract,
+                effective_budget=effective_budget,
+                profile_trace=profile_trace,
+                before_messages=before_messages,
+                after_messages=before_messages,
+                before_layers=before_layers,
+                after_layers=before_layers,
+                dropped=[],
+                reason="not_required",
+                required_preserved=True,
+                current_turn_preserved=True,
+            ),
+            retained_source_ids=_retained_retrieval_ids(working_retrieval),
+        )
+
+    def drop_retrieval(*, want_current: bool, reason: str) -> bool:
+        bundle = working_retrieval.get("bundle", {})
+        candidates: list[tuple[float, int, str, int]] = []
+        stable = 0
+        for key in ("semantic", "artifact_refs"):
+            items = bundle.get(key, []) or []
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                if _is_current_truth_item(item) is want_current:
+                    candidates.append((_score_value(item), stable, key, index))
+                stable += 1
+        if not candidates:
+            return False
+        _, _, key, index = sorted(candidates, key=lambda row: (row[0], row[1]))[0]
+        bundle[key].pop(index)
+        dropped.append({"layer": "retrieval_augmentation", "reason": reason})
+        return True
+
+    def drop_external() -> bool:
+        if not isinstance(working_external, dict):
+            return False
+        items = working_external.get("items")
+        if not isinstance(items, list) or not items:
+            return False
+        candidates = [
+            (_score_value(item) if isinstance(item, dict) else 0.0, -index, index)
+            for index, item in enumerate(items)
+        ]
+        _, _, index = sorted(candidates, key=lambda row: (row[0], row[1]))[0]
+        items.pop(index)
+        dropped.append(
+            {"layer": "external_source_context", "reason": "prompt_budget_external_context_omitted"}
+        )
+        return True
+
+    reduction_layers = [
+        "world_state",
+        "relationship_context",
+        "runtime_overlay",
+        "style_guidance",
+        "response_shape",
+    ]
+
+    while True:
+        current, current_layers = build()
+        if estimate_prompt_tokens(current) <= effective_budget:
+            return PromptBudgetResult(
+                messages=current,
+                layers=_strip_layer_messages(current_layers),
+                trace=prompt_budget_trace(
+                    contract=contract,
+                    effective_budget=effective_budget,
+                    profile_trace=profile_trace,
+                    before_messages=before_messages,
+                    after_messages=current,
+                    before_layers=before_layers,
+                    after_layers=current_layers,
+                    dropped=dropped,
+                    reason="optional_context_reduced",
+                    required_preserved=True,
+                    current_turn_preserved=True,
+                ),
+                retained_source_ids=_retained_retrieval_ids(working_retrieval),
+            )
+
+        changed = False
+        if request_history:
+            request_history.pop(0)
+            dropped.append(
+                {"layer": "current_messages", "reason": "prompt_budget_request_history_omitted"}
+            )
+            changed = True
+        else:
+            bundle = working_retrieval.get("bundle", {})
+            recent = bundle.get("recent")
+            if isinstance(recent, list) and recent:
+                recent.pop(0)
+                dropped.append(
+                    {"layer": "recent_history", "reason": "prompt_budget_recent_history_omitted"}
+                )
+                changed = True
+            elif drop_retrieval(
+                want_current=False,
+                reason="prompt_budget_historical_retrieval_omitted",
+            ):
+                changed = True
+            elif drop_external():
+                changed = True
+            elif drop_retrieval(
+                want_current=True,
+                reason="prompt_budget_current_retrieval_omitted",
+            ):
+                changed = True
+            else:
+                for layer_name in reduction_layers:
+                    if layer_name not in omitted_whole_layers:
+                        layer = base_by_name.get(layer_name, {})
+                        if layer.get("message_count", 0) > 0:
+                            omitted_whole_layers.add(layer_name)
+                            dropped.append(
+                                {
+                                    "layer": layer_name,
+                                    "reason": "prompt_budget_optional_layer_omitted",
+                                }
+                            )
+                            changed = True
+                            break
+        if not changed:
+            failure_messages, failure_layers = build()
+            trace = prompt_budget_trace(
+                contract=contract,
+                effective_budget=effective_budget,
+                profile_trace=profile_trace,
+                before_messages=before_messages,
+                after_messages=failure_messages,
+                before_layers=before_layers,
+                after_layers=failure_layers,
+                dropped=dropped,
+                reason="required_prompt_content_exceeds_budget",
+                required_preserved=True,
+                current_turn_preserved=True,
+            )
+            trace["failure_reason"] = "required_prompt_content_exceeds_budget"
+            raise PromptBudgetError("required_prompt_content_exceeds_budget", trace)
+
+
 def _validated_governance_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
@@ -311,9 +612,7 @@ def _validated_label_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [
-        item
-        for item in value
-        if isinstance(item, str) and SAFE_GOVERNANCE_LABEL.fullmatch(item)
+        item for item in value if isinstance(item, str) and SAFE_GOVERNANCE_LABEL.fullmatch(item)
     ]
 
 
@@ -358,9 +657,7 @@ def _sanitize_interaction_governance(governance: dict[str, Any] | None) -> dict[
             and response_posture in VALID_GOVERNANCE_RESPONSE_POSTURES
             else None
         ),
-        "commentary_allowed": _validated_governance_bool(
-            governance.get("commentary_allowed")
-        ),
+        "commentary_allowed": _validated_governance_bool(governance.get("commentary_allowed")),
         "humor_allowed": _validated_governance_bool(governance.get("humor_allowed")),
         "clarifying_question_allowed": _validated_governance_bool(
             governance.get("clarifying_question_allowed")
@@ -369,13 +666,10 @@ def _sanitize_interaction_governance(governance: dict[str, Any] | None) -> dict[
         "requires_confirmation": _validated_governance_bool(
             governance.get("requires_confirmation")
         ),
-        "persona_scope_hint": _validated_governance_label(
-            governance.get("persona_scope_hint")
-        ),
+        "persona_scope_hint": _validated_governance_label(governance.get("persona_scope_hint")),
         "privacy_sensitivity_hint": (
             privacy_hint
-            if isinstance(privacy_hint, str)
-            and privacy_hint in VALID_GOVERNANCE_PRIVACY_HINTS
+            if isinstance(privacy_hint, str) and privacy_hint in VALID_GOVERNANCE_PRIVACY_HINTS
             else None
         ),
         "confidence": governance.get("confidence"),
@@ -512,7 +806,8 @@ def build_persona_containment_messages(
         or sanitized.get("allowed_tool_domains")
     ):
         lines.append(
-            "- Treat domain lists as scope guidance only; do not imply retrieval, tool access, world-state access, or relationship access occurred."
+            "- Treat domain lists as scope guidance only; do not imply retrieval, "
+            "tool access, world-state access, or relationship access occurred."
         )
 
     if sanitized.get("cross_scope_access_allowed") is True:
@@ -541,9 +836,7 @@ def persona_containment_trace(persona_trace: dict[str, Any] | None) -> dict[str,
         "allowed_memory_domains": sanitized.get("allowed_memory_domains", []),
         "blocked_memory_domains": sanitized.get("blocked_memory_domains", []),
         "allowed_world_state_domains": sanitized.get("allowed_world_state_domains", []),
-        "allowed_relationship_domains": sanitized.get(
-            "allowed_relationship_domains", []
-        ),
+        "allowed_relationship_domains": sanitized.get("allowed_relationship_domains", []),
         "allowed_tool_domains": sanitized.get("allowed_tool_domains", []),
         "cross_scope_access_allowed": sanitized.get("cross_scope_access_allowed"),
         "cross_scope_reason": sanitized.get("cross_scope_reason"),
@@ -557,15 +850,9 @@ def persona_containment_trace(persona_trace: dict[str, Any] | None) -> dict[str,
         "artifact_request_reason": persona_trace.get("artifact_request_reason"),
         "artifact_result_status": persona_trace.get("artifact_result_status"),
         "artifact_result_reason": persona_trace.get("artifact_result_reason"),
-        "artifact_result_count_omitted": persona_trace.get(
-            "artifact_result_count_omitted"
-        ),
-        "domain_retrieval_scope_status": persona_trace.get(
-            "domain_retrieval_scope_status"
-        ),
-        "domain_retrieval_scope_reason": persona_trace.get(
-            "domain_retrieval_scope_reason"
-        ),
+        "artifact_result_count_omitted": persona_trace.get("artifact_result_count_omitted"),
+        "domain_retrieval_scope_status": persona_trace.get("domain_retrieval_scope_status"),
+        "domain_retrieval_scope_reason": persona_trace.get("domain_retrieval_scope_reason"),
         "tool_scope_status": persona_trace.get("tool_scope_status"),
         "tool_scope_reason": persona_trace.get("tool_scope_reason"),
         "omission_reason": persona_trace.get("omission_reason"),
@@ -577,9 +864,7 @@ def _sanitize_restraint(restraint: dict[str, Any] | None) -> dict[str, Any]:
     policy = restraint.get("restraint_policy")
     return {
         "restraint_policy": (
-            policy
-            if isinstance(policy, str) and policy in VALID_RESTRAINT_POLICIES
-            else None
+            policy if isinstance(policy, str) and policy in VALID_RESTRAINT_POLICIES else None
         ),
         "domains": _validated_label_list(restraint.get("domains")),
         "reason": _validated_governance_label(restraint.get("reason")),
@@ -587,16 +872,12 @@ def _sanitize_restraint(restraint: dict[str, Any] | None) -> dict[str, Any]:
         "confidence": _validated_confidence(restraint.get("confidence")),
         "reason_summary": _validated_label_list(restraint.get("reason_summary")),
         "retrieval_suppressed": _validated_bool(restraint.get("retrieval_suppressed")),
-        "personalization_suppressed": _validated_bool(
-            restraint.get("personalization_suppressed")
-        ),
+        "personalization_suppressed": _validated_bool(restraint.get("personalization_suppressed")),
         "proactive_output_suppressed": _validated_bool(
             restraint.get("proactive_output_suppressed")
         ),
         "brevity_preferred": _validated_bool(restraint.get("brevity_preferred")),
-        "clarification_preferred": _validated_bool(
-            restraint.get("clarification_preferred")
-        ),
+        "clarification_preferred": _validated_bool(restraint.get("clarification_preferred")),
     }
 
 
@@ -613,9 +894,7 @@ def build_restraint_messages(restraint: dict[str, Any] | None) -> list[dict[str,
         lines.append(f"- Apply the {restraint_policy} restraint policy.")
 
     if sanitized.get("domains"):
-        lines.append(
-            f"- Affected restraint domains: {', '.join(sanitized['domains'])}."
-        )
+        lines.append(f"- Affected restraint domains: {', '.join(sanitized['domains'])}.")
 
     if sanitized.get("retrieval_suppressed") is True:
         lines.append("- Do not assume retrieval or prior context should be surfaced.")
@@ -679,11 +958,16 @@ def _sanitize_privacy_context(privacy_context: dict[str, Any] | None) -> dict[st
             else None
         ),
         "privacy_zone": (
-            privacy_zone if isinstance(privacy_zone, str) and privacy_zone in PRIVACY_ZONES else None
+            privacy_zone
+            if isinstance(privacy_zone, str) and privacy_zone in PRIVACY_ZONES
+            else None
         ),
         "sensitivity_level": (
             sensitivity_level
-            if isinstance(sensitivity_level, str) and sensitivity_level in PRIVACY_SENSITIVITY_LEVELS
+            if (
+                isinstance(sensitivity_level, str)
+                and sensitivity_level in PRIVACY_SENSITIVITY_LEVELS
+            )
             else None
         ),
         "sensitive_detail_allowed": _validated_bool(
@@ -695,9 +979,7 @@ def _sanitize_privacy_context(privacy_context: dict[str, Any] | None) -> dict[st
         "voice_detail_allowed": _validated_bool(privacy_context.get("voice_detail_allowed")),
         "screen_detail_allowed": _validated_bool(privacy_context.get("screen_detail_allowed")),
         "redaction_required": _validated_bool(privacy_context.get("redaction_required")),
-        "safe_summary_required": _validated_bool(
-            privacy_context.get("safe_summary_required")
-        ),
+        "safe_summary_required": _validated_bool(privacy_context.get("safe_summary_required")),
         "reason_codes": sanitized_reason_codes,
     }
 
@@ -710,13 +992,16 @@ def build_privacy_context_messages(
     if not isinstance(surface_type, str):
         return []
 
-    lines = [f"Privacy context guidance:", f"- Active channel type: {surface_type}."]
+    lines = ["Privacy context guidance:", f"- Active channel type: {surface_type}."]
     if sanitized.get("sensitive_detail_allowed") is True:
         lines.append("- Sensitive detail is allowed on this surface only when otherwise safe.")
     else:
         lines.append("- Sensitive detail is not allowed on this surface.")
 
-    if sanitized.get("safe_summary_required") is True or sanitized.get("redaction_required") is True:
+    if (
+        sanitized.get("safe_summary_required") is True
+        or sanitized.get("redaction_required") is True
+    ):
         lines.append("- Use a safe summary or full withholding instead of detailed disclosure.")
         lines.append("- Never expose raw memory details when a safe summary is required.")
 
@@ -813,6 +1098,7 @@ def assemble_prompt(
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
+    prompt_budget_contract: PromptBudgetContract | None = None,
 ) -> PromptAssembly:
     messages: list[dict[str, str]] = []
     layers: list[dict[str, Any]] = []
@@ -831,12 +1117,8 @@ def assemble_prompt(
             style_messages,
             metadata={
                 "source_fields": style_trace_out.get("source_fields", []),
-                "recognized_profile_fields": style_trace_out.get(
-                    "recognized_profile_fields", []
-                ),
-                "recognized_request_fields": style_trace_out.get(
-                    "recognized_request_fields", []
-                ),
+                "recognized_profile_fields": style_trace_out.get("recognized_profile_fields", []),
+                "recognized_request_fields": style_trace_out.get("recognized_request_fields", []),
                 "guidance_flags": style_trace_out.get("guidance_flags", {}),
                 "resolved_envelope": style_trace_out.get("resolved_envelope", {}),
                 "omission_reason": style_trace_out.get("omission_reason"),
@@ -846,9 +1128,7 @@ def assemble_prompt(
 
     response_shape_trace_out = dict(response_shape_trace or {})
     response_shape_messages = (
-        [{"role": "system", "content": response_shape_guidance}]
-        if response_shape_guidance
-        else []
+        [{"role": "system", "content": response_shape_guidance}] if response_shape_guidance else []
     )
     messages.extend(response_shape_messages)
     layers.append(
@@ -960,16 +1240,10 @@ def assemble_prompt(
         "scene_source": companion_trace_out.get("scene_source"),
         "warnings": companion_trace_out.get("warnings", []),
         "companion_profile_id": companion_trace_out.get("companion_profile_id"),
-        "companion_profile_version": companion_trace_out.get(
-            "companion_profile_version"
-        ),
+        "companion_profile_version": companion_trace_out.get("companion_profile_version"),
         "interaction_contract_id": companion_trace_out.get("interaction_contract_id"),
-        "interaction_contract_version": companion_trace_out.get(
-            "interaction_contract_version"
-        ),
-        "companion_policy_warnings": companion_trace_out.get(
-            "companion_policy_warnings", []
-        ),
+        "interaction_contract_version": companion_trace_out.get("interaction_contract_version"),
+        "companion_policy_warnings": companion_trace_out.get("companion_policy_warnings", []),
         "companion_overlay_ids": companion_trace_out.get("companion_overlay_ids", []),
         "runtime_overlay_ids": companion_trace_out.get("runtime_overlay_ids", []),
         "cognitive_runtime_compile_status": companion_trace_out.get(
@@ -993,9 +1267,7 @@ def assemble_prompt(
         )
     )
 
-    interaction_governance_messages = build_interaction_governance_messages(
-        interaction_governance
-    )
+    interaction_governance_messages = build_interaction_governance_messages(interaction_governance)
     governance_trace_out = interaction_governance_trace(interaction_governance_trace_data)
     if interaction_governance_messages:
         messages.extend(interaction_governance_messages)
@@ -1019,12 +1291,8 @@ def assemble_prompt(
                 "commentary_allowed": governance_trace_out.get("commentary_allowed"),
                 "humor_allowed": governance_trace_out.get("humor_allowed"),
                 "action_allowed": governance_trace_out.get("action_allowed"),
-                "requires_confirmation": governance_trace_out.get(
-                    "requires_confirmation"
-                ),
-                "privacy_sensitivity_hint": governance_trace_out.get(
-                    "privacy_sensitivity_hint"
-                ),
+                "requires_confirmation": governance_trace_out.get("requires_confirmation"),
+                "privacy_sensitivity_hint": governance_trace_out.get("privacy_sensitivity_hint"),
                 "confidence": governance_trace_out.get("confidence"),
                 "reason_summary": governance_trace_out.get("reason_summary", []),
                 "omission_reason": governance_trace_out.get("omission_reason"),
@@ -1033,9 +1301,7 @@ def assemble_prompt(
     )
 
     persona_containment_messages = build_persona_containment_messages(persona_containment)
-    persona_containment_trace_out = persona_containment_trace(
-        persona_containment_trace_data
-    )
+    persona_containment_trace_out = persona_containment_trace(persona_containment_trace_data)
     if persona_containment_messages:
         messages.extend(persona_containment_messages)
     elif (
@@ -1074,17 +1340,13 @@ def assemble_prompt(
                 "cross_scope_access_allowed": persona_containment_trace_out.get(
                     "cross_scope_access_allowed"
                 ),
-                "cross_scope_reason": persona_containment_trace_out.get(
-                    "cross_scope_reason"
-                ),
+                "cross_scope_reason": persona_containment_trace_out.get("cross_scope_reason"),
                 "confidence": persona_containment_trace_out.get("confidence"),
                 "reason_summary": persona_containment_trace_out.get("reason_summary", []),
                 "retrieval_scope_requested": persona_containment_trace_out.get(
                     "retrieval_scope_requested"
                 ),
-                "retrieval_scope_used": persona_containment_trace_out.get(
-                    "retrieval_scope_used"
-                ),
+                "retrieval_scope_used": persona_containment_trace_out.get("retrieval_scope_used"),
                 "retrieval_scope_status": persona_containment_trace_out.get(
                     "retrieval_scope_status"
                 ),
@@ -1112,12 +1374,8 @@ def assemble_prompt(
                 "domain_retrieval_scope_reason": persona_containment_trace_out.get(
                     "domain_retrieval_scope_reason"
                 ),
-                "tool_scope_status": persona_containment_trace_out.get(
-                    "tool_scope_status"
-                ),
-                "tool_scope_reason": persona_containment_trace_out.get(
-                    "tool_scope_reason"
-                ),
+                "tool_scope_status": persona_containment_trace_out.get("tool_scope_status"),
+                "tool_scope_reason": persona_containment_trace_out.get("tool_scope_reason"),
                 "omission_reason": persona_containment_trace_out.get("omission_reason"),
             },
         )
@@ -1146,16 +1404,12 @@ def assemble_prompt(
                 "confidence": restraint_trace_out.get("confidence"),
                 "reason_summary": restraint_trace_out.get("reason_summary", []),
                 "retrieval_suppressed": restraint_trace_out.get("retrieval_suppressed"),
-                "personalization_suppressed": restraint_trace_out.get(
-                    "personalization_suppressed"
-                ),
+                "personalization_suppressed": restraint_trace_out.get("personalization_suppressed"),
                 "proactive_output_suppressed": restraint_trace_out.get(
                     "proactive_output_suppressed"
                 ),
                 "brevity_preferred": restraint_trace_out.get("brevity_preferred"),
-                "clarification_preferred": restraint_trace_out.get(
-                    "clarification_preferred"
-                ),
+                "clarification_preferred": restraint_trace_out.get("clarification_preferred"),
                 "omission_reason": restraint_trace_out.get("omission_reason"),
             },
         )
@@ -1178,9 +1432,7 @@ def assemble_prompt(
                     "sensitive_detail_allowed": privacy_context_trace_out.get(
                         "sensitive_detail_allowed"
                     ),
-                    "safe_summary_required": privacy_context_trace_out.get(
-                        "safe_summary_required"
-                    ),
+                    "safe_summary_required": privacy_context_trace_out.get("safe_summary_required"),
                 },
             )
         )
@@ -1189,9 +1441,7 @@ def assemble_prompt(
     runtime_identity_trace_out = dict(runtime_identity_trace or {})
     runtime_identity_omission_reason = runtime_identity_trace_out.get("omission_reason")
     if runtime_identity and runtime_identity.get("content"):
-        runtime_identity_messages.append(
-            {"role": "system", "content": runtime_identity["content"]}
-        )
+        runtime_identity_messages.append({"role": "system", "content": runtime_identity["content"]})
         messages.extend(runtime_identity_messages)
     layers.append(
         _layer_trace(
@@ -1247,9 +1497,7 @@ def assemble_prompt(
 
     relationship_context_messages: list[dict[str, str]] = []
     relationship_context_trace_out = dict(relationship_context_trace or {})
-    relationship_context_omission_reason = relationship_context_trace_out.get(
-        "omission_reason"
-    )
+    relationship_context_omission_reason = relationship_context_trace_out.get("omission_reason")
     if relationship_context and relationship_context.get("prompt_content"):
         relationship_context_messages.append(
             {"role": "system", "content": relationship_context["prompt_content"]}
@@ -1284,9 +1532,7 @@ def assemble_prompt(
                 "relationship_confirmation_required": relationship_context_trace_out.get(
                     "relationship_confirmation_required", False
                 ),
-                "active_persona_id": relationship_context_trace_out.get(
-                    "active_persona_id"
-                ),
+                "active_persona_id": relationship_context_trace_out.get("active_persona_id"),
                 "allowed_relationship_scopes": relationship_context_trace_out.get(
                     "allowed_relationship_scopes", []
                 ),
@@ -1322,9 +1568,7 @@ def assemble_prompt(
                 else None,
                 "overlay_id": runtime_overlay_in.get("overlay_id") if runtime_overlay_in else None,
                 "overlay_type": (
-                    runtime_overlay_in.get("overlay_type")
-                    if runtime_overlay_in
-                    else None
+                    runtime_overlay_in.get("overlay_type") if runtime_overlay_in else None
                 ),
                 "source_fields": runtime_overlay_in.get("source_fields", [])
                 if runtime_overlay_in
@@ -1361,11 +1605,60 @@ def assemble_prompt(
     messages.extend(current_messages)
     layers.append(_layer_trace("current_messages", current_messages))
 
+    prompt_budget_trace_out: dict[str, Any] | None = None
+    retained_source_ids: dict[str, list[str]] | None = None
+    if prompt_budget_contract is not None:
+        try:
+            budget_result = _apply_prompt_budget(
+                contract=prompt_budget_contract,
+                base_layers=layers,
+                profile_messages=profile_messages,
+                style_messages=style_messages,
+                response_shape_messages=response_shape_messages,
+                companion_messages=companion_messages,
+                interaction_governance_messages=interaction_governance_messages,
+                persona_containment_messages=persona_containment_messages,
+                restraint_messages=restraint_messages,
+                privacy_context_messages=privacy_context_messages,
+                runtime_identity_messages=runtime_identity_messages,
+                world_state_messages=world_state_messages,
+                relationship_context_messages=relationship_context_messages,
+                runtime_messages=runtime_messages,
+                retrieval_bundle=retrieval_bundle,
+                external_context_pack=external_context_pack,
+                current_messages=current_messages,
+            )
+        except PromptBudgetError:
+            raise
+        except Exception as exc:
+            raise PromptBudgetError(
+                "prompt_budget_evaluation_failed",
+                prompt_budget_failure_trace(
+                    contract=prompt_budget_contract,
+                    failure_reason="prompt_budget_evaluation_failed",
+                ),
+            ) from exc
+        messages = budget_result.messages
+        layers = budget_result.layers
+        prompt_budget_trace_out = budget_result.trace
+        retained_source_ids = budget_result.retained_source_ids
+
     trace = {
         "layers": layers,
         "included_layers": [layer["name"] for layer in layers if layer["included"]],
         "omitted_layers": [layer["name"] for layer in layers if not layer["included"]],
-        "truncation": {"applied": False, "reason": None},
+        "truncation": {
+            "applied": bool(
+                prompt_budget_trace_out
+                and prompt_budget_trace_out.get("omission_or_truncation_occurred")
+            ),
+            "reason": (
+                prompt_budget_trace_out.get("status")
+                if prompt_budget_trace_out
+                and prompt_budget_trace_out.get("omission_or_truncation_occurred")
+                else None
+            ),
+        },
         "handoff": handoff.trace_summary() if handoff is not None else None,
         "presentation": presentation.trace_summary() if presentation is not None else None,
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
@@ -1373,8 +1666,7 @@ def assemble_prompt(
         or {"attempted": False, "status": "not_requested"},
         "surface_presence": surface_presence_trace
         or {"attempted": False, "status": "not_requested"},
-        "companion_policy": companion_trace_out
-        or {"attempted": False, "status": "not_requested"},
+        "companion_policy": companion_trace_out or {"attempted": False, "status": "not_requested"},
         "interaction_governance": governance_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "persona_containment": persona_containment_trace_out
@@ -1394,6 +1686,9 @@ def assemble_prompt(
         "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
         "message_count": len(messages),
     }
+    if prompt_budget_trace_out is not None:
+        trace["prompt_budget"] = prompt_budget_trace_out
+        trace["retained_source_ids"] = retained_source_ids or {}
     if interrupt_trace is not None:
         trace["interrupt_policy"] = interrupt_trace
 

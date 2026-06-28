@@ -88,8 +88,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
     ]
     assert out.messages[0]["content"] == "profile text"
     assert out.messages[1]["content"] == (
-        "Retrieved memory excerpts:\n"
-        "- [2026-01-01T00:00:00+00:00] assistant: semantic note"
+        "Retrieved memory excerpts:\n" "- [2026-01-01T00:00:00+00:00] assistant: semantic note"
     )
     assert out.messages[2]["content"] == (
         "Retrieved file snippets:\n- [repo/api/main.py] def entrypoint(): pass"
@@ -214,7 +213,8 @@ def test_assemble_prompt_applies_memory_hygiene_prefixes_without_changing_curren
     assert "The current state is not established by memory context" in out.messages[0]["content"]
     assert out.messages[1]["content"] == (
         "Historical or unverified memory context:\n"
-        "- [freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: unknown memory\n"
+        "- [freshness unknown; do not treat as current] "
+        "[2026-01-01T00:00:00+00:00] assistant: unknown memory\n"
         "- [stale or unverified context] [repo/api/main.py] stale snippet"
     )
     assert out.messages[2]["content"] == "[historical/parked context] parked history"
@@ -287,7 +287,9 @@ def test_assemble_prompt_includes_compact_external_source_context_without_text_i
         "Battery replacement. Date: 2025-07-12."
     )
     assert "external_source_context" in out.trace["included_layers"]
-    layer = next(layer for layer in out.trace["layers"] if layer["name"] == "external_source_context")
+    layer = next(
+        layer for layer in out.trace["layers"] if layer["name"] == "external_source_context"
+    )
     assert layer["metadata"] == {
         "item_count": 1,
         "sources_used": ["vehicle_log_primary"],
@@ -340,8 +342,7 @@ def test_assemble_prompt_includes_response_shape_after_style_guidance():
             "resolved_envelope": {"sentence_length": "short"},
         },
         response_shape_guidance=(
-            "Response shape guidance:\n"
-            "- Write for spoken delivery with plain, speakable text."
+            "Response shape guidance:\n" "- Write for spoken delivery with plain, speakable text."
         ),
         response_shape_trace={
             "attempted": True,
@@ -672,7 +673,7 @@ def test_assemble_prompt_marks_unusable_interaction_governance_as_failed():
         retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
         current_messages=[{"role": "user", "content": "hi"}],
         interaction_governance={
-            "response_posture": 'drop_table();',
+            "response_posture": "drop_table();",
             "commentary_allowed": "false",
             "humor_allowed": "false",
             "privacy_sensitivity_hint": "super-secret",
@@ -683,7 +684,7 @@ def test_assemble_prompt_marks_unusable_interaction_governance_as_failed():
             "status": "included",
             "included": True,
             "runtime_call_status": "included",
-            "response_posture": 'drop_table();',
+            "response_posture": "drop_table();",
             "commentary_allowed": "false",
             "humor_allowed": "false",
             "privacy_sensitivity_hint": "super-secret",
@@ -799,7 +800,8 @@ def test_assemble_prompt_includes_persona_containment_and_restraint_before_retri
         "- Memory scope hints for this turn: technical, project.\n"
         "- Treat these memory domains as blocked scope hints: finance.\n"
         "- Tool scope hints for this turn: technical.\n"
-        "- Treat domain lists as scope guidance only; do not imply retrieval, tool access, world-state access, or relationship access occurred.\n"
+        "- Treat domain lists as scope guidance only; do not imply retrieval, "
+        "tool access, world-state access, or relationship access occurred.\n"
         "- Do not bridge blocked or unrelated domains unless the user explicitly requests it."
     )
     assert out.messages[1]["content"] == (
@@ -1010,8 +1012,7 @@ def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_re
             "resolved_envelope": {"sentence_length": "short"},
         },
         response_shape_guidance=(
-            "Response shape guidance:\n"
-            "- Lead with the answer before any supporting detail."
+            "Response shape guidance:\n" "- Lead with the answer before any supporting detail."
         ),
         response_shape_trace={
             "attempted": True,
@@ -1058,10 +1059,11 @@ def test_assemble_prompt_includes_runtime_overlay_after_response_shape_before_re
         "retrieval_augmentation",
         "current_messages",
     ]
-    runtime_layer = next(layer for layer in out.trace["layers"] if layer["name"] == "runtime_overlay")
+    runtime_layer = next(
+        layer for layer in out.trace["layers"] if layer["name"] == "runtime_overlay"
+    )
     assert runtime_layer["metadata"]["runtime_state_id"] == "rtstate_1"
     assert out.trace["runtime"]["status"] == "included"
-
 
 
 def test_assemble_prompt_omits_runtime_overlay_with_non_system_role():
@@ -1088,12 +1090,13 @@ def test_assemble_prompt_omits_runtime_overlay_with_non_system_role():
 
     assert out.messages == [{"role": "user", "content": "hi"}]
     assert "runtime_overlay" in out.trace["omitted_layers"]
-    runtime_layer = next(layer for layer in out.trace["layers"] if layer["name"] == "runtime_overlay")
+    runtime_layer = next(
+        layer for layer in out.trace["layers"] if layer["name"] == "runtime_overlay"
+    )
     assert runtime_layer["metadata"]["omission_reason"] == "invalid_runtime_overlay_role"
     assert out.trace["runtime"]["status"] == "omitted"
     assert out.trace["runtime"]["included"] is False
     assert out.trace["runtime"]["omission_reason"] == "invalid_runtime_overlay_role"
-
 
 
 def test_assemble_prompt_includes_companion_policy_after_response_shape_before_runtime_overlay():
@@ -1113,8 +1116,7 @@ def test_assemble_prompt_includes_companion_policy_after_response_shape_before_r
             "resolved_envelope": {"analogy_density": "low"},
         },
         response_shape_guidance=(
-            "Response shape guidance:\n"
-            "- Lead with the answer before any supporting detail."
+            "Response shape guidance:\n" "- Lead with the answer before any supporting detail."
         ),
         response_shape_trace={
             "attempted": True,
@@ -1267,7 +1269,10 @@ def test_assemble_prompt_places_world_state_after_runtime_identity_before_runtim
             "surface_id": "vscode",
         },
         world_state={
-            "prompt_content": "World state:\n- active_repository/branch_status: {\"branch\": \"main\"} (fresh)",
+            "prompt_content": (
+                'World state:\n- active_repository/branch_status: {"branch": "main"} '
+                "(fresh)"
+            ),
         },
         world_state_trace={
             "attempted": True,
@@ -1296,7 +1301,7 @@ def test_assemble_prompt_places_world_state_after_runtime_identity_before_runtim
             "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
             "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
         ),
-        "World state:\n- active_repository/branch_status: {\"branch\": \"main\"} (fresh)",
+        'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)',
         "Runtime context: scene=planning.",
     ]
     assert out.trace["included_layers"] == [
@@ -1314,7 +1319,6 @@ def test_assemble_prompt_places_world_state_after_runtime_identity_before_runtim
     assert identity_layer["metadata"]["active_persona_id"] == "technical_architect"
     assert out.trace["runtime_identity"]["status"] == "included"
     assert out.trace["world_state"]["included_claim_count"] == 1
-
 
 
 def test_assemble_prompt_omits_companion_policy_with_non_system_role():

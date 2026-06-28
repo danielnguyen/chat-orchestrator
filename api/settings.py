@@ -66,6 +66,16 @@ class Settings(BaseSettings):
         default="shadow",
         alias="RESPONSE_ACTION_MODE",
     )
+    prompt_output_token_reserve: int = Field(
+        default=2048,
+        alias="PROMPT_OUTPUT_TOKEN_RESERVE",
+        ge=0,
+    )
+    prompt_context_safety_margin: int = Field(
+        default=256,
+        alias="PROMPT_CONTEXT_SAFETY_MARGIN",
+        ge=0,
+    )
 
     offline_provider: str = Field(default="litellm-local", alias="OFFLINE_PROVIDER")
     ollama_base_url: str | None = Field(default=None, alias="OLLAMA_BASE_URL")
