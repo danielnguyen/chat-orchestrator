@@ -5,6 +5,7 @@ from typing import Any
 
 ESTIMATOR_ID = "co-local-utf8-v1"
 BUDGET_CONTRACT_VERSION = "prompt-input-budget-v1"
+ESTIMATED_GLOBAL_PROMPT_OVERHEAD_TOKENS = 2
 
 
 class PromptBudgetError(RuntimeError):
@@ -55,7 +56,11 @@ def estimate_message_tokens(message: dict[str, str]) -> int:
 
 
 def estimate_prompt_tokens(messages: list[dict[str, str]]) -> int:
-    return 2 + sum(estimate_message_tokens(message) for message in messages)
+    return ESTIMATED_GLOBAL_PROMPT_OVERHEAD_TOKENS + estimate_messages_tokens(messages)
+
+
+def estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+    return sum(estimate_message_tokens(message) for message in messages)
 
 
 def validate_budget_contract(contract: PromptBudgetContract) -> tuple[int, dict[str, Any]]:
@@ -163,8 +168,17 @@ def _base_trace(
         "context_safety_margin": contract.context_safety_margin,
         "profile_clamp": profile_trace,
         "effective_hard_input_budget": effective_hard_input_budget,
+        "estimated_global_prompt_overhead_tokens": ESTIMATED_GLOBAL_PROMPT_OVERHEAD_TOKENS,
         "failure_reason": failure_reason,
     }
+
+
+def prompt_budget_failure_trace(
+    *,
+    contract: PromptBudgetContract,
+    failure_reason: str,
+) -> dict[str, Any]:
+    return _base_trace(contract, failure_reason=failure_reason)
 
 
 def prompt_budget_trace(
@@ -199,6 +213,7 @@ def prompt_budget_trace(
         {
             "estimated_tokens_before_budgeting": before_estimate,
             "estimated_tokens_after_budgeting": after_estimate,
+            "estimated_global_prompt_overhead_tokens": ESTIMATED_GLOBAL_PROMPT_OVERHEAD_TOKENS,
             "final_within_budget": after_estimate <= effective_budget,
             "omission_or_truncation_occurred": bool(dropped),
             "required_content_preserved": required_preserved,
@@ -226,17 +241,24 @@ def _layer_budget_summary(
         after = after_by_name.get(name, {})
         before_messages = before.get("_messages", [])
         after_messages = after.get("_messages", [])
+        before_estimated_tokens = estimate_messages_tokens(before_messages)
+        after_estimated_tokens = estimate_messages_tokens(after_messages)
         rows.append(
             {
                 "name": name,
-                "before_estimated_tokens": estimate_prompt_tokens(before_messages)
-                if before_messages
-                else 0,
-                "after_estimated_tokens": estimate_prompt_tokens(after_messages)
-                if after_messages
-                else 0,
+                "before_estimated_tokens": before_estimated_tokens,
+                "after_estimated_tokens": after_estimated_tokens,
                 "before_message_count": len(before_messages),
                 "after_message_count": len(after_messages),
             }
         )
+    rows.append(
+        {
+            "name": "global_prompt_framing",
+            "before_estimated_tokens": ESTIMATED_GLOBAL_PROMPT_OVERHEAD_TOKENS,
+            "after_estimated_tokens": ESTIMATED_GLOBAL_PROMPT_OVERHEAD_TOKENS,
+            "before_message_count": 0,
+            "after_message_count": 0,
+        }
+    )
     return rows

@@ -2788,11 +2788,12 @@ async def orchestrate_chat(
                 ),
             )
         except PromptBudgetError as budget_error:
+            truncation_applied = bool(budget_error.trace.get("omission_or_truncation_occurred"))
             budget_prompt_trace = {
                 "prompt_budget": budget_error.trace,
                 "truncation": {
-                    "applied": True,
-                    "reason": budget_error.reason,
+                    "applied": truncation_applied,
+                    "reason": (budget_error.trace.get("status") if truncation_applied else None),
                 },
                 "style": style_trace,
                 "response_shape": response_shape_trace,

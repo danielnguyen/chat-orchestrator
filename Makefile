@@ -31,10 +31,10 @@ replay-test:
 	@cd api && ./.venv/bin/python -m pytest -q tests/test_orchestration_replay.py
 
 prompt-budget-test:
-	@cd api && ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_orchestrate_flow.py tests/test_offline_fallback.py tests/test_orchestration_replay.py
+	@cd api && ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_prompt_budget_smoke.py tests/test_orchestrate_flow.py tests/test_offline_fallback.py tests/test_orchestration_replay.py
 
 prompt-budget-smoke:
-	@cd api && ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_orchestrate_flow.py::test_orchestrate_provider_fallback_reuses_identical_truth_qualified_messages tests/test_orchestrate_flow.py::test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
+	@cd api && ./.venv/bin/python -m pytest -q tests/test_prompt_budget_smoke.py
 
 composed-smoke:
 	@./scripts/composed_smoke.sh

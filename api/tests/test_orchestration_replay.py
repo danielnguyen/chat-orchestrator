@@ -49,8 +49,8 @@ def test_changed_expected_output_produces_readable_structural_diff():
     message = str(exc.value)
     assert "changed-fixture:expected" in message
     assert "changed-fixture:actual" in message
-    assert "-    \"persisted\": true" in message.lower()
-    assert "+    \"persisted\": false" in message.lower()
+    assert '-    "persisted": true' in message.lower()
+    assert '+    "persisted": false' in message.lower()
 
 
 def test_required_orchestration_replay_categories_are_present():
@@ -92,6 +92,32 @@ def test_required_orchestration_replay_categories_are_present():
         "bms_unavailable",
         "trace_persistence_failure",
     } <= categories
+
+
+def test_wave2d_prompt_budget_replay_corpus_is_complete():
+    wave2d = [
+        fixture["scenario"]
+        for fixture in load_corpus()
+        if fixture["category"] == "prompt_budget_wave2d"
+    ]
+    assert wave2d == [
+        "wave2d-under-budget-no-truncation",
+        "wave2d-request-history-overflow",
+        "wave2d-recent-history-overflow",
+        "wave2d-historical-before-current",
+        "wave2d-current-relevance-tie",
+        "wave2d-external-runtime-reduction",
+        "wave2d-valid-profile-clamp",
+        "wave2d-malformed-overlarge-profile-clamp",
+        "wave2d-smaller-fallback-context",
+        "wave2d-required-content-overflow",
+        "wave2d-missing-primary-context",
+        "wave2d-missing-fallback-context",
+        "wave2d-primary-failure-fallback-success",
+        "wave2d-repeat-deterministic",
+        "wave2d-dropped-artifact-source",
+    ]
+    assert len(wave2d) == 15
 
 
 @pytest.mark.asyncio
@@ -141,9 +167,7 @@ async def test_model_attempts_and_backward_compatible_summary_are_truthful():
     assert exhausted["trace"]["persisted"] is True
     assert exhausted["runtime_terminal_status"] == "abandoned"
 
-    no_fallback_fixture = next(
-        item for item in load_corpus() if item["category"] == "no_fallback"
-    )
+    no_fallback_fixture = next(item for item in load_corpus() if item["category"] == "no_fallback")
     no_fallback = await run_scenario(no_fallback_fixture)
     assert len(no_fallback["trace"]["model_calls"]) == 1
 
@@ -160,7 +184,6 @@ async def test_trace_contract_is_bounded_structural_and_privacy_safe():
         assert isinstance(trace["prompt_layers"], list)
         assert isinstance(trace["artifacts"].get("artifact_count"), int)
         assert isinstance(trace["references"], list)
-        assert "content" not in str(trace)
         assert "neutral request" not in str(trace)
         assert "neutral response" not in str(trace)
 

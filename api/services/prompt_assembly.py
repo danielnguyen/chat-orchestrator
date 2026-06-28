@@ -17,6 +17,7 @@ from services.prompt_budget import (
     PromptBudgetError,
     PromptBudgetResult,
     estimate_prompt_tokens,
+    prompt_budget_failure_trace,
     prompt_budget_trace,
     validate_budget_contract,
 )
@@ -1607,25 +1608,36 @@ def assemble_prompt(
     prompt_budget_trace_out: dict[str, Any] | None = None
     retained_source_ids: dict[str, list[str]] | None = None
     if prompt_budget_contract is not None:
-        budget_result = _apply_prompt_budget(
-            contract=prompt_budget_contract,
-            base_layers=layers,
-            profile_messages=profile_messages,
-            style_messages=style_messages,
-            response_shape_messages=response_shape_messages,
-            companion_messages=companion_messages,
-            interaction_governance_messages=interaction_governance_messages,
-            persona_containment_messages=persona_containment_messages,
-            restraint_messages=restraint_messages,
-            privacy_context_messages=privacy_context_messages,
-            runtime_identity_messages=runtime_identity_messages,
-            world_state_messages=world_state_messages,
-            relationship_context_messages=relationship_context_messages,
-            runtime_messages=runtime_messages,
-            retrieval_bundle=retrieval_bundle,
-            external_context_pack=external_context_pack,
-            current_messages=current_messages,
-        )
+        try:
+            budget_result = _apply_prompt_budget(
+                contract=prompt_budget_contract,
+                base_layers=layers,
+                profile_messages=profile_messages,
+                style_messages=style_messages,
+                response_shape_messages=response_shape_messages,
+                companion_messages=companion_messages,
+                interaction_governance_messages=interaction_governance_messages,
+                persona_containment_messages=persona_containment_messages,
+                restraint_messages=restraint_messages,
+                privacy_context_messages=privacy_context_messages,
+                runtime_identity_messages=runtime_identity_messages,
+                world_state_messages=world_state_messages,
+                relationship_context_messages=relationship_context_messages,
+                runtime_messages=runtime_messages,
+                retrieval_bundle=retrieval_bundle,
+                external_context_pack=external_context_pack,
+                current_messages=current_messages,
+            )
+        except PromptBudgetError:
+            raise
+        except Exception as exc:
+            raise PromptBudgetError(
+                "prompt_budget_evaluation_failed",
+                prompt_budget_failure_trace(
+                    contract=prompt_budget_contract,
+                    failure_reason="prompt_budget_evaluation_failed",
+                ),
+            ) from exc
         messages = budget_result.messages
         layers = budget_result.layers
         prompt_budget_trace_out = budget_result.trace

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from copy import deepcopy
 from difflib import unified_diff
 from pathlib import Path
@@ -14,9 +15,7 @@ DEFAULT_CORPUS_PATH = (
     Path(__file__).resolve().parents[1] / "replay" / "orchestration_scenarios.v1.json"
 )
 RULES_PATH = Path(__file__).resolve().parents[1] / "router" / "rules.yaml"
-NO_FALLBACK_RULES_PATH = (
-    Path(__file__).resolve().parents[1] / "replay" / "rules_no_fallback.yaml"
-)
+NO_FALLBACK_RULES_PATH = Path(__file__).resolve().parents[1] / "replay" / "rules_no_fallback.yaml"
 REGISTRY_PATH = Path(__file__).resolve().parents[1] / "router" / "model_registry.yaml"
 
 _BANNED_SNAPSHOT_KEYS = {
@@ -61,17 +60,20 @@ class ReplayMemoryStore:
 
     async def resolve_profile(self, **kwargs: Any) -> dict[str, Any]:
         self._record("profile_resolution")
+        profile = self.scenario.get("profile")
+        profile = profile if isinstance(profile, dict) else {}
         return {
             "profile_name": "neutral",
             "source": "global_default",
             "profile_version": 1,
             "effective_profile_ref": "owner:neutral:1",
-            "prompt_overlay": "",
+            "prompt_overlay": profile.get("prompt_overlay", ""),
             "retrieval_policy": {},
-            "routing_policy": {},
+            "routing_policy": profile.get("routing_policy", {}),
             "response_style": {},
             "safety_policy": {},
             "tool_policy": {},
+            "prompt_budget": profile.get("prompt_budget"),
         }
 
     async def retrieve_bundle(self, **kwargs: Any) -> dict[str, Any]:
@@ -321,11 +323,82 @@ class ReplayMemoryStore:
                 }
             )
             artifacts = []
+        elif mode == "wave2d_under_budget":
+            semantic[0]["content"] = "Compact current evidence."
+            artifacts = []
+        elif mode == "wave2d_empty":
+            semantic = []
+            artifacts = []
+            recent = []
+        elif mode == "wave2d_recent_overflow":
+            semantic = []
+            artifacts = []
+            recent = [
+                {"role": "assistant", "content": "Old recent context. " * 80},
+                {"role": "assistant", "content": "Newer recent context. " * 20},
+            ]
+        elif mode == "wave2d_historical_current":
+            semantic[0]["content"] = "Historical or unverified context. " * 70
+            semantic[0]["freshness_state"] = "stale"
+            semantic[0]["durable_status"] = "stale"
+            semantic.append(
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "current-memory-1",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Current memory evidence: compact.",
+                    "source_ref": {"ref_type": "message", "ref_id": "current-memory-1"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                }
+            )
+            artifacts = []
+        elif mode == "wave2d_current_tie":
+            semantic = [
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "current-low",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Current low relevance context. " * 50,
+                    "score": 0.2,
+                    "source_ref": {"ref_type": "message", "ref_id": "current-low"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                },
+                {
+                    "owner_id": "owner-replay",
+                    "evidence_role": "canonical",
+                    "message_id": "current-high",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "role": "assistant",
+                    "content": "Current high relevance context.",
+                    "score": 0.9,
+                    "source_ref": {"ref_type": "message", "ref_id": "current-high"},
+                    "source_availability": "not_applicable",
+                    "freshness_state": "active",
+                    "durable_status": "active",
+                },
+            ]
+            artifacts = []
+        elif mode == "wave2d_artifact_overflow":
+            semantic = []
+            artifacts[0]["artifact_id"] = "artifact-wave2d-private"
+            artifacts[0]["snippet"] = "Private replay artifact. " * 80
+        else:
+            recent = []
+        if "recent" not in locals():
+            recent = []
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
             "bundle": {
-                "recent": [],
+                "recent": recent,
                 "semantic": semantic,
                 "artifact_refs": artifacts,
                 "observed_metadata": {"has_code_like_content": False},
@@ -445,6 +518,21 @@ class ReplayRuntime:
                 },
                 "omitted": False,
             }
+        if mode == "wave2d_long_overlay":
+            return {
+                "runtime_state": {
+                    "runtime_state_id": "runtime-state-1",
+                    "reset_after_turn": False,
+                },
+                "overlay": {
+                    "overlay_id": "runtime-overlay-long",
+                    "overlay_type": "runtime_state",
+                    "role": "system",
+                    "content": "Long runtime overlay. " * 120,
+                    "source_fields": ["fixture"],
+                },
+                "omitted": False,
+            }
         return {
             "runtime_state": {
                 "runtime_state_id": "runtime-state-1",
@@ -517,9 +605,7 @@ class ReplayProvider:
 
     async def chat(self, **kwargs: Any) -> dict[str, Any]:
         if self.attempt == 0:
-            self.calls.append(
-                {"name": "prompt_assembly", "request_id": kwargs["request_id"]}
-            )
+            self.calls.append({"name": "prompt_assembly", "request_id": kwargs["request_id"]})
         self.attempt += 1
         self.calls.append(
             {
@@ -528,7 +614,9 @@ class ReplayProvider:
                 "attempt": self.attempt,
                 "model": kwargs["model"],
                 "prompt_fingerprint": _message_fingerprint(kwargs.get("messages")),
-                "has_beta": "Beta" in "\n".join(
+                "message_count": len(kwargs.get("messages") or []),
+                "has_beta": "Beta"
+                in "\n".join(
                     message.get("content", "")
                     for message in kwargs.get("messages", [])
                     if isinstance(message, dict)
@@ -536,9 +624,11 @@ class ReplayProvider:
             }
         )
         provider_mode = self.scenario.get("provider", "success")
-        should_fail = provider_mode == "exhausted" or (
-            provider_mode == "fallback_success" and self.attempt == 1
-        ) or provider_mode == "no_fallback"
+        should_fail = (
+            provider_mode == "exhausted"
+            or (provider_mode == "fallback_success" and self.attempt == 1)
+            or provider_mode == "no_fallback"
+        )
         if should_fail:
             request = httpx.Request("POST", "http://provider.local/v1/chat/completions")
             response = httpx.Response(503, request=request)
@@ -596,7 +686,7 @@ def _payload(scenario: dict[str, Any]) -> dict[str, Any]:
         "owner_id": "owner-replay",
         "client_id": "client-replay",
         "surface": scenario.get("surface", "chat"),
-        "messages": [{"role": "user", "content": "neutral request"}],
+        "messages": scenario.get("messages") or [{"role": "user", "content": "neutral request"}],
         "sensitivity": "private",
         "retrieval": None,
         "response_mode": "normal",
@@ -617,7 +707,18 @@ def _normalize(
 ) -> dict[str, Any]:
     trace = memory.trace or {}
     prompt = trace.get("prompt") if isinstance(trace.get("prompt"), dict) else {}
+    raw_prompt = (
+        (trace.get("retrieval") or {}).get("prompt_assembly", {})
+        if isinstance(trace.get("retrieval"), dict)
+        else {}
+    )
+    raw_prompt = raw_prompt if isinstance(raw_prompt, dict) else {}
     artifacts = trace.get("artifacts") if isinstance(trace.get("artifacts"), dict) else {}
+    truncation = raw_prompt.get("truncation") or prompt.get("truncation")
+    truncation = truncation if isinstance(truncation, dict) else {"applied": False}
+    prompt_budget = raw_prompt.get("prompt_budget") or prompt.get("prompt_budget")
+    prompt_budget = prompt_budget if isinstance(prompt_budget, dict) else {}
+    provider_attempts = [call for call in calls if call.get("name") == "provider_attempt"]
     return {
         "schema_version": "orchestration-replay-v1",
         "scenario": scenario["scenario"],
@@ -631,9 +732,7 @@ def _normalize(
             "answer_category": _answer_category(result),
         },
         "call_order": [call["name"] for call in calls],
-        "request_ids": [
-            call["request_id"] for call in calls if call.get("request_id") is not None
-        ],
+        "request_ids": [call["request_id"] for call in calls if call.get("request_id") is not None],
         "trace": {
             "persisted": memory.trace is not None,
             "status": trace.get("status"),
@@ -643,22 +742,85 @@ def _normalize(
             "prompt_layers": prompt.get("ordered_layer_names", []),
             "prompt_included": prompt.get("included_layers", []),
             "runtime_overlay": prompt.get("runtime_overlay", {}),
-            "budget_enforcement": (
-                prompt.get("token_accounting", {}).get("budget_enforcement")
-            ),
+            "budget_enforcement": (prompt.get("token_accounting", {}).get("budget_enforcement")),
             "artifacts": artifacts,
             "references": trace.get("references", []),
             "retrieval": (trace.get("retrieval") or {}).get("bundle", {}),
             "memory_hygiene": (
-                (trace.get("retrieval") or {})
-                .get("prompt_assembly", {})
-                .get("memory_hygiene", {})
+                (trace.get("retrieval") or {}).get("prompt_assembly", {}).get("memory_hygiene", {})
             ),
             "provider_prompt": prompt.get("provider_prompt", {}),
             "provider_fallback_context": prompt.get("provider_fallback_context", {}),
+            "prompt_budget": {
+                "status": prompt_budget.get("status"),
+                "failure_reason": prompt_budget.get("failure_reason"),
+                "final_within_budget": prompt_budget.get("final_within_budget"),
+                "omission_or_truncation_occurred": prompt_budget.get(
+                    "omission_or_truncation_occurred"
+                ),
+                "effective_hard_input_budget": prompt_budget.get("effective_hard_input_budget"),
+                "estimated_tokens_before_budgeting": prompt_budget.get(
+                    "estimated_tokens_before_budgeting"
+                ),
+                "estimated_tokens_after_budgeting": prompt_budget.get(
+                    "estimated_tokens_after_budgeting"
+                ),
+                "effective_min_context_limit": prompt_budget.get("effective_min_context_limit"),
+                "dropped_total": (
+                    (prompt_budget.get("dropped_context") or {}).get("total_count")
+                    if isinstance(prompt_budget.get("dropped_context"), dict)
+                    else None
+                ),
+                "profile_clamp": prompt_budget.get("profile_clamp"),
+                "retained_source_ids": prompt_budget.get("retained_source_ids")
+                or raw_prompt.get("retained_source_ids"),
+            },
+            "truncation": truncation,
         },
+        "provider_attempt_count": len(provider_attempts),
+        "provider_fingerprints": [
+            attempt.get("prompt_fingerprint") for attempt in provider_attempts
+        ],
+        "provider_message_counts": [attempt.get("message_count") for attempt in provider_attempts],
+        "sources_count": len(result.get("sources", [])) if result else 0,
         "runtime_terminal_status": runtime.terminal_status,
     }
+
+
+def _router_files_for_scenario(scenario: dict[str, Any], directory: Path) -> tuple[Path, Path]:
+    rules = directory / "rules.yaml"
+    models = directory / "models.yaml"
+    primary = scenario.get("primary_model", "gpt-4o-mini")
+    fallback = scenario.get("fallback_model")
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        f"      selected_model: {primary}\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        + (
+            "      fallbacks:\n"
+            f"        - selected_model: {fallback}\n"
+            "          provider: cloud\n"
+            if fallback
+            else "      fallbacks: []\n"
+        ),
+        encoding="utf-8",
+    )
+    model_limits = scenario.get("model_limits")
+    model_limits = model_limits if isinstance(model_limits, dict) else {}
+    models_text = "models:\n"
+    for model in [primary, fallback]:
+        if not model:
+            continue
+        limit = model_limits.get(model, 128000)
+        models_text += f"  {model}:\n    provider: cloud\n"
+        if limit != "missing":
+            models_text += f"    max_context_tokens: {limit}\n"
+    models.write_text(models_text, encoding="utf-8")
+    return rules, models
 
 
 async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
@@ -670,22 +832,49 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
     result = None
     error = None
     try:
-        result = await orchestrate_chat(
-            payload=_payload(scenario),
-            memory_store=memory,
-            litellm=provider,
-            runtime=runtime,
-            rules_path=str(
-                NO_FALLBACK_RULES_PATH
-                if scenario.get("provider") == "no_fallback"
-                else RULES_PATH
-            ),
-            model_registry_path=str(REGISTRY_PATH),
-            allow_manual_override=False,
-            enable_runtime_overlays=True,
-            memory_hygiene_enabled=True,
-            request_id=request_id,
-        )
+        if scenario.get("model_limits") is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                rules_path, registry_path = _router_files_for_scenario(
+                    scenario,
+                    Path(tmp),
+                )
+                result = await orchestrate_chat(
+                    payload=_payload(scenario),
+                    memory_store=memory,
+                    litellm=provider,
+                    runtime=runtime,
+                    rules_path=str(rules_path),
+                    model_registry_path=str(registry_path),
+                    allow_manual_override=False,
+                    enable_runtime_overlays=True,
+                    memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
+                    request_id=request_id,
+                    prompt_output_token_reserve=scenario.get(
+                        "prompt_output_token_reserve",
+                        0,
+                    ),
+                    prompt_context_safety_margin=scenario.get(
+                        "prompt_context_safety_margin",
+                        0,
+                    ),
+                )
+        else:
+            result = await orchestrate_chat(
+                payload=_payload(scenario),
+                memory_store=memory,
+                litellm=provider,
+                runtime=runtime,
+                rules_path=str(
+                    NO_FALLBACK_RULES_PATH
+                    if scenario.get("provider") == "no_fallback"
+                    else RULES_PATH
+                ),
+                model_registry_path=str(REGISTRY_PATH),
+                allow_manual_override=False,
+                enable_runtime_overlays=True,
+                memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
+                request_id=request_id,
+            )
     except Exception as exc:  # replay snapshots intentionally cover failures
         error = exc
     return _normalize(
@@ -718,9 +907,10 @@ def compare_snapshot(expected: dict[str, Any], actual: dict[str, Any], scenario:
 
 def project_snapshot(actual: Any, expected_shape: Any) -> Any:
     if isinstance(expected_shape, dict):
+        if not isinstance(actual, dict):
+            return actual
         return {
-            key: project_snapshot(actual.get(key), nested)
-            for key, nested in expected_shape.items()
+            key: project_snapshot(actual.get(key), nested) for key, nested in expected_shape.items()
         }
     if isinstance(expected_shape, list):
         return actual

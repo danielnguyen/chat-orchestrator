@@ -6,6 +6,7 @@ from services.prompt_budget import (
     PromptBudgetError,
     ProviderAttempt,
     estimate_message_tokens,
+    estimate_messages_tokens,
     estimate_prompt_tokens,
 )
 
@@ -242,3 +243,128 @@ def test_required_content_overflow_raises_bounded_budget_error():
         )
     assert exc.value.reason == "required_prompt_content_exceeds_budget"
     assert "final user text" not in str(exc.value.trace)
+
+
+def test_layer_accounting_reconciles_with_total_before_and_after_reduction():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "required profile"},
+        retrieval_bundle={
+            "bundle": {
+                "recent": [{"role": "assistant", "content": "old recent " * 20}],
+                "semantic": [
+                    {
+                        "message_id": "current",
+                        "created_at": "2026-01-03",
+                        "role": "assistant",
+                        "content": "current high",
+                        "score": 0.9,
+                        "_truth_framing": "current",
+                    }
+                ],
+                "artifact_refs": [],
+            }
+        },
+        current_messages=[
+            {"role": "user", "content": "old request " * 20},
+            {"role": "user", "content": "final question"},
+        ],
+        prompt_budget_contract=_contract(80),
+    )
+    budget = out.trace["prompt_budget"]
+    before_sum = sum(layer["before_estimated_tokens"] for layer in budget["per_layer"])
+    after_sum = sum(layer["after_estimated_tokens"] for layer in budget["per_layer"])
+    assert before_sum == budget["estimated_tokens_before_budgeting"]
+    assert after_sum == budget["estimated_tokens_after_budgeting"]
+    assert budget["estimated_global_prompt_overhead_tokens"] == 2
+
+
+@pytest.mark.parametrize("bad_limit", ["1000", True, 0, -5])
+def test_malformed_model_context_limits_block_budgeting(bad_limit):
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(
+            profile={"prompt_overlay": ""},
+            retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+            current_messages=[{"role": "user", "content": "short"}],
+            prompt_budget_contract=PromptBudgetContract(
+                attempts=[ProviderAttempt("bad", "local", bad_limit, "primary")],
+                output_token_reserve=0,
+                context_safety_margin=0,
+            ),
+        )
+    assert exc.value.reason == "model_context_limit_unavailable"
+
+
+def test_missing_eligible_fallback_context_limit_blocks_budgeting():
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(
+            profile={"prompt_overlay": ""},
+            retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+            current_messages=[{"role": "user", "content": "short"}],
+            prompt_budget_contract=PromptBudgetContract(
+                attempts=[
+                    ProviderAttempt("primary", "cloud", 1000, "primary"),
+                    ProviderAttempt("fallback", "local", None, "fallback"),
+                ],
+                output_token_reserve=0,
+                context_safety_margin=0,
+            ),
+        )
+    assert exc.value.reason == "model_context_limit_unavailable"
+
+
+def test_reserve_and_margin_exceeding_context_blocks_budgeting():
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(
+            profile={"prompt_overlay": ""},
+            retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+            current_messages=[{"role": "user", "content": "short"}],
+            prompt_budget_contract=PromptBudgetContract(
+                attempts=[_attempt(100)],
+                output_token_reserve=80,
+                context_safety_margin=20,
+            ),
+        )
+    assert exc.value.reason == "effective_prompt_budget_unusable"
+
+
+def test_overlarge_profile_clamp_does_not_expand_budget_and_warns():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "short"}],
+        prompt_budget_contract=PromptBudgetContract(
+            attempts=[_attempt(100)],
+            output_token_reserve=0,
+            context_safety_margin=0,
+            profile_prompt_budget={"max_input_tokens": 1000},
+        ),
+    )
+    assert out.trace["prompt_budget"]["effective_hard_input_budget"] == 100
+    assert out.trace["prompt_budget"]["profile_clamp"]["warning"] == "profile_clamp_not_narrower"
+
+
+def test_repeated_identical_budgeting_is_deterministic():
+    kwargs = dict(
+        profile={"prompt_overlay": "required profile"},
+        retrieval_bundle={
+            "bundle": {
+                "recent": [{"role": "assistant", "content": "old recent " * 20}],
+                "semantic": [],
+                "artifact_refs": [],
+            }
+        },
+        current_messages=[
+            {"role": "user", "content": "old request " * 20},
+            {"role": "user", "content": "final question"},
+        ],
+        prompt_budget_contract=_contract(60),
+    )
+    first = assemble_prompt(**kwargs)
+    second = assemble_prompt(**kwargs)
+    assert first.messages == second.messages
+    assert first.trace["prompt_budget"] == second.trace["prompt_budget"]
+
+
+def test_layer_estimates_exclude_global_overhead_per_layer():
+    messages = [{"role": "system", "content": "abcd"}, {"role": "user", "content": "efgh"}]
+    assert estimate_prompt_tokens(messages) == 2 + estimate_messages_tokens(messages)
