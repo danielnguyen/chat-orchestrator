@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 
 DEV_COMPOSE := docker-compose.yml
 
-.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test composed-smoke smoke dev-start dev-start-reload
+.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test prompt-budget-test prompt-budget-smoke composed-smoke smoke dev-start dev-start-reload
 
 dev-up:
 	@docker compose -f $(DEV_COMPOSE) up -d
@@ -29,6 +29,12 @@ dev-lint:
 
 replay-test:
 	@cd api && ./.venv/bin/python -m pytest -q tests/test_orchestration_replay.py
+
+prompt-budget-test:
+	@cd api && ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_orchestrate_flow.py tests/test_offline_fallback.py tests/test_orchestration_replay.py
+
+prompt-budget-smoke:
+	@cd api && ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_orchestrate_flow.py::test_orchestrate_provider_fallback_reuses_identical_truth_qualified_messages tests/test_orchestrate_flow.py::test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
 
 composed-smoke:
 	@./scripts/composed_smoke.sh

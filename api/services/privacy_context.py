@@ -216,8 +216,7 @@ def derive_privacy_context(
             elif top_level_surface == "car" or surface_type == "car":
                 surface_category = "car_voice_possible_passenger"
             elif (
-                top_level_surface in _NOTIFICATION_ALIASES
-                or surface_type in _NOTIFICATION_ALIASES
+                top_level_surface in _NOTIFICATION_ALIASES or surface_type in _NOTIFICATION_ALIASES
             ):
                 surface_category = "notification_preview"
             elif top_level_surface in _GLASSES_ALIASES or surface_type in _GLASSES_ALIASES:
@@ -253,11 +252,16 @@ def derive_privacy_context(
 
     external_items = (
         external_context_pack.get("items")
-        if isinstance(external_context_pack, dict) and isinstance(external_context_pack.get("items"), list)
+        if isinstance(external_context_pack, dict)
+        and isinstance(external_context_pack.get("items"), list)
         else []
     )
     for item in external_items:
-        if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item.get("text"):
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("text"), str)
+            or not item.get("text")
+        ):
             continue
         sensitivity_level, sensitivity_domains = _apply_metadata(
             current_level=sensitivity_level,
@@ -298,9 +302,7 @@ def privacy_fallback_policy(
     sensitivity_level: str,
     fallback_reason: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    allow_detail = (
-        surface_category in _PRIVATE_DETAIL_SURFACES and sensitivity_level == "normal"
-    )
+    allow_detail = surface_category in _PRIVATE_DETAIL_SURFACES and sensitivity_level == "normal"
     applicable_voice = surface_category in {"voice_private", "car_voice_possible_passenger"}
     applicable_notification = surface_category == "notification_preview"
     if allow_detail:
@@ -467,10 +469,12 @@ def sanitize_prompt_trace_for_privacy(
             "recent_history_count": retrieval_summary["recent_item_count"],
             "observed_metadata": {
                 "has_code_like_content": bool(
-                    ((handoff["retrieval"].get("observed_metadata") or {}).get(
-                        "has_code_like_content",
-                        False,
-                    ))
+                    (
+                        (handoff["retrieval"].get("observed_metadata") or {}).get(
+                            "has_code_like_content",
+                            False,
+                        )
+                    )
                 )
             },
             "privacy_suppressed": True,
@@ -557,13 +561,21 @@ def sanitize_prompt_trace_for_privacy(
             elif layer.get("name") == "persona_containment":
                 metadata = layer.get("metadata") if isinstance(layer.get("metadata"), dict) else {}
                 layer["metadata"] = {
-                    "allowed_memory_domain_count": len(metadata.get("allowed_memory_domains", []) or []),
-                    "blocked_memory_domain_count": len(metadata.get("blocked_memory_domains", []) or []),
-                    "allowed_world_state_domain_count": len(metadata.get("allowed_world_state_domains", []) or []),
+                    "allowed_memory_domain_count": len(
+                        metadata.get("allowed_memory_domains", []) or []
+                    ),
+                    "blocked_memory_domain_count": len(
+                        metadata.get("blocked_memory_domains", []) or []
+                    ),
+                    "allowed_world_state_domain_count": len(
+                        metadata.get("allowed_world_state_domains", []) or []
+                    ),
                     "allowed_relationship_domain_count": len(
                         metadata.get("allowed_relationship_domains", []) or []
                     ),
-                    "allowed_tool_domain_count": len(metadata.get("allowed_tool_domains", []) or []),
+                    "allowed_tool_domain_count": len(
+                        metadata.get("allowed_tool_domains", []) or []
+                    ),
                     "cross_scope_access_allowed": metadata.get("cross_scope_access_allowed"),
                     "retrieval_scope_status": metadata.get("retrieval_scope_status"),
                     "retrieval_scope_reason": metadata.get("retrieval_scope_reason"),
@@ -591,7 +603,9 @@ def sanitize_prompt_trace_for_privacy(
                 layer["metadata"] = {
                     "selected_relationship_count": metadata.get("selected_relationship_count", 0),
                     "excluded_relationship_count": metadata.get("excluded_relationship_count", 0),
-                    "relationship_edges_used_count": len(metadata.get("relationship_edges_used", []) or []),
+                    "relationship_edges_used_count": len(
+                        metadata.get("relationship_edges_used", []) or []
+                    ),
                     "relationship_edges_excluded_count": len(
                         metadata.get("relationship_edges_excluded", []) or []
                     ),
@@ -602,7 +616,9 @@ def sanitize_prompt_trace_for_privacy(
                         "relationship_context_overlay_applied",
                         False,
                     ),
-                    "relationship_conflict_count": len(metadata.get("relationship_conflicts", []) or []),
+                    "relationship_conflict_count": len(
+                        metadata.get("relationship_conflicts", []) or []
+                    ),
                     "relationship_confirmation_required": metadata.get(
                         "relationship_confirmation_required",
                         False,
@@ -654,8 +670,12 @@ def sanitize_prompt_trace_for_privacy(
             "ranking_mode": dsa_trace.get("ranking_mode"),
             "selected_source_count": len(dsa_trace.get("selected_source_ids", []) or []),
             "considered_source_count": len(dsa_trace.get("considered_source_ids", []) or []),
-            "source_diagnostics_count": len(source_diagnostics) if isinstance(source_diagnostics, list) else 0,
-            "candidate_source_count": len(candidate_counts) if isinstance(candidate_counts, dict) else 0,
+            "source_diagnostics_count": len(source_diagnostics)
+            if isinstance(source_diagnostics, list)
+            else 0,
+            "candidate_source_count": len(candidate_counts)
+            if isinstance(candidate_counts, dict)
+            else 0,
             "candidate_truncated": dsa_trace.get("candidate_truncated", False),
         }
 
@@ -666,8 +686,7 @@ def sanitize_prompt_trace_for_privacy(
             "status": companion_trace.get("status"),
             "included": companion_trace.get("included"),
             "profile_present": bool(
-                companion_trace.get("profile_id")
-                or companion_trace.get("companion_profile_id")
+                companion_trace.get("profile_id") or companion_trace.get("companion_profile_id")
             ),
             "profile_version": companion_trace.get("profile_version"),
             "contract_present": bool(
@@ -697,8 +716,12 @@ def sanitize_prompt_trace_for_privacy(
             "attempted": persona_trace.get("attempted", False),
             "status": persona_trace.get("status"),
             "included": persona_trace.get("included"),
-            "allowed_memory_domain_count": len(persona_trace.get("allowed_memory_domains", []) or []),
-            "blocked_memory_domain_count": len(persona_trace.get("blocked_memory_domains", []) or []),
+            "allowed_memory_domain_count": len(
+                persona_trace.get("allowed_memory_domains", []) or []
+            ),
+            "blocked_memory_domain_count": len(
+                persona_trace.get("blocked_memory_domains", []) or []
+            ),
             "allowed_world_state_domain_count": len(
                 persona_trace.get("allowed_world_state_domains", []) or []
             ),

@@ -131,6 +131,8 @@ async def chat(body: ChatRequest) -> ChatResponse:
             interrupt_policy_mode=body.interrupt_policy_mode,
             dsa=dsa,
             dsa_enabled=settings.dsa_enabled,
+            prompt_output_token_reserve=settings.prompt_output_token_reserve,
+            prompt_context_safety_margin=settings.prompt_context_safety_margin,
             request_id=request_id,
         )
         return ChatResponse(**result)

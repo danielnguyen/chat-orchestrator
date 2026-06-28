@@ -156,7 +156,7 @@ async def test_trace_contract_is_bounded_structural_and_privacy_safe():
         if not snapshot["trace"]["persisted"]:
             continue
         trace = snapshot["trace"]
-        assert trace["budget_enforcement"] == "not_enforced"
+        assert trace["budget_enforcement"] == "enforced"
         assert isinstance(trace["prompt_layers"], list)
         assert isinstance(trace["artifacts"].get("artifact_count"), int)
         assert isinstance(trace["references"], list)

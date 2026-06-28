@@ -225,7 +225,8 @@ class FakeRuntime:
                 "advisory_tool_permission_summary": ["inspect_repository"],
                 "content": (
                     "Runtime identity: persona=technical_architect; surface=dev; "
-                    "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
+                    "capability_domain=software_architecture; "
+                    "advisory_memory_scope=technical_context; "
                     "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
                 ),
             },
@@ -791,9 +792,7 @@ def _write_router_files(tmp_path):
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     return rules, models
@@ -876,9 +875,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
 
@@ -1023,9 +1020,7 @@ async def test_orchestrate_applies_spec_shaped_retrieval_policy(tmp_path):
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
 
@@ -1106,10 +1101,12 @@ async def test_orchestrate_rejects_cloud_override_when_profile_is_local_only(tmp
         "models:\n"
         "  chat_local_fast:\n"
         "    provider: local\n"
+        "    max_context_tokens: 16000\n"
         "    avg_latency_bucket: fast\n"
         "    cost_per_1k_tokens: 0\n"
         "  chat_voice_openai:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "    avg_latency_bucket: medium\n"
         "    cost_per_1k_tokens: 0.003\n",
         encoding="utf-8",
@@ -1178,14 +1175,17 @@ async def test_orchestrate_applies_latency_and_cost_policy(tmp_path):
         "models:\n"
         "  chat_voice_openai:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "    avg_latency_bucket: medium\n"
         "    cost_per_1k_tokens: 0.003\n"
         "  chat_fast_cloud:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "    avg_latency_bucket: fast\n"
         "    cost_per_1k_tokens: 0.02\n"
         "  chat_cheap_cloud:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "    avg_latency_bucket: slow\n"
         "    cost_per_1k_tokens: 0.001\n",
         encoding="utf-8",
@@ -1271,6 +1271,7 @@ async def test_orchestrate_uses_local_route_when_request_sensitivity_is_local_on
         "models:\n"
         "  chat_local_fast:\n"
         "    provider: local\n"
+        "    max_context_tokens: 16000\n"
         "    avg_latency_bucket: fast\n"
         "    cost_per_1k_tokens: 0\n",
         encoding="utf-8",
@@ -1323,8 +1324,10 @@ async def test_orchestrate_fallback_trace_metadata(tmp_path):
         "models:\n"
         "  chat_cloud_primary:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "  chat_local_fast:\n"
-        "    provider: local\n",
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
 
@@ -1375,7 +1378,8 @@ async def test_orchestrate_local_only_without_local_model_fails_before_model_cal
     models.write_text(
         "models:\n"
         "  chat_cloud_primary:\n"
-        "    provider: cloud\n",
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
 
@@ -1475,7 +1479,10 @@ async def test_orchestrate_does_not_call_runtime_when_overlays_disabled(tmp_path
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
 
     runtime = FakeRuntime()
     memory_store = FakeMemoryStore()
@@ -1522,7 +1529,10 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     runtime = FakeRuntime(
         response={
             "runtime_state": {
@@ -1551,7 +1561,10 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     runtime.world_state_response = {
         "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
         "excluded_claim_summaries": [{"world_state_claim_id": "wsclaim_2"}],
-        "prompt_content": 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)',
+        "prompt_content": (
+            'World state:\n- active_repository/branch_status: {"branch": "main"} '
+            "(fresh)"
+        ),
         "trace": {
             "active_persona_id": "technical_architect",
             "allowed_domains": ["active_repository"],
@@ -1568,7 +1581,10 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "selected_entities": [{"entity_id": "project:alpha"}],
         "selected_relationships": [{"relationship_id": "rel_1"}],
         "excluded_relationship_summaries": [{"relationship_id": "rel_2"}],
-        "prompt_content": "Relationship context:\n- Project Alpha works_on Repo Alpha (scope=project_context; confidence=0.90)",
+        "prompt_content": (
+            "Relationship context:\n- Project Alpha works_on Repo Alpha "
+            "(scope=project_context; confidence=0.90)"
+        ),
         "trace": {
             "relationship_edges_used": ["rel_1"],
             "relationship_edges_excluded": ["rel_2"],
@@ -1620,7 +1636,9 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
         "advisory_tools=inspect_repository; persona_owns_durable_memory=false."
     )
-    assert contents[1] == 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)'
+    assert (
+        contents[1] == 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)'
+    )
     assert contents[2] == (
         "Relationship context:\n"
         "- Project Alpha works_on Repo Alpha (scope=project_context; confidence=0.90)"
@@ -1704,7 +1722,10 @@ async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tm
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
 
@@ -1750,7 +1771,10 @@ async def test_orchestrate_world_state_malformed_response_is_non_fatal(tmp_path)
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     runtime = FakeRuntime()
     runtime.world_state_response = ["not", "a", "dict"]
     memory_store = FakeMemoryStore()
@@ -1798,7 +1822,10 @@ async def test_orchestrate_relationship_context_malformed_response_is_non_fatal(
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     runtime = FakeRuntime()
     runtime.relationship_response = ["not", "a", "dict"]
     memory_store = FakeMemoryStore()
@@ -1824,14 +1851,11 @@ async def test_orchestrate_relationship_context_malformed_response_is_non_fatal(
     )
 
     assert out["status"] == "ok"
-    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["relationship_context"]
+    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "relationship_context"
+    ]
     assert relationship_trace["status"] == "failed"
-    assert (
-        relationship_trace["omission_reason"]
-        == "malformed_relationship_context_response"
-    )
+    assert relationship_trace["omission_reason"] == "malformed_relationship_context_response"
 
 
 @pytest.mark.asyncio
@@ -1865,7 +1889,10 @@ async def test_orchestrate_relationship_context_layer_order_when_all_relevant_la
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     runtime = FakeRuntime(
         response={
             "runtime_state": {
@@ -1887,7 +1914,10 @@ async def test_orchestrate_relationship_context_layer_order_when_all_relevant_la
     runtime.world_state_response = {
         "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
         "excluded_claim_summaries": [],
-        "prompt_content": 'World state:\n- active_repository/branch_status: {"branch": "main"} (fresh)',
+        "prompt_content": (
+            'World state:\n- active_repository/branch_status: {"branch": "main"} '
+            "(fresh)"
+        ),
         "trace": {
             "active_persona_id": "technical_architect",
             "allowed_domains": ["active_repository"],
@@ -1904,7 +1934,10 @@ async def test_orchestrate_relationship_context_layer_order_when_all_relevant_la
         "selected_entities": [{"entity_id": "project:alpha"}],
         "selected_relationships": [{"relationship_id": "rel_1"}],
         "excluded_relationship_summaries": [],
-        "prompt_content": "Relationship context:\n- Project Alpha works_on Repo Alpha (scope=project_context; confidence=0.90)",
+        "prompt_content": (
+            "Relationship context:\n- Project Alpha works_on Repo Alpha "
+            "(scope=project_context; confidence=0.90)"
+        ),
         "trace": {
             "relationship_edges_used": ["rel_1"],
             "relationship_edges_excluded": [],
@@ -1968,7 +2001,10 @@ async def test_orchestrate_resets_runtime_after_turn_when_requested(tmp_path):
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     runtime = FakeRuntime(
         response={
             "runtime_state": {
@@ -2148,24 +2184,14 @@ async def test_orchestrate_persona_containment_and_restraint_run_before_retrieva
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
         "persona_containment"
     )
-    assert runtime.call_order.index("persona_containment") < runtime.call_order.index(
-        "restraint"
-    )
-    assert runtime.call_order.index("restraint") < runtime.call_order.index(
-        "retrieval_bundle"
-    )
+    assert runtime.call_order.index("persona_containment") < runtime.call_order.index("restraint")
+    assert runtime.call_order.index("restraint") < runtime.call_order.index("retrieval_bundle")
     assert runtime.call_order.index("retrieval_bundle") < runtime.call_order.index(
         "companion_policy"
     )
-    assert runtime.call_order.index("companion_policy") < runtime.call_order.index(
-        "interrupt"
-    )
-    assert runtime.call_order.index("interrupt") < runtime.call_order.index(
-        "resolve_identity"
-    )
-    assert runtime.call_order.index("resolve_identity") < runtime.call_order.index(
-        "world_state"
-    )
+    assert runtime.call_order.index("companion_policy") < runtime.call_order.index("interrupt")
+    assert runtime.call_order.index("interrupt") < runtime.call_order.index("resolve_identity")
+    assert runtime.call_order.index("resolve_identity") < runtime.call_order.index("world_state")
     assert runtime.call_order.index("world_state") < runtime.call_order.index(
         "relationship_context"
     )
@@ -2182,7 +2208,7 @@ async def test_orchestrate_persona_containment_and_restraint_run_before_retrieva
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("requested_scope", ["owner", "client"])
-async def test_orchestrate_containment_lock_clamps_broad_retrieval_scope_and_keeps_same_conversation_context(
+async def test_orchestrate_containment_lock_clamps_scope_and_keeps_context(
     tmp_path,
     requested_scope,
 ):
@@ -2757,6 +2783,7 @@ async def test_orchestrate_chat_works_when_interaction_governance_disabled(tmp_p
         "omission_reason": None,
     }
 
+
 @pytest.mark.asyncio
 async def test_orchestrate_does_not_call_companion_policy_when_disabled(tmp_path):
     rules = tmp_path / "rules.yaml"
@@ -2772,7 +2799,10 @@ async def test_orchestrate_does_not_call_companion_policy_when_disabled(tmp_path
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
 
     runtime = FakeRuntime()
     memory_store = FakeMemoryStore()
@@ -2824,7 +2854,10 @@ async def test_orchestrate_does_not_call_interrupt_policy_when_mode_off(tmp_path
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
 
     runtime = FakeRuntime()
     memory_store = FakeMemoryStore()
@@ -2868,7 +2901,10 @@ async def test_orchestrate_includes_interrupt_trace_only_when_explicitly_enabled
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
 
     runtime = FakeRuntime()
     memory_store = FakeMemoryStore()
@@ -2938,7 +2974,10 @@ async def test_orchestrate_interrupt_runtime_failure_is_non_fatal(tmp_path):
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
@@ -2982,7 +3021,10 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     runtime = FakeRuntime(
         companion_response={
             "profile_id": "default_companion_profile",
@@ -3112,10 +3154,7 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
     assert handoff["routing"]["selected_model"] == "gpt-4o-mini"
     assert companion_trace["cognitive_runtime_compile_status"] == "included"
     assert companion_trace["cognitive_runtime_compile_error"] is None
-    assert (
-        companion_trace["cognitive_runtime_compile_endpoint"]
-        == "/v1/companion/profile/compile"
-    )
+    assert companion_trace["cognitive_runtime_compile_endpoint"] == "/v1/companion/profile/compile"
 
 
 @pytest.mark.asyncio
@@ -3133,7 +3172,10 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     memory_store = FakeMemoryStore()
 
     runtime = FakeRuntime(
@@ -3182,6 +3224,7 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
         "reason": None,
     }
 
+
 @pytest.mark.asyncio
 async def test_orchestrate_companion_runtime_400_failure_does_not_trigger_alias_semantics(tmp_path):
     rules = tmp_path / "rules.yaml"
@@ -3198,7 +3241,7 @@ async def test_orchestrate_companion_runtime_400_failure_does_not_trigger_alias_
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n  gpt-4o-mini:\n    provider: cloud\n",
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     memory_store = FakeMemoryStore()
@@ -3236,6 +3279,8 @@ async def test_orchestrate_companion_runtime_400_failure_does_not_trigger_alias_
     assert companion_trace["cognitive_runtime_compile_endpoint"] == (
         "/v1/companion/profile/compile"
     )
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
     rules = tmp_path / "rules.yaml"
@@ -3251,7 +3296,10 @@ async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
         "      fallbacks: []\n",
         encoding="utf-8",
     )
-    models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n", encoding="utf-8")
+    models.write_text(
+        "models:\n  gpt-4o-mini:\n    provider: cloud\n    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
     memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
@@ -3286,7 +3334,6 @@ async def test_orchestrate_malformed_companion_response_is_non_fatal(tmp_path):
     assert companion_trace["cognitive_runtime_compile_endpoint"] is None
 
 
-
 @pytest.mark.asyncio
 async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_answer(tmp_path):
     rules = tmp_path / "rules.yaml"
@@ -3303,9 +3350,7 @@ async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_ans
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
 
@@ -3378,9 +3423,7 @@ async def test_orchestrate_normal_mode_does_not_shape_or_add_raw_answer_trace(tm
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
 
@@ -3483,7 +3526,9 @@ async def test_orchestrate_memory_hygiene_disabled_preserves_existing_behavior_a
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_persona_domains_forward_to_bms_even_when_memory_hygiene_disabled(tmp_path):
+async def test_orchestrate_persona_domains_forward_to_bms_even_when_memory_hygiene_disabled(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -3510,7 +3555,9 @@ async def test_orchestrate_persona_domains_forward_to_bms_even_when_memory_hygie
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_persona_domains_sanitize_invalid_members_without_mutating_source(tmp_path):
+async def test_orchestrate_persona_domains_sanitize_invalid_members_without_mutating_source(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     original_containment = {
@@ -3759,7 +3806,9 @@ async def test_orchestrate_memory_hygiene_same_ref_id_different_ref_types_do_not
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_memory_hygiene_ambiguous_duplicate_metadata_retains_whole_key_as_unknown(tmp_path):
+async def test_orchestrate_memory_hygiene_ambiguous_duplicate_metadata_retains_whole_key_as_unknown(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
         _retrieval_bundle_for_hygiene(
@@ -3813,7 +3862,10 @@ async def test_orchestrate_memory_hygiene_ambiguous_duplicate_metadata_retains_w
     )
     assert any(
         msg["role"] == "system"
-        and "[freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        and (
+            "[freshness unknown; do not treat as current] "
+            "[2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        )
         in msg["content"]
         for msg in litellm.calls[0]["messages"]
     )
@@ -3823,7 +3875,9 @@ async def test_orchestrate_memory_hygiene_ambiguous_duplicate_metadata_retains_w
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_memory_hygiene_ambiguous_duplicate_with_superseded_occurrence_omits_whole_key(tmp_path):
+async def test_orchestrate_memory_hygiene_superseded_duplicate_omits_whole_key(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
         _retrieval_bundle_for_hygiene(
@@ -3876,7 +3930,9 @@ async def test_orchestrate_memory_hygiene_ambiguous_duplicate_with_superseded_oc
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decisions_fall_back(tmp_path):
+async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decisions_fall_back(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
         _retrieval_bundle_for_hygiene(
@@ -3935,7 +3991,10 @@ async def test_orchestrate_memory_hygiene_conflicting_duplicate_runtime_decision
 
     assert any(
         msg["role"] == "system"
-        and "[freshness unknown; do not treat as current] [2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        and (
+            "[freshness unknown; do not treat as current] "
+            "[2026-01-01T00:00:00+00:00] assistant: semantic copy"
+        )
         in msg["content"]
         for msg in litellm.calls[0]["messages"]
     )
@@ -4034,7 +4093,7 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_fields_fall_b
     assert trace["invalid_decision_count"] == 1
     assert "invalid-frame" not in str(trace)
     assert "invalid-freshness" not in str(trace)
-    assert "\"false\"" not in str(trace)
+    assert '"false"' not in str(trace)
 
 
 @pytest.mark.asyncio
@@ -4232,7 +4291,9 @@ async def test_orchestrate_memory_hygiene_runtime_freshness_framing_conflicts_fa
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_duplicate_falls_back_once(tmp_path):
+async def test_orchestrate_memory_hygiene_invalid_then_valid_duplicate_falls_back_once(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
         _retrieval_bundle_for_hygiene(
@@ -4303,7 +4364,9 @@ async def test_orchestrate_memory_hygiene_invalid_runtime_decision_then_valid_du
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_memory_hygiene_valid_runtime_decision_then_invalid_duplicate_falls_back_once(tmp_path):
+async def test_orchestrate_memory_hygiene_valid_then_invalid_duplicate_falls_back_once(
+    tmp_path,
+):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
         _retrieval_bundle_for_hygiene(
@@ -4544,13 +4607,11 @@ async def test_orchestrate_truth_selection_prefers_active_canonical(tmp_path):
     prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
     assert (
         "Current memory evidence:\n"
-        "- [2026-01-01T00:00:00+00:00] assistant: Current plan is Alpha."
-        in prompt_text
+        "- [2026-01-01T00:00:00+00:00] assistant: Current plan is Alpha." in prompt_text
     )
     assert (
         "Historical or unverified memory context:\n"
-        "- [historical/parked context] [repo/plan-beta.txt] Old plan was Beta."
-        in prompt_text
+        "- [historical/parked context] [repo/plan-beta.txt] Old plan was Beta." in prompt_text
     )
     truth = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "memory_hygiene"
@@ -5403,8 +5464,10 @@ async def test_orchestrate_truth_selection_omits_malformed_derivative(
         "models:\n"
         "  gpt-4o-mini:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "  local-llm:\n"
-        "    provider: local\n",
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
     unsafe = _memory_item(
@@ -5607,8 +5670,10 @@ async def test_orchestrate_provider_fallback_reuses_identical_truth_qualified_me
         "models:\n"
         "  gpt-4o-mini:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "  local-llm:\n"
-        "    provider: local\n",
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
     memory_store = BundledMemoryStore(
@@ -5686,8 +5751,10 @@ async def test_orchestrate_provider_fallback_reuses_intersected_policy_ceiling(t
         "models:\n"
         "  gpt-4o-mini:\n"
         "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
         "  local-llm:\n"
-        "    provider: local\n",
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
     memory_store = BundledMemoryStore(
@@ -5750,7 +5817,6 @@ async def test_orchestrate_provider_fallback_reuses_intersected_policy_ceiling(t
     assert prompt_trace["memory_hygiene"]["runtime_decision_narrowed_count"] == 1
 
 
-
 def _write_default_route_files(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
@@ -5766,9 +5832,7 @@ def _write_default_route_files(tmp_path):
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     return rules, models
@@ -5947,8 +6011,7 @@ async def test_orchestrate_active_task_surface_emits_decisive_low_cognitive_load
         msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
     ]
     assert any(
-        "Lead with the answer, keep cognitive load low" in content
-        for content in system_messages
+        "Lead with the answer, keep cognitive load low" in content for content in system_messages
     )
     assert any(
         "Response shape guidance:" in content
@@ -7200,10 +7263,12 @@ async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
         "models:\n"
         "  chat_local_fast:\n"
         "    provider: local\n"
+        "    max_context_tokens: 16000\n"
         "    avg_latency_bucket: fast\n"
         "    cost_per_1k_tokens: 0\n"
         "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     memory_store = FakeMemoryStore()
@@ -7268,10 +7333,12 @@ async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
         "models:\n"
         "  chat_local_fast:\n"
         "    provider: local\n"
+        "    max_context_tokens: 16000\n"
         "    avg_latency_bucket: fast\n"
         "    cost_per_1k_tokens: 0\n"
         "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
 
@@ -7346,7 +7413,9 @@ async def test_orchestrate_privacy_context_disabled_preserves_behavior_and_skips
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_privacy_context_submits_metadata_only_with_session_and_turn_ids(tmp_path):
+async def test_orchestrate_privacy_context_submits_metadata_only_with_session_and_turn_ids(
+    tmp_path,
+):
     rules, models = _write_router_files(tmp_path)
     bundle = {
         "request_id": "rid",
@@ -7552,7 +7621,9 @@ async def test_orchestrate_privacy_guidance_uses_final_policy_result(tmp_path):
     )
 
     system_messages = [
-        message["content"] for message in litellm.calls[0]["messages"] if message["role"] == "system"
+        message["content"]
+        for message in litellm.calls[0]["messages"]
+        if message["role"] == "system"
     ]
     assert any("notification_preview" in message for message in system_messages)
 
@@ -7575,7 +7646,8 @@ async def test_orchestrate_privacy_context_explicit_level_cannot_deescalate(tmp_
     models.write_text(
         "models:\n"
         "  chat_local_fast:\n"
-        "    provider: local\n",
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
     runtime = FakeRuntime()
@@ -8078,9 +8150,7 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     runtime = FakeRuntime(
@@ -8586,10 +8656,9 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
     assert prompt_trace["companion_policy"]["profile_id"] == "COMPANION_PROFILE_ID_SENTINEL"
     assert prompt_trace["companion_policy"]["contract_id"] == "COMPANION_CONTRACT_ID_SENTINEL"
     assert prompt_trace["companion_policy"]["scene_id"] == "COMPANION_SCENE_ID_SENTINEL"
-    assert (
-        prompt_trace["companion_policy"]["interaction_contract"]["memory_or_recall_boundaries"]
-        == ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
-    )
+    assert prompt_trace["companion_policy"]["interaction_contract"][
+        "memory_or_recall_boundaries"
+    ] == ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
     assert prompt_trace["companion_policy"]["contract_trace"] == {
         "id": "COMPANION_CONTRACT_TRACE_SENTINEL"
     }
@@ -8689,3 +8758,145 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
     assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
     assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
     assert trace_payload["retrieval"]["prompt_assembly"]["privacy_context"]["status"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_prompt_budget_missing_model_limit_blocks_provider(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    with pytest.raises(RuntimeError, match="model_context_limit_unavailable"):
+        await orchestrate_chat(
+            payload=_base_payload(),
+            memory_store=memory_store,
+            litellm=litellm,
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-budget-missing-limit",
+        )
+
+    assert litellm.calls == []
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    prompt_budget = trace_payload["retrieval"]["prompt_assembly"]["prompt_budget"]
+    assert prompt_budget["failure_reason"] == "model_context_limit_unavailable"
+    assert trace_payload["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_prompt_budget_smaller_fallback_constrains_primary_and_reuses_messages(
+    tmp_path,
+):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: primary-large\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: fallback-small\n"
+        "          provider: cloud\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  primary-large:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 1000\n"
+        "  fallback-small:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 180\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(fail_first=True)
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[
+                {"role": "user", "content": "old request " * 40},
+                {"role": "user", "content": "final question"},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-budget-fallback",
+        prompt_output_token_reserve=0,
+        prompt_context_safety_margin=0,
+    )
+
+    assert out["status"] == "degraded"
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
+    assert "old request" not in str(litellm.calls[0]["messages"])
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["prompt_budget"]["effective_min_context_limit"] == 180
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+    assert (
+        prompt_trace["provider_fallback_context"]["prompt_fingerprint"]
+        == prompt_trace["provider_prompt"]["fingerprint"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_prompt_budget_dropped_artifact_is_absent_from_sources(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 35\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "final question"}]),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-budget-dropped-source",
+        prompt_output_token_reserve=0,
+        prompt_context_safety_margin=0,
+    )
+
+    assert out["sources"] == []
+    assert "def entrypoint" not in str(litellm.calls[0]["messages"])
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["retained_source_ids"]["artifact_ids"] == []

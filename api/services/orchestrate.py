@@ -17,7 +17,7 @@ from router.engine import evaluate_route
 from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.companion_presentation import build_companion_presentation
-from services.fallback import choose_fallback
+from services.fallback import resolve_provider_attempt_plan
 from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
 from services.privacy_context import (
     apply_privacy_boundary,
@@ -30,6 +30,7 @@ from services.privacy_context import (
 )
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import assemble_prompt
+from services.prompt_budget import PromptBudgetContract, PromptBudgetError
 from services.response_action import ResponseActionInput, apply_response_action
 from services.response_review import ResponseReviewInput, review_response
 from services.response_shape import (
@@ -228,9 +229,7 @@ def _apply_persona_containment_result_boundary(
     sanitized_bundle = dict(bundle)
     sanitized_bundle["artifact_refs"] = []
     trace["artifact_result_status"] = "suppressed"
-    trace["artifact_result_reason"] = (
-        "unexpected_artifact_results_omitted_under_containment_lock"
-    )
+    trace["artifact_result_reason"] = "unexpected_artifact_results_omitted_under_containment_lock"
     trace["artifact_result_count_omitted"] = len(artifact_refs)
     return {**retrieval_bundle, "bundle": sanitized_bundle}
 
@@ -374,8 +373,7 @@ def _trace_artifacts(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
         )
     ]
     reason = _sanitize_trace_string(
-        retrieval_debug.get("artifact_fallback_reason")
-        or retrieval_debug.get("fallback"),
+        retrieval_debug.get("artifact_fallback_reason") or retrieval_debug.get("fallback"),
         max_length=120,
     )
     status = "included" if artifact_ids else ("degraded" if reason else "omitted")
@@ -427,13 +425,9 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
     )
     return {
         "layers": structural_layers,
-        "ordered_layer_names": [
-            layer["name"] for layer in structural_layers if layer.get("name")
-        ],
+        "ordered_layer_names": [layer["name"] for layer in structural_layers if layer.get("name")],
         "included_layers": [
-            layer["name"]
-            for layer in structural_layers
-            if layer.get("name") and layer["included"]
+            layer["name"] for layer in structural_layers if layer.get("name") and layer["included"]
         ],
         "omitted_layers": [
             layer["name"]
@@ -456,9 +450,16 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         "provider_prompt": trace.get("provider_prompt", {}),
         "provider_fallback_context": trace.get("provider_fallback_context", {}),
         "token_accounting": {
-            "status": "estimate_unavailable",
-            "budget_enforcement": "not_enforced",
+            "status": (
+                "estimated"
+                if isinstance(trace.get("prompt_budget"), dict)
+                else "estimate_unavailable"
+            ),
+            "budget_enforcement": (
+                "enforced" if isinstance(trace.get("prompt_budget"), dict) else "not_enforced"
+            ),
         },
+        "prompt_budget": trace.get("prompt_budget", {}),
     }
 
 
@@ -497,9 +498,7 @@ def _public_answer_sources(sources: Any) -> list[dict[str, Any]]:
             {
                 key: value
                 for key, value in source.items()
-                if isinstance(key, str)
-                and not key.startswith("_")
-                and key not in private_keys
+                if isinstance(key, str) and not key.startswith("_") and key not in private_keys
             }
         )
     return public_sources
@@ -670,9 +669,7 @@ def _sanitize_context_pack_diagnostics(value: Any) -> tuple[dict[str, Any] | Non
         limit=20,
         item_max_length=80,
     )
-    source_diagnostics = _sanitize_context_pack_source_diagnostics(
-        value.get("source_diagnostics")
-    )
+    source_diagnostics = _sanitize_context_pack_source_diagnostics(value.get("source_diagnostics"))
 
     candidate_counts_by_source: dict[str, int] = {}
     raw_candidate_counts = value.get("candidate_counts_by_source")
@@ -683,9 +680,7 @@ def _sanitize_context_pack_diagnostics(value: Any) -> tuple[dict[str, Any] | Non
             if source_id and count is not None:
                 candidate_counts_by_source[source_id] = count
 
-    budget_truncated_candidates = _sanitize_trace_bool(
-        value.get("budget_truncated_candidates")
-    )
+    budget_truncated_candidates = _sanitize_trace_bool(value.get("budget_truncated_candidates"))
 
     if selection_mode:
         diagnostics_out["selection_mode"] = selection_mode
@@ -939,9 +934,7 @@ async def _resolve_external_context(
                 "candidate_counts_by_source",
                 {},
             )
-            dsa_trace["candidate_truncated"] = bool(
-                diagnostics.get("budget_truncated_candidates")
-            )
+            dsa_trace["candidate_truncated"] = bool(diagnostics.get("budget_truncated_candidates"))
             if diagnostics.get("considered_source_ids"):
                 dsa_trace["considered_source_ids"] = diagnostics["considered_source_ids"]
             if diagnostics.get("source_diagnostics"):
@@ -1343,9 +1336,7 @@ async def _resolve_runtime_identity(
         "surface_type": trace.get("surface_type"),
         "surface_display_name": trace.get("surface_display_name"),
         "advisory_memory_scope_summary": trace.get("advisory_memory_scope_summary", []),
-        "advisory_tool_permission_summary": trace.get(
-            "advisory_tool_permission_summary", []
-        ),
+        "advisory_tool_permission_summary": trace.get("advisory_tool_permission_summary", []),
     }
 
 
@@ -1508,7 +1499,13 @@ async def _resolve_world_state(
             "omission_reason": "empty_world_state",
         }
     world_state_out: dict[str, Any] = {"prompt_content": prompt_content}
-    for key in ("sensitivity", "sensitivity_level", "sensitivity_domains", "domain_tags", "policy_metadata"):
+    for key in (
+        "sensitivity",
+        "sensitivity_level",
+        "sensitivity_domains",
+        "domain_tags",
+        "policy_metadata",
+    ):
         if key in response:
             world_state_out[key] = response.get(key)
         elif key in trace:
@@ -1580,9 +1577,7 @@ async def _resolve_relationship_context(
         "excluded_relationship_count": trace.get("excluded_relationship_count", 0),
         "relationship_edges_used": trace.get("relationship_edges_used", []),
         "relationship_edges_excluded": trace.get("relationship_edges_excluded", []),
-        "relationship_exclusion_reasons": trace.get(
-            "relationship_exclusion_reasons", {}
-        ),
+        "relationship_exclusion_reasons": trace.get("relationship_exclusion_reasons", {}),
         "relationship_context_overlay_applied": bool(
             trace.get("relationship_context_overlay_applied", False)
         ),
@@ -1601,7 +1596,13 @@ async def _resolve_relationship_context(
             "omission_reason": "empty_relationship_context",
         }
     relationship_context_out: dict[str, Any] = {"prompt_content": prompt_content}
-    for key in ("sensitivity", "sensitivity_level", "sensitivity_domains", "domain_tags", "policy_metadata"):
+    for key in (
+        "sensitivity",
+        "sensitivity_level",
+        "sensitivity_domains",
+        "domain_tags",
+        "policy_metadata",
+    ):
         if key in response:
             relationship_context_out[key] = response.get(key)
         elif key in trace:
@@ -1865,9 +1866,7 @@ async def _resolve_persona_containment(
         "allowed_memory_domains": result.get("allowed_memory_domains", []),
         "blocked_memory_domains": result.get("blocked_memory_domains", []),
         "allowed_world_state_domains": result.get("allowed_world_state_domains", []),
-        "allowed_relationship_domains": result.get(
-            "allowed_relationship_domains", []
-        ),
+        "allowed_relationship_domains": result.get("allowed_relationship_domains", []),
         "allowed_tool_domains": result.get("allowed_tool_domains", []),
         "cross_scope_access_allowed": result.get("cross_scope_access_allowed"),
         "cross_scope_reason": result.get("cross_scope_reason"),
@@ -2310,6 +2309,8 @@ async def orchestrate_chat(
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
     dsa_enabled: bool = False,
+    prompt_output_token_reserve: int = 2048,
+    prompt_context_safety_margin: int = 256,
 ) -> dict[str, Any]:
     started = perf_counter()
     surface = payload.get("surface", "unknown")
@@ -2369,22 +2370,20 @@ async def orchestrate_chat(
         ),
         error_type=turn_state_trace.get("error_type"),
     )
-    interaction_governance, interaction_governance_trace = (
-        await _resolve_interaction_governance(
-            runtime=runtime,
-            enabled=interaction_governance_enabled,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            surface_session_id=surface_session_id,
-            active_mode=active_mode,
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
-        )
+    interaction_governance, interaction_governance_trace = await _resolve_interaction_governance(
+        runtime=runtime,
+        enabled=interaction_governance_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        surface_session_id=surface_session_id,
+        active_mode=active_mode,
+        current_user_text=last_user_text,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
     )
     persona_containment, persona_containment_trace = await _resolve_persona_containment(
         runtime=runtime,
@@ -2539,9 +2538,7 @@ async def orchestrate_chat(
             dsa_enabled=dsa_enabled,
             external_context_enabled=external_context_enabled,
             external_context=(
-                external_context_request
-                if isinstance(external_context_request, dict)
-                else None
+                external_context_request if isinstance(external_context_request, dict) else None
             ),
             external_calls_allowed=not local_only,
             query=last_user_text,
@@ -2583,16 +2580,14 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
-        relationship_context, relationship_context_trace = (
-            await _resolve_relationship_context(
-                runtime=runtime,
-                request_id=request_id,
-                owner_id=payload["owner_id"],
-                conversation_id=conversation_id,
-                surface=surface,
-                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-                active_persona_id=runtime_identity_trace.get("active_persona_id"),
-            )
+        relationship_context, relationship_context_trace = await _resolve_relationship_context(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
@@ -2702,6 +2697,17 @@ async def orchestrate_chat(
         if policy_candidate:
             selected_model = policy_candidate
             selected_provider = _model_provider(selected_model, registry, selected_provider)
+        provider_attempt_plan = resolve_provider_attempt_plan(
+            registry=registry,
+            route=route,
+            selected_model=selected_model,
+            selected_provider=selected_provider,
+            local_only=local_only,
+            cost_mode=cost_mode,
+            latency_mode=latency_mode,
+            policy_pick_model=_policy_pick_model,
+            model_provider=_model_provider,
+        )
 
         status = "ok"
         fallback_used = False
@@ -2734,44 +2740,108 @@ async def orchestrate_chat(
 
         presentation = build_companion_presentation(handoff)
 
-        prompt = assemble_prompt(
-            profile=profile,
-            retrieval_bundle=retrieval_bundle,
-            current_messages=effective_payload["messages"],
-            handoff=handoff,
-            presentation=presentation,
-            style_guidance=style_guidance,
-            style_trace=style_trace,
-            response_shape_guidance=response_shape_guidance,
-            response_shape_trace=response_shape_trace,
-            surface_presence_trace=surface_presence_trace,
-            companion_overlays=companion_overlays,
-            companion_trace=companion_trace,
-            interaction_governance=interaction_governance,
-            interaction_governance_trace_data=interaction_governance_trace,
-            persona_containment=persona_containment,
-            persona_containment_trace_data=persona_containment_trace,
-            restraint=restraint,
-            restraint_trace_data=restraint_trace,
-            memory_hygiene_trace_data=(
-                memory_hygiene_result.trace
-                if memory_hygiene_result is not None
-                else disabled_memory_hygiene_trace(retrieval_bundle)
-            ),
-            privacy_context=privacy_context,
-            privacy_context_trace_data=privacy_context_trace,
-            runtime_identity=runtime_identity,
-            runtime_identity_trace=runtime_identity_trace,
-            world_state=world_state,
-            world_state_trace=world_state_trace,
-            relationship_context=relationship_context,
-            relationship_context_trace=relationship_context_trace,
-            runtime_overlay=runtime_overlay,
-            runtime_trace=runtime_trace,
-            interrupt_trace=interrupt_trace,
-            external_context_pack=external_context_pack,
-            dsa_trace=dsa_trace,
-        )
+        try:
+            prompt = assemble_prompt(
+                profile=profile,
+                retrieval_bundle=retrieval_bundle,
+                current_messages=effective_payload["messages"],
+                handoff=handoff,
+                presentation=presentation,
+                style_guidance=style_guidance,
+                style_trace=style_trace,
+                response_shape_guidance=response_shape_guidance,
+                response_shape_trace=response_shape_trace,
+                surface_presence_trace=surface_presence_trace,
+                companion_overlays=companion_overlays,
+                companion_trace=companion_trace,
+                interaction_governance=interaction_governance,
+                interaction_governance_trace_data=interaction_governance_trace,
+                persona_containment=persona_containment,
+                persona_containment_trace_data=persona_containment_trace,
+                restraint=restraint,
+                restraint_trace_data=restraint_trace,
+                memory_hygiene_trace_data=(
+                    memory_hygiene_result.trace
+                    if memory_hygiene_result is not None
+                    else disabled_memory_hygiene_trace(retrieval_bundle)
+                ),
+                privacy_context=privacy_context,
+                privacy_context_trace_data=privacy_context_trace,
+                runtime_identity=runtime_identity,
+                runtime_identity_trace=runtime_identity_trace,
+                world_state=world_state,
+                world_state_trace=world_state_trace,
+                relationship_context=relationship_context,
+                relationship_context_trace=relationship_context_trace,
+                runtime_overlay=runtime_overlay,
+                runtime_trace=runtime_trace,
+                interrupt_trace=interrupt_trace,
+                external_context_pack=external_context_pack,
+                dsa_trace=dsa_trace,
+                prompt_budget_contract=PromptBudgetContract(
+                    attempts=provider_attempt_plan,
+                    output_token_reserve=prompt_output_token_reserve,
+                    context_safety_margin=prompt_context_safety_margin,
+                    profile_prompt_budget=(
+                        profile.get("prompt_budget") if isinstance(profile, dict) else None
+                    ),
+                ),
+            )
+        except PromptBudgetError as budget_error:
+            budget_prompt_trace = {
+                "prompt_budget": budget_error.trace,
+                "truncation": {
+                    "applied": True,
+                    "reason": budget_error.reason,
+                },
+                "style": style_trace,
+                "response_shape": response_shape_trace,
+                "companion_policy": companion_trace,
+                "interaction_governance": interaction_governance_trace,
+                "persona_containment": persona_containment_trace,
+                "restraint": restraint_trace,
+                "memory_hygiene": (
+                    memory_hygiene_result.trace
+                    if memory_hygiene_result is not None
+                    else disabled_memory_hygiene_trace(retrieval_bundle)
+                ),
+                "privacy_context": privacy_context_trace,
+                "world_state": world_state_trace,
+                "relationship_context": relationship_context_trace,
+                "runtime": runtime_trace,
+                "dsa": dsa_trace,
+                "message_count": 0,
+            }
+            await _create_error_trace(
+                memory_store=memory_store,
+                request_id=request_id,
+                conversation_id=conversation_id,
+                payload=effective_payload,
+                profile=profile,
+                retrieval_bundle=retrieval_bundle,
+                last_user_text=last_user_text,
+                route=route,
+                selected_model=selected_model,
+                selected_provider=selected_provider,
+                sensitivity_local_only=sensitivity_local_only,
+                profile_local_only=profile_local_only,
+                effective_local_only=local_only,
+                override_requested=override_requested,
+                override_applied=bool(override),
+                override_reason=override_reason,
+                failure_reason=budget_error.reason,
+                started=started,
+                prompt_trace=budget_prompt_trace,
+                surface_presence_trace=surface_presence_trace,
+                dsa_trace=dsa_trace,
+            )
+            await _complete_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="abandoned",
+            )
+            raise RuntimeError(budget_error.reason) from budget_error
         messages = prompt.messages
         prompt_fingerprint = _prompt_fingerprint(messages)
         prompt.trace["provider_prompt"] = {
@@ -2810,8 +2880,8 @@ async def orchestrate_chat(
                     error=e,
                 )
             )
-            fallback = choose_fallback(route)
-            if fallback:
+            fallback_attempt = provider_attempt_plan[1] if len(provider_attempt_plan) > 1 else None
+            if fallback_attempt:
                 fallback_used = True
                 status = "degraded"
                 prompt.trace["provider_fallback_context"] = {
@@ -2819,57 +2889,8 @@ async def orchestrate_chat(
                     "prompt_fingerprint": prompt_fingerprint["fingerprint"],
                     "message_count": prompt_fingerprint["message_count"],
                 }
-                fallback_model = fallback["selected_model"]
-                fallback_provider = _model_provider(
-                    fallback_model,
-                    registry,
-                    fallback.get("provider"),
-                )
-                if local_only and fallback_provider != "local":
-                    local_fallback = _policy_pick_model(
-                        registry,
-                        provider="local",
-                        cost_mode=cost_mode,
-                        latency_mode=latency_mode,
-                    )
-                    if not local_fallback:
-                        await _create_error_trace(
-                            memory_store=memory_store,
-                            request_id=request_id,
-                            conversation_id=conversation_id,
-                            payload=effective_payload,
-                            profile=profile,
-                            retrieval_bundle=retrieval_bundle,
-                            last_user_text=last_user_text,
-                            route=route,
-                            selected_model=fallback_model,
-                            selected_provider=fallback_provider,
-                            sensitivity_local_only=sensitivity_local_only,
-                            profile_local_only=profile_local_only,
-                            effective_local_only=local_only,
-                            override_requested=override_requested,
-                            override_applied=bool(override),
-                            override_reason=override_reason,
-                            failure_reason="no_local_model_available",
-                            started=started,
-                            fallback_used=True,
-                            prompt_trace=prompt.trace,
-                            surface_presence_trace=surface_presence_trace,
-                            dsa_trace=dsa_trace,
-                        )
-                        await _complete_runtime_turn(
-                            runtime=runtime,
-                            turn_state_trace=turn_state_trace,
-                            request_id=request_id,
-                            turn_status="abandoned",
-                        )
-                        raise RuntimeError(
-                            "local_only policy active but no local fallback available"
-                        )
-                    fallback_model = local_fallback
-                    fallback_provider = "local"
-                selected_model = fallback_model
-                selected_provider = fallback_provider
+                selected_model = fallback_attempt.model
+                selected_provider = fallback_attempt.provider
                 fallback_started = perf_counter()
                 try:
                     completion = await litellm.chat(
@@ -2996,9 +3017,22 @@ async def orchestrate_chat(
                 "shaped_answer": answer,
             }
 
-        answer_sources = _public_answer_sources(
-            retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+        retained_artifact_ids = set(
+            (prompt.trace.get("retained_source_ids") or {}).get("artifact_ids") or []
         )
+        artifact_refs_for_sources = retrieval_bundle.get("bundle", {}).get(
+            "artifact_refs",
+            [],
+        )
+        if retained_artifact_ids:
+            artifact_refs_for_sources = [
+                item
+                for item in artifact_refs_for_sources
+                if isinstance(item, dict) and item.get("artifact_id") in retained_artifact_ids
+            ]
+        elif prompt.trace.get("prompt_budget"):
+            artifact_refs_for_sources = []
+        answer_sources = _public_answer_sources(artifact_refs_for_sources)
         if privacy_context_enabled and privacy_context is not None:
             privacy_boundary = apply_privacy_boundary(
                 policy=privacy_context,
@@ -3084,10 +3118,13 @@ async def orchestrate_chat(
             if privacy_boundary.enforced
             else prompt.trace
         )
+        if privacy_boundary.enforced and isinstance(persisted_prompt_trace, dict):
+            persisted_prompt_trace.pop("retained_source_ids", None)
+            prompt_budget = persisted_prompt_trace.get("prompt_budget")
+            if isinstance(prompt_budget, dict):
+                prompt_budget.pop("retained_source_ids", None)
         persisted_dsa_trace = (
-            persisted_prompt_trace.get("dsa", {})
-            if privacy_boundary.enforced
-            else dsa_trace
+            persisted_prompt_trace.get("dsa", {}) if privacy_boundary.enforced else dsa_trace
         )
         persisted_retrieval = {
             "query_present": bool(last_user_text),
