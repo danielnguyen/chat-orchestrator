@@ -334,11 +334,11 @@ class ReplayMemoryStore:
             semantic = []
             artifacts = []
             recent = [
-                {"role": "assistant", "content": "Old recent context. " * 80},
-                {"role": "assistant", "content": "Newer recent context. " * 20},
+                {"role": "assistant", "content": "RECENT_OLDEST_MARKER " * 80},
+                {"role": "assistant", "content": "RECENT_NEWEST_MARKER " * 10},
             ]
         elif mode == "wave2d_historical_current":
-            semantic[0]["content"] = "Historical or unverified context. " * 70
+            semantic[0]["content"] = "HISTORICAL_REPLAY_MARKER " * 70
             semantic[0]["freshness_state"] = "stale"
             semantic[0]["durable_status"] = "stale"
             semantic.append(
@@ -348,7 +348,7 @@ class ReplayMemoryStore:
                     "message_id": "current-memory-1",
                     "created_at": "2026-01-02T00:00:00+00:00",
                     "role": "assistant",
-                    "content": "Current memory evidence: compact.",
+                    "content": "CURRENT_REPLAY_MARKER compact.",
                     "source_ref": {"ref_type": "message", "ref_id": "current-memory-1"},
                     "source_availability": "not_applicable",
                     "freshness_state": "active",
@@ -364,8 +364,8 @@ class ReplayMemoryStore:
                     "message_id": "current-low",
                     "created_at": "2026-01-01T00:00:00+00:00",
                     "role": "assistant",
-                    "content": "Current low relevance context. " * 50,
-                    "score": 0.2,
+                    "content": "TIE_FIRST_MARKER " * 50,
+                    "score": 0.5,
                     "source_ref": {"ref_type": "message", "ref_id": "current-low"},
                     "source_availability": "not_applicable",
                     "freshness_state": "active",
@@ -377,8 +377,8 @@ class ReplayMemoryStore:
                     "message_id": "current-high",
                     "created_at": "2026-01-02T00:00:00+00:00",
                     "role": "assistant",
-                    "content": "Current high relevance context.",
-                    "score": 0.9,
+                    "content": "TIE_SECOND_MARKER compact.",
+                    "score": 0.5,
                     "source_ref": {"ref_type": "message", "ref_id": "current-high"},
                     "source_availability": "not_applicable",
                     "freshness_state": "active",
@@ -528,7 +528,7 @@ class ReplayRuntime:
                     "overlay_id": "runtime-overlay-long",
                     "overlay_type": "runtime_state",
                     "role": "system",
-                    "content": "Long runtime overlay. " * 120,
+                    "content": "RUNTIME_OVERLAY_MARKER " * 18,
                     "source_fields": ["fixture"],
                 },
                 "omitted": False,
@@ -597,6 +597,29 @@ class ReplayRuntime:
         return {"result": {"decisions": decisions, "aggregate": {}}}
 
 
+class ReplayDSA:
+    def __init__(self, scenario: dict[str, Any], calls: list[dict[str, Any]]) -> None:
+        self.scenario = scenario
+        self.calls = calls
+
+    async def context_pack(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append({"name": "dsa_context_pack", "request_id": None})
+        mode = self.scenario.get("dsa")
+        if mode != "wave2d_external":
+            return {"sources_used": [], "items": []}
+        return {
+            "sources_used": ["wave2d_external_source"],
+            "items": [
+                {
+                    "source_name": "Replay DSA",
+                    "title": "Wave 2D external context",
+                    "source_ref": "external-wave2d-1",
+                    "text": "EXT_CONTEXT_MARKER " * 120,
+                }
+            ],
+        }
+
+
 class ReplayProvider:
     def __init__(self, scenario: dict[str, Any], calls: list[dict[str, Any]]) -> None:
         self.scenario = scenario
@@ -604,6 +627,7 @@ class ReplayProvider:
         self.attempt = 0
 
     async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        messages = kwargs.get("messages") or []
         if self.attempt == 0:
             self.calls.append({"name": "prompt_assembly", "request_id": kwargs["request_id"]})
         self.attempt += 1
@@ -613,13 +637,17 @@ class ReplayProvider:
                 "request_id": kwargs["request_id"],
                 "attempt": self.attempt,
                 "model": kwargs["model"],
-                "prompt_fingerprint": _message_fingerprint(kwargs.get("messages")),
-                "message_count": len(kwargs.get("messages") or []),
+                "prompt_fingerprint": _message_fingerprint(messages),
+                "message_count": len(messages),
+                "role_sequence": [
+                    str(message.get("role", ""))
+                    for message in messages
+                    if isinstance(message, dict)
+                ],
+                "prompt_evidence": _provider_prompt_evidence(messages),
                 "has_beta": "Beta"
                 in "\n".join(
-                    message.get("content", "")
-                    for message in kwargs.get("messages", [])
-                    if isinstance(message, dict)
+                    message.get("content", "") for message in messages if isinstance(message, dict)
                 ),
             }
         )
@@ -647,6 +675,25 @@ class ReplayProvider:
         else:
             content = "neutral response"
         return {"choices": [{"message": {"content": content}}]}
+
+
+def _provider_prompt_evidence(messages: Any) -> dict[str, bool]:
+    joined = "\n".join(
+        message.get("content", "") for message in messages if isinstance(message, dict)
+    )
+    return {
+        "old_request_present": "older request context" in joined,
+        "final_current_turn_present": "neutral request" in joined,
+        "recent_oldest_present": "RECENT_OLDEST_MARKER" in joined,
+        "recent_newest_present": "RECENT_NEWEST_MARKER" in joined,
+        "historical_retrieval_present": "HISTORICAL_REPLAY_MARKER" in joined,
+        "current_retrieval_present": "CURRENT_REPLAY_MARKER" in joined,
+        "tie_first_present": "TIE_FIRST_MARKER" in joined,
+        "tie_second_present": "TIE_SECOND_MARKER" in joined,
+        "external_context_present": "EXT_CONTEXT_MARKER" in joined,
+        "runtime_overlay_present": "RUNTIME_OVERLAY_MARKER" in joined,
+        "artifact_context_present": "Private replay artifact" in joined,
+    }
 
 
 def _message_fingerprint(messages: Any) -> str:
@@ -682,7 +729,7 @@ def load_corpus(path: Path = DEFAULT_CORPUS_PATH) -> list[dict[str, Any]]:
 
 
 def _payload(scenario: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "owner_id": "owner-replay",
         "client_id": "client-replay",
         "surface": scenario.get("surface", "chat"),
@@ -692,6 +739,56 @@ def _payload(scenario: dict[str, Any]) -> dict[str, Any]:
         "response_mode": "normal",
         "brief_type": "general",
         "interrupt_policy_mode": "off",
+    }
+    if scenario.get("external_context_enabled") is not None:
+        payload["external_context_enabled"] = bool(scenario.get("external_context_enabled"))
+    if isinstance(scenario.get("external_context"), dict):
+        payload["external_context"] = scenario["external_context"]
+    return payload
+
+
+def _layer_by_name(raw_prompt: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    layers = raw_prompt.get("layers")
+    if not isinstance(layers, list):
+        return {}
+    return {
+        layer["name"]: layer
+        for layer in layers
+        if isinstance(layer, dict) and isinstance(layer.get("name"), str)
+    }
+
+
+def _bounded_layer_state(layer: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(layer, dict):
+        return {"included": False, "message_count": 0}
+    return {
+        "included": bool(layer.get("included")),
+        "message_count": layer.get("message_count", 0),
+    }
+
+
+def _retrieval_snippet_projection(layer: dict[str, Any] | None) -> dict[str, Any]:
+    metadata = layer.get("metadata", {}) if isinstance(layer, dict) else {}
+    snippets = metadata.get("snippets", {}) if isinstance(metadata, dict) else {}
+    semantic = snippets.get("semantic", []) if isinstance(snippets, dict) else []
+    artifact_refs = snippets.get("artifact_refs", []) if isinstance(snippets, dict) else []
+    semantic_ids = [
+        item.get("message_id")
+        for item in semantic
+        if isinstance(item, dict) and isinstance(item.get("message_id"), str)
+    ]
+    artifact_ids = [
+        item.get("artifact_id")
+        for item in artifact_refs
+        if isinstance(item, dict) and isinstance(item.get("artifact_id"), str)
+    ]
+    return {
+        "semantic_message_ids": semantic_ids,
+        "artifact_ids": artifact_ids,
+        "current_count": snippets.get("current_count") if isinstance(snippets, dict) else None,
+        "historical_or_unverified_count": (
+            snippets.get("historical_or_unverified_count") if isinstance(snippets, dict) else None
+        ),
     }
 
 
@@ -718,6 +815,9 @@ def _normalize(
     truncation = truncation if isinstance(truncation, dict) else {"applied": False}
     prompt_budget = raw_prompt.get("prompt_budget") or prompt.get("prompt_budget")
     prompt_budget = prompt_budget if isinstance(prompt_budget, dict) else {}
+    dropped_context = prompt_budget.get("dropped_context")
+    dropped_context = dropped_context if isinstance(dropped_context, dict) else {}
+    raw_layers = _layer_by_name(raw_prompt)
     provider_attempts = [call for call in calls if call.get("name") == "provider_attempt"]
     return {
         "schema_version": "orchestration-replay-v1",
@@ -767,21 +867,41 @@ def _normalize(
                 ),
                 "effective_min_context_limit": prompt_budget.get("effective_min_context_limit"),
                 "dropped_total": (
-                    (prompt_budget.get("dropped_context") or {}).get("total_count")
-                    if isinstance(prompt_budget.get("dropped_context"), dict)
+                    dropped_context.get("total_count")
+                    if isinstance(dropped_context, dict)
                     else None
                 ),
+                "dropped_by_reason": dropped_context.get("by_reason", {}),
+                "dropped_by_layer": dropped_context.get("by_layer", {}),
                 "profile_clamp": prompt_budget.get("profile_clamp"),
                 "retained_source_ids": prompt_budget.get("retained_source_ids")
                 or raw_prompt.get("retained_source_ids"),
             },
             "truncation": truncation,
+            "wave2d_layers": {
+                name: _bounded_layer_state(raw_layers.get(name))
+                for name in (
+                    "external_source_context",
+                    "runtime_overlay",
+                    "retrieval_augmentation",
+                    "recent_history",
+                    "current_messages",
+                )
+            },
+            "wave2d_retrieval_projection": _retrieval_snippet_projection(
+                raw_layers.get("retrieval_augmentation")
+            ),
+            "dsa": raw_prompt.get("dsa", {}),
         },
         "provider_attempt_count": len(provider_attempts),
         "provider_fingerprints": [
             attempt.get("prompt_fingerprint") for attempt in provider_attempts
         ],
         "provider_message_counts": [attempt.get("message_count") for attempt in provider_attempts],
+        "provider_role_sequences": [attempt.get("role_sequence") for attempt in provider_attempts],
+        "provider_prompt_evidence": [
+            attempt.get("prompt_evidence") for attempt in provider_attempts
+        ],
         "sources_count": len(result.get("sources", [])) if result else 0,
         "runtime_terminal_status": runtime.terminal_status,
     }
@@ -828,6 +948,7 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
     memory = ReplayMemoryStore(scenario, calls)
     runtime = ReplayRuntime(scenario, calls)
     provider = ReplayProvider(scenario, calls)
+    dsa = ReplayDSA(scenario, calls) if scenario.get("dsa") else None
     request_id = f"request-{scenario['scenario']}"
     result = None
     error = None
@@ -843,6 +964,8 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                     memory_store=memory,
                     litellm=provider,
                     runtime=runtime,
+                    dsa=dsa,
+                    dsa_enabled=bool(scenario.get("dsa")),
                     rules_path=str(rules_path),
                     model_registry_path=str(registry_path),
                     allow_manual_override=False,
@@ -864,6 +987,8 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                 memory_store=memory,
                 litellm=provider,
                 runtime=runtime,
+                dsa=dsa,
+                dsa_enabled=bool(scenario.get("dsa")),
                 rules_path=str(
                     NO_FALLBACK_RULES_PATH
                     if scenario.get("provider") == "no_fallback"
@@ -913,6 +1038,15 @@ def project_snapshot(actual: Any, expected_shape: Any) -> Any:
             key: project_snapshot(actual.get(key), nested) for key, nested in expected_shape.items()
         }
     if isinstance(expected_shape, list):
+        if (
+            isinstance(actual, list)
+            and len(actual) == len(expected_shape)
+            and all(isinstance(item, dict) for item in expected_shape)
+        ):
+            return [
+                project_snapshot(actual_item, expected_item)
+                for actual_item, expected_item in zip(actual, expected_shape, strict=True)
+            ]
         return actual
     return actual
 

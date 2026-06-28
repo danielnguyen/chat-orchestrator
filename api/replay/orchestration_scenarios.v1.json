@@ -782,13 +782,29 @@
                     "prompt_budget": {
                         "status": "optional_context_reduced",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true
+                        "omission_or_truncation_occurred": true,
+                        "dropped_by_reason": {
+                            "prompt_budget_request_history_omitted": 1
+                        },
+                        "dropped_by_layer": {
+                            "current_messages": 1
+                        }
                     },
                     "truncation": {
-                        "applied": true
+                        "applied": true,
+                        "reason": "optional_context_reduced"
                     }
                 },
-                "provider_attempt_count": 1
+                "provider_attempt_count": 1,
+                "provider_prompt_evidence": [
+                    {
+                        "old_request_present": false,
+                        "final_current_turn_present": true
+                    }
+                ],
+                "provider_message_counts": [
+                    2
+                ]
             }
         },
         {
@@ -797,7 +813,7 @@
             "retrieval": "wave2d_recent_overflow",
             "memory_hygiene_enabled": false,
             "model_limits": {
-                "gpt-4o-mini": 70
+                "gpt-4o-mini": 180
             },
             "expected": {
                 "outcome": {
@@ -807,13 +823,40 @@
                     "prompt_budget": {
                         "status": "optional_context_reduced",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true
+                        "omission_or_truncation_occurred": true,
+                        "dropped_by_reason": {
+                            "prompt_budget_recent_history_omitted": 1
+                        },
+                        "dropped_by_layer": {
+                            "recent_history": 1
+                        }
                     },
                     "truncation": {
-                        "applied": true
+                        "applied": true,
+                        "reason": "optional_context_reduced"
+                    },
+                    "wave2d_layers": {
+                        "recent_history": {
+                            "included": true,
+                            "message_count": 1
+                        }
                     }
                 },
-                "provider_attempt_count": 1
+                "provider_attempt_count": 1,
+                "provider_prompt_evidence": [
+                    {
+                        "recent_oldest_present": false,
+                        "recent_newest_present": true,
+                        "final_current_turn_present": true
+                    }
+                ],
+                "provider_role_sequences": [
+                    [
+                        "system",
+                        "assistant",
+                        "user"
+                    ]
+                ]
             }
         },
         {
@@ -821,7 +864,7 @@
             "category": "prompt_budget_wave2d",
             "retrieval": "wave2d_historical_current",
             "model_limits": {
-                "gpt-4o-mini": 140
+                "gpt-4o-mini": 180
             },
             "expected": {
                 "outcome": {
@@ -831,13 +874,37 @@
                     "prompt_budget": {
                         "status": "optional_context_reduced",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true
+                        "omission_or_truncation_occurred": true,
+                        "dropped_by_reason": {
+                            "prompt_budget_historical_retrieval_omitted": 1
+                        },
+                        "retained_source_ids": {
+                            "semantic_message_ids": [
+                                "current-memory-1"
+                            ],
+                            "artifact_ids": []
+                        }
                     },
                     "truncation": {
-                        "applied": true
+                        "applied": true,
+                        "reason": "optional_context_reduced"
+                    },
+                    "wave2d_retrieval_projection": {
+                        "semantic_message_ids": [
+                            "current-memory-1"
+                        ],
+                        "current_count": 1,
+                        "historical_or_unverified_count": 0
                     }
                 },
-                "provider_attempt_count": 1
+                "provider_attempt_count": 1,
+                "provider_prompt_evidence": [
+                    {
+                        "historical_retrieval_present": false,
+                        "current_retrieval_present": true,
+                        "final_current_turn_present": true
+                    }
+                ]
             }
         },
         {
@@ -845,7 +912,7 @@
             "category": "prompt_budget_wave2d",
             "retrieval": "wave2d_current_tie",
             "model_limits": {
-                "gpt-4o-mini": 125
+                "gpt-4o-mini": 180
             },
             "expected": {
                 "outcome": {
@@ -855,21 +922,53 @@
                     "prompt_budget": {
                         "status": "optional_context_reduced",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true
+                        "omission_or_truncation_occurred": true,
+                        "dropped_by_reason": {
+                            "prompt_budget_current_retrieval_omitted": 1
+                        },
+                        "retained_source_ids": {
+                            "semantic_message_ids": [
+                                "current-high"
+                            ],
+                            "artifact_ids": []
+                        }
                     },
                     "truncation": {
-                        "applied": true
+                        "applied": true,
+                        "reason": "optional_context_reduced"
+                    },
+                    "wave2d_retrieval_projection": {
+                        "semantic_message_ids": [
+                            "current-high"
+                        ],
+                        "current_count": 1
                     }
                 },
-                "provider_attempt_count": 1
+                "provider_attempt_count": 1,
+                "provider_prompt_evidence": [
+                    {
+                        "tie_first_present": false,
+                        "tie_second_present": true,
+                        "final_current_turn_present": true
+                    }
+                ]
             }
         },
         {
             "scenario": "wave2d-external-runtime-reduction",
             "category": "prompt_budget_wave2d",
+            "retrieval": "wave2d_empty",
             "runtime": "wave2d_long_overlay",
+            "dsa": "wave2d_external",
+            "external_context_enabled": true,
+            "external_context": {
+                "enabled": true,
+                "source_ids": [
+                    "wave2d_external_source"
+                ]
+            },
             "model_limits": {
-                "gpt-4o-mini": 110
+                "gpt-4o-mini": 180
             },
             "expected": {
                 "outcome": {
@@ -879,13 +978,43 @@
                     "prompt_budget": {
                         "status": "optional_context_reduced",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true
+                        "omission_or_truncation_occurred": true,
+                        "dropped_by_reason": {
+                            "prompt_budget_external_context_omitted": 1
+                        },
+                        "dropped_by_layer": {
+                            "external_source_context": 1
+                        }
                     },
                     "truncation": {
-                        "applied": true
+                        "applied": true,
+                        "reason": "optional_context_reduced"
+                    },
+                    "wave2d_layers": {
+                        "external_source_context": {
+                            "included": false,
+                            "message_count": 0
+                        },
+                        "runtime_overlay": {
+                            "included": true,
+                            "message_count": 1
+                        }
+                    },
+                    "dsa": {
+                        "called": true,
+                        "status": "success",
+                        "item_count": 1,
+                        "context_injected": true
                     }
                 },
-                "provider_attempt_count": 1
+                "provider_attempt_count": 1,
+                "provider_prompt_evidence": [
+                    {
+                        "external_context_present": false,
+                        "runtime_overlay_present": true,
+                        "final_current_turn_present": true
+                    }
+                ]
             }
         },
         {
@@ -979,7 +1108,8 @@
                         "failure_reason": "required_prompt_content_exceeds_budget"
                     },
                     "truncation": {
-                        "applied": false
+                        "applied": false,
+                        "reason": null
                     }
                 },
                 "provider_attempt_count": 0,
@@ -1004,7 +1134,8 @@
                         "failure_reason": "model_context_limit_unavailable"
                     },
                     "truncation": {
-                        "applied": false
+                        "applied": false,
+                        "reason": null
                     }
                 },
                 "provider_attempt_count": 0,
@@ -1031,7 +1162,8 @@
                         "failure_reason": "model_context_limit_unavailable"
                     },
                     "truncation": {
-                        "applied": false
+                        "applied": false,
+                        "reason": null
                     }
                 },
                 "provider_attempt_count": 0,
@@ -1058,10 +1190,29 @@
                     },
                     "prompt_budget": {
                         "effective_min_context_limit": 95,
-                        "final_within_budget": true
+                        "final_within_budget": true,
+                        "status": "optional_context_reduced"
                     }
                 },
                 "provider_attempt_count": 2,
+                "provider_fingerprints": [
+                    "299b71bb5c0d9a305472059110e0e543144925c6eedd2cbb35c129dfcf26d68e",
+                    "299b71bb5c0d9a305472059110e0e543144925c6eedd2cbb35c129dfcf26d68e"
+                ],
+                "provider_message_counts": [
+                    2,
+                    2
+                ],
+                "provider_role_sequences": [
+                    [
+                        "system",
+                        "user"
+                    ],
+                    [
+                        "system",
+                        "user"
+                    ]
+                ],
                 "runtime_terminal_status": "completed"
             }
         },
@@ -1081,7 +1232,7 @@
                 }
             ],
             "model_limits": {
-                "gpt-4o-mini": 70
+                "gpt-4o-mini": 180
             },
             "expected": {
                 "outcome": {
@@ -1091,7 +1242,11 @@
                     "prompt_budget": {
                         "status": "optional_context_reduced",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true
+                        "omission_or_truncation_occurred": true,
+                        "dropped_by_reason": {
+                            "prompt_budget_request_history_omitted": 1,
+                            "prompt_budget_recent_history_omitted": 1
+                        }
                     }
                 },
                 "provider_attempt_count": 1
@@ -1115,9 +1270,18 @@
                             "semantic_message_ids": [],
                             "artifact_ids": []
                         }
+                    },
+                    "wave2d_retrieval_projection": {
+                        "artifact_ids": []
                     }
                 },
                 "provider_attempt_count": 1,
+                "provider_prompt_evidence": [
+                    {
+                        "artifact_context_present": false,
+                        "final_current_turn_present": true
+                    }
+                ],
                 "sources_count": 0
             }
         },

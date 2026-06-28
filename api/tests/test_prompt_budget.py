@@ -245,6 +245,45 @@ def test_required_content_overflow_raises_bounded_budget_error():
     assert "final user text" not in str(exc.value.trace)
 
 
+def test_prompt_budget_trace_states_keep_truncation_and_failure_reasons_distinct():
+    under_budget = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "short"}],
+        prompt_budget_contract=_contract(4096),
+    )
+    assert under_budget.trace["truncation"] == {"applied": False, "reason": None}
+    assert under_budget.trace["prompt_budget"]["failure_reason"] is None
+
+    reduced = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={
+            "bundle": {
+                "recent": [{"role": "assistant", "content": "old recent " * 40}],
+                "semantic": [],
+                "artifact_refs": [],
+            }
+        },
+        current_messages=[{"role": "user", "content": "final question"}],
+        prompt_budget_contract=_contract(70),
+    )
+    assert reduced.trace["truncation"] == {
+        "applied": True,
+        "reason": "optional_context_reduced",
+    }
+    assert reduced.trace["prompt_budget"]["failure_reason"] is None
+
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(
+            profile={"prompt_overlay": "required profile " * 50},
+            retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+            current_messages=[{"role": "user", "content": "final user text"}],
+            prompt_budget_contract=_contract(20),
+        )
+    assert exc.value.trace["failure_reason"] == "required_prompt_content_exceeds_budget"
+    assert exc.value.trace["omission_or_truncation_occurred"] is False
+
+
 def test_layer_accounting_reconciles_with_total_before_and_after_reduction():
     out = assemble_prompt(
         profile={"prompt_overlay": "required profile"},

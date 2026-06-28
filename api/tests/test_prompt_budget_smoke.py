@@ -240,6 +240,7 @@ async def test_smoke_budget_pressure_reduces_optional_context_and_preserves_requ
     assert budget["estimated_tokens_after_budgeting"] <= budget["effective_hard_input_budget"]
     assert budget["omission_or_truncation_occurred"] is True
     assert prompt_trace["truncation"]["applied"] is True
+    assert prompt_trace["truncation"]["reason"] == "optional_context_reduced"
     assert "REQUIRED_PROFILE_ANCHOR" in sent_text
     assert sent_messages[-1] == {"role": "user", "content": "FINAL_TURN_SENTINEL"}
     assert "OLD_REQUEST_SENTINEL" not in sent_text
@@ -359,6 +360,7 @@ async def test_smoke_required_content_overflow_fails_without_false_truncation(tm
         prompt_trace["prompt_budget"]["failure_reason"] == "required_prompt_content_exceeds_budget"
     )
     assert prompt_trace["truncation"]["applied"] is False
+    assert prompt_trace["truncation"]["reason"] is None
     assert "REQUIRED_PROFILE_SENTINEL" not in _private_trace_text(prompt_trace)
     assert runtime.terminal_status == "abandoned"
 
@@ -398,6 +400,7 @@ async def test_smoke_required_overflow_after_optional_removal_reports_truncation
         prompt_trace["prompt_budget"]["failure_reason"] == "required_prompt_content_exceeds_budget"
     )
     assert prompt_trace["truncation"]["applied"] is True
+    assert prompt_trace["truncation"]["reason"] == "optional_context_reduced"
     assert prompt_trace["prompt_budget"]["dropped_context"]["total_count"] > 0
     assert runtime.terminal_status == "abandoned"
 
@@ -427,6 +430,7 @@ async def test_smoke_metadata_failure_is_bounded_and_skips_provider(tmp_path):
     assert provider.calls == []
     assert prompt_trace["prompt_budget"]["failure_reason"] == "model_context_limit_unavailable"
     assert prompt_trace["truncation"]["applied"] is False
+    assert prompt_trace["truncation"]["reason"] is None
     assert runtime.terminal_status == "abandoned"
 
 
