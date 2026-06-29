@@ -82,6 +82,7 @@ class MemoryStoreClient:
             "request_id": request_id,
             "owner_id": owner_id,
             "query": query,
+            "mode": "augmented",
             "retrieval": retrieval,
         }
         if include_artifacts is not None:

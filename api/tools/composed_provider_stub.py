@@ -51,6 +51,12 @@ async def chat_completions(
     has_historical = "Historical or unverified memory context:" in prompt_text
     beta_in_current = "Current memory evidence:" in current_block and "Beta" in current_block
     beta_anywhere = "Beta" in prompt_text
+    wave2e_private_sentinel = "PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL" in prompt_text
+    raw_diagnostics_marker = (
+        "raw_bundle" in prompt_text
+        or "augmented_bundle" in prompt_text
+        or "comparison" in prompt_text
+    )
     global _fail_next_primary
     should_fail_primary = request_id in _fail_primary or _fail_next_primary
     if should_fail_primary and request_id not in _primary_failed:
@@ -67,6 +73,8 @@ async def chat_completions(
                 "has_historical_memory_context": has_historical,
                 "has_forbidden_beta_in_current": beta_in_current,
                 "has_beta_marker": beta_anywhere,
+                "has_wave2e_private_sentinel": wave2e_private_sentinel,
+                "has_raw_diagnostics_marker": raw_diagnostics_marker,
                 "status": "failed",
             }
         )
@@ -88,6 +96,8 @@ async def chat_completions(
             "has_historical_memory_context": has_historical,
             "has_forbidden_beta_in_current": beta_in_current,
             "has_beta_marker": beta_anywhere,
+            "has_wave2e_private_sentinel": wave2e_private_sentinel,
+            "has_raw_diagnostics_marker": raw_diagnostics_marker,
             "status": "ok",
         }
     )

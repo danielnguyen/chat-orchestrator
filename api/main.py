@@ -136,7 +136,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
             request_id=request_id,
         )
         return ChatResponse(**result)
-    except Exception as e:
+    except Exception:
         return JSONResponse(
             status_code=500,
             content={
@@ -144,7 +144,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
                 "status": "failed",
                 "error": {
                     "code": "orchestration_error",
-                    "message": str(e),
+                    "message": "The chat request could not be completed.",
                 },
             },
         )

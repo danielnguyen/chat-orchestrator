@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="3c10de23160822a3da3fec5ab71570ce93ab568c"
+BMS_COMMIT="8cf0e42783d40b3bd1a720286ccaaec9f045a355"
 CR_COMMIT="1404a77f9c9d1a13df3246f1e98401d9680d653e"
 
 for command in git docker curl jq python3; do
@@ -309,16 +309,75 @@ assert_common_trace() {
     .request_id == $request_id
     and (.status == "ok" or .status == "degraded")
     and (.retrieval.bundle | type == "object")
-    and (.retrieval.bundle.retrieval_debug.truth_qualification | type == "object")
+    and (.retrieval.bundle.doctrine_summary | type == "object")
     and .retrieval.prompt_assembly.memory_hygiene.attempted == true
     and (.prompt.provider_prompt.fingerprint | type == "string")
     and (.prompt.ordered_layer_names | length > 0)
-    and .prompt.token_accounting.budget_enforcement == "not_enforced"
+    and .prompt.token_accounting.budget_enforcement == "enforced"
   ' <<<"$trace" >/dev/null
+}
+
+run_wave2e_retrieval_scenario() {
+  local owner client conversation_id response request_id answer trace provider_calls trace_text
+  owner="owner-smoke-wave2e"
+  client="client-smoke-wave2e"
+  conversation_id="$(resolve_conversation "$owner" "$client" "smoke-wave2e")"
+  seed_canonical "$conversation_id" "$owner" "$client" "Current plan is Alpha." "active" >/dev/null
+  seed_missing_source_derivative \
+    "$conversation_id" \
+    "$owner" \
+    "$client" \
+    "PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL unsafe derived text." \
+    "004" >/dev/null
+  response="$(run_chat "$owner" "$client" "$conversation_id" "What is the current plan?")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  test "$answer" = "Current plan is Alpha."
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  assert_common_trace "$trace" "$request_id"
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  trace_text="$(jq -c . <<<"$trace")"
+  case "$trace_text" in
+    *PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL*|*raw_bundle*|*augmented_bundle*|*private_query*)
+      echo "Wave 2E smoke leaked private diagnostics into CO trace" >&2
+      exit 1
+      ;;
+  esac
+  jq -e --arg request_id "$request_id" '
+    .request_id == $request_id
+    and .retrieval.bundle.doctrine_summary.diagnostics_status == "included"
+    and .retrieval.bundle.doctrine_summary.contract_version == "raw-retrieval-debug.v1"
+    and .retrieval.bundle.doctrine_summary.mode == "augmented"
+    and .retrieval.bundle.doctrine_summary.status == "ok"
+    and .retrieval.bundle.doctrine_summary.canonical_used == true
+    and (.retrieval.bundle.doctrine_summary.fallback_to_raw | type == "boolean")
+    and (.retrieval.bundle.doctrine_summary.reason_codes | type == "array")
+    and ((.retrieval.bundle.doctrine_summary.provenance_summary.source_missing_count // 0) >= 1)
+    and (.retrieval.bundle.doctrine_summary | has("comparison") | not)
+    and (.retrieval.bundle.doctrine_summary | has("raw_result_ids") | not)
+    and (.retrieval.bundle.doctrine_summary | has("augmented_result_ids") | not)
+  ' <<<"$trace" >/dev/null
+jq -e '
+    (.answer | contains("PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL") | not)
+    and ((.sources | tostring) | contains("PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL") | not)
+  ' <<<"$response" >/dev/null
+  jq -e '
+    (.calls | map(select(.kind == "chat")) | length) == 1
+    and (.calls | map(select(.kind == "chat")) | all(.has_wave2e_private_sentinel == false))
+    and (.calls | map(select(.kind == "chat")) | all(.has_raw_diagnostics_marker == false))
+  ' <<<"$provider_calls" >/dev/null
 }
 
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+
+if [ "${WAVE2E_ONLY:-}" = "1" ]; then
+  run_wave2e_retrieval_scenario
+  echo "Wave 2E retrieval smoke passed: scenario=F-bms-diagnostics-compat"
+  echo "Topology: CO branch -> BMS main -> PostgreSQL 16 + Qdrant -> CO trace -> deterministic provider stub."
+  exit 0
+fi
 
 # Scenario A: active canonical Alpha beats parked derivative Beta.
 owner="owner-smoke-a"
@@ -385,9 +444,9 @@ provider_calls="$(fetch_provider_calls "$request_id")"
 assert_common_trace "$trace" "$request_id"
 assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
 assert_runtime_memory_hygiene_count "$trace" "$request_id" 1
-jq -e '
-  (.retrieval.bundle.retrieval_debug.truth_qualification.source_missing_count // 0) >= 1
-  and (.retrieval.bundle.retrieval_debug.truth_qualification.derivative_omissions_by_reason.missing_derivative_source_record // 0) >= 1
+  jq -e '
+  (.retrieval.bundle.doctrine_summary.provenance_summary.source_missing_count // 0) >= 1
+  and (.retrieval.bundle.doctrine_summary.provenance_summary.derivative_omissions_by_reason.missing_derivative_source_record // 0) >= 1
 ' <<<"$trace" >/dev/null
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
@@ -460,5 +519,7 @@ jq -e '
   and (.calls | map(select(.kind == "chat")) | all(.has_forbidden_beta_in_current == false))
 ' <<<"$provider_calls" >/dev/null
 
-echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement"
+run_wave2e_retrieval_scenario
+
+echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-wave2e-diagnostics-compat"
 echo "Topology: CO branch -> deterministic provider stub; BMS main -> PostgreSQL 16 + Qdrant; CR main -> disposable SQLite."
