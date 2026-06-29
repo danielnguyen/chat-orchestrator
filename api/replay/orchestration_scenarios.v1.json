@@ -12,7 +12,7 @@
                 "trace": {
                     "persisted": true,
                     "status": "ok",
-                    "budget_enforcement": "not_enforced"
+                    "budget_enforcement": "enforced"
                 },
                 "runtime_terminal_status": "completed"
             }

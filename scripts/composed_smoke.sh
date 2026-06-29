@@ -313,7 +313,7 @@ assert_common_trace() {
     and .retrieval.prompt_assembly.memory_hygiene.attempted == true
     and (.prompt.provider_prompt.fingerprint | type == "string")
     and (.prompt.ordered_layer_names | length > 0)
-    and .prompt.token_accounting.budget_enforcement == "not_enforced"
+    and .prompt.token_accounting.budget_enforcement == "enforced"
   ' <<<"$trace" >/dev/null
 }
 

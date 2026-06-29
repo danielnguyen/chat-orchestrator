@@ -384,7 +384,22 @@ DOCTRINE_REASON_CODES = {
 }
 DOCTRINE_FALLBACK_REASONS = {
     "augmented_retrieval_failed",
+    "malformed_vector_result",
+    "missing_canonical_source",
     "vector_unavailable",
+}
+DOCTRINE_CONTRACT_VERSIONS = {
+    "raw-retrieval-debug.v1",
+}
+DOCTRINE_RETRIEVAL_MODES = {
+    "augmented",
+    "compare",
+    "raw",
+}
+DOCTRINE_DIAGNOSTIC_STATUSES = {
+    "degraded",
+    "failed",
+    "ok",
 }
 DOCTRINE_DERIVATIVE_OMISSION_REASONS = {
     "cross_owner_derivative_provenance",
@@ -458,6 +473,13 @@ def _sanitize_doctrine_status(value: Any) -> str | None:
     return cleaned
 
 
+def _sanitize_doctrine_allowlisted_status(value: Any, allowed_values: set[str]) -> str | None:
+    cleaned = _sanitize_doctrine_status(value)
+    if cleaned and cleaned in allowed_values:
+        return cleaned
+    return None
+
+
 def _sanitize_doctrine_reason_list(
     value: Any,
     *,
@@ -501,9 +523,18 @@ def _trace_doctrine_summary(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
         return {"diagnostics_status": "invalid"}
 
     summary: dict[str, Any] = {"diagnostics_status": "included"}
-    contract_version = _sanitize_doctrine_status(diagnostics.get("contract_version"))
-    mode = _sanitize_doctrine_status(diagnostics.get("mode"))
-    status = _sanitize_doctrine_status(diagnostics.get("status"))
+    contract_version = _sanitize_doctrine_allowlisted_status(
+        diagnostics.get("contract_version"),
+        DOCTRINE_CONTRACT_VERSIONS,
+    )
+    mode = _sanitize_doctrine_allowlisted_status(
+        diagnostics.get("mode"),
+        DOCTRINE_RETRIEVAL_MODES,
+    )
+    status = _sanitize_doctrine_allowlisted_status(
+        diagnostics.get("status"),
+        DOCTRINE_DIAGNOSTIC_STATUSES,
+    )
     if contract_version:
         summary["contract_version"] = contract_version
     if mode:
@@ -643,7 +674,6 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
     )
     prompt_budget = trace.get("prompt_budget")
     prompt_budget = prompt_budget if isinstance(prompt_budget, dict) else {}
-    prompt_budget_enforced = bool(prompt_budget) and prompt_budget.get("status") != "not_required"
     return {
         "layers": structural_layers,
         "ordered_layer_names": [layer["name"] for layer in structural_layers if layer.get("name")],
@@ -677,7 +707,7 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
                 else "estimate_unavailable"
             ),
             "budget_enforcement": (
-                "enforced" if prompt_budget_enforced else "not_enforced"
+                "enforced" if prompt_budget else "not_enforced"
             ),
         },
         "prompt_budget": prompt_budget,

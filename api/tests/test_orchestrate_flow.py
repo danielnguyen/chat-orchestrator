@@ -206,6 +206,9 @@ class Wave2EMemoryStore(FakeMemoryStore):
                         ],
                         "fallback_reasons": [
                             "vector_unavailable",
+                            "malformed_vector_result",
+                            "missing_canonical_source",
+                            "augmented_retrieval_failed",
                             "private_customer_identifier",
                         ],
                         "raw_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-RAW-ID"],
@@ -9018,9 +9021,12 @@ def _assert_private_wave2e_values_absent(value):
     for sentinel in (
         "PRIVATE-DIAGNOSTIC-SENTINEL",
         "private_customer_identifier",
+        "private_contract_version",
+        "private_diagnostic_status",
         "private_query_material",
         "private_derived_state",
         "private_omission_reason",
+        "private_retrieval_mode",
         "raw_bundle",
         "augmented_bundle",
         "private_query",
@@ -9063,7 +9069,12 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
         "derived_used": True,
         "fallback_to_raw": False,
         "reason_codes": ["canonical_evidence_used", "derivative_augmentation_used"],
-        "fallback_reasons": ["vector_unavailable"],
+        "fallback_reasons": [
+            "vector_unavailable",
+            "malformed_vector_result",
+            "missing_canonical_source",
+            "augmented_retrieval_failed",
+        ],
         "provenance_summary": {
             "derivative_source_checks_attempted": 2,
             "source_available_count": 1,
@@ -9081,6 +9092,8 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
     assert trace["request_id"] == "rid-wave2e-additive"
     assert trace["conversation_id"] == "conv-1"
     assert trace["owner_id"] == "owner"
+    assert trace["prompt"]["token_accounting"]["budget_enforcement"] == "enforced"
+    assert trace["prompt"]["prompt_budget"]["status"] == "not_required"
     _assert_private_wave2e_values_absent(out)
     _assert_private_wave2e_values_absent(trace)
 
@@ -9108,6 +9121,76 @@ async def test_orchestrate_optional_malformed_diagnostics_do_not_discard_valid_b
     _assert_private_wave2e_values_absent(out)
     _assert_private_wave2e_values_absent(trace)
     _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_drops_unknown_lowercase_doctrine_identity_fields(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = Wave2EMemoryStore(
+        diagnostics={
+            "contract_version": "private_contract_version",
+            "mode": "private_retrieval_mode",
+            "status": "private_diagnostic_status",
+            "canonical_used": True,
+            "derived_used": True,
+            "fallback_to_raw": True,
+            "reason_codes": ["canonical_evidence_used", "private_customer_identifier"],
+            "fallback_reasons": ["vector_unavailable", "private_customer_identifier"],
+            "provenance_summary": {
+                "source_missing_count": 1,
+                "derivative_omissions_by_reason": {
+                    "missing_derivative_source_record": 1,
+                    "private_omission_reason": 99,
+                },
+            },
+            "validation": {
+                "vector_retrieval_status": "ok",
+                "derivative_retrieval_status": "private_diagnostic_status",
+                "derivative_state_counts": {
+                    "active": 1,
+                    "private_derived_state": 99,
+                },
+                "artifact_omission_reasons": [
+                    "missing_derivative_source_record",
+                    "private_omission_reason",
+                ],
+            },
+        }
+    )
+    litellm = FakeLiteLLM(content="safe answer")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-wave2e-private-identity-fields",
+    )
+
+    trace = memory_store.trace_calls[0]["payload"]
+    doctrine = trace["retrieval"]["bundle"]["doctrine_summary"]
+    assert "contract_version" not in doctrine
+    assert "mode" not in doctrine
+    assert "status" not in doctrine
+    assert doctrine["canonical_used"] is True
+    assert doctrine["derived_used"] is True
+    assert doctrine["fallback_to_raw"] is True
+    assert doctrine["reason_codes"] == ["canonical_evidence_used"]
+    assert doctrine["fallback_reasons"] == ["vector_unavailable"]
+    assert doctrine["provenance_summary"]["derivative_omissions_by_reason"] == {
+        "missing_derivative_source_record": 1
+    }
+    assert doctrine["validation"]["vector_retrieval_status"] == "ok"
+    assert "derivative_retrieval_status" not in doctrine["validation"]
+    assert doctrine["validation"]["derivative_state_counts"] == {"active": 1}
+    assert doctrine["validation"]["artifact_omission_reasons"] == [
+        "missing_derivative_source_record"
+    ]
+    _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
+    _assert_private_wave2e_values_absent(out)
+    _assert_private_wave2e_values_absent(trace)
 
 
 @pytest.mark.asyncio
