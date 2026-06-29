@@ -309,12 +309,11 @@ assert_common_trace() {
     .request_id == $request_id
     and (.status == "ok" or .status == "degraded")
     and (.retrieval.bundle | type == "object")
-    and (.retrieval.bundle.retrieval_debug.truth_qualification | type == "object")
+    and (.retrieval.bundle.doctrine_summary | type == "object")
     and .retrieval.prompt_assembly.memory_hygiene.attempted == true
     and (.prompt.provider_prompt.fingerprint | type == "string")
     and (.prompt.ordered_layer_names | length > 0)
-    and (.prompt.token_accounting.budget_enforcement == "enforced"
-      or .prompt.token_accounting.budget_enforcement == "not_enforced")
+    and .prompt.token_accounting.budget_enforcement == "not_enforced"
   ' <<<"$trace" >/dev/null
 }
 
@@ -359,7 +358,7 @@ run_wave2e_retrieval_scenario() {
     and (.retrieval.bundle.doctrine_summary | has("raw_result_ids") | not)
     and (.retrieval.bundle.doctrine_summary | has("augmented_result_ids") | not)
   ' <<<"$trace" >/dev/null
-  jq -e '
+jq -e '
     (.answer | contains("PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL") | not)
     and ((.sources | tostring) | contains("PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL") | not)
   ' <<<"$response" >/dev/null
@@ -445,9 +444,9 @@ provider_calls="$(fetch_provider_calls "$request_id")"
 assert_common_trace "$trace" "$request_id"
 assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
 assert_runtime_memory_hygiene_count "$trace" "$request_id" 1
-jq -e '
-  (.retrieval.bundle.retrieval_debug.truth_qualification.source_missing_count // 0) >= 1
-  and (.retrieval.bundle.retrieval_debug.truth_qualification.derivative_omissions_by_reason.missing_derivative_source_record // 0) >= 1
+  jq -e '
+  (.retrieval.bundle.doctrine_summary.provenance_summary.source_missing_count // 0) >= 1
+  and (.retrieval.bundle.doctrine_summary.provenance_summary.derivative_omissions_by_reason.missing_derivative_source_record // 0) >= 1
 ' <<<"$trace" >/dev/null
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1

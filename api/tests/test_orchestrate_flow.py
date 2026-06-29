@@ -202,9 +202,12 @@ class Wave2EMemoryStore(FakeMemoryStore):
                         "reason_codes": [
                             "canonical_evidence_used",
                             "derivative_augmentation_used",
-                            "PRIVATE-DIAGNOSTIC-SENTINEL-REASON",
+                            "private_customer_identifier",
                         ],
-                        "fallback_reasons": [],
+                        "fallback_reasons": [
+                            "vector_unavailable",
+                            "private_customer_identifier",
+                        ],
                         "raw_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-RAW-ID"],
                         "augmented_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-AUG-ID"],
                         "comparison": {
@@ -218,23 +221,42 @@ class Wave2EMemoryStore(FakeMemoryStore):
                             "source_missing_count": 1,
                             "derivative_omissions_by_reason": {
                                 "missing_derivative_source_record": 1,
-                                "PRIVATE-DIAGNOSTIC-SENTINEL-OMISSION": 99,
+                                "private_omission_reason": 99,
                             },
                         },
                         "validation": {
                             "vector_retrieval_status": "ok",
                             "derivative_retrieval_status": "ok",
                             "derived_degraded_count": 0,
-                            "derivative_state_counts": {"active": 1, "parked": 1},
+                            "derivative_state_counts": {
+                                "active": 1,
+                                "parked": 1,
+                                "private_derived_state": 99,
+                            },
                             "artifact_omission_reasons": [
-                                "source_missing",
-                                "PRIVATE-DIAGNOSTIC-SENTINEL-ARTIFACT-OMISSION",
+                                "missing_derivative_source_record",
+                                "private_omission_reason",
                             ],
                         },
                     }
                 ),
             }
         )
+        response["bundle"]["retrieval_debug"] = {
+            "truth_qualification": {
+                "canonical_result_count": 1,
+                "derived_result_count": 1,
+                "private_query_material": {
+                    "private_customer_identifier": 1,
+                },
+                "derivative_omissions_by_reason": {
+                    "private_omission_reason": 1,
+                },
+                "derivative_state_counts": {
+                    "private_derived_state": 1,
+                },
+            },
+        }
         return response
 
 
@@ -8995,9 +9017,15 @@ def _assert_private_wave2e_values_absent(value):
     serialized = json.dumps(value, sort_keys=True, default=str)
     for sentinel in (
         "PRIVATE-DIAGNOSTIC-SENTINEL",
+        "private_customer_identifier",
+        "private_query_material",
+        "private_derived_state",
+        "private_omission_reason",
         "raw_bundle",
         "augmented_bundle",
         "private_query",
+        "retrieval_debug",
+        "truth_qualification",
     ):
         assert sentinel not in serialized
 
@@ -9023,7 +9051,7 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
     assert memory_store.retrieve_calls[0]["request_id"] == "rid-wave2e-additive"
     assert memory_store.retrieve_calls[0]["owner_id"] == "owner"
     assert memory_store.retrieve_calls[0]["conversation_id"] == "conv-1"
-    assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(litellm.calls[0]["messages"])
+    _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
     trace = memory_store.trace_calls[0]["payload"]
     doctrine = trace["retrieval"]["bundle"]["doctrine_summary"]
     assert doctrine == {
@@ -9035,6 +9063,7 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
         "derived_used": True,
         "fallback_to_raw": False,
         "reason_codes": ["canonical_evidence_used", "derivative_augmentation_used"],
+        "fallback_reasons": ["vector_unavailable"],
         "provenance_summary": {
             "derivative_source_checks_attempted": 2,
             "source_available_count": 1,
@@ -9046,7 +9075,7 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
             "derivative_retrieval_status": "ok",
             "derived_degraded_count": 0,
             "derivative_state_counts": {"active": 1, "parked": 1},
-            "artifact_omission_reasons": ["source_missing"],
+            "artifact_omission_reasons": ["missing_derivative_source_record"],
         },
     }
     assert trace["request_id"] == "rid-wave2e-additive"
@@ -9078,7 +9107,7 @@ async def test_orchestrate_optional_malformed_diagnostics_do_not_discard_valid_b
     assert trace["retrieval"]["bundle"]["doctrine_summary"] == {"diagnostics_status": "invalid"}
     _assert_private_wave2e_values_absent(out)
     _assert_private_wave2e_values_absent(trace)
-    assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(litellm.calls[0]["messages"])
+    _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
 
 
 @pytest.mark.asyncio
@@ -9127,7 +9156,7 @@ async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_
     assert len(litellm.calls) == 2
     assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
     for call in litellm.calls:
-        assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(call["messages"])
+        _assert_private_wave2e_values_absent(call["messages"])
     trace = memory_store.trace_calls[0]["payload"]
     prompt_trace = trace["retrieval"]["prompt_assembly"]
     assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True

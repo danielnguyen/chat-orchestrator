@@ -357,6 +357,77 @@ def _trace_references(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
 
 SAFE_DOCTRINE_CODE = re.compile(r"^[a-z0-9_.:-]{1,120}$")
 SAFE_DOCTRINE_STATUS = re.compile(r"^[a-z0-9_.:-]{1,80}$")
+DOCTRINE_REASON_CODES = {
+    "advanced_dependency_unavailable",
+    "augmented_retrieval_failed",
+    "canonical_evidence_used",
+    "compare_mode_completed",
+    "compare_mode_degraded",
+    "compare_mode_requested",
+    "derivative_active",
+    "derivative_augmentation_used",
+    "derivative_contradicted",
+    "derivative_corrected",
+    "derivative_forgotten_or_demoted",
+    "derivative_ineligible",
+    "derivative_parked",
+    "derivative_retracted",
+    "derivative_stale",
+    "derivative_superseded",
+    "derivative_unknown_freshness",
+    "derivative_unsupported_validation_state",
+    "fallback_to_raw",
+    "provenance_missing_or_invalid",
+    "retrieval_failed",
+    "source_missing_or_unavailable",
+    "validation_violation",
+}
+DOCTRINE_FALLBACK_REASONS = {
+    "augmented_retrieval_failed",
+    "vector_unavailable",
+}
+DOCTRINE_DERIVATIVE_OMISSION_REASONS = {
+    "cross_owner_derivative_provenance",
+    "cross_owner_derivative_source_ref",
+    "derivative_source_lookup_unavailable",
+    "malformed_derivative_provenance",
+    "malformed_derivative_source_ref",
+    "missing_derivative_source_record",
+    "missing_derivative_source_refs",
+}
+DOCTRINE_DERIVATIVE_STATES = {
+    "active",
+    "contradicted",
+    "corrected",
+    "forgotten_or_demoted",
+    "parked",
+    "retracted",
+    "stale",
+    "superseded",
+    "unknown_freshness",
+    "unsupported_validation_state",
+}
+DOCTRINE_ARTIFACT_OMISSION_REASONS = {
+    "artifact_retrieval_unavailable",
+    "augmented_retrieval_failed",
+    "cross_owner_derivative_provenance",
+    "cross_owner_derivative_source_ref",
+    "derivative_source_lookup_unavailable",
+    "malformed_artifact_result",
+    "malformed_derivative_provenance",
+    "malformed_derivative_source_ref",
+    "missing_derivative_source",
+    "missing_derivative_source_record",
+    "missing_derivative_source_refs",
+}
+DOCTRINE_RETRIEVAL_STATUSES = {
+    "degraded",
+    "failed",
+    "not_requested",
+    "not_run",
+    "ok",
+    "unavailable",
+}
 DOCTRINE_COUNT_KEYS = {
     "derivative_source_checks_attempted",
     "source_available_count",
@@ -387,27 +458,37 @@ def _sanitize_doctrine_status(value: Any) -> str | None:
     return cleaned
 
 
-def _sanitize_doctrine_reason_list(value: Any, *, limit: int = 20) -> list[str]:
+def _sanitize_doctrine_reason_list(
+    value: Any,
+    *,
+    allowed_values: set[str],
+    limit: int = 20,
+) -> list[str]:
     if not isinstance(value, list):
         return []
     reasons: list[str] = []
     for item in value:
         cleaned = _sanitize_doctrine_code(item)
-        if cleaned:
+        if cleaned and cleaned in allowed_values:
             reasons.append(cleaned)
         if len(reasons) >= limit:
             break
     return list(dict.fromkeys(reasons))
 
 
-def _sanitize_doctrine_counts(value: Any, *, limit: int = 20) -> dict[str, int]:
+def _sanitize_doctrine_counts(
+    value: Any,
+    *,
+    allowed_keys: set[str],
+    limit: int = 20,
+) -> dict[str, int]:
     if not isinstance(value, dict):
         return {}
     counts: dict[str, int] = {}
     for key, raw_count in list(value.items())[:limit]:
         cleaned_key = _sanitize_doctrine_code(key, max_length=80)
         count = _sanitize_trace_int(raw_count, minimum=0, maximum=10000)
-        if cleaned_key and count is not None:
+        if cleaned_key and cleaned_key in allowed_keys and count is not None:
             counts[cleaned_key] = count
     return counts
 
@@ -434,10 +515,16 @@ def _trace_doctrine_summary(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
         if value is not None:
             summary[key] = value
 
-    reason_codes = _sanitize_doctrine_reason_list(diagnostics.get("reason_codes"))
+    reason_codes = _sanitize_doctrine_reason_list(
+        diagnostics.get("reason_codes"),
+        allowed_values=DOCTRINE_REASON_CODES,
+    )
     if reason_codes:
         summary["reason_codes"] = reason_codes
-    fallback_reasons = _sanitize_doctrine_reason_list(diagnostics.get("fallback_reasons"))
+    fallback_reasons = _sanitize_doctrine_reason_list(
+        diagnostics.get("fallback_reasons"),
+        allowed_values=DOCTRINE_FALLBACK_REASONS,
+    )
     if fallback_reasons:
         summary["fallback_reasons"] = fallback_reasons
 
@@ -450,6 +537,7 @@ def _trace_doctrine_summary(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
                 provenance_summary[key] = count
         omission_counts = _sanitize_doctrine_counts(
             provenance.get("derivative_omissions_by_reason"),
+            allowed_keys=DOCTRINE_DERIVATIVE_OMISSION_REASONS,
         )
         if omission_counts:
             provenance_summary["derivative_omissions_by_reason"] = omission_counts
@@ -461,17 +549,21 @@ def _trace_doctrine_summary(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
     if isinstance(validation, dict):
         for key in ("vector_retrieval_status", "derivative_retrieval_status"):
             value = _sanitize_doctrine_status(validation.get(key))
-            if value:
+            if value and value in DOCTRINE_RETRIEVAL_STATUSES:
                 validation_summary[key] = value
         for key in DOCTRINE_COUNT_KEYS:
             count = _sanitize_trace_int(validation.get(key), minimum=0, maximum=10000)
             if count is not None:
                 validation_summary[key] = count
-        state_counts = _sanitize_doctrine_counts(validation.get("derivative_state_counts"))
+        state_counts = _sanitize_doctrine_counts(
+            validation.get("derivative_state_counts"),
+            allowed_keys=DOCTRINE_DERIVATIVE_STATES,
+        )
         if state_counts:
             validation_summary["derivative_state_counts"] = state_counts
         omission_reasons = _sanitize_doctrine_reason_list(
             validation.get("artifact_omission_reasons"),
+            allowed_values=DOCTRINE_ARTIFACT_OMISSION_REASONS,
         )
         if omission_reasons:
             validation_summary["artifact_omission_reasons"] = omission_reasons
@@ -549,6 +641,9 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         minimum=0,
         maximum=5000,
     )
+    prompt_budget = trace.get("prompt_budget")
+    prompt_budget = prompt_budget if isinstance(prompt_budget, dict) else {}
+    prompt_budget_enforced = bool(prompt_budget) and prompt_budget.get("status") != "not_required"
     return {
         "layers": structural_layers,
         "ordered_layer_names": [layer["name"] for layer in structural_layers if layer.get("name")],
@@ -578,14 +673,14 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         "token_accounting": {
             "status": (
                 "estimated"
-                if isinstance(trace.get("prompt_budget"), dict)
+                if prompt_budget
                 else "estimate_unavailable"
             ),
             "budget_enforcement": (
-                "enforced" if isinstance(trace.get("prompt_budget"), dict) else "not_enforced"
+                "enforced" if prompt_budget_enforced else "not_enforced"
             ),
         },
-        "prompt_budget": trace.get("prompt_budget", {}),
+        "prompt_budget": prompt_budget,
     }
 
 
@@ -692,13 +787,6 @@ def _trace_retrieval(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
             debug.get("fallback_reason") or debug.get("fallback"),
             max_length=120,
         ),
-        "retrieval_debug": {
-            "truth_qualification": (
-                debug.get("truth_qualification")
-                if isinstance(debug.get("truth_qualification"), dict)
-                else {}
-            )
-        },
         "vector_status": _sanitize_trace_string(
             debug.get("vector_status"),
             max_length=80,
