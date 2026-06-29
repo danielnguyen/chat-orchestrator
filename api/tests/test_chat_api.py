@@ -109,3 +109,33 @@ async def test_chat_endpoint_preserves_request_level_external_context_contract(
     assert len(captured_payloads) == 1
     assert captured_payloads[0]["external_context_enabled"] is expected_enabled
     assert captured_payloads[0]["external_context"] == expected_external_context
+
+
+@pytest.mark.asyncio
+async def test_chat_endpoint_does_not_expose_orchestration_exception_text(monkeypatch):
+    main = _load_main(monkeypatch)
+
+    async def fake_orchestrate_chat(**kwargs):
+        raise RuntimeError("PRIVATE-DIAGNOSTIC-SENTINEL-BMS-EXCEPTION")
+
+    monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
+
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/v1/chat",
+            headers={"X-API-Key": "orch-test"},
+            json=_full_chat_payload(),
+        )
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error"] == {
+        "code": "orchestration_error",
+        "message": "The chat request could not be completed.",
+    }
+    assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(body)

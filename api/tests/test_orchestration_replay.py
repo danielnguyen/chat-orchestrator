@@ -12,8 +12,10 @@ from services.orchestration_replay import (
 @pytest.mark.asyncio
 async def test_memory_store_client_rejects_retrieval_request_id_mismatch():
     client = MemoryStoreClient("http://memory.local", "key")
+    captured = {}
 
     async def fake_post(path, *, request_id=None, json):
+        captured.update({"path": path, "request_id": request_id, "json": json})
         return {"request_id": "different-request", "bundle": {}}
 
     client._post = fake_post  # type: ignore[method-assign]
@@ -25,6 +27,11 @@ async def test_memory_store_client_rejects_retrieval_request_id_mismatch():
             query="neutral",
             retrieval=None,
         )
+    assert captured["path"] == "/v2/conversations/conversation-1/retrieve"
+    assert captured["request_id"] == "expected-request"
+    assert captured["json"]["request_id"] == "expected-request"
+    assert captured["json"]["owner_id"] == "owner"
+    assert captured["json"]["mode"] == "augmented"
 
 
 @pytest.mark.asyncio

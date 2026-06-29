@@ -149,6 +149,95 @@ class FakeMemoryStore:
         return {"trace_id": "t-1", "request_id": kwargs["request_id"]}
 
 
+class Wave2EMemoryStore(FakeMemoryStore):
+    def __init__(self, *, diagnostics: object | None = None, malformed_bundle: bool = False):
+        super().__init__()
+        self.diagnostics = diagnostics
+        self.malformed_bundle = malformed_bundle
+
+    async def retrieve_bundle(self, **kwargs):
+        response = await super().retrieve_bundle(**kwargs)
+        if self.malformed_bundle:
+            response["bundle"] = "PRIVATE-DIAGNOSTIC-SENTINEL-MALFORMED-BUNDLE"
+            return response
+        response.update(
+            {
+                "raw_bundle": {
+                    "recent": [],
+                    "semantic": [
+                        {
+                            "content": "PRIVATE-DIAGNOSTIC-SENTINEL-RAW-BUNDLE",
+                            "message_id": "raw-private",
+                        }
+                    ],
+                    "artifact_refs": [],
+                    "observed_metadata": {},
+                },
+                "augmented_bundle": {
+                    "recent": [],
+                    "semantic": [
+                        {
+                            "content": "PRIVATE-DIAGNOSTIC-SENTINEL-AUG-BUNDLE",
+                            "message_id": "aug-private",
+                        }
+                    ],
+                    "artifact_refs": [],
+                    "observed_metadata": {},
+                },
+                "comparison": {
+                    "private_query": "PRIVATE-DIAGNOSTIC-SENTINEL-QUERY",
+                    "raw_order": ["raw-private"],
+                    "augmented_order": ["aug-private"],
+                },
+                "diagnostics": (
+                    self.diagnostics
+                    if self.diagnostics is not None
+                    else {
+                        "contract_version": "raw-retrieval-debug.v1",
+                        "mode": "augmented",
+                        "status": "ok",
+                        "canonical_used": True,
+                        "derived_used": True,
+                        "fallback_to_raw": False,
+                        "reason_codes": [
+                            "canonical_evidence_used",
+                            "derivative_augmentation_used",
+                            "PRIVATE-DIAGNOSTIC-SENTINEL-REASON",
+                        ],
+                        "fallback_reasons": [],
+                        "raw_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-RAW-ID"],
+                        "augmented_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-AUG-ID"],
+                        "comparison": {
+                            "private": "PRIVATE-DIAGNOSTIC-SENTINEL-COMPARISON"
+                        },
+                        "query": "PRIVATE-DIAGNOSTIC-SENTINEL-QUERY",
+                        "error": "PRIVATE-DIAGNOSTIC-SENTINEL-ERROR",
+                        "provenance_summary": {
+                            "derivative_source_checks_attempted": 2,
+                            "source_available_count": 1,
+                            "source_missing_count": 1,
+                            "derivative_omissions_by_reason": {
+                                "missing_derivative_source_record": 1,
+                                "PRIVATE-DIAGNOSTIC-SENTINEL-OMISSION": 99,
+                            },
+                        },
+                        "validation": {
+                            "vector_retrieval_status": "ok",
+                            "derivative_retrieval_status": "ok",
+                            "derived_degraded_count": 0,
+                            "derivative_state_counts": {"active": 1, "parked": 1},
+                            "artifact_omission_reasons": [
+                                "source_missing",
+                                "PRIVATE-DIAGNOSTIC-SENTINEL-ARTIFACT-OMISSION",
+                            ],
+                        },
+                    }
+                ),
+            }
+        )
+        return response
+
+
 class FakeRuntime:
     def __init__(
         self,
@@ -8900,3 +8989,194 @@ async def test_orchestrate_prompt_budget_dropped_artifact_is_absent_from_sources
     assert "def entrypoint" not in str(litellm.calls[0]["messages"])
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["retained_source_ids"]["artifact_ids"] == []
+
+
+def _assert_private_wave2e_values_absent(value):
+    serialized = json.dumps(value, sort_keys=True, default=str)
+    for sentinel in (
+        "PRIVATE-DIAGNOSTIC-SENTINEL",
+        "raw_bundle",
+        "augmented_bundle",
+        "private_query",
+    ):
+        assert sentinel not in serialized
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = Wave2EMemoryStore()
+    litellm = FakeLiteLLM(content="safe answer")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "PRIVATE-USER-QUERY"}]),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-wave2e-additive",
+    )
+
+    assert out["answer"] == "safe answer"
+    assert out["sources"][0]["snippet"] == "def entrypoint(): pass"
+    assert memory_store.retrieve_calls[0]["request_id"] == "rid-wave2e-additive"
+    assert memory_store.retrieve_calls[0]["owner_id"] == "owner"
+    assert memory_store.retrieve_calls[0]["conversation_id"] == "conv-1"
+    assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(litellm.calls[0]["messages"])
+    trace = memory_store.trace_calls[0]["payload"]
+    doctrine = trace["retrieval"]["bundle"]["doctrine_summary"]
+    assert doctrine == {
+        "diagnostics_status": "included",
+        "contract_version": "raw-retrieval-debug.v1",
+        "mode": "augmented",
+        "status": "ok",
+        "canonical_used": True,
+        "derived_used": True,
+        "fallback_to_raw": False,
+        "reason_codes": ["canonical_evidence_used", "derivative_augmentation_used"],
+        "provenance_summary": {
+            "derivative_source_checks_attempted": 2,
+            "source_available_count": 1,
+            "source_missing_count": 1,
+            "derivative_omissions_by_reason": {"missing_derivative_source_record": 1},
+        },
+        "validation": {
+            "vector_retrieval_status": "ok",
+            "derivative_retrieval_status": "ok",
+            "derived_degraded_count": 0,
+            "derivative_state_counts": {"active": 1, "parked": 1},
+            "artifact_omission_reasons": ["source_missing"],
+        },
+    }
+    assert trace["request_id"] == "rid-wave2e-additive"
+    assert trace["conversation_id"] == "conv-1"
+    assert trace["owner_id"] == "owner"
+    _assert_private_wave2e_values_absent(out)
+    _assert_private_wave2e_values_absent(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_optional_malformed_diagnostics_do_not_discard_valid_bundle(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = Wave2EMemoryStore(diagnostics="PRIVATE-DIAGNOSTIC-SENTINEL-BAD-DIAG")
+    litellm = FakeLiteLLM(content="safe answer")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-wave2e-malformed-optional",
+    )
+
+    assert out["answer"] == "safe answer"
+    assert len(litellm.calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["retrieval"]["bundle"]["doctrine_summary"] == {"diagnostics_status": "invalid"}
+    _assert_private_wave2e_values_absent(out)
+    _assert_private_wave2e_values_absent(trace)
+    assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(litellm.calls[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_diagnostics(
+    tmp_path,
+):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: local-llm\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "  local-llm:\n"
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
+        encoding="utf-8",
+    )
+    memory_store = Wave2EMemoryStore()
+    litellm = FakeLiteLLM(fail_first=True, content="safe answer")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-wave2e-provider-fallback",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
+    for call in litellm.calls:
+        assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(call["messages"])
+    trace = memory_store.trace_calls[0]["payload"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+    assert (
+        prompt_trace["provider_fallback_context"]["prompt_fingerprint"]
+        == prompt_trace["provider_prompt"]["fingerprint"]
+    )
+    _assert_private_wave2e_values_absent(out)
+    _assert_private_wave2e_values_absent(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_bms_unavailable_remains_bounded(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+
+    class UnavailableMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            raise RuntimeError("PRIVATE-DIAGNOSTIC-SENTINEL-BMS-DOWN")
+
+    memory_store = UnavailableMemoryStore()
+
+    with pytest.raises(RuntimeError, match="PRIVATE-DIAGNOSTIC-SENTINEL-BMS-DOWN"):
+        await orchestrate_chat(
+            payload=_base_payload(),
+            memory_store=memory_store,
+            litellm=FakeLiteLLM(),
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-wave2e-bms-down",
+        )
+    assert memory_store.retrieve_calls[0]["request_id"] == "rid-wave2e-bms-down"
+    assert memory_store.trace_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_malformed_required_bundle_still_fails(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = Wave2EMemoryStore(malformed_bundle=True)
+
+    with pytest.raises(AttributeError):
+        await orchestrate_chat(
+            payload=_base_payload(),
+            memory_store=memory_store,
+            litellm=FakeLiteLLM(),
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-wave2e-malformed-required",
+        )
+    assert memory_store.trace_calls == []

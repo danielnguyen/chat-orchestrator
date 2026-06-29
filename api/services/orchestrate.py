@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -354,6 +355,131 @@ def _trace_references(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
     return references
 
 
+SAFE_DOCTRINE_CODE = re.compile(r"^[a-z0-9_.:-]{1,120}$")
+SAFE_DOCTRINE_STATUS = re.compile(r"^[a-z0-9_.:-]{1,80}$")
+DOCTRINE_COUNT_KEYS = {
+    "derivative_source_checks_attempted",
+    "source_available_count",
+    "source_missing_count",
+    "source_malformed_count",
+    "source_unavailable_count",
+    "source_owner_mismatch_count",
+    "derived_degraded_count",
+    "lifecycle_restricted_derived_count",
+}
+
+
+def _sanitize_doctrine_code(value: Any, *, max_length: int = 120) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()[:max_length]
+    if not SAFE_DOCTRINE_CODE.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+def _sanitize_doctrine_status(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()[:80]
+    if not SAFE_DOCTRINE_STATUS.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+def _sanitize_doctrine_reason_list(value: Any, *, limit: int = 20) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    reasons: list[str] = []
+    for item in value:
+        cleaned = _sanitize_doctrine_code(item)
+        if cleaned:
+            reasons.append(cleaned)
+        if len(reasons) >= limit:
+            break
+    return list(dict.fromkeys(reasons))
+
+
+def _sanitize_doctrine_counts(value: Any, *, limit: int = 20) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for key, raw_count in list(value.items())[:limit]:
+        cleaned_key = _sanitize_doctrine_code(key, max_length=80)
+        count = _sanitize_trace_int(raw_count, minimum=0, maximum=10000)
+        if cleaned_key and count is not None:
+            counts[cleaned_key] = count
+    return counts
+
+
+def _trace_doctrine_summary(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = retrieval_bundle.get("diagnostics")
+    if diagnostics is None:
+        return {"diagnostics_status": "absent"}
+    if not isinstance(diagnostics, dict):
+        return {"diagnostics_status": "invalid"}
+
+    summary: dict[str, Any] = {"diagnostics_status": "included"}
+    contract_version = _sanitize_doctrine_status(diagnostics.get("contract_version"))
+    mode = _sanitize_doctrine_status(diagnostics.get("mode"))
+    status = _sanitize_doctrine_status(diagnostics.get("status"))
+    if contract_version:
+        summary["contract_version"] = contract_version
+    if mode:
+        summary["mode"] = mode
+    if status:
+        summary["status"] = status
+    for key in ("canonical_used", "derived_used", "fallback_to_raw"):
+        value = _sanitize_trace_bool(diagnostics.get(key))
+        if value is not None:
+            summary[key] = value
+
+    reason_codes = _sanitize_doctrine_reason_list(diagnostics.get("reason_codes"))
+    if reason_codes:
+        summary["reason_codes"] = reason_codes
+    fallback_reasons = _sanitize_doctrine_reason_list(diagnostics.get("fallback_reasons"))
+    if fallback_reasons:
+        summary["fallback_reasons"] = fallback_reasons
+
+    provenance = diagnostics.get("provenance_summary")
+    provenance_summary: dict[str, Any] = {}
+    if isinstance(provenance, dict):
+        for key in DOCTRINE_COUNT_KEYS:
+            count = _sanitize_trace_int(provenance.get(key), minimum=0, maximum=10000)
+            if count is not None:
+                provenance_summary[key] = count
+        omission_counts = _sanitize_doctrine_counts(
+            provenance.get("derivative_omissions_by_reason"),
+        )
+        if omission_counts:
+            provenance_summary["derivative_omissions_by_reason"] = omission_counts
+    if provenance_summary:
+        summary["provenance_summary"] = provenance_summary
+
+    validation = diagnostics.get("validation")
+    validation_summary: dict[str, Any] = {}
+    if isinstance(validation, dict):
+        for key in ("vector_retrieval_status", "derivative_retrieval_status"):
+            value = _sanitize_doctrine_status(validation.get(key))
+            if value:
+                validation_summary[key] = value
+        for key in DOCTRINE_COUNT_KEYS:
+            count = _sanitize_trace_int(validation.get(key), minimum=0, maximum=10000)
+            if count is not None:
+                validation_summary[key] = count
+        state_counts = _sanitize_doctrine_counts(validation.get("derivative_state_counts"))
+        if state_counts:
+            validation_summary["derivative_state_counts"] = state_counts
+        omission_reasons = _sanitize_doctrine_reason_list(
+            validation.get("artifact_omission_reasons"),
+        )
+        if omission_reasons:
+            validation_summary["artifact_omission_reasons"] = omission_reasons
+    if validation_summary:
+        summary["validation"] = validation_summary
+    return summary
+
+
 def _trace_artifacts(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
     bundle = retrieval_bundle.get("bundle")
     bundle = bundle if isinstance(bundle, dict) else {}
@@ -577,6 +703,7 @@ def _trace_retrieval(retrieval_bundle: dict[str, Any]) -> dict[str, Any]:
             debug.get("vector_status"),
             max_length=80,
         ),
+        "doctrine_summary": _trace_doctrine_summary(retrieval_bundle),
         "references": _trace_references(retrieval_bundle),
     }
 
