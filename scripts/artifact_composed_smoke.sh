@@ -397,13 +397,14 @@ budget_retained_content="$BUDGET_RETAINED_SENTINEL retained anchor compact survi
 budget_omitted_content="$BUDGET_OMITTED_SENTINEL omitted archive filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler."
 budget_retained_artifact="$(upload_artifact "$budget_owner" "$budget_client" "$budget_conversation" "budget-retained.txt" "$budget_retained_content")"
 budget_omitted_artifact="$(upload_artifact "$budget_owner" "$budget_client" "$budget_conversation" "budget-omitted.txt" "$budget_omitted_content")"
+budget_query="retained anchor compact survivor omitted archive"
 
 bms_budget_request_id="bms-wave2f-budget-$(python3 - <<'PY'
 from uuid import uuid4
 print(uuid4())
 PY
 )"
-bms_budget="$(bms_retrieve "$budget_conversation" "$bms_budget_request_id" "$budget_owner" "retained anchor compact survivor omitted archive")"
+bms_budget="$(bms_retrieve "$budget_conversation" "$bms_budget_request_id" "$budget_owner" "$budget_query")"
 jq -e \
   --arg retained "$budget_retained_artifact" \
   --arg omitted "$budget_omitted_artifact" '
@@ -415,7 +416,7 @@ budget_response="$(co_chat \
   "$budget_owner" \
   "$budget_client" \
   "$budget_conversation" \
-  "Answer using retained anchor compact survivor." \
+  "$budget_query" \
   "public" \
   "desktop_private")"
 budget_request_id="$(jq -r '.request_id' <<<"$budget_response")"
@@ -435,9 +436,11 @@ jq -e '
 budget_trace="$(fetch_trace "$budget_request_id")"
 budget_trace_text="$(jq -c . <<<"$budget_trace")"
 jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_artifact" --argjson response "$budget_response" '
-  .retrieval.prompt_assembly.prompt_budget.status == "optional_context_reduced"
+  ([.retrieval.bundle.artifact_refs[].artifact_id] | index($retained))
+  and ([.retrieval.bundle.artifact_refs[].artifact_id] | index($omitted))
+  and .retrieval.prompt_assembly.prompt_budget.status == "optional_context_reduced"
+  and (.retrieval.prompt_assembly.prompt_budget.dropped_context.by_layer.retrieval_augmentation >= 1)
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids == [$retained])
-  and ([.prompt.prompt_budget.dropped_context.by_reason | keys[]] | length) >= 1
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids == ([$response.sources[] | select(.artifact_id != null) | .artifact_id] | unique))
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids | index($omitted) | not)
 ' <<<"$budget_trace" >/dev/null
@@ -448,7 +451,7 @@ fallback_response="$(co_chat \
   "$budget_owner" \
   "$budget_client" \
   "$budget_conversation" \
-  "Retry with fallback but keep only retained anchor compact survivor." \
+  "$budget_query" \
   "public" \
   "desktop_private")"
 fallback_request_id="$(jq -r '.request_id' <<<"$fallback_response")"
@@ -469,12 +472,17 @@ jq -e '
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.budget_omitted == false))
 ' <<<"$fallback_calls" >/dev/null
 fallback_trace="$(fetch_trace "$fallback_request_id")"
-jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_artifact" '
+jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_artifact" --argjson response "$fallback_response" '
   .fallback.triggered == true
   and .prompt.provider_fallback_context.same_sanitized_messages_reused == true
   and .prompt.provider_fallback_context.prompt_fingerprint == .prompt.provider_prompt.fingerprint
   and ([.model_calls[].status] == ["failed","ok"])
+  and ([.retrieval.bundle.artifact_refs[].artifact_id] | index($retained))
+  and ([.retrieval.bundle.artifact_refs[].artifact_id] | index($omitted))
+  and .retrieval.prompt_assembly.prompt_budget.status == "optional_context_reduced"
+  and (.retrieval.prompt_assembly.prompt_budget.dropped_context.by_layer.retrieval_augmentation >= 1)
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids == [$retained])
+  and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids == ([$response.sources[] | select(.artifact_id != null) | .artifact_id] | unique))
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids | index($omitted) | not)
 ' <<<"$fallback_trace" >/dev/null
 
