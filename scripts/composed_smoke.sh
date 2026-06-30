@@ -119,7 +119,7 @@ qdrant_upsert_derived() {
     --arg client "$client_id" \
     --arg path "$file_path" \
     --argjson vector "$vector" \
-    '{points:[{id:$id, vector:$vector, payload:{ref_type:"derived_text", derived_text_id:$id, artifact_id:$artifact, owner_id:$owner, client_id:$client, file_path:$path, repo_name:"smoke", chunk_index:0}}]}' \
+    '{points:[{id:$id, vector:$vector, payload:{ref_type:"derived_text", derived_text_id:$id, artifact_id:$artifact, owner_id:$owner, client_id:$client, file_path:$path, repo_name:"smoke", chunk_index:0, derivation_status:"active"}}]}' \
     | curl -fsS -X PUT "http://127.0.0.1:14391/collections/messages/points" \
       -H "Content-Type: application/json" \
       -d @- >/dev/null
@@ -379,7 +379,7 @@ if [ "${WAVE2E_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
-# Scenario A: active canonical Alpha beats parked derivative Beta.
+# Scenario A: active canonical Alpha is retained while parked derivative Beta is omitted.
 owner="owner-smoke-a"
 client="client-smoke-a"
 conversation_id="$(resolve_conversation "$owner" "$client" "smoke-a")"
@@ -393,17 +393,17 @@ trace="$(fetch_trace "$request_id")"
 provider_calls="$(fetch_provider_calls "$request_id")"
 assert_common_trace "$trace" "$request_id"
 assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-assert_runtime_memory_hygiene_count "$trace" "$request_id" 2
+assert_runtime_memory_hygiene_count "$trace" "$request_id" 1
 jq -e '
   .retrieval.prompt_assembly.memory_hygiene.truth_selection.current_canonical_evidence_count >= 1
-  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.historical_or_parked_context_count >= 1
   and .retrieval.prompt_assembly.memory_hygiene.truth_selection.no_safe_current_evidence == false
 ' <<<"$trace" >/dev/null
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
   and (.calls | map(select(.kind == "chat")) | all(.has_current_memory_evidence == true))
-  and (.calls | map(select(.kind == "chat")) | all(.has_historical_memory_context == true))
+  and (.calls | map(select(.kind == "chat")) | all(.has_historical_memory_context == false))
   and (.calls | map(select(.kind == "chat")) | all(.has_forbidden_beta_in_current == false))
+  and (.calls | map(select(.kind == "chat")) | all(.has_beta_marker == false))
 ' <<<"$provider_calls" >/dev/null
 
 # Scenario B: only stale evidence remains uncertain/historical.
