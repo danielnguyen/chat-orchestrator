@@ -36,6 +36,15 @@ async def chat_completions(
         for message in messages
         if isinstance(message, dict) and isinstance(message.get("content"), str)
     )
+    user_text = "\n".join(
+        message.get("content", "")
+        for message in messages
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        )
+    )
     normalized_messages = [
         {
             "role": str(message.get("role", "")),
@@ -63,6 +72,9 @@ async def chat_completions(
     sentinel_presence = {
         name: sentinel in prompt_text for name, sentinel in sorted(_watched_sentinels.items())
     }
+    sentinel_in_user_messages = {
+        name: sentinel in user_text for name, sentinel in sorted(_watched_sentinels.items())
+    }
     global _fail_next_primary
     should_fail_primary = request_id in _fail_primary or _fail_next_primary
     if should_fail_primary and request_id not in _primary_failed:
@@ -82,6 +94,7 @@ async def chat_completions(
                 "has_wave2e_private_sentinel": wave2e_private_sentinel,
                 "has_raw_diagnostics_marker": raw_diagnostics_marker,
                 "sentinel_presence": sentinel_presence,
+                "sentinel_in_user_messages": sentinel_in_user_messages,
                 "status": "failed",
             }
         )
@@ -106,6 +119,7 @@ async def chat_completions(
             "has_wave2e_private_sentinel": wave2e_private_sentinel,
             "has_raw_diagnostics_marker": raw_diagnostics_marker,
             "sentinel_presence": sentinel_presence,
+            "sentinel_in_user_messages": sentinel_in_user_messages,
             "status": "ok",
         }
     )

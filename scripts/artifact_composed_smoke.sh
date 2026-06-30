@@ -325,12 +325,21 @@ positive_source_ref="$(
     <<<"$bms_positive"
 )"
 test -n "$positive_source_ref"
+jq -e \
+  --arg artifact "$positive_artifact" \
+  --arg sentinel "$POSITIVE_SENTINEL" '
+    (.bundle.artifact_refs[] | select(
+      .artifact_id == $artifact
+      and (.snippet | contains($sentinel))
+      and (.source_ref.ref_type == "derived_text")
+    ))
+  ' <<<"$bms_positive" >/dev/null
 
 positive_response="$(co_chat \
   "$owner" \
   "$client" \
   "$conversation_id" \
-  "Use the retained artifact $POSITIVE_SENTINEL and ignore unavailable or unrelated artifacts." \
+  "Use retained artifact alpha provenance same-artifact derivation and ignore unavailable or unrelated artifacts." \
   "public" \
   "desktop_private")"
 positive_request_id="$(jq -r '.request_id' <<<"$positive_response")"
@@ -375,6 +384,7 @@ positive_provider_calls="$(fetch_provider_calls "$positive_request_id")"
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.positive == true))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.positive == false))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.other_owner == false))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.other_conversation == false))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.incomplete == false))
@@ -384,7 +394,7 @@ budget_owner="owner-wave2f-budget"
 budget_client="client-wave2f-budget"
 budget_conversation="$(resolve_conversation "$budget_owner" "$budget_client" "wave2f-budget")"
 budget_retained_content="$BUDGET_RETAINED_SENTINEL retained anchor compact survivor."
-budget_omitted_content="$BUDGET_OMITTED_SENTINEL omitted archive filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler."
+budget_omitted_content="$BUDGET_OMITTED_SENTINEL omitted archive filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler."
 budget_retained_artifact="$(upload_artifact "$budget_owner" "$budget_client" "$budget_conversation" "budget-retained.txt" "$budget_retained_content")"
 budget_omitted_artifact="$(upload_artifact "$budget_owner" "$budget_client" "$budget_conversation" "budget-omitted.txt" "$budget_omitted_content")"
 
@@ -393,7 +403,7 @@ from uuid import uuid4
 print(uuid4())
 PY
 )"
-bms_budget="$(bms_retrieve "$budget_conversation" "$bms_budget_request_id" "$budget_owner" "$BUDGET_RETAINED_SENTINEL retained anchor")"
+bms_budget="$(bms_retrieve "$budget_conversation" "$bms_budget_request_id" "$budget_owner" "retained anchor compact survivor omitted archive")"
 jq -e \
   --arg retained "$budget_retained_artifact" \
   --arg omitted "$budget_omitted_artifact" '
@@ -405,7 +415,7 @@ budget_response="$(co_chat \
   "$budget_owner" \
   "$budget_client" \
   "$budget_conversation" \
-  "Answer using the retained anchor $BUDGET_RETAINED_SENTINEL." \
+  "Answer using retained anchor compact survivor." \
   "public" \
   "desktop_private")"
 budget_request_id="$(jq -r '.request_id' <<<"$budget_response")"
@@ -418,15 +428,17 @@ budget_provider_calls="$(fetch_provider_calls "$budget_request_id")"
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.budget_retained == true))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.budget_retained == false))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.budget_omitted == false))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.budget_omitted == false))
 ' <<<"$budget_provider_calls" >/dev/null
 budget_trace="$(fetch_trace "$budget_request_id")"
 budget_trace_text="$(jq -c . <<<"$budget_trace")"
-jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_artifact" '
+jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_artifact" --argjson response "$budget_response" '
   .retrieval.prompt_assembly.prompt_budget.status == "optional_context_reduced"
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids == [$retained])
   and ([.prompt.prompt_budget.dropped_context.by_reason | keys[]] | length) >= 1
-  and ([.retrieval.prompt_assembly.retained_source_ids.artifact_ids[]] == [.retrieval.prompt_assembly.retained_source_ids.artifact_ids[]])
+  and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids == ([$response.sources[] | select(.artifact_id != null) | .artifact_id] | unique))
   and (.retrieval.prompt_assembly.retained_source_ids.artifact_ids | index($omitted) | not)
 ' <<<"$budget_trace" >/dev/null
 assert_not_contains "$budget_trace_text" "$budget_omitted_content" "budget-omitted complete object bytes in trace"
@@ -436,7 +448,7 @@ fallback_response="$(co_chat \
   "$budget_owner" \
   "$budget_client" \
   "$budget_conversation" \
-  "Retry with fallback but keep only $BUDGET_RETAINED_SENTINEL." \
+  "Retry with fallback but keep only retained anchor compact survivor." \
   "public" \
   "desktop_private")"
 fallback_request_id="$(jq -r '.request_id' <<<"$fallback_response")"
@@ -452,7 +464,9 @@ jq -e '
   and (.calls | map(select(.kind == "chat")) | .[1].status == "ok")
   and ((.calls | map(select(.kind == "chat")) | .[0].prompt_fingerprint) == (.calls | map(select(.kind == "chat")) | .[1].prompt_fingerprint))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.budget_retained == true))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.budget_retained == false))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.budget_omitted == false))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.budget_omitted == false))
 ' <<<"$fallback_calls" >/dev/null
 fallback_trace="$(fetch_trace "$fallback_request_id")"
 jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_artifact" '
@@ -467,13 +481,13 @@ jq -e --arg retained "$budget_retained_artifact" --arg omitted "$budget_omitted_
 privacy_owner="owner-wave2f-privacy"
 privacy_client="client-wave2f-privacy"
 privacy_conversation="$(resolve_conversation "$privacy_owner" "$privacy_client" "wave2f-privacy")"
-privacy_content="$PRIVACY_SENTINEL sensitive disposable artifact detail."
+privacy_content="$PRIVACY_SENTINEL privacy anchor notice."
 privacy_artifact="$(upload_artifact "$privacy_owner" "$privacy_client" "$privacy_conversation" "privacy-sensitive.txt" "$privacy_content")"
 privacy_response="$(co_chat \
   "$privacy_owner" \
   "$privacy_client" \
   "$privacy_conversation" \
-  "Summarize $PRIVACY_SENTINEL for a notification." \
+  "Summarize privacy anchor notice." \
   "private" \
   "notification_preview")"
 privacy_request_id="$(jq -r '.request_id' <<<"$privacy_response")"
@@ -486,6 +500,7 @@ privacy_calls="$(fetch_provider_calls "$privacy_request_id")"
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.privacy == true))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.privacy == false))
 ' <<<"$privacy_calls" >/dev/null
 privacy_trace="$(fetch_trace "$privacy_request_id")"
 privacy_trace_text="$(jq -c . <<<"$privacy_trace")"

@@ -183,6 +183,42 @@ production database, production object store, production credentials, or
 deployed user data. The command fails with an explicit prerequisite message
 when a sibling repository or required merge is unavailable.
 
+### Artifact composed smoke
+
+Run:
+
+```bash
+make artifact-composed-smoke
+```
+
+Prerequisites:
+
+- Docker with Compose support
+- `git`, `curl`, `jq`, and `python3`
+- sibling checkout at `../basic-memory-store`
+- `basic-memory-store/main` containing the Wave 2F artifact merge head
+  `919b670617e6749c0eee45e0192576e562490ac1`
+
+The artifact composed smoke builds Chat Orchestrator from the current branch and
+Basic Memory Store from the sibling `main` worktree. It runs a dedicated,
+disposable topology with PostgreSQL 16, Qdrant, MinIO, a bucket initializer, and
+a deterministic local OpenAI-compatible provider/embedding stub. The smoke uses
+the real Basic Memory Store artifact lifecycle: initialize an artifact, upload
+bytes through the returned presigned PUT URL, complete the artifact, derive text
+for the same artifact, retrieve through Basic Memory Store, and call
+`/v1/chat`.
+
+The assertions cover retained artifact source refs and snippets, owner and
+conversation isolation, incomplete artifact omission, prompt-budget survivor
+filtering, fallback reuse of the already-budgeted prompt, and privacy-driven
+public source suppression. Provider diagnostics are bounded to request ID,
+model, message count, prompt fingerprint, attempt status, section booleans, and
+watched-sentinel booleans; the stub does not expose full provider messages.
+
+All storage in this smoke is disposable. It uses no production provider,
+production database, production object store, production credentials, deployed
+data, or persistent MinIO bucket.
+
 ## File-backed retrieval behavior
 
 When `basic-memory-store` returns `bundle.artifact_refs`, the orchestrator:
