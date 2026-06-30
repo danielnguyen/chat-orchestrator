@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -12,6 +13,8 @@ _calls: dict[str, list[dict[str, Any]]] = defaultdict(list)
 _fail_primary: set[str] = set()
 _primary_failed: set[str] = set()
 _fail_next_primary = False
+_watched_sentinels: dict[str, str] = {}
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
 @app.get("/healthz")
@@ -32,6 +35,15 @@ async def chat_completions(
         message.get("content", "")
         for message in messages
         if isinstance(message, dict) and isinstance(message.get("content"), str)
+    )
+    user_text = "\n".join(
+        message.get("content", "")
+        for message in messages
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        )
     )
     normalized_messages = [
         {
@@ -57,6 +69,12 @@ async def chat_completions(
         or "augmented_bundle" in prompt_text
         or "comparison" in prompt_text
     )
+    sentinel_presence = {
+        name: sentinel in prompt_text for name, sentinel in sorted(_watched_sentinels.items())
+    }
+    sentinel_in_user_messages = {
+        name: sentinel in user_text for name, sentinel in sorted(_watched_sentinels.items())
+    }
     global _fail_next_primary
     should_fail_primary = request_id in _fail_primary or _fail_next_primary
     if should_fail_primary and request_id not in _primary_failed:
@@ -75,6 +93,8 @@ async def chat_completions(
                 "has_beta_marker": beta_anywhere,
                 "has_wave2e_private_sentinel": wave2e_private_sentinel,
                 "has_raw_diagnostics_marker": raw_diagnostics_marker,
+                "sentinel_presence": sentinel_presence,
+                "sentinel_in_user_messages": sentinel_in_user_messages,
                 "status": "failed",
             }
         )
@@ -98,6 +118,8 @@ async def chat_completions(
             "has_beta_marker": beta_anywhere,
             "has_wave2e_private_sentinel": wave2e_private_sentinel,
             "has_raw_diagnostics_marker": raw_diagnostics_marker,
+            "sentinel_presence": sentinel_presence,
+            "sentinel_in_user_messages": sentinel_in_user_messages,
             "status": "ok",
         }
     )
@@ -130,10 +152,11 @@ async def embeddings(
             "input_count": len(inputs),
         }
     )
+    vectors = [_embedding_vector(item) for item in inputs]
     return {
         "data": [
-            {"object": "embedding", "index": index, "embedding": [1.0] + [0.0] * 1535}
-            for index, _ in enumerate(inputs)
+            {"object": "embedding", "index": index, "embedding": vector}
+            for index, vector in enumerate(vectors)
         ],
         "model": body.get("model"),
     }
@@ -156,6 +179,7 @@ async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
         _calls.clear()
         _fail_primary.clear()
         _primary_failed.clear()
+        _watched_sentinels.clear()
         _fail_next_primary = False
     return {"status": "ok"}
 
@@ -172,3 +196,25 @@ async def fixture_fail_next_primary() -> dict[str, str]:
     global _fail_next_primary
     _fail_next_primary = True
     return {"status": "ok"}
+
+
+@app.post("/fixture/sentinels")
+async def fixture_sentinels(body: dict[str, Any]) -> dict[str, Any]:
+    _watched_sentinels.clear()
+    sentinels = body.get("sentinels")
+    if isinstance(sentinels, dict):
+        for name, sentinel in sentinels.items():
+            if isinstance(name, str) and isinstance(sentinel, str) and name and sentinel:
+                _watched_sentinels[name[:80]] = sentinel[:240]
+    return {"status": "ok", "count": len(_watched_sentinels)}
+
+
+def _embedding_vector(value: Any) -> list[float]:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    vector = [0.0] * 1536
+    vector[0] = 10.0
+    for token in _TOKEN_RE.findall(text.lower()):
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        index = 1 + (int.from_bytes(digest[:2], "big") % 1535)
+        vector[index] += 1.0
+    return vector

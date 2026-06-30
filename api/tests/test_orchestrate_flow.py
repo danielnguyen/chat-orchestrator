@@ -100,6 +100,12 @@ class FakeMemoryStore:
                         "file_path": "api/main.py",
                         "snippet": "def entrypoint(): pass",
                         "relevance_score": 0.9,
+                        "download_url": (
+                            "http://127.0.0.1:14400/memory-artifacts/a-1"
+                            "?X-Amz-Signature=PRIVATE-SIGNATURE-SENTINEL"
+                        ),
+                        "object_uri": "artifacts/PRIVATE-OBJECT-URI-SENTINEL/a-1",
+                        "credentials": "minioadmin",
                         "source_ref": {"ref_type": "derived_text", "ref_id": "derived-text-1"},
                         "source_availability": "available",
                         "source_checks": [
@@ -7843,6 +7849,12 @@ async def test_orchestrate_private_desktop_policy_preserves_answer_and_sources(t
 
     assert out["answer"] == "normal detail"
     assert out["sources"][0]["artifact_id"] == "a-1"
+    serialized_sources = json.dumps(out["sources"], sort_keys=True)
+    assert "download_url" not in serialized_sources
+    assert "object_uri" not in serialized_sources
+    assert "credentials" not in serialized_sources
+    assert "X-Amz-" not in serialized_sources
+    assert "minioadmin" not in serialized_sources
     assert memory_store.added_messages[-1]["content"] == "normal detail"
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "privacy_context"
@@ -7932,8 +7944,12 @@ async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
         "artifact_count": 1,
     }
     assert "semantic note" not in str(trace_payload)
+    assert "def entrypoint" not in str(trace_payload)
     assert "api/main.py" not in str(trace_payload)
     assert "a-1" not in str(trace_payload)
+    assert "X-Amz-" not in str(trace_payload)
+    assert "minioadmin" not in str(trace_payload)
+    assert "PRIVATE-OBJECT-URI-SENTINEL" not in str(trace_payload)
     brief = trace_payload["model_call"]["brief"]
     assert brief["enabled"] is True
     assert "raw_model_answer" not in brief

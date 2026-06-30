@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 
 DEV_COMPOSE := docker-compose.yml
 
-.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test prompt-budget-test prompt-budget-smoke composed-smoke wave2e-retrieval-smoke smoke dev-start dev-start-reload
+.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test prompt-budget-test prompt-budget-smoke composed-smoke artifact-composed-smoke wave2e-retrieval-smoke smoke dev-start dev-start-reload
 
 dev-up:
 	@docker compose -f $(DEV_COMPOSE) up -d
@@ -38,6 +38,9 @@ prompt-budget-smoke:
 
 composed-smoke:
 	@./scripts/composed_smoke.sh
+
+artifact-composed-smoke:
+	@./scripts/artifact_composed_smoke.sh
 
 wave2e-retrieval-smoke:
 	@WAVE2E_ONLY=1 ./scripts/composed_smoke.sh

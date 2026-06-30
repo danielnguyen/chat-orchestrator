@@ -109,7 +109,7 @@ qdrant_upsert_message() {
 }
 
 qdrant_upsert_derived() {
-  local derived_id="$1" artifact_id="$2" owner="$3" client_id="$4" file_path="$5"
+  local derived_id="$1" artifact_id="$2" owner="$3" client_id="$4" conversation_id="$5" file_path="$6" publication_status="${7:-active}"
   local vector
   vector="$(json_vector)"
   jq -nc \
@@ -117,9 +117,11 @@ qdrant_upsert_derived() {
     --arg artifact "$artifact_id" \
     --arg owner "$owner" \
     --arg client "$client_id" \
+    --arg conversation "$conversation_id" \
     --arg path "$file_path" \
+    --arg publication_status "$publication_status" \
     --argjson vector "$vector" \
-    '{points:[{id:$id, vector:$vector, payload:{ref_type:"derived_text", derived_text_id:$id, artifact_id:$artifact, owner_id:$owner, client_id:$client, file_path:$path, repo_name:"smoke", chunk_index:0}}]}' \
+    '{points:[{id:$id, vector:$vector, payload:{ref_type:"derived_text", derived_text_id:$id, artifact_id:$artifact, owner_id:$owner, client_id:$client, conversation_id:$conversation, file_path:$path, repo_name:"smoke", chunk_index:0, derivation_status:$publication_status}}]}' \
     | curl -fsS -X PUT "http://127.0.0.1:14391/collections/messages/points" \
       -H "Content-Type: application/json" \
       -d @- >/dev/null
@@ -202,7 +204,7 @@ seed_canonical_with_memory_id() {
 }
 
 seed_derived() {
-  local conversation_id="$1" owner="$2" client="$3" source_message_id="$4" text="$5" status="$6" suffix="$7"
+  local conversation_id="$1" owner="$2" client="$3" source_message_id="$4" text="$5" status="$6" suffix="$7" publication_status="${8:-active}"
   local artifact_id="10000000-0000-4000-8000-000000000$suffix"
   local derived_id="20000000-0000-4000-8000-000000000$suffix"
   local file_path="fixture-$suffix.txt"
@@ -217,11 +219,11 @@ INSERT INTO artifacts (
 INSERT INTO derived_text (id, artifact_id, kind, language, text, derivation_params)
 VALUES (
   '$derived_id', '$artifact_id', 'derived_text', 'en', '$text',
-  '{"source_refs":[{"ref_type":"message","ref_id":"$source_message_id","support_kind":"direct"}],"status":"$status","derivation_version":"v1","confidence":0.9}'::jsonb
+  '{"source_refs":[{"ref_type":"message","ref_id":"$source_message_id","support_kind":"direct"}],"status":"$publication_status","derivation_version":"v1","confidence":0.9}'::jsonb
 );
 SQL
   insert_memory_item "$owner" "derived_text" "$derived_id" "$status"
-  qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$file_path"
+  qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$conversation_id" "$file_path" "$publication_status"
   echo "$derived_id"
 }
 
@@ -245,13 +247,28 @@ VALUES (
   '{"source_refs":[{"ref_type":"message","ref_id":"$missing_id","support_kind":"direct"}],"status":"active","derivation_version":"v1","confidence":0.9}'::jsonb
 );
 SQL
-  qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$file_path"
+  qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$conversation_id" "$file_path"
   echo "$derived_id"
 }
 
 run_chat() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
   co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation_id" --arg question "$question" '{owner_id:$owner, client_id:$client, conversation_id:$conversation, surface:"chat", messages:[{role:"user", content:$question}], sensitivity:"private"}')"
+}
+
+run_chat_with_artifacts() {
+  local owner="$1" client="$2" conversation_id="$3" question="$4"
+  co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation_id" --arg question "$question" '{owner_id:$owner, client_id:$client, conversation_id:$conversation, surface:"chat", messages:[{role:"user", content:$question}], sensitivity:"private", retrieval:{include_artifacts:true,k:8,min_score:0,scope:"conversation",time_window:"all",retrieval_mode:"balanced"}}')"
+}
+
+bms_retrieve_with_artifacts() {
+  local owner="$1" client="$2" conversation_id="$3" query="$4"
+  local request_id="bms-smoke-a-artifacts"
+  curl -fsS -X POST "http://127.0.0.1:14321/v2/conversations/$conversation_id/retrieve" \
+    -H "X-API-Key: smoke-memory-key" \
+    -H "X-Request-ID: $request_id" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg request_id "$request_id" --arg owner "$owner" --arg client "$client" --arg query "$query" '{request_id:$request_id,owner_id:$owner,client_id:$client,query:$query,include_artifacts:true,retrieval:{k:8,min_score:0,scope:"conversation",time_window:"all",retrieval_mode:"balanced"}}')"
 }
 
 fetch_trace() {
@@ -379,13 +396,18 @@ if [ "${WAVE2E_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
-# Scenario A: active canonical Alpha beats parked derivative Beta.
+# Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
 owner="owner-smoke-a"
 client="client-smoke-a"
 conversation_id="$(resolve_conversation "$owner" "$client" "smoke-a")"
 alpha_id="$(seed_canonical "$conversation_id" "$owner" "$client" "Current plan is Alpha." "active")"
-seed_derived "$conversation_id" "$owner" "$client" "$alpha_id" "Old plan was Beta." "parked" "001" >/dev/null
-response="$(run_chat "$owner" "$client" "$conversation_id" "What is the current plan?")"
+seed_derived "$conversation_id" "$owner" "$client" "$alpha_id" "Old plan was Beta." "parked" "001" "active" >/dev/null
+direct_retrieval="$(bms_retrieve_with_artifacts "$owner" "$client" "$conversation_id" "What is the current plan?")"
+jq -e '(.bundle.artifact_refs | length) >= 1' <<<"$direct_retrieval" >/dev/null || {
+  jq -c '.bundle.retrieval_debug' <<<"$direct_retrieval" >&2
+  exit 1
+}
+response="$(run_chat_with_artifacts "$owner" "$client" "$conversation_id" "What is the current plan?")"
 request_id="$(jq -r '.request_id' <<<"$response")"
 answer="$(jq -r '.answer' <<<"$response")"
 test "$answer" = "Current plan is Alpha."
@@ -396,14 +418,16 @@ assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
 assert_runtime_memory_hygiene_count "$trace" "$request_id" 2
 jq -e '
   .retrieval.prompt_assembly.memory_hygiene.truth_selection.current_canonical_evidence_count >= 1
-  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.historical_or_parked_context_count >= 1
   and .retrieval.prompt_assembly.memory_hygiene.truth_selection.no_safe_current_evidence == false
+  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.provider_visible_historical_count >= 1
+  and .retrieval.prompt_assembly.memory_hygiene.truth_selection.historical_or_parked_context_count >= 1
 ' <<<"$trace" >/dev/null
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
   and (.calls | map(select(.kind == "chat")) | all(.has_current_memory_evidence == true))
   and (.calls | map(select(.kind == "chat")) | all(.has_historical_memory_context == true))
   and (.calls | map(select(.kind == "chat")) | all(.has_forbidden_beta_in_current == false))
+  and (.calls | map(select(.kind == "chat")) | all(.has_beta_marker == true))
 ' <<<"$provider_calls" >/dev/null
 
 # Scenario B: only stale evidence remains uncertain/historical.

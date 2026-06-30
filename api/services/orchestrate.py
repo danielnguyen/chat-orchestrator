@@ -736,10 +736,15 @@ def _public_answer_sources(sources: Any) -> list[dict[str, Any]]:
     if not isinstance(sources, list):
         return []
     private_keys = {
+        "credentials",
+        "download_url",
         "memory_hygiene",
+        "object_uri",
         "provenance",
         "qualification_reasons",
+        "presigned_url",
         "source_checks",
+        "upload_url",
     }
     public_sources: list[dict[str, Any]] = []
     for source in sources:
