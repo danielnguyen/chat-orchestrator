@@ -69,18 +69,28 @@ class FakeMemoryStore:
                 "recent": [
                     {
                         "owner_id": "owner",
+                        "conversation_id": kwargs["conversation_id"],
                         "evidence_role": "canonical",
+                        "message_id": "recent-message-1",
                         "role": "assistant",
                         "content": "prior history",
                         "source_ref": {"ref_type": "message", "ref_id": "recent-message-1"},
                         "source_availability": "not_applicable",
                         "freshness_state": "active",
                         "durable_status": "active",
+                        "policy_metadata": {
+                            "memory_domains": ["technical"],
+                            "sensitivity": "medium",
+                            "entity_ids": ["entity_repo"],
+                            "relationship_ids": ["rel_project"],
+                            "relationship_scopes": ["project_context"],
+                        },
                     }
                 ],
                 "semantic": [
                     {
                         "owner_id": "owner",
+                        "conversation_id": kwargs["conversation_id"],
                         "evidence_role": "canonical",
                         "message_id": "semantic-message-1",
                         "created_at": "2026-01-01T00:00:00+00:00",
@@ -90,6 +100,13 @@ class FakeMemoryStore:
                         "source_availability": "not_applicable",
                         "freshness_state": "active",
                         "durable_status": "active",
+                        "policy_metadata": {
+                            "memory_domains": ["technical"],
+                            "sensitivity": "medium",
+                            "entity_ids": ["entity_repo"],
+                            "relationship_ids": ["rel_project"],
+                            "relationship_scopes": ["project_context"],
+                        },
                     }
                 ],
                 "artifact_refs": [
@@ -130,6 +147,14 @@ class FakeMemoryStore:
                         },
                         "freshness_state": "active",
                         "durable_status": "active",
+                        "policy_metadata": {
+                            "memory_domains": ["technical"],
+                            "sensitivity": "medium",
+                            "content_class": "code",
+                            "entity_ids": ["entity_repo"],
+                            "relationship_ids": ["rel_project"],
+                            "relationship_scopes": ["project_context"],
+                        },
                     }
                 ],
                 "observed_metadata": {"has_code_like_content": False},
@@ -2447,15 +2472,16 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
         request_id="rid-containment-trace",
     )
 
-    assert out["sources"] == []
-    assert all(
-        "Retrieved file snippets:" not in message["content"]
+    assert [source["artifact_id"] for source in out["sources"]] == ["a-1"]
+    assert any(
+        "Retrieved file snippets:" in message["content"]
         for message in litellm.calls[0]["messages"]
         if message["role"] == "system"
     )
 
     trace_payload = memory_store.trace_calls[0]["payload"]
-    assert trace_payload["retrieval"]["bundle"]["artifact_refs"] == []
+    artifact_refs = trace_payload["retrieval"]["bundle"]["artifact_refs"]
+    assert [item["artifact_id"] for item in artifact_refs] == ["a-1"]
     persona_trace = trace_payload["retrieval"]["prompt_assembly"]["persona_containment"]
     assert persona_trace["retrieval_scope_requested"] == "owner"
     assert persona_trace["retrieval_scope_used"] == "conversation"
@@ -2469,12 +2495,14 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
         persona_trace["artifact_request_reason"]
         == "artifact_search_disabled_under_containment_lock"
     )
-    assert persona_trace["artifact_result_status"] == "suppressed"
-    assert (
-        persona_trace["artifact_result_reason"]
-        == "unexpected_artifact_results_omitted_under_containment_lock"
-    )
-    assert persona_trace["artifact_result_count_omitted"] == 1
+    result_boundary = trace_payload["retrieval"]["prompt_assembly"]["result_boundary"]
+    assert result_boundary["validation_status"] == "filtered"
+    assert result_boundary["retained_counts"] == {
+        "recent": 1,
+        "semantic": 1,
+        "artifact_refs": 1,
+    }
+    assert result_boundary["artifact_policy_applied"] is True
     assert persona_trace["domain_retrieval_scope_status"] == "requested_tagged_only"
     assert (
         persona_trace["domain_retrieval_scope_reason"]
@@ -2606,6 +2634,268 @@ async def test_wave3b_valid_containment_sends_exact_mandatory_bms_policy(tmp_pat
         "retrieval_bundle"
     )
     assert len(runtime.relationship_calls) == 1
+
+
+def _co2_policy_metadata(
+    *,
+    domains=None,
+    sensitivity="medium",
+    content_class=None,
+    relationship_id="rel_project",
+):
+    metadata = {
+        "memory_domains": domains or ["technical"],
+        "sensitivity": sensitivity,
+        "entity_ids": ["entity_repo"] if relationship_id else [],
+        "relationship_ids": [relationship_id] if relationship_id else [],
+        "relationship_scopes": ["project_context"] if relationship_id else [],
+    }
+    if content_class is not None:
+        metadata["content_class"] = content_class
+    return metadata
+
+
+def _co2_message(message_id, content, **overrides):
+    item = {
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "message_id": message_id,
+        "role": "assistant",
+        "content": content,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "source_ref": {"ref_type": "message", "ref_id": message_id},
+        "source_availability": "not_applicable",
+        "policy_metadata": _co2_policy_metadata(),
+    }
+    item.update(overrides)
+    return item
+
+
+def _co2_artifact(artifact_id, snippet, **overrides):
+    item = {
+        "owner_id": "owner",
+        "artifact_id": artifact_id,
+        "file_path": f"docs/{artifact_id}.md",
+        "snippet": snippet,
+        "relevance_score": 0.9,
+        "source_ref": {"ref_type": "derived_text", "ref_id": artifact_id},
+        "source_availability": "available",
+        "policy_metadata": _co2_policy_metadata(content_class="document"),
+    }
+    item.update(overrides)
+    return item
+
+
+class Wave3BResultBoundaryMemoryStore(FakeMemoryStore):
+    async def retrieve_bundle(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "bundle": {
+                "recent": [
+                    _co2_message("recent-good", "recent valid memory"),
+                    _co2_message("recent-owner-bad", "recent forbidden", owner_id="other"),
+                ],
+                "semantic": [
+                    _co2_message("semantic-good", "semantic valid memory"),
+                    _co2_message(
+                        "semantic-restricted",
+                        "semantic forbidden",
+                        policy_metadata=_co2_policy_metadata(sensitivity="restricted"),
+                    ),
+                    _co2_message(
+                        "semantic-extra-field",
+                        "semantic malformed",
+                        policy_metadata={
+                            **_co2_policy_metadata(),
+                            "active_persona_id": "technical_architect",
+                        },
+                    ),
+                ],
+                "artifact_refs": [
+                    _co2_artifact("artifact-good", "eligible artifact snippet"),
+                    _co2_artifact(
+                        "artifact-blocked",
+                        "blocked artifact snippet",
+                        policy_metadata=_co2_policy_metadata(
+                            domains=["finance"],
+                            content_class="document",
+                        ),
+                    ),
+                    _co2_artifact(
+                        "artifact-low-score",
+                        "low score artifact snippet",
+                        relevance_score=0.01,
+                    ),
+                ],
+                "observed_metadata": {},
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_wave3b_result_boundary_filters_messages_artifacts_and_sources(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = Wave3BResultBoundaryMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped memory"}],
+            "sensitivity": "private",
+            "retrieval": {"scope": "owner", "min_score": 0.5},
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-wave3b-result-boundary",
+    )
+
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    assert "semantic valid memory" in prompt_text
+    assert "eligible artifact snippet" in prompt_text
+    assert "semantic forbidden" not in prompt_text
+    assert "semantic malformed" not in prompt_text
+    assert "blocked artifact snippet" not in prompt_text
+    assert "low score artifact snippet" not in prompt_text
+    assert [source["artifact_id"] for source in out["sources"]] == ["artifact-good"]
+
+    trace = memory_store.trace_calls[0]["payload"]
+    boundary = trace["retrieval"]["prompt_assembly"]["result_boundary"]
+    assert boundary["validation_status"] == "filtered"
+    assert boundary["input_counts"] == {"recent": 2, "semantic": 3, "artifact_refs": 3}
+    assert boundary["retained_counts"] == {"recent": 1, "semantic": 1, "artifact_refs": 1}
+    assert boundary["relationship_policy_applied"] is True
+    assert boundary["artifact_policy_applied"] is True
+    assert boundary["omission_counts_by_reason"]["owner_mismatch"] == 1
+    assert boundary["omission_counts_by_reason"]["restricted_sensitivity"] == 1
+    assert boundary["omission_counts_by_reason"]["unexpected_policy_metadata_fields"] == 1
+    assert boundary["omission_counts_by_reason"]["memory_domain_not_allowed"] == 1
+    assert boundary["omission_counts_by_reason"]["relevance_score_below_minimum"] == 1
+    retrieval = trace["retrieval"]["bundle"]
+    assert [item["message_id"] for item in retrieval["semantic"]] == ["semantic-good"]
+    assert [item["artifact_id"] for item in retrieval["artifact_refs"]] == ["artifact-good"]
+
+
+@pytest.mark.asyncio
+async def test_wave3b_result_boundary_envelope_mismatch_fails_closed(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+
+    class MismatchedEnvelopeMemoryStore(Wave3BResultBoundaryMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            response = await super().retrieve_bundle(**kwargs)
+            response["request_id"] = "wrong-request"
+            return response
+
+    memory_store = MismatchedEnvelopeMemoryStore()
+    litellm = FakeLiteLLM()
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-wave3b-envelope",
+    )
+
+    prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
+    assert "semantic valid memory" not in prompt_text
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "result_boundary"
+    ]
+    assert trace["validation_status"] == "failed_closed"
+    assert trace["envelope_validation_failed"] is True
+    assert trace["omission_counts_by_reason"]["retrieval_envelope_mismatch"] == 1
+
+
+@pytest.mark.asyncio
+async def test_wave3b_result_boundary_fallback_reuses_same_prompt_identity(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: chat_cloud_primary\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: chat_local_fast\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  chat_cloud_primary:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "  chat_local_fast:\n"
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
+        encoding="utf-8",
+    )
+    memory_store = Wave3BResultBoundaryMemoryStore()
+    litellm = FakeLiteLLM(fail_first=True)
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped memory"}],
+            "sensitivity": "private",
+            "retrieval": {"scope": "owner", "min_score": 0.5},
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-wave3b-fallback-identity",
+    )
+
+    trace = memory_store.trace_calls[0]["payload"]
+    model_calls = trace["model_calls"]
+    assert len(model_calls) == 2
+    assert model_calls[0]["status"] == "failed"
+    assert model_calls[1]["status"] == "ok"
+    assert model_calls[0]["prompt_fingerprint"] == model_calls[1]["prompt_fingerprint"]
+    assert model_calls[0]["prompt_message_count"] == model_calls[1]["prompt_message_count"]
+    assert model_calls[0]["retained_semantic_message_ids"] == ["semantic-good"]
+    assert model_calls[1]["retained_semantic_message_ids"] == ["semantic-good"]
+    assert model_calls[0]["retained_artifact_ids"] == ["artifact-good"]
+    assert model_calls[1]["retained_artifact_ids"] == ["artifact-good"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
 
 
 @pytest.mark.asyncio
@@ -9212,8 +9502,8 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
 
     assert trace_payload["retrieval"]["bundle"] == {
         "privacy_suppressed": True,
-        "recent_item_count": 1,
-        "semantic_item_count": 1,
+        "recent_item_count": 0,
+        "semantic_item_count": 0,
         "artifact_count": 0,
     }
     prompt_trace = trace_payload["retrieval"]["prompt_assembly"]

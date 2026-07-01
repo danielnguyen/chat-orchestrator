@@ -96,6 +96,7 @@ class ReplayMemoryStore:
         semantic: list[dict[str, Any]] = [
             {
                 "owner_id": "owner-replay",
+                "conversation_id": kwargs["conversation_id"],
                 "evidence_role": "canonical",
                 "message_id": "memory-1",
                 "created_at": "2026-01-01T00:00:00+00:00",
@@ -105,6 +106,13 @@ class ReplayMemoryStore:
                 "source_availability": "not_applicable",
                 "freshness_state": "active",
                 "durable_status": "active",
+                "policy_metadata": {
+                    "memory_domains": ["technical"],
+                    "sensitivity": "medium",
+                    "entity_ids": ["entity_repo"],
+                    "relationship_ids": ["rel_project"],
+                    "relationship_scopes": ["project_context"],
+                },
             }
         ]
         artifacts: list[dict[str, Any]] = [
@@ -114,6 +122,7 @@ class ReplayMemoryStore:
                 "artifact_id": "artifact-1",
                 "file_path": "fixture.txt",
                 "snippet": "neutral artifact fixture",
+                "relevance_score": 0.9,
                 "source_ref": {"ref_type": "derived_text", "ref_id": "derived-1"},
                 "source_availability": "available",
                 "source_checks": [
@@ -138,6 +147,14 @@ class ReplayMemoryStore:
                 },
                 "freshness_state": "active",
                 "durable_status": "active",
+                "policy_metadata": {
+                    "memory_domains": ["technical"],
+                    "sensitivity": "medium",
+                    "content_class": "document",
+                    "entity_ids": ["entity_repo"],
+                    "relationship_ids": ["rel_project"],
+                    "relationship_scopes": ["project_context"],
+                },
             }
         ]
         if mode == "missing_derivative":
@@ -164,6 +181,34 @@ class ReplayMemoryStore:
         elif mode == "artifact_unavailable":
             artifacts = []
             debug.update({"degraded": True, "fallback": "artifact_unavailable"})
+        elif mode == "wave3b_mixed_result_boundary":
+            semantic.append(
+                {
+                    **semantic[0],
+                    "message_id": "memory-restricted",
+                    "content": "restricted replay memory",
+                    "source_ref": {"ref_type": "message", "ref_id": "memory-restricted"},
+                    "policy_metadata": {
+                        **semantic[0]["policy_metadata"],
+                        "sensitivity": "restricted",
+                    },
+                }
+            )
+            artifacts.append(
+                {
+                    **artifacts[0],
+                    "artifact_id": "artifact-blocked",
+                    "snippet": "blocked replay artifact",
+                    "source_ref": {
+                        "ref_type": "derived_text",
+                        "ref_id": "derived-blocked",
+                    },
+                    "policy_metadata": {
+                        **artifacts[0]["policy_metadata"],
+                        "memory_domains": ["finance"],
+                    },
+                }
+            )
         elif mode == "truth_active_parked":
             semantic[0]["content"] = "Current plan is Alpha."
             artifacts[0]["snippet"] = "Old plan was Beta."
@@ -600,6 +645,29 @@ class ReplayRuntime:
             }
         }
 
+    async def evaluate_privacy_context(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_privacy_context", kwargs["request_id"])
+        self._maybe_fail()
+        enforce = self.scenario.get("privacy_context") == "replace_answer"
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "surface": kwargs["surface"],
+            "runtime_session_id": kwargs.get("runtime_session_id"),
+            "runtime_turn_id": kwargs.get("runtime_turn_id"),
+            "result": {
+                "surface_type": "public_projector" if enforce else "desktop_private",
+                "redaction_required": enforce,
+                "safe_summary_required": enforce,
+                "sensitive_detail_allowed": not enforce,
+                "screen_detail_allowed": not enforce,
+                "template_id": "privacy_safe_summary" if enforce else None,
+                "confidence": 0.9,
+                "reason_codes": ["replay_privacy_boundary"],
+            },
+        }
+
     async def overlay(self, **kwargs: Any) -> Any:
         self._record("cr_overlay", kwargs["request_id"])
         self._maybe_fail()
@@ -924,6 +992,8 @@ def _normalize(
     provider_attempts = [call for call in calls if call.get("name") == "provider_attempt"]
     retrieval_dispatch = raw_prompt.get("retrieval_dispatch")
     retrieval_dispatch = retrieval_dispatch if isinstance(retrieval_dispatch, dict) else {}
+    result_boundary = raw_prompt.get("result_boundary")
+    result_boundary = result_boundary if isinstance(result_boundary, dict) else {}
     return {
         "schema_version": "orchestration-replay-v1",
         "scenario": scenario["scenario"],
@@ -1025,6 +1095,25 @@ def _normalize(
                     "neutral_persistence_classification"
                 ),
             },
+            "result_boundary": {
+                "enforcement_mode": result_boundary.get("enforcement_mode"),
+                "validation_status": result_boundary.get("validation_status"),
+                "envelope_validation_failed": result_boundary.get(
+                    "envelope_validation_failed"
+                ),
+                "input_counts": result_boundary.get("input_counts"),
+                "retained_counts": result_boundary.get("retained_counts"),
+                "omission_counts_by_reason": result_boundary.get(
+                    "omission_counts_by_reason"
+                ),
+                "relationship_policy_applied": result_boundary.get(
+                    "relationship_policy_applied"
+                ),
+                "artifact_policy_applied": result_boundary.get("artifact_policy_applied"),
+                "post_budget_survivor_filter_removed_sources": result_boundary.get(
+                    "post_budget_survivor_filter_removed_sources"
+                ),
+            },
         },
         "provider_attempt_count": len(provider_attempts),
         "provider_fingerprints": [
@@ -1111,6 +1200,7 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                     ),
                     restraint_enabled=bool(scenario.get("restraint_enabled")),
                     memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
+                    privacy_context_enabled=bool(scenario.get("privacy_context_enabled")),
                     request_id=request_id,
                     prompt_output_token_reserve=scenario.get(
                         "prompt_output_token_reserve",
@@ -1143,6 +1233,7 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                 persona_containment_enabled=bool(scenario.get("persona_containment_enabled")),
                 restraint_enabled=bool(scenario.get("restraint_enabled")),
                 memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
+                privacy_context_enabled=bool(scenario.get("privacy_context_enabled")),
                 request_id=request_id,
             )
     except Exception as exc:  # replay snapshots intentionally cover failures

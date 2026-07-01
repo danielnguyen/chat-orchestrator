@@ -78,6 +78,117 @@
             }
         },
         {
+            "scenario": "wave3b-co2-mixed-result-boundary",
+            "category": "wave3b_result_boundary",
+            "persona_containment_enabled": true,
+            "restraint_enabled": true,
+            "retrieval": "wave3b_mixed_result_boundary",
+            "relationship_projection": {
+                "applied": true,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"]
+            },
+            "expected": {
+                "outcome": {
+                    "status": "ok",
+                    "error_type": null
+                },
+                "trace": {
+                    "result_boundary": {
+                        "enforcement_mode": "mandatory",
+                        "validation_status": "filtered",
+                        "envelope_validation_failed": false,
+                        "input_counts": {
+                            "recent": 0,
+                            "semantic": 2,
+                            "artifact_refs": 2
+                        },
+                        "retained_counts": {
+                            "recent": 0,
+                            "semantic": 1,
+                            "artifact_refs": 1
+                        },
+                        "relationship_policy_applied": true,
+                        "artifact_policy_applied": true
+                    }
+                }
+            }
+        },
+        {
+            "scenario": "wave3b-co2-fallback-same-prompt",
+            "category": "wave3b_result_boundary_fallback",
+            "persona_containment_enabled": true,
+            "restraint_enabled": true,
+            "provider": "fallback_success",
+            "retrieval": "wave3b_mixed_result_boundary",
+            "relationship_projection": {
+                "applied": true,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"]
+            },
+            "expected": {
+                "outcome": {
+                    "status": "degraded",
+                    "error_type": null
+                },
+                "trace": {
+                    "fallback": {
+                        "triggered": true,
+                        "reason": "provider_error"
+                    },
+                    "provider_fallback_context": {
+                        "same_sanitized_messages_reused": true
+                    },
+                    "result_boundary": {
+                        "enforcement_mode": "mandatory",
+                        "validation_status": "filtered",
+                        "retained_counts": {
+                            "recent": 0,
+                            "semantic": 1,
+                            "artifact_refs": 1
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "scenario": "wave3b-co2-privacy-after-scoped-retrieval",
+            "category": "wave3b_result_boundary_privacy",
+            "persona_containment_enabled": true,
+            "restraint_enabled": true,
+            "privacy_context_enabled": true,
+            "privacy_context": "replace_answer",
+            "retrieval": "wave3b_mixed_result_boundary",
+            "relationship_projection": {
+                "applied": true,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"]
+            },
+            "expected": {
+                "outcome": {
+                    "status": "ok",
+                    "error_type": null
+                },
+                "trace": {
+                    "result_boundary": {
+                        "enforcement_mode": "mandatory",
+                        "validation_status": "filtered",
+                        "retained_counts": {
+                            "recent": 0,
+                            "semantic": 1,
+                            "artifact_refs": 1
+                        }
+                    }
+                }
+            }
+        },
+        {
             "scenario": "runtime-overlay-included",
             "category": "runtime_overlay_included",
             "runtime": "included",
