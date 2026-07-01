@@ -54,16 +54,20 @@ class MemoryStoreClient:
         content: str,
         client_id: str | None,
         metadata: dict[str, Any] | None = None,
+        policy_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        payload = {
+            "owner_id": owner_id,
+            "role": role,
+            "content": content,
+            "client_id": client_id,
+            "metadata": metadata,
+        }
+        if policy_metadata is not None:
+            payload["policy_metadata"] = policy_metadata
         return await self._post(
             f"/v1/conversations/{conversation_id}/messages",
-            json={
-                "owner_id": owner_id,
-                "role": role,
-                "content": content,
-                "client_id": client_id,
-                "metadata": metadata,
-            },
+            json=payload,
         )
 
     async def retrieve_bundle(
@@ -77,6 +81,7 @@ class MemoryStoreClient:
         include_artifacts: bool | None = None,
         allowed_memory_domains: list[str] | None = None,
         blocked_memory_domains: list[str] | None = None,
+        containment_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -87,9 +92,11 @@ class MemoryStoreClient:
         }
         if include_artifacts is not None:
             payload["include_artifacts"] = include_artifacts
-        if allowed_memory_domains:
+        if containment_policy is not None:
+            payload["containment_policy"] = containment_policy
+        elif allowed_memory_domains:
             payload["allowed_memory_domains"] = allowed_memory_domains
-        if blocked_memory_domains:
+        if containment_policy is None and blocked_memory_domains:
             payload["blocked_memory_domains"] = blocked_memory_domains
         response = await self._post(
             f"/v2/conversations/{conversation_id}/retrieve",

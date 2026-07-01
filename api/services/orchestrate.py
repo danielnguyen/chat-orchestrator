@@ -141,11 +141,264 @@ class RetrievalBoundaryResult:
     blocked_memory_domains: list[str] | None
 
 
+@dataclass(frozen=True)
+class MandatoryRetrievalPolicy:
+    containment_policy: dict[str, Any] | None
+    relationship_context: dict[str, Any] | None
+    relationship_trace: dict[str, Any]
+    validation_trace: dict[str, Any]
+
+
+SAFE_POLICY_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+SAFE_SCOPE_ID = re.compile(r"^[A-Za-z0-9_.:/@-]{1,160}$")
+
+
 def _sanitize_memory_domain_list(value: Any) -> list[str] | None:
     if not isinstance(value, list):
         return None
     cleaned = [item for item in value if isinstance(item, str) and item]
     return cleaned or None
+
+
+def _policy_label_list(value: Any, *, limit: int, required: bool = False) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > limit:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        cleaned = item.strip()
+        if not SAFE_POLICY_LABEL.fullmatch(cleaned):
+            return None
+        normalized = cleaned.lower().replace("-", "_")
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    if required and not out:
+        return None
+    return out
+
+
+def _scope_id_list(value: Any, *, limit: int) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > limit:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        cleaned = item.strip()
+        if not SAFE_SCOPE_ID.fullmatch(cleaned):
+            return None
+        if cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
+
+
+def _validate_artifact_access_policy(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, "missing_artifact_access_policy"
+    if value.get("enforcement_mode") != "mandatory":
+        return None, "invalid_artifact_policy_enforcement_mode"
+    allowed_content_classes = _policy_label_list(
+        value.get("allowed_content_classes"),
+        limit=8,
+    )
+    allowed_domains = _policy_label_list(value.get("allowed_domains"), limit=16)
+    surface_content_capabilities = _policy_label_list(
+        value.get("surface_content_capabilities"),
+        limit=8,
+    )
+    reason_codes = _policy_label_list(value.get("reason_codes"), limit=8)
+    maximum_sensitivity = value.get("maximum_sensitivity")
+    if maximum_sensitivity not in {"low", "medium", "high"}:
+        return None, "invalid_artifact_policy_sensitivity"
+    if (
+        allowed_content_classes is None
+        or allowed_domains is None
+        or surface_content_capabilities is None
+        or reason_codes is None
+    ):
+        return None, "malformed_artifact_access_policy"
+    return {
+        "enforcement_mode": "mandatory",
+        "allowed_content_classes": allowed_content_classes,
+        "allowed_domains": allowed_domains,
+        "maximum_sensitivity": maximum_sensitivity,
+        "surface_content_capabilities": surface_content_capabilities,
+        "reason_codes": reason_codes,
+    }, None
+
+
+def _validate_relationship_projection(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, "missing_relationship_scope_projection"
+    if not isinstance(value.get("applied"), bool):
+        return None, "malformed_relationship_scope_projection"
+    relationship_ids = _scope_id_list(value.get("relationship_ids"), limit=64)
+    entity_ids = _scope_id_list(value.get("entity_ids"), limit=64)
+    relationship_scopes = _policy_label_list(value.get("relationship_scopes"), limit=16)
+    reason_codes = _policy_label_list(value.get("reason_codes"), limit=8)
+    if (
+        relationship_ids is None
+        or entity_ids is None
+        or relationship_scopes is None
+        or reason_codes is None
+    ):
+        return None, "malformed_relationship_scope_projection"
+    if value.get("applied") is True and not relationship_ids and not entity_ids:
+        return None, "empty_applied_relationship_scope_projection"
+    return {
+        "applied": value["applied"],
+        "relationship_ids": relationship_ids,
+        "entity_ids": entity_ids,
+        "relationship_scopes": relationship_scopes,
+        "reason_codes": reason_codes,
+    }, None
+
+
+def _validate_persona_containment_policy(
+    persona_containment: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    trace = {
+        "mandatory_containment_requested": True,
+        "policy_validation_status": "failed",
+        "policy_validation_reason": None,
+    }
+    if not isinstance(persona_containment, dict):
+        trace["policy_validation_reason"] = "persona_containment_unavailable"
+        return None, trace
+    allowed_memory_domains = _policy_label_list(
+        persona_containment.get("allowed_memory_domains"),
+        limit=16,
+        required=True,
+    )
+    blocked_memory_domains = _policy_label_list(
+        persona_containment.get("blocked_memory_domains"),
+        limit=16,
+    )
+    artifact_policy, artifact_reason = _validate_artifact_access_policy(
+        persona_containment.get("artifact_access_policy")
+    )
+    if allowed_memory_domains is None:
+        trace["policy_validation_reason"] = "malformed_allowed_memory_domains"
+        return None, trace
+    if blocked_memory_domains is None:
+        trace["policy_validation_reason"] = "malformed_blocked_memory_domains"
+        return None, trace
+    if artifact_policy is None:
+        trace["policy_validation_reason"] = artifact_reason
+        return None, trace
+    trace.update(
+        {
+            "policy_validation_status": "valid",
+            "policy_validation_reason": "mandatory_containment_policy_valid",
+            "allowed_memory_domain_count": len(allowed_memory_domains),
+            "blocked_memory_domain_count": len(blocked_memory_domains),
+            "artifact_content_class_count": len(artifact_policy["allowed_content_classes"]),
+            "artifact_domain_count": len(artifact_policy["allowed_domains"]),
+        }
+    )
+    return {
+        "enforcement_mode": "mandatory",
+        "allowed_memory_domains": allowed_memory_domains,
+        "blocked_memory_domains": blocked_memory_domains,
+        "artifact_access_policy": artifact_policy,
+    }, trace
+
+
+def _empty_retrieval_bundle(
+    *,
+    request_id: str,
+    conversation_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "bundle": {
+            "recent": [],
+            "semantic": [],
+            "artifact_refs": [],
+            "observed_metadata": {},
+            "retrieval_debug": {
+                "degraded": False,
+                "fallback": False,
+                "suppressed": True,
+                "suppression_reason": reason,
+            },
+        },
+        "diagnostics": {
+            "contract_version": "raw-retrieval-debug.v1",
+            "mode": "augmented",
+            "status": "ok",
+            "canonical_used": False,
+            "derived_used": False,
+            "fallback_to_raw": False,
+            "reason_codes": [reason],
+        },
+    }
+
+
+def _restraint_suppression_reason(restraint: dict[str, Any] | None) -> str | None:
+    if not isinstance(restraint, dict):
+        return None
+    if restraint.get("retrieval_suppressed") is True:
+        return "retrieval_suppressed_true"
+    if restraint.get("restraint_policy") == "do_not_retrieve":
+        return "restraint_policy_do_not_retrieve"
+    return None
+
+
+def _classify_turn_policy_metadata(
+    *,
+    persona_containment: dict[str, Any] | None,
+    relationship_projection: dict[str, Any] | None,
+    request_sensitivity: Any,
+    interaction_governance: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(persona_containment, dict):
+        return None, "persona_containment_unavailable"
+    allowed_domains = _policy_label_list(
+        persona_containment.get("allowed_memory_domains"),
+        limit=16,
+        required=True,
+    )
+    capability_domain = persona_containment.get("capability_domain")
+    if (
+        not isinstance(capability_domain, str)
+        or not SAFE_POLICY_LABEL.fullmatch(capability_domain.strip())
+        or allowed_domains is None
+    ):
+        return None, "capability_domain_unavailable"
+    normalized_domain = capability_domain.strip().lower().replace("-", "_")
+    if normalized_domain not in allowed_domains:
+        return None, "capability_domain_outside_allowed_domains"
+    sensitivity = "medium"
+    if request_sensitivity in {"public", "low"}:
+        sensitivity = "low"
+    elif request_sensitivity in {"high", "local_only", "restricted"}:
+        sensitivity = "high"
+    hint = (
+        interaction_governance.get("privacy_sensitivity_hint")
+        if isinstance(interaction_governance, dict)
+        else None
+    )
+    if hint in {"private", "sensitive", "high"}:
+        sensitivity = "high"
+    metadata: dict[str, Any] = {
+        "memory_domains": [normalized_domain],
+        "sensitivity": sensitivity,
+    }
+    if isinstance(relationship_projection, dict):
+        metadata["entity_ids"] = list(relationship_projection.get("entity_ids") or [])
+        metadata["relationship_ids"] = list(relationship_projection.get("relationship_ids") or [])
+        metadata["relationship_scopes"] = list(
+            relationship_projection.get("relationship_scopes") or []
+        )
+    return metadata, None
 
 
 def _apply_persona_containment_retrieval_boundary(
@@ -1813,6 +2066,7 @@ async def _resolve_relationship_context(
     trace = response.get("trace")
     selected_relationships = response.get("selected_relationships")
     prompt_content = response.get("prompt_content")
+    projection = response.get("retrieval_scope_projection")
     if not isinstance(trace, dict) or not isinstance(selected_relationships, list):
         return None, {
             "attempted": True,
@@ -1838,6 +2092,14 @@ async def _resolve_relationship_context(
         "active_persona_id": trace.get("active_persona_id"),
         "allowed_relationship_scopes": trace.get("allowed_relationship_scopes", []),
     }
+    if isinstance(projection, dict):
+        base_trace["retrieval_scope_projection_raw"] = {
+            "applied": projection.get("applied"),
+            "relationship_ids": projection.get("relationship_ids"),
+            "entity_ids": projection.get("entity_ids"),
+            "relationship_scopes": projection.get("relationship_scopes"),
+            "reason_codes": projection.get("reason_codes"),
+        }
     if not isinstance(prompt_content, str) or not prompt_content:
         return None, {
             **base_trace,
@@ -1862,6 +2124,97 @@ async def _resolve_relationship_context(
         "status": "included",
         "included": True,
     }
+
+
+async def _resolve_mandatory_retrieval_policy(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    persona_containment: dict[str, Any] | None,
+) -> MandatoryRetrievalPolicy:
+    base_policy, validation_trace = _validate_persona_containment_policy(persona_containment)
+    if base_policy is None:
+        return MandatoryRetrievalPolicy(
+            containment_policy=None,
+            relationship_context=None,
+            relationship_trace={
+                "attempted": False,
+                "status": "skipped",
+                "included": False,
+                "omission_reason": validation_trace.get("policy_validation_reason"),
+                "retrieval_scope_projection_applied": None,
+                "relationship_id_count": 0,
+                "entity_id_count": 0,
+                "relationship_scope_count": 0,
+            },
+            validation_trace=validation_trace,
+        )
+
+    relationship_context, relationship_trace = await _resolve_relationship_context(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        active_persona_id=persona_containment.get("active_persona_id"),
+    )
+    relationship_trace["relationship_edges_used"] = []
+    relationship_trace["relationship_edges_excluded"] = []
+    relationship_trace["relationship_exclusion_reasons"] = {}
+    relationship_trace["relationship_conflicts"] = []
+    projection_raw = relationship_trace.get("retrieval_scope_projection_raw")
+    if projection_raw is None and isinstance(relationship_trace, dict):
+        projection_raw = relationship_trace.get("retrieval_scope_projection")
+    relationship_trace.pop("retrieval_scope_projection_raw", None)
+    relationship_trace.pop("retrieval_scope_projection", None)
+    projection, projection_reason = _validate_relationship_projection(projection_raw)
+    if projection is None:
+        validation_trace.update(
+            {
+                "policy_validation_status": "failed",
+                "policy_validation_reason": projection_reason,
+            }
+        )
+        relationship_trace.update(
+            {
+                "status": "failed",
+                "included": False,
+                "omission_reason": projection_reason,
+                "retrieval_scope_projection_applied": None,
+                "relationship_id_count": 0,
+                "entity_id_count": 0,
+                "relationship_scope_count": 0,
+            }
+        )
+        return MandatoryRetrievalPolicy(
+            containment_policy=None,
+            relationship_context=relationship_context,
+            relationship_trace=relationship_trace,
+            validation_trace=validation_trace,
+        )
+
+    relationship_trace.update(
+        {
+            "retrieval_scope_projection_applied": projection["applied"],
+            "relationship_id_count": len(projection["relationship_ids"]),
+            "entity_id_count": len(projection["entity_ids"]),
+            "relationship_scope_count": len(projection["relationship_scopes"]),
+        }
+    )
+    return MandatoryRetrievalPolicy(
+        containment_policy={
+            **base_policy,
+            "relationship_scope_projection": projection,
+        },
+        relationship_context=relationship_context,
+        relationship_trace=relationship_trace,
+        validation_trace=validation_trace,
+    )
 
 
 async def _resolve_interrupt_policy(
@@ -2571,20 +2924,6 @@ async def orchestrate_chat(
     )
     conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
 
-    # Persist incoming user messages first.
-    last_user_message_id = None
-    for msg in payload["messages"]:
-        if msg["role"] == "user":
-            saved = await memory_store.add_message(
-                conversation_id=conversation_id,
-                owner_id=payload["owner_id"],
-                role="user",
-                content=msg["content"],
-                client_id=payload.get("client_id"),
-                metadata={"surface": surface},
-            )
-            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
-
     last_user_text = _extract_last_user_text(payload["messages"])
     recent_messages = _bounded_recent_messages(payload["messages"])
     surface_context = payload.get("surface_context")
@@ -2600,6 +2939,145 @@ async def orchestrate_chat(
         else None
     )
 
+    last_user_message_id = None
+    turn_response: dict[str, Any] | None = None
+    turn_state_trace: dict[str, Any] = _turn_state_disabled_trace()
+    runtime_session_trace: dict[str, Any] = _runtime_session_disabled_trace()
+    interaction_governance: dict[str, Any] | None = None
+    interaction_governance_trace: dict[str, Any] = _interaction_governance_disabled_trace()
+    persona_containment: dict[str, Any] | None = None
+    persona_containment_trace: dict[str, Any] = _persona_containment_disabled_trace()
+    restraint: dict[str, Any] | None = None
+    restraint_trace: dict[str, Any] = _restraint_disabled_trace()
+    mandatory_policy = MandatoryRetrievalPolicy(
+        containment_policy=None,
+        relationship_context=None,
+        relationship_trace=_relationship_context_disabled_trace(),
+        validation_trace={
+            "mandatory_containment_requested": False,
+            "policy_validation_status": "not_requested",
+        },
+    )
+    turn_policy_metadata: dict[str, Any] | None = None
+    turn_policy_omission_reason: str | None = "mandatory_containment_not_requested"
+
+    if persona_containment_enabled:
+        runtime_session, runtime_session_trace = await _resolve_runtime_session(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+        (
+            interaction_governance,
+            interaction_governance_trace,
+        ) = await _resolve_interaction_governance(
+            runtime=runtime,
+            enabled=interaction_governance_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=None,
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        persona_containment, persona_containment_trace = await _resolve_persona_containment(
+            runtime=runtime,
+            enabled=True,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=None,
+            persona_scope_hint=(
+                interaction_governance.get("persona_scope_hint")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        mandatory_policy = await _resolve_mandatory_retrieval_policy(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            persona_containment=persona_containment,
+        )
+        persona_containment_trace.update(mandatory_policy.validation_trace)
+        restraint, restraint_trace = await _resolve_restraint(
+            runtime=runtime,
+            enabled=restraint_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=None,
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            response_posture=(
+                interaction_governance.get("response_posture")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            active_persona_id=(
+                persona_containment.get("active_persona_id")
+                if isinstance(persona_containment, dict)
+                else None
+            ),
+            capability_domain=(
+                persona_containment.get("capability_domain")
+                if isinstance(persona_containment, dict)
+                else None
+            ),
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        relationship_projection = (
+            mandatory_policy.containment_policy.get("relationship_scope_projection")
+            if isinstance(mandatory_policy.containment_policy, dict)
+            else None
+        )
+        turn_policy_metadata, turn_policy_omission_reason = _classify_turn_policy_metadata(
+            persona_containment=persona_containment,
+            relationship_projection=relationship_projection,
+            request_sensitivity=payload.get("sensitivity"),
+            interaction_governance=interaction_governance,
+        )
+
+    for msg in payload["messages"]:
+        if msg["role"] == "user":
+            saved = await memory_store.add_message(
+                conversation_id=conversation_id,
+                owner_id=payload["owner_id"],
+                role="user",
+                content=msg["content"],
+                client_id=payload.get("client_id"),
+                metadata={"surface": surface},
+                policy_metadata=turn_policy_metadata,
+            )
+            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
+
     turn_response, turn_state_trace = await _start_runtime_turn(
         runtime=runtime,
         request_id=request_id,
@@ -2608,89 +3086,77 @@ async def orchestrate_chat(
         surface=surface,
         input_message_id=last_user_message_id,
     )
-    runtime_session = (
-        turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
-    )
-    runtime_session_trace = _runtime_session_trace_from_session(
-        runtime_session,
-        attempted=bool(turn_state_trace.get("attempted")),
-        omission_reason=turn_state_trace.get(
-            "omission_reason",
-            "runtime_session_missing_from_turn_response",
-        ),
-        error_type=turn_state_trace.get("error_type"),
-    )
-    interaction_governance, interaction_governance_trace = await _resolve_interaction_governance(
-        runtime=runtime,
-        enabled=interaction_governance_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        surface_session_id=surface_session_id,
-        active_mode=active_mode,
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    persona_containment, persona_containment_trace = await _resolve_persona_containment(
-        runtime=runtime,
-        enabled=persona_containment_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        persona_scope_hint=(
-            interaction_governance.get("persona_scope_hint")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        interaction_kind=(
-            interaction_governance.get("interaction_kind")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    restraint, restraint_trace = await _resolve_restraint(
-        runtime=runtime,
-        enabled=restraint_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        interaction_kind=(
-            interaction_governance.get("interaction_kind")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        response_posture=(
-            interaction_governance.get("response_posture")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        active_persona_id=(
-            persona_containment.get("active_persona_id")
-            if isinstance(persona_containment, dict)
-            else None
-        ),
-        capability_domain=(
-            persona_containment.get("capability_domain")
-            if isinstance(persona_containment, dict)
-            else None
-        ),
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
+    if not persona_containment_enabled:
+        runtime_session = (
+            turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
+        )
+        runtime_session_trace = _runtime_session_trace_from_session(
+            runtime_session,
+            attempted=bool(turn_state_trace.get("attempted")),
+            omission_reason=turn_state_trace.get(
+                "omission_reason",
+                "runtime_session_missing_from_turn_response",
+            ),
+            error_type=turn_state_trace.get("error_type"),
+        )
+        (
+            interaction_governance,
+            interaction_governance_trace,
+        ) = await _resolve_interaction_governance(
+            runtime=runtime,
+            enabled=interaction_governance_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        persona_containment, persona_containment_trace = await _resolve_persona_containment(
+            runtime=runtime,
+            enabled=False,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            persona_scope_hint=None,
+            interaction_kind=None,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        restraint, restraint_trace = await _resolve_restraint(
+            runtime=runtime,
+            enabled=restraint_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            response_posture=(
+                interaction_governance.get("response_posture")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            active_persona_id=None,
+            capability_domain=None,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
 
     profile = await memory_store.resolve_profile(
         owner_id=payload["owner_id"],
@@ -2744,33 +3210,92 @@ async def orchestrate_chat(
             request_id=request_id,
             turn_status="retrieving",
         )
-        retrieve_bundle_kwargs: dict[str, Any] = {
-            "request_id": request_id,
-            "conversation_id": conversation_id,
-            "owner_id": payload["owner_id"],
-            "query": last_user_text,
-            "retrieval": retrieval_boundary.retrieval,
-            "include_artifacts": retrieval_boundary.include_artifacts,
+        suppression_reason = _restraint_suppression_reason(restraint)
+        dependency_failure_reason = None
+        if persona_containment_enabled and mandatory_policy.containment_policy is None:
+            dependency_failure_reason = (
+                mandatory_policy.validation_trace.get("policy_validation_reason")
+                or "mandatory_containment_unavailable"
+            )
+        retrieval_dispatch_trace = {
+            "mandatory_containment_requested": bool(persona_containment_enabled),
+            "policy_validation_status": mandatory_policy.validation_trace.get(
+                "policy_validation_status"
+            ),
+            "bms_retrieval_call_issued": False,
+            "bms_retrieval_call_suppressed": False,
+            "suppression_or_dependency_reason": None,
+            "relationship_projection_applied": mandatory_policy.relationship_trace.get(
+                "retrieval_scope_projection_applied"
+            ),
+            "relationship_id_count": mandatory_policy.relationship_trace.get(
+                "relationship_id_count",
+                0,
+            ),
+            "entity_id_count": mandatory_policy.relationship_trace.get("entity_id_count", 0),
+            "relationship_scope_count": mandatory_policy.relationship_trace.get(
+                "relationship_scope_count",
+                0,
+            ),
+            "neutral_persistence_classification": (
+                "applied" if turn_policy_metadata is not None else "omitted"
+            ),
+            "neutral_persistence_omission_reason": (
+                None if turn_policy_metadata is not None else turn_policy_omission_reason
+            ),
         }
-        if retrieval_boundary.allowed_memory_domains is not None:
-            retrieve_bundle_kwargs["allowed_memory_domains"] = (
-                retrieval_boundary.allowed_memory_domains
+        if suppression_reason or dependency_failure_reason:
+            reason = suppression_reason or dependency_failure_reason or "retrieval_suppressed"
+            retrieval_dispatch_trace.update(
+                {
+                    "bms_retrieval_call_suppressed": True,
+                    "suppression_or_dependency_reason": reason,
+                }
             )
-        if retrieval_boundary.blocked_memory_domains is not None:
-            retrieve_bundle_kwargs["blocked_memory_domains"] = (
-                retrieval_boundary.blocked_memory_domains
+            if suppression_reason:
+                restraint_trace["retrieval_enforcement_status"] = "suppressed"
+                restraint_trace["retrieval_enforcement_reason"] = suppression_reason
+            retrieval_bundle = _empty_retrieval_bundle(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                reason=reason,
             )
+        else:
+            retrieve_bundle_kwargs: dict[str, Any] = {
+                "request_id": request_id,
+                "conversation_id": conversation_id,
+                "owner_id": payload["owner_id"],
+                "query": last_user_text,
+                "retrieval": retrieval_boundary.retrieval,
+                "include_artifacts": (
+                    None if persona_containment_enabled else retrieval_boundary.include_artifacts
+                ),
+            }
+            if persona_containment_enabled:
+                retrieve_bundle_kwargs["containment_policy"] = (
+                    mandatory_policy.containment_policy
+                )
+            else:
+                if retrieval_boundary.allowed_memory_domains is not None:
+                    retrieve_bundle_kwargs["allowed_memory_domains"] = (
+                        retrieval_boundary.allowed_memory_domains
+                    )
+                if retrieval_boundary.blocked_memory_domains is not None:
+                    retrieve_bundle_kwargs["blocked_memory_domains"] = (
+                        retrieval_boundary.blocked_memory_domains
+                    )
 
-        retrieval_bundle = await memory_store.retrieve_bundle(
-            **retrieve_bundle_kwargs,
-        )
-        if not isinstance(retrieval_bundle, dict):
-            raise RuntimeError("malformed_retrieval_response")
-        retrieval_bundle = _apply_persona_containment_result_boundary(
-            retrieval_bundle=retrieval_bundle,
-            persona_containment=persona_containment,
-            persona_containment_trace=persona_containment_trace,
-        )
+            retrieval_bundle = await memory_store.retrieve_bundle(
+                **retrieve_bundle_kwargs,
+            )
+            retrieval_dispatch_trace["bms_retrieval_call_issued"] = True
+            if not isinstance(retrieval_bundle, dict):
+                raise RuntimeError("malformed_retrieval_response")
+            retrieval_bundle = _apply_persona_containment_result_boundary(
+                retrieval_bundle=retrieval_bundle,
+                persona_containment=persona_containment,
+                persona_containment_trace=persona_containment_trace,
+            )
         memory_hygiene_result = await apply_memory_hygiene(
             runtime=runtime,
             enabled=memory_hygiene_enabled,
@@ -2830,15 +3355,19 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
-        relationship_context, relationship_context_trace = await _resolve_relationship_context(
-            runtime=runtime,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            active_persona_id=runtime_identity_trace.get("active_persona_id"),
-        )
+        if persona_containment_enabled:
+            relationship_context = mandatory_policy.relationship_context
+            relationship_context_trace = mandatory_policy.relationship_trace
+        else:
+            relationship_context, relationship_context_trace = await _resolve_relationship_context(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -2920,6 +3449,7 @@ async def orchestrate_chat(
                         "interaction_governance": interaction_governance_trace,
                         "persona_containment": persona_containment_trace,
                         "restraint": restraint_trace,
+                        "retrieval_dispatch": retrieval_dispatch_trace,
                         "memory_hygiene": (
                             memory_hygiene_result.trace
                             if memory_hygiene_result is not None
@@ -3058,6 +3588,7 @@ async def orchestrate_chat(
                 "interaction_governance": interaction_governance_trace,
                 "persona_containment": persona_containment_trace,
                 "restraint": restraint_trace,
+                "retrieval_dispatch": retrieval_dispatch_trace,
                 "memory_hygiene": (
                     memory_hygiene_result.trace
                     if memory_hygiene_result is not None
@@ -3101,6 +3632,7 @@ async def orchestrate_chat(
             )
             raise RuntimeError(budget_error.reason) from budget_error
         messages = prompt.messages
+        prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
         prompt_fingerprint = _prompt_fingerprint(messages)
         prompt.trace["provider_prompt"] = {
             **prompt_fingerprint,
@@ -3336,11 +3868,18 @@ async def orchestrate_chat(
             content=answer,
             client_id=payload.get("client_id"),
             metadata={"request_id": request_id, "selected_model": selected_model},
+            policy_metadata=turn_policy_metadata,
         )
         prompt.trace["answer_persistence"] = {
             "assistant_message_persisted": True,
             "persistence_acknowledged": True,
             "persisted_role": "assistant",
+            "neutral_policy_metadata": (
+                "applied" if turn_policy_metadata is not None else "omitted"
+            ),
+            "neutral_policy_metadata_omission_reason": (
+                None if turn_policy_metadata is not None else turn_policy_omission_reason
+            ),
         }
 
         await _reset_runtime_after_turn(
@@ -3362,6 +3901,7 @@ async def orchestrate_chat(
         prompt.trace["turn_state"] = turn_state_trace
         prompt.trace["runtime_identity"] = runtime_identity_trace
         prompt.trace["relationship_context"] = relationship_context_trace
+        prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
         prompt.trace["memory_hygiene"] = (
             memory_hygiene_result.trace
             if memory_hygiene_result is not None

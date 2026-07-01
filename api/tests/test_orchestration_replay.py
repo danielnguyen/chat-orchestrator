@@ -35,6 +35,60 @@ async def test_memory_store_client_rejects_retrieval_request_id_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_memory_store_client_serializes_policy_metadata_and_containment_policy():
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = []
+
+    async def fake_post(path, *, request_id=None, json):
+        captured.append({"path": path, "request_id": request_id, "json": json})
+        if path.endswith("/retrieve"):
+            return {"request_id": json["request_id"], "bundle": {}}
+        return {"message_id": "message-1"}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    policy_metadata = {"memory_domains": ["technical"], "sensitivity": "medium"}
+    containment_policy = {
+        "enforcement_mode": "mandatory",
+        "allowed_memory_domains": ["technical"],
+        "blocked_memory_domains": [],
+        "artifact_access_policy": {
+            "enforcement_mode": "mandatory",
+            "allowed_content_classes": ["document"],
+            "allowed_domains": ["technical"],
+            "maximum_sensitivity": "medium",
+            "surface_content_capabilities": ["document"],
+            "reason_codes": ["test"],
+        },
+        "relationship_scope_projection": {"applied": False},
+    }
+
+    await client.add_message(
+        conversation_id="conversation-1",
+        owner_id="owner",
+        role="user",
+        content="hello",
+        client_id="client",
+        metadata={"surface": "dev"},
+        policy_metadata=policy_metadata,
+    )
+    await client.retrieve_bundle(
+        request_id="request-1",
+        conversation_id="conversation-1",
+        owner_id="owner",
+        query="hello",
+        retrieval=None,
+        allowed_memory_domains=["legacy"],
+        blocked_memory_domains=["legacy_blocked"],
+        containment_policy=containment_policy,
+    )
+
+    assert captured[0]["json"]["policy_metadata"] == policy_metadata
+    assert captured[1]["json"]["containment_policy"] == containment_policy
+    assert "allowed_memory_domains" not in captured[1]["json"]
+    assert "blocked_memory_domains" not in captured[1]["json"]
+
+
+@pytest.mark.asyncio
 async def test_complete_persisted_orchestration_replay_corpus_passes_twice():
     for fixture in load_corpus():
         first = await run_scenario(fixture)
@@ -98,6 +152,8 @@ def test_required_orchestration_replay_categories_are_present():
         "request_id_mismatch",
         "bms_unavailable",
         "trace_persistence_failure",
+        "wave3b_retrieval_suppressed",
+        "wave3b_valid_containment",
     } <= categories
 
 

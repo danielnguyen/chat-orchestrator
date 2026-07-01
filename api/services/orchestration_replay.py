@@ -55,7 +55,11 @@ class ReplayMemoryStore:
         self.message_ordinal += 1
         role = kwargs["role"]
         request_id = (kwargs.get("metadata") or {}).get("request_id")
-        self._record(f"{role}_message_persistence", request_id)
+        self._record(
+            f"{role}_message_persistence",
+            request_id,
+            policy_metadata_present=kwargs.get("policy_metadata") is not None,
+        )
         return {"message_id": f"message-{self.message_ordinal}"}
 
     async def resolve_profile(self, **kwargs: Any) -> dict[str, Any]:
@@ -78,7 +82,11 @@ class ReplayMemoryStore:
 
     async def retrieve_bundle(self, **kwargs: Any) -> dict[str, Any]:
         request_id = kwargs["request_id"]
-        self._record("bms_retrieval", request_id)
+        self._record(
+            "bms_retrieval",
+            request_id,
+            containment_policy_present=kwargs.get("containment_policy") is not None,
+        )
         mode = self.scenario.get("retrieval", "normal")
         if mode == "unavailable":
             raise BoundaryFailure("bms_unavailable")
@@ -427,6 +435,17 @@ class ReplayRuntime:
         if self.scenario.get("runtime") == "unavailable":
             raise BoundaryFailure("runtime_unavailable")
 
+    async def resolve_session(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_session", kwargs["request_id"])
+        self._maybe_fail()
+        return {
+            "runtime_session": {
+                "runtime_session_id": "runtime-session-1",
+                "status": "active",
+                "surface": kwargs["surface"],
+            }
+        }
+
     async def start_turn(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_turn_start", kwargs["request_id"])
         self._maybe_fail()
@@ -488,13 +507,97 @@ class ReplayRuntime:
     async def relationship_select(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_relationships", kwargs["request_id"])
         self._maybe_fail()
+        projection = self.scenario.get("relationship_projection")
+        if not isinstance(projection, dict):
+            projection = {
+                "applied": False,
+                "relationship_ids": [],
+                "entity_ids": [],
+                "relationship_scopes": [],
+                "reason_codes": ["no_eligible_relationship_scope"],
+            }
         return {
             "selected_relationships": [],
             "prompt_content": None,
+            "retrieval_scope_projection": projection,
             "trace": {
                 "selected_relationship_count": 0,
                 "excluded_relationship_count": 0,
+                "relationship_edges_used": [],
+                "relationship_edges_excluded": [],
+                "relationship_exclusion_reasons": {},
+                "relationship_context_overlay_applied": False,
+                "relationship_conflicts": [],
+                "relationship_confirmation_required": False,
+                "active_persona_id": kwargs.get("active_persona_id"),
+                "allowed_relationship_scopes": projection.get("relationship_scopes", []),
             },
+        }
+
+    async def evaluate_interaction_governance(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_interaction_governance", kwargs["request_id"])
+        self._maybe_fail()
+        return {
+            "result": {
+                "interaction_kind": "question",
+                "response_posture": "direct",
+                "persona_scope_hint": None,
+                "privacy_sensitivity_hint": "normal",
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "action_allowed": False,
+                "requires_confirmation": False,
+                "confidence": 0.9,
+                "reason_summary": ["replay_default"],
+            }
+        }
+
+    async def evaluate_persona_containment(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_persona_containment", kwargs["request_id"])
+        self._maybe_fail()
+        return {
+            "result": {
+                "active_persona_id": "technical_architect",
+                "capability_domain": "technical",
+                "allowed_memory_domains": ["technical"],
+                "blocked_memory_domains": ["finance"],
+                "allowed_world_state_domains": ["technical"],
+                "allowed_relationship_domains": ["project"],
+                "allowed_tool_domains": ["technical"],
+                "cross_scope_access_allowed": False,
+                "cross_scope_reason": "not_requested",
+                "confidence": 0.9,
+                "reason_summary": ["replay_default"],
+                "artifact_access_policy": {
+                    "enforcement_mode": "mandatory",
+                    "allowed_content_classes": ["document"],
+                    "allowed_domains": ["technical"],
+                    "maximum_sensitivity": "medium",
+                    "surface_content_capabilities": ["document"],
+                    "reason_codes": ["replay_default"],
+                },
+            }
+        }
+
+    async def evaluate_restraint(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_restraint", kwargs["request_id"])
+        self._maybe_fail()
+        policy = self.scenario.get("restraint_policy", "answer_normally")
+        suppressed = bool(self.scenario.get("retrieval_suppressed", False))
+        return {
+            "result": {
+                "restraint_policy": policy,
+                "domains": ["retrieval"],
+                "reason": "replay_default",
+                "prompt_overlay": None,
+                "confidence": 0.9,
+                "reason_summary": ["replay_default"],
+                "retrieval_suppressed": suppressed,
+                "personalization_suppressed": False,
+                "proactive_output_suppressed": False,
+                "brevity_preferred": False,
+                "clarification_preferred": False,
+            }
         }
 
     async def overlay(self, **kwargs: Any) -> Any:
@@ -819,6 +922,8 @@ def _normalize(
     dropped_context = dropped_context if isinstance(dropped_context, dict) else {}
     raw_layers = _layer_by_name(raw_prompt)
     provider_attempts = [call for call in calls if call.get("name") == "provider_attempt"]
+    retrieval_dispatch = raw_prompt.get("retrieval_dispatch")
+    retrieval_dispatch = retrieval_dispatch if isinstance(retrieval_dispatch, dict) else {}
     return {
         "schema_version": "orchestration-replay-v1",
         "scenario": scenario["scenario"],
@@ -892,6 +997,34 @@ def _normalize(
                 raw_layers.get("retrieval_augmentation")
             ),
             "dsa": raw_prompt.get("dsa", {}),
+            "retrieval_dispatch": {
+                "mandatory_containment_requested": retrieval_dispatch.get(
+                    "mandatory_containment_requested"
+                ),
+                "policy_validation_status": retrieval_dispatch.get(
+                    "policy_validation_status"
+                ),
+                "bms_retrieval_call_issued": retrieval_dispatch.get(
+                    "bms_retrieval_call_issued"
+                ),
+                "bms_retrieval_call_suppressed": retrieval_dispatch.get(
+                    "bms_retrieval_call_suppressed"
+                ),
+                "suppression_or_dependency_reason": retrieval_dispatch.get(
+                    "suppression_or_dependency_reason"
+                ),
+                "relationship_projection_applied": retrieval_dispatch.get(
+                    "relationship_projection_applied"
+                ),
+                "relationship_id_count": retrieval_dispatch.get("relationship_id_count"),
+                "entity_id_count": retrieval_dispatch.get("entity_id_count"),
+                "relationship_scope_count": retrieval_dispatch.get(
+                    "relationship_scope_count"
+                ),
+                "neutral_persistence_classification": retrieval_dispatch.get(
+                    "neutral_persistence_classification"
+                ),
+            },
         },
         "provider_attempt_count": len(provider_attempts),
         "provider_fingerprints": [
@@ -970,6 +1103,13 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                     model_registry_path=str(registry_path),
                     allow_manual_override=False,
                     enable_runtime_overlays=True,
+                    interaction_governance_enabled=bool(
+                        scenario.get("interaction_governance_enabled")
+                    ),
+                    persona_containment_enabled=bool(
+                        scenario.get("persona_containment_enabled")
+                    ),
+                    restraint_enabled=bool(scenario.get("restraint_enabled")),
                     memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
                     request_id=request_id,
                     prompt_output_token_reserve=scenario.get(
@@ -997,6 +1137,11 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                 model_registry_path=str(REGISTRY_PATH),
                 allow_manual_override=False,
                 enable_runtime_overlays=True,
+                interaction_governance_enabled=bool(
+                    scenario.get("interaction_governance_enabled")
+                ),
+                persona_containment_enabled=bool(scenario.get("persona_containment_enabled")),
+                restraint_enabled=bool(scenario.get("restraint_enabled")),
                 memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
                 request_id=request_id,
             )

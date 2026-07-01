@@ -18,6 +18,66 @@
             }
         },
         {
+            "scenario": "wave3b-retrieval-suppressed-zero-bms",
+            "category": "wave3b_retrieval_suppressed",
+            "persona_containment_enabled": true,
+            "restraint_enabled": true,
+            "retrieval_suppressed": true,
+            "expected": {
+                "outcome": {
+                    "status": "ok",
+                    "error_type": null
+                },
+                "trace": {
+                    "retrieval_dispatch": {
+                        "mandatory_containment_requested": true,
+                        "policy_validation_status": "valid",
+                        "bms_retrieval_call_issued": false,
+                        "bms_retrieval_call_suppressed": true,
+                        "suppression_or_dependency_reason": "retrieval_suppressed_true",
+                        "relationship_projection_applied": false,
+                        "relationship_id_count": 0,
+                        "entity_id_count": 0,
+                        "relationship_scope_count": 0,
+                        "neutral_persistence_classification": "applied"
+                    }
+                }
+            }
+        },
+        {
+            "scenario": "wave3b-valid-containment-retrieval",
+            "category": "wave3b_valid_containment",
+            "persona_containment_enabled": true,
+            "restraint_enabled": true,
+            "relationship_projection": {
+                "applied": true,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"]
+            },
+            "expected": {
+                "outcome": {
+                    "status": "ok",
+                    "error_type": null
+                },
+                "trace": {
+                    "retrieval_dispatch": {
+                        "mandatory_containment_requested": true,
+                        "policy_validation_status": "valid",
+                        "bms_retrieval_call_issued": true,
+                        "bms_retrieval_call_suppressed": false,
+                        "suppression_or_dependency_reason": null,
+                        "relationship_projection_applied": true,
+                        "relationship_id_count": 1,
+                        "entity_id_count": 1,
+                        "relationship_scope_count": 1,
+                        "neutral_persistence_classification": "applied"
+                    }
+                }
+            }
+        },
+        {
             "scenario": "runtime-overlay-included",
             "category": "runtime_overlay_included",
             "runtime": "included",
