@@ -2538,6 +2538,12 @@ def _scoped_relationship_response(*, applied=True):
     }
 
 
+def _persona_response_with_artifact_policy(policy):
+    response = FakeRuntime().persona_containment_response
+    response["result"]["artifact_access_policy"] = policy
+    return response
+
+
 @pytest.mark.asyncio
 async def test_wave3b_valid_containment_sends_exact_mandatory_bms_policy(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
@@ -2651,6 +2657,16 @@ async def test_wave3b_restraint_suppression_produces_zero_bms_calls(
     assert trace["bms_retrieval_call_issued"] is False
     assert trace["bms_retrieval_call_suppressed"] is True
     assert trace["suppression_or_dependency_reason"] == expected_reason
+    doctrine = memory_store.trace_calls[0]["payload"]["retrieval"]["bundle"][
+        "doctrine_summary"
+    ]
+    assert doctrine == {"diagnostics_status": "absent"}
+    retrieval_bundle = memory_store.trace_calls[0]["payload"]["retrieval"]["bundle"]
+    assert retrieval_bundle["recent_count"] == 0
+    assert retrieval_bundle["semantic_count"] == 0
+    assert retrieval_bundle["artifact_count"] == 0
+    assert "status" not in doctrine
+    assert "contract_version" not in doctrine
 
 
 @pytest.mark.asyncio
@@ -2698,6 +2714,102 @@ async def test_wave3b_malformed_mandatory_containment_fails_closed_without_legac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "expected_reason"),
+    [
+        (
+            {
+                "enforcement_mode": "mandatory",
+                "allowed_content_classes": ["whiteboard"],
+                "allowed_domains": ["technical"],
+                "maximum_sensitivity": "medium",
+                "surface_content_capabilities": ["document"],
+                "reason_codes": ["test"],
+            },
+            "malformed_artifact_access_policy",
+        ),
+        (
+            {
+                "enforcement_mode": "mandatory",
+                "allowed_content_classes": ["document"],
+                "allowed_domains": ["technical"],
+                "maximum_sensitivity": "medium",
+                "surface_content_capabilities": ["whiteboard"],
+                "reason_codes": ["test"],
+            },
+            "malformed_artifact_access_policy",
+        ),
+        (
+            {
+                "enforcement_mode": "mandatory",
+                "allowed_content_classes": ["document"],
+                "allowed_domains": ["finance"],
+                "maximum_sensitivity": "medium",
+                "surface_content_capabilities": ["document"],
+                "reason_codes": ["test"],
+            },
+            "artifact_domains_outside_allowed_memory_domains",
+        ),
+        (
+            {
+                "enforcement_mode": "mandatory",
+                "allowed_content_classes": ["document", "image"],
+                "allowed_domains": ["technical"],
+                "maximum_sensitivity": "medium",
+                "surface_content_capabilities": ["document"],
+                "reason_codes": ["test"],
+            },
+            "artifact_classes_outside_surface_capabilities",
+        ),
+        (
+            {
+                "enforcement_mode": "mandatory",
+                "allowed_content_classes": ["document"],
+                "allowed_domains": ["technical"],
+                "maximum_sensitivity": "medium",
+                "surface_content_capabilities": ["document"],
+                "reason_codes": ["test"],
+                "private_extra": "do_not_forward",
+            },
+            "unexpected_artifact_policy_fields",
+        ),
+    ],
+)
+async def test_wave3b_invalid_artifact_policy_fields_fail_closed(
+    tmp_path,
+    policy,
+    expected_reason,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "check memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(
+            persona_containment_response=_persona_response_with_artifact_policy(policy)
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        request_id=f"rid-wave3b-artifact-{expected_reason}",
+    )
+
+    assert memory_store.retrieve_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "retrieval_dispatch"
+    ]
+    assert trace["suppression_or_dependency_reason"] == expected_reason
+
+
+@pytest.mark.asyncio
 async def test_wave3b_relationship_failure_under_mandatory_containment_fails_closed(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
@@ -2741,6 +2853,102 @@ async def test_wave3b_relationship_failure_under_mandatory_containment_fails_clo
 
 
 @pytest.mark.asyncio
+async def test_wave3b_malformed_relationship_projection_drops_private_prompt_text(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    sentinel = "PRIVATE_RELATIONSHIP_PROMPT_SENTINEL"
+    runtime = FakeRuntime(
+        relationship_response={
+            **_scoped_relationship_response(),
+            "prompt_content": f"Relationship context: {sentinel}",
+            "retrieval_scope_projection": {
+                "applied": False,
+                "relationship_ids": ["rel_private"],
+                "entity_ids": [],
+                "relationship_scopes": [],
+                "reason_codes": ["no_eligible_relationship_scope"],
+            },
+        }
+    )
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "check memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        request_id="rid-wave3b-relationship-private-prompt",
+    )
+
+    assert memory_store.retrieve_calls == []
+    assert sentinel not in out["answer"]
+    assert sentinel not in json.dumps(litellm.calls, sort_keys=True)
+    assert sentinel not in json.dumps(memory_store.trace_calls, sort_keys=True)
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "retrieval_dispatch"
+    ]
+    assert trace["suppression_or_dependency_reason"] == (
+        "contradictory_unapplied_relationship_scope_projection"
+    )
+    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["relationship_context"]
+    assert relationship_trace["status"] == "failed"
+    assert relationship_trace["relationship_id_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_wave3b_unapplied_projection_with_relationship_ids_fails_closed(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "check memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(
+            relationship_response={
+                **_scoped_relationship_response(applied=False),
+                "retrieval_scope_projection": {
+                    "applied": False,
+                    "relationship_ids": ["rel_unapplied"],
+                    "entity_ids": [],
+                    "relationship_scopes": [],
+                    "reason_codes": ["no_eligible_relationship_scope"],
+                },
+            }
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        request_id="rid-wave3b-unapplied-with-ids",
+    )
+
+    assert memory_store.retrieve_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "retrieval_dispatch"
+    ]
+    assert trace["suppression_or_dependency_reason"] == (
+        "contradictory_unapplied_relationship_scope_projection"
+    )
+
+
+@pytest.mark.asyncio
 async def test_wave3b_applied_false_relationship_projection_permits_retrieval(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
@@ -2767,6 +2975,10 @@ async def test_wave3b_applied_false_relationship_projection_permits_retrieval(tm
         "relationship_scope_projection"
     ]
     assert projection["applied"] is False
+    for call in memory_store.added_messages:
+        assert call["policy_metadata"]["entity_ids"] == []
+        assert call["policy_metadata"]["relationship_ids"] == []
+        assert call["policy_metadata"]["relationship_scopes"] == []
 
 
 @pytest.mark.asyncio
@@ -9060,7 +9272,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
     assert prompt_trace["persona_containment"]["allowed_relationship_domain_count"] == 1
     assert prompt_trace["persona_containment"]["allowed_tool_domain_count"] == 1
     assert prompt_trace["world_state"]["allowed_domain_count"] == 1
-    assert prompt_trace["relationship_context"]["allowed_relationship_scope_count"] == 1
+    assert prompt_trace["relationship_context"]["allowed_relationship_scope_count"] == 0
     assert prompt_trace["relationship_context"]["relationship_edges_used_count"] == 0
     assert prompt_trace["retrieval_dispatch"]["relationship_projection_applied"] is False
     assert prompt_trace["runtime_identity"]["advisory_memory_scope_count"] == 1

@@ -151,6 +151,23 @@ class MandatoryRetrievalPolicy:
 
 SAFE_POLICY_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 SAFE_SCOPE_ID = re.compile(r"^[A-Za-z0-9_.:/@-]{1,160}$")
+ARTIFACT_CONTENT_CLASSES = {
+    "document",
+    "code",
+    "image",
+    "screenshot",
+    "audio",
+    "video",
+    "other",
+}
+ARTIFACT_POLICY_FIELDS = {
+    "enforcement_mode",
+    "allowed_content_classes",
+    "allowed_domains",
+    "maximum_sensitivity",
+    "surface_content_capabilities",
+    "reason_codes",
+}
 
 
 def _sanitize_memory_domain_list(value: Any) -> list[str] | None:
@@ -180,6 +197,15 @@ def _policy_label_list(value: Any, *, limit: int, required: bool = False) -> lis
     return out
 
 
+def _artifact_class_list(value: Any, *, limit: int) -> list[str] | None:
+    classes = _policy_label_list(value, limit=limit)
+    if classes is None:
+        return None
+    if any(item not in ARTIFACT_CONTENT_CLASSES for item in classes):
+        return None
+    return classes
+
+
 def _scope_id_list(value: Any, *, limit: int) -> list[str] | None:
     if not isinstance(value, list) or len(value) > limit:
         return None
@@ -197,17 +223,23 @@ def _scope_id_list(value: Any, *, limit: int) -> list[str] | None:
     return out
 
 
-def _validate_artifact_access_policy(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_artifact_access_policy(
+    value: Any,
+    *,
+    allowed_memory_domains: list[str],
+) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(value, dict):
         return None, "missing_artifact_access_policy"
+    if set(value) - ARTIFACT_POLICY_FIELDS:
+        return None, "unexpected_artifact_policy_fields"
     if value.get("enforcement_mode") != "mandatory":
         return None, "invalid_artifact_policy_enforcement_mode"
-    allowed_content_classes = _policy_label_list(
+    allowed_content_classes = _artifact_class_list(
         value.get("allowed_content_classes"),
         limit=8,
     )
     allowed_domains = _policy_label_list(value.get("allowed_domains"), limit=16)
-    surface_content_capabilities = _policy_label_list(
+    surface_content_capabilities = _artifact_class_list(
         value.get("surface_content_capabilities"),
         limit=8,
     )
@@ -222,6 +254,10 @@ def _validate_artifact_access_policy(value: Any) -> tuple[dict[str, Any] | None,
         or reason_codes is None
     ):
         return None, "malformed_artifact_access_policy"
+    if not set(allowed_domains).issubset(set(allowed_memory_domains)):
+        return None, "artifact_domains_outside_allowed_memory_domains"
+    if not set(allowed_content_classes).issubset(set(surface_content_capabilities)):
+        return None, "artifact_classes_outside_surface_capabilities"
     return {
         "enforcement_mode": "mandatory",
         "allowed_content_classes": allowed_content_classes,
@@ -250,6 +286,10 @@ def _validate_relationship_projection(value: Any) -> tuple[dict[str, Any] | None
         return None, "malformed_relationship_scope_projection"
     if value.get("applied") is True and not relationship_ids and not entity_ids:
         return None, "empty_applied_relationship_scope_projection"
+    if value.get("applied") is False and (
+        relationship_ids or entity_ids or relationship_scopes
+    ):
+        return None, "contradictory_unapplied_relationship_scope_projection"
     return {
         "applied": value["applied"],
         "relationship_ids": relationship_ids,
@@ -279,15 +319,16 @@ def _validate_persona_containment_policy(
         persona_containment.get("blocked_memory_domains"),
         limit=16,
     )
-    artifact_policy, artifact_reason = _validate_artifact_access_policy(
-        persona_containment.get("artifact_access_policy")
-    )
     if allowed_memory_domains is None:
         trace["policy_validation_reason"] = "malformed_allowed_memory_domains"
         return None, trace
     if blocked_memory_domains is None:
         trace["policy_validation_reason"] = "malformed_blocked_memory_domains"
         return None, trace
+    artifact_policy, artifact_reason = _validate_artifact_access_policy(
+        persona_containment.get("artifact_access_policy"),
+        allowed_memory_domains=allowed_memory_domains,
+    )
     if artifact_policy is None:
         trace["policy_validation_reason"] = artifact_reason
         return None, trace
@@ -329,15 +370,6 @@ def _empty_retrieval_bundle(
                 "suppressed": True,
                 "suppression_reason": reason,
             },
-        },
-        "diagnostics": {
-            "contract_version": "raw-retrieval-debug.v1",
-            "mode": "augmented",
-            "status": "ok",
-            "canonical_used": False,
-            "derived_used": False,
-            "fallback_to_raw": False,
-            "reason_codes": [reason],
         },
     }
 
@@ -392,12 +424,16 @@ def _classify_turn_policy_metadata(
         "memory_domains": [normalized_domain],
         "sensitivity": sensitivity,
     }
-    if isinstance(relationship_projection, dict):
+    if isinstance(relationship_projection, dict) and relationship_projection.get("applied") is True:
         metadata["entity_ids"] = list(relationship_projection.get("entity_ids") or [])
         metadata["relationship_ids"] = list(relationship_projection.get("relationship_ids") or [])
         metadata["relationship_scopes"] = list(
             relationship_projection.get("relationship_scopes") or []
         )
+    elif isinstance(relationship_projection, dict):
+        metadata["entity_ids"] = []
+        metadata["relationship_ids"] = []
+        metadata["relationship_scopes"] = []
     return metadata, None
 
 
@@ -2163,10 +2199,6 @@ async def _resolve_mandatory_retrieval_policy(
         runtime_session_id=runtime_session_id,
         active_persona_id=persona_containment.get("active_persona_id"),
     )
-    relationship_trace["relationship_edges_used"] = []
-    relationship_trace["relationship_edges_excluded"] = []
-    relationship_trace["relationship_exclusion_reasons"] = {}
-    relationship_trace["relationship_conflicts"] = []
     projection_raw = relationship_trace.get("retrieval_scope_projection_raw")
     if projection_raw is None and isinstance(relationship_trace, dict):
         projection_raw = relationship_trace.get("retrieval_scope_projection")
@@ -2186,6 +2218,15 @@ async def _resolve_mandatory_retrieval_policy(
                 "included": False,
                 "omission_reason": projection_reason,
                 "retrieval_scope_projection_applied": None,
+                "selected_relationship_count": 0,
+                "excluded_relationship_count": 0,
+                "relationship_edges_used": [],
+                "relationship_edges_excluded": [],
+                "relationship_exclusion_reasons": {},
+                "relationship_context_overlay_applied": False,
+                "relationship_conflicts": [],
+                "relationship_confirmation_required": False,
+                "allowed_relationship_scopes": [],
                 "relationship_id_count": 0,
                 "entity_id_count": 0,
                 "relationship_scope_count": 0,
@@ -2193,7 +2234,7 @@ async def _resolve_mandatory_retrieval_policy(
         )
         return MandatoryRetrievalPolicy(
             containment_policy=None,
-            relationship_context=relationship_context,
+            relationship_context=None,
             relationship_trace=relationship_trace,
             validation_trace=validation_trace,
         )
@@ -2201,6 +2242,11 @@ async def _resolve_mandatory_retrieval_policy(
     relationship_trace.update(
         {
             "retrieval_scope_projection_applied": projection["applied"],
+            "relationship_edges_used": projection["relationship_ids"],
+            "relationship_edges_excluded": [],
+            "relationship_exclusion_reasons": {},
+            "relationship_conflicts": [],
+            "allowed_relationship_scopes": projection["relationship_scopes"],
             "relationship_id_count": len(projection["relationship_ids"]),
             "entity_id_count": len(projection["entity_ids"]),
             "relationship_scope_count": len(projection["relationship_scopes"]),
