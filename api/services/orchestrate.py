@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -180,6 +181,26 @@ RESULT_POLICY_FIELDS = {
 SENSITIVITY_RANK = {"low": 0, "medium": 1, "high": 2}
 VALID_RESULT_ROLES = {"user", "assistant", "system", "tool"}
 RESULT_SOURCE_REF_FIELDS = {"ref_type", "ref_id"}
+PROVENANCE_SOURCE_REF_FIELDS = {
+    "ref_type",
+    "ref_id",
+    "support_kind",
+    "span",
+    "field_path",
+    "note",
+    "metadata",
+}
+PROVENANCE_SOURCE_REF_REQUIRED_FIELDS = {"ref_type", "ref_id", "support_kind"}
+PROVENANCE_REQUIRED_FIELDS = {
+    "derived_id",
+    "owner_id",
+    "derivation_type",
+    "source_refs",
+    "derivation_version",
+    "created_at",
+    "status",
+    "provenance_status",
+}
 RESULT_PROVENANCE_FIELDS = {
     "derived_id",
     "owner_id",
@@ -196,7 +217,39 @@ RESULT_PROVENANCE_FIELDS = {
     "provenance_status",
     "retrieval_reason",
 }
-COMPLETE_PROVENANCE_STATUSES = {"complete", "available", "ready", "active"}
+CONTRADICTORY_PROVENANCE_STATUS_MARKERS = {
+    "failed",
+    "failure",
+    "error",
+    "invalid",
+    "missing",
+    "unavailable",
+    "incomplete",
+}
+RETRIEVAL_DEBUG_STATUSES = {
+    "ok",
+    "available",
+    "unavailable",
+    "degraded",
+    "disabled",
+    "failed",
+    "missing",
+    "malformed",
+    "suppressed",
+}
+RETRIEVAL_DEBUG_REASONS = {
+    "fallback_provider_used",
+    "mandatory_result_boundary_failed_closed",
+    "malformed_retrieval_envelope",
+    "memory_domain_not_allowed",
+    "no_retrieval_results",
+    "prompt_budget_exceeded",
+    "relationship_projection_filtered",
+    "retrieval_suppressed_true",
+    "restraint_policy_do_not_retrieve",
+    "source_unavailable",
+    "vector_unavailable",
+}
 CODE_LIKE_RE = re.compile(
     r"\b(def|class|function|import|from|return|const|let|var|package)\b|[{};]",
     re.IGNORECASE,
@@ -661,10 +714,19 @@ def _valid_result_source_ref(value: Any) -> dict[str, str] | None:
     if set(value) - RESULT_SOURCE_REF_FIELDS:
         return None
     ref_type = value.get("ref_type")
-    ref_id = _sanitize_trace_string(value.get("ref_id"), max_length=160)
+    ref_id = _bounded_contract_text(value.get("ref_id"), max_length=160)
     if ref_type not in {"message", "derived_text"} or not ref_id:
         return None
     return {"ref_type": ref_type, "ref_id": ref_id}
+
+
+def _bounded_contract_text(value: Any, *, max_length: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > max_length:
+        return None
+    return cleaned
 
 
 def _valid_result_source_ref_list(value: Any) -> list[dict[str, str]] | None:
@@ -679,6 +741,92 @@ def _valid_result_source_ref_list(value: Any) -> list[dict[str, str]] | None:
     return refs
 
 
+def _bounded_json_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= 160 else None
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _valid_provenance_metadata(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 8:
+        return None
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            return None
+        cleaned_key = key.strip()
+        if not cleaned_key or len(cleaned_key) > 64:
+            return None
+        if item is None:
+            out[cleaned_key] = None
+            continue
+        scalar = _bounded_json_scalar(item)
+        if scalar is None:
+            return None
+        out[cleaned_key] = scalar
+    return out
+
+
+def _valid_provenance_source_ref(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if set(value) - PROVENANCE_SOURCE_REF_FIELDS:
+        return None
+    if not PROVENANCE_SOURCE_REF_REQUIRED_FIELDS.issubset(value):
+        return None
+    ref_type = _bounded_contract_text(value.get("ref_type"), max_length=64)
+    ref_id = _bounded_contract_text(value.get("ref_id"), max_length=160)
+    support_kind = _bounded_contract_text(value.get("support_kind"), max_length=64)
+    if not ref_type or not ref_id or not support_kind:
+        return None
+    out: dict[str, Any] = {
+        "ref_type": ref_type,
+        "ref_id": ref_id,
+        "support_kind": support_kind,
+    }
+    for key in ("span", "field_path", "note"):
+        if key in value:
+            bounded = _bounded_contract_text(value.get(key), max_length=160)
+            if bounded is None:
+                return None
+            out[key] = bounded
+    if "metadata" in value:
+        metadata = _valid_provenance_metadata(value.get("metadata"))
+        if metadata is None:
+            return None
+        if metadata:
+            out["metadata"] = metadata
+    return out
+
+
+def _valid_provenance_source_ref_list(value: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list) or not value or len(value) > 50:
+        return None
+    refs: list[dict[str, Any]] = []
+    for item in value:
+        source_ref = _valid_provenance_source_ref(item)
+        if source_ref is None:
+            return None
+        refs.append(source_ref)
+    return refs
+
+
+def _provenance_status_contradicts_completion(value: Any) -> bool:
+    cleaned = _bounded_contract_text(value, max_length=80)
+    if cleaned is None:
+        return True
+    normalized = cleaned.lower()
+    return any(marker in normalized for marker in CONTRADICTORY_PROVENANCE_STATUS_MARKERS)
+
+
 def _valid_artifact_provenance(value: Any, *, owner_id: str) -> tuple[bool, str | None]:
     if value is None:
         return True, None
@@ -686,26 +834,40 @@ def _valid_artifact_provenance(value: Any, *, owner_id: str) -> tuple[bool, str 
         return False, "malformed_provenance"
     if set(value) - RESULT_PROVENANCE_FIELDS:
         return False, "malformed_provenance"
+    if not PROVENANCE_REQUIRED_FIELDS.issubset(value):
+        return False, "malformed_provenance"
     if value.get("owner_id") != owner_id:
         return False, "provenance_owner_mismatch"
-    provenance_status = value.get("provenance_status")
-    if provenance_status is not None and provenance_status != "complete":
+    if value.get("provenance_status") != "complete":
         return False, "contradictory_provenance"
-    status = value.get("effective_status", value.get("status"))
-    if status is not None:
-        normalized_status = _sanitize_trace_string(status, max_length=80)
-        if normalized_status is None or normalized_status not in COMPLETE_PROVENANCE_STATUSES:
-            return False, "contradictory_provenance"
-    if "source_refs" in value and _valid_result_source_ref_list(value.get("source_refs")) is None:
+    if _provenance_status_contradicts_completion(value.get("status")):
+        return False, "contradictory_provenance"
+    if value.get("effective_status") is not None and _provenance_status_contradicts_completion(
+        value.get("effective_status")
+    ):
+        return False, "contradictory_provenance"
+    if _valid_provenance_source_ref_list(value.get("source_refs")) is None:
         return False, "malformed_provenance_source_refs"
     for key in ("derived_id", "derivation_type", "derivation_version", "created_at"):
-        if key in value and value.get(key) is not None:
-            if _sanitize_trace_string(value.get(key), max_length=200) is None:
-                return False, "malformed_provenance"
+        if _bounded_contract_text(value.get(key), max_length=160) is None:
+            return False, "malformed_provenance"
     confidence = value.get("confidence")
     if confidence is not None and (
-        not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not math.isfinite(float(confidence))
     ):
+        return False, "malformed_provenance"
+    for key in ("generation_trace_id", "retrieval_reason"):
+        if value.get(key) is not None and _bounded_contract_text(
+            value.get(key),
+            max_length=160,
+        ) is None:
+            return False, "malformed_provenance"
+    if value.get("explanation") is not None and _bounded_contract_text(
+        value.get("explanation"),
+        max_length=500,
+    ) is None:
         return False, "malformed_provenance"
     compatibility_defaults = value.get("compatibility_defaults", [])
     if compatibility_defaults is not None and _sanitize_trace_string_list(
@@ -742,9 +904,6 @@ def _retained_observed_metadata(
             and policy_metadata.get("content_class") == "code"
         ):
             has_code_like_content = True
-        mime_type = _sanitize_trace_string(item.get("mime_type"), max_length=120)
-        if mime_type and mime_type not in mime_types:
-            mime_types.append(mime_type)
     return {
         "mime_types": mime_types,
         "has_artifacts": bool(artifacts),
@@ -762,9 +921,13 @@ def _bounded_retrieval_debug(value: Any) -> dict[str, Any]:
             out[key] = value[key]
     for key in ("fallback_reason", "suppression_reason", "vector_status"):
         cleaned = _sanitize_trace_string(value.get(key), max_length=120)
-        if cleaned is not None:
+        if cleaned in RETRIEVAL_DEBUG_STATUSES or cleaned in RETRIEVAL_DEBUG_REASONS:
             out[key] = cleaned
-    reason_codes = _sanitize_trace_string_list(value.get("reason_codes"), limit=20)
+    reason_codes = [
+        code
+        for code in _sanitize_trace_string_list(value.get("reason_codes"), limit=20)
+        if code in RETRIEVAL_DEBUG_REASONS
+    ]
     if reason_codes:
         out["reason_codes"] = reason_codes
     return out
@@ -848,7 +1011,11 @@ def _apply_persona_containment_result_boundary(
 
     scope = retrieval.get("scope") if isinstance(retrieval, dict) else None
     min_score = retrieval.get("min_score") if isinstance(retrieval, dict) else None
-    if not isinstance(min_score, (int, float)) or isinstance(min_score, bool):
+    if (
+        not isinstance(min_score, (int, float))
+        or isinstance(min_score, bool)
+        or not math.isfinite(float(min_score))
+    ):
         min_score = None
 
     def keep_message(item: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -857,6 +1024,7 @@ def _apply_persona_containment_result_boundary(
         message_id = _sanitize_trace_string(item.get("message_id"), max_length=160)
         role = item.get("role")
         content = item.get("content")
+        source_ref = _valid_result_source_ref(item.get("source_ref"))
         if not message_id:
             return None, "missing_message_id"
         if item.get("owner_id") != owner_id:
@@ -867,7 +1035,7 @@ def _apply_persona_containment_result_boundary(
             return None, "invalid_message_role"
         if not isinstance(content, str) or len(content) > 20000:
             return None, "malformed_message_content"
-        if _valid_result_source_ref(item.get("source_ref")) is None:
+        if source_ref is None:
             return None, "malformed_source_ref"
         metadata, reason = _validate_result_policy_metadata(
             item.get("policy_metadata"),
@@ -880,12 +1048,47 @@ def _apply_persona_containment_result_boundary(
             containment_policy=containment_policy,
             relationship_projection=relationship_projection,
         )
-        return (item, None) if allowed else (None, reason)
+        if not allowed:
+            return None, reason
+        kept: dict[str, Any] = {
+            "message_id": message_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content,
+            "source_ref": source_ref,
+            "policy_metadata": metadata,
+        }
+        for key in (
+            "created_at",
+            "source_availability",
+            "freshness_state",
+            "durable_status",
+            "last_verified_at",
+            "source_kind",
+            "supersedes",
+            "superseded_by",
+        ):
+            value = item.get(key)
+            if isinstance(value, str):
+                kept[key] = value
+        score = item.get("score")
+        if (
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(float(score))
+        ):
+            kept["score"] = score
+        memory_id = _bounded_contract_text(item.get("memory_id"), max_length=160)
+        if memory_id:
+            kept["memory_id"] = memory_id
+        return kept, None
 
     def keep_artifact(item: Any) -> tuple[dict[str, Any] | None, str | None]:
         if not isinstance(item, dict):
             return None, "malformed_artifact_record"
         artifact_id = _sanitize_trace_string(item.get("artifact_id"), max_length=160)
+        source_ref = _valid_result_source_ref(item.get("source_ref"))
         if not artifact_id:
             return None, "missing_artifact_id"
         if item.get("owner_id") != owner_id:
@@ -894,12 +1097,18 @@ def _apply_persona_containment_result_boundary(
             return None, "malformed_artifact_path"
         if not isinstance(item.get("snippet"), str):
             return None, "malformed_artifact_snippet"
-        if _valid_result_source_ref(item.get("source_ref")) is None:
+        if source_ref is None:
             return None, "malformed_source_ref"
         if item.get("source_availability") != "available":
             return None, "source_unavailable"
         score = item.get("relevance_score")
-        if score is not None and (not isinstance(score, (int, float)) or isinstance(score, bool)):
+        if min_score is not None and score is None:
+            return None, "missing_relevance_score"
+        if score is not None and (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+        ):
             return None, "malformed_relevance_score"
         if min_score is not None and score is not None and score < min_score:
             return None, "relevance_score_below_minimum"
@@ -920,7 +1129,46 @@ def _apply_persona_containment_result_boundary(
             containment_policy=containment_policy,
             relationship_projection=relationship_projection,
         )
-        return (item, None) if allowed else (None, reason)
+        if not allowed:
+            return None, reason
+        kept = {
+            "artifact_id": artifact_id,
+            "owner_id": owner_id,
+            "file_path": item["file_path"],
+            "snippet": item["snippet"],
+            "source_ref": source_ref,
+            "source_availability": "available",
+            "policy_metadata": metadata,
+        }
+        for key in (
+            "evidence_role",
+            "repo_name",
+            "freshness_state",
+            "durable_status",
+            "last_verified_at",
+            "source_kind",
+            "supersedes",
+            "superseded_by",
+        ):
+            value = item.get(key)
+            if isinstance(value, str):
+                kept[key] = value
+        if score is not None:
+            kept["relevance_score"] = score
+        confidence = item.get("confidence")
+        if (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and math.isfinite(float(confidence))
+        ):
+            kept["confidence"] = confidence
+        memory_id = _bounded_contract_text(item.get("memory_id"), max_length=160)
+        if memory_id:
+            kept["memory_id"] = memory_id
+        provenance = item.get("provenance")
+        if provenance is not None:
+            kept["provenance"] = provenance
+        return kept, None
 
     retained_recent: list[dict[str, Any]] = []
     retained_semantic: list[dict[str, Any]] = []

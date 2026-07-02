@@ -144,6 +144,16 @@ class ReplayMemoryStore:
                             "support_kind": "direct",
                         }
                     ],
+                    "derivation_version": "v1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "active",
+                    "effective_status": "active",
+                    "confidence": 0.9,
+                    "explanation": "bounded provenance",
+                    "generation_trace_id": "trace-1",
+                    "compatibility_defaults": [],
+                    "provenance_status": "complete",
+                    "retrieval_reason": "semantic_match",
                 },
                 "freshness_state": "active",
                 "durable_status": "active",
@@ -455,10 +465,20 @@ class ReplayMemoryStore:
                 source_refs = provenance.get("source_refs")
                 if not isinstance(source_refs, list):
                     continue
+                allowed_ref_fields = {
+                    "ref_type",
+                    "ref_id",
+                    "support_kind",
+                    "span",
+                    "field_path",
+                    "note",
+                    "metadata",
+                }
                 provenance["source_refs"] = [
                     {
-                        "ref_type": ref.get("ref_type"),
-                        "ref_id": ref.get("ref_id"),
+                        key: value
+                        for key, value in ref.items()
+                        if key in allowed_ref_fields
                     }
                     for ref in source_refs
                     if isinstance(ref, dict)
