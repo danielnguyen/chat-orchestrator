@@ -219,6 +219,71 @@ class ReplayMemoryStore:
                     },
                 }
             )
+        elif mode == "wave3b_unauthorized_artifact_returned":
+            artifacts[0].update(
+                {
+                    "artifact_id": "artifact-unauthorized",
+                    "snippet": "unauthorized replay artifact",
+                    "source_ref": {
+                        "ref_type": "derived_text",
+                        "ref_id": "derived-unauthorized",
+                    },
+                    "policy_metadata": {
+                        **artifacts[0]["policy_metadata"],
+                        "memory_domains": ["finance"],
+                    },
+                }
+            )
+        elif mode == "wave3b_relationship_projection":
+            semantic[0]["content"] = "selected relationship scoped replay memory"
+            semantic.append(
+                {
+                    **semantic[0],
+                    "message_id": "memory-revoked-relationship",
+                    "content": "excluded relationship replay memory",
+                    "source_ref": {
+                        "ref_type": "message",
+                        "ref_id": "memory-revoked-relationship",
+                    },
+                    "policy_metadata": {
+                        **semantic[0]["policy_metadata"],
+                        "entity_ids": ["entity_revoked"],
+                        "relationship_ids": ["rel_revoked"],
+                    },
+                }
+            )
+            artifacts = []
+        elif mode == "wave3b_privacy_side_channels":
+            semantic[0]["content"] = "PRIVATE_WAVE3B_REPLAY_CONTENT_SENTINEL"
+            semantic[0]["policy_metadata"] = {
+                **semantic[0]["policy_metadata"],
+                "sensitivity": "high",
+            }
+            artifacts[0].update(
+                {
+                    "snippet": "PRIVATE_WAVE3B_REPLAY_ARTIFACT_SENTINEL",
+                    "download_url": "https://signed.example/PRIVATE_WAVE3B_SIGNED_URL",
+                    "object_uri": "memory://PRIVATE_WAVE3B_OBJECT_URI",
+                    "credentials": "PRIVATE_WAVE3B_CREDENTIAL",
+                    "provenance": {
+                        **artifacts[0]["provenance"],
+                        "explanation": "PRIVATE_WAVE3B_PROVENANCE_SENTINEL",
+                    },
+                }
+            )
+            debug.update({"reason_codes": ["source_unavailable"]})
+        elif mode == "wave3b_malformed_response":
+            return {
+                "request_id": "wrong-replay-request",
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [],
+                    "semantic": semantic,
+                    "artifact_refs": artifacts,
+                    "observed_metadata": {"has_code_like_content": True},
+                    "retrieval_debug": debug,
+                },
+            }
         elif mode == "truth_active_parked":
             semantic[0]["content"] = "Current plan is Alpha."
             artifacts[0]["snippet"] = "Old plan was Beta."
@@ -900,6 +965,14 @@ def _provider_prompt_evidence(messages: Any) -> dict[str, bool]:
         "external_context_present": "EXT_CONTEXT_MARKER" in joined,
         "runtime_overlay_present": "RUNTIME_OVERLAY_MARKER" in joined,
         "artifact_context_present": "Private replay artifact" in joined,
+        "selected_relationship_memory_present": (
+            "selected relationship scoped replay memory" in joined
+        ),
+        "excluded_relationship_memory_present": (
+            "excluded relationship replay memory" in joined
+        ),
+        "unauthorized_artifact_present": "unauthorized replay artifact" in joined,
+        "privacy_replay_sentinel_present": "PRIVATE_WAVE3B_REPLAY" in joined,
     }
 
 
@@ -1030,6 +1103,8 @@ def _normalize(
     retrieval_dispatch = retrieval_dispatch if isinstance(retrieval_dispatch, dict) else {}
     result_boundary = raw_prompt.get("result_boundary")
     result_boundary = result_boundary if isinstance(result_boundary, dict) else {}
+    persona_containment = raw_prompt.get("persona_containment")
+    persona_containment = persona_containment if isinstance(persona_containment, dict) else {}
     return {
         "schema_version": "orchestration-replay-v1",
         "scenario": scenario["scenario"],
@@ -1129,6 +1204,27 @@ def _normalize(
                 ),
                 "neutral_persistence_classification": retrieval_dispatch.get(
                     "neutral_persistence_classification"
+                ),
+            },
+            "persona_containment": {
+                "active_persona_id": persona_containment.get("active_persona_id"),
+                "retrieval_scope_status": persona_containment.get(
+                    "retrieval_scope_status"
+                ),
+                "retrieval_scope_reason": persona_containment.get(
+                    "retrieval_scope_reason"
+                ),
+                "artifact_request_status": persona_containment.get(
+                    "artifact_request_status"
+                ),
+                "artifact_request_reason": persona_containment.get(
+                    "artifact_request_reason"
+                ),
+                "artifact_result_status": persona_containment.get(
+                    "artifact_result_status"
+                ),
+                "artifact_result_reason": persona_containment.get(
+                    "artifact_result_reason"
                 ),
             },
             "result_boundary": {

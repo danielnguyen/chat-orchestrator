@@ -154,6 +154,10 @@ def test_required_orchestration_replay_categories_are_present():
         "trace_persistence_failure",
         "wave3b_retrieval_suppressed",
         "wave3b_valid_containment",
+        "wave3b_co3_unauthorized_artifact",
+        "wave3b_co3_relationship_projection",
+        "wave3b_co3_privacy_sanitization",
+        "wave3b_co3_malformed_mandatory_response",
     } <= categories
 
 
