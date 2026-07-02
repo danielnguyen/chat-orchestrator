@@ -124,6 +124,16 @@ def _ensure_persona_containment_trace_defaults(
     return trace
 
 
+def _set_artifact_result_trace(
+    *,
+    persona_trace: dict[str, Any],
+    status: str,
+    reason: str,
+) -> None:
+    persona_trace["artifact_result_status"] = status
+    persona_trace["artifact_result_reason"] = reason
+
+
 def _persona_containment_lock_active(persona_containment: dict[str, Any] | None) -> bool:
     return (
         isinstance(persona_containment, dict)
@@ -572,11 +582,11 @@ def _apply_persona_containment_retrieval_boundary(
     trace["retrieval_scope_used"] = "conversation"
     trace["retrieval_scope_status"] = "request_boundary_enforced"
     trace["retrieval_scope_reason"] = "conversation_scope_enforced_under_containment_lock"
-    trace["artifact_request_status"] = "request_boundary_enforced"
-    trace["artifact_request_reason"] = "artifact_search_disabled_under_containment_lock"
+    trace["artifact_request_status"] = "mandatory_policy_forwarded"
+    trace["artifact_request_reason"] = "artifact_search_governed_by_mandatory_policy"
     return RetrievalBoundaryResult(
         retrieval=effective_retrieval,
-        include_artifacts=False,
+        include_artifacts=None,
         allowed_memory_domains=allowed_memory_domains,
         blocked_memory_domains=blocked_memory_domains,
     )
@@ -4135,6 +4145,11 @@ async def orchestrate_chat(
                     "suppression_or_dependency_reason": reason,
                 }
             )
+            _set_artifact_result_trace(
+                persona_trace=persona_containment_trace,
+                status="not_requested",
+                reason=reason,
+            )
             if suppression_reason:
                 restraint_trace["retrieval_enforcement_status"] = "suppressed"
                 restraint_trace["retrieval_enforcement_reason"] = suppression_reason
@@ -4190,6 +4205,28 @@ async def orchestrate_chat(
                     else None
                 ),
             )
+            if (
+                persona_containment_enabled
+                and result_boundary_trace.get("validation_status") == "failed_closed"
+            ):
+                failure_reasons = result_boundary_trace.get("omission_counts_by_reason")
+                failure_reason = None
+                if isinstance(failure_reasons, dict):
+                    failure_reason = next(iter(failure_reasons), None)
+                _set_artifact_result_trace(
+                    persona_trace=persona_containment_trace,
+                    status="failed_closed",
+                    reason=(
+                        _sanitize_trace_string(failure_reason, max_length=80)
+                        or "mandatory_artifact_result_boundary_failed_closed"
+                    ),
+                )
+            elif persona_containment_enabled and isinstance(retrieval_bundle, dict):
+                _set_artifact_result_trace(
+                    persona_trace=persona_containment_trace,
+                    status="validated",
+                    reason="mandatory_artifact_result_boundary_applied",
+                )
         memory_hygiene_result = await apply_memory_hygiene(
             runtime=runtime,
             enabled=memory_hygiene_enabled,

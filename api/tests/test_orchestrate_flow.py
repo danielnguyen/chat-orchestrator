@@ -2506,10 +2506,25 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
         persona_trace["retrieval_scope_reason"]
         == "conversation_scope_enforced_under_containment_lock"
     )
-    assert persona_trace["artifact_request_status"] == "request_boundary_enforced"
+    call = memory_store.retrieve_calls[0]
+    assert call["include_artifacts"] is None
+    assert call["containment_policy"]["artifact_access_policy"] == {
+        "enforcement_mode": "mandatory",
+        "allowed_content_classes": ["document", "code"],
+        "allowed_domains": ["technical", "project"],
+        "maximum_sensitivity": "high",
+        "surface_content_capabilities": ["document", "code"],
+        "reason_codes": ["persona_scope_hint_applied"],
+    }
+    assert persona_trace["artifact_request_status"] == "mandatory_policy_forwarded"
     assert (
         persona_trace["artifact_request_reason"]
-        == "artifact_search_disabled_under_containment_lock"
+        == "artifact_search_governed_by_mandatory_policy"
+    )
+    assert persona_trace["artifact_result_status"] == "validated"
+    assert (
+        persona_trace["artifact_result_reason"]
+        == "mandatory_artifact_result_boundary_applied"
     )
     result_boundary = trace_payload["retrieval"]["prompt_assembly"]["result_boundary"]
     assert result_boundary["validation_status"] == "filtered"
@@ -2526,6 +2541,80 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
     )
     assert persona_trace["tool_scope_status"] == "deferred"
     assert persona_trace["tool_scope_reason"] == "tool_enforcement_deferred"
+
+
+@pytest.mark.asyncio
+async def test_wave3b_mandatory_artifact_policy_omits_ineligible_artifact_truthfully(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+
+    class IneligibleArtifactMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            response = await super().retrieve_bundle(**kwargs)
+            artifact = dict(response["bundle"]["artifact_refs"][0])
+            artifact.update(
+                {
+                    "artifact_id": "blocked-artifact",
+                    "snippet": "blocked artifact should not reach provider",
+                    "source_ref": {
+                        "ref_type": "derived_text",
+                        "ref_id": "blocked-derived",
+                    },
+                    "policy_metadata": {
+                        **artifact["policy_metadata"],
+                        "memory_domains": ["finance"],
+                    },
+                }
+            )
+            response["bundle"]["artifact_refs"] = [artifact]
+            return response
+
+    memory_store = IneligibleArtifactMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "hi"}],
+            "retrieval": {"scope": "owner", "k": 4},
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        persona_containment_enabled=True,
+        request_id="rid-wave3b-artifact-policy-omission",
+    )
+
+    assert out["sources"] == []
+    assert "blocked artifact should not reach provider" not in json.dumps(
+        litellm.calls[0]["messages"]
+    )
+    persona_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "persona_containment"
+    ]
+    assert persona_trace["artifact_request_status"] == "mandatory_policy_forwarded"
+    assert (
+        persona_trace["artifact_request_reason"]
+        == "artifact_search_governed_by_mandatory_policy"
+    )
+    assert persona_trace["artifact_result_status"] == "validated"
+    assert (
+        persona_trace["artifact_result_reason"]
+        == "mandatory_artifact_result_boundary_applied"
+    )
+    result_boundary = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["result_boundary"]
+    assert result_boundary["artifact_policy_applied"] is True
+    assert result_boundary["retained_counts"]["artifact_refs"] == 0
+    assert result_boundary["omission_counts_by_reason"]["memory_domain_not_allowed"] == 1
 
 
 def _allowed_restraint_response():
@@ -2626,6 +2715,7 @@ async def test_wave3b_valid_containment_sends_exact_mandatory_bms_policy(tmp_pat
     call = memory_store.retrieve_calls[0]
     assert "allowed_memory_domains" not in call
     assert "blocked_memory_domains" not in call
+    assert call["include_artifacts"] is None
     assert call["containment_policy"] == {
         "enforcement_mode": "mandatory",
         "allowed_memory_domains": ["technical", "project"],
@@ -2876,12 +2966,16 @@ async def test_wave3b_result_boundary_envelope_mismatch_fails_closed(tmp_path):
 
     prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
     assert "semantic valid memory" not in prompt_text
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "result_boundary"
-    ]
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    trace = prompt_trace["result_boundary"]
     assert trace["validation_status"] == "failed_closed"
     assert trace["envelope_validation_failed"] is True
     assert trace["omission_counts_by_reason"]["retrieval_envelope_mismatch"] == 1
+    assert prompt_trace["persona_containment"]["artifact_result_status"] == "failed_closed"
+    assert (
+        prompt_trace["persona_containment"]["artifact_result_reason"]
+        == "retrieval_envelope_mismatch"
+    )
 
 
 @pytest.mark.asyncio
@@ -3578,6 +3672,12 @@ async def test_wave3b_restraint_suppression_produces_zero_bms_calls(
     assert trace["bms_retrieval_call_issued"] is False
     assert trace["bms_retrieval_call_suppressed"] is True
     assert trace["suppression_or_dependency_reason"] == expected_reason
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    persona_trace = prompt_trace["persona_containment"]
+    assert persona_trace["artifact_result_status"] == "not_requested"
+    assert persona_trace["artifact_result_reason"] == expected_reason
+    assert prompt_trace["result_boundary"]["artifact_policy_applied"] is False
+    assert prompt_trace["result_boundary"]["validation_status"] == "not_applied"
     doctrine = memory_store.trace_calls[0]["payload"]["retrieval"]["bundle"][
         "doctrine_summary"
     ]
@@ -3632,6 +3732,13 @@ async def test_wave3b_malformed_mandatory_containment_fails_closed_without_legac
     ]
     assert trace["policy_validation_status"] == "failed"
     assert trace["suppression_or_dependency_reason"] == "invalid_artifact_policy_sensitivity"
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt_trace["persona_containment"]["artifact_result_status"] == "not_requested"
+    assert (
+        prompt_trace["persona_containment"]["artifact_result_reason"]
+        == "invalid_artifact_policy_sensitivity"
+    )
+    assert prompt_trace["result_boundary"]["artifact_policy_applied"] is False
 
 
 @pytest.mark.asyncio
@@ -3995,7 +4102,18 @@ async def test_wave3b_disabled_containment_preserves_legacy_request_and_persiste
 
     assert len(memory_store.retrieve_calls) == 1
     assert "containment_policy" not in memory_store.retrieve_calls[0]
+    assert memory_store.retrieve_calls[0]["include_artifacts"] is None
     assert [call.get("policy_metadata") for call in memory_store.added_messages] == [None, None]
+    persona_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "persona_containment"
+    ]
+    assert persona_trace["artifact_request_status"] == "not_enforced"
+    assert persona_trace["artifact_request_reason"] == "artifact_request_not_enforced"
+    assert persona_trace["artifact_result_status"] == "not_applied"
+    assert (
+        persona_trace["artifact_result_reason"]
+        == "artifact_result_suppression_not_applied"
+    )
 
 
 @pytest.mark.asyncio
