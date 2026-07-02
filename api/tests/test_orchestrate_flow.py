@@ -141,7 +141,6 @@ class FakeMemoryStore:
                                 {
                                     "ref_type": "message",
                                     "ref_id": "semantic-message-1",
-                                    "support_kind": "direct",
                                 }
                             ],
                         },
@@ -763,6 +762,12 @@ class FakeLiteLLM:
         if self.fail_first and len(self.calls) == 1:
             raise RuntimeError("primary failed")
         return {"choices": [{"message": {"content": self.content}}]}
+
+
+class FailingLiteLLM(FakeLiteLLM):
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        raise RuntimeError("provider failed")
 
 
 class TruthAwareLiteLLM(FakeLiteLLM):
@@ -2896,6 +2901,307 @@ async def test_wave3b_result_boundary_fallback_reuses_same_prompt_identity(tmp_p
     assert model_calls[1]["retained_artifact_ids"] == ["artifact-good"]
     prompt_trace = trace["retrieval"]["prompt_assembly"]
     assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+
+
+@pytest.mark.asyncio
+async def test_wave3b_result_boundary_removes_observed_metadata_and_auxiliary_side_channels(
+    tmp_path,
+):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: code\n"
+        "    when:\n"
+        "      has_code: true\n"
+        "    then:\n"
+        "      selected_model: code-model\n"
+        "      provider: cloud\n"
+        "      rationale: code\n"
+        "      fallbacks: []\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: general-model\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  code-model:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "    cost_per_1k_tokens: 10\n"
+        "  general-model:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "    cost_per_1k_tokens: 1\n",
+        encoding="utf-8",
+    )
+    sentinel = "PRIVATE_OMITTED_CODE_SENTINEL"
+
+    class SideChannelMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            blocked_artifact = _co2_artifact(
+                "blocked-code",
+                f"def secret(): return '{sentinel}'",
+                policy_metadata=_co2_policy_metadata(
+                    domains=["finance"],
+                    content_class="code",
+                ),
+            )
+            return {
+                "request_id": kwargs["request_id"],
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [],
+                    "semantic": [_co2_message("semantic-good", "plain retained memory")],
+                    "artifact_refs": [blocked_artifact],
+                    "observed_metadata": {
+                        "has_artifacts": True,
+                        "has_code_like_content": True,
+                        "estimated_chars": 9999,
+                        "mime_types": ["text/x-python"],
+                    },
+                    "retrieval_debug": {"vector_status": "ok"},
+                },
+                "raw_bundle": {"artifact_refs": [blocked_artifact]},
+                "augmented_bundle": {"artifact_refs": [blocked_artifact]},
+                "comparison": {"private": sentinel},
+                "diagnostics": {
+                    "contract_version": "raw-retrieval-debug.v1",
+                    "mode": "compare",
+                    "status": "ok",
+                    "raw_result_ids": [sentinel],
+                    "augmented_result_ids": [sentinel],
+                    "comparison": {"private": sentinel},
+                },
+            }
+
+    memory_store = SideChannelMemoryStore()
+    litellm = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-wave3b-side-channel",
+    )
+
+    assert out["selected_model"] == "general-model"
+    assert out["sources"] == []
+    assert sentinel not in json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    serialized_trace = json.dumps(trace_payload, sort_keys=True)
+    assert sentinel not in serialized_trace
+    bundle_trace = trace_payload["retrieval"]["bundle"]
+    assert bundle_trace["artifact_refs"] == []
+    persisted_bundle = trace_payload["retrieval"]["prompt_assembly"]["handoff"]["retrieval"]
+    assert persisted_bundle["observed_metadata"]["has_code_like_content"] is False
+    boundary = trace_payload["retrieval"]["prompt_assembly"]["result_boundary"]
+    assert boundary["omission_counts_by_reason"]["memory_domain_not_allowed"] == 1
+    assert "raw_bundle" not in serialized_trace
+    assert "augmented_bundle" not in serialized_trace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artifact_overrides", "reason"),
+    [
+        (
+            {"source_ref": {"ref_type": "external_url", "ref_id": "artifact-bad"}},
+            "malformed_source_ref",
+        ),
+        ({"provenance": "not-a-dict"}, "malformed_provenance"),
+        (
+            {
+                "provenance": {
+                    "owner_id": "owner",
+                    "source_refs": [
+                        {"ref_type": "message", "ref_id": "source", "extra": "nope"}
+                    ],
+                }
+            },
+            "malformed_provenance_source_refs",
+        ),
+        (
+            {"provenance": {"owner_id": "other-owner", "source_refs": []}},
+            "provenance_owner_mismatch",
+        ),
+        (
+            {
+                "provenance": {
+                    "owner_id": "owner",
+                    "status": "failed",
+                    "provenance_status": "complete",
+                    "source_refs": [{"ref_type": "message", "ref_id": "source"}],
+                }
+            },
+            "contradictory_provenance",
+        ),
+    ],
+)
+async def test_wave3b_result_boundary_rejects_malformed_source_and_provenance(
+    tmp_path,
+    artifact_overrides,
+    reason,
+):
+    rules, models = _write_default_route_files(tmp_path)
+
+    class ProvenanceMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            return {
+                "request_id": kwargs["request_id"],
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [],
+                    "semantic": [_co2_message("semantic-good", "semantic valid memory")],
+                    "artifact_refs": [
+                        _co2_artifact(
+                            "artifact-bad",
+                            "bad artifact snippet",
+                            **artifact_overrides,
+                        )
+                    ],
+                    "observed_metadata": {},
+                },
+            }
+
+    memory_store = ProvenanceMemoryStore()
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id=f"rid-wave3b-{reason}",
+    )
+
+    assert out["sources"] == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "result_boundary"
+    ]
+    assert trace["omission_counts_by_reason"][reason] == 1
+
+
+@pytest.mark.asyncio
+async def test_wave3b_result_boundary_allows_valid_bounded_provenance_and_public_sources(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+
+    class PublicSourceMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            return {
+                "request_id": kwargs["request_id"],
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [],
+                    "semantic": [_co2_message("semantic-good", "semantic valid memory")],
+                    "artifact_refs": [
+                        _co2_artifact(
+                            "artifact-good",
+                            "eligible artifact snippet",
+                            repo_name="repo",
+                            source_ref={
+                                "ref_type": "derived_text",
+                                "ref_id": "artifact-good",
+                            },
+                            provenance={
+                                "owner_id": "owner",
+                                "status": "complete",
+                                "provenance_status": "complete",
+                                "source_refs": [
+                                    {"ref_type": "message", "ref_id": "semantic-good"}
+                                ],
+                            },
+                            source_checks=[{"private": "SOURCE_CHECK_SENTINEL"}],
+                            policy_metadata=_co2_policy_metadata(content_class="document"),
+                            object_uri="PRIVATE_OBJECT_URI_SENTINEL",
+                            download_url="PRIVATE_SIGNED_URL_SENTINEL",
+                            credentials="PRIVATE_CREDENTIAL_SENTINEL",
+                            unknown_private_field="UNKNOWN_PRIVATE_SENTINEL",
+                        )
+                    ],
+                    "observed_metadata": {},
+                },
+            }
+
+    memory_store = PublicSourceMemoryStore()
+    litellm = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped memory"}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-wave3b-public-sources",
+    )
+
+    assert "eligible artifact snippet" in json.dumps(litellm.calls[0]["messages"])
+    assert out["sources"] == [
+        {
+            "artifact_id": "artifact-good",
+            "repo_name": "repo",
+            "file_path": "docs/artifact-good.md",
+            "snippet": "eligible artifact snippet",
+            "relevance_score": 0.9,
+            "source_ref": {"ref_type": "derived_text", "ref_id": "artifact-good"},
+        }
+    ]
+    serialized_sources = json.dumps(out["sources"], sort_keys=True)
+    for sentinel in [
+        "PRIVATE_OBJECT_URI_SENTINEL",
+        "PRIVATE_SIGNED_URL_SENTINEL",
+        "PRIVATE_CREDENTIAL_SENTINEL",
+        "UNKNOWN_PRIVATE_SENTINEL",
+        "SOURCE_CHECK_SENTINEL",
+    ]:
+        assert sentinel not in serialized_sources
+    assert "policy_metadata" not in serialized_sources
+    assert "provenance" not in serialized_sources
 
 
 @pytest.mark.asyncio
@@ -6535,7 +6841,6 @@ async def test_orchestrate_truth_selection_omits_malformed_derivative(
                 {
                     "ref_type": "message",
                     "ref_id": "unsafe-beta-source",
-                    "support_kind": "direct",
                 }
             ],
         }
@@ -6547,7 +6852,6 @@ async def test_orchestrate_truth_selection_omits_malformed_derivative(
                 {
                     "ref_type": "message",
                     "ref_id": "unsafe-beta-source",
-                    "support_kind": "direct",
                 }
             ],
         }
@@ -6560,7 +6864,6 @@ async def test_orchestrate_truth_selection_omits_malformed_derivative(
                 {
                     "ref_type": "message",
                     "ref_id": "",
-                    "support_kind": "direct",
                 }
             ],
         }
@@ -9246,6 +9549,243 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
     assert prompt_trace["response_action"]["action_taken"] == "template_fallback"
     assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
     assert trace_payload["model_call"]["brief"]["enabled"] is True
+
+
+def _privacy_error_bundle(request_id="rid-privacy-error"):
+    return {
+        "request_id": request_id,
+        "conversation_id": "conv-1",
+        "bundle": {
+            "recent": [
+                {
+                    "owner_id": "owner",
+                    "conversation_id": "conv-1",
+                    "message_id": "recent-private",
+                    "role": "assistant",
+                    "content": "PRIVATE_ERROR_TRACE_SENTINEL recent",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "source_ref": {"ref_type": "message", "ref_id": "recent-private"},
+                    "policy_metadata": {
+                        "memory_domains": ["technical"],
+                        "sensitivity": "medium",
+                    },
+                }
+            ],
+            "semantic": [
+                {
+                    "owner_id": "owner",
+                    "conversation_id": "conv-1",
+                    "message_id": "semantic-private",
+                    "role": "assistant",
+                    "content": "PRIVATE_ERROR_TRACE_SENTINEL semantic",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "source_ref": {"ref_type": "message", "ref_id": "semantic-private"},
+                    "policy_metadata": {
+                        "memory_domains": ["technical"],
+                        "sensitivity": "medium",
+                    },
+                }
+            ],
+            "artifact_refs": [
+                {
+                    "owner_id": "owner",
+                    "artifact_id": "artifact-private",
+                    "file_path": "private.txt",
+                    "snippet": "PRIVATE_ERROR_TRACE_SENTINEL artifact",
+                    "relevance_score": 0.9,
+                    "source_ref": {"ref_type": "derived_text", "ref_id": "artifact-private"},
+                    "source_availability": "available",
+                    "object_uri": "PRIVATE_ERROR_OBJECT_URI",
+                    "download_url": "PRIVATE_ERROR_SIGNED_URL",
+                    "credentials": "PRIVATE_ERROR_CREDENTIALS",
+                    "policy_metadata": {
+                        "memory_domains": ["technical"],
+                        "sensitivity": "medium",
+                        "content_class": "document",
+                    },
+                }
+            ],
+            "observed_metadata": {"has_code_like_content": False},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_error_trace_sanitizes_dual_provider_failure(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: primary\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: fallback\n"
+        "          provider: cloud\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  primary:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "  fallback:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="unknown_surface",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+        )
+    )
+    memory_store = BundledMemoryStore(_privacy_error_bundle("rid-privacy-error-fallback"))
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await orchestrate_chat(
+            payload=_base_payload(surface_context={"surface_category": "unknown_surface"}),
+            memory_store=memory_store,
+            litellm=FailingLiteLLM(),
+            runtime=runtime,
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-privacy-error-fallback",
+            privacy_context_enabled=True,
+        )
+
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    serialized = json.dumps(trace_payload, sort_keys=True)
+    for forbidden in [
+        "PRIVATE_ERROR_TRACE_SENTINEL",
+        "semantic-private",
+        "artifact-private",
+        "derived_text",
+        "PRIVATE_ERROR_OBJECT_URI",
+        "PRIVATE_ERROR_SIGNED_URL",
+        "PRIVATE_ERROR_CREDENTIALS",
+        "policy_metadata",
+    ]:
+        assert forbidden not in serialized
+    assert trace_payload["retrieval"]["bundle"] == {
+        "privacy_suppressed": True,
+        "recent_item_count": 1,
+        "semantic_item_count": 1,
+        "artifact_count": 1,
+    }
+    assert trace_payload["references"] == []
+    assert trace_payload["artifacts"]["reason"] == "privacy_suppressed"
+    assert trace_payload["fallback"] == {"triggered": True, "reason": "provider_error"}
+    assert [call["attempt_ordinal"] for call in trace_payload["model_calls"]] == [1, 2]
+    assert all("retained_artifact_ids" not in call for call in trace_payload["model_calls"])
+    assert all("retained_semantic_message_ids" not in call for call in trace_payload["model_calls"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_error_trace_sanitizes_prompt_budget_failure(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks: []\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="unknown_surface",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+        )
+    )
+    memory_store = BundledMemoryStore(_privacy_error_bundle("rid-privacy-budget-error"))
+    litellm = FakeLiteLLM()
+
+    with pytest.raises(RuntimeError, match="model_context_limit_unavailable"):
+        await orchestrate_chat(
+            payload=_base_payload(surface_context={"surface_category": "unknown_surface"}),
+            memory_store=memory_store,
+            litellm=litellm,
+            runtime=runtime,
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-privacy-budget-error",
+            privacy_context_enabled=True,
+        )
+
+    assert litellm.calls == []
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    serialized = json.dumps(trace_payload, sort_keys=True)
+    assert "PRIVATE_ERROR_TRACE_SENTINEL" not in serialized
+    assert "semantic-private" not in serialized
+    assert "artifact-private" not in serialized
+    assert trace_payload["references"] == []
+    assert "retained_source_ids" not in serialized
+    assert trace_payload["retrieval"]["bundle"]["privacy_suppressed"] is True
+    assert trace_payload["error"] == "model_context_limit_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_non_enforcing_privacy_error_trace_preserves_bounded_ids(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=True,
+            screen_detail_allowed=True,
+            redaction_required=False,
+            safe_summary_required=False,
+        )
+    )
+    memory_store = BundledMemoryStore(_privacy_error_bundle("rid-privacy-ordinary-error"))
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await orchestrate_chat(
+            payload=_base_payload(surface_context={"surface_category": "desktop_private"}),
+            memory_store=memory_store,
+            litellm=FailingLiteLLM(),
+            runtime=runtime,
+            rules_path=str(rules),
+            model_registry_path=str(models),
+            allow_manual_override=True,
+            request_id="rid-privacy-ordinary-error",
+            privacy_context_enabled=True,
+        )
+
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    model_call = trace_payload["model_calls"][0]
+    assert model_call["retained_semantic_message_ids"] == ["semantic-private"]
+    assert model_call["retained_artifact_ids"] == ["artifact-private"]
+    assert trace_payload["references"] == [
+        {"ref_type": "message", "ref_id": "recent-private"},
+        {"ref_type": "message", "ref_id": "semantic-private"},
+        {"ref_type": "derived_text", "ref_id": "artifact-private"},
+    ]
+    assert trace_payload["retrieval"]["bundle"]["semantic"][0]["message_id"] == "semantic-private"
 
 
 @pytest.mark.asyncio

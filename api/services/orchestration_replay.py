@@ -447,6 +447,22 @@ class ReplayMemoryStore:
             recent = []
         if "recent" not in locals():
             recent = []
+        if kwargs.get("containment_policy") is not None:
+            for artifact in artifacts:
+                provenance = artifact.get("provenance")
+                if not isinstance(provenance, dict):
+                    continue
+                source_refs = provenance.get("source_refs")
+                if not isinstance(source_refs, list):
+                    continue
+                provenance["source_refs"] = [
+                    {
+                        "ref_type": ref.get("ref_type"),
+                        "ref_id": ref.get("ref_id"),
+                    }
+                    for ref in source_refs
+                    if isinstance(ref, dict)
+                ]
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],

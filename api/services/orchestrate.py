@@ -25,6 +25,7 @@ from services.privacy_context import (
     derive_privacy_context,
     disabled_privacy_trace,
     privacy_fallback_policy,
+    privacy_policy_requires_suppression,
     restricted_retrieval_trace_summary,
     sanitize_prompt_trace_for_privacy,
     validate_privacy_runtime_response,
@@ -178,6 +179,28 @@ RESULT_POLICY_FIELDS = {
 }
 SENSITIVITY_RANK = {"low": 0, "medium": 1, "high": 2}
 VALID_RESULT_ROLES = {"user", "assistant", "system", "tool"}
+RESULT_SOURCE_REF_FIELDS = {"ref_type", "ref_id"}
+RESULT_PROVENANCE_FIELDS = {
+    "derived_id",
+    "owner_id",
+    "derivation_type",
+    "source_refs",
+    "derivation_version",
+    "created_at",
+    "status",
+    "effective_status",
+    "confidence",
+    "explanation",
+    "generation_trace_id",
+    "compatibility_defaults",
+    "provenance_status",
+    "retrieval_reason",
+}
+COMPLETE_PROVENANCE_STATUSES = {"complete", "available", "ready", "active"}
+CODE_LIKE_RE = re.compile(
+    r"\b(def|class|function|import|from|return|const|let|var|package)\b|[{};]",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_memory_domain_list(value: Any) -> list[str] | None:
@@ -632,6 +655,128 @@ def _record_omission(trace: dict[str, Any], reason: str | None) -> None:
     omissions[reason_key] = int(omissions.get(reason_key, 0)) + 1
 
 
+def _valid_result_source_ref(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    if set(value) - RESULT_SOURCE_REF_FIELDS:
+        return None
+    ref_type = value.get("ref_type")
+    ref_id = _sanitize_trace_string(value.get("ref_id"), max_length=160)
+    if ref_type not in {"message", "derived_text"} or not ref_id:
+        return None
+    return {"ref_type": ref_type, "ref_id": ref_id}
+
+
+def _valid_result_source_ref_list(value: Any) -> list[dict[str, str]] | None:
+    if not isinstance(value, list) or len(value) > 50:
+        return None
+    refs: list[dict[str, str]] = []
+    for item in value:
+        source_ref = _valid_result_source_ref(item)
+        if source_ref is None:
+            return None
+        refs.append(source_ref)
+    return refs
+
+
+def _valid_artifact_provenance(value: Any, *, owner_id: str) -> tuple[bool, str | None]:
+    if value is None:
+        return True, None
+    if not isinstance(value, dict):
+        return False, "malformed_provenance"
+    if set(value) - RESULT_PROVENANCE_FIELDS:
+        return False, "malformed_provenance"
+    if value.get("owner_id") != owner_id:
+        return False, "provenance_owner_mismatch"
+    provenance_status = value.get("provenance_status")
+    if provenance_status is not None and provenance_status != "complete":
+        return False, "contradictory_provenance"
+    status = value.get("effective_status", value.get("status"))
+    if status is not None:
+        normalized_status = _sanitize_trace_string(status, max_length=80)
+        if normalized_status is None or normalized_status not in COMPLETE_PROVENANCE_STATUSES:
+            return False, "contradictory_provenance"
+    if "source_refs" in value and _valid_result_source_ref_list(value.get("source_refs")) is None:
+        return False, "malformed_provenance_source_refs"
+    for key in ("derived_id", "derivation_type", "derivation_version", "created_at"):
+        if key in value and value.get(key) is not None:
+            if _sanitize_trace_string(value.get(key), max_length=200) is None:
+                return False, "malformed_provenance"
+    confidence = value.get("confidence")
+    if confidence is not None and (
+        not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
+    ):
+        return False, "malformed_provenance"
+    compatibility_defaults = value.get("compatibility_defaults", [])
+    if compatibility_defaults is not None and _sanitize_trace_string_list(
+        compatibility_defaults,
+        limit=20,
+        item_max_length=80,
+    ) != compatibility_defaults:
+        return False, "malformed_provenance"
+    return True, None
+
+
+def _retained_observed_metadata(
+    *,
+    recent: list[dict[str, Any]],
+    semantic: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    estimated_chars = 0
+    has_code_like_content = False
+    mime_types: list[str] = []
+    for item in [*recent, *semantic]:
+        content = item.get("content")
+        if isinstance(content, str):
+            estimated_chars += len(content)
+            has_code_like_content = has_code_like_content or bool(CODE_LIKE_RE.search(content))
+    for item in artifacts:
+        snippet = item.get("snippet")
+        if isinstance(snippet, str):
+            estimated_chars += len(snippet)
+            has_code_like_content = has_code_like_content or bool(CODE_LIKE_RE.search(snippet))
+        policy_metadata = item.get("policy_metadata")
+        if (
+            isinstance(policy_metadata, dict)
+            and policy_metadata.get("content_class") == "code"
+        ):
+            has_code_like_content = True
+        mime_type = _sanitize_trace_string(item.get("mime_type"), max_length=120)
+        if mime_type and mime_type not in mime_types:
+            mime_types.append(mime_type)
+    return {
+        "mime_types": mime_types,
+        "has_artifacts": bool(artifacts),
+        "has_code_like_content": has_code_like_content,
+        "estimated_chars": estimated_chars,
+    }
+
+
+def _bounded_retrieval_debug(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("degraded", "fallback", "suppressed"):
+        if isinstance(value.get(key), bool):
+            out[key] = value[key]
+    for key in ("fallback_reason", "suppression_reason", "vector_status"):
+        cleaned = _sanitize_trace_string(value.get(key), max_length=120)
+        if cleaned is not None:
+            out[key] = cleaned
+    reason_codes = _sanitize_trace_string_list(value.get("reason_codes"), limit=20)
+    if reason_codes:
+        out["reason_codes"] = reason_codes
+    return out
+
+
+def _bounded_bms_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    summary = _trace_doctrine_summary({"diagnostics": value})
+    return summary if isinstance(summary, dict) else {}
+
+
 def _apply_persona_containment_result_boundary(
     *,
     retrieval_bundle: Any,
@@ -722,7 +867,7 @@ def _apply_persona_containment_result_boundary(
             return None, "invalid_message_role"
         if not isinstance(content, str) or len(content) > 20000:
             return None, "malformed_message_content"
-        if _bounded_source_ref(item.get("source_ref")) is None:
+        if _valid_result_source_ref(item.get("source_ref")) is None:
             return None, "malformed_source_ref"
         metadata, reason = _validate_result_policy_metadata(
             item.get("policy_metadata"),
@@ -749,7 +894,7 @@ def _apply_persona_containment_result_boundary(
             return None, "malformed_artifact_path"
         if not isinstance(item.get("snippet"), str):
             return None, "malformed_artifact_snippet"
-        if _bounded_source_ref(item.get("source_ref")) is None:
+        if _valid_result_source_ref(item.get("source_ref")) is None:
             return None, "malformed_source_ref"
         if item.get("source_availability") != "available":
             return None, "source_unavailable"
@@ -758,9 +903,12 @@ def _apply_persona_containment_result_boundary(
             return None, "malformed_relevance_score"
         if min_score is not None and score is not None and score < min_score:
             return None, "relevance_score_below_minimum"
-        provenance = item.get("provenance")
-        if isinstance(provenance, dict) and provenance.get("owner_id") not in {None, owner_id}:
-            return None, "provenance_owner_mismatch"
+        provenance_ok, reason = _valid_artifact_provenance(
+            item.get("provenance"),
+            owner_id=owner_id,
+        )
+        if not provenance_ok:
+            return None, reason
         metadata, reason = _validate_result_policy_metadata(
             item.get("policy_metadata"),
             artifact=True,
@@ -789,15 +937,29 @@ def _apply_persona_containment_result_boundary(
             else:
                 output.append(kept)
 
+    observed_metadata = _retained_observed_metadata(
+        recent=retained_recent,
+        semantic=retained_semantic,
+        artifacts=retained_artifacts,
+    )
+    token_estimate_total = max(1, observed_metadata["estimated_chars"] // 4) if (
+        observed_metadata["estimated_chars"] > 0
+    ) else 0
     filtered_bundle = {
-        **retrieval_bundle,
+        "request_id": request_id,
+        "conversation_id": conversation_id,
         "bundle": {
-            **bundle,
             "recent": retained_recent,
             "semantic": retained_semantic,
             "artifact_refs": retained_artifacts,
+            "observed_metadata": observed_metadata,
+            "retrieval_debug": _bounded_retrieval_debug(bundle.get("retrieval_debug")),
+            "token_estimate_total": token_estimate_total,
         },
     }
+    diagnostics = _bounded_bms_diagnostics(retrieval_bundle.get("diagnostics"))
+    if diagnostics:
+        filtered_bundle["diagnostics"] = diagnostics
     trace["retained_counts"] = {
         "recent": len(retained_recent),
         "semantic": len(retained_semantic),
@@ -1390,28 +1552,31 @@ def _prompt_fingerprint(messages: list[dict[str, str]]) -> dict[str, Any]:
 def _public_answer_sources(sources: Any) -> list[dict[str, Any]]:
     if not isinstance(sources, list):
         return []
-    private_keys = {
-        "credentials",
-        "download_url",
-        "memory_hygiene",
-        "object_uri",
-        "provenance",
-        "qualification_reasons",
-        "presigned_url",
-        "source_checks",
-        "upload_url",
-    }
     public_sources: list[dict[str, Any]] = []
     for source in sources:
         if not isinstance(source, dict):
             continue
-        public_sources.append(
-            {
-                key: value
-                for key, value in source.items()
-                if isinstance(key, str) and not key.startswith("_") and key not in private_keys
-            }
-        )
+        public_source: dict[str, Any] = {}
+        artifact_id = _sanitize_trace_string(source.get("artifact_id"), max_length=160)
+        if artifact_id:
+            public_source["artifact_id"] = artifact_id
+        repo_name = _sanitize_trace_string(source.get("repo_name"), max_length=160)
+        if repo_name:
+            public_source["repo_name"] = repo_name
+        file_path = _sanitize_trace_string(source.get("file_path"), max_length=240)
+        if file_path:
+            public_source["file_path"] = file_path
+        snippet = source.get("snippet")
+        if isinstance(snippet, str):
+            public_source["snippet"] = snippet[:4000]
+        relevance_score = source.get("relevance_score")
+        if isinstance(relevance_score, (int, float)) and not isinstance(relevance_score, bool):
+            public_source["relevance_score"] = relevance_score
+        source_ref = _valid_result_source_ref(source.get("source_ref"))
+        if source_ref is not None:
+            public_source["source_ref"] = source_ref
+        if public_source:
+            public_sources.append(public_source)
     return public_sources
 
 
@@ -3225,8 +3390,35 @@ async def _create_error_trace(
     dsa_trace: dict[str, Any] | None = None,
     model_calls: list[dict[str, Any]] | None = None,
     model_call: dict[str, Any] | None = None,
+    privacy_policy: dict[str, Any] | None = None,
+    privacy_enforced: bool | None = None,
 ) -> None:
-    references = _trace_references(retrieval_bundle)
+    enforce_privacy = (
+        privacy_policy_requires_suppression(privacy_policy)
+        if privacy_enforced is None
+        else privacy_enforced
+    )
+    persisted_prompt_trace = prompt_trace or {}
+    if enforce_privacy:
+        persisted_prompt_trace = sanitize_prompt_trace_for_privacy(
+            persisted_prompt_trace,
+            retrieval_bundle,
+        )
+        persisted_prompt_trace.pop("retained_source_ids", None)
+        prompt_budget = persisted_prompt_trace.get("prompt_budget")
+        if isinstance(prompt_budget, dict):
+            prompt_budget.pop("retained_source_ids", None)
+    persisted_model_calls = (
+        [_sanitize_model_call_for_privacy(call) for call in model_calls or []]
+        if enforce_privacy
+        else model_calls or []
+    )
+    persisted_model_call = (
+        _sanitize_model_call_for_privacy(model_call)
+        if enforce_privacy and isinstance(model_call, dict)
+        else model_call
+    )
+    references = [] if enforce_privacy else _trace_references(retrieval_bundle)
     await memory_store.create_trace(
         request_id=request_id,
         payload={
@@ -3242,9 +3434,13 @@ async def _create_error_trace(
             },
             "retrieval": {
                 "query_present": bool(last_user_text),
-                "bundle": _trace_retrieval(retrieval_bundle),
+                "bundle": (
+                    restricted_retrieval_trace_summary(retrieval_bundle)
+                    if enforce_privacy
+                    else _trace_retrieval(retrieval_bundle)
+                ),
                 "prompt_assembly": {
-                    **(prompt_trace or {}),
+                    **persisted_prompt_trace,
                     "surface_presence": apply_surface_presence_outcome(
                         surface_presence_trace,
                         fallback_active=fallback_used,
@@ -3252,7 +3448,7 @@ async def _create_error_trace(
                     ),
                 },
             },
-            "prompt": _trace_prompt(prompt_trace),
+            "prompt": _trace_prompt(persisted_prompt_trace),
             "router_decision": {
                 "rule_id": route.get("rule_id"),
                 "selected_model": selected_model,
@@ -3278,7 +3474,7 @@ async def _create_error_trace(
                 "applied": override_applied,
                 "rejection_reason": override_reason,
             },
-            "model_call": model_call
+            "model_call": persisted_model_call
             or {
                 "provider": selected_provider,
                 "model": selected_model,
@@ -3286,13 +3482,29 @@ async def _create_error_trace(
                 "latency_ms": None,
                 "error_code": failure_reason,
             },
-            "model_calls": model_calls or [],
+            "model_calls": persisted_model_calls,
             "fallback": {
                 "triggered": fallback_used,
                 "reason": "provider_error" if fallback_used else None,
             },
-            "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
-            "artifacts": _trace_artifacts(retrieval_bundle),
+            "dsa": (
+                persisted_prompt_trace.get("dsa", {})
+                if enforce_privacy
+                else dsa_trace or {"enabled": False, "called": False, "status": "disabled"}
+            ),
+            "artifacts": (
+                {
+                    "status": "omitted",
+                    "artifact_count": len(
+                        retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+                    ),
+                    "included_ids": [],
+                    "source_reference_count": 0,
+                    "reason": "privacy_suppressed",
+                }
+                if enforce_privacy
+                else _trace_artifacts(retrieval_bundle)
+            ),
             "references": references,
             "cost": {},
             "latency_ms": int((perf_counter() - started) * 1000),
@@ -3897,6 +4109,7 @@ async def orchestrate_chat(
                     },
                     surface_presence_trace=surface_presence_trace,
                     dsa_trace=dsa_trace,
+                    privacy_policy=privacy_context,
                 )
                 raise RuntimeError("local_only policy active but no local model available")
             selected_model = local_candidate
@@ -4058,6 +4271,7 @@ async def orchestrate_chat(
                 prompt_trace=budget_prompt_trace,
                 surface_presence_trace=surface_presence_trace,
                 dsa_trace=dsa_trace,
+                privacy_policy=privacy_context,
             )
             await _complete_runtime_turn(
                 runtime=runtime,
@@ -4202,6 +4416,7 @@ async def orchestrate_chat(
                         dsa_trace=dsa_trace,
                         model_calls=model_calls,
                         model_call=final_attempt,
+                        privacy_policy=privacy_context,
                     )
                     raise
             else:
@@ -4230,6 +4445,7 @@ async def orchestrate_chat(
                     dsa_trace=dsa_trace,
                     model_calls=model_calls,
                     model_call=final_attempt,
+                    privacy_policy=privacy_context,
                 )
                 await _complete_runtime_turn(
                     runtime=runtime,
