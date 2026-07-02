@@ -2,7 +2,11 @@ import json
 
 import httpx
 import pytest
-from services.orchestrate import _bounded_retrieval_debug, orchestrate_chat
+from services.orchestrate import (
+    _bounded_retrieval_debug,
+    _relationship_projection_allows,
+    orchestrate_chat,
+)
 
 BANNED_TRACE_TOKENS = [
     "R26",
@@ -82,8 +86,6 @@ class FakeMemoryStore:
                             "memory_domains": ["technical"],
                             "sensitivity": "medium",
                             "entity_ids": ["entity_repo"],
-                            "relationship_ids": ["rel_project"],
-                            "relationship_scopes": ["project_context"],
                         },
                     }
                 ],
@@ -104,8 +106,6 @@ class FakeMemoryStore:
                             "memory_domains": ["technical"],
                             "sensitivity": "medium",
                             "entity_ids": ["entity_repo"],
-                            "relationship_ids": ["rel_project"],
-                            "relationship_scopes": ["project_context"],
                         },
                     }
                 ],
@@ -162,8 +162,6 @@ class FakeMemoryStore:
                             "sensitivity": "medium",
                             "content_class": "code",
                             "entity_ids": ["entity_repo"],
-                            "relationship_ids": ["rel_project"],
-                            "relationship_scopes": ["project_context"],
                         },
                     }
                 ],
@@ -2929,6 +2927,63 @@ async def test_wave3b_result_boundary_filters_messages_artifacts_and_sources(tmp
     retrieval = trace["retrieval"]["bundle"]
     assert [item["message_id"] for item in retrieval["semantic"]] == ["semantic-good"]
     assert [item["artifact_id"] for item in retrieval["artifact_refs"]] == ["artifact-good"]
+
+
+def test_wave3b_relationship_projection_requires_selected_relationship_id():
+    projection = {
+        "applied": True,
+        "relationship_ids": ["rel-good"],
+        "entity_ids": ["project:wave3b", "repo:good"],
+        "relationship_scopes": ["project_context"],
+    }
+
+    allowed, reason = _relationship_projection_allows(
+        {
+            "relationship_ids": ["rel-good"],
+            "entity_ids": ["project:wave3b", "repo:good"],
+            "relationship_scopes": ["project_context"],
+        },
+        projection,
+    )
+    assert (allowed, reason) == (True, None)
+
+    allowed, reason = _relationship_projection_allows(
+        {
+            "relationship_ids": ["rel-excluded"],
+            "entity_ids": ["project:wave3b", "repo:excluded"],
+            "relationship_scopes": ["project_context"],
+        },
+        projection,
+    )
+    assert (allowed, reason) == (False, "relationship_projection_mismatch")
+
+    allowed, reason = _relationship_projection_allows(
+        {
+            "entity_ids": ["repo:good"],
+            "relationship_scopes": ["project_context"],
+        },
+        projection,
+    )
+    assert (allowed, reason) == (True, None)
+
+    empty_projection = {
+        "applied": False,
+        "relationship_ids": [],
+        "entity_ids": [],
+        "relationship_scopes": [],
+        "reason_codes": ["no_eligible_relationship_scope"],
+    }
+    allowed, reason = _relationship_projection_allows(
+        {"relationship_ids": ["rel-good"], "entity_ids": ["project:wave3b"]},
+        empty_projection,
+    )
+    assert (allowed, reason) == (False, "relationship_projection_mismatch")
+
+    allowed, reason = _relationship_projection_allows(
+        {"entity_ids": ["project:wave3b"]},
+        empty_projection,
+    )
+    assert (allowed, reason) == (True, None)
 
 
 @pytest.mark.asyncio
@@ -9580,6 +9635,7 @@ async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
         )
     )
     memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="Top secret account number 1234.")
 
     out = await orchestrate_chat(
         payload=_base_payload(
@@ -9589,7 +9645,7 @@ async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
             brief_type="general",
         ),
         memory_store=memory_store,
-        litellm=FakeLiteLLM(content="Top secret account number 1234."),
+        litellm=litellm,
         runtime=runtime,
         rules_path=str(rules),
         model_registry_path=str(models),
@@ -9598,6 +9654,9 @@ async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
         privacy_context_enabled=True,
     )
 
+    serialized_provider_messages = json.dumps(litellm.calls, sort_keys=True)
+    assert "semantic note" not in serialized_provider_messages
+    assert "def entrypoint" not in serialized_provider_messages
     assert out["answer"] == expected_answer
     assert out["sources"] == []
     assert memory_store.added_messages[-1]["content"] == expected_answer

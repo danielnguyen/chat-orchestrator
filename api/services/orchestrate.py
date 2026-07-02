@@ -638,17 +638,21 @@ def _relationship_projection_allows(
 ) -> tuple[bool, str | None]:
     if (
         not isinstance(relationship_projection, dict)
-        or relationship_projection.get("applied") is not True
+        or "applied" not in relationship_projection
     ):
+        return True, None
+    record_relationships = set(metadata.get("relationship_ids") or [])
+    record_entities = set(metadata.get("entity_ids") or [])
+    if relationship_projection.get("applied") is not True:
+        if record_relationships:
+            return False, "relationship_projection_mismatch"
         return True, None
     selected_relationships = set(relationship_projection.get("relationship_ids") or [])
     selected_entities = set(relationship_projection.get("entity_ids") or [])
-    record_relationships = set(metadata.get("relationship_ids") or [])
-    record_entities = set(metadata.get("entity_ids") or [])
-    if not (
-        selected_relationships.intersection(record_relationships)
-        or selected_entities.intersection(record_entities)
-    ):
+    if record_relationships:
+        if not selected_relationships.intersection(record_relationships):
+            return False, "relationship_projection_mismatch"
+    elif record_entities and not selected_entities.intersection(record_entities):
         return False, "relationship_projection_mismatch"
     selected_scopes = set(relationship_projection.get("relationship_scopes") or [])
     record_scopes = set(metadata.get("relationship_scopes") or [])
@@ -749,6 +753,30 @@ def _valid_result_source_ref_list(value: Any) -> list[dict[str, str]] | None:
             return None
         refs.append(source_ref)
     return refs
+
+
+def _valid_result_source_checks(value: Any) -> list[dict[str, str]] | None:
+    if not isinstance(value, list) or not value or len(value) > 50:
+        return None
+    checks: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        ref_type = _bounded_contract_text(item.get("ref_type"), max_length=64)
+        ref_id = _bounded_contract_text(item.get("ref_id"), max_length=160)
+        support_kind = _bounded_contract_text(item.get("support_kind"), max_length=64)
+        availability = _bounded_contract_text(item.get("availability"), max_length=64)
+        if not ref_type or not ref_id or not support_kind or availability != "available":
+            return None
+        checks.append(
+            {
+                "ref_type": ref_type,
+                "ref_id": ref_id,
+                "support_kind": support_kind,
+                "availability": availability,
+            }
+        )
+    return checks
 
 
 def _bounded_json_scalar(value: Any) -> Any:
@@ -1070,6 +1098,7 @@ def _apply_persona_containment_result_boundary(
             "policy_metadata": metadata,
         }
         for key in (
+            "evidence_role",
             "created_at",
             "source_availability",
             "freshness_state",
@@ -1148,6 +1177,8 @@ def _apply_persona_containment_result_boundary(
             "snippet": item["snippet"],
             "source_ref": source_ref,
             "source_availability": "available",
+            "freshness_state": "active",
+            "durable_status": "active",
             "policy_metadata": metadata,
         }
         for key in (
@@ -1178,6 +1209,9 @@ def _apply_persona_containment_result_boundary(
         provenance = item.get("provenance")
         if provenance is not None:
             kept["provenance"] = provenance
+        source_checks = _valid_result_source_checks(item.get("source_checks"))
+        if source_checks is not None:
+            kept["source_checks"] = source_checks
         return kept, None
 
     retained_recent: list[dict[str, Any]] = []
@@ -4324,6 +4358,16 @@ async def orchestrate_chat(
             world_state=world_state,
             relationship_context=relationship_context,
         )
+        provider_retrieval_bundle = (
+            _empty_retrieval_bundle(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                reason="privacy_prompt_suppression",
+            )
+            if privacy_context_enabled
+            and privacy_policy_requires_suppression(privacy_context)
+            else retrieval_bundle
+        )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
 
@@ -4446,7 +4490,7 @@ async def orchestrate_chat(
             runtime_overlay=runtime_overlay,
             runtime_trace=runtime_trace,
             retrieval_query=last_user_text,
-            retrieval_bundle=retrieval_bundle,
+            retrieval_bundle=provider_retrieval_bundle,
             interrupt_trace=interrupt_trace,
         )
 
@@ -4455,7 +4499,7 @@ async def orchestrate_chat(
         try:
             prompt = assemble_prompt(
                 profile=profile,
-                retrieval_bundle=retrieval_bundle,
+                retrieval_bundle=provider_retrieval_bundle,
                 current_messages=effective_payload["messages"],
                 handoff=handoff,
                 presentation=presentation,
@@ -4790,7 +4834,9 @@ async def orchestrate_chat(
                 for item in artifact_refs_for_sources
                 if isinstance(item, dict) and item.get("artifact_id") in retained_artifact_ids
             ]
-        elif prompt.trace.get("prompt_budget"):
+        elif prompt.trace.get("prompt_budget") and not (
+            privacy_context_enabled and privacy_policy_requires_suppression(privacy_context)
+        ):
             artifact_refs_for_sources = []
         answer_sources = _public_answer_sources(artifact_refs_for_sources)
         if privacy_context_enabled and privacy_context is not None:

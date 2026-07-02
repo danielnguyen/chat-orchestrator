@@ -1,0 +1,16 @@
+name: chat-orchestrator-wave3b-smoke
+
+services:
+  bms:
+    environment:
+      INDEX_USER_QUESTIONS: "true"
+      INDEX_ASSISTANT_MESSAGES: "true"
+
+  orchestrator:
+    environment:
+      COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED: "true"
+      COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED: "true"
+      COGNITIVE_RUNTIME_RESTRAINT_ENABLED: "true"
+      COGNITIVE_RUNTIME_PRIVACY_CONTEXT_ENABLED: "true"
+      ENABLE_RUNTIME_OVERLAYS: "true"
+      COGNITIVE_RUNTIME_MEMORY_HYGIENE_ENABLED: "true"

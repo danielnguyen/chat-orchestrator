@@ -248,6 +248,7 @@
             "category": "wave3b_co3_relationship_projection",
             "persona_containment_enabled": true,
             "restraint_enabled": true,
+            "memory_hygiene_enabled": false,
             "retrieval": "wave3b_relationship_projection",
             "relationship_projection": {
                 "applied": true,
