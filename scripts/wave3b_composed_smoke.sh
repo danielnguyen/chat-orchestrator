@@ -8,6 +8,96 @@ COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 OVERLAY="$ROOT/docker-compose.wave3b-smoke.yml"
 BMS_REQUIRED_COMMIT="f8a4e51595963555a024d22b1491301d5dbd29e6"
 CR_REQUIRED_COMMIT="8353f0010e1616db55286eab0e79897315f412eb"
+REQUESTED_SCENARIOS="${WAVE3B_SCENARIOS:-all}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scenario)
+      shift
+      test "$#" -gt 0 || {
+        echo "wave3b-composed-smoke usage error: --scenario requires a name" >&2
+        exit 2
+      }
+      REQUESTED_SCENARIOS="$1"
+      ;;
+    --scenario=*)
+      REQUESTED_SCENARIOS="${1#--scenario=}"
+      ;;
+    *)
+      echo "wave3b-composed-smoke usage error: unknown argument $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+selected_scenarios=()
+full_suite=false
+harness_only=false
+
+add_selected_scenario() {
+  local name="$1"
+  case "$name" in
+    all)
+      full_suite=true
+      selected_scenarios=(
+        shared_memory
+        relationship
+        restraint
+        artifact
+        fallback
+        privacy
+      )
+      ;;
+    harness)
+      harness_only=true
+      selected_scenarios=(harness)
+      ;;
+    shared_memory|shared-memory|shared_canonical_memory_prelimit_filtering)
+      selected_scenarios+=(shared_memory)
+      ;;
+    relationship|relationship-narrowing|relationship_narrowing_before_retrieval)
+      selected_scenarios+=(relationship)
+      ;;
+    restraint|restraint-zero-call|restraint_zero_call_boundary)
+      selected_scenarios+=(restraint)
+      ;;
+    artifact|artifact-policy|artifact_policy_prelimit_filtering)
+      selected_scenarios+=(artifact)
+      ;;
+    fallback|fallback-identity|fallback_identity)
+      selected_scenarios+=(fallback)
+      ;;
+    privacy|privacy-safe-diagnostics|privacy_safe_diagnostics)
+      selected_scenarios+=(privacy)
+      ;;
+    "")
+      echo "wave3b-composed-smoke usage error: empty scenario name" >&2
+      exit 2
+      ;;
+    *)
+      echo "wave3b-composed-smoke usage error: unknown scenario $name" >&2
+      exit 2
+      ;;
+  esac
+}
+
+IFS=',' read -r -a requested_scenario_parts <<<"$REQUESTED_SCENARIOS"
+for requested_scenario in "${requested_scenario_parts[@]}"; do
+  add_selected_scenario "$requested_scenario"
+done
+if [ "${#selected_scenarios[@]}" -eq 0 ]; then
+  echo "wave3b-composed-smoke usage error: no scenarios selected" >&2
+  exit 2
+fi
+if [ "$harness_only" = true ] && [ "${#selected_scenarios[@]}" -ne 1 ]; then
+  echo "wave3b-composed-smoke usage error: harness cannot be combined with composed scenarios" >&2
+  exit 2
+fi
+if [ "$full_suite" = true ] && [ "$REQUESTED_SCENARIOS" != "all" ]; then
+  echo "wave3b-composed-smoke usage error: all cannot be combined with focused scenarios" >&2
+  exit 2
+fi
 
 for command in git docker curl jq python3; do
   command -v "$command" >/dev/null || {
@@ -50,8 +140,6 @@ cleanup() {
 }
 trap cleanup EXIT
 cleanup
-
-compose up -d --build --wait
 
 curl_json() {
   local label="$1"
@@ -179,9 +267,9 @@ PY
 }
 
 ensure_qdrant_collection() {
-  curl -sS -o /dev/null -X PUT "http://127.0.0.1:14391/collections/messages" \
+  curl_json "Qdrant ensure messages collection" -X PUT "http://127.0.0.1:14391/collections/messages" \
     -H "Content-Type: application/json" \
-    -d '{"vectors":{"size":1536,"distance":"Cosine"}}' || true
+    -d '{"vectors":{"size":1536,"distance":"Cosine"}}' >/dev/null
 }
 
 resolve_conversation() {
@@ -259,7 +347,7 @@ qdrant_upsert_message() {
         } + (if $policy.content_class then {content_class:$policy.content_class} else {} end)
       }]
     }' \
-    | curl -fsS -X PUT "http://127.0.0.1:14391/collections/messages/points" \
+    | curl_json "Qdrant upsert message fixture" -X PUT "http://127.0.0.1:14391/collections/messages/points" \
       -H "Content-Type: application/json" \
       -d @- >/dev/null
 }
@@ -307,7 +395,7 @@ qdrant_upsert_message_untrusted() {
         }
       }]
     }' \
-    | curl -fsS -X PUT "http://127.0.0.1:14391/collections/messages/points" \
+    | curl_json "Qdrant upsert untrusted message fixture" -X PUT "http://127.0.0.1:14391/collections/messages/points" \
       -H "Content-Type: application/json" \
       -d @- >/dev/null
 }
@@ -341,7 +429,7 @@ seed_artifact() {
   if [ "$status" = "completed" ] && [ "$provenance_status" = "complete" ]; then
     derived_status="active"
   fi
-  psql_exec >/dev/null <<SQL
+  if ! psql_exec >/dev/null <<SQL
 INSERT INTO artifacts (
   id, owner_id, client_id, conversation_id, filename, mime, size, object_uri,
   source_surface, status, source_kind, repo_name, file_path, policy_metadata, completed_at
@@ -366,6 +454,10 @@ VALUES (
 )
 ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text, derivation_params = EXCLUDED.derivation_params;
 SQL
+  then
+    echo "wave3b-composed-smoke fixture failed: artifact-sql-$suffix" >&2
+    exit 1
+  fi
   qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$conversation" "$file_path" "$policy" "$derived_status"
   echo "$artifact_id:$derived_id"
 }
@@ -408,13 +500,13 @@ qdrant_upsert_derived() {
         } + (if $policy.content_class then {content_class:$policy.content_class} else {} end)
       }]
     }' \
-    | curl -fsS -X PUT "http://127.0.0.1:14391/collections/messages/points" \
+    | curl_json "Qdrant upsert derived artifact fixture" -X PUT "http://127.0.0.1:14391/collections/messages/points" \
       -H "Content-Type: application/json" \
       -d @- >/dev/null
 }
 
 retrieval_log_count() {
-  compose logs --no-color bms 2>/dev/null | grep -Ec 'POST /v2/conversations/.*/retrieve' || true
+  compose logs --no-color bms 2>/dev/null | awk '/POST \/v2\/conversations\/.*\/retrieve/ {count += 1} END {print count + 0}'
 }
 
 cr_storage_match_count() {
@@ -471,12 +563,46 @@ assert_not_contains() {
   esac
 }
 
+assert_provider_chat_calls() {
+  local calls="$1" request_id="$2" expected_attempts="${3:-}"
+  if ! jq -e --arg request_id "$request_id" --arg expected_attempts "$expected_attempts" '
+    (.request_id == $request_id)
+    and ([.calls[]? | select(.kind == "chat")] | length) > 0
+    and (
+      $expected_attempts == ""
+      or ([.calls[]? | select(.kind == "chat")] | length) == ($expected_attempts | tonumber)
+    )
+  ' <<<"$calls" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: provider chat calls request_id=$request_id expected_attempts=${expected_attempts:-any}" >&2
+    exit 1
+  fi
+}
+
 assert_provider_sentinel() {
-  local calls="$1" label="$2" expected="$3"
+  local calls="$1" request_id="$2" label="$3" expected="$4" expected_attempts="${5:-}"
+  assert_provider_chat_calls "$calls" "$request_id" "$expected_attempts"
   if ! jq -e --arg label "$label" --argjson expected "$expected" \
-    '[.calls[] | select(.kind=="chat") | .sentinel_presence[$label] == $expected] | all' \
+    '[.calls[]? | select(.kind=="chat") | .sentinel_presence[$label] == $expected] as $matches
+    | ($matches | length > 0) and ($matches | all)' \
     <<<"$calls" >/dev/null; then
-    echo "wave3b-composed-smoke assertion failed: provider sentinel $label expected=$expected" >&2
+    echo "wave3b-composed-smoke assertion failed: provider sentinel label=$label request_id=$request_id expected=$expected" >&2
+    exit 1
+  fi
+}
+
+assert_public_source_allowlist() {
+  local response="$1" expected_artifact="$2" label="$3"
+  if ! jq -e --arg artifact "$expected_artifact" '
+    (.sources | type == "array")
+    and (.sources | length > 0)
+    and ([.sources[] | select(.artifact_id == $artifact)] | length) >= 1
+    and (
+      [.sources[] | keys_unsorted[]]
+      - ["artifact_id","repo_name","file_path","snippet","relevance_score","source_ref"]
+      | length == 0
+    )
+  ' <<<"$response" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: public source allowlist label=$label expected_artifact=$expected_artifact" >&2
     exit 1
   fi
 }
@@ -494,6 +620,94 @@ mark_acceptance() {
   acceptance_json="$(jq -c --arg row "$row" --arg scenario "$scenario" '. + {($row): $scenario}' <<<"$acceptance_json")"
 }
 
+expect_harness_failure() {
+  local label="$1"
+  shift
+  if ( "$@" ) >/dev/null 2>&1; then
+    echo "wave3b-composed-smoke harness assertion failed: expected failure label=$label" >&2
+    exit 1
+  fi
+}
+
+expect_harness_success() {
+  local label="$1"
+  shift
+  if ! "$@" >/dev/null 2>&1; then
+    echo "wave3b-composed-smoke harness assertion failed: expected success label=$label" >&2
+    exit 1
+  fi
+}
+
+assert_required_fixture_setup_is_strict() {
+  python3 - "$0" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = "|" + "| true"
+required_patterns = (
+    "provider_post",
+    "bms_post",
+    "cr_post",
+    "seed_message",
+    "seed_untrusted_message",
+    "seed_artifact",
+    "qdrant_upsert",
+    "ensure_qdrant_collection",
+)
+for lineno, line in enumerate(source.splitlines(), 1):
+    if needle not in line:
+        continue
+    if "compose down" in line:
+        continue
+    if any(pattern in line for pattern in required_patterns):
+        print(f"wave3b-composed-smoke harness assertion failed: swallowed required fixture setup line={lineno}", file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+run_harness_selftest() {
+  local zero_calls matching_calls missing_required forbidden_present source_good source_empty source_internal
+  zero_calls='{"request_id":"rid-provider","calls":[]}'
+  matching_calls='{"request_id":"rid-provider","calls":[{"kind":"chat","sentinel_presence":{"expected":true,"forbidden":false}}]}'
+  missing_required='{"request_id":"rid-provider","calls":[{"kind":"chat","sentinel_presence":{"expected":false,"forbidden":false}}]}'
+  forbidden_present='{"request_id":"rid-provider","calls":[{"kind":"chat","sentinel_presence":{"expected":true,"forbidden":true}}]}'
+  source_good='{"sources":[{"artifact_id":"artifact-1","repo_name":"repo","file_path":"file.py","snippet":"allowed","relevance_score":0.9,"source_ref":{"ref_type":"derived_text","ref_id":"derived-1"}}]}'
+  source_empty='{"sources":[]}'
+  source_internal='{"sources":[{"artifact_id":"artifact-1","snippet":"allowed","owner_id":"owner-internal"}]}'
+
+  expect_harness_failure "zero-provider-calls" assert_provider_sentinel "$zero_calls" "rid-provider" "expected" true "1"
+  expect_harness_success "matching-provider-sentinel" assert_provider_sentinel "$matching_calls" "rid-provider" "expected" true "1"
+  expect_harness_failure "missing-required-provider-sentinel" assert_provider_sentinel "$missing_required" "rid-provider" "expected" true "1"
+  expect_harness_failure "forbidden-provider-sentinel" assert_provider_sentinel "$forbidden_present" "rid-provider" "forbidden" false "1"
+  expect_harness_success "non-empty-public-source" assert_public_source_allowlist "$source_good" "artifact-1" "harness-public-source"
+  expect_harness_failure "empty-public-source" assert_public_source_allowlist "$source_empty" "artifact-1" "harness-public-source"
+  expect_harness_failure "internal-public-source-field" assert_public_source_allowlist "$source_internal" "artifact-1" "harness-public-source"
+  assert_required_fixture_setup_is_strict
+  assert_jq "$acceptance_json" '. == {}' "harness acceptance starts empty"
+
+  jq -nc \
+    --argjson scenarios '{"harness":"CO-3A harness truthfulness assertions passed"}' \
+    --argjson acceptance "$acceptance_json" \
+    '{
+      packet_ok: true,
+      packet: "CO-3A",
+      focused: true,
+      wave: "3B",
+      final_acceptance: false,
+      scenarios: $scenarios,
+      acceptance: $acceptance
+    }'
+}
+
+if [ "$harness_only" = true ]; then
+  run_harness_selftest
+  exit 0
+fi
+
+compose up -d --build --wait
 ensure_qdrant_collection
 provider_post "/fixture/reset"
 
@@ -545,8 +759,8 @@ scenario_shared_memory() {
   read_calls="$(fetch_provider_calls "$read_request")"
   public_json="$read_response $read_trace $read_calls"
   assert_not_contains "$public_json" "$decoy" "shared-memory-decoy"
-  assert_provider_sentinel "$read_calls" "canonical" true
-  assert_provider_sentinel "$read_calls" "decoy" false
+  assert_provider_sentinel "$read_calls" "$read_request" "canonical" true "1"
+  assert_provider_sentinel "$read_calls" "$read_request" "decoy" false "1"
   assert_jq "$read_trace" '(.retrieval.prompt_assembly.result_boundary.retained_counts.semantic // .retrieval.prompt_assembly.result_boundary.retained_semantic_count // 0) >= 1' "$scenario retained semantic evidence"
   assert_jq "$read_trace" '.retrieval.bundle.doctrine_summary.canonical_used == true and (.retrieval.bundle.doctrine_summary.reason_codes // [] | index("canonical_evidence_used"))' "$scenario canonical doctrine evidence"
   assert_jq "$read_trace" '(.retrieval.prompt_assembly.memory_hygiene.truth_selection.pre_cr_rejection_reasons.canonical_durable_status_invalid // 0) >= 1' "$scenario rejected untrusted decoys before prompt assembly"
@@ -555,7 +769,7 @@ scenario_shared_memory() {
   denied_response="$(co_chat "$owner" "web" "web" "$conv_unauthorized" "What from memory is saved for my car maintenance?" "private" "desktop_private" "false")"
   denied_request="$(jq -r '.request_id' <<<"$denied_response")"
   denied_calls="$(fetch_provider_calls "$denied_request")"
-  assert_provider_sentinel "$denied_calls" "canonical" false
+  assert_provider_sentinel "$denied_calls" "$denied_request" "canonical" false "1"
   if [ "$(cr_storage_match_count "$canonical")" != "0" ]; then
     echo "wave3b-composed-smoke assertion failed: $scenario canonical absent from CR runtime/profile storage" >&2
     exit 1
@@ -631,8 +845,8 @@ scenario_relationship_narrowing() {
     exit 1
   fi
   assert_jq "$trace" '.retrieval.prompt_assembly.retrieval_dispatch.relationship_projection_applied == true and .retrieval.prompt_assembly.retrieval_dispatch.relationship_id_count == 1' "$scenario CO dispatched selected projection"
-  assert_provider_sentinel "$calls" "eligible_relationship" true
-  assert_provider_sentinel "$calls" "excluded_relationship" false
+  assert_provider_sentinel "$calls" "$request_id" "eligible_relationship" true "1"
+  assert_provider_sentinel "$calls" "$request_id" "excluded_relationship" false "1"
   assert_not_contains "$trace" "filtering-only relationship evidence" "relationship-evidence-text"
 
   cr_post "/v1/relationships/edges/revoke" "$(jq -nc --arg owner "$owner" --arg rel "$rel_good" '{request_id:"rid-wave3b-rel-revoke",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",relationship_id:$rel,evidence:{evidence_type:"user_confirmation",source_ref:"turn:wave3b",summary:"revoked",confidence_delta:0}}')" >/dev/null
@@ -640,7 +854,7 @@ scenario_relationship_narrowing() {
   revoked_response="$(co_chat "$owner" "vscode" "vscode" "$conv" "What from memory should be used for the selected project relationship after revocation?" "private" "desktop_private" "false")"
   revoked_request="$(jq -r '.request_id' <<<"$revoked_response")"
   revoked_calls="$(fetch_provider_calls "$revoked_request")"
-  assert_provider_sentinel "$revoked_calls" "eligible_relationship" false
+  assert_provider_sentinel "$revoked_calls" "$revoked_request" "eligible_relationship" false "1"
 
   record_scenario "$scenario" "A4 assertions passed"
   mark_acceptance "A4" "$scenario"
@@ -676,10 +890,12 @@ scenario_artifact_policy() {
   outside_policy="$(policy_json "personal" "medium" "code")"
   sensitive_policy="$(policy_json "project" "restricted" "code")"
   malformed_policy='{"memory_domains":[],"sensitivity":"medium","content_class":"code"}'
-  seed_artifact "$owner" "vscode" "$conv" "eligible" "eligible project code artifact $eligible" "$eligible_policy" "completed" "complete" >/dev/null
+  local eligible_artifact_pair eligible_artifact_id
+  eligible_artifact_pair="$(seed_artifact "$owner" "vscode" "$conv" "eligible" "eligible project code artifact $eligible" "$eligible_policy" "completed" "complete")"
+  eligible_artifact_id="${eligible_artifact_pair%%:*}"
   seed_artifact "$owner" "vscode" "$conv" "blocked" "blocked domain artifact $blocked $credential" "$blocked_policy" "completed" "complete" >/dev/null
   seed_artifact "$owner" "vscode" "$conv" "outside" "outside domain artifact $blocked" "$outside_policy" "completed" "complete" >/dev/null
-  seed_artifact "$owner" "vscode" "$conv" "sensitive" "restricted artifact $blocked" "$sensitive_policy" "completed" "complete" >/dev/null || true
+  seed_artifact "$owner" "vscode" "$conv" "sensitive" "restricted artifact $blocked" "$sensitive_policy" "completed" "complete" >/dev/null
   seed_artifact "$owner" "vscode" "$conv" "malformed" "malformed metadata artifact $blocked" "$malformed_policy" "completed" "complete" >/dev/null
   seed_artifact "$owner" "vscode" "$conv" "incomplete" "incomplete provenance artifact $blocked" "$eligible_policy" "pending" "building" >/dev/null
   provider_post "/fixture/sentinels" "$(jq -nc --arg eligible "$eligible" --arg blocked "$blocked" --arg credential "$credential" '{sentinels:{eligible_artifact:$eligible,blocked_artifact:$blocked,artifact_credential:$credential}}')"
@@ -690,11 +906,11 @@ scenario_artifact_policy() {
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
   assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated"' "$scenario artifact policy validated"
-  assert_provider_sentinel "$calls" "eligible_artifact" true
-  assert_provider_sentinel "$calls" "blocked_artifact" false
-  assert_provider_sentinel "$calls" "artifact_credential" false
+  assert_provider_sentinel "$calls" "$request_id" "eligible_artifact" true "1"
+  assert_provider_sentinel "$calls" "$request_id" "blocked_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "artifact_credential" false "1"
   assert_not_contains "$response $trace $calls" "$credential" "artifact-credential"
-  assert_jq "$response" '[.sources[]? | keys_unsorted[]] - ["artifact_id","repo_name","file_path","snippet","relevance_score","source_ref"] | length == 0' "$scenario public sources allowlist"
+  assert_public_source_allowlist "$response" "$eligible_artifact_id" "$scenario public sources allowlist"
   record_scenario "$scenario" "A6 and artifact A7 assertions passed"
   mark_acceptance "A6" "$scenario"
   mark_acceptance "A7_artifact" "$scenario"
@@ -720,8 +936,8 @@ scenario_fallback_identity() {
   assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .normalized_messages] | .[0] == .[1]' "$scenario normalized messages identical"
   assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .prompt_fingerprint] | .[0] == .[1]' "$scenario prompt fingerprints identical"
   assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .message_count] | .[0] == .[1]' "$scenario message counts identical"
-  assert_provider_sentinel "$calls" "fallback_allowed" true
-  assert_provider_sentinel "$calls" "fallback_blocked" false
+  assert_provider_sentinel "$calls" "$request_id" "fallback_allowed" true "2"
+  assert_provider_sentinel "$calls" "$request_id" "fallback_blocked" false "2"
   assert_jq "$trace" '.retrieval.prompt_assembly.provider_fallback_context.same_sanitized_messages_reused == true' "$scenario bounded trace fallback identity"
   record_scenario "$scenario" "A8 assertions passed"
   mark_acceptance "A8" "$scenario"
@@ -741,6 +957,7 @@ scenario_privacy_safe_diagnostics() {
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
+  assert_provider_chat_calls "$calls" "$request_id" "1"
   for label in privacy_msg privacy_artifact privacy_meta privacy_url privacy_credential privacy_relationship; do
     local sentinel
     sentinel="$(jq -r --arg label "$label" '.sentinels[$label]' <<<"$(jq -nc --arg msg "$msg" --arg artifact "$artifact" --arg meta "$meta" --arg url "$url" --arg cred "$cred" --arg rel "$rel" '{sentinels:{privacy_msg:$msg,privacy_artifact:$artifact,privacy_meta:$meta,privacy_url:$url,privacy_credential:$cred,privacy_relationship:$rel}}')")"
@@ -756,32 +973,49 @@ scenario_privacy_safe_diagnostics() {
   mark_acceptance "A9" "$scenario"
 }
 
-scenario_shared_memory
-scenario_relationship_narrowing
-scenario_restraint_zero_call
-scenario_artifact_policy
-scenario_fallback_identity
-scenario_privacy_safe_diagnostics
+for selected_scenario in "${selected_scenarios[@]}"; do
+  case "$selected_scenario" in
+    shared_memory)
+      scenario_shared_memory
+      ;;
+    relationship)
+      scenario_relationship_narrowing
+      ;;
+    restraint)
+      scenario_restraint_zero_call
+      ;;
+    artifact)
+      scenario_artifact_policy
+      ;;
+    fallback)
+      scenario_fallback_identity
+      ;;
+    privacy)
+      scenario_privacy_safe_diagnostics
+      ;;
+    *)
+      echo "wave3b-composed-smoke usage error: selected scenario not executable: $selected_scenario" >&2
+      exit 2
+      ;;
+  esac
+done
 
 acceptance_json="$(jq -c 'if (.A7_message and .A7_artifact) then . + {A7:"message_and_artifact_prelimit_filtering"} else . end' <<<"$acceptance_json")"
 
-jq -e '
-  ["A1","A2","A3","A4","A5","A6","A7","A8","A9"] as $required
-  | ($required - (keys)) == []
-' <<<"$acceptance_json" >/dev/null || {
-  echo "wave3b-composed-smoke assertion failed: not all A1-A9 rows were proven" >&2
-  exit 1
-}
+if [ "$full_suite" = true ]; then
+  jq -e '
+    ["A1","A2","A3","A4","A5","A6","A7","A8","A9"] as $required
+    | ($required - (keys)) == []
+  ' <<<"$acceptance_json" >/dev/null || {
+    echo "wave3b-composed-smoke assertion failed: not all A1-A9 rows were proven" >&2
+    exit 1
+  }
+fi
 
-jq -nc \
-  --argjson scenarios "$scenario_json" \
-  --argjson acceptance "$acceptance_json" \
+topology_json="$(jq -nc \
   --arg bms_required "$BMS_REQUIRED_COMMIT" \
   --arg cr_required "$CR_REQUIRED_COMMIT" \
   '{
-    ok: true,
-    wave: "3B",
-    topology: {
       orchestrator: "branch-under-test",
       basic_memory_store: "main",
       cognitive_runtime: "main",
@@ -803,7 +1037,35 @@ jq -nc \
         basic_memory_store_contains: $bms_required,
         cognitive_runtime_contains: $cr_required
       }
-    },
-    scenarios: $scenarios,
-    acceptance: $acceptance
-  }'
+    }')"
+
+if [ "$full_suite" = true ] && { [ "${WAVE3B_FINAL_ACCEPTANCE:-false}" = "true" ] || [ "${WAVE3B_FINAL_ACCEPTANCE:-false}" = "1" ]; }; then
+  jq -nc \
+    --argjson scenarios "$scenario_json" \
+    --argjson acceptance "$acceptance_json" \
+    --argjson topology "$topology_json" \
+    '{
+      ok: true,
+      wave: "3B",
+      final_acceptance: true,
+      topology: $topology,
+      scenarios: $scenarios,
+      acceptance: $acceptance
+    }'
+else
+  jq -nc \
+    --argjson scenarios "$scenario_json" \
+    --argjson acceptance "$acceptance_json" \
+    --argjson topology "$topology_json" \
+    --argjson focused "$(if [ "$full_suite" = true ]; then echo false; else echo true; fi)" \
+    '{
+      packet_ok: true,
+      packet: "CO-3A",
+      wave: "3B",
+      focused: $focused,
+      final_acceptance: false,
+      topology: $topology,
+      scenarios: $scenarios,
+      acceptance: $acceptance
+    }'
+fi
