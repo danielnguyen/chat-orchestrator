@@ -504,10 +504,58 @@ qdrant_upsert_message_untrusted() {
       -d @- >/dev/null
 }
 
+demote_current_turn_query_messages() {
+  local owner="$1" query="$2" canonical_id="$3" policy="$4" vector="$5"
+  local rows
+  rows="$(psql_exec -At -F '|' -c "SELECT id, conversation_id, COALESCE(client_id, ''), role FROM messages WHERE owner_id='$owner' AND content='$query' AND id <> '$canonical_id';")"
+  while IFS='|' read -r message_id conversation_id client_id role; do
+    [ -n "$message_id" ] || continue
+    qdrant_upsert_message "$message_id" "$owner" "$conversation_id" "$client_id" "$role" "$policy" "$vector"
+  done <<<"$rows"
+}
+
+qdrant_upsert_message_untagged() {
+  local message_id="$1" owner="$2" conversation="$3" client="$4" role="$5" vector="${6-}"
+  if [ -z "$vector" ]; then
+    vector="$(json_vector)"
+  fi
+  jq -nc \
+    --arg id "$message_id" \
+    --arg owner "$owner" \
+    --arg conversation "$conversation" \
+    --arg client "$client" \
+    --arg role "$role" \
+    --argjson vector "$vector" \
+    '{
+      points:[{
+        id:$id,
+        vector:$vector,
+        payload:{
+          ref_type:"message",
+          message_id:$id,
+          owner_id:$owner,
+          conversation_id:$conversation,
+          client_id:$client,
+          role:$role
+        }
+      }]
+    }' \
+    | curl_json "Qdrant upsert untagged message fixture" -X PUT "http://127.0.0.1:14391/collections/messages/points" \
+      -H "Content-Type: application/json" \
+      -d @- >/dev/null
+}
+
 seed_untrusted_message() {
   local conversation="$1" owner="$2" client="$3" content="$4" metadata="${5-}" vector="${6-}" message_id
   message_id="$(add_message_untrusted "$conversation" "$owner" "$client" "assistant" "$content" "$metadata")"
   qdrant_upsert_message_untrusted "$message_id" "$owner" "$conversation" "$client" "assistant" "$vector"
+  echo "$message_id"
+}
+
+seed_untagged_message() {
+  local conversation="$1" owner="$2" client="$3" content="$4" metadata="${5-}" vector="${6-}" message_id
+  message_id="$(add_message_untrusted "$conversation" "$owner" "$client" "assistant" "$content" "$metadata")"
+  qdrant_upsert_message_untagged "$message_id" "$owner" "$conversation" "$client" "assistant" "$vector"
   echo "$message_id"
 }
 
@@ -611,6 +659,25 @@ qdrant_upsert_derived() {
 
 retrieval_log_count() {
   compose logs --no-color bms 2>/dev/null | awk '/POST \/v2\/conversations\/.*\/retrieve/ {count += 1} END {print count + 0}'
+}
+
+wait_retrieval_log_delta() {
+  local before="$1" expected="$2" label="$3" current delta
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    current="$(retrieval_log_count)"
+    delta=$((current - before))
+    if [ "$delta" -ge "$expected" ]; then
+      break
+    fi
+    sleep 0.25
+  done
+  current="$(retrieval_log_count)"
+  delta=$((current - before))
+  if [ "$delta" -ne "$expected" ]; then
+    echo "wave3b-composed-smoke assertion failed: $label expected_retrieval_delta=$expected actual_retrieval_delta=$delta" >&2
+    exit 1
+  fi
+  echo "$current"
 }
 
 qdrant_message_scores() {
@@ -814,6 +881,53 @@ assert_score_ordering() {
   fi
 }
 
+score_for_message_id() {
+  local score_json="$1" message_id="$2"
+  jq -r --arg id "$message_id" '[.result[]? | select(.payload.message_id == $id) | .score] | first // empty' <<<"$score_json"
+}
+
+assert_ids_absent_from_json() {
+  local json="$1" ids_json="$2" label="$3"
+  if ! jq -n -e --argjson ids "$ids_json" --arg text "$json" '
+    $ids
+    | map(. as $id | select(($text | contains($id)) == true))
+    | length == 0
+  ' >/dev/null; then
+    python3 - "$json" "$ids_json" <<'PY' >&2
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = sys.argv[1]
+ids = set(json.loads(sys.argv[2]))
+paths: list[str] = []
+
+def walk(value, path):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            walk(child, f"{path}.{key}" if path else str(key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            walk(child, f"{path}[{index}]")
+    elif isinstance(value, str) and any(item in value for item in ids):
+        paths.append(path or "$")
+
+walk(payload, "")
+for path in paths[:20]:
+    print(f"leaked excluded id path: {path}")
+PY
+    echo "wave3b-composed-smoke assertion failed: excluded id leaked label=$label" >&2
+    exit 1
+  fi
+}
+
+assert_id_absent_from_json() {
+  local json="$1" id="$2" label="$3"
+  assert_ids_absent_from_json "$json" "$(jq -nc --arg id "$id" '[$id]')" "$label"
+}
+
 assert_public_source_allowlist() {
   local response="$1" expected_artifact="$2" label="$3"
   if ! jq -e --arg artifact "$expected_artifact" '
@@ -842,6 +956,23 @@ record_scenario() {
 mark_acceptance() {
   local row="$1" scenario="$2"
   acceptance_json="$(jq -c --arg row "$row" --arg scenario "$scenario" '. + {($row): $scenario}' <<<"$acceptance_json")"
+}
+
+focused_packet_label() {
+  if [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 1 ] && [ "${selected_scenarios[0]}" = "shared_memory" ]; then
+    echo "CO-3B"
+  else
+    echo "CO-3A"
+  fi
+}
+
+assert_packet_label_for_selection() {
+  local expected="$1" label="$2" actual
+  actual="$(focused_packet_label)"
+  if [ "$actual" != "$expected" ]; then
+    echo "wave3b-composed-smoke harness assertion failed: packet label $label expected=$expected actual=$actual" >&2
+    exit 1
+  fi
 }
 
 expect_harness_failure() {
@@ -894,6 +1025,8 @@ PY
 
 run_harness_selftest() {
   local zero_calls matching_calls missing_required forbidden_present source_good source_empty source_internal
+  local saved_full_suite saved_harness_only saved_focused_selected
+  local -a saved_selected_scenarios
   zero_calls='{"request_id":"rid-provider","calls":[]}'
   matching_calls='{"request_id":"rid-provider","calls":[{"kind":"chat","sentinel_presence":{"expected":true,"forbidden":false}}]}'
   missing_required='{"request_id":"rid-provider","calls":[{"kind":"chat","sentinel_presence":{"expected":false,"forbidden":false}}]}'
@@ -911,6 +1044,24 @@ run_harness_selftest() {
   expect_harness_failure "internal-public-source-field" assert_public_source_allowlist "$source_internal" "artifact-1" "harness-public-source"
   assert_required_fixture_setup_is_strict
   assert_jq "$acceptance_json" '. == {}' "harness acceptance starts empty"
+  saved_full_suite="$full_suite"
+  saved_harness_only="$harness_only"
+  saved_focused_selected="$focused_composed_selected"
+  saved_selected_scenarios=("${selected_scenarios[@]}")
+  selected_scenarios=(harness)
+  full_suite=false
+  harness_only=true
+  focused_composed_selected=false
+  assert_packet_label_for_selection "CO-3A" "harness"
+  selected_scenarios=(shared_memory)
+  full_suite=false
+  harness_only=false
+  focused_composed_selected=true
+  assert_packet_label_for_selection "CO-3B" "shared-memory"
+  selected_scenarios=("${saved_selected_scenarios[@]}")
+  full_suite="$saved_full_suite"
+  harness_only="$saved_harness_only"
+  focused_composed_selected="$saved_focused_selected"
 
   jq -nc \
     --argjson scenarios '{"harness":"CO-3A harness truthfulness assertions passed"}' \
@@ -941,8 +1092,9 @@ scenario_shared_memory() {
   local persona_a="general_assistant" persona_b="technical_architect" persona_c="personal_companion"
   local unauthorized_surface="wave3b-personal"
   local conv_general conv_authorized conv_unauthorized write_response request_id trace calls metadata_row qpayload
-  local allowed_policy blocked_policy outside_policy decoy_conv read_query query_vector canonical_vector decoy_vector
-  local canonical_message_id canonical_count decoy_ids_json score_evidence crowd_size effective_limit
+  local allowed_policy blocked_policy outside_policy decoy_conv read_query persona_c_query query_vector canonical_vector decoy_vector demoted_query_vector
+  local canonical_message_id canonical_count decoy_ids_json blocked_ids_json spoof_ids_json outside_ids_json untagged_ids_json
+  local score_evidence canonical_score min_decoy_score crowd_size effective_limit normal_retrieval_before normal_retrieval_after
   assert_distinct_personas "$persona_a" "$persona_b" "$persona_c" "$scenario"
   ensure_cr_surface_binding "$unauthorized_surface" "private_app" "Wave 3B Personal Fixture" "$persona_c"
   conv_general="$(resolve_conversation "$owner" "web" "wave3b general write")"
@@ -954,9 +1106,11 @@ scenario_shared_memory() {
   blocked_policy="$(policy_json "finance" "medium")"
   outside_policy="$(policy_json "personal" "medium")"
   read_query="Bring in project context from memory. What is the saved durable fact?"
+  persona_c_query="For my personal planning, use memory to find the same saved project fact from earlier."
   query_vector="$(provider_embedding_vector "$read_query")"
   canonical_vector="$(json_vector_for_score "$query_vector" "0.62")"
   decoy_vector="$(json_vector_for_score "$query_vector" "0.98")"
+  demoted_query_vector="$(json_vector_for_score "$query_vector" "0.01")"
 
   write_response="$(co_chat "$owner" "web" "web" "$conv_general" "Remember this project fact for later: $canonical" "private" "desktop_private" "false")"
   request_id="$(jq -r '.request_id' <<<"$write_response")"
@@ -1000,15 +1154,24 @@ scenario_shared_memory() {
 
   decoy_conv="$(resolve_conversation "$owner" "vscode" "wave3b decoys")"
   decoy_ids_json='[]'
+  blocked_ids_json='[]'
+  spoof_ids_json='[]'
+  outside_ids_json='[]'
+  untagged_ids_json='[]'
   effective_limit=3
   crowd_size=0
   for i in 1 2 3 4; do
-    local blocked_id spoof_id outside_id
+    local blocked_id spoof_id outside_id untagged_id
     blocked_id="$(seed_message "$decoy_conv" "$owner" "vscode" "higher score blocked decoy $i $decoy" "$blocked_policy" "{}" "$decoy_vector")"
     spoof_id="$(seed_untrusted_message "$decoy_conv" "$owner" "vscode" "higher score spoof metadata decoy $i $decoy" '{"memory_domains":["project"],"trusted_policy_metadata":false}' "$decoy_vector")"
     outside_id="$(seed_message "$decoy_conv" "$owner" "vscode" "higher score outside decoy $i $decoy" "$outside_policy" "{}" "$decoy_vector")"
-    decoy_ids_json="$(jq -c --arg blocked "$blocked_id" --arg spoof "$spoof_id" --arg outside "$outside_id" '. + [$blocked, $spoof, $outside]' <<<"$decoy_ids_json")"
-    crowd_size=$((crowd_size + 3))
+    untagged_id="$(seed_untagged_message "$decoy_conv" "$owner" "vscode" "higher score untagged decoy $i $decoy" "{}" "$decoy_vector")"
+    blocked_ids_json="$(jq -c --arg id "$blocked_id" '. + [$id]' <<<"$blocked_ids_json")"
+    spoof_ids_json="$(jq -c --arg id "$spoof_id" '. + [$id]' <<<"$spoof_ids_json")"
+    outside_ids_json="$(jq -c --arg id "$outside_id" '. + [$id]' <<<"$outside_ids_json")"
+    untagged_ids_json="$(jq -c --arg id "$untagged_id" '. + [$id]' <<<"$untagged_ids_json")"
+    decoy_ids_json="$(jq -c --arg blocked "$blocked_id" --arg spoof "$spoof_id" --arg outside "$outside_id" --arg untagged "$untagged_id" '. + [$blocked, $spoof, $outside, $untagged]' <<<"$decoy_ids_json")"
+    crowd_size=$((crowd_size + 4))
   done
   if [ "$crowd_size" -le "$effective_limit" ]; then
     echo "wave3b-composed-smoke assertion failed: $scenario ineligible crowd does not exceed effective limit" >&2
@@ -1016,12 +1179,34 @@ scenario_shared_memory() {
   fi
   score_evidence="$(qdrant_message_scores "$owner" "$query_vector" 32)"
   assert_score_ordering "$score_evidence" "$canonical_message_id" "$decoy_ids_json" "$crowd_size" "$scenario ineligible candidates score above canonical"
+  canonical_score="$(score_for_message_id "$score_evidence" "$canonical_message_id")"
+  min_decoy_score="$(jq -r --argjson decoys "$decoy_ids_json" '[.result[]? | select(.payload.message_id as $id | $decoys | index($id)) | .score] | min // empty' <<<"$score_evidence")"
 
   local read_response read_request read_trace read_calls public_json direct_bms_request direct_bms_response
+  normal_retrieval_before="$(retrieval_log_count)"
   read_response="$(co_chat "$owner" "vscode" "vscode" "$conv_authorized" "$read_query" "private" "desktop_private" "false")"
+  normal_retrieval_after="$(wait_retrieval_log_delta "$normal_retrieval_before" 1 "$scenario normal CO request BMS retrieval boundary")"
   read_request="$(jq -r '.request_id' <<<"$read_response")"
   read_trace="$(fetch_trace "$read_request")"
   read_calls="$(fetch_provider_calls "$read_request")"
+  public_json="$read_response $read_trace $read_calls"
+  assert_not_contains "$public_json" "$decoy" "shared-memory-decoy"
+  assert_ids_absent_from_json "$read_response" "$decoy_ids_json" "shared-memory-response-decoy-ids"
+  assert_ids_absent_from_json "$read_calls" "$decoy_ids_json" "shared-memory-provider-decoy-ids"
+  assert_ids_absent_from_json "$read_trace" "$decoy_ids_json" "shared-memory-trace-decoy-ids"
+  assert_jq_arg "$read_trace" persona "$persona_b" '.retrieval.prompt_assembly.runtime_identity.active_persona_id == $persona and .retrieval.prompt_assembly.persona_containment.active_persona_id == $persona' "$scenario authorized technical persona"
+  assert_provider_sentinel "$read_calls" "$read_request" "canonical" true "1"
+  assert_provider_sentinel "$read_calls" "$read_request" "decoy" false "1"
+  assert_jq_arg "$read_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 1' "$scenario exact canonical retained from BMS response"
+  assert_jq_argjson "$read_trace" decoys "$decoy_ids_json" '([.retrieval.bundle.semantic[]? | select(.message_id as $id | $decoys | index($id))] | length) == 0' "$scenario no decoy retained from BMS response"
+  assert_jq_arg "$read_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id) | .score] | first) < 0.9' "$scenario retained eligible is lower scoring"
+  assert_jq_argjson "$read_trace" limit "$effective_limit" '
+    ([.retrieval.bundle.semantic[]?] | length) <= $limit
+  ' "$scenario CO-retained mandatory filtering evidence"
+  assert_jq "$read_trace" '(.retrieval.prompt_assembly.result_boundary.retained_counts.semantic // .retrieval.prompt_assembly.result_boundary.retained_semantic_count // 0) >= 1' "$scenario retained semantic evidence"
+  assert_jq "$read_trace" '.retrieval.bundle.doctrine_summary.canonical_used == true and (.retrieval.bundle.doctrine_summary.reason_codes // [] | index("canonical_evidence_used"))' "$scenario canonical doctrine evidence"
+  assert_jq "$read_trace" '(.retrieval.prompt_assembly.memory_hygiene.truth_selection.pre_cr_rejection_reasons.canonical_durable_status_invalid // 0) >= 1' "$scenario rejected untrusted decoys before prompt assembly"
+  demote_current_turn_query_messages "$owner" "$read_query" "$canonical_message_id" "$outside_policy" "$demoted_query_vector"
   direct_bms_request="wave3b-direct-shared-memory"
   direct_bms_response="$(bms_retrieve_bundle "$conv_authorized" "$direct_bms_request" "$(jq -nc \
     --arg request_id "$direct_bms_request" \
@@ -1036,41 +1221,37 @@ scenario_shared_memory() {
       include_artifacts:false,
       containment_policy:$policy
     }')")"
-  public_json="$read_response $read_trace $read_calls"
-  assert_not_contains "$public_json" "$decoy" "shared-memory-decoy"
-  assert_jq_arg "$read_trace" persona "$persona_b" '.retrieval.prompt_assembly.runtime_identity.active_persona_id == $persona and .retrieval.prompt_assembly.persona_containment.active_persona_id == $persona' "$scenario authorized technical persona"
-  assert_provider_sentinel "$read_calls" "$read_request" "canonical" true "1"
-  assert_provider_sentinel "$read_calls" "$read_request" "decoy" false "1"
-  if ! jq -e --argjson limit "$effective_limit" '
+  if ! jq -e --arg id "$canonical_message_id" --argjson decoys "$decoy_ids_json" --argjson limit "$effective_limit" --argjson min_decoy "$min_decoy_score" '
     (
       .bundle.retrieval_debug.containment_policy.pre_limit_policy_filter_applied == true
       or .bundle.retrieval_debug.mandatory_policy_filter_applied == true
     )
     and ((.bundle.retrieval_debug.semantic_candidates // 0) <= $limit)
+    and ([.bundle.semantic[]? | select(.message_id == $id)] | length) == 1
+    and ([.bundle.semantic[]? | select(.message_id as $message_id | $decoys | index($message_id))] | length) == 0
+    and ([.bundle.semantic[]? | select(.message_id == $id) | .score] | first) < $min_decoy
     and ((.diagnostics.reason_codes // [] | index("mandatory_containment_applied")) != null)
   ' <<<"$direct_bms_response" >/dev/null; then
     echo "wave3b-composed-smoke assertion failed: $scenario direct BMS pre-limit mandatory filtering before limiting" >&2
     exit 1
   fi
-  assert_jq_arg "$read_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 1' "$scenario exact canonical retained from BMS response"
-  assert_jq_argjson "$read_trace" decoys "$decoy_ids_json" '([.retrieval.bundle.semantic[]? | select(.message_id as $id | $decoys | index($id))] | length) == 0' "$scenario no decoy retained from BMS response"
-  assert_jq_arg "$read_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id) | .score] | first) < 0.9' "$scenario retained eligible is lower scoring"
-  assert_jq_argjson "$read_trace" limit "$effective_limit" '
-    ([.retrieval.bundle.semantic[]?] | length) <= $limit
-  ' "$scenario CO-retained mandatory filtering evidence"
-  assert_jq "$read_trace" '(.retrieval.prompt_assembly.result_boundary.retained_counts.semantic // .retrieval.prompt_assembly.result_boundary.retained_semantic_count // 0) >= 1' "$scenario retained semantic evidence"
-  assert_jq "$read_trace" '.retrieval.bundle.doctrine_summary.canonical_used == true and (.retrieval.bundle.doctrine_summary.reason_codes // [] | index("canonical_evidence_used"))' "$scenario canonical doctrine evidence"
-  assert_jq "$read_trace" '(.retrieval.prompt_assembly.memory_hygiene.truth_selection.pre_cr_rejection_reasons.canonical_durable_status_invalid // 0) >= 1' "$scenario rejected untrusted decoys before prompt assembly"
+  assert_ids_absent_from_json "$direct_bms_response" "$decoy_ids_json" "shared-memory-direct-bms-decoy-ids"
 
   local denied_response denied_request denied_calls
-  denied_response="$(co_chat "$owner" "$unauthorized_surface" "$unauthorized_surface" "$conv_unauthorized" "Use memory for this personal planning turn. What saved fact is relevant?" "private" "desktop_private" "false")"
+  denied_response="$(co_chat "$owner" "$unauthorized_surface" "$unauthorized_surface" "$conv_unauthorized" "$persona_c_query" "private" "desktop_private" "false")"
   denied_request="$(jq -r '.request_id' <<<"$denied_response")"
   local denied_trace
   denied_trace="$(fetch_trace "$denied_request")"
   denied_calls="$(fetch_provider_calls "$denied_request")"
   assert_jq_arg "$denied_trace" persona "$persona_c" '.retrieval.prompt_assembly.runtime_identity.active_persona_id == $persona and .retrieval.prompt_assembly.persona_containment.active_persona_id == $persona' "$scenario third persona surface"
+  assert_jq "$denied_trace" '(.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("project")) == null and (.retrieval.prompt_assembly.persona_containment.blocked_memory_domains // [] | index("project")) != null and .retrieval.prompt_assembly.persona_containment.cross_scope_access_allowed == false and .retrieval.prompt_assembly.persona_containment.capability_domain == "personal"' "$scenario persona C containment blocks project memory"
+  assert_jq "$denied_calls" '[.calls[]? | select(.kind=="chat") | .normalized_messages[]? | select(.role=="user") | .content | ascii_downcase | contains("memory") and contains("saved project fact")] | any' "$scenario persona C explicitly requested same project memory"
   assert_provider_sentinel "$denied_calls" "$denied_request" "canonical" false "1"
   assert_jq_arg "$denied_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 0' "$scenario unauthorized persona cannot retain canonical"
+  assert_not_contains "$denied_response $denied_calls $denied_trace" "$canonical" "persona-c-canonical-sentinel"
+  assert_id_absent_from_json "$denied_response" "$canonical_message_id" "persona-c-response-canonical-id"
+  assert_id_absent_from_json "$denied_calls" "$canonical_message_id" "persona-c-provider-canonical-id"
+  assert_id_absent_from_json "$denied_trace" "$canonical_message_id" "persona-c-trace-canonical-id"
   if [ "$(cr_storage_match_count "$canonical")" != "0" ]; then
     echo "wave3b-composed-smoke assertion failed: $scenario canonical absent from CR runtime/profile storage" >&2
     exit 1
@@ -1084,7 +1265,7 @@ scenario_shared_memory() {
     exit 1
   fi
 
-  record_scenario "$scenario" "CO-3B A1/A2/A3 and message A7 assertions passed with three distinct personas, BMS/Qdrant score evidence, and no CR/BMS persona-overlay copy"
+  record_scenario "$scenario" "CO-3B A1/A2/A3 and message A7 assertions passed with three distinct personas, blocked/outside/malformed/untagged crowding, BMS/Qdrant score evidence canonical_score=$canonical_score min_decoy_score=$min_decoy_score, and no CR/BMS persona-overlay copy"
   mark_acceptance "A1" "$scenario"
   mark_acceptance "A2" "$scenario"
   mark_acceptance "A3" "$scenario"
@@ -1362,14 +1543,16 @@ if [ "$full_suite" = true ] && { [ "${WAVE3B_FINAL_ACCEPTANCE:-false}" = "true" 
       acceptance: $acceptance
     }'
 else
+  focused_packet="$(focused_packet_label)"
   jq -nc \
+    --arg packet "$focused_packet" \
     --argjson scenarios "$scenario_json" \
     --argjson acceptance "$acceptance_json" \
     --argjson topology "$topology_json" \
     --argjson focused "$(if [ "$full_suite" = true ]; then echo false; else echo true; fi)" \
     '{
       packet_ok: true,
-      packet: "CO-3A",
+      packet: $packet,
       wave: "3B",
       focused: $focused,
       final_acceptance: false,

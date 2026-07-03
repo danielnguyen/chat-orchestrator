@@ -111,6 +111,14 @@ def test_wave3b_harness_scenario_runs_without_final_acceptance():
     assert payload["acceptance"] == {}
 
 
+def test_wave3b_harness_selftest_exercises_packet_labels():
+    source = _script()
+    assert "focused_packet_label()" in source
+    assert 'assert_packet_label_for_selection "CO-3A" "harness"' in source
+    assert 'assert_packet_label_for_selection "CO-3B" "shared-memory"' in source
+    assert 'packet: $packet' in source
+
+
 def test_wave3b_unknown_scenario_fails_before_topology_execution():
     result = subprocess.run(
         [str(SCRIPT), "--scenario", "unknown-co3a"],
@@ -220,16 +228,51 @@ def test_wave3b_shared_memory_message_crowding_has_score_and_boundary_evidence()
     source = _script()
     scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
     assert 'effective_limit=3' in scenario
-    assert 'crowd_size=$((crowd_size + 3))' in scenario
+    assert 'crowd_size=$((crowd_size + 4))' in scenario
     assert 'json_vector_for_score "$query_vector" "0.62"' in scenario
     assert 'json_vector_for_score "$query_vector" "0.98"' in scenario
     assert "assert_score_ordering" in scenario
+    assert "canonical_score" in scenario
+    assert "min_decoy_score" in scenario
     assert "pre_limit_policy_filter_applied == true" in scenario
     assert "mandatory_policy_filter_applied == true" in scenario
     assert "semantic_candidates" in scenario
     assert 'index("mandatory_containment_applied")' in scenario
+    assert 'select(.message_id == $id)' in scenario
+    assert 'select(.message_id as $message_id | $decoys | index($message_id))' in scenario
     assert "exact canonical retained from BMS response" in scenario
     assert "no decoy retained from BMS response" in scenario
+
+
+def test_wave3b_shared_memory_crowd_distinguishes_all_ineligible_groups():
+    source = _script()
+    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    assert "blocked_ids_json" in scenario
+    assert "spoof_ids_json" in scenario
+    assert "outside_ids_json" in scenario
+    assert "untagged_ids_json" in scenario
+    assert "seed_untagged_message" in scenario
+    assert "qdrant_upsert_message_untagged" in source
+    untagged_helper = source[
+        source.index("qdrant_upsert_message_untagged()") : source.index("seed_untrusted_message()")
+    ]
+    assert "retrieval_policy_valid" not in untagged_helper
+    assert "memory_domains" not in untagged_helper
+
+
+def test_wave3b_shared_memory_checks_normal_co_boundary_before_direct_bms_probe():
+    source = _script()
+    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    normal_before = scenario.index('normal_retrieval_before="$(retrieval_log_count)"')
+    normal_call = scenario.index('read_response="$(co_chat')
+    normal_after = scenario.index('normal_retrieval_after="$(wait_retrieval_log_delta')
+    demote_query = scenario.index('demote_current_turn_query_messages "$owner" "$read_query"')
+    direct_call = scenario.index('direct_bms_response="$(bms_retrieve_bundle')
+    assert normal_before < normal_call < normal_after < demote_query < direct_call
+    assert "normal CO request BMS retrieval boundary" in scenario
+    assert 'read_query="Bring in project context from memory. What is the saved durable fact?"' in scenario
+    assert "demoted_query_vector" in scenario
+    assert "demote_current_turn_query_messages()" in source
 
 
 def test_wave3b_shared_memory_focused_acceptance_is_partial_not_final():
@@ -249,4 +292,11 @@ def test_wave3b_shared_memory_denial_does_not_reuse_authorized_personas():
     assert '"$unauthorized_surface" "$unauthorized_surface" "$conv_unauthorized"' in scenario
     assert "third persona surface" in scenario
     assert "unauthorized persona cannot retain canonical" in scenario
+    assert "same saved project fact" in scenario
+    assert "persona C containment blocks project memory" in scenario
+    assert "allowed_memory_domains" in scenario
+    assert "blocked_memory_domains" in scenario
+    assert "capability_domain == \"personal\"" in scenario
+    assert "persona-c-canonical-sentinel" in scenario
+    assert "persona-c-trace-canonical-id" in scenario
     assert '"web" "$conv_unauthorized"' not in scenario
