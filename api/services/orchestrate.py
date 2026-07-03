@@ -3066,9 +3066,6 @@ async def _resolve_mandatory_retrieval_policy(
         {
             "retrieval_scope_projection_applied": projection["applied"],
             "relationship_edges_used": projection["relationship_ids"],
-            "relationship_edges_excluded": [],
-            "relationship_exclusion_reasons": {},
-            "relationship_conflicts": [],
             "allowed_relationship_scopes": projection["relationship_scopes"],
             "relationship_id_count": len(projection["relationship_ids"]),
             "entity_id_count": len(projection["entity_ids"]),
@@ -4163,6 +4160,11 @@ async def orchestrate_chat(
             "relationship_scope_count": mandatory_policy.relationship_trace.get(
                 "relationship_scope_count",
                 0,
+            ),
+            "relationship_scope_projection": (
+                mandatory_policy.containment_policy.get("relationship_scope_projection")
+                if isinstance(mandatory_policy.containment_policy, dict)
+                else None
             ),
             "neutral_persistence_classification": (
                 "applied" if turn_policy_metadata is not None else "omitted"

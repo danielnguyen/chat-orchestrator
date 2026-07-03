@@ -661,6 +661,10 @@ retrieval_log_count() {
   compose logs --no-color bms 2>/dev/null | awk '/POST \/v2\/conversations\/.*\/retrieve/ {count += 1} END {print count + 0}'
 }
 
+relationship_select_log_count() {
+  compose logs --no-color runtime 2>/dev/null | awk '/POST \/v1\/relationships\/select/ {count += 1} END {print count + 0}'
+}
+
 wait_retrieval_log_delta() {
   local before="$1" expected="$2" label="$3" current delta
   for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -678,6 +682,75 @@ wait_retrieval_log_delta() {
     exit 1
   fi
   echo "$current"
+}
+
+wait_relationship_select_log_delta() {
+  local before="$1" expected="$2" label="$3" current delta
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    current="$(relationship_select_log_count)"
+    delta=$((current - before))
+    if [ "$delta" -ge "$expected" ]; then
+      break
+    fi
+    sleep 0.25
+  done
+  current="$(relationship_select_log_count)"
+  delta=$((current - before))
+  if [ "$delta" -ne "$expected" ]; then
+    echo "wave3b-composed-smoke assertion failed: $label expected_relationship_select_delta=$expected actual_relationship_select_delta=$delta" >&2
+    exit 1
+  fi
+  echo "$current"
+}
+
+assert_relationship_select_before_bms_retrieve() {
+  local relationship_before="$1" retrieval_before="$2" label="$3" log_file
+  log_file="$(mktemp)"
+  compose logs --no-color --timestamps runtime bms >"$log_file" 2>/dev/null
+  if ! python3 - "$log_file" "$relationship_before" "$retrieval_before" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()
+relationship_before = int(sys.argv[2])
+retrieval_before = int(sys.argv[3])
+relationship_seen = 0
+retrieval_seen = 0
+relationship_index = None
+retrieval_index = None
+relationship_timestamp = None
+retrieval_timestamp = None
+timestamp_pattern = re.compile(r"(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)")
+
+for index, line in enumerate(lines):
+    if re.search(r"POST /v1/relationships/select", line):
+        relationship_seen += 1
+        if relationship_seen > relationship_before and relationship_index is None:
+            relationship_index = index
+            match = timestamp_pattern.search(line)
+            relationship_timestamp = match.group(1) if match else None
+    if re.search(r"POST /v2/conversations/.*/retrieve", line):
+        retrieval_seen += 1
+        if retrieval_seen > retrieval_before and retrieval_index is None:
+            retrieval_index = index
+            match = timestamp_pattern.search(line)
+            retrieval_timestamp = match.group(1) if match else None
+
+if relationship_index is None or retrieval_index is None:
+    raise SystemExit(1)
+if relationship_timestamp and retrieval_timestamp:
+    if relationship_timestamp >= retrieval_timestamp:
+        raise SystemExit(1)
+elif relationship_index >= retrieval_index:
+    raise SystemExit(1)
+PY
+  then
+    rm -f "$log_file"
+    echo "wave3b-composed-smoke assertion failed: $label relationship selection did not precede BMS retrieve in service logs" >&2
+    exit 1
+  fi
+  rm -f "$log_file"
 }
 
 qdrant_message_scores() {
@@ -959,6 +1032,19 @@ mark_acceptance() {
 }
 
 focused_packet_label() {
+  if [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 2 ]; then
+    local has_relationship=false has_restraint=false scenario
+    for scenario in "${selected_scenarios[@]}"; do
+      case "$scenario" in
+        relationship) has_relationship=true ;;
+        restraint) has_restraint=true ;;
+      esac
+    done
+    if [ "$has_relationship" = true ] && [ "$has_restraint" = true ]; then
+      echo "CO-3C"
+      return
+    fi
+  fi
   if [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 1 ] && [ "${selected_scenarios[0]}" = "shared_memory" ]; then
     echo "CO-3B"
   else
@@ -1058,6 +1144,11 @@ run_harness_selftest() {
   harness_only=false
   focused_composed_selected=true
   assert_packet_label_for_selection "CO-3B" "shared-memory"
+  selected_scenarios=(relationship restraint)
+  full_suite=false
+  harness_only=false
+  focused_composed_selected=true
+  assert_packet_label_for_selection "CO-3C" "relationship-restraint"
   selected_scenarios=("${saved_selected_scenarios[@]}")
   full_suite="$saved_full_suite"
   harness_only="$saved_harness_only"
@@ -1279,14 +1370,14 @@ relationship_entity_json() {
 }
 
 relationship_edge_json() {
-  local rel_id="$1" object_id="$2" status="${3:-active}" mentionability="${4:-use_for_filtering_only}" blocked_persona="${5:-}"
-  jq -nc --arg rel_id "$rel_id" --arg object_id "$object_id" --arg status "$status" --arg mentionability "$mentionability" --arg blocked "$blocked_persona" \
+  local rel_id="$1" object_id="$2" status="${3:-active}" mentionability="${4:-use_for_filtering_only}" blocked_persona="${5:-}" rel_type="${6:-documents}" rel_scope="${7:-project_context}"
+  jq -nc --arg rel_id "$rel_id" --arg object_id "$object_id" --arg status "$status" --arg mentionability "$mentionability" --arg blocked "$blocked_persona" --arg rel_type "$rel_type" --arg rel_scope "$rel_scope" \
     '{
       relationship_id:$rel_id,
       subject_entity_id:"project:wave3b",
-      relationship_type:"documents",
+      relationship_type:$rel_type,
       object_entity_id:$object_id,
-      relationship_scope:"project_context",
+      relationship_scope:$rel_scope,
       source_type:"trusted_config",
       source_refs_json:["config:wave3b"],
       confidence:0.9,
@@ -1305,68 +1396,119 @@ relationship_edge_json() {
 
 scenario_relationship_narrowing() {
   local scenario="relationship_narrowing_before_retrieval"
-  local owner="owner-wave3b-s2" eligible="W3B_REL_ELIGIBLE_7d1" excluded="W3B_REL_EXCLUDED_984"
-  local conv rel_good="rel_wave3b_good" rel_bad="rel_wave3b_bad" good_entity="repo:wave3b-good" bad_entity="repo:wave3b-bad"
+  local owner="owner-wave3b-s2" eligible="W3B_REL_ELIGIBLE_7d1" excluded="W3B_REL_EXCLUDED_984" unrelated="W3B_REL_UNRELATED_542"
+  local conv rel_good="rel_wave3b_good" rel_bad="rel_wave3b_bad" rel_unrelated="rel_wave3b_unrelated"
+  local good_entity="repo:wave3b-good" bad_entity="repo:wave3b-bad" unrelated_entity="repo:wave3b-unrelated"
   conv="$(resolve_conversation "$owner" "vscode" "wave3b relationship")"
   cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "project:wave3b" "Wave 3B Project")" '{request_id:"rid-wave3b-rel-project",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",entity:$entity}')" >/dev/null
   cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "$good_entity" "Wave 3B Good Repo" "repository")" '{request_id:"rid-wave3b-rel-good-entity",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",entity:$entity}')" >/dev/null
   cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "$bad_entity" "Wave 3B Bad Repo" "repository")" '{request_id:"rid-wave3b-rel-bad-entity",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",entity:$entity}')" >/dev/null
+  cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "$unrelated_entity" "Wave 3B Unrelated Repo" "repository" "personal_context")" '{request_id:"rid-wave3b-rel-unrelated-entity",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",entity:$entity}')" >/dev/null
   cr_post "/v1/relationships/edges/upsert" "$(jq -nc --arg owner "$owner" --argjson edge "$(relationship_edge_json "$rel_good" "$good_entity")" '{request_id:"rid-wave3b-rel-good",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",edge:$edge,evidence:[{evidence_type:"config_reference",source_ref:"config:wave3b",summary:"filtering-only relationship evidence",confidence_delta:0.1}]}')" >/dev/null
   cr_post "/v1/relationships/edges/upsert" "$(jq -nc --arg owner "$owner" --argjson edge "$(relationship_edge_json "$rel_bad" "$bad_entity" "active" "mentionable" "technical_architect")" '{request_id:"rid-wave3b-rel-bad",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",edge:$edge,evidence:[]}')" >/dev/null
+  cr_post "/v1/relationships/edges/upsert" "$(jq -nc --arg owner "$owner" --argjson edge "$(relationship_edge_json "$rel_unrelated" "$unrelated_entity" "active" "mentionable" "" "documents" "personal_context")" '{request_id:"rid-wave3b-rel-unrelated",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",edge:$edge,evidence:[]}')" >/dev/null
 
-  local good_policy bad_policy
+  local good_policy bad_policy unrelated_policy eligible_message_id excluded_message_id unrelated_message_id excluded_ids_json
   good_policy="$(policy_json "project" "medium" "" "$rel_good" "$good_entity" "project_context")"
   bad_policy="$(policy_json "project" "medium" "" "$rel_bad" "$bad_entity" "project_context")"
-  seed_message "$conv" "$owner" "vscode" "eligible relationship memory $eligible" "$good_policy" "{}" >/dev/null
-  seed_message "$conv" "$owner" "vscode" "excluded relationship memory $excluded" "$bad_policy" "{}" >/dev/null
-  provider_post "/fixture/sentinels" "$(jq -nc --arg eligible "$eligible" --arg excluded "$excluded" '{sentinels:{eligible_relationship:$eligible,excluded_relationship:$excluded}}')"
+  unrelated_policy="$(policy_json "project" "medium" "" "$rel_unrelated" "$unrelated_entity" "personal_context")"
+  eligible_message_id="$(seed_message "$conv" "$owner" "vscode" "eligible relationship memory $eligible" "$good_policy" "{}")"
+  excluded_message_id="$(seed_message "$conv" "$owner" "vscode" "excluded relationship memory $excluded" "$bad_policy" "{}")"
+  unrelated_message_id="$(seed_message "$conv" "$owner" "vscode" "unrelated relationship memory $unrelated" "$unrelated_policy" "{}")"
+  excluded_ids_json="$(jq -nc --arg excluded "$excluded_message_id" --arg unrelated "$unrelated_message_id" '[$excluded, $unrelated]')"
+  provider_post "/fixture/sentinels" "$(jq -nc --arg eligible "$eligible" --arg excluded "$excluded" --arg unrelated "$unrelated" '{sentinels:{eligible_relationship:$eligible,excluded_relationship:$excluded,unrelated_relationship:$unrelated}}')"
 
-  local before after response request_id trace calls cr_select
+  local relationship_before relationship_after before after response request_id trace calls
+  relationship_before="$(relationship_select_log_count)"
   before="$(retrieval_log_count)"
   response="$(co_chat "$owner" "vscode" "vscode" "$conv" "What from memory should be used for the selected project relationship?" "private" "desktop_private" "false")"
   request_id="$(jq -r '.request_id' <<<"$response")"
-  after="$(retrieval_log_count)"
-  test "$after" -gt "$before" || { echo "wave3b-composed-smoke assertion failed: relationship scenario did not cross BMS retrieve boundary" >&2; exit 1; }
+  relationship_after="$(wait_relationship_select_log_delta "$relationship_before" 1 "$scenario normal CO request CR relationship selection boundary")"
+  after="$(wait_retrieval_log_delta "$before" 1 "$scenario normal CO request BMS retrieval boundary")"
+  assert_relationship_select_before_bms_retrieve "$relationship_before" "$before" "$scenario normal CO request"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
-  cr_select="$(cr_post "/v1/relationships/select" "$(jq -nc --arg owner "$owner" '{request_id:"rid-wave3b-rel-select-proof",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",active_persona_id:"technical_architect",requested_scopes:["project_context"],relationship_types:["documents"]}')")"
-  if ! jq -e --arg rel "$rel_good" '.retrieval_scope_projection.relationship_ids == [$rel]' <<<"$cr_select" >/dev/null; then
-    echo "wave3b-composed-smoke assertion failed: $scenario CR selected only eligible relationship" >&2
-    exit 1
-  fi
-  assert_jq "$trace" '.retrieval.prompt_assembly.retrieval_dispatch.relationship_projection_applied == true and .retrieval.prompt_assembly.retrieval_dispatch.relationship_id_count == 1' "$scenario CO dispatched selected projection"
+  assert_jq_arg "$trace" rel "$rel_good" '.retrieval.prompt_assembly.relationship_context.relationship_edges_used == [$rel]' "$scenario CR selected only eligible relationship for CO request"
+  assert_jq_arg "$trace" rel "$rel_bad" '(.retrieval.prompt_assembly.relationship_context.relationship_edges_excluded // [] | index($rel)) != null and (.retrieval.prompt_assembly.relationship_context.relationship_exclusion_reasons[$rel] // "") != ""' "$scenario excluded relationship recorded with bounded reason"
+  assert_jq_arg "$trace" rel "$rel_unrelated" '(.retrieval.prompt_assembly.relationship_context.relationship_edges_used // [] | index($rel)) == null' "$scenario unrelated relationship not selected"
+  assert_jq_arg "$trace" rel "$rel_good" '.retrieval.prompt_assembly.retrieval_dispatch.relationship_projection_applied == true and .retrieval.prompt_assembly.retrieval_dispatch.relationship_id_count == 1 and .retrieval.prompt_assembly.retrieval_dispatch.entity_id_count == 2 and .retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_count == 1 and .retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_ids == [$rel]' "$scenario BMS request projection contains only eligible relationship"
+  assert_jq_arg "$trace" entity "$good_entity" '(.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.entity_ids // [] | index("project:wave3b")) != null and (.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.entity_ids // [] | index($entity)) != null and ((.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.entity_ids // []) | length) == 2' "$scenario BMS request projection contains only eligible entities"
+  assert_jq_arg "$trace" scope "project_context" '.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_scopes == [$scope]' "$scenario BMS request projection contains only project scope"
+  assert_jq_arg "$trace" rel "$rel_bad" '(.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_ids // [] | index($rel)) == null' "$scenario BMS request excludes blocked relationship"
+  assert_jq_arg "$trace" rel "$rel_unrelated" '(.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_ids // [] | index($rel)) == null' "$scenario BMS request excludes unrelated relationship"
+  assert_jq_arg "$trace" id "$eligible_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 1' "$scenario eligible relationship memory retained"
+  assert_jq_argjson "$trace" ids "$excluded_ids_json" '([.retrieval.bundle.semantic[]? | select(.message_id as $id | $ids | index($id))] | length) == 0' "$scenario excluded relationship memories absent from retained bundle"
   assert_provider_sentinel "$calls" "$request_id" "eligible_relationship" true "1"
   assert_provider_sentinel "$calls" "$request_id" "excluded_relationship" false "1"
-  assert_not_contains "$trace" "filtering-only relationship evidence" "relationship-evidence-text"
+  assert_provider_sentinel "$calls" "$request_id" "unrelated_relationship" false "1"
+  assert_not_contains "$response $trace $calls" "$excluded" "excluded-relationship-sentinel"
+  assert_not_contains "$response $trace $calls" "$unrelated" "unrelated-relationship-sentinel"
+  assert_ids_absent_from_json "$response" "$excluded_ids_json" "relationship-response-excluded-ids"
+  assert_ids_absent_from_json "$calls" "$excluded_ids_json" "relationship-provider-excluded-ids"
+  assert_ids_absent_from_json "$trace" "$excluded_ids_json" "relationship-trace-excluded-ids"
+  assert_not_contains "$calls" "filtering-only relationship evidence" "relationship-evidence-text"
 
   cr_post "/v1/relationships/edges/revoke" "$(jq -nc --arg owner "$owner" --arg rel "$rel_good" '{request_id:"rid-wave3b-rel-revoke",owner_id:$owner,conversation_id:"conv-rel",surface:"dev",relationship_id:$rel,evidence:{evidence_type:"user_confirmation",source_ref:"turn:wave3b",summary:"revoked",confidence_delta:0}}')" >/dev/null
-  local revoked_response revoked_request revoked_calls
+  local revoked_relationship_before revoked_relationship_after revoked_before revoked_after revoked_response revoked_request revoked_trace revoked_calls revoked_excluded_ids_json
+  revoked_excluded_ids_json="$(jq -nc --arg eligible "$eligible_message_id" --arg excluded "$excluded_message_id" --arg unrelated "$unrelated_message_id" '[$eligible, $excluded, $unrelated]')"
+  revoked_relationship_before="$(relationship_select_log_count)"
+  revoked_before="$(retrieval_log_count)"
   revoked_response="$(co_chat "$owner" "vscode" "vscode" "$conv" "What from memory should be used for the selected project relationship after revocation?" "private" "desktop_private" "false")"
   revoked_request="$(jq -r '.request_id' <<<"$revoked_response")"
+  revoked_relationship_after="$(wait_relationship_select_log_delta "$revoked_relationship_before" 1 "$scenario revoked CO request CR relationship selection boundary")"
+  revoked_after="$(wait_retrieval_log_delta "$revoked_before" 1 "$scenario revoked CO request BMS retrieval boundary")"
+  assert_relationship_select_before_bms_retrieve "$revoked_relationship_before" "$revoked_before" "$scenario revoked CO request"
+  revoked_trace="$(fetch_trace "$revoked_request")"
   revoked_calls="$(fetch_provider_calls "$revoked_request")"
+  assert_jq_arg "$revoked_trace" rel "$rel_good" '(.retrieval.prompt_assembly.relationship_context.relationship_edges_used // [] | index($rel)) == null and (.retrieval.prompt_assembly.relationship_context.relationship_edges_excluded // [] | index($rel)) != null' "$scenario revoked relationship no longer selected"
+  assert_jq "$revoked_trace" '.retrieval.prompt_assembly.retrieval_dispatch.relationship_projection_applied == false and .retrieval.prompt_assembly.retrieval_dispatch.relationship_id_count == 0 and .retrieval.prompt_assembly.retrieval_dispatch.entity_id_count == 0' "$scenario revoked request has no stale relationship projection"
+  assert_jq "$revoked_trace" '(.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_ids // []) == [] and (.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.entity_ids // []) == []' "$scenario BMS request has no revoked relationship projection"
   assert_provider_sentinel "$revoked_calls" "$revoked_request" "eligible_relationship" false "1"
+  assert_provider_sentinel "$revoked_calls" "$revoked_request" "excluded_relationship" false "1"
+  assert_provider_sentinel "$revoked_calls" "$revoked_request" "unrelated_relationship" false "1"
+  assert_not_contains "$revoked_response $revoked_trace $revoked_calls" "$eligible" "revoked-eligible-relationship-sentinel"
+  assert_not_contains "$revoked_response $revoked_trace $revoked_calls" "$excluded" "revoked-excluded-relationship-sentinel"
+  assert_not_contains "$revoked_response $revoked_trace $revoked_calls" "$unrelated" "revoked-unrelated-relationship-sentinel"
+  assert_ids_absent_from_json "$revoked_response" "$revoked_excluded_ids_json" "revoked-relationship-response-ids"
+  assert_ids_absent_from_json "$revoked_calls" "$revoked_excluded_ids_json" "revoked-relationship-provider-ids"
+  assert_ids_absent_from_json "$revoked_trace" "$revoked_excluded_ids_json" "revoked-relationship-trace-ids"
 
-  record_scenario "$scenario" "A4 assertions passed"
+  record_scenario "$scenario" "A4 assertions passed with CR select deltas normal=$((relationship_after - relationship_before)) revoked=$((revoked_relationship_after - revoked_relationship_before)), BMS retrieve deltas normal=$((after - before)) revoked=$((revoked_after - revoked_before)), eligible_relationship=$rel_good, excluded_relationship=$rel_bad, unrelated_relationship=$rel_unrelated"
   mark_acceptance "A4" "$scenario"
 }
 
 scenario_restraint_zero_call() {
   local scenario="restraint_zero_call_boundary"
-  local owner="owner-wave3b-s3" conv before after response request_id trace control_before control_after control_response
+  local owner="owner-wave3b-s3" conv policy before after response request_id trace calls control_before control_after control_response control_request control_trace current_turn suppressed_policy suppressed_domains suppressed_reasons control_policy memory_sentinel="W3B_RESTRAINT_MEMORY_4aa"
   conv="$(resolve_conversation "$owner" "web" "wave3b restraint")"
+  policy="$(policy_json "general" "medium")"
+  seed_message "$conv" "$owner" "web" "restraint seeded memory $memory_sentinel" "$policy" "{}" >/dev/null
+  provider_post "/fixture/sentinels" "$(jq -nc --arg memory "$memory_sentinel" '{sentinels:{restraint_memory:$memory}}')"
   before="$(retrieval_log_count)"
-  response="$(co_chat "$owner" "web" "web" "$conv" "Give a short current-turn answer without using memory." "private" "desktop_private" "false")"
+  current_turn="What does this function do?"
+  response="$(co_chat "$owner" "web" "web" "$conv" "$current_turn" "private" "desktop_private" "false")"
   request_id="$(jq -r '.request_id' <<<"$response")"
-  after="$(retrieval_log_count)"
-  test "$after" = "$before" || { echo "wave3b-composed-smoke assertion failed: restraint request reached BMS retrieve boundary" >&2; exit 1; }
+  after="$(wait_retrieval_log_delta "$before" 0 "$scenario suppressed request BMS retrieval boundary")"
   trace="$(fetch_trace "$request_id")"
-  assert_jq "$trace" '.retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_suppressed == true and .retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued == false' "$scenario suppressed trace"
+  calls="$(fetch_provider_calls "$request_id")"
+  assert_jq "$trace" '.retrieval.prompt_assembly.restraint.retrieval_suppressed == true and (.retrieval.prompt_assembly.restraint.reason_summary // [] | index("retrieval_not_requested")) != null and (.retrieval.prompt_assembly.restraint.domains // [] | index("retrieval")) != null and .retrieval.prompt_assembly.restraint.restraint_policy != "ask_clarifying_question"' "$scenario actual CR retrieval_suppressed restraint contract enforced"
+  assert_jq "$trace" '.retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_suppressed == true and .retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued == false and .retrieval.prompt_assembly.retrieval_dispatch.suppression_or_dependency_reason == "retrieval_suppressed_true"' "$scenario suppressed trace"
+  assert_jq "$trace" '([.retrieval.bundle.semantic[]?] | length) == 0 and ([.retrieval.bundle.artifact_refs[]?] | length) == 0 and ((.sources // []) | length) == 0' "$scenario suppressed trace has no retained memory or sources"
+  assert_provider_chat_calls "$calls" "$request_id" "1"
+  assert_jq_arg "$calls" turn "$current_turn" '[.calls[]? | select(.kind == "chat") | .normalized_messages[]? | select(.role == "user") | (.content // "") | contains($turn)] | any' "$scenario provider receives current turn"
+  assert_provider_sentinel "$calls" "$request_id" "restraint_memory" false "1"
   control_before="$(retrieval_log_count)"
   control_response="$(co_chat "$owner" "web" "web" "$conv" "What from memory is relevant?" "private" "desktop_private" "false")"
-  control_after="$(retrieval_log_count)"
-  test $((control_after - control_before)) -eq 1 || { echo "wave3b-composed-smoke assertion failed: explicit memory control did not issue exactly one BMS retrieval" >&2; exit 1; }
-  assert_jq "$(fetch_trace "$(jq -r '.request_id' <<<"$control_response")")" '.retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued == true' "$scenario control issued"
-  record_scenario "$scenario" "A5 assertions passed"
+  control_request="$(jq -r '.request_id' <<<"$control_response")"
+  control_after="$(wait_retrieval_log_delta "$control_before" 1 "$scenario explicit memory control BMS retrieval boundary")"
+  control_trace="$(fetch_trace "$control_request")"
+  assert_jq "$control_trace" '.retrieval.prompt_assembly.restraint.restraint_policy != "ask_clarifying_question" and .retrieval.prompt_assembly.restraint.retrieval_suppressed == false' "$scenario control restraint allows retrieval"
+  assert_jq "$control_trace" '.retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued == true and .retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_suppressed == false' "$scenario control issued"
+  suppressed_policy="$(jq -r '.retrieval.prompt_assembly.restraint.restraint_policy' <<<"$trace")"
+  suppressed_domains="$(jq -c '.retrieval.prompt_assembly.restraint.domains // []' <<<"$trace")"
+  suppressed_reasons="$(jq -c '.retrieval.prompt_assembly.restraint.reason_summary // []' <<<"$trace")"
+  control_policy="$(jq -r '.retrieval.prompt_assembly.restraint.restraint_policy' <<<"$control_trace")"
+  record_scenario "$scenario" "A5 assertions passed with suppressed_bms_delta=$((after - before)) suppressed_policy=$suppressed_policy suppressed_domains=$suppressed_domains suppressed_reasons=$suppressed_reasons and control_bms_delta=$((control_after - control_before)) control_policy=$control_policy"
   mark_acceptance "A5" "$scenario"
 }
 
