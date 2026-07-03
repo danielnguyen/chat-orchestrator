@@ -200,3 +200,53 @@ def test_wave3b_prerequisites_are_checked_before_docker_startup():
     assert source.index("merge-base --is-ancestor \"$CR_REQUIRED_COMMIT\" HEAD") < source.index(
         "compose up"
     )
+
+
+def test_wave3b_shared_memory_uses_three_distinct_personas_and_storage_checks():
+    source = _script()
+    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    assert 'persona_a="general_assistant"' in scenario
+    assert 'persona_b="technical_architect"' in scenario
+    assert 'persona_c="personal_companion"' in scenario
+    assert "assert_distinct_personas" in scenario
+    assert "ensure_cr_surface_binding" in scenario
+    assert "cr_storage_match_count" in scenario
+    assert "bms_persona_overlay_match_count" in scenario
+    assert "bms_canonical_message_count" in scenario
+    assert "canonical fact duplicated in BMS messages" in scenario
+
+
+def test_wave3b_shared_memory_message_crowding_has_score_and_boundary_evidence():
+    source = _script()
+    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    assert 'effective_limit=3' in scenario
+    assert 'crowd_size=$((crowd_size + 3))' in scenario
+    assert 'json_vector_for_score "$query_vector" "0.62"' in scenario
+    assert 'json_vector_for_score "$query_vector" "0.98"' in scenario
+    assert "assert_score_ordering" in scenario
+    assert "pre_limit_policy_filter_applied == true" in scenario
+    assert "mandatory_policy_filter_applied == true" in scenario
+    assert "semantic_candidates" in scenario
+    assert 'index("mandatory_containment_applied")' in scenario
+    assert "exact canonical retained from BMS response" in scenario
+    assert "no decoy retained from BMS response" in scenario
+
+
+def test_wave3b_shared_memory_focused_acceptance_is_partial_not_final():
+    source = _script()
+    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    assert 'mark_acceptance "A1"' in scenario
+    assert 'mark_acceptance "A2"' in scenario
+    assert 'mark_acceptance "A3"' in scenario
+    assert 'mark_acceptance "A7_message"' in scenario
+    for row in ("A4", "A5", "A6", "A7_artifact", "A8", "A9"):
+        assert f'mark_acceptance "{row}"' not in scenario
+
+
+def test_wave3b_shared_memory_denial_does_not_reuse_authorized_personas():
+    source = _script()
+    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    assert '"$unauthorized_surface" "$unauthorized_surface" "$conv_unauthorized"' in scenario
+    assert "third persona surface" in scenario
+    assert "unauthorized persona cannot retain canonical" in scenario
+    assert '"web" "$conv_unauthorized"' not in scenario

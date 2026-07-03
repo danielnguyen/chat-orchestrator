@@ -230,6 +230,15 @@ bms_post() {
     -d "$2"
 }
 
+bms_retrieve_bundle() {
+  local conversation="$1" request_id="$2" body="$3"
+  curl_json "BMS POST retrieve bundle" -X POST "http://127.0.0.1:14321/v2/conversations/$conversation/retrieve" \
+    -H "X-API-Key: smoke-memory-key" \
+    -H "X-Request-ID: $request_id" \
+    -H "Content-Type: application/json" \
+    -d "$body"
+}
+
 cr_post() {
   curl_json "CR POST $1" -X POST "http://127.0.0.1:14371$1" \
     -H "Content-Type: application/json" \
@@ -305,6 +314,42 @@ print(json.dumps([1.0] + [0.0] * 1535))
 PY
 }
 
+provider_embedding_vector() {
+  local text="$1"
+  curl_json "provider embeddings fixture vector" -X POST "http://127.0.0.1:14381/v1/embeddings" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg text "$text" '{input:$text,model:"fixture-embedding"}')" \
+    | jq -c '.data[0].embedding'
+}
+
+json_vector_for_score() {
+  local query_vector="$1" score="$2"
+  python3 - "$query_vector" "$score" <<'PY'
+import json
+import math
+import sys
+
+q = [float(value) for value in json.loads(sys.argv[1])]
+score = float(sys.argv[2])
+norm = math.sqrt(sum(value * value for value in q))
+if norm <= 0:
+    raise SystemExit("query vector has zero norm")
+q = [value / norm for value in q]
+basis_index = min(range(len(q)), key=lambda index: abs(q[index]))
+basis = [0.0] * len(q)
+basis[basis_index] = 1.0
+dot = sum(a * b for a, b in zip(q, basis))
+u = [b - dot * a for a, b in zip(q, basis)]
+u_norm = math.sqrt(sum(value * value for value in u))
+if u_norm <= 0:
+    raise SystemExit("orthogonal vector unavailable")
+u = [value / u_norm for value in u]
+orthogonal_weight = math.sqrt(max(0.0, 1.0 - score * score))
+vector = [score * a + orthogonal_weight * b for a, b in zip(q, u)]
+print(json.dumps(vector, separators=(",", ":")))
+PY
+}
+
 ensure_qdrant_collection() {
   curl_json "Qdrant ensure messages collection" -X PUT "http://127.0.0.1:14391/collections/messages" \
     -H "Content-Type: application/json" \
@@ -337,6 +382,24 @@ policy_json() {
     } + (if $content_class == "" then {} else {content_class:$content_class} end)'
 }
 
+mandatory_message_policy_json() {
+  local domain="$1"
+  jq -nc --arg domain "$domain" '{
+    enforcement_mode:"mandatory",
+    allowed_memory_domains:[$domain],
+    blocked_memory_domains:[],
+    artifact_access_policy:{
+      enforcement_mode:"mandatory",
+      allowed_content_classes:["document","code"],
+      allowed_domains:[$domain],
+      maximum_sensitivity:"medium",
+      surface_content_capabilities:["document","code"],
+      reason_codes:["artifact_policy_applied"]
+    },
+    relationship_scope_projection:null
+  }'
+}
+
 add_message() {
   local conversation="$1" owner="$2" client="$3" role="$4" content="$5" policy="$6" metadata="${7-}"
   if [ -z "$metadata" ]; then
@@ -355,9 +418,10 @@ add_message() {
 }
 
 qdrant_upsert_message() {
-  local message_id="$1" owner="$2" conversation="$3" client="$4" role="$5" policy="$6"
-  local vector
-  vector="$(json_vector)"
+  local message_id="$1" owner="$2" conversation="$3" client="$4" role="$5" policy="$6" vector="${7-}"
+  if [ -z "$vector" ]; then
+    vector="$(json_vector)"
+  fi
   jq -nc \
     --arg id "$message_id" \
     --arg owner "$owner" \
@@ -408,9 +472,10 @@ add_message_untrusted() {
 }
 
 qdrant_upsert_message_untrusted() {
-  local message_id="$1" owner="$2" conversation="$3" client="$4" role="$5"
-  local vector
-  vector="$(json_vector)"
+  local message_id="$1" owner="$2" conversation="$3" client="$4" role="$5" vector="${6-}"
+  if [ -z "$vector" ]; then
+    vector="$(json_vector)"
+  fi
   jq -nc \
     --arg id "$message_id" \
     --arg owner "$owner" \
@@ -440,20 +505,20 @@ qdrant_upsert_message_untrusted() {
 }
 
 seed_untrusted_message() {
-  local conversation="$1" owner="$2" client="$3" content="$4" metadata="${5-}" message_id
+  local conversation="$1" owner="$2" client="$3" content="$4" metadata="${5-}" vector="${6-}" message_id
   message_id="$(add_message_untrusted "$conversation" "$owner" "$client" "assistant" "$content" "$metadata")"
-  qdrant_upsert_message_untrusted "$message_id" "$owner" "$conversation" "$client" "assistant"
+  qdrant_upsert_message_untrusted "$message_id" "$owner" "$conversation" "$client" "assistant" "$vector"
   echo "$message_id"
 }
 
 seed_message() {
-  local conversation="$1" owner="$2" client="$3" content="$4" policy="$5" metadata="${6-}"
+  local conversation="$1" owner="$2" client="$3" content="$4" policy="$5" metadata="${6-}" vector="${7-}"
   if [ -z "$metadata" ]; then
     metadata="{}"
   fi
   local message_id
   message_id="$(add_message "$conversation" "$owner" "$client" "assistant" "$content" "$policy" "$metadata")"
-  qdrant_upsert_message "$message_id" "$owner" "$conversation" "$client" "assistant" "$policy"
+  qdrant_upsert_message "$message_id" "$owner" "$conversation" "$client" "assistant" "$policy" "$vector"
   echo "$message_id"
 }
 
@@ -548,6 +613,22 @@ retrieval_log_count() {
   compose logs --no-color bms 2>/dev/null | awk '/POST \/v2\/conversations\/.*\/retrieve/ {count += 1} END {print count + 0}'
 }
 
+qdrant_message_scores() {
+  local owner="$1" query_vector="$2" limit="${3:-32}"
+  curl_json "Qdrant message score evidence" -X POST "http://127.0.0.1:14391/collections/messages/points/search" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc \
+      --arg owner "$owner" \
+      --argjson vector "$query_vector" \
+      --argjson limit "$limit" \
+      '{
+        vector:$vector,
+        limit:$limit,
+        with_payload:true,
+        filter:{must:[{key:"owner_id",match:{value:$owner}}]}
+      }')"
+}
+
 cr_storage_match_count() {
   local needle="$1"
   compose exec -T runtime python -c '
@@ -584,9 +665,82 @@ print(count)
 ' "$needle"
 }
 
+bms_persona_overlay_match_count() {
+  local owner="$1" needle="$2"
+  psql_value -c "SELECT count(*) FROM persona_overlays WHERE owner_id='$owner' AND (persona_json::text LIKE '%$needle%' OR COALESCE(policy_metadata::text, '') LIKE '%$needle%');"
+}
+
+bms_canonical_message_count() {
+  local owner="$1" needle="$2"
+  psql_value -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND content LIKE '%$needle%';"
+}
+
+ensure_cr_surface_binding() {
+  local surface="$1" surface_type="$2" display_name="$3" persona_id="$4"
+  if ! compose exec -T runtime python - "$surface" "$surface_type" "$display_name" "$persona_id" <<'PY'
+from datetime import UTC, datetime
+import sys
+
+from services.companion_contracts import companion_contracts_repository
+
+surface, surface_type, display_name, persona_id = sys.argv[1:5]
+repo = companion_contracts_repository()
+now = datetime.now(UTC).isoformat()
+with repo._connect() as conn:
+    if repo.persona_profile(persona_id) is None:
+        raise SystemExit("unknown persona fixture")
+    conn.execute(
+        """
+        INSERT INTO surface_bindings (
+            surface_id, surface_type, surface_display_name, default_persona_id,
+            allow_user_persona_override, response_length, default_mode,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+        ON CONFLICT(surface_id) DO UPDATE SET
+            surface_type = excluded.surface_type,
+            surface_display_name = excluded.surface_display_name,
+            default_persona_id = excluded.default_persona_id,
+            allow_user_persona_override = excluded.allow_user_persona_override,
+            response_length = excluded.response_length,
+            default_mode = excluded.default_mode,
+            updated_at = excluded.updated_at;
+        """,
+        (surface, surface_type, display_name, persona_id, "concise", "general", now, now),
+    )
+PY
+  then
+    echo "wave3b-composed-smoke fixture failed: cr-surface-binding-$surface" >&2
+    exit 1
+  fi
+}
+
 assert_jq() {
   local json="$1" filter="$2" label="$3"
   if ! jq -e "$filter" <<<"$json" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: $label" >&2
+    exit 1
+  fi
+}
+
+assert_jq_arg() {
+  local json="$1" arg_name="$2" arg_value="$3" filter="$4" label="$5"
+  if ! jq -e --arg "$arg_name" "$arg_value" "$filter" <<<"$json" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: $label" >&2
+    exit 1
+  fi
+}
+
+assert_jq_argjson() {
+  local json="$1" arg_name="$2" arg_value="$3" filter="$4" label="$5"
+  if ! jq -e --argjson "$arg_name" "$arg_value" "$filter" <<<"$json" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: $label" >&2
+    exit 1
+  fi
+}
+
+assert_jq_two_argjson() {
+  local json="$1" first_name="$2" first_value="$3" second_name="$4" second_value="$5" filter="$6" label="$7"
+  if ! jq -e --argjson "$first_name" "$first_value" --argjson "$second_name" "$second_value" "$filter" <<<"$json" >/dev/null; then
     echo "wave3b-composed-smoke assertion failed: $label" >&2
     exit 1
   fi
@@ -625,6 +779,37 @@ assert_provider_sentinel() {
     | ($matches | length > 0) and ($matches | all)' \
     <<<"$calls" >/dev/null; then
     echo "wave3b-composed-smoke assertion failed: provider sentinel label=$label request_id=$request_id expected=$expected" >&2
+    exit 1
+  fi
+}
+
+assert_distinct_personas() {
+  local persona_a="$1" persona_b="$2" persona_c="$3" label="$4"
+  if [ "$persona_a" = "$persona_b" ] || [ "$persona_a" = "$persona_c" ] || [ "$persona_b" = "$persona_c" ]; then
+    echo "wave3b-composed-smoke assertion failed: personas not distinct label=$label" >&2
+    exit 1
+  fi
+}
+
+assert_score_ordering() {
+  local score_json="$1" canonical_id="$2" decoy_ids_json="$3" min_decoys="$4" label="$5"
+  if ! jq -e \
+    --arg canonical "$canonical_id" \
+    --argjson decoys "$decoy_ids_json" \
+    --argjson min_decoys "$min_decoys" \
+    '
+      (.result | type == "array")
+      and ([.result[] | select(.payload.message_id == $canonical)] | length == 1)
+      and (
+        [.result[] | select(.payload.message_id as $id | $decoys | index($id))]
+        | length >= $min_decoys
+      )
+      and (
+        ([.result[] | select(.payload.message_id == $canonical)][0].score) as $canonical_score
+        | ([.result[] | select(.payload.message_id as $id | $decoys | index($id)) | select(.score > $canonical_score)] | length) >= $min_decoys
+      )
+    ' <<<"$score_json" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: score ordering label=$label" >&2
     exit 1
   fi
 }
@@ -753,17 +938,42 @@ provider_post "/fixture/reset"
 scenario_shared_memory() {
   local scenario="shared_canonical_memory_prelimit_filtering"
   local owner="owner-wave3b-s1" canonical="W3B_CANONICAL_FACT_ALPHA_7fd51" decoy="W3B_DECOY_PRIVATE_90cb2"
+  local persona_a="general_assistant" persona_b="technical_architect" persona_c="personal_companion"
+  local unauthorized_surface="wave3b-personal"
   local conv_general conv_authorized conv_unauthorized write_response request_id trace calls metadata_row qpayload
+  local allowed_policy blocked_policy outside_policy decoy_conv read_query query_vector canonical_vector decoy_vector
+  local canonical_message_id canonical_count decoy_ids_json score_evidence crowd_size effective_limit
+  assert_distinct_personas "$persona_a" "$persona_b" "$persona_c" "$scenario"
+  ensure_cr_surface_binding "$unauthorized_surface" "private_app" "Wave 3B Personal Fixture" "$persona_c"
   conv_general="$(resolve_conversation "$owner" "web" "wave3b general write")"
   conv_authorized="$(resolve_conversation "$owner" "vscode" "wave3b technical read")"
-  conv_unauthorized="$(resolve_conversation "$owner" "web" "wave3b general excluded read")"
+  conv_unauthorized="$(resolve_conversation "$owner" "$unauthorized_surface" "wave3b personal excluded read")"
   provider_post "/fixture/sentinels" "$(jq -nc --arg canonical "$canonical" --arg decoy "$decoy" '{sentinels:{canonical:$canonical,decoy:$decoy}}')"
+
+  allowed_policy="$(policy_json "project" "medium")"
+  blocked_policy="$(policy_json "finance" "medium")"
+  outside_policy="$(policy_json "personal" "medium")"
+  read_query="Bring in project context from memory. What is the saved durable fact?"
+  query_vector="$(provider_embedding_vector "$read_query")"
+  canonical_vector="$(json_vector_for_score "$query_vector" "0.62")"
+  decoy_vector="$(json_vector_for_score "$query_vector" "0.98")"
 
   write_response="$(co_chat "$owner" "web" "web" "$conv_general" "Remember this project fact for later: $canonical" "private" "desktop_private" "false")"
   request_id="$(jq -r '.request_id' <<<"$write_response")"
   trace="$(fetch_trace "$request_id")"
+  assert_jq_arg "$trace" persona "$persona_a" '.retrieval.prompt_assembly.runtime_identity.active_persona_id == $persona and .retrieval.prompt_assembly.persona_containment.active_persona_id == $persona' "$scenario general assistant surface persona"
   assert_jq "$trace" '.retrieval.prompt_assembly.retrieval_dispatch.neutral_persistence_classification == "applied"' "$scenario neutral persistence applied"
-  metadata_row="$(psql_value -c "SELECT policy_metadata::text FROM messages WHERE owner_id='$owner' AND content LIKE '%$canonical%' ORDER BY created_at DESC LIMIT 1;")"
+  canonical_message_id="$(psql_value -c "SELECT id FROM messages WHERE owner_id='$owner' AND content LIKE '%$canonical%' ORDER BY created_at DESC LIMIT 1;")"
+  test -n "$canonical_message_id" || {
+    echo "wave3b-composed-smoke assertion failed: $scenario canonical message persisted" >&2
+    exit 1
+  }
+  canonical_count="$(bms_canonical_message_count "$owner" "$canonical")"
+  if [ "$canonical_count" != "1" ]; then
+    echo "wave3b-composed-smoke assertion failed: $scenario canonical fact duplicated in BMS messages" >&2
+    exit 1
+  fi
+  metadata_row="$(psql_value -c "SELECT policy_metadata::text FROM messages WHERE id='$canonical_message_id';")"
   case "$metadata_row" in
     *active_persona_id*|*persona_owner*|*persona_id*)
       echo "wave3b-composed-smoke assertion failed: canonical fact stored persona ownership" >&2
@@ -777,44 +987,104 @@ scenario_shared_memory() {
       exit 1
       ;;
   esac
-  qpayload="$(curl_json "Qdrant scroll canonical" -X POST "http://127.0.0.1:14391/collections/messages/points/scroll" -H "Content-Type: application/json" -d "$(jq -nc --arg owner "$owner" '{filter:{must:[{key:"owner_id",match:{value:$owner}}]},with_payload:true,limit:64}')")"
-  assert_jq "$qpayload" '.result.points | length > 0' "$scenario canonical indexed"
+  case "$metadata_row" in
+    *project*) ;;
+    *)
+      echo "wave3b-composed-smoke assertion failed: canonical fact missing project-domain policy metadata" >&2
+      exit 1
+      ;;
+  esac
+  qdrant_upsert_message "$canonical_message_id" "$owner" "$conv_general" "web" "user" "$allowed_policy" "$canonical_vector"
+  qpayload="$(curl_json "Qdrant scroll canonical" -X POST "http://127.0.0.1:14391/collections/messages/points/scroll" -H "Content-Type: application/json" -d "$(jq -nc --arg id "$canonical_message_id" '{filter:{must:[{key:"message_id",match:{value:$id}}]},with_payload:true,limit:8}')")"
+  assert_jq_arg "$qpayload" id "$canonical_message_id" '.result.points | map(select(.payload.message_id == $id and .payload.retrieval_policy_valid == true and (.payload.memory_domains | index("project")))) | length == 1' "$scenario canonical indexed with trusted neutral policy"
 
-  local allowed_policy blocked_policy outside_policy decoy_conv
-  allowed_policy="$(policy_json "project" "medium")"
-  blocked_policy="$(policy_json "finance" "medium")"
-  outside_policy="$(policy_json "personal" "medium")"
   decoy_conv="$(resolve_conversation "$owner" "vscode" "wave3b decoys")"
+  decoy_ids_json='[]'
+  effective_limit=3
+  crowd_size=0
   for i in 1 2 3 4; do
-    seed_message "$decoy_conv" "$owner" "vscode" "higher score blocked decoy $i $decoy" "$blocked_policy" "{}" >/dev/null
-    seed_untrusted_message "$decoy_conv" "$owner" "vscode" "higher score spoof metadata decoy $i $decoy" '{"memory_domains":["project"]}' >/dev/null
-    seed_message "$decoy_conv" "$owner" "vscode" "higher score outside decoy $i $decoy" "$outside_policy" "{}" >/dev/null
+    local blocked_id spoof_id outside_id
+    blocked_id="$(seed_message "$decoy_conv" "$owner" "vscode" "higher score blocked decoy $i $decoy" "$blocked_policy" "{}" "$decoy_vector")"
+    spoof_id="$(seed_untrusted_message "$decoy_conv" "$owner" "vscode" "higher score spoof metadata decoy $i $decoy" '{"memory_domains":["project"],"trusted_policy_metadata":false}' "$decoy_vector")"
+    outside_id="$(seed_message "$decoy_conv" "$owner" "vscode" "higher score outside decoy $i $decoy" "$outside_policy" "{}" "$decoy_vector")"
+    decoy_ids_json="$(jq -c --arg blocked "$blocked_id" --arg spoof "$spoof_id" --arg outside "$outside_id" '. + [$blocked, $spoof, $outside]' <<<"$decoy_ids_json")"
+    crowd_size=$((crowd_size + 3))
   done
+  if [ "$crowd_size" -le "$effective_limit" ]; then
+    echo "wave3b-composed-smoke assertion failed: $scenario ineligible crowd does not exceed effective limit" >&2
+    exit 1
+  fi
+  score_evidence="$(qdrant_message_scores "$owner" "$query_vector" 32)"
+  assert_score_ordering "$score_evidence" "$canonical_message_id" "$decoy_ids_json" "$crowd_size" "$scenario ineligible candidates score above canonical"
 
-  local read_response read_request read_trace read_calls public_json
-  read_response="$(co_chat "$owner" "vscode" "vscode" "$conv_authorized" "Bring in project context. What from memory is the saved project fact?" "private" "desktop_private" "false")"
+  local read_response read_request read_trace read_calls public_json direct_bms_request direct_bms_response
+  read_response="$(co_chat "$owner" "vscode" "vscode" "$conv_authorized" "$read_query" "private" "desktop_private" "false")"
   read_request="$(jq -r '.request_id' <<<"$read_response")"
   read_trace="$(fetch_trace "$read_request")"
   read_calls="$(fetch_provider_calls "$read_request")"
+  direct_bms_request="wave3b-direct-shared-memory"
+  direct_bms_response="$(bms_retrieve_bundle "$conv_authorized" "$direct_bms_request" "$(jq -nc \
+    --arg request_id "$direct_bms_request" \
+    --arg owner "$owner" \
+    --arg query "$read_query" \
+    --argjson policy "$(mandatory_message_policy_json "project")" \
+    '{
+      request_id:$request_id,
+      owner_id:$owner,
+      query:$query,
+      retrieval:{k:3,min_score:0,scope:"owner",time_window:"all",retrieval_mode:"balanced"},
+      include_artifacts:false,
+      containment_policy:$policy
+    }')")"
   public_json="$read_response $read_trace $read_calls"
   assert_not_contains "$public_json" "$decoy" "shared-memory-decoy"
+  assert_jq_arg "$read_trace" persona "$persona_b" '.retrieval.prompt_assembly.runtime_identity.active_persona_id == $persona and .retrieval.prompt_assembly.persona_containment.active_persona_id == $persona' "$scenario authorized technical persona"
   assert_provider_sentinel "$read_calls" "$read_request" "canonical" true "1"
   assert_provider_sentinel "$read_calls" "$read_request" "decoy" false "1"
+  if ! jq -e --argjson limit "$effective_limit" '
+    (
+      .bundle.retrieval_debug.containment_policy.pre_limit_policy_filter_applied == true
+      or .bundle.retrieval_debug.mandatory_policy_filter_applied == true
+    )
+    and ((.bundle.retrieval_debug.semantic_candidates // 0) <= $limit)
+    and ((.diagnostics.reason_codes // [] | index("mandatory_containment_applied")) != null)
+  ' <<<"$direct_bms_response" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: $scenario direct BMS pre-limit mandatory filtering before limiting" >&2
+    exit 1
+  fi
+  assert_jq_arg "$read_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 1' "$scenario exact canonical retained from BMS response"
+  assert_jq_argjson "$read_trace" decoys "$decoy_ids_json" '([.retrieval.bundle.semantic[]? | select(.message_id as $id | $decoys | index($id))] | length) == 0' "$scenario no decoy retained from BMS response"
+  assert_jq_arg "$read_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id) | .score] | first) < 0.9' "$scenario retained eligible is lower scoring"
+  assert_jq_argjson "$read_trace" limit "$effective_limit" '
+    ([.retrieval.bundle.semantic[]?] | length) <= $limit
+  ' "$scenario CO-retained mandatory filtering evidence"
   assert_jq "$read_trace" '(.retrieval.prompt_assembly.result_boundary.retained_counts.semantic // .retrieval.prompt_assembly.result_boundary.retained_semantic_count // 0) >= 1' "$scenario retained semantic evidence"
   assert_jq "$read_trace" '.retrieval.bundle.doctrine_summary.canonical_used == true and (.retrieval.bundle.doctrine_summary.reason_codes // [] | index("canonical_evidence_used"))' "$scenario canonical doctrine evidence"
   assert_jq "$read_trace" '(.retrieval.prompt_assembly.memory_hygiene.truth_selection.pre_cr_rejection_reasons.canonical_durable_status_invalid // 0) >= 1' "$scenario rejected untrusted decoys before prompt assembly"
 
   local denied_response denied_request denied_calls
-  denied_response="$(co_chat "$owner" "web" "web" "$conv_unauthorized" "What from memory is saved for my car maintenance?" "private" "desktop_private" "false")"
+  denied_response="$(co_chat "$owner" "$unauthorized_surface" "$unauthorized_surface" "$conv_unauthorized" "Use memory for this personal planning turn. What saved fact is relevant?" "private" "desktop_private" "false")"
   denied_request="$(jq -r '.request_id' <<<"$denied_response")"
+  local denied_trace
+  denied_trace="$(fetch_trace "$denied_request")"
   denied_calls="$(fetch_provider_calls "$denied_request")"
+  assert_jq_arg "$denied_trace" persona "$persona_c" '.retrieval.prompt_assembly.runtime_identity.active_persona_id == $persona and .retrieval.prompt_assembly.persona_containment.active_persona_id == $persona' "$scenario third persona surface"
   assert_provider_sentinel "$denied_calls" "$denied_request" "canonical" false "1"
+  assert_jq_arg "$denied_trace" id "$canonical_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 0' "$scenario unauthorized persona cannot retain canonical"
   if [ "$(cr_storage_match_count "$canonical")" != "0" ]; then
     echo "wave3b-composed-smoke assertion failed: $scenario canonical absent from CR runtime/profile storage" >&2
     exit 1
   fi
+  if [ "$(bms_persona_overlay_match_count "$owner" "$canonical")" != "0" ]; then
+    echo "wave3b-composed-smoke assertion failed: $scenario canonical absent from BMS persona overlays" >&2
+    exit 1
+  fi
+  if [ "$(bms_canonical_message_count "$owner" "$canonical")" != "1" ]; then
+    echo "wave3b-composed-smoke assertion failed: $scenario canonical fact copied in BMS messages" >&2
+    exit 1
+  fi
 
-  record_scenario "$scenario" "A1/A2/A3 and message A7 assertions passed"
+  record_scenario "$scenario" "CO-3B A1/A2/A3 and message A7 assertions passed with three distinct personas, BMS/Qdrant score evidence, and no CR/BMS persona-overlay copy"
   mark_acceptance "A1" "$scenario"
   mark_acceptance "A2" "$scenario"
   mark_acceptance "A3" "$scenario"
