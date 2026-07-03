@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -121,6 +122,57 @@ def test_wave3b_unknown_scenario_fails_before_topology_execution():
     assert result.returncode == 2
     assert "unknown scenario unknown-co3a" in result.stderr
     assert "compose up" not in result.stderr
+
+
+def _assert_invalid_selection_fails_before_topology(
+    *,
+    args: list[str],
+    env_value: str | None = None,
+    expected_token: str = "harness",
+):
+    env = os.environ.copy()
+    if env_value is not None:
+        env["WAVE3B_SCENARIOS"] = env_value
+    result = subprocess.run(
+        [str(SCRIPT), *args],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert "wave3b-composed-smoke usage error:" in result.stderr
+    assert expected_token in result.stderr
+    assert "compose up" not in result.stderr
+    assert "prerequisite" not in result.stderr
+    assert '"packet_ok"' not in result.stdout
+    assert '"ok"' not in result.stdout
+
+
+def test_wave3b_harness_artifact_selection_fails_before_topology():
+    _assert_invalid_selection_fails_before_topology(args=["--scenario", "harness,artifact"])
+
+
+def test_wave3b_artifact_harness_selection_fails_before_topology():
+    _assert_invalid_selection_fails_before_topology(args=["--scenario", "artifact,harness"])
+
+
+def test_wave3b_env_artifact_harness_selection_fails_before_topology():
+    _assert_invalid_selection_fails_before_topology(args=[], env_value="artifact,harness")
+
+
+def test_wave3b_duplicate_harness_selection_fails_before_topology():
+    _assert_invalid_selection_fails_before_topology(args=["--scenario", "harness,harness"])
+
+
+def test_wave3b_all_combination_selection_fails_order_independent_before_topology():
+    _assert_invalid_selection_fails_before_topology(
+        args=["--scenario", "all,artifact"], expected_token="all"
+    )
+    _assert_invalid_selection_fails_before_topology(
+        args=["--scenario", "artifact,all"], expected_token="all"
+    )
 
 
 def test_wave3b_topology_overlay_enables_required_flags_and_indexing():

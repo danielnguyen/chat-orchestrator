@@ -34,11 +34,16 @@ done
 selected_scenarios=()
 full_suite=false
 harness_only=false
+focused_composed_selected=false
 
 add_selected_scenario() {
   local name="$1"
   case "$name" in
     all)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ] || [ "$focused_composed_selected" = true ]; then
+        echo "wave3b-composed-smoke usage error: all cannot be combined with focused scenarios" >&2
+        exit 2
+      fi
       full_suite=true
       selected_scenarios=(
         shared_memory
@@ -50,25 +55,63 @@ add_selected_scenario() {
       )
       ;;
     harness)
+      if [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: duplicate scenario harness" >&2
+        exit 2
+      fi
+      if [ "$full_suite" = true ] || [ "$focused_composed_selected" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
       harness_only=true
       selected_scenarios=(harness)
       ;;
     shared_memory|shared-memory|shared_canonical_memory_prelimit_filtering)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness/all cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
+      focused_composed_selected=true
       selected_scenarios+=(shared_memory)
       ;;
     relationship|relationship-narrowing|relationship_narrowing_before_retrieval)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness/all cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
+      focused_composed_selected=true
       selected_scenarios+=(relationship)
       ;;
     restraint|restraint-zero-call|restraint_zero_call_boundary)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness/all cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
+      focused_composed_selected=true
       selected_scenarios+=(restraint)
       ;;
     artifact|artifact-policy|artifact_policy_prelimit_filtering)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness/all cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
+      focused_composed_selected=true
       selected_scenarios+=(artifact)
       ;;
     fallback|fallback-identity|fallback_identity)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness/all cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
+      focused_composed_selected=true
       selected_scenarios+=(fallback)
       ;;
     privacy|privacy-safe-diagnostics|privacy_safe_diagnostics)
+      if [ "$full_suite" = true ] || [ "$harness_only" = true ]; then
+        echo "wave3b-composed-smoke usage error: harness/all cannot be combined with composed scenarios" >&2
+        exit 2
+      fi
+      focused_composed_selected=true
       selected_scenarios+=(privacy)
       ;;
     "")
@@ -92,10 +135,6 @@ if [ "${#selected_scenarios[@]}" -eq 0 ]; then
 fi
 if [ "$harness_only" = true ] && [ "${#selected_scenarios[@]}" -ne 1 ]; then
   echo "wave3b-composed-smoke usage error: harness cannot be combined with composed scenarios" >&2
-  exit 2
-fi
-if [ "$full_suite" = true ] && [ "$REQUESTED_SCENARIOS" != "all" ]; then
-  echo "wave3b-composed-smoke usage error: all cannot be combined with focused scenarios" >&2
   exit 2
 fi
 
