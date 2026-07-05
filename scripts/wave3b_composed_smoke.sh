@@ -1528,11 +1528,11 @@ relationship_entity_json() {
 }
 
 relationship_edge_json() {
-  local rel_id="$1" object_id="$2" status="${3:-active}" mentionability="${4:-use_for_filtering_only}" blocked_persona="${5:-}" rel_type="${6:-documents}" rel_scope="${7:-project_context}"
-  jq -nc --arg rel_id "$rel_id" --arg object_id "$object_id" --arg status "$status" --arg mentionability "$mentionability" --arg blocked "$blocked_persona" --arg rel_type "$rel_type" --arg rel_scope "$rel_scope" \
+  local rel_id="$1" object_id="$2" status="${3:-active}" mentionability="${4:-use_for_filtering_only}" blocked_persona="${5:-}" rel_type="${6:-documents}" rel_scope="${7:-project_context}" subject_id="${8:-project:wave3b}"
+  jq -nc --arg rel_id "$rel_id" --arg object_id "$object_id" --arg status "$status" --arg mentionability "$mentionability" --arg blocked "$blocked_persona" --arg rel_type "$rel_type" --arg rel_scope "$rel_scope" --arg subject_id "$subject_id" \
     '{
       relationship_id:$rel_id,
-      subject_entity_id:"project:wave3b",
+      subject_entity_id:$subject_id,
       relationship_type:$rel_type,
       object_entity_id:$object_id,
       relationship_scope:$rel_scope,
@@ -1716,6 +1716,8 @@ scenario_artifact_policy() {
 
   eligible_code_artifact="${eligible_code_pair%%:*}"; eligible_code_derived="${eligible_code_pair#*:}"
   eligible_doc_artifact="${eligible_doc_pair%%:*}"; eligible_doc_derived="${eligible_doc_pair#*:}"
+  seed_active_memory_item_for_source_ref "$owner" "derived_text" "$eligible_code_derived" "artifact eligible code active lifecycle"
+  seed_active_memory_item_for_source_ref "$owner" "derived_text" "$eligible_doc_derived" "artifact eligible document active lifecycle"
   blocked_artifact="${blocked_pair%%:*}"; blocked_derived="${blocked_pair#*:}"
   outside_artifact="${outside_pair%%:*}"; outside_derived="${outside_pair#*:}"
   sensitive_artifact="${sensitive_pair%%:*}"; sensitive_derived="${sensitive_pair#*:}"
@@ -1984,16 +1986,17 @@ scenario_privacy_safe_diagnostics() {
   derived_id="${artifact_pair#*:}"
   seed_active_memory_item_for_source_ref "$owner" "derived_text" "$derived_id" "privacy active artifact lifecycle"
   psql_exec >/dev/null -c "UPDATE artifacts SET object_uri = 'https://storage.invalid/private/$url?token=$cred' WHERE id = '$artifact_id';"
+  local privacy_project_entity="project:wave3b-privacy"
   restricted_entity="repo:privacy-restricted"
   restricted_rel="rel_privacy_restricted"
-  cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "project:wave3b" "Wave 3B Project")" '{request_id:"rid-wave3b-privacy-project",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",entity:$entity}')" >/dev/null
+  cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "$privacy_project_entity" "Wave 3B Privacy Project")" '{request_id:"rid-wave3b-privacy-project",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",entity:$entity}')" >/dev/null
   cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "$restricted_entity" "Restricted privacy repo" "repository" "technical")" '{request_id:"rid-wave3b-privacy-entity",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",entity:$entity}')" >/dev/null
   relationship_fixture="$(jq -nc \
     --arg owner "$owner" \
     --arg rid "$restricted_rel" \
     --arg entity "$restricted_entity" \
     --arg relsent "$rel" \
-    --argjson edge "$(relationship_edge_json "$restricted_rel" "$restricted_entity" "active" "restricted" "" "references" "project_context")" \
+    --argjson edge "$(relationship_edge_json "$restricted_rel" "$restricted_entity" "active" "restricted" "" "references" "project_context" "$privacy_project_entity")" \
     '{request_id:"rid-wave3b-privacy-rel",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",edge:($edge + {relationship_id:$rid,object_entity_id:$entity,source_type:"explicit_user_confirmation",source_refs_json:[$relsent],sensitivity_level:"restricted"}),evidence:[{evidence_type:"user_confirmation",source_ref:$relsent,summary:$relsent,confidence_delta:0.1}]}')"
   assert_jq_arg "$relationship_fixture" sentinel "$rel" '.edge.source_refs_json == [$sentinel] and .evidence[0].source_ref == $sentinel and .evidence[0].summary == $sentinel' "$scenario restricted relationship fixture contains sentinel in source refs and evidence"
   cr_post "/v1/relationships/edges/upsert" "$relationship_fixture" >/dev/null

@@ -13,6 +13,20 @@ def _script() -> str:
     return SCRIPT.read_text(encoding="utf-8")
 
 
+def _shared_memory_scenario(source: str) -> str:
+    return source[
+        source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")
+    ]
+
+
+def _focused_packet_labeler(source: str) -> str:
+    return source[
+        source.index("focused_packet_label()") : source.index(
+            "assert_packet_label_for_selection()"
+        )
+    ]
+
+
 def test_wave3b_smoke_harness_has_no_generic_probe_or_prepassed_rows():
     source = _script()
     assert "run_boundary_probe" not in source
@@ -229,7 +243,7 @@ def test_wave3b_prerequisites_are_checked_before_docker_startup():
 
 def test_wave3b_shared_memory_uses_three_distinct_personas_and_storage_checks():
     source = _script()
-    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    scenario = _shared_memory_scenario(source)
     assert 'persona_a="general_assistant"' in scenario
     assert 'persona_b="technical_architect"' in scenario
     assert 'persona_c="personal_companion"' in scenario
@@ -243,7 +257,7 @@ def test_wave3b_shared_memory_uses_three_distinct_personas_and_storage_checks():
 
 def test_wave3b_shared_memory_message_crowding_has_score_and_boundary_evidence():
     source = _script()
-    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    scenario = _shared_memory_scenario(source)
     assert 'effective_limit=3' in scenario
     assert 'crowd_size=$((crowd_size + 4))' in scenario
     assert 'json_vector_for_score "$query_vector" "0.62"' in scenario
@@ -263,7 +277,7 @@ def test_wave3b_shared_memory_message_crowding_has_score_and_boundary_evidence()
 
 def test_wave3b_shared_memory_crowd_distinguishes_all_ineligible_groups():
     source = _script()
-    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    scenario = _shared_memory_scenario(source)
     assert "blocked_ids_json" in scenario
     assert "spoof_ids_json" in scenario
     assert "outside_ids_json" in scenario
@@ -279,7 +293,7 @@ def test_wave3b_shared_memory_crowd_distinguishes_all_ineligible_groups():
 
 def test_wave3b_shared_memory_checks_normal_co_boundary_before_direct_bms_probe():
     source = _script()
-    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    scenario = _shared_memory_scenario(source)
     normal_before = scenario.index('normal_retrieval_before="$(retrieval_log_count)"')
     normal_call = scenario.index('read_response="$(co_chat')
     normal_after = scenario.index('normal_retrieval_after="$(wait_retrieval_log_delta')
@@ -287,14 +301,17 @@ def test_wave3b_shared_memory_checks_normal_co_boundary_before_direct_bms_probe(
     direct_call = scenario.index('direct_bms_response="$(bms_retrieve_bundle')
     assert normal_before < normal_call < normal_after < demote_query < direct_call
     assert "normal CO request BMS retrieval boundary" in scenario
-    assert 'read_query="Bring in project context from memory. What is the saved durable fact?"' in scenario
+    assert (
+        'read_query="Bring in project context from memory. What is the saved durable fact?"'
+        in scenario
+    )
     assert "demoted_query_vector" in scenario
     assert "demote_current_turn_query_messages()" in source
 
 
 def test_wave3b_shared_memory_focused_acceptance_is_partial_not_final():
     source = _script()
-    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    scenario = _shared_memory_scenario(source)
     assert 'mark_acceptance "A1"' in scenario
     assert 'mark_acceptance "A2"' in scenario
     assert 'mark_acceptance "A3"' in scenario
@@ -305,7 +322,7 @@ def test_wave3b_shared_memory_focused_acceptance_is_partial_not_final():
 
 def test_wave3b_shared_memory_denial_does_not_reuse_authorized_personas():
     source = _script()
-    scenario = source[source.index("scenario_shared_memory()") : source.index("relationship_entity_json()")]
+    scenario = _shared_memory_scenario(source)
     assert '"$unauthorized_surface" "$unauthorized_surface" "$conv_unauthorized"' in scenario
     assert "third persona surface" in scenario
     assert "unauthorized persona cannot retain canonical" in scenario
@@ -415,8 +432,14 @@ def test_wave3b_artifact_scenario_ties_normal_co_provider_and_public_sources():
     assert ".artifact_access_policy.reason_codes" in scenario
     assert "eligible code artifact retained by CO" in scenario
     assert "eligible document artifact retained by CO" in scenario
-    assert 'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"' in scenario
-    assert 'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_doc" true "1"' in scenario
+    assert (
+        'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"'
+        in scenario
+    )
+    assert (
+        'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_doc" true "1"'
+        in scenario
+    )
     assert "artifact-provider-negative-artifact-ids" in scenario
     assert "assert_public_source_allowlist" in scenario
     assert "artifact-public-source-forbidden" in scenario
@@ -428,7 +451,7 @@ def test_wave3b_artifact_scenario_ties_normal_co_provider_and_public_sources():
 
 def test_wave3b_artifact_focused_label_is_co3d_only_for_artifact():
     source = _script()
-    labeler = source[source.index("focused_packet_label()") : source.index("assert_packet_label_for_selection()")]
+    labeler = _focused_packet_labeler(source)
     assert 'selected_scenarios[0]}" = "artifact"' in labeler
     assert 'echo "CO-3D"' in labeler
     assert 'selected_scenarios=(artifact)' in source
@@ -436,7 +459,7 @@ def test_wave3b_artifact_focused_label_is_co3d_only_for_artifact():
 
 def test_wave3b_fallback_privacy_focused_label_is_co3e_order_independent():
     source = _script()
-    labeler = source[source.index("focused_packet_label()") : source.index("assert_packet_label_for_selection()")]
+    labeler = _focused_packet_labeler(source)
     assert "has_fallback=false" in labeler
     assert "has_privacy=false" in labeler
     assert 'echo "CO-3E"' in labeler
