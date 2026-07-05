@@ -6,11 +6,33 @@ services:
       INDEX_USER_QUESTIONS: "true"
       INDEX_ASSISTANT_MESSAGES: "true"
 
+  bms-observer:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    command: ["uvicorn", "tools.wave3b_bms_observer:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      BMS_UPSTREAM_URL: http://bms:8000
+    ports:
+      - "14331:8000"
+    depends_on:
+      bms:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   orchestrator:
     environment:
+      MEMORY_STORE_BASE_URL: http://bms-observer:8000
       COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED: "true"
       COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED: "true"
       COGNITIVE_RUNTIME_RESTRAINT_ENABLED: "true"
       COGNITIVE_RUNTIME_PRIVACY_CONTEXT_ENABLED: "true"
       ENABLE_RUNTIME_OVERLAYS: "true"
       COGNITIVE_RUNTIME_MEMORY_HYGIENE_ENABLED: "true"
+    depends_on:
+      bms-observer:
+        condition: service_healthy

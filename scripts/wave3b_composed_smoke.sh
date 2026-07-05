@@ -223,6 +223,16 @@ provider_post() {
   rm -f "$payload_file"
 }
 
+bms_observer_reset() {
+  curl_json "BMS observer reset" -X POST "http://127.0.0.1:14331/fixture/reset" \
+    -H "Content-Type: application/json" \
+    -d "{}" >/dev/null
+}
+
+bms_observer_requests() {
+  curl_json "BMS observer requests" "http://127.0.0.1:14331/fixture/requests"
+}
+
 bms_post() {
   curl_json "BMS POST $1" -X POST "http://127.0.0.1:14321$1" \
     -H "X-API-Key: smoke-memory-key" \
@@ -1759,35 +1769,35 @@ scenario_artifact_policy() {
   min_ineligible_score="$(jq -r --argjson crowd "$crowd_derived_ids_json" '[.result[]? | select(.payload.derived_text_id as $id | $crowd | index($id)) | .score] | min // empty' <<<"$score_evidence")"
   assert_jq_arg "$score_evidence" id "$irrelevant_derived" '([.result[]? | select(.payload.derived_text_id == $id)] | length) == 1' "$scenario irrelevant artifact score evidence present"
 
-  local direct_policy direct_bms_request direct_bms_response
-  direct_policy="$(jq -nc '{
-    enforcement_mode:"mandatory",
-    allowed_memory_domains:["technical","project"],
-    blocked_memory_domains:["finance"],
-    artifact_access_policy:{
-      enforcement_mode:"mandatory",
-      allowed_content_classes:["document","code"],
-      allowed_domains:["technical","project"],
-      maximum_sensitivity:"high",
-      surface_content_capabilities:["document","code"],
-      reason_codes:["persona_scope_hint_applied"]
-    },
-    relationship_scope_projection:null
-  }')"
+  local before after response request_id trace calls observer_capture captured_body captured_policy
+  bms_observer_reset
+  before="$(retrieval_log_count)"
+  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "$query" "private" "desktop_private" "true" "0.5")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  after="$(wait_retrieval_log_delta "$before" 1 "$scenario normal CO artifact request BMS retrieval boundary")"
+  observer_capture="$(bms_observer_requests)"
+  assert_jq_arg "$observer_capture" rid "$request_id" '.request_count == 1 and .forwarded_count == 1 and ([.requests[]? | select(.request_id == $rid and .method == "POST" and (.path | test("^/v2/conversations/[^/]+/retrieve$")))] | length) == 1' "$scenario observer captured and forwarded exactly one normal CO retrieval"
+  assert_jq "$observer_capture" '([.requests[]?.headers | has("x-api-key")] | any) == false and ([.requests[]?.headers | has("authorization")] | any) == false' "$scenario observer does not expose BMS credentials"
+  captured_body="$(jq -c --arg rid "$request_id" '.requests[] | select(.request_id == $rid) | .body' <<<"$observer_capture")"
+  captured_policy="$(jq -c '.containment_policy' <<<"$captured_body")"
+  assert_jq "$captured_body" '.owner_id != null and .query != null and .include_artifacts == null and .retrieval.k == 3 and .retrieval.min_score == 0.5 and .containment_policy.enforcement_mode == "mandatory" and (.containment_policy.artifact_access_policy | type == "object") and (.containment_policy | has("relationship_scope_projection"))' "$scenario captured normal CO request contains complete mandatory artifact policy"
+  assert_jq "$captured_policy" '.artifact_access_policy.enforcement_mode == "mandatory" and (.artifact_access_policy.allowed_content_classes | type == "array" and length > 0) and (.artifact_access_policy.allowed_domains | type == "array" and length > 0) and (.artifact_access_policy.maximum_sensitivity | type == "string") and (.artifact_access_policy.surface_content_capabilities | type == "array" and length > 0) and (.artifact_access_policy.reason_codes | type == "array" and length > 0) and (.allowed_memory_domains | type == "array") and (.blocked_memory_domains | type == "array") and has("relationship_scope_projection")' "$scenario captured policy has complete bounded policy fields"
+  trace="$(fetch_trace "$request_id")"
+  calls="$(fetch_provider_calls "$request_id")"
+  assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_request_status == "mandatory_policy_forwarded" and .retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated"' "$scenario artifact policy validated"
+  assert_jq "$trace" '.retrieval.prompt_assembly.result_boundary.artifact_policy_applied == true and .retrieval.prompt_assembly.result_boundary.validation_status == "filtered" and (.retrieval.prompt_assembly.result_boundary.retained_counts.artifact_refs // 0) >= 2' "$scenario CO artifact result boundary validated"
+  assert_jq_arg "$trace" id "$eligible_code_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible code artifact retained by CO"
+  assert_jq_arg "$trace" id "$eligible_doc_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible document artifact retained by CO"
+  assert_jq_argjson "$trace" negatives "$negative_artifact_ids_json" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id as $id | $negatives | index($id))] | length) == 0' "$scenario negative artifacts absent from CO retained bundle"
+
+  local direct_bms_request direct_bms_payload direct_bms_response direct_debug_json
   direct_bms_request="wave3b-direct-artifact"
-  direct_bms_response="$(bms_retrieve_bundle "$conv" "$direct_bms_request" "$(jq -nc \
+  direct_bms_payload="$(jq -c \
     --arg request_id "$direct_bms_request" \
-    --arg owner "$owner" \
-    --arg query "$query" \
-    --argjson policy "$direct_policy" \
-    '{
-      request_id:$request_id,
-      owner_id:$owner,
-      query:$query,
-      retrieval:{k:3,min_score:0.5,scope:"owner",time_window:"all",retrieval_mode:"balanced"},
-      include_artifacts:true,
-      containment_policy:$policy
-    }')")"
+    '. + {request_id:$request_id}' <<<"$captured_body")"
+  assert_jq_two_argjson "$direct_bms_payload" captured "$captured_policy" observed "$(jq -c '.containment_policy' <<<"$direct_bms_payload")" '$captured == $observed' "$scenario direct BMS request uses exact captured normal CO policy"
+  assert_jq_argjson "$direct_bms_payload" captured "$captured_body" '.owner_id == $captured.owner_id and .query == $captured.query and .retrieval == $captured.retrieval and .include_artifacts == $captured.include_artifacts and .containment_policy == $captured.containment_policy' "$scenario direct BMS request preserves captured owner query retrieval artifact state and policy"
+  direct_bms_response="$(bms_retrieve_bundle "$conv" "$direct_bms_request" "$direct_bms_payload")"
   if ! jq -e \
     --arg code "$eligible_code_artifact" \
     --arg doc "$eligible_doc_artifact" \
@@ -1818,20 +1828,10 @@ scenario_artifact_policy() {
     exit 1
   fi
   assert_ids_absent_from_json "$direct_bms_response" "$negative_artifact_ids_json" "artifact-direct-bms-negative-artifact-ids"
-
-  local before after response request_id trace calls
-  before="$(retrieval_log_count)"
-  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "$query" "private" "desktop_private" "true" "0.5")"
-  request_id="$(jq -r '.request_id' <<<"$response")"
-  after="$(wait_retrieval_log_delta "$before" 1 "$scenario normal CO artifact request BMS retrieval boundary")"
-  request_id="$(jq -r '.request_id' <<<"$response")"
-  trace="$(fetch_trace "$request_id")"
-  calls="$(fetch_provider_calls "$request_id")"
-  assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_request_status == "mandatory_policy_forwarded" and .retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated" and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("technical")) != null and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("project")) != null and (.retrieval.prompt_assembly.persona_containment.blocked_memory_domains // [] | index("finance")) != null' "$scenario artifact policy validated"
-  assert_jq "$trace" '.retrieval.prompt_assembly.result_boundary.artifact_policy_applied == true and .retrieval.prompt_assembly.result_boundary.validation_status == "filtered" and (.retrieval.prompt_assembly.result_boundary.retained_counts.artifact_refs // 0) >= 2' "$scenario CO artifact result boundary validated"
-  assert_jq_arg "$trace" id "$eligible_code_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible code artifact retained by CO"
-  assert_jq_arg "$trace" id "$eligible_doc_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible document artifact retained by CO"
-  assert_jq_argjson "$trace" negatives "$negative_artifact_ids_json" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id as $id | $negatives | index($id))] | length) == 0' "$scenario negative artifacts absent from CO retained bundle"
+  direct_debug_json="$(jq -c '.bundle.retrieval_debug' <<<"$direct_bms_response")"
+  assert_not_contains "$direct_debug_json" "$credential" "artifact-direct-bms-diagnostics-credential"
+  assert_not_contains "$direct_debug_json" "object_uri" "artifact-direct-bms-diagnostics-object-uri"
+  assert_not_contains "$direct_debug_json" "signed_url" "artifact-direct-bms-diagnostics-signed-url"
   assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"
   assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_doc" true "1"
   assert_provider_sentinel "$calls" "$request_id" "blocked_artifact" false "1"

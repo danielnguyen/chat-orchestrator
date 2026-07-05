@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "wave3b_composed_smoke.sh"
 OVERLAY = ROOT / "docker-compose.wave3b-smoke.yml"
+OBSERVER = ROOT / "api" / "tools" / "wave3b_bms_observer.py"
 
 
 def _script() -> str:
@@ -70,6 +71,19 @@ def test_wave3b_smoke_harness_required_fixture_setup_is_not_swallowed():
         assert "compose down" in line
     assert "assert_required_fixture_setup_is_strict" in source
     assert "fixture failed: artifact-sql-" in source
+
+
+def test_wave3b_smoke_overlay_routes_co_through_bms_observer_only():
+    overlay = OVERLAY.read_text(encoding="utf-8")
+    observer = OBSERVER.read_text(encoding="utf-8")
+    assert "bms-observer:" in overlay
+    assert "tools.wave3b_bms_observer:app" in overlay
+    assert "MEMORY_STORE_BASE_URL: http://bms-observer:8000" in overlay
+    assert "BMS_UPSTREAM_URL: http://bms:8000" in overlay
+    assert '"14331:8000"' in overlay
+    assert "x-api-key" not in observer[observer.index('_records.append(') :]
+    assert "/v2/conversations/([^/]+)/retrieve" in observer
+    assert 'content=raw_body' in observer
 
 
 def test_wave3b_smoke_harness_public_source_positive_requires_expected_source():
@@ -358,10 +372,15 @@ def test_wave3b_artifact_scenario_proves_score_crowding_and_direct_bms_filtering
     assert "eligible_doc_rank" in scenario
     assert "min_ineligible_score" in scenario
     assert 'direct_bms_response="$(bms_retrieve_bundle' in scenario
-    assert 'allowed_memory_domains:["technical","project"]' in scenario
-    assert 'blocked_memory_domains:["finance"]' in scenario
-    assert 'allowed_domains:["technical","project"]' in scenario
-    assert 'reason_codes:["persona_scope_hint_applied"]' in scenario
+    assert "direct_policy=" not in scenario
+    assert "bms_observer_reset" in scenario
+    assert "observer_capture" in scenario
+    assert "captured_policy" in scenario
+    assert "direct_bms_payload" in scenario
+    assert ".containment_policy == $captured.containment_policy" in scenario
+    assert "direct BMS request uses exact captured normal CO policy" in scenario
+    assert "observer captured and forwarded exactly one normal CO retrieval" in scenario
+    assert "observer does not expose BMS credentials" in scenario
     assert "pre_limit_policy_filter_applied == true" in scenario
     assert "missing_derivative_source_record" in scenario
     assert "source_missing_or_unavailable" in scenario
@@ -387,9 +406,11 @@ def test_wave3b_artifact_scenario_ties_normal_co_provider_and_public_sources():
     assert "normal CO artifact request BMS retrieval boundary" in scenario
     assert "artifact_request_status == \"mandatory_policy_forwarded\"" in scenario
     assert "artifact_result_status == \"validated\"" in scenario
-    assert 'index("technical")' in scenario
-    assert 'index("project")' in scenario
-    assert 'index("finance")' in scenario
+    assert ".artifact_access_policy.allowed_content_classes" in scenario
+    assert ".artifact_access_policy.allowed_domains" in scenario
+    assert ".artifact_access_policy.maximum_sensitivity" in scenario
+    assert ".artifact_access_policy.surface_content_capabilities" in scenario
+    assert ".artifact_access_policy.reason_codes" in scenario
     assert "eligible code artifact retained by CO" in scenario
     assert "eligible document artifact retained by CO" in scenario
     assert 'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"' in scenario
