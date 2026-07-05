@@ -289,9 +289,21 @@ async def test_wave3b_replay_fallback_attempt_identity_is_structural():
     assert len(set(snapshot["provider_fingerprints"])) == 1
     assert len(set(snapshot["provider_message_counts"])) == 1
     assert snapshot["provider_role_sequences"][0] == snapshot["provider_role_sequences"][1]
-    retained = snapshot["trace"]["prompt_budget"]["retained_source_ids"]
-    assert isinstance(retained, dict)
-    assert sorted(retained) == ["artifact_ids", "semantic_message_ids"]
+    model_calls = snapshot["trace"]["model_calls"]
+    assert len(model_calls) == 2
+    assert [call["status"] for call in model_calls] == ["failed", "ok"]
+    assert [call["attempt_ordinal"] for call in model_calls] == [1, 2]
+    assert model_calls[0]["prompt_fingerprint"] == model_calls[1]["prompt_fingerprint"]
+    assert model_calls[0]["prompt_message_count"] == model_calls[1]["prompt_message_count"]
+    assert model_calls[0]["prompt_role_sequence"] == model_calls[1]["prompt_role_sequence"]
+    assert model_calls[0]["retained_semantic_message_ids"] == model_calls[1][
+        "retained_semantic_message_ids"
+    ]
+    assert model_calls[0]["retained_artifact_ids"] == model_calls[1]["retained_artifact_ids"]
+    assert model_calls[0]["retained_semantic_message_ids"]
+    assert model_calls[0]["retained_artifact_ids"]
+    assert all("memory-1" in call["retained_semantic_message_ids"] for call in model_calls)
+    assert all("artifact-1" in call["retained_artifact_ids"] for call in model_calls)
 
 
 @pytest.mark.asyncio
