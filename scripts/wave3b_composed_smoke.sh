@@ -993,29 +993,50 @@ assert_score_ordering() {
   fi
 }
 
+artifact_qdrant_candidate_limit() {
+  local artifact_limit="$1"
+  local expanded=$((artifact_limit * 20))
+  if [ "$expanded" -lt "$artifact_limit" ]; then
+    expanded="$artifact_limit"
+  fi
+  if [ "$expanded" -gt 100 ]; then
+    expanded=100
+  fi
+  echo "$expanded"
+}
+
 score_for_message_id() {
   local score_json="$1" message_id="$2"
   jq -r --arg id "$message_id" '[.result[]? | select(.payload.message_id == $id) | .score] | first // empty' <<<"$score_json"
 }
 
 assert_artifact_score_ordering() {
-  local score_json="$1" eligible_derived_id="$2" crowd_ids_json="$3" min_crowd="$4" effective_limit="$5" label="$6"
+  local score_json="$1" eligible_code_derived_id="$2" eligible_doc_derived_id="$3" crowd_ids_json="$4" expected_crowd="$5" candidate_limit="$6" label="$7"
   if ! jq -e \
-    --arg eligible "$eligible_derived_id" \
+    --arg code "$eligible_code_derived_id" \
+    --arg doc "$eligible_doc_derived_id" \
     --argjson crowd "$crowd_ids_json" \
-    --argjson min_crowd "$min_crowd" \
-    --argjson effective_limit "$effective_limit" \
+    --argjson expected_crowd "$expected_crowd" \
+    --argjson candidate_limit "$candidate_limit" \
     '
       (.result | type == "array")
-      and ($min_crowd > $effective_limit)
-      and ([.result[] | select(.payload.derived_text_id == $eligible)] | length == 1)
+      and ($expected_crowd > $candidate_limit)
+      and ([.result[] | select(.payload.derived_text_id == $code)] | length == 1)
+      and ([.result[] | select(.payload.derived_text_id == $doc)] | length == 1)
       and (
         [.result[] | select(.payload.derived_text_id as $id | $crowd | index($id))]
-        | length >= $min_crowd
+        | length == $expected_crowd
       )
       and (
-        ([.result[] | select(.payload.derived_text_id == $eligible)][0].score) as $eligible_score
-        | ([.result[] | select(.payload.derived_text_id as $id | $crowd | index($id)) | select(.score > $eligible_score)] | length) >= $min_crowd
+        ([.result[] | select(.payload.derived_text_id == $code)][0].score) as $code_score
+        | ([.result[] | select(.payload.derived_text_id == $doc)][0].score) as $doc_score
+        | ($code_score > $doc_score)
+        and ([.result[] | select(.payload.derived_text_id as $id | $crowd | index($id)) | select(.score > $code_score and .score > $doc_score)] | length) == $expected_crowd
+      )
+      and (
+        ([.result | to_entries[] | select(.value.payload.derived_text_id == $code) | .key + 1] | first) as $code_rank
+        | ([.result | to_entries[] | select(.value.payload.derived_text_id == $doc) | .key + 1] | first) as $doc_rank
+        | ($code_rank > $candidate_limit and $doc_rank > $candidate_limit)
       )
     ' <<<"$score_json" >/dev/null; then
     echo "wave3b-composed-smoke assertion failed: artifact score ordering label=$label" >&2
@@ -1026,6 +1047,11 @@ assert_artifact_score_ordering() {
 score_for_derived_text_id() {
   local score_json="$1" derived_text_id="$2"
   jq -r --arg id "$derived_text_id" '[.result[]? | select(.payload.derived_text_id == $id) | .score] | first // empty' <<<"$score_json"
+}
+
+rank_for_derived_text_id() {
+  local score_json="$1" derived_text_id="$2"
+  jq -r --arg id "$derived_text_id" '[.result | to_entries[]? | select(.value.payload.derived_text_id == $id) | .key + 1] | first // empty' <<<"$score_json"
 }
 
 assert_ids_absent_from_json() {
@@ -1590,11 +1616,12 @@ scenario_restraint_zero_call() {
 
 scenario_artifact_policy() {
   local scenario="artifact_policy_prelimit_filtering"
-  local owner="owner-wave3b-s4" conv query effective_limit=3
+  local owner="owner-wave3b-s4" conv query artifact_limit=3 candidate_limit
   local eligible_code="W3B_ARTIFACT_ELIGIBLE_CODE_3b1" eligible_doc="W3B_ARTIFACT_ELIGIBLE_DOC_4c2"
   local blocked="W3B_ARTIFACT_BLOCKED_2aa" outside="W3B_ARTIFACT_OUTSIDE_6bc" sensitive="W3B_ARTIFACT_SENSITIVE_7cd"
   local unsupported="W3B_ARTIFACT_UNSUPPORTED_8de" malformed="W3B_ARTIFACT_MALFORMED_9ef" incomplete="W3B_ARTIFACT_INCOMPLETE_1f0"
   local unavailable="W3B_ARTIFACT_UNAVAILABLE_2f1" irrelevant="W3B_ARTIFACT_IRRELEVANT_3f2" credential="W3B_ARTIFACT_CREDENTIAL_5c9"
+  candidate_limit="$(artifact_qdrant_candidate_limit "$artifact_limit")"
   conv="$(resolve_conversation "$owner" "vscode" "wave3b artifacts")"
   query="What from memory should I use from allowed project artifacts for Wave 3B?"
   local query_vector eligible_code_vector eligible_doc_vector crowd_vector irrelevant_vector
@@ -1642,6 +1669,48 @@ scenario_artifact_policy() {
   unavailable_artifact="${unavailable_pair%%:*}"; unavailable_derived="${unavailable_pair#*:}"
   irrelevant_artifact="${irrelevant_pair%%:*}"; irrelevant_derived="${irrelevant_pair#*:}"
 
+  local high_crowd_artifact_ids_json='[]' high_crowd_derived_ids_json='[]' high_crowd_count=0 crowd_pair crowd_artifact crowd_derived index
+  for crowd_pair in "$blocked_pair" "$outside_pair" "$sensitive_pair" "$unsupported_pair" "$malformed_pair" "$incomplete_pair" "$unavailable_pair"; do
+    crowd_artifact="${crowd_pair%%:*}"
+    crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+  done
+  for index in $(seq 1 9); do
+    crowd_pair="$(seed_artifact "$owner" "vscode" "$conv" "blocked-domain-extra-$index" "blocked domain crowd artifact $credential" "$blocked_policy" "completed" "complete" "$crowd_vector" "text/plain" "blocked-domain-extra-$index.py")"
+    crowd_artifact="${crowd_pair%%:*}"; crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+    crowd_pair="$(seed_artifact "$owner" "vscode" "$conv" "outside-domain-extra-$index" "outside domain crowd artifact $credential" "$outside_policy" "completed" "complete" "$crowd_vector" "text/plain" "outside-domain-extra-$index.py")"
+    crowd_artifact="${crowd_pair%%:*}"; crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+    crowd_pair="$(seed_artifact "$owner" "vscode" "$conv" "too-sensitive-extra-$index" "restricted crowd artifact $credential" "$sensitive_policy" "completed" "complete" "$crowd_vector" "text/plain" "too-sensitive-extra-$index.py")"
+    crowd_artifact="${crowd_pair%%:*}"; crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+    crowd_pair="$(seed_artifact "$owner" "vscode" "$conv" "unsupported-class-extra-$index" "unsupported image crowd artifact $credential" "$unsupported_policy" "completed" "complete" "$crowd_vector" "image/png" "unsupported-extra-$index.png")"
+    crowd_artifact="${crowd_pair%%:*}"; crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+    crowd_pair="$(seed_artifact "$owner" "vscode" "$conv" "malformed-policy-extra-$index" "malformed metadata crowd artifact $credential" "$malformed_policy" "completed" "complete" "$crowd_vector" "text/plain" "malformed-policy-extra-$index.py")"
+    crowd_artifact="${crowd_pair%%:*}"; crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+    crowd_pair="$(seed_artifact "$owner" "vscode" "$conv" "incomplete-lifecycle-extra-$index" "incomplete lifecycle crowd artifact $credential" "$code_policy" "pending" "building" "$crowd_vector" "text/plain" "incomplete-lifecycle-extra-$index.py")"
+    crowd_artifact="${crowd_pair%%:*}"; crowd_derived="${crowd_pair#*:}"
+    high_crowd_artifact_ids_json="$(jq -c --arg id "$crowd_artifact" '. + [$id]' <<<"$high_crowd_artifact_ids_json")"
+    high_crowd_derived_ids_json="$(jq -c --arg id "$crowd_derived" '. + [$id]' <<<"$high_crowd_derived_ids_json")"
+    high_crowd_count=$((high_crowd_count + 1))
+  done
+  test "$high_crowd_count" -gt "$candidate_limit" || { echo "wave3b-composed-smoke assertion failed: $scenario high-scoring crowd does not exceed candidate limit" >&2; exit 1; }
+
   local fixture_ids_json negative_artifact_ids_json crowd_derived_ids_json all_negative_sentinels_json
   fixture_ids_json="$(jq -nc \
     --arg code "$eligible_code_artifact" --arg code_derived "$eligible_code_derived" \
@@ -1668,8 +1737,8 @@ scenario_artifact_policy() {
       }
     }')"
   assert_jq "$fixture_ids_json" '(.positive | to_entries | length) == 2 and (.negative | to_entries | length) == 8 and ([.. | objects | select(has("artifact_id") and has("derived_text_id")) | select(.artifact_id != "" and .derived_text_id != "")] | length) == 10' "$scenario every artifact fixture group created"
-  negative_artifact_ids_json="$(jq -c '[.negative[] | .artifact_id]' <<<"$fixture_ids_json")"
-  crowd_derived_ids_json="$(jq -c '[.negative.blocked_domain.derived_text_id,.negative.outside_domain.derived_text_id,.negative.sensitivity_above_ceiling.derived_text_id,.negative.unsupported_content_class.derived_text_id,.negative.malformed_policy_metadata.derived_text_id,.negative.incomplete_lifecycle.derived_text_id,.negative.unavailable_source.derived_text_id]' <<<"$fixture_ids_json")"
+  negative_artifact_ids_json="$(jq -c --arg irrelevant_id "$irrelevant_artifact" '. + [$irrelevant_id]' <<<"$high_crowd_artifact_ids_json")"
+  crowd_derived_ids_json="$high_crowd_derived_ids_json"
   all_negative_sentinels_json="$(jq -nc --arg blocked "$blocked" --arg outside "$outside" --arg sensitive "$sensitive" --arg unsupported "$unsupported" --arg malformed "$malformed" --arg incomplete "$incomplete" --arg unavailable "$unavailable" --arg irrelevant "$irrelevant" '[$blocked,$outside,$sensitive,$unsupported,$malformed,$incomplete,$unavailable,$irrelevant]')"
 
   provider_post "/fixture/sentinels" "$(jq -nc \
@@ -1679,25 +1748,29 @@ scenario_artifact_policy() {
     --arg credential "$credential" \
     '{sentinels:{eligible_artifact_code:$eligible_code,eligible_artifact_doc:$eligible_doc,blocked_artifact:$blocked,outside_artifact:$outside,sensitive_artifact:$sensitive,unsupported_artifact:$unsupported,malformed_artifact:$malformed,incomplete_artifact:$incomplete,unavailable_artifact:$unavailable,irrelevant_artifact:$irrelevant,artifact_credential:$credential}}')"
 
-  local score_evidence eligible_score min_ineligible_score
-  score_evidence="$(qdrant_artifact_scores "$owner" "$query_vector" 32)"
-  assert_artifact_score_ordering "$score_evidence" "$eligible_code_derived" "$crowd_derived_ids_json" "7" "$effective_limit" "$scenario ineligible artifact crowd scores above eligible"
-  eligible_score="$(score_for_derived_text_id "$score_evidence" "$eligible_code_derived")"
+  local score_evidence eligible_code_score eligible_doc_score min_ineligible_score eligible_code_rank eligible_doc_rank raw_qdrant_limit
+  raw_qdrant_limit=$((high_crowd_count + 4))
+  score_evidence="$(qdrant_artifact_scores "$owner" "$query_vector" "$raw_qdrant_limit")"
+  assert_artifact_score_ordering "$score_evidence" "$eligible_code_derived" "$eligible_doc_derived" "$crowd_derived_ids_json" "$high_crowd_count" "$candidate_limit" "$scenario ineligible artifact crowd scores above both eligibles beyond candidate limit"
+  eligible_code_score="$(score_for_derived_text_id "$score_evidence" "$eligible_code_derived")"
+  eligible_doc_score="$(score_for_derived_text_id "$score_evidence" "$eligible_doc_derived")"
+  eligible_code_rank="$(rank_for_derived_text_id "$score_evidence" "$eligible_code_derived")"
+  eligible_doc_rank="$(rank_for_derived_text_id "$score_evidence" "$eligible_doc_derived")"
   min_ineligible_score="$(jq -r --argjson crowd "$crowd_derived_ids_json" '[.result[]? | select(.payload.derived_text_id as $id | $crowd | index($id)) | .score] | min // empty' <<<"$score_evidence")"
   assert_jq_arg "$score_evidence" id "$irrelevant_derived" '([.result[]? | select(.payload.derived_text_id == $id)] | length) == 1' "$scenario irrelevant artifact score evidence present"
 
   local direct_policy direct_bms_request direct_bms_response
   direct_policy="$(jq -nc '{
     enforcement_mode:"mandatory",
-    allowed_memory_domains:["project"],
-    blocked_memory_domains:[],
+    allowed_memory_domains:["technical","project"],
+    blocked_memory_domains:["finance"],
     artifact_access_policy:{
       enforcement_mode:"mandatory",
       allowed_content_classes:["document","code"],
-      allowed_domains:["project"],
+      allowed_domains:["technical","project"],
       maximum_sensitivity:"high",
       surface_content_capabilities:["document","code"],
-      reason_codes:["artifact_policy_applied","restricted_artifact_access_blocked"]
+      reason_codes:["persona_scope_hint_applied"]
     },
     relationship_scope_projection:null
   }')"
@@ -1719,10 +1792,17 @@ scenario_artifact_policy() {
     --arg code "$eligible_code_artifact" \
     --arg doc "$eligible_doc_artifact" \
     --argjson negatives "$negative_artifact_ids_json" \
-    --argjson limit "$effective_limit" \
+    --argjson limit "$artifact_limit" \
+    --argjson candidate_limit "$candidate_limit" \
+    --argjson crowd_count "$high_crowd_count" \
+    --argjson code_rank "$eligible_code_rank" \
+    --argjson doc_rank "$eligible_doc_rank" \
     --argjson min_ineligible "$min_ineligible_score" \
     '
       .bundle.retrieval_debug.containment_policy.pre_limit_policy_filter_applied == true
+      and $crowd_count > $candidate_limit
+      and $code_rank > $candidate_limit
+      and $doc_rank > $candidate_limit
       and ((.bundle.retrieval_debug.artifact_ranked // 0) <= $limit)
       and ((.bundle.retrieval_debug.truth_qualification.derivative_omissions_by_reason.missing_derivative_source_record // 0) >= 1)
       and ((.diagnostics.reason_codes // [] | index("mandatory_containment_applied")) != null)
@@ -1732,6 +1812,7 @@ scenario_artifact_policy() {
       and ([.bundle.artifact_refs[]? | select(.artifact_id as $id | $negatives | index($id))] | length) == 0
       and ([.bundle.artifact_refs[]?] | length) <= $limit
       and ([.bundle.artifact_refs[]? | select(.artifact_id == $code) | .relevance_score] | first) < $min_ineligible
+      and ([.bundle.artifact_refs[]? | select(.artifact_id == $doc) | .relevance_score] | first) < $min_ineligible
     ' <<<"$direct_bms_response" >/dev/null; then
     echo "wave3b-composed-smoke assertion failed: $scenario direct BMS artifact pre-limit mandatory filtering before limiting" >&2
     exit 1
@@ -1746,7 +1827,7 @@ scenario_artifact_policy() {
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
-  assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_request_status == "mandatory_policy_forwarded" and .retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated" and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("project")) != null' "$scenario artifact policy validated"
+  assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_request_status == "mandatory_policy_forwarded" and .retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated" and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("technical")) != null and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("project")) != null and (.retrieval.prompt_assembly.persona_containment.blocked_memory_domains // [] | index("finance")) != null' "$scenario artifact policy validated"
   assert_jq "$trace" '.retrieval.prompt_assembly.result_boundary.artifact_policy_applied == true and .retrieval.prompt_assembly.result_boundary.validation_status == "filtered" and (.retrieval.prompt_assembly.result_boundary.retained_counts.artifact_refs // 0) >= 2' "$scenario CO artifact result boundary validated"
   assert_jq_arg "$trace" id "$eligible_code_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible code artifact retained by CO"
   assert_jq_arg "$trace" id "$eligible_doc_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible document artifact retained by CO"
@@ -1775,7 +1856,7 @@ scenario_artifact_policy() {
   for forbidden in "$credential" "memory://wave3b" "object_uri" "download_url" "signed_url" "credentials" "policy_metadata" "provenance" "source_checks" "freshness_state" "durable_status"; do
     assert_not_contains "$response" "$forbidden" "artifact-public-source-forbidden-$forbidden"
   done
-  record_scenario "$scenario" "A6 and artifact A7 assertions passed with artifact_limit=$effective_limit crowd_count=7 eligible_code_artifact=$eligible_code_artifact eligible_doc_artifact=$eligible_doc_artifact eligible_score=$eligible_score min_ineligible_score=$min_ineligible_score normal_bms_delta=$((after - before))"
+  record_scenario "$scenario" "A6 and artifact A7 assertions passed with artifact_limit=$artifact_limit qdrant_candidate_limit=$candidate_limit high_scoring_crowd_count=$high_crowd_count eligible_code_artifact=$eligible_code_artifact eligible_doc_artifact=$eligible_doc_artifact eligible_code_score=$eligible_code_score eligible_doc_score=$eligible_doc_score eligible_code_raw_rank=$eligible_code_rank eligible_doc_raw_rank=$eligible_doc_rank min_ineligible_score=$min_ineligible_score normal_bms_delta=$((after - before))"
   mark_acceptance "A6" "$scenario"
   mark_acceptance "A7_artifact" "$scenario"
 }

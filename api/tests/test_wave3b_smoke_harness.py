@@ -332,20 +332,46 @@ def test_wave3b_artifact_scenario_proves_score_crowding_and_direct_bms_filtering
     scenario = source[
         source.index("scenario_artifact_policy()") : source.index("scenario_fallback_identity()")
     ]
-    assert "effective_limit=3" in scenario
+    assert "artifact_limit=3" in scenario
+    assert 'candidate_limit="$(artifact_qdrant_candidate_limit "$artifact_limit")"' in scenario
+    assert "artifact_limit * 20" in source
+    assert "expanded=100" in source
     assert 'json_vector_for_score "$query_vector" "0.62"' in scenario
+    assert 'json_vector_for_score "$query_vector" "0.61"' in scenario
     assert 'json_vector_for_score "$query_vector" "0.98"' in scenario
+    assert "high_crowd_count" in scenario
+    assert '"$high_crowd_count" -gt "$candidate_limit"' in scenario
+    assert "blocked-domain-extra-$index" in scenario
+    assert "outside-domain-extra-$index" in scenario
+    assert "too-sensitive-extra-$index" in scenario
+    assert "unsupported-class-extra-$index" in scenario
+    assert "malformed-policy-extra-$index" in scenario
+    assert "incomplete-lifecycle-extra-$index" in scenario
     assert "qdrant_artifact_scores" in scenario
     assert "assert_artifact_score_ordering" in scenario
-    assert "crowd_count=7" in scenario
-    assert "eligible_score" in scenario
+    assert "$expected_crowd > $candidate_limit" in source
+    assert "$code_rank > $candidate_limit" in source
+    assert "$doc_rank > $candidate_limit" in source
+    assert "eligible_code_score" in scenario
+    assert "eligible_doc_score" in scenario
+    assert "eligible_code_rank" in scenario
+    assert "eligible_doc_rank" in scenario
     assert "min_ineligible_score" in scenario
     assert 'direct_bms_response="$(bms_retrieve_bundle' in scenario
+    assert 'allowed_memory_domains:["technical","project"]' in scenario
+    assert 'blocked_memory_domains:["finance"]' in scenario
+    assert 'allowed_domains:["technical","project"]' in scenario
+    assert 'reason_codes:["persona_scope_hint_applied"]' in scenario
     assert "pre_limit_policy_filter_applied == true" in scenario
     assert "missing_derivative_source_record" in scenario
     assert "source_missing_or_unavailable" in scenario
     assert 'select(.artifact_id == $code)' in scenario
+    assert 'select(.artifact_id == $doc)' in scenario
     assert 'select(.artifact_id as $id | $negatives | index($id))' in scenario
+    assert "qdrant_candidate_limit=$candidate_limit" in scenario
+    assert "high_scoring_crowd_count=$high_crowd_count" in scenario
+    assert "eligible_code_raw_rank=$eligible_code_rank" in scenario
+    assert "eligible_doc_raw_rank=$eligible_doc_rank" in scenario
 
 
 def test_wave3b_artifact_scenario_ties_normal_co_provider_and_public_sources():
@@ -360,6 +386,10 @@ def test_wave3b_artifact_scenario_ties_normal_co_provider_and_public_sources():
     assert '"true" "0.5"' in scenario
     assert "normal CO artifact request BMS retrieval boundary" in scenario
     assert "artifact_request_status == \"mandatory_policy_forwarded\"" in scenario
+    assert "artifact_result_status == \"validated\"" in scenario
+    assert 'index("technical")' in scenario
+    assert 'index("project")' in scenario
+    assert 'index("finance")' in scenario
     assert "eligible code artifact retained by CO" in scenario
     assert "eligible document artifact retained by CO" in scenario
     assert 'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"' in scenario
