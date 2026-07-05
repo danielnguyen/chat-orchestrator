@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from services.privacy_context import (
     derive_privacy_context,
     disabled_privacy_trace,
     privacy_fallback_policy,
+    privacy_policy_requires_suppression,
     restricted_retrieval_trace_summary,
     sanitize_prompt_trace_for_privacy,
     validate_privacy_runtime_response,
@@ -122,6 +124,16 @@ def _ensure_persona_containment_trace_defaults(
     return trace
 
 
+def _set_artifact_result_trace(
+    *,
+    persona_trace: dict[str, Any],
+    status: str,
+    reason: str,
+) -> None:
+    persona_trace["artifact_result_status"] = status
+    persona_trace["artifact_result_reason"] = reason
+
+
 def _persona_containment_lock_active(persona_containment: dict[str, Any] | None) -> bool:
     return (
         isinstance(persona_containment, dict)
@@ -141,11 +153,384 @@ class RetrievalBoundaryResult:
     blocked_memory_domains: list[str] | None
 
 
+@dataclass(frozen=True)
+class MandatoryRetrievalPolicy:
+    containment_policy: dict[str, Any] | None
+    relationship_context: dict[str, Any] | None
+    relationship_trace: dict[str, Any]
+    validation_trace: dict[str, Any]
+
+
+SAFE_POLICY_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+SAFE_SCOPE_ID = re.compile(r"^[A-Za-z0-9_.:/@-]{1,160}$")
+ARTIFACT_CONTENT_CLASSES = {
+    "document",
+    "code",
+    "image",
+    "screenshot",
+    "audio",
+    "video",
+    "other",
+}
+ARTIFACT_POLICY_FIELDS = {
+    "enforcement_mode",
+    "allowed_content_classes",
+    "allowed_domains",
+    "maximum_sensitivity",
+    "surface_content_capabilities",
+    "reason_codes",
+}
+RESULT_POLICY_FIELDS = {
+    "memory_domains",
+    "sensitivity",
+    "content_class",
+    "entity_ids",
+    "relationship_ids",
+    "relationship_scopes",
+}
+SENSITIVITY_RANK = {"low": 0, "medium": 1, "high": 2}
+VALID_RESULT_ROLES = {"user", "assistant", "system", "tool"}
+RESULT_SOURCE_REF_FIELDS = {"ref_type", "ref_id"}
+PROVENANCE_SOURCE_REF_FIELDS = {
+    "ref_type",
+    "ref_id",
+    "support_kind",
+    "span",
+    "field_path",
+    "note",
+    "metadata",
+}
+PROVENANCE_SOURCE_REF_REQUIRED_FIELDS = {"ref_type", "ref_id", "support_kind"}
+PROVENANCE_REQUIRED_FIELDS = {
+    "derived_id",
+    "owner_id",
+    "derivation_type",
+    "source_refs",
+    "derivation_version",
+    "created_at",
+    "status",
+    "provenance_status",
+}
+RESULT_PROVENANCE_FIELDS = {
+    "derived_id",
+    "owner_id",
+    "derivation_type",
+    "source_refs",
+    "derivation_version",
+    "created_at",
+    "status",
+    "effective_status",
+    "confidence",
+    "explanation",
+    "generation_trace_id",
+    "compatibility_defaults",
+    "provenance_status",
+    "retrieval_reason",
+}
+CONTRADICTORY_PROVENANCE_STATUS_MARKERS = {
+    "failed",
+    "failure",
+    "error",
+    "invalid",
+    "missing",
+    "unavailable",
+    "incomplete",
+}
+RETRIEVAL_DEBUG_STATUSES = {
+    "ok",
+    "available",
+    "unavailable",
+    "degraded",
+    "disabled",
+    "failed",
+    "missing",
+    "malformed",
+    "suppressed",
+}
+RETRIEVAL_DEBUG_REASONS = {
+    "fallback_provider_used",
+    "mandatory_result_boundary_failed_closed",
+    "malformed_retrieval_envelope",
+    "memory_domain_not_allowed",
+    "no_retrieval_results",
+    "prompt_budget_exceeded",
+    "relationship_projection_filtered",
+    "retrieval_suppressed_true",
+    "restraint_policy_do_not_retrieve",
+    "source_unavailable",
+    "vector_unavailable",
+}
+CODE_LIKE_RE = re.compile(
+    r"\b(def|class|function|import|from|return|const|let|var|package)\b|[{};]",
+    re.IGNORECASE,
+)
+
+
 def _sanitize_memory_domain_list(value: Any) -> list[str] | None:
     if not isinstance(value, list):
         return None
     cleaned = [item for item in value if isinstance(item, str) and item]
     return cleaned or None
+
+
+def _policy_label_list(value: Any, *, limit: int, required: bool = False) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > limit:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        cleaned = item.strip()
+        if not SAFE_POLICY_LABEL.fullmatch(cleaned):
+            return None
+        normalized = cleaned.lower().replace("-", "_")
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    if required and not out:
+        return None
+    return out
+
+
+def _artifact_class_list(value: Any, *, limit: int) -> list[str] | None:
+    classes = _policy_label_list(value, limit=limit)
+    if classes is None:
+        return None
+    if any(item not in ARTIFACT_CONTENT_CLASSES for item in classes):
+        return None
+    return classes
+
+
+def _scope_id_list(value: Any, *, limit: int) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > limit:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        cleaned = item.strip()
+        if not SAFE_SCOPE_ID.fullmatch(cleaned):
+            return None
+        if cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
+
+
+def _validate_artifact_access_policy(
+    value: Any,
+    *,
+    allowed_memory_domains: list[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, "missing_artifact_access_policy"
+    if set(value) - ARTIFACT_POLICY_FIELDS:
+        return None, "unexpected_artifact_policy_fields"
+    if value.get("enforcement_mode") != "mandatory":
+        return None, "invalid_artifact_policy_enforcement_mode"
+    allowed_content_classes = _artifact_class_list(
+        value.get("allowed_content_classes"),
+        limit=8,
+    )
+    allowed_domains = _policy_label_list(value.get("allowed_domains"), limit=16)
+    surface_content_capabilities = _artifact_class_list(
+        value.get("surface_content_capabilities"),
+        limit=8,
+    )
+    reason_codes = _policy_label_list(value.get("reason_codes"), limit=8)
+    maximum_sensitivity = value.get("maximum_sensitivity")
+    if maximum_sensitivity not in {"low", "medium", "high"}:
+        return None, "invalid_artifact_policy_sensitivity"
+    if (
+        allowed_content_classes is None
+        or allowed_domains is None
+        or surface_content_capabilities is None
+        or reason_codes is None
+    ):
+        return None, "malformed_artifact_access_policy"
+    if not set(allowed_domains).issubset(set(allowed_memory_domains)):
+        return None, "artifact_domains_outside_allowed_memory_domains"
+    if not set(allowed_content_classes).issubset(set(surface_content_capabilities)):
+        return None, "artifact_classes_outside_surface_capabilities"
+    return {
+        "enforcement_mode": "mandatory",
+        "allowed_content_classes": allowed_content_classes,
+        "allowed_domains": allowed_domains,
+        "maximum_sensitivity": maximum_sensitivity,
+        "surface_content_capabilities": surface_content_capabilities,
+        "reason_codes": reason_codes,
+    }, None
+
+
+def _validate_relationship_projection(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, "missing_relationship_scope_projection"
+    if not isinstance(value.get("applied"), bool):
+        return None, "malformed_relationship_scope_projection"
+    relationship_ids = _scope_id_list(value.get("relationship_ids"), limit=64)
+    entity_ids = _scope_id_list(value.get("entity_ids"), limit=64)
+    relationship_scopes = _policy_label_list(value.get("relationship_scopes"), limit=16)
+    reason_codes = _policy_label_list(value.get("reason_codes"), limit=8)
+    if (
+        relationship_ids is None
+        or entity_ids is None
+        or relationship_scopes is None
+        or reason_codes is None
+    ):
+        return None, "malformed_relationship_scope_projection"
+    if value.get("applied") is True and not relationship_ids and not entity_ids:
+        return None, "empty_applied_relationship_scope_projection"
+    if value.get("applied") is False and (
+        relationship_ids or entity_ids or relationship_scopes
+    ):
+        return None, "contradictory_unapplied_relationship_scope_projection"
+    return {
+        "applied": value["applied"],
+        "relationship_ids": relationship_ids,
+        "entity_ids": entity_ids,
+        "relationship_scopes": relationship_scopes,
+        "reason_codes": reason_codes,
+    }, None
+
+
+def _validate_persona_containment_policy(
+    persona_containment: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    trace = {
+        "mandatory_containment_requested": True,
+        "policy_validation_status": "failed",
+        "policy_validation_reason": None,
+    }
+    if not isinstance(persona_containment, dict):
+        trace["policy_validation_reason"] = "persona_containment_unavailable"
+        return None, trace
+    allowed_memory_domains = _policy_label_list(
+        persona_containment.get("allowed_memory_domains"),
+        limit=16,
+        required=True,
+    )
+    blocked_memory_domains = _policy_label_list(
+        persona_containment.get("blocked_memory_domains"),
+        limit=16,
+    )
+    if allowed_memory_domains is None:
+        trace["policy_validation_reason"] = "malformed_allowed_memory_domains"
+        return None, trace
+    if blocked_memory_domains is None:
+        trace["policy_validation_reason"] = "malformed_blocked_memory_domains"
+        return None, trace
+    artifact_policy, artifact_reason = _validate_artifact_access_policy(
+        persona_containment.get("artifact_access_policy"),
+        allowed_memory_domains=allowed_memory_domains,
+    )
+    if artifact_policy is None:
+        trace["policy_validation_reason"] = artifact_reason
+        return None, trace
+    trace.update(
+        {
+            "policy_validation_status": "valid",
+            "policy_validation_reason": "mandatory_containment_policy_valid",
+            "allowed_memory_domain_count": len(allowed_memory_domains),
+            "blocked_memory_domain_count": len(blocked_memory_domains),
+            "artifact_content_class_count": len(artifact_policy["allowed_content_classes"]),
+            "artifact_domain_count": len(artifact_policy["allowed_domains"]),
+        }
+    )
+    return {
+        "enforcement_mode": "mandatory",
+        "allowed_memory_domains": allowed_memory_domains,
+        "blocked_memory_domains": blocked_memory_domains,
+        "artifact_access_policy": artifact_policy,
+    }, trace
+
+
+def _empty_retrieval_bundle(
+    *,
+    request_id: str,
+    conversation_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "bundle": {
+            "recent": [],
+            "semantic": [],
+            "artifact_refs": [],
+            "observed_metadata": {},
+            "retrieval_debug": {
+                "degraded": False,
+                "fallback": False,
+                "suppressed": True,
+                "suppression_reason": reason,
+            },
+        },
+    }
+
+
+def _restraint_suppression_reason(restraint: dict[str, Any] | None) -> str | None:
+    if not isinstance(restraint, dict):
+        return None
+    if restraint.get("retrieval_suppressed") is True:
+        return "retrieval_suppressed_true"
+    if restraint.get("restraint_policy") == "do_not_retrieve":
+        return "restraint_policy_do_not_retrieve"
+    return None
+
+
+def _classify_turn_policy_metadata(
+    *,
+    persona_containment: dict[str, Any] | None,
+    relationship_projection: dict[str, Any] | None,
+    request_sensitivity: Any,
+    interaction_governance: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(persona_containment, dict):
+        return None, "persona_containment_unavailable"
+    allowed_domains = _policy_label_list(
+        persona_containment.get("allowed_memory_domains"),
+        limit=16,
+        required=True,
+    )
+    capability_domain = persona_containment.get("capability_domain")
+    if (
+        not isinstance(capability_domain, str)
+        or not SAFE_POLICY_LABEL.fullmatch(capability_domain.strip())
+        or allowed_domains is None
+    ):
+        return None, "capability_domain_unavailable"
+    normalized_domain = capability_domain.strip().lower().replace("-", "_")
+    if normalized_domain not in allowed_domains:
+        return None, "capability_domain_outside_allowed_domains"
+    sensitivity = "medium"
+    if request_sensitivity in {"public", "low"}:
+        sensitivity = "low"
+    elif request_sensitivity in {"high", "local_only", "restricted"}:
+        sensitivity = "high"
+    hint = (
+        interaction_governance.get("privacy_sensitivity_hint")
+        if isinstance(interaction_governance, dict)
+        else None
+    )
+    if hint in {"private", "sensitive", "high"}:
+        sensitivity = "high"
+    metadata: dict[str, Any] = {
+        "memory_domains": [normalized_domain],
+        "sensitivity": sensitivity,
+    }
+    if isinstance(relationship_projection, dict) and relationship_projection.get("applied") is True:
+        metadata["entity_ids"] = list(relationship_projection.get("entity_ids") or [])
+        metadata["relationship_ids"] = list(relationship_projection.get("relationship_ids") or [])
+        metadata["relationship_scopes"] = list(
+            relationship_projection.get("relationship_scopes") or []
+        )
+    elif isinstance(relationship_projection, dict):
+        metadata["entity_ids"] = []
+        metadata["relationship_ids"] = []
+        metadata["relationship_scopes"] = []
+    return metadata, None
 
 
 def _apply_persona_containment_retrieval_boundary(
@@ -197,42 +582,684 @@ def _apply_persona_containment_retrieval_boundary(
     trace["retrieval_scope_used"] = "conversation"
     trace["retrieval_scope_status"] = "request_boundary_enforced"
     trace["retrieval_scope_reason"] = "conversation_scope_enforced_under_containment_lock"
-    trace["artifact_request_status"] = "request_boundary_enforced"
-    trace["artifact_request_reason"] = "artifact_search_disabled_under_containment_lock"
+    trace["artifact_request_status"] = "mandatory_policy_forwarded"
+    trace["artifact_request_reason"] = "artifact_search_governed_by_mandatory_policy"
     return RetrievalBoundaryResult(
         retrieval=effective_retrieval,
-        include_artifacts=False,
+        include_artifacts=None,
         allowed_memory_domains=allowed_memory_domains,
         blocked_memory_domains=blocked_memory_domains,
     )
 
 
+def _validate_result_policy_metadata(
+    value: Any,
+    *,
+    artifact: bool,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, "missing_policy_metadata"
+    if set(value) - RESULT_POLICY_FIELDS:
+        return None, "unexpected_policy_metadata_fields"
+    memory_domains = _policy_label_list(value.get("memory_domains"), limit=16, required=True)
+    sensitivity = value.get("sensitivity")
+    content_class = value.get("content_class")
+    entity_ids = _scope_id_list(value.get("entity_ids", []), limit=64)
+    relationship_ids = _scope_id_list(value.get("relationship_ids", []), limit=64)
+    relationship_scopes = _policy_label_list(value.get("relationship_scopes", []), limit=16)
+    if (
+        memory_domains is None
+        or sensitivity not in {"low", "medium", "high", "restricted"}
+        or entity_ids is None
+        or relationship_ids is None
+        or relationship_scopes is None
+    ):
+        return None, "malformed_policy_metadata"
+    if content_class is not None:
+        content_classes = _artifact_class_list([content_class], limit=1)
+        if content_classes is None:
+            return None, "malformed_policy_metadata"
+        content_class = content_classes[0]
+    if artifact and content_class is None:
+        return None, "missing_artifact_content_class"
+    return {
+        "memory_domains": memory_domains,
+        "sensitivity": sensitivity,
+        "content_class": content_class,
+        "entity_ids": entity_ids,
+        "relationship_ids": relationship_ids,
+        "relationship_scopes": relationship_scopes,
+    }, None
+
+
+def _relationship_projection_allows(
+    metadata: dict[str, Any],
+    relationship_projection: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    if (
+        not isinstance(relationship_projection, dict)
+        or "applied" not in relationship_projection
+    ):
+        return True, None
+    record_relationships = set(metadata.get("relationship_ids") or [])
+    record_entities = set(metadata.get("entity_ids") or [])
+    if relationship_projection.get("applied") is not True:
+        if record_relationships:
+            return False, "relationship_projection_mismatch"
+        return True, None
+    selected_relationships = set(relationship_projection.get("relationship_ids") or [])
+    selected_entities = set(relationship_projection.get("entity_ids") or [])
+    if record_relationships:
+        if not selected_relationships.intersection(record_relationships):
+            return False, "relationship_projection_mismatch"
+    elif record_entities:
+        if not selected_entities.intersection(record_entities):
+            return False, "relationship_projection_mismatch"
+    else:
+        return False, "relationship_projection_mismatch"
+    selected_scopes = set(relationship_projection.get("relationship_scopes") or [])
+    record_scopes = set(metadata.get("relationship_scopes") or [])
+    if selected_scopes and record_scopes and not selected_scopes.intersection(record_scopes):
+        return False, "relationship_scope_mismatch"
+    return True, None
+
+
+def _result_policy_allows_message(
+    metadata: dict[str, Any],
+    *,
+    containment_policy: dict[str, Any],
+    relationship_projection: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    allowed_domains = set(containment_policy.get("allowed_memory_domains") or [])
+    blocked_domains = set(containment_policy.get("blocked_memory_domains") or [])
+    record_domains = set(metadata.get("memory_domains") or [])
+    if metadata.get("sensitivity") == "restricted":
+        return False, "restricted_sensitivity"
+    if not record_domains.intersection(allowed_domains):
+        return False, "memory_domain_not_allowed"
+    if record_domains.intersection(blocked_domains):
+        return False, "blocked_memory_domain"
+    return _relationship_projection_allows(metadata, relationship_projection)
+
+
+def _result_policy_allows_artifact(
+    metadata: dict[str, Any],
+    *,
+    containment_policy: dict[str, Any],
+    relationship_projection: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    artifact_policy = containment_policy.get("artifact_access_policy")
+    if not isinstance(artifact_policy, dict):
+        return False, "missing_artifact_policy"
+    allowed_memory_domains = set(containment_policy.get("allowed_memory_domains") or [])
+    allowed_artifact_domains = set(artifact_policy.get("allowed_domains") or [])
+    blocked_domains = set(containment_policy.get("blocked_memory_domains") or [])
+    record_domains = set(metadata.get("memory_domains") or [])
+    sensitivity = metadata.get("sensitivity")
+    content_class = metadata.get("content_class")
+    if sensitivity == "restricted":
+        return False, "restricted_sensitivity"
+    if not record_domains.intersection(allowed_memory_domains):
+        return False, "memory_domain_not_allowed"
+    if not record_domains.intersection(allowed_artifact_domains):
+        return False, "artifact_domain_not_allowed"
+    if record_domains.intersection(blocked_domains):
+        return False, "blocked_memory_domain"
+    if content_class not in set(artifact_policy.get("allowed_content_classes") or []):
+        return False, "artifact_content_class_not_allowed"
+    if content_class not in set(artifact_policy.get("surface_content_capabilities") or []):
+        return False, "artifact_content_class_not_surface_capable"
+    ceiling = artifact_policy.get("maximum_sensitivity")
+    if SENSITIVITY_RANK.get(sensitivity, 99) > SENSITIVITY_RANK.get(ceiling, -1):
+        return False, "artifact_sensitivity_above_ceiling"
+    return _relationship_projection_allows(metadata, relationship_projection)
+
+
+def _count_collection(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def _record_omission(trace: dict[str, Any], reason: str | None) -> None:
+    reason_key = _sanitize_trace_string(reason, max_length=80) or "unknown"
+    omissions = trace.setdefault("omission_counts_by_reason", {})
+    omissions[reason_key] = int(omissions.get(reason_key, 0)) + 1
+
+
+def _valid_result_source_ref(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    if set(value) - RESULT_SOURCE_REF_FIELDS:
+        return None
+    ref_type = value.get("ref_type")
+    ref_id = _bounded_contract_text(value.get("ref_id"), max_length=160)
+    if ref_type not in {"message", "derived_text"} or not ref_id:
+        return None
+    return {"ref_type": ref_type, "ref_id": ref_id}
+
+
+def _bounded_contract_text(value: Any, *, max_length: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > max_length:
+        return None
+    return cleaned
+
+
+def _valid_result_source_ref_list(value: Any) -> list[dict[str, str]] | None:
+    if not isinstance(value, list) or len(value) > 50:
+        return None
+    refs: list[dict[str, str]] = []
+    for item in value:
+        source_ref = _valid_result_source_ref(item)
+        if source_ref is None:
+            return None
+        refs.append(source_ref)
+    return refs
+
+
+def _valid_result_source_checks(value: Any) -> list[dict[str, str]] | None:
+    if not isinstance(value, list) or not value or len(value) > 50:
+        return None
+    checks: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        ref_type = _bounded_contract_text(item.get("ref_type"), max_length=64)
+        ref_id = _bounded_contract_text(item.get("ref_id"), max_length=160)
+        support_kind = _bounded_contract_text(item.get("support_kind"), max_length=64)
+        availability = _bounded_contract_text(item.get("availability"), max_length=64)
+        if not ref_type or not ref_id or not support_kind or availability != "available":
+            return None
+        checks.append(
+            {
+                "ref_type": ref_type,
+                "ref_id": ref_id,
+                "support_kind": support_kind,
+                "availability": availability,
+            }
+        )
+    return checks
+
+
+def _bounded_json_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= 160 else None
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _valid_provenance_metadata(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 8:
+        return None
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            return None
+        cleaned_key = key.strip()
+        if not cleaned_key or len(cleaned_key) > 64:
+            return None
+        if item is None:
+            out[cleaned_key] = None
+            continue
+        scalar = _bounded_json_scalar(item)
+        if scalar is None:
+            return None
+        out[cleaned_key] = scalar
+    return out
+
+
+def _valid_provenance_source_ref(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if set(value) - PROVENANCE_SOURCE_REF_FIELDS:
+        return None
+    if not PROVENANCE_SOURCE_REF_REQUIRED_FIELDS.issubset(value):
+        return None
+    ref_type = _bounded_contract_text(value.get("ref_type"), max_length=64)
+    ref_id = _bounded_contract_text(value.get("ref_id"), max_length=160)
+    support_kind = _bounded_contract_text(value.get("support_kind"), max_length=64)
+    if not ref_type or not ref_id or not support_kind:
+        return None
+    out: dict[str, Any] = {
+        "ref_type": ref_type,
+        "ref_id": ref_id,
+        "support_kind": support_kind,
+    }
+    for key in ("span", "field_path", "note"):
+        if key in value:
+            bounded = _bounded_contract_text(value.get(key), max_length=160)
+            if bounded is None:
+                return None
+            out[key] = bounded
+    if "metadata" in value:
+        metadata = _valid_provenance_metadata(value.get("metadata"))
+        if metadata is None:
+            return None
+        if metadata:
+            out["metadata"] = metadata
+    return out
+
+
+def _valid_provenance_source_ref_list(value: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list) or not value or len(value) > 50:
+        return None
+    refs: list[dict[str, Any]] = []
+    for item in value:
+        source_ref = _valid_provenance_source_ref(item)
+        if source_ref is None:
+            return None
+        refs.append(source_ref)
+    return refs
+
+
+def _provenance_status_contradicts_completion(value: Any) -> bool:
+    cleaned = _bounded_contract_text(value, max_length=80)
+    if cleaned is None:
+        return True
+    normalized = cleaned.lower()
+    return any(marker in normalized for marker in CONTRADICTORY_PROVENANCE_STATUS_MARKERS)
+
+
+def _valid_artifact_provenance(value: Any, *, owner_id: str) -> tuple[bool, str | None]:
+    if value is None:
+        return True, None
+    if not isinstance(value, dict):
+        return False, "malformed_provenance"
+    if set(value) - RESULT_PROVENANCE_FIELDS:
+        return False, "malformed_provenance"
+    if not PROVENANCE_REQUIRED_FIELDS.issubset(value):
+        return False, "malformed_provenance"
+    if value.get("owner_id") != owner_id:
+        return False, "provenance_owner_mismatch"
+    if value.get("provenance_status") != "complete":
+        return False, "contradictory_provenance"
+    if _provenance_status_contradicts_completion(value.get("status")):
+        return False, "contradictory_provenance"
+    if value.get("effective_status") is not None and _provenance_status_contradicts_completion(
+        value.get("effective_status")
+    ):
+        return False, "contradictory_provenance"
+    if _valid_provenance_source_ref_list(value.get("source_refs")) is None:
+        return False, "malformed_provenance_source_refs"
+    for key in ("derived_id", "derivation_type", "derivation_version", "created_at"):
+        if _bounded_contract_text(value.get(key), max_length=160) is None:
+            return False, "malformed_provenance"
+    confidence = value.get("confidence")
+    if confidence is not None and (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not math.isfinite(float(confidence))
+    ):
+        return False, "malformed_provenance"
+    for key in ("generation_trace_id", "retrieval_reason"):
+        if value.get(key) is not None and _bounded_contract_text(
+            value.get(key),
+            max_length=160,
+        ) is None:
+            return False, "malformed_provenance"
+    if value.get("explanation") is not None and _bounded_contract_text(
+        value.get("explanation"),
+        max_length=500,
+    ) is None:
+        return False, "malformed_provenance"
+    compatibility_defaults = value.get("compatibility_defaults", [])
+    if compatibility_defaults is not None and _sanitize_trace_string_list(
+        compatibility_defaults,
+        limit=20,
+        item_max_length=80,
+    ) != compatibility_defaults:
+        return False, "malformed_provenance"
+    return True, None
+
+
+def _retained_observed_metadata(
+    *,
+    recent: list[dict[str, Any]],
+    semantic: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    estimated_chars = 0
+    has_code_like_content = False
+    mime_types: list[str] = []
+    for item in [*recent, *semantic]:
+        content = item.get("content")
+        if isinstance(content, str):
+            estimated_chars += len(content)
+            has_code_like_content = has_code_like_content or bool(CODE_LIKE_RE.search(content))
+    for item in artifacts:
+        snippet = item.get("snippet")
+        if isinstance(snippet, str):
+            estimated_chars += len(snippet)
+            has_code_like_content = has_code_like_content or bool(CODE_LIKE_RE.search(snippet))
+        policy_metadata = item.get("policy_metadata")
+        if (
+            isinstance(policy_metadata, dict)
+            and policy_metadata.get("content_class") == "code"
+        ):
+            has_code_like_content = True
+    return {
+        "mime_types": mime_types,
+        "has_artifacts": bool(artifacts),
+        "has_code_like_content": has_code_like_content,
+        "estimated_chars": estimated_chars,
+    }
+
+
+def _bounded_retrieval_debug(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("degraded", "fallback", "suppressed"):
+        if isinstance(value.get(key), bool):
+            out[key] = value[key]
+    for key in ("fallback_reason", "suppression_reason", "vector_status"):
+        cleaned = _sanitize_trace_string(value.get(key), max_length=120)
+        if cleaned in RETRIEVAL_DEBUG_STATUSES or cleaned in RETRIEVAL_DEBUG_REASONS:
+            out[key] = cleaned
+    reason_codes = [
+        code
+        for code in _sanitize_trace_string_list(value.get("reason_codes"), limit=20)
+        if code in RETRIEVAL_DEBUG_REASONS
+    ]
+    if reason_codes:
+        out["reason_codes"] = reason_codes
+    return out
+
+
+def _bounded_bms_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    summary = _trace_doctrine_summary({"diagnostics": value})
+    return summary if isinstance(summary, dict) else {}
+
+
 def _apply_persona_containment_result_boundary(
     *,
-    retrieval_bundle: dict[str, Any],
-    persona_containment: dict[str, Any] | None,
-    persona_containment_trace: dict[str, Any] | None,
-) -> dict[str, Any]:
-    trace = _ensure_persona_containment_trace_defaults(persona_containment_trace)
-    if not _persona_containment_lock_active(persona_containment):
-        return retrieval_bundle
+    retrieval_bundle: Any,
+    request_id: str,
+    conversation_id: str,
+    owner_id: str,
+    retrieval: dict[str, Any] | None,
+    containment_policy: dict[str, Any] | None,
+    relationship_projection: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    trace: dict[str, Any] = {
+        "enforcement_mode": (
+            "mandatory" if isinstance(containment_policy, dict) else "not_applicable"
+        ),
+        "validation_status": "not_applied",
+        "envelope_validation_failed": False,
+        "input_counts": {"recent": 0, "semantic": 0, "artifact_refs": 0},
+        "retained_counts": {"recent": 0, "semantic": 0, "artifact_refs": 0},
+        "omission_counts_by_reason": {},
+        "relationship_policy_applied": bool(
+            isinstance(relationship_projection, dict)
+            and relationship_projection.get("applied") is True
+        ),
+        "artifact_policy_applied": isinstance(containment_policy, dict)
+        and isinstance(containment_policy.get("artifact_access_policy"), dict),
+        "post_budget_survivor_filter_removed_sources": False,
+    }
+    if not isinstance(containment_policy, dict):
+        return retrieval_bundle if isinstance(retrieval_bundle, dict) else {}, trace
 
+    empty = _empty_retrieval_bundle(
+        request_id=request_id,
+        conversation_id=conversation_id,
+        reason="mandatory_result_boundary_failed_closed",
+    )
+    if not isinstance(retrieval_bundle, dict):
+        trace["validation_status"] = "failed_closed"
+        trace["envelope_validation_failed"] = True
+        _record_omission(trace, "malformed_retrieval_envelope")
+        return empty, trace
     bundle = retrieval_bundle.get("bundle")
-    if not isinstance(bundle, dict):
-        trace["artifact_result_reason"] = "retrieval_bundle_missing"
-        return retrieval_bundle
+    if (
+        retrieval_bundle.get("request_id") != request_id
+        or retrieval_bundle.get("conversation_id") != conversation_id
+        or not isinstance(bundle, dict)
+    ):
+        trace["validation_status"] = "failed_closed"
+        trace["envelope_validation_failed"] = True
+        _record_omission(trace, "retrieval_envelope_mismatch")
+        return empty, trace
 
-    artifact_refs = bundle.get("artifact_refs")
-    if not isinstance(artifact_refs, list) or not artifact_refs:
-        trace["artifact_result_reason"] = "no_artifact_results_returned"
-        return retrieval_bundle
+    recent_raw = bundle.get("recent")
+    semantic_raw = bundle.get("semantic")
+    artifacts_raw = bundle.get("artifact_refs")
+    trace["input_counts"] = {
+        "recent": _count_collection(recent_raw),
+        "semantic": _count_collection(semantic_raw),
+        "artifact_refs": _count_collection(artifacts_raw),
+    }
+    if not isinstance(recent_raw, list):
+        recent_raw = []
+        _record_omission(trace, "malformed_recent_collection")
+    if not isinstance(semantic_raw, list):
+        semantic_raw = []
+        _record_omission(trace, "malformed_semantic_collection")
+    if not isinstance(artifacts_raw, list):
+        artifacts_raw = []
+        _record_omission(trace, "malformed_artifact_collection")
 
-    sanitized_bundle = dict(bundle)
-    sanitized_bundle["artifact_refs"] = []
-    trace["artifact_result_status"] = "suppressed"
-    trace["artifact_result_reason"] = "unexpected_artifact_results_omitted_under_containment_lock"
-    trace["artifact_result_count_omitted"] = len(artifact_refs)
-    return {**retrieval_bundle, "bundle": sanitized_bundle}
+    scope = retrieval.get("scope") if isinstance(retrieval, dict) else None
+    min_score = retrieval.get("min_score") if isinstance(retrieval, dict) else None
+    if (
+        not isinstance(min_score, (int, float))
+        or isinstance(min_score, bool)
+        or not math.isfinite(float(min_score))
+    ):
+        min_score = None
+
+    def keep_message(item: Any) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(item, dict):
+            return None, "malformed_message_record"
+        message_id = _sanitize_trace_string(item.get("message_id"), max_length=160)
+        role = item.get("role")
+        content = item.get("content")
+        source_ref = _valid_result_source_ref(item.get("source_ref"))
+        if not message_id:
+            return None, "missing_message_id"
+        if item.get("owner_id") != owner_id:
+            return None, "owner_mismatch"
+        if scope == "conversation" and item.get("conversation_id") != conversation_id:
+            return None, "conversation_mismatch"
+        if role not in VALID_RESULT_ROLES:
+            return None, "invalid_message_role"
+        if not isinstance(content, str) or len(content) > 20000:
+            return None, "malformed_message_content"
+        if source_ref is None:
+            return None, "malformed_source_ref"
+        metadata, reason = _validate_result_policy_metadata(
+            item.get("policy_metadata"),
+            artifact=False,
+        )
+        if metadata is None:
+            return None, reason
+        allowed, reason = _result_policy_allows_message(
+            metadata,
+            containment_policy=containment_policy,
+            relationship_projection=relationship_projection,
+        )
+        if not allowed:
+            return None, reason
+        kept: dict[str, Any] = {
+            "message_id": message_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content,
+            "source_ref": source_ref,
+            "policy_metadata": metadata,
+        }
+        for key in (
+            "evidence_role",
+            "created_at",
+            "source_availability",
+            "freshness_state",
+            "durable_status",
+            "last_verified_at",
+            "source_kind",
+            "supersedes",
+            "superseded_by",
+        ):
+            value = item.get(key)
+            if isinstance(value, str):
+                kept[key] = value
+        score = item.get("score")
+        if (
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(float(score))
+        ):
+            kept["score"] = score
+        memory_id = _bounded_contract_text(item.get("memory_id"), max_length=160)
+        if memory_id:
+            kept["memory_id"] = memory_id
+        return kept, None
+
+    def keep_artifact(item: Any) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(item, dict):
+            return None, "malformed_artifact_record"
+        artifact_id = _sanitize_trace_string(item.get("artifact_id"), max_length=160)
+        source_ref = _valid_result_source_ref(item.get("source_ref"))
+        if not artifact_id:
+            return None, "missing_artifact_id"
+        if item.get("owner_id") != owner_id:
+            return None, "owner_mismatch"
+        if not isinstance(item.get("file_path"), str) or not item.get("file_path"):
+            return None, "malformed_artifact_path"
+        if not isinstance(item.get("snippet"), str):
+            return None, "malformed_artifact_snippet"
+        if source_ref is None:
+            return None, "malformed_source_ref"
+        if item.get("source_availability") != "available":
+            return None, "source_unavailable"
+        score = item.get("relevance_score")
+        if min_score is not None and score is None:
+            return None, "missing_relevance_score"
+        if score is not None and (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+        ):
+            return None, "malformed_relevance_score"
+        if min_score is not None and score is not None and score < min_score:
+            return None, "relevance_score_below_minimum"
+        provenance_ok, reason = _valid_artifact_provenance(
+            item.get("provenance"),
+            owner_id=owner_id,
+        )
+        if not provenance_ok:
+            return None, reason
+        metadata, reason = _validate_result_policy_metadata(
+            item.get("policy_metadata"),
+            artifact=True,
+        )
+        if metadata is None:
+            return None, reason
+        allowed, reason = _result_policy_allows_artifact(
+            metadata,
+            containment_policy=containment_policy,
+            relationship_projection=relationship_projection,
+        )
+        if not allowed:
+            return None, reason
+        kept = {
+            "artifact_id": artifact_id,
+            "owner_id": owner_id,
+            "file_path": item["file_path"],
+            "snippet": item["snippet"],
+            "source_ref": source_ref,
+            "source_availability": "available",
+            "policy_metadata": metadata,
+        }
+        for key in (
+            "evidence_role",
+            "repo_name",
+            "freshness_state",
+            "durable_status",
+            "last_verified_at",
+            "source_kind",
+            "supersedes",
+            "superseded_by",
+        ):
+            value = item.get(key)
+            if isinstance(value, str):
+                kept[key] = value
+        if score is not None:
+            kept["relevance_score"] = score
+        confidence = item.get("confidence")
+        if (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and math.isfinite(float(confidence))
+        ):
+            kept["confidence"] = confidence
+        memory_id = _bounded_contract_text(item.get("memory_id"), max_length=160)
+        if memory_id:
+            kept["memory_id"] = memory_id
+        provenance = item.get("provenance")
+        if provenance is not None:
+            kept["provenance"] = provenance
+        source_checks = _valid_result_source_checks(item.get("source_checks"))
+        if source_checks is not None:
+            kept["source_checks"] = source_checks
+        return kept, None
+
+    retained_recent: list[dict[str, Any]] = []
+    retained_semantic: list[dict[str, Any]] = []
+    retained_artifacts: list[dict[str, Any]] = []
+    for collection, output, checker in (
+        (recent_raw, retained_recent, keep_message),
+        (semantic_raw, retained_semantic, keep_message),
+        (artifacts_raw, retained_artifacts, keep_artifact),
+    ):
+        for item in collection:
+            kept, reason = checker(item)
+            if kept is None:
+                _record_omission(trace, reason)
+            else:
+                output.append(kept)
+
+    observed_metadata = _retained_observed_metadata(
+        recent=retained_recent,
+        semantic=retained_semantic,
+        artifacts=retained_artifacts,
+    )
+    token_estimate_total = max(1, observed_metadata["estimated_chars"] // 4) if (
+        observed_metadata["estimated_chars"] > 0
+    ) else 0
+    filtered_bundle = {
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "bundle": {
+            "recent": retained_recent,
+            "semantic": retained_semantic,
+            "artifact_refs": retained_artifacts,
+            "observed_metadata": observed_metadata,
+            "retrieval_debug": _bounded_retrieval_debug(bundle.get("retrieval_debug")),
+            "token_estimate_total": token_estimate_total,
+        },
+    }
+    diagnostics = _bounded_bms_diagnostics(retrieval_bundle.get("diagnostics"))
+    if diagnostics:
+        filtered_bundle["diagnostics"] = diagnostics
+    trace["retained_counts"] = {
+        "recent": len(retained_recent),
+        "semantic": len(retained_semantic),
+        "artifact_refs": len(retained_artifacts),
+    }
+    trace["validation_status"] = "filtered"
+    return filtered_bundle, trace
 
 
 def _restraint_disabled_trace() -> dict[str, Any]:
@@ -317,6 +1344,89 @@ def _model_attempt(
     if error is not None:
         attempt.update(_safe_error_summary(error))
     return attempt
+
+
+def _filtered_retrieval_ids(retrieval_bundle: dict[str, Any]) -> dict[str, list[str]]:
+    bundle = retrieval_bundle.get("bundle") if isinstance(retrieval_bundle, dict) else {}
+    bundle = bundle if isinstance(bundle, dict) else {}
+    semantic = bundle.get("semantic")
+    artifacts = bundle.get("artifact_refs")
+    return {
+        "semantic_message_ids": [
+            item["message_id"]
+            for item in semantic
+            if isinstance(item, dict) and isinstance(item.get("message_id"), str)
+        ][:50]
+        if isinstance(semantic, list)
+        else [],
+        "artifact_ids": [
+            item["artifact_id"]
+            for item in artifacts
+            if isinstance(item, dict) and isinstance(item.get("artifact_id"), str)
+        ][:50]
+        if isinstance(artifacts, list)
+        else [],
+    }
+
+
+def _apply_post_budget_survivor_trace(
+    *,
+    result_boundary_trace: dict[str, Any],
+    retrieval_bundle: dict[str, Any],
+    prompt_trace: dict[str, Any],
+) -> None:
+    filtered_ids = _filtered_retrieval_ids(retrieval_bundle)
+    retained = prompt_trace.get("retained_source_ids")
+    if not isinstance(retained, dict):
+        return
+    retained_semantic = {
+        item for item in retained.get("semantic_message_ids") or [] if isinstance(item, str)
+    }
+    retained_artifacts = {
+        item for item in retained.get("artifact_ids") or [] if isinstance(item, str)
+    }
+    filtered_semantic = set(filtered_ids["semantic_message_ids"])
+    filtered_artifacts = set(filtered_ids["artifact_ids"])
+    result_boundary_trace["post_budget_survivor_filter_removed_sources"] = bool(
+        filtered_semantic - retained_semantic or filtered_artifacts - retained_artifacts
+    )
+    result_boundary_trace["post_budget_retained_counts"] = {
+        "semantic": len(retained_semantic.intersection(filtered_semantic)),
+        "artifact_refs": len(retained_artifacts.intersection(filtered_artifacts)),
+    }
+
+
+def _provider_attempt_evidence(
+    *,
+    ordinal: int,
+    prompt_fingerprint: dict[str, Any],
+    prompt_trace: dict[str, Any],
+) -> dict[str, Any]:
+    retained = prompt_trace.get("retained_source_ids")
+    retained = retained if isinstance(retained, dict) else {}
+    semantic_ids = [
+        item for item in retained.get("semantic_message_ids") or [] if isinstance(item, str)
+    ][:20]
+    artifact_ids = [
+        item for item in retained.get("artifact_ids") or [] if isinstance(item, str)
+    ][:20]
+    return {
+        "attempt_ordinal": max(1, ordinal),
+        "prompt_fingerprint": prompt_fingerprint.get("fingerprint"),
+        "prompt_message_count": prompt_fingerprint.get("message_count"),
+        "prompt_role_sequence": prompt_fingerprint.get("role_sequence"),
+        "retained_semantic_message_count": len(semantic_ids),
+        "retained_artifact_count": len(artifact_ids),
+        "retained_semantic_message_ids": semantic_ids,
+        "retained_artifact_ids": artifact_ids,
+    }
+
+
+def _sanitize_model_call_for_privacy(model_call: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(model_call)
+    sanitized.pop("retained_semantic_message_ids", None)
+    sanitized.pop("retained_artifact_ids", None)
+    return sanitized
 
 
 def _bounded_source_ref(value: Any) -> dict[str, str] | None:
@@ -700,6 +1810,7 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         },
         "provider_prompt": trace.get("provider_prompt", {}),
         "provider_fallback_context": trace.get("provider_fallback_context", {}),
+        "result_boundary": trace.get("result_boundary", {}),
         "token_accounting": {
             "status": (
                 "estimated"
@@ -735,28 +1846,31 @@ def _prompt_fingerprint(messages: list[dict[str, str]]) -> dict[str, Any]:
 def _public_answer_sources(sources: Any) -> list[dict[str, Any]]:
     if not isinstance(sources, list):
         return []
-    private_keys = {
-        "credentials",
-        "download_url",
-        "memory_hygiene",
-        "object_uri",
-        "provenance",
-        "qualification_reasons",
-        "presigned_url",
-        "source_checks",
-        "upload_url",
-    }
     public_sources: list[dict[str, Any]] = []
     for source in sources:
         if not isinstance(source, dict):
             continue
-        public_sources.append(
-            {
-                key: value
-                for key, value in source.items()
-                if isinstance(key, str) and not key.startswith("_") and key not in private_keys
-            }
-        )
+        public_source: dict[str, Any] = {}
+        artifact_id = _sanitize_trace_string(source.get("artifact_id"), max_length=160)
+        if artifact_id:
+            public_source["artifact_id"] = artifact_id
+        repo_name = _sanitize_trace_string(source.get("repo_name"), max_length=160)
+        if repo_name:
+            public_source["repo_name"] = repo_name
+        file_path = _sanitize_trace_string(source.get("file_path"), max_length=240)
+        if file_path:
+            public_source["file_path"] = file_path
+        snippet = source.get("snippet")
+        if isinstance(snippet, str):
+            public_source["snippet"] = snippet[:4000]
+        relevance_score = source.get("relevance_score")
+        if isinstance(relevance_score, (int, float)) and not isinstance(relevance_score, bool):
+            public_source["relevance_score"] = relevance_score
+        source_ref = _valid_result_source_ref(source.get("source_ref"))
+        if source_ref is not None:
+            public_source["source_ref"] = source_ref
+        if public_source:
+            public_sources.append(public_source)
     return public_sources
 
 
@@ -1813,6 +2927,7 @@ async def _resolve_relationship_context(
     trace = response.get("trace")
     selected_relationships = response.get("selected_relationships")
     prompt_content = response.get("prompt_content")
+    projection = response.get("retrieval_scope_projection")
     if not isinstance(trace, dict) or not isinstance(selected_relationships, list):
         return None, {
             "attempted": True,
@@ -1838,6 +2953,14 @@ async def _resolve_relationship_context(
         "active_persona_id": trace.get("active_persona_id"),
         "allowed_relationship_scopes": trace.get("allowed_relationship_scopes", []),
     }
+    if isinstance(projection, dict):
+        base_trace["retrieval_scope_projection_raw"] = {
+            "applied": projection.get("applied"),
+            "relationship_ids": projection.get("relationship_ids"),
+            "entity_ids": projection.get("entity_ids"),
+            "relationship_scopes": projection.get("relationship_scopes"),
+            "reason_codes": projection.get("reason_codes"),
+        }
     if not isinstance(prompt_content, str) or not prompt_content:
         return None, {
             **base_trace,
@@ -1862,6 +2985,104 @@ async def _resolve_relationship_context(
         "status": "included",
         "included": True,
     }
+
+
+async def _resolve_mandatory_retrieval_policy(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    persona_containment: dict[str, Any] | None,
+) -> MandatoryRetrievalPolicy:
+    base_policy, validation_trace = _validate_persona_containment_policy(persona_containment)
+    if base_policy is None:
+        return MandatoryRetrievalPolicy(
+            containment_policy=None,
+            relationship_context=None,
+            relationship_trace={
+                "attempted": False,
+                "status": "skipped",
+                "included": False,
+                "omission_reason": validation_trace.get("policy_validation_reason"),
+                "retrieval_scope_projection_applied": None,
+                "relationship_id_count": 0,
+                "entity_id_count": 0,
+                "relationship_scope_count": 0,
+            },
+            validation_trace=validation_trace,
+        )
+
+    relationship_context, relationship_trace = await _resolve_relationship_context(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        active_persona_id=persona_containment.get("active_persona_id"),
+    )
+    projection_raw = relationship_trace.get("retrieval_scope_projection_raw")
+    if projection_raw is None and isinstance(relationship_trace, dict):
+        projection_raw = relationship_trace.get("retrieval_scope_projection")
+    relationship_trace.pop("retrieval_scope_projection_raw", None)
+    relationship_trace.pop("retrieval_scope_projection", None)
+    projection, projection_reason = _validate_relationship_projection(projection_raw)
+    if projection is None:
+        validation_trace.update(
+            {
+                "policy_validation_status": "failed",
+                "policy_validation_reason": projection_reason,
+            }
+        )
+        relationship_trace.update(
+            {
+                "status": "failed",
+                "included": False,
+                "omission_reason": projection_reason,
+                "retrieval_scope_projection_applied": None,
+                "selected_relationship_count": 0,
+                "excluded_relationship_count": 0,
+                "relationship_edges_used": [],
+                "relationship_edges_excluded": [],
+                "relationship_exclusion_reasons": {},
+                "relationship_context_overlay_applied": False,
+                "relationship_conflicts": [],
+                "relationship_confirmation_required": False,
+                "allowed_relationship_scopes": [],
+                "relationship_id_count": 0,
+                "entity_id_count": 0,
+                "relationship_scope_count": 0,
+            }
+        )
+        return MandatoryRetrievalPolicy(
+            containment_policy=None,
+            relationship_context=None,
+            relationship_trace=relationship_trace,
+            validation_trace=validation_trace,
+        )
+
+    relationship_trace.update(
+        {
+            "retrieval_scope_projection_applied": projection["applied"],
+            "relationship_edges_used": projection["relationship_ids"],
+            "allowed_relationship_scopes": projection["relationship_scopes"],
+            "relationship_id_count": len(projection["relationship_ids"]),
+            "entity_id_count": len(projection["entity_ids"]),
+            "relationship_scope_count": len(projection["relationship_scopes"]),
+        }
+    )
+    return MandatoryRetrievalPolicy(
+        containment_policy={
+            **base_policy,
+            "relationship_scope_projection": projection,
+        },
+        relationship_context=relationship_context,
+        relationship_trace=relationship_trace,
+        validation_trace=validation_trace,
+    )
 
 
 async def _resolve_interrupt_policy(
@@ -2460,8 +3681,35 @@ async def _create_error_trace(
     dsa_trace: dict[str, Any] | None = None,
     model_calls: list[dict[str, Any]] | None = None,
     model_call: dict[str, Any] | None = None,
+    privacy_policy: dict[str, Any] | None = None,
+    privacy_enforced: bool | None = None,
 ) -> None:
-    references = _trace_references(retrieval_bundle)
+    enforce_privacy = (
+        privacy_policy_requires_suppression(privacy_policy)
+        if privacy_enforced is None
+        else privacy_enforced
+    )
+    persisted_prompt_trace = prompt_trace or {}
+    if enforce_privacy:
+        persisted_prompt_trace = sanitize_prompt_trace_for_privacy(
+            persisted_prompt_trace,
+            retrieval_bundle,
+        )
+        persisted_prompt_trace.pop("retained_source_ids", None)
+        prompt_budget = persisted_prompt_trace.get("prompt_budget")
+        if isinstance(prompt_budget, dict):
+            prompt_budget.pop("retained_source_ids", None)
+    persisted_model_calls = (
+        [_sanitize_model_call_for_privacy(call) for call in model_calls or []]
+        if enforce_privacy
+        else model_calls or []
+    )
+    persisted_model_call = (
+        _sanitize_model_call_for_privacy(model_call)
+        if enforce_privacy and isinstance(model_call, dict)
+        else model_call
+    )
+    references = [] if enforce_privacy else _trace_references(retrieval_bundle)
     await memory_store.create_trace(
         request_id=request_id,
         payload={
@@ -2477,9 +3725,13 @@ async def _create_error_trace(
             },
             "retrieval": {
                 "query_present": bool(last_user_text),
-                "bundle": _trace_retrieval(retrieval_bundle),
+                "bundle": (
+                    restricted_retrieval_trace_summary(retrieval_bundle)
+                    if enforce_privacy
+                    else _trace_retrieval(retrieval_bundle)
+                ),
                 "prompt_assembly": {
-                    **(prompt_trace or {}),
+                    **persisted_prompt_trace,
                     "surface_presence": apply_surface_presence_outcome(
                         surface_presence_trace,
                         fallback_active=fallback_used,
@@ -2487,7 +3739,7 @@ async def _create_error_trace(
                     ),
                 },
             },
-            "prompt": _trace_prompt(prompt_trace),
+            "prompt": _trace_prompt(persisted_prompt_trace),
             "router_decision": {
                 "rule_id": route.get("rule_id"),
                 "selected_model": selected_model,
@@ -2513,7 +3765,7 @@ async def _create_error_trace(
                 "applied": override_applied,
                 "rejection_reason": override_reason,
             },
-            "model_call": model_call
+            "model_call": persisted_model_call
             or {
                 "provider": selected_provider,
                 "model": selected_model,
@@ -2521,13 +3773,29 @@ async def _create_error_trace(
                 "latency_ms": None,
                 "error_code": failure_reason,
             },
-            "model_calls": model_calls or [],
+            "model_calls": persisted_model_calls,
             "fallback": {
                 "triggered": fallback_used,
                 "reason": "provider_error" if fallback_used else None,
             },
-            "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
-            "artifacts": _trace_artifacts(retrieval_bundle),
+            "dsa": (
+                persisted_prompt_trace.get("dsa", {})
+                if enforce_privacy
+                else dsa_trace or {"enabled": False, "called": False, "status": "disabled"}
+            ),
+            "artifacts": (
+                {
+                    "status": "omitted",
+                    "artifact_count": len(
+                        retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+                    ),
+                    "included_ids": [],
+                    "source_reference_count": 0,
+                    "reason": "privacy_suppressed",
+                }
+                if enforce_privacy
+                else _trace_artifacts(retrieval_bundle)
+            ),
             "references": references,
             "cost": {},
             "latency_ms": int((perf_counter() - started) * 1000),
@@ -2571,20 +3839,6 @@ async def orchestrate_chat(
     )
     conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
 
-    # Persist incoming user messages first.
-    last_user_message_id = None
-    for msg in payload["messages"]:
-        if msg["role"] == "user":
-            saved = await memory_store.add_message(
-                conversation_id=conversation_id,
-                owner_id=payload["owner_id"],
-                role="user",
-                content=msg["content"],
-                client_id=payload.get("client_id"),
-                metadata={"surface": surface},
-            )
-            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
-
     last_user_text = _extract_last_user_text(payload["messages"])
     recent_messages = _bounded_recent_messages(payload["messages"])
     surface_context = payload.get("surface_context")
@@ -2600,6 +3854,156 @@ async def orchestrate_chat(
         else None
     )
 
+    last_user_message_id = None
+    turn_response: dict[str, Any] | None = None
+    turn_state_trace: dict[str, Any] = _turn_state_disabled_trace()
+    runtime_session_trace: dict[str, Any] = _runtime_session_disabled_trace()
+    interaction_governance: dict[str, Any] | None = None
+    interaction_governance_trace: dict[str, Any] = _interaction_governance_disabled_trace()
+    persona_containment: dict[str, Any] | None = None
+    persona_containment_trace: dict[str, Any] = _persona_containment_disabled_trace()
+    restraint: dict[str, Any] | None = None
+    restraint_trace: dict[str, Any] = _restraint_disabled_trace()
+    mandatory_policy = MandatoryRetrievalPolicy(
+        containment_policy=None,
+        relationship_context=None,
+        relationship_trace=_relationship_context_disabled_trace(),
+        validation_trace={
+            "mandatory_containment_requested": False,
+            "policy_validation_status": "not_requested",
+        },
+    )
+    turn_policy_metadata: dict[str, Any] | None = None
+    turn_policy_omission_reason: str | None = "mandatory_containment_not_requested"
+    result_boundary_trace: dict[str, Any] = {
+        "enforcement_mode": "not_applicable",
+        "validation_status": "not_applied",
+        "envelope_validation_failed": False,
+        "input_counts": {"recent": 0, "semantic": 0, "artifact_refs": 0},
+        "retained_counts": {"recent": 0, "semantic": 0, "artifact_refs": 0},
+        "omission_counts_by_reason": {},
+        "relationship_policy_applied": False,
+        "artifact_policy_applied": False,
+        "post_budget_survivor_filter_removed_sources": False,
+    }
+
+    if persona_containment_enabled:
+        runtime_session, runtime_session_trace = await _resolve_runtime_session(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+        (
+            interaction_governance,
+            interaction_governance_trace,
+        ) = await _resolve_interaction_governance(
+            runtime=runtime,
+            enabled=interaction_governance_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=None,
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        persona_containment, persona_containment_trace = await _resolve_persona_containment(
+            runtime=runtime,
+            enabled=True,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=None,
+            persona_scope_hint=(
+                interaction_governance.get("persona_scope_hint")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        mandatory_policy = await _resolve_mandatory_retrieval_policy(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            persona_containment=persona_containment,
+        )
+        persona_containment_trace.update(mandatory_policy.validation_trace)
+        restraint, restraint_trace = await _resolve_restraint(
+            runtime=runtime,
+            enabled=restraint_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=None,
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            response_posture=(
+                interaction_governance.get("response_posture")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            active_persona_id=(
+                persona_containment.get("active_persona_id")
+                if isinstance(persona_containment, dict)
+                else None
+            ),
+            capability_domain=(
+                persona_containment.get("capability_domain")
+                if isinstance(persona_containment, dict)
+                else None
+            ),
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        relationship_projection = (
+            mandatory_policy.containment_policy.get("relationship_scope_projection")
+            if isinstance(mandatory_policy.containment_policy, dict)
+            else None
+        )
+        turn_policy_metadata, turn_policy_omission_reason = _classify_turn_policy_metadata(
+            persona_containment=persona_containment,
+            relationship_projection=relationship_projection,
+            request_sensitivity=payload.get("sensitivity"),
+            interaction_governance=interaction_governance,
+        )
+
+    for msg in payload["messages"]:
+        if msg["role"] == "user":
+            saved = await memory_store.add_message(
+                conversation_id=conversation_id,
+                owner_id=payload["owner_id"],
+                role="user",
+                content=msg["content"],
+                client_id=payload.get("client_id"),
+                metadata={"surface": surface},
+                policy_metadata=turn_policy_metadata,
+            )
+            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
+
     turn_response, turn_state_trace = await _start_runtime_turn(
         runtime=runtime,
         request_id=request_id,
@@ -2608,89 +4012,77 @@ async def orchestrate_chat(
         surface=surface,
         input_message_id=last_user_message_id,
     )
-    runtime_session = (
-        turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
-    )
-    runtime_session_trace = _runtime_session_trace_from_session(
-        runtime_session,
-        attempted=bool(turn_state_trace.get("attempted")),
-        omission_reason=turn_state_trace.get(
-            "omission_reason",
-            "runtime_session_missing_from_turn_response",
-        ),
-        error_type=turn_state_trace.get("error_type"),
-    )
-    interaction_governance, interaction_governance_trace = await _resolve_interaction_governance(
-        runtime=runtime,
-        enabled=interaction_governance_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        surface_session_id=surface_session_id,
-        active_mode=active_mode,
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    persona_containment, persona_containment_trace = await _resolve_persona_containment(
-        runtime=runtime,
-        enabled=persona_containment_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        persona_scope_hint=(
-            interaction_governance.get("persona_scope_hint")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        interaction_kind=(
-            interaction_governance.get("interaction_kind")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    restraint, restraint_trace = await _resolve_restraint(
-        runtime=runtime,
-        enabled=restraint_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        interaction_kind=(
-            interaction_governance.get("interaction_kind")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        response_posture=(
-            interaction_governance.get("response_posture")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        active_persona_id=(
-            persona_containment.get("active_persona_id")
-            if isinstance(persona_containment, dict)
-            else None
-        ),
-        capability_domain=(
-            persona_containment.get("capability_domain")
-            if isinstance(persona_containment, dict)
-            else None
-        ),
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
+    if not persona_containment_enabled:
+        runtime_session = (
+            turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
+        )
+        runtime_session_trace = _runtime_session_trace_from_session(
+            runtime_session,
+            attempted=bool(turn_state_trace.get("attempted")),
+            omission_reason=turn_state_trace.get(
+                "omission_reason",
+                "runtime_session_missing_from_turn_response",
+            ),
+            error_type=turn_state_trace.get("error_type"),
+        )
+        (
+            interaction_governance,
+            interaction_governance_trace,
+        ) = await _resolve_interaction_governance(
+            runtime=runtime,
+            enabled=interaction_governance_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        persona_containment, persona_containment_trace = await _resolve_persona_containment(
+            runtime=runtime,
+            enabled=False,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            persona_scope_hint=None,
+            interaction_kind=None,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        restraint, restraint_trace = await _resolve_restraint(
+            runtime=runtime,
+            enabled=restraint_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            response_posture=(
+                interaction_governance.get("response_posture")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            active_persona_id=None,
+            capability_domain=None,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
 
     profile = await memory_store.resolve_profile(
         owner_id=payload["owner_id"],
@@ -2744,33 +4136,135 @@ async def orchestrate_chat(
             request_id=request_id,
             turn_status="retrieving",
         )
-        retrieve_bundle_kwargs: dict[str, Any] = {
-            "request_id": request_id,
-            "conversation_id": conversation_id,
-            "owner_id": payload["owner_id"],
-            "query": last_user_text,
-            "retrieval": retrieval_boundary.retrieval,
-            "include_artifacts": retrieval_boundary.include_artifacts,
+        suppression_reason = _restraint_suppression_reason(restraint)
+        dependency_failure_reason = None
+        if persona_containment_enabled and mandatory_policy.containment_policy is None:
+            dependency_failure_reason = (
+                mandatory_policy.validation_trace.get("policy_validation_reason")
+                or "mandatory_containment_unavailable"
+            )
+        retrieval_dispatch_trace = {
+            "mandatory_containment_requested": bool(persona_containment_enabled),
+            "policy_validation_status": mandatory_policy.validation_trace.get(
+                "policy_validation_status"
+            ),
+            "bms_retrieval_call_issued": False,
+            "bms_retrieval_call_suppressed": False,
+            "suppression_or_dependency_reason": None,
+            "relationship_projection_applied": mandatory_policy.relationship_trace.get(
+                "retrieval_scope_projection_applied"
+            ),
+            "relationship_id_count": mandatory_policy.relationship_trace.get(
+                "relationship_id_count",
+                0,
+            ),
+            "entity_id_count": mandatory_policy.relationship_trace.get("entity_id_count", 0),
+            "relationship_scope_count": mandatory_policy.relationship_trace.get(
+                "relationship_scope_count",
+                0,
+            ),
+            "relationship_scope_projection": (
+                mandatory_policy.containment_policy.get("relationship_scope_projection")
+                if isinstance(mandatory_policy.containment_policy, dict)
+                else None
+            ),
+            "neutral_persistence_classification": (
+                "applied" if turn_policy_metadata is not None else "omitted"
+            ),
+            "neutral_persistence_omission_reason": (
+                None if turn_policy_metadata is not None else turn_policy_omission_reason
+            ),
         }
-        if retrieval_boundary.allowed_memory_domains is not None:
-            retrieve_bundle_kwargs["allowed_memory_domains"] = (
-                retrieval_boundary.allowed_memory_domains
+        if suppression_reason or dependency_failure_reason:
+            reason = suppression_reason or dependency_failure_reason or "retrieval_suppressed"
+            retrieval_dispatch_trace.update(
+                {
+                    "bms_retrieval_call_suppressed": True,
+                    "suppression_or_dependency_reason": reason,
+                }
             )
-        if retrieval_boundary.blocked_memory_domains is not None:
-            retrieve_bundle_kwargs["blocked_memory_domains"] = (
-                retrieval_boundary.blocked_memory_domains
+            _set_artifact_result_trace(
+                persona_trace=persona_containment_trace,
+                status="not_requested",
+                reason=reason,
             )
+            if suppression_reason:
+                restraint_trace["retrieval_enforcement_status"] = "suppressed"
+                restraint_trace["retrieval_enforcement_reason"] = suppression_reason
+            retrieval_bundle = _empty_retrieval_bundle(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                reason=reason,
+            )
+        else:
+            retrieve_bundle_kwargs: dict[str, Any] = {
+                "request_id": request_id,
+                "conversation_id": conversation_id,
+                "owner_id": payload["owner_id"],
+                "query": last_user_text,
+                "retrieval": retrieval_boundary.retrieval,
+                "include_artifacts": (
+                    None if persona_containment_enabled else retrieval_boundary.include_artifacts
+                ),
+            }
+            if persona_containment_enabled:
+                retrieve_bundle_kwargs["containment_policy"] = (
+                    mandatory_policy.containment_policy
+                )
+            else:
+                if retrieval_boundary.allowed_memory_domains is not None:
+                    retrieve_bundle_kwargs["allowed_memory_domains"] = (
+                        retrieval_boundary.allowed_memory_domains
+                    )
+                if retrieval_boundary.blocked_memory_domains is not None:
+                    retrieve_bundle_kwargs["blocked_memory_domains"] = (
+                        retrieval_boundary.blocked_memory_domains
+                    )
 
-        retrieval_bundle = await memory_store.retrieve_bundle(
-            **retrieve_bundle_kwargs,
-        )
-        if not isinstance(retrieval_bundle, dict):
-            raise RuntimeError("malformed_retrieval_response")
-        retrieval_bundle = _apply_persona_containment_result_boundary(
-            retrieval_bundle=retrieval_bundle,
-            persona_containment=persona_containment,
-            persona_containment_trace=persona_containment_trace,
-        )
+            retrieval_bundle = await memory_store.retrieve_bundle(
+                **retrieve_bundle_kwargs,
+            )
+            retrieval_dispatch_trace["bms_retrieval_call_issued"] = True
+            if (
+                not isinstance(retrieval_bundle, dict)
+                and mandatory_policy.containment_policy is None
+            ):
+                raise RuntimeError("malformed_retrieval_response")
+            retrieval_bundle, result_boundary_trace = _apply_persona_containment_result_boundary(
+                retrieval_bundle=retrieval_bundle,
+                request_id=request_id,
+                conversation_id=conversation_id,
+                owner_id=payload["owner_id"],
+                retrieval=retrieval_boundary.retrieval,
+                containment_policy=mandatory_policy.containment_policy,
+                relationship_projection=(
+                    mandatory_policy.containment_policy.get("relationship_scope_projection")
+                    if isinstance(mandatory_policy.containment_policy, dict)
+                    else None
+                ),
+            )
+            if (
+                persona_containment_enabled
+                and result_boundary_trace.get("validation_status") == "failed_closed"
+            ):
+                failure_reasons = result_boundary_trace.get("omission_counts_by_reason")
+                failure_reason = None
+                if isinstance(failure_reasons, dict):
+                    failure_reason = next(iter(failure_reasons), None)
+                _set_artifact_result_trace(
+                    persona_trace=persona_containment_trace,
+                    status="failed_closed",
+                    reason=(
+                        _sanitize_trace_string(failure_reason, max_length=80)
+                        or "mandatory_artifact_result_boundary_failed_closed"
+                    ),
+                )
+            elif persona_containment_enabled and isinstance(retrieval_bundle, dict):
+                _set_artifact_result_trace(
+                    persona_trace=persona_containment_trace,
+                    status="validated",
+                    reason="mandatory_artifact_result_boundary_applied",
+                )
         memory_hygiene_result = await apply_memory_hygiene(
             runtime=runtime,
             enabled=memory_hygiene_enabled,
@@ -2830,15 +4324,19 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
-        relationship_context, relationship_context_trace = await _resolve_relationship_context(
-            runtime=runtime,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            active_persona_id=runtime_identity_trace.get("active_persona_id"),
-        )
+        if persona_containment_enabled:
+            relationship_context = mandatory_policy.relationship_context
+            relationship_context_trace = mandatory_policy.relationship_trace
+        else:
+            relationship_context, relationship_context_trace = await _resolve_relationship_context(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -2863,6 +4361,16 @@ async def orchestrate_chat(
             runtime_overlay=runtime_overlay,
             world_state=world_state,
             relationship_context=relationship_context,
+        )
+        provider_retrieval_bundle = (
+            _empty_retrieval_bundle(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                reason="privacy_prompt_suppression",
+            )
+            if privacy_context_enabled
+            and privacy_policy_requires_suppression(privacy_context)
+            else retrieval_bundle
         )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
@@ -2920,6 +4428,7 @@ async def orchestrate_chat(
                         "interaction_governance": interaction_governance_trace,
                         "persona_containment": persona_containment_trace,
                         "restraint": restraint_trace,
+                        "retrieval_dispatch": retrieval_dispatch_trace,
                         "memory_hygiene": (
                             memory_hygiene_result.trace
                             if memory_hygiene_result is not None
@@ -2933,6 +4442,7 @@ async def orchestrate_chat(
                     },
                     surface_presence_trace=surface_presence_trace,
                     dsa_trace=dsa_trace,
+                    privacy_policy=privacy_context,
                 )
                 raise RuntimeError("local_only policy active but no local model available")
             selected_model = local_candidate
@@ -2984,7 +4494,7 @@ async def orchestrate_chat(
             runtime_overlay=runtime_overlay,
             runtime_trace=runtime_trace,
             retrieval_query=last_user_text,
-            retrieval_bundle=retrieval_bundle,
+            retrieval_bundle=provider_retrieval_bundle,
             interrupt_trace=interrupt_trace,
         )
 
@@ -2993,7 +4503,7 @@ async def orchestrate_chat(
         try:
             prompt = assemble_prompt(
                 profile=profile,
-                retrieval_bundle=retrieval_bundle,
+                retrieval_bundle=provider_retrieval_bundle,
                 current_messages=effective_payload["messages"],
                 handoff=handoff,
                 presentation=presentation,
@@ -3057,7 +4567,9 @@ async def orchestrate_chat(
                 "companion_policy": companion_trace,
                 "interaction_governance": interaction_governance_trace,
                 "persona_containment": persona_containment_trace,
+                "result_boundary": result_boundary_trace,
                 "restraint": restraint_trace,
+                "retrieval_dispatch": retrieval_dispatch_trace,
                 "memory_hygiene": (
                     memory_hygiene_result.trace
                     if memory_hygiene_result is not None
@@ -3092,6 +4604,7 @@ async def orchestrate_chat(
                 prompt_trace=budget_prompt_trace,
                 surface_presence_trace=surface_presence_trace,
                 dsa_trace=dsa_trace,
+                privacy_policy=privacy_context,
             )
             await _complete_runtime_turn(
                 runtime=runtime,
@@ -3101,6 +4614,13 @@ async def orchestrate_chat(
             )
             raise RuntimeError(budget_error.reason) from budget_error
         messages = prompt.messages
+        prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
+        prompt.trace["result_boundary"] = result_boundary_trace
+        _apply_post_budget_survivor_trace(
+            result_boundary_trace=result_boundary_trace,
+            retrieval_bundle=retrieval_bundle,
+            prompt_trace=prompt.trace,
+        )
         prompt_fingerprint = _prompt_fingerprint(messages)
         prompt.trace["provider_prompt"] = {
             **prompt_fingerprint,
@@ -3121,22 +4641,36 @@ async def orchestrate_chat(
                 messages=messages,
             )
             model_calls.append(
-                _model_attempt(
-                    provider=selected_provider,
-                    model=selected_model,
-                    status="ok",
-                    latency_ms=int((perf_counter() - model_started) * 1000),
-                )
+                {
+                    **_model_attempt(
+                        provider=selected_provider,
+                        model=selected_model,
+                        status="ok",
+                        latency_ms=int((perf_counter() - model_started) * 1000),
+                    ),
+                    **_provider_attempt_evidence(
+                        ordinal=1,
+                        prompt_fingerprint=prompt_fingerprint,
+                        prompt_trace=prompt.trace,
+                    ),
+                }
             )
         except Exception as e:
             model_calls.append(
-                _model_attempt(
-                    provider=selected_provider,
-                    model=selected_model,
-                    status="failed",
-                    latency_ms=int((perf_counter() - model_started) * 1000),
-                    error=e,
-                )
+                {
+                    **_model_attempt(
+                        provider=selected_provider,
+                        model=selected_model,
+                        status="failed",
+                        latency_ms=int((perf_counter() - model_started) * 1000),
+                        error=e,
+                    ),
+                    **_provider_attempt_evidence(
+                        ordinal=1,
+                        prompt_fingerprint=prompt_fingerprint,
+                        prompt_trace=prompt.trace,
+                    ),
+                }
             )
             fallback_attempt = provider_attempt_plan[1] if len(provider_attempt_plan) > 1 else None
             if fallback_attempt:
@@ -3157,23 +4691,37 @@ async def orchestrate_chat(
                         messages=messages,
                     )
                     model_calls.append(
-                        _model_attempt(
-                            provider=selected_provider,
-                            model=selected_model,
-                            status="ok",
-                            latency_ms=int((perf_counter() - fallback_started) * 1000),
-                        )
+                        {
+                            **_model_attempt(
+                                provider=selected_provider,
+                                model=selected_model,
+                                status="ok",
+                                latency_ms=int((perf_counter() - fallback_started) * 1000),
+                            ),
+                            **_provider_attempt_evidence(
+                                ordinal=2,
+                                prompt_fingerprint=prompt_fingerprint,
+                                prompt_trace=prompt.trace,
+                            ),
+                        }
                     )
                     model_error = model_calls[0].get("error_code")
                 except Exception as fallback_error:
                     model_calls.append(
-                        _model_attempt(
-                            provider=selected_provider,
-                            model=selected_model,
-                            status="failed",
-                            latency_ms=int((perf_counter() - fallback_started) * 1000),
-                            error=fallback_error,
-                        )
+                        {
+                            **_model_attempt(
+                                provider=selected_provider,
+                                model=selected_model,
+                                status="failed",
+                                latency_ms=int((perf_counter() - fallback_started) * 1000),
+                                error=fallback_error,
+                            ),
+                            **_provider_attempt_evidence(
+                                ordinal=2,
+                                prompt_fingerprint=prompt_fingerprint,
+                                prompt_trace=prompt.trace,
+                            ),
+                        }
                     )
                     final_attempt = dict(model_calls[-1])
                     await _create_error_trace(
@@ -3201,6 +4749,7 @@ async def orchestrate_chat(
                         dsa_trace=dsa_trace,
                         model_calls=model_calls,
                         model_call=final_attempt,
+                        privacy_policy=privacy_context,
                     )
                     raise
             else:
@@ -3229,6 +4778,7 @@ async def orchestrate_chat(
                     dsa_trace=dsa_trace,
                     model_calls=model_calls,
                     model_call=final_attempt,
+                    privacy_policy=privacy_context,
                 )
                 await _complete_runtime_turn(
                     runtime=runtime,
@@ -3288,7 +4838,9 @@ async def orchestrate_chat(
                 for item in artifact_refs_for_sources
                 if isinstance(item, dict) and item.get("artifact_id") in retained_artifact_ids
             ]
-        elif prompt.trace.get("prompt_budget"):
+        elif prompt.trace.get("prompt_budget") and not (
+            privacy_context_enabled and privacy_policy_requires_suppression(privacy_context)
+        ):
             artifact_refs_for_sources = []
         answer_sources = _public_answer_sources(artifact_refs_for_sources)
         if privacy_context_enabled and privacy_context is not None:
@@ -3336,11 +4888,18 @@ async def orchestrate_chat(
             content=answer,
             client_id=payload.get("client_id"),
             metadata={"request_id": request_id, "selected_model": selected_model},
+            policy_metadata=turn_policy_metadata,
         )
         prompt.trace["answer_persistence"] = {
             "assistant_message_persisted": True,
             "persistence_acknowledged": True,
             "persisted_role": "assistant",
+            "neutral_policy_metadata": (
+                "applied" if turn_policy_metadata is not None else "omitted"
+            ),
+            "neutral_policy_metadata_omission_reason": (
+                None if turn_policy_metadata is not None else turn_policy_omission_reason
+            ),
         }
 
         await _reset_runtime_after_turn(
@@ -3362,6 +4921,7 @@ async def orchestrate_chat(
         prompt.trace["turn_state"] = turn_state_trace
         prompt.trace["runtime_identity"] = runtime_identity_trace
         prompt.trace["relationship_context"] = relationship_context_trace
+        prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
         prompt.trace["memory_hygiene"] = (
             memory_hygiene_result.trace
             if memory_hygiene_result is not None
@@ -3384,6 +4944,11 @@ async def orchestrate_chat(
         persisted_dsa_trace = (
             persisted_prompt_trace.get("dsa", {}) if privacy_boundary.enforced else dsa_trace
         )
+        persisted_model_calls = (
+            [_sanitize_model_call_for_privacy(call) for call in model_calls]
+            if privacy_boundary.enforced
+            else model_calls
+        )
         persisted_retrieval = {
             "query_present": bool(last_user_text),
             "bundle": (
@@ -3394,7 +4959,7 @@ async def orchestrate_chat(
             "prompt_assembly": persisted_prompt_trace,
         }
         effective_model_call = {
-            **model_calls[-1],
+            **persisted_model_calls[-1],
             "brief": {
                 key: value
                 for key, value in brief_metadata.items()
@@ -3443,7 +5008,7 @@ async def orchestrate_chat(
                     "rejection_reason": override_reason,
                 },
                 "model_call": effective_model_call,
-                "model_calls": model_calls,
+                "model_calls": persisted_model_calls,
                 "fallback": {
                     "triggered": fallback_used,
                     "reason": "provider_error" if fallback_used else None,

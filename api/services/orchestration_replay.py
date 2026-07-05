@@ -55,7 +55,11 @@ class ReplayMemoryStore:
         self.message_ordinal += 1
         role = kwargs["role"]
         request_id = (kwargs.get("metadata") or {}).get("request_id")
-        self._record(f"{role}_message_persistence", request_id)
+        self._record(
+            f"{role}_message_persistence",
+            request_id,
+            policy_metadata_present=kwargs.get("policy_metadata") is not None,
+        )
         return {"message_id": f"message-{self.message_ordinal}"}
 
     async def resolve_profile(self, **kwargs: Any) -> dict[str, Any]:
@@ -78,7 +82,11 @@ class ReplayMemoryStore:
 
     async def retrieve_bundle(self, **kwargs: Any) -> dict[str, Any]:
         request_id = kwargs["request_id"]
-        self._record("bms_retrieval", request_id)
+        self._record(
+            "bms_retrieval",
+            request_id,
+            containment_policy_present=kwargs.get("containment_policy") is not None,
+        )
         mode = self.scenario.get("retrieval", "normal")
         if mode == "unavailable":
             raise BoundaryFailure("bms_unavailable")
@@ -88,6 +96,7 @@ class ReplayMemoryStore:
         semantic: list[dict[str, Any]] = [
             {
                 "owner_id": "owner-replay",
+                "conversation_id": kwargs["conversation_id"],
                 "evidence_role": "canonical",
                 "message_id": "memory-1",
                 "created_at": "2026-01-01T00:00:00+00:00",
@@ -97,6 +106,13 @@ class ReplayMemoryStore:
                 "source_availability": "not_applicable",
                 "freshness_state": "active",
                 "durable_status": "active",
+                "policy_metadata": {
+                    "memory_domains": ["technical"],
+                    "sensitivity": "medium",
+                    "entity_ids": ["entity_repo"],
+                    "relationship_ids": ["rel_project"],
+                    "relationship_scopes": ["project_context"],
+                },
             }
         ]
         artifacts: list[dict[str, Any]] = [
@@ -106,6 +122,7 @@ class ReplayMemoryStore:
                 "artifact_id": "artifact-1",
                 "file_path": "fixture.txt",
                 "snippet": "neutral artifact fixture",
+                "relevance_score": 0.9,
                 "source_ref": {"ref_type": "derived_text", "ref_id": "derived-1"},
                 "source_availability": "available",
                 "source_checks": [
@@ -127,9 +144,27 @@ class ReplayMemoryStore:
                             "support_kind": "direct",
                         }
                     ],
+                    "derivation_version": "v1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "active",
+                    "effective_status": "active",
+                    "confidence": 0.9,
+                    "explanation": "bounded provenance",
+                    "generation_trace_id": "trace-1",
+                    "compatibility_defaults": [],
+                    "provenance_status": "complete",
+                    "retrieval_reason": "semantic_match",
                 },
                 "freshness_state": "active",
                 "durable_status": "active",
+                "policy_metadata": {
+                    "memory_domains": ["technical"],
+                    "sensitivity": "medium",
+                    "content_class": "document",
+                    "entity_ids": ["entity_repo"],
+                    "relationship_ids": ["rel_project"],
+                    "relationship_scopes": ["project_context"],
+                },
             }
         ]
         if mode == "missing_derivative":
@@ -156,6 +191,99 @@ class ReplayMemoryStore:
         elif mode == "artifact_unavailable":
             artifacts = []
             debug.update({"degraded": True, "fallback": "artifact_unavailable"})
+        elif mode == "wave3b_mixed_result_boundary":
+            semantic.append(
+                {
+                    **semantic[0],
+                    "message_id": "memory-restricted",
+                    "content": "restricted replay memory",
+                    "source_ref": {"ref_type": "message", "ref_id": "memory-restricted"},
+                    "policy_metadata": {
+                        **semantic[0]["policy_metadata"],
+                        "sensitivity": "restricted",
+                    },
+                }
+            )
+            artifacts.append(
+                {
+                    **artifacts[0],
+                    "artifact_id": "artifact-blocked",
+                    "snippet": "blocked replay artifact",
+                    "source_ref": {
+                        "ref_type": "derived_text",
+                        "ref_id": "derived-blocked",
+                    },
+                    "policy_metadata": {
+                        **artifacts[0]["policy_metadata"],
+                        "memory_domains": ["finance"],
+                    },
+                }
+            )
+        elif mode == "wave3b_unauthorized_artifact_returned":
+            artifacts[0].update(
+                {
+                    "artifact_id": "artifact-unauthorized",
+                    "snippet": "unauthorized replay artifact",
+                    "source_ref": {
+                        "ref_type": "derived_text",
+                        "ref_id": "derived-unauthorized",
+                    },
+                    "policy_metadata": {
+                        **artifacts[0]["policy_metadata"],
+                        "memory_domains": ["finance"],
+                    },
+                }
+            )
+        elif mode == "wave3b_relationship_projection":
+            semantic[0]["content"] = "selected relationship scoped replay memory"
+            semantic.append(
+                {
+                    **semantic[0],
+                    "message_id": "memory-revoked-relationship",
+                    "content": "excluded relationship replay memory",
+                    "source_ref": {
+                        "ref_type": "message",
+                        "ref_id": "memory-revoked-relationship",
+                    },
+                    "policy_metadata": {
+                        **semantic[0]["policy_metadata"],
+                        "entity_ids": ["entity_revoked"],
+                        "relationship_ids": ["rel_revoked"],
+                    },
+                }
+            )
+            artifacts = []
+        elif mode == "wave3b_privacy_side_channels":
+            semantic[0]["content"] = "PRIVATE_WAVE3B_REPLAY_CONTENT_SENTINEL"
+            semantic[0]["policy_metadata"] = {
+                **semantic[0]["policy_metadata"],
+                "sensitivity": "high",
+            }
+            artifacts[0].update(
+                {
+                    "snippet": "PRIVATE_WAVE3B_REPLAY_ARTIFACT_SENTINEL",
+                    "download_url": "https://signed.example/PRIVATE_WAVE3B_SIGNED_URL",
+                    "object_uri": "memory://PRIVATE_WAVE3B_OBJECT_URI",
+                    "credentials": "PRIVATE_WAVE3B_CREDENTIAL",
+                    "provenance": {
+                        **artifacts[0]["provenance"],
+                        "explanation": "PRIVATE_WAVE3B_PROVENANCE_SENTINEL",
+                    },
+                }
+            )
+            debug.update({"reason_codes": ["source_unavailable"]})
+        elif mode == "wave3b_malformed_response":
+            return {
+                "request_id": "wrong-replay-request",
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [],
+                    "semantic": semantic,
+                    "artifact_refs": artifacts,
+                    "observed_metadata": {"has_code_like_content": True},
+                    "retrieval_debug": debug,
+                },
+            }
         elif mode == "truth_active_parked":
             semantic[0]["content"] = "Current plan is Alpha."
             artifacts[0]["snippet"] = "Old plan was Beta."
@@ -394,6 +522,32 @@ class ReplayMemoryStore:
             recent = []
         if "recent" not in locals():
             recent = []
+        if kwargs.get("containment_policy") is not None:
+            for artifact in artifacts:
+                provenance = artifact.get("provenance")
+                if not isinstance(provenance, dict):
+                    continue
+                source_refs = provenance.get("source_refs")
+                if not isinstance(source_refs, list):
+                    continue
+                allowed_ref_fields = {
+                    "ref_type",
+                    "ref_id",
+                    "support_kind",
+                    "span",
+                    "field_path",
+                    "note",
+                    "metadata",
+                }
+                provenance["source_refs"] = [
+                    {
+                        key: value
+                        for key, value in ref.items()
+                        if key in allowed_ref_fields
+                    }
+                    for ref in source_refs
+                    if isinstance(ref, dict)
+                ]
         return {
             "request_id": request_id,
             "conversation_id": kwargs["conversation_id"],
@@ -426,6 +580,17 @@ class ReplayRuntime:
     def _maybe_fail(self) -> None:
         if self.scenario.get("runtime") == "unavailable":
             raise BoundaryFailure("runtime_unavailable")
+
+    async def resolve_session(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_session", kwargs["request_id"])
+        self._maybe_fail()
+        return {
+            "runtime_session": {
+                "runtime_session_id": "runtime-session-1",
+                "status": "active",
+                "surface": kwargs["surface"],
+            }
+        }
 
     async def start_turn(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_turn_start", kwargs["request_id"])
@@ -488,12 +653,119 @@ class ReplayRuntime:
     async def relationship_select(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_relationships", kwargs["request_id"])
         self._maybe_fail()
+        projection = self.scenario.get("relationship_projection")
+        if not isinstance(projection, dict):
+            projection = {
+                "applied": False,
+                "relationship_ids": [],
+                "entity_ids": [],
+                "relationship_scopes": [],
+                "reason_codes": ["no_eligible_relationship_scope"],
+            }
         return {
             "selected_relationships": [],
             "prompt_content": None,
+            "retrieval_scope_projection": projection,
             "trace": {
                 "selected_relationship_count": 0,
                 "excluded_relationship_count": 0,
+                "relationship_edges_used": [],
+                "relationship_edges_excluded": [],
+                "relationship_exclusion_reasons": {},
+                "relationship_context_overlay_applied": False,
+                "relationship_conflicts": [],
+                "relationship_confirmation_required": False,
+                "active_persona_id": kwargs.get("active_persona_id"),
+                "allowed_relationship_scopes": projection.get("relationship_scopes", []),
+            },
+        }
+
+    async def evaluate_interaction_governance(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_interaction_governance", kwargs["request_id"])
+        self._maybe_fail()
+        return {
+            "result": {
+                "interaction_kind": "question",
+                "response_posture": "direct",
+                "persona_scope_hint": None,
+                "privacy_sensitivity_hint": "normal",
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "action_allowed": False,
+                "requires_confirmation": False,
+                "confidence": 0.9,
+                "reason_summary": ["replay_default"],
+            }
+        }
+
+    async def evaluate_persona_containment(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_persona_containment", kwargs["request_id"])
+        self._maybe_fail()
+        return {
+            "result": {
+                "active_persona_id": "technical_architect",
+                "capability_domain": "technical",
+                "allowed_memory_domains": ["technical"],
+                "blocked_memory_domains": ["finance"],
+                "allowed_world_state_domains": ["technical"],
+                "allowed_relationship_domains": ["project"],
+                "allowed_tool_domains": ["technical"],
+                "cross_scope_access_allowed": False,
+                "cross_scope_reason": "not_requested",
+                "confidence": 0.9,
+                "reason_summary": ["replay_default"],
+                "artifact_access_policy": {
+                    "enforcement_mode": "mandatory",
+                    "allowed_content_classes": ["document"],
+                    "allowed_domains": ["technical"],
+                    "maximum_sensitivity": "medium",
+                    "surface_content_capabilities": ["document"],
+                    "reason_codes": ["replay_default"],
+                },
+            }
+        }
+
+    async def evaluate_restraint(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_restraint", kwargs["request_id"])
+        self._maybe_fail()
+        policy = self.scenario.get("restraint_policy", "answer_normally")
+        suppressed = bool(self.scenario.get("retrieval_suppressed", False))
+        return {
+            "result": {
+                "restraint_policy": policy,
+                "domains": ["retrieval"],
+                "reason": "replay_default",
+                "prompt_overlay": None,
+                "confidence": 0.9,
+                "reason_summary": ["replay_default"],
+                "retrieval_suppressed": suppressed,
+                "personalization_suppressed": False,
+                "proactive_output_suppressed": False,
+                "brevity_preferred": False,
+                "clarification_preferred": False,
+            }
+        }
+
+    async def evaluate_privacy_context(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_privacy_context", kwargs["request_id"])
+        self._maybe_fail()
+        enforce = self.scenario.get("privacy_context") == "replace_answer"
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "surface": kwargs["surface"],
+            "runtime_session_id": kwargs.get("runtime_session_id"),
+            "runtime_turn_id": kwargs.get("runtime_turn_id"),
+            "result": {
+                "surface_type": "public_projector" if enforce else "desktop_private",
+                "redaction_required": enforce,
+                "safe_summary_required": enforce,
+                "sensitive_detail_allowed": not enforce,
+                "screen_detail_allowed": not enforce,
+                "template_id": "privacy_safe_summary" if enforce else None,
+                "confidence": 0.9,
+                "reason_codes": ["replay_privacy_boundary"],
             },
         }
 
@@ -693,6 +965,14 @@ def _provider_prompt_evidence(messages: Any) -> dict[str, bool]:
         "external_context_present": "EXT_CONTEXT_MARKER" in joined,
         "runtime_overlay_present": "RUNTIME_OVERLAY_MARKER" in joined,
         "artifact_context_present": "Private replay artifact" in joined,
+        "selected_relationship_memory_present": (
+            "selected relationship scoped replay memory" in joined
+        ),
+        "excluded_relationship_memory_present": (
+            "excluded relationship replay memory" in joined
+        ),
+        "unauthorized_artifact_present": "unauthorized replay artifact" in joined,
+        "privacy_replay_sentinel_present": "PRIVATE_WAVE3B_REPLAY" in joined,
     }
 
 
@@ -819,6 +1099,12 @@ def _normalize(
     dropped_context = dropped_context if isinstance(dropped_context, dict) else {}
     raw_layers = _layer_by_name(raw_prompt)
     provider_attempts = [call for call in calls if call.get("name") == "provider_attempt"]
+    retrieval_dispatch = raw_prompt.get("retrieval_dispatch")
+    retrieval_dispatch = retrieval_dispatch if isinstance(retrieval_dispatch, dict) else {}
+    result_boundary = raw_prompt.get("result_boundary")
+    result_boundary = result_boundary if isinstance(result_boundary, dict) else {}
+    persona_containment = raw_prompt.get("persona_containment")
+    persona_containment = persona_containment if isinstance(persona_containment, dict) else {}
     return {
         "schema_version": "orchestration-replay-v1",
         "scenario": scenario["scenario"],
@@ -892,6 +1178,74 @@ def _normalize(
                 raw_layers.get("retrieval_augmentation")
             ),
             "dsa": raw_prompt.get("dsa", {}),
+            "retrieval_dispatch": {
+                "mandatory_containment_requested": retrieval_dispatch.get(
+                    "mandatory_containment_requested"
+                ),
+                "policy_validation_status": retrieval_dispatch.get(
+                    "policy_validation_status"
+                ),
+                "bms_retrieval_call_issued": retrieval_dispatch.get(
+                    "bms_retrieval_call_issued"
+                ),
+                "bms_retrieval_call_suppressed": retrieval_dispatch.get(
+                    "bms_retrieval_call_suppressed"
+                ),
+                "suppression_or_dependency_reason": retrieval_dispatch.get(
+                    "suppression_or_dependency_reason"
+                ),
+                "relationship_projection_applied": retrieval_dispatch.get(
+                    "relationship_projection_applied"
+                ),
+                "relationship_id_count": retrieval_dispatch.get("relationship_id_count"),
+                "entity_id_count": retrieval_dispatch.get("entity_id_count"),
+                "relationship_scope_count": retrieval_dispatch.get(
+                    "relationship_scope_count"
+                ),
+                "neutral_persistence_classification": retrieval_dispatch.get(
+                    "neutral_persistence_classification"
+                ),
+            },
+            "persona_containment": {
+                "active_persona_id": persona_containment.get("active_persona_id"),
+                "retrieval_scope_status": persona_containment.get(
+                    "retrieval_scope_status"
+                ),
+                "retrieval_scope_reason": persona_containment.get(
+                    "retrieval_scope_reason"
+                ),
+                "artifact_request_status": persona_containment.get(
+                    "artifact_request_status"
+                ),
+                "artifact_request_reason": persona_containment.get(
+                    "artifact_request_reason"
+                ),
+                "artifact_result_status": persona_containment.get(
+                    "artifact_result_status"
+                ),
+                "artifact_result_reason": persona_containment.get(
+                    "artifact_result_reason"
+                ),
+            },
+            "result_boundary": {
+                "enforcement_mode": result_boundary.get("enforcement_mode"),
+                "validation_status": result_boundary.get("validation_status"),
+                "envelope_validation_failed": result_boundary.get(
+                    "envelope_validation_failed"
+                ),
+                "input_counts": result_boundary.get("input_counts"),
+                "retained_counts": result_boundary.get("retained_counts"),
+                "omission_counts_by_reason": result_boundary.get(
+                    "omission_counts_by_reason"
+                ),
+                "relationship_policy_applied": result_boundary.get(
+                    "relationship_policy_applied"
+                ),
+                "artifact_policy_applied": result_boundary.get("artifact_policy_applied"),
+                "post_budget_survivor_filter_removed_sources": result_boundary.get(
+                    "post_budget_survivor_filter_removed_sources"
+                ),
+            },
         },
         "provider_attempt_count": len(provider_attempts),
         "provider_fingerprints": [
@@ -970,7 +1324,15 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                     model_registry_path=str(registry_path),
                     allow_manual_override=False,
                     enable_runtime_overlays=True,
+                    interaction_governance_enabled=bool(
+                        scenario.get("interaction_governance_enabled")
+                    ),
+                    persona_containment_enabled=bool(
+                        scenario.get("persona_containment_enabled")
+                    ),
+                    restraint_enabled=bool(scenario.get("restraint_enabled")),
                     memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
+                    privacy_context_enabled=bool(scenario.get("privacy_context_enabled")),
                     request_id=request_id,
                     prompt_output_token_reserve=scenario.get(
                         "prompt_output_token_reserve",
@@ -997,7 +1359,13 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                 model_registry_path=str(REGISTRY_PATH),
                 allow_manual_override=False,
                 enable_runtime_overlays=True,
+                interaction_governance_enabled=bool(
+                    scenario.get("interaction_governance_enabled")
+                ),
+                persona_containment_enabled=bool(scenario.get("persona_containment_enabled")),
+                restraint_enabled=bool(scenario.get("restraint_enabled")),
                 memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
+                privacy_context_enabled=bool(scenario.get("privacy_context_enabled")),
                 request_id=request_id,
             )
     except Exception as exc:  # replay snapshots intentionally cover failures

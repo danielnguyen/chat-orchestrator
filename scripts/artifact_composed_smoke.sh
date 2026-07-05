@@ -507,7 +507,7 @@ jq -e '
 privacy_calls="$(fetch_provider_calls "$privacy_request_id")"
 jq -e '
   (.calls | map(select(.kind == "chat")) | length) == 1
-  and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.privacy == true))
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.privacy == false))
   and (.calls | map(select(.kind == "chat")) | all(.sentinel_in_user_messages.privacy == false))
 ' <<<"$privacy_calls" >/dev/null
 privacy_trace="$(fetch_trace "$privacy_request_id")"

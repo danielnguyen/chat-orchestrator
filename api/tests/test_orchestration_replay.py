@@ -9,6 +9,11 @@ from services.orchestration_replay import (
 )
 
 
+async def _snapshot_for_scenario(name: str):
+    fixture = next(item for item in load_corpus() if item["scenario"] == name)
+    return await run_scenario(fixture)
+
+
 @pytest.mark.asyncio
 async def test_memory_store_client_rejects_retrieval_request_id_mismatch():
     client = MemoryStoreClient("http://memory.local", "key")
@@ -32,6 +37,60 @@ async def test_memory_store_client_rejects_retrieval_request_id_mismatch():
     assert captured["json"]["request_id"] == "expected-request"
     assert captured["json"]["owner_id"] == "owner"
     assert captured["json"]["mode"] == "augmented"
+
+
+@pytest.mark.asyncio
+async def test_memory_store_client_serializes_policy_metadata_and_containment_policy():
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = []
+
+    async def fake_post(path, *, request_id=None, json):
+        captured.append({"path": path, "request_id": request_id, "json": json})
+        if path.endswith("/retrieve"):
+            return {"request_id": json["request_id"], "bundle": {}}
+        return {"message_id": "message-1"}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    policy_metadata = {"memory_domains": ["technical"], "sensitivity": "medium"}
+    containment_policy = {
+        "enforcement_mode": "mandatory",
+        "allowed_memory_domains": ["technical"],
+        "blocked_memory_domains": [],
+        "artifact_access_policy": {
+            "enforcement_mode": "mandatory",
+            "allowed_content_classes": ["document"],
+            "allowed_domains": ["technical"],
+            "maximum_sensitivity": "medium",
+            "surface_content_capabilities": ["document"],
+            "reason_codes": ["test"],
+        },
+        "relationship_scope_projection": {"applied": False},
+    }
+
+    await client.add_message(
+        conversation_id="conversation-1",
+        owner_id="owner",
+        role="user",
+        content="hello",
+        client_id="client",
+        metadata={"surface": "dev"},
+        policy_metadata=policy_metadata,
+    )
+    await client.retrieve_bundle(
+        request_id="request-1",
+        conversation_id="conversation-1",
+        owner_id="owner",
+        query="hello",
+        retrieval=None,
+        allowed_memory_domains=["legacy"],
+        blocked_memory_domains=["legacy_blocked"],
+        containment_policy=containment_policy,
+    )
+
+    assert captured[0]["json"]["policy_metadata"] == policy_metadata
+    assert captured[1]["json"]["containment_policy"] == containment_policy
+    assert "allowed_memory_domains" not in captured[1]["json"]
+    assert "blocked_memory_domains" not in captured[1]["json"]
 
 
 @pytest.mark.asyncio
@@ -98,6 +157,13 @@ def test_required_orchestration_replay_categories_are_present():
         "request_id_mismatch",
         "bms_unavailable",
         "trace_persistence_failure",
+        "wave3b_retrieval_suppressed",
+        "wave3b_valid_containment",
+        "wave3b_result_boundary_fallback",
+        "wave3b_co3_unauthorized_artifact",
+        "wave3b_co3_relationship_projection",
+        "wave3b_co3_privacy_sanitization",
+        "wave3b_co3_malformed_mandatory_response",
     } <= categories
 
 
@@ -177,6 +243,93 @@ async def test_model_attempts_and_backward_compatible_summary_are_truthful():
     no_fallback_fixture = next(item for item in load_corpus() if item["category"] == "no_fallback")
     no_fallback = await run_scenario(no_fallback_fixture)
     assert len(no_fallback["trace"]["model_calls"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_wave3b_replay_restraint_records_zero_bms_retrieval():
+    snapshot = await _snapshot_for_scenario("wave3b-retrieval-suppressed-zero-bms")
+    assert "bms_retrieval" not in snapshot["call_order"]
+    dispatch = snapshot["trace"]["retrieval_dispatch"]
+    assert dispatch["bms_retrieval_call_issued"] is False
+    assert dispatch["bms_retrieval_call_suppressed"] is True
+
+
+@pytest.mark.asyncio
+async def test_wave3b_replay_blocks_unauthorized_artifact_from_every_attempt():
+    snapshot = await _snapshot_for_scenario("wave3b-co3-unauthorized-artifact-returned")
+    assert snapshot["provider_attempt_count"] >= 1
+    assert all(
+        attempt["unauthorized_artifact_present"] is False
+        for attempt in snapshot["provider_prompt_evidence"]
+    )
+    retained = snapshot["trace"]["result_boundary"]["retained_counts"]
+    assert retained["artifact_refs"] == 0
+    assert snapshot["sources_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_wave3b_replay_relationship_projection_includes_selected_only():
+    snapshot = await _snapshot_for_scenario("wave3b-co3-relationship-projection-narrows")
+    assert snapshot["provider_attempt_count"] >= 1
+    assert all(
+        attempt["selected_relationship_memory_present"] is True
+        for attempt in snapshot["provider_prompt_evidence"]
+    )
+    assert all(
+        attempt["excluded_relationship_memory_present"] is False
+        for attempt in snapshot["provider_prompt_evidence"]
+    )
+    assert snapshot["trace"]["result_boundary"]["relationship_policy_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_wave3b_replay_fallback_attempt_identity_is_structural():
+    snapshot = await _snapshot_for_scenario("wave3b-co2-fallback-same-prompt")
+    assert snapshot["provider_attempt_count"] == 2
+    assert len(set(snapshot["provider_fingerprints"])) == 1
+    assert len(set(snapshot["provider_message_counts"])) == 1
+    assert snapshot["provider_role_sequences"][0] == snapshot["provider_role_sequences"][1]
+    model_calls = snapshot["trace"]["model_calls"]
+    assert len(model_calls) == 2
+    assert [call["status"] for call in model_calls] == ["failed", "ok"]
+    assert [call["attempt_ordinal"] for call in model_calls] == [1, 2]
+    assert model_calls[0]["prompt_fingerprint"] == model_calls[1]["prompt_fingerprint"]
+    assert model_calls[0]["prompt_message_count"] == model_calls[1]["prompt_message_count"]
+    assert model_calls[0]["prompt_role_sequence"] == model_calls[1]["prompt_role_sequence"]
+    assert model_calls[0]["retained_semantic_message_ids"] == model_calls[1][
+        "retained_semantic_message_ids"
+    ]
+    assert model_calls[0]["retained_artifact_ids"] == model_calls[1]["retained_artifact_ids"]
+    assert model_calls[0]["retained_semantic_message_ids"]
+    assert model_calls[0]["retained_artifact_ids"]
+    assert all("memory-1" in call["retained_semantic_message_ids"] for call in model_calls)
+    assert all("artifact-1" in call["retained_artifact_ids"] for call in model_calls)
+
+
+@pytest.mark.asyncio
+async def test_wave3b_replay_privacy_snapshot_has_no_retained_ids_or_sentinels():
+    snapshot = await _snapshot_for_scenario("wave3b-co3-privacy-side-channels")
+    assert all(
+        attempt["privacy_replay_sentinel_present"] is False
+        for attempt in snapshot["provider_prompt_evidence"]
+    )
+    assert snapshot["trace"]["references"] == []
+    assert snapshot["trace"]["prompt_budget"]["retained_source_ids"] in (None, [])
+    assert snapshot["trace"]["retrieval"].get("artifact_refs") in (None, [])
+    assert_snapshot_privacy_safe(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_wave3b_replay_malformed_mandatory_response_retains_no_ids():
+    snapshot = await _snapshot_for_scenario("wave3b-co3-malformed-mandatory-response")
+    retained = snapshot["trace"]["result_boundary"]["retained_counts"]
+    assert retained["semantic"] == 0
+    assert retained["artifact_refs"] == 0
+    retrieval = snapshot["trace"]["retrieval"]
+    assert retrieval["semantic_count"] == 0
+    assert retrieval["artifact_count"] == 0
+    assert retrieval["semantic"] == []
+    assert retrieval["artifact_refs"] == []
 
 
 @pytest.mark.asyncio

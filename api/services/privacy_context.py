@@ -369,6 +369,17 @@ def _applicable_channel_allowed(policy: dict[str, Any]) -> bool:
     return policy.get("screen_detail_allowed") is True
 
 
+def privacy_policy_requires_suppression(policy: dict[str, Any] | None) -> bool:
+    if not isinstance(policy, dict):
+        return False
+    return (
+        policy.get("redaction_required") is True
+        or policy.get("safe_summary_required") is True
+        or policy.get("sensitive_detail_allowed") is not True
+        or not _applicable_channel_allowed(policy)
+    )
+
+
 def _template_for_surface(surface_type: str) -> tuple[str, str]:
     templates = {
         "notification_preview": (
@@ -407,13 +418,7 @@ def apply_privacy_boundary(
     answer: str,
     sources: list[dict[str, Any]],
 ) -> PrivacyBoundaryResult:
-    must_replace = (
-        policy.get("redaction_required") is True
-        or policy.get("safe_summary_required") is True
-        or policy.get("sensitive_detail_allowed") is not True
-        or not _applicable_channel_allowed(policy)
-    )
-    if not must_replace:
+    if not privacy_policy_requires_suppression(policy):
         return PrivacyBoundaryResult(
             final_answer=answer,
             enforced=False,
