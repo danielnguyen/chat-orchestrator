@@ -652,7 +652,10 @@ def _relationship_projection_allows(
     if record_relationships:
         if not selected_relationships.intersection(record_relationships):
             return False, "relationship_projection_mismatch"
-    elif record_entities and not selected_entities.intersection(record_entities):
+    elif record_entities:
+        if not selected_entities.intersection(record_entities):
+            return False, "relationship_projection_mismatch"
+    else:
         return False, "relationship_projection_mismatch"
     selected_scopes = set(relationship_projection.get("relationship_scopes") or [])
     record_scopes = set(metadata.get("relationship_scopes") or [])

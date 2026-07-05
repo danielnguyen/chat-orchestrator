@@ -3120,6 +3120,24 @@ def test_wave3b_relationship_projection_requires_selected_relationship_id():
     )
     assert (allowed, reason) == (True, None)
 
+    allowed, reason = _relationship_projection_allows(
+        {"relationship_ids": [], "entity_ids": [], "relationship_scopes": []},
+        projection,
+    )
+    assert (allowed, reason) == (False, "relationship_projection_mismatch")
+
+    allowed, reason = _relationship_projection_allows(
+        {"relationship_ids": [], "entity_ids": [], "relationship_scopes": ["project_context"]},
+        projection,
+    )
+    assert (allowed, reason) == (False, "relationship_projection_mismatch")
+
+    allowed, reason = _relationship_projection_allows(
+        {"entity_ids": ["repo:excluded"], "relationship_scopes": ["project_context"]},
+        projection,
+    )
+    assert (allowed, reason) == (False, "relationship_projection_mismatch")
+
     empty_projection = {
         "applied": False,
         "relationship_ids": [],
@@ -3138,6 +3156,105 @@ def test_wave3b_relationship_projection_requires_selected_relationship_id():
         empty_projection,
     )
     assert (allowed, reason) == (True, None)
+
+    allowed, reason = _relationship_projection_allows(
+        {"relationship_ids": [], "entity_ids": [], "relationship_scopes": []},
+        empty_projection,
+    )
+    assert (allowed, reason) == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_wave3b_result_boundary_rejects_domain_valid_records_without_relationship_identity(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    semantic_sentinel = "RELATIONSHIP_IDENTITYLESS_SEMANTIC_SENTINEL"
+    artifact_sentinel = "RELATIONSHIP_IDENTITYLESS_ARTIFACT_SENTINEL"
+
+    identityless_policy = _co2_policy_metadata(relationship_id=None)
+    identityless_policy["relationship_scopes"] = ["project_context"]
+
+    class IdentitylessRelationshipMemoryStore(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            return {
+                "request_id": kwargs["request_id"],
+                "conversation_id": kwargs["conversation_id"],
+                "bundle": {
+                    "recent": [],
+                    "semantic": [
+                        _co2_message(
+                            "semantic-identityless",
+                            f"identityless semantic {semantic_sentinel}",
+                            policy_metadata=identityless_policy,
+                        )
+                    ],
+                    "artifact_refs": [
+                        _co2_artifact(
+                            "artifact-identityless",
+                            f"identityless artifact {artifact_sentinel}",
+                            source_ref={
+                                "ref_type": "derived_text",
+                                "ref_id": "derived-identityless",
+                            },
+                            provenance=_co2_provenance(derived_id="derived-identityless"),
+                            policy_metadata={
+                                **identityless_policy,
+                                "content_class": "document",
+                            },
+                        )
+                    ],
+                    "observed_metadata": {},
+                },
+            }
+
+    memory_store = IdentitylessRelationshipMemoryStore()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "surface": "vscode",
+            "messages": [{"role": "user", "content": "use scoped relationship memory"}],
+            "sensitivity": "private",
+            "retrieval": {"scope": "owner", "min_score": 0.5},
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(
+            restraint_response=_allowed_restraint_response(),
+            relationship_response=_scoped_relationship_response(),
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-wave3b-relationship-identityless-result",
+    )
+
+    prompt_text = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert semantic_sentinel not in prompt_text
+    assert artifact_sentinel not in prompt_text
+    assert out["sources"] == []
+
+    trace = memory_store.trace_calls[0]["payload"]
+    retrieval = trace["retrieval"]["bundle"]
+    assert retrieval["semantic"] == []
+    assert retrieval["artifact_refs"] == []
+    assert trace["references"] == []
+
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    retained = prompt_trace["retained_source_ids"]
+    assert retained["semantic_message_ids"] == []
+    assert retained["artifact_ids"] == []
+
+    boundary = prompt_trace["result_boundary"]
+    assert boundary["relationship_policy_applied"] is True
+    assert boundary["retained_counts"]["semantic"] == 0
+    assert boundary["retained_counts"]["artifact_refs"] == 0
+    assert boundary["omission_counts_by_reason"]["relationship_projection_mismatch"] == 2
 
 
 @pytest.mark.asyncio
