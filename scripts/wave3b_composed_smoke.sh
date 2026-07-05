@@ -642,6 +642,29 @@ SQL
   echo "$artifact_id:$derived_id"
 }
 
+seed_active_memory_item_for_source_ref() {
+  local owner="$1" ref_type="$2" ref_id="$3" summary="$4" source_hash
+  source_hash="$(uuid_for "wave3b-memory-item-$owner-$ref_type-$ref_id")"
+  if ! psql_exec >/dev/null <<SQL
+INSERT INTO memory_items (
+  owner_id, memory_type, summary, source_refs_json, source_ref_hash,
+  scores_json, promotion_state, status, confidence, explanation_json,
+  last_reinforced_at
+) VALUES (
+  '$owner', 'derived_artifact', '$summary',
+  jsonb_build_array(jsonb_build_object('ref_type', '$ref_type', 'ref_id', '$ref_id')),
+  '$source_hash', '{}'::jsonb, 'promoted', 'active', 0.91,
+  jsonb_build_object('rationale', 'wave3b active lifecycle fixture'),
+  now()
+)
+ON CONFLICT DO NOTHING;
+SQL
+  then
+    echo "wave3b-composed-smoke fixture failed: active-memory-item-$ref_id" >&2
+    exit 1
+  fi
+}
+
 qdrant_upsert_derived() {
   local derived_id="$1" artifact_id="$2" owner="$3" client="$4" conversation="$5" file_path="$6" policy="$7" status="$8" vector="${9-}" retrieval_policy_valid="${10:-true}"
   if [ -z "$vector" ]; then
@@ -1138,6 +1161,19 @@ mark_acceptance() {
 
 focused_packet_label() {
   if [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 2 ]; then
+    local has_fallback=false has_privacy=false scenario
+    for scenario in "${selected_scenarios[@]}"; do
+      case "$scenario" in
+        fallback) has_fallback=true ;;
+        privacy) has_privacy=true ;;
+      esac
+    done
+    if [ "$has_fallback" = true ] && [ "$has_privacy" = true ]; then
+      echo "CO-3E"
+      return
+    fi
+  fi
+  if [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 2 ]; then
     local has_relationship=false has_restraint=false scenario
     for scenario in "${selected_scenarios[@]}"; do
       case "$scenario" in
@@ -1261,6 +1297,16 @@ run_harness_selftest() {
   harness_only=false
   focused_composed_selected=true
   assert_packet_label_for_selection "CO-3D" "artifact"
+  selected_scenarios=(fallback privacy)
+  full_suite=false
+  harness_only=false
+  focused_composed_selected=true
+  assert_packet_label_for_selection "CO-3E" "fallback-privacy"
+  selected_scenarios=(privacy fallback)
+  full_suite=false
+  harness_only=false
+  focused_composed_selected=true
+  assert_packet_label_for_selection "CO-3E" "privacy-fallback"
   selected_scenarios=("${saved_selected_scenarios[@]}")
   full_suite="$saved_full_suite"
   harness_only="$saved_harness_only"
@@ -1863,58 +1909,135 @@ scenario_artifact_policy() {
 
 scenario_fallback_identity() {
   local scenario="fallback_identity"
-  local owner="owner-wave3b-s5" conv sentinel="W3B_FALLBACK_ALLOWED_33e" blocked="W3B_FALLBACK_BLOCKED_44f" policy response request_id calls trace before after
+  local owner="owner-wave3b-s5" conv sentinel="W3B_FALLBACK_ALLOWED_33e" artifact_sentinel="W3B_FALLBACK_ART_23a" blocked="W3B_FALLBACK_BLOCKED_44f" blocked_artifact_sentinel="W3B_FALLBACK_BLOCKED_ART_12c" policy artifact_policy response request_id calls trace before after allowed_message_id blocked_message_id allowed_artifact_pair allowed_artifact_id blocked_artifact_pair blocked_artifact_id query query_vector allowed_artifact_vector blocked_artifact_vector allowed_source_refs blocked_source_refs observer_capture
   conv="$(resolve_conversation "$owner" "vscode" "wave3b fallback")"
-  policy="$(policy_json "project" "medium")"
-  seed_message "$conv" "$owner" "vscode" "fallback eligible memory $sentinel" "$policy" "{}" >/dev/null
-  seed_message "$conv" "$owner" "vscode" "fallback blocked finance memory $blocked" "$(policy_json "finance" "medium")" "{}" >/dev/null
-  provider_post "/fixture/sentinels" "$(jq -nc --arg sentinel "$sentinel" --arg blocked "$blocked" '{sentinels:{fallback_allowed:$sentinel,fallback_blocked:$blocked}}')"
+  query="What from memory tests fallback scoped context?"
+  query_vector="$(provider_embedding_vector "$query")"
+  allowed_artifact_vector="$(json_vector_for_score "$query_vector" "0.999")"
+  blocked_artifact_vector="$(json_vector_for_score "$query_vector" "0.998")"
+  policy="$(policy_json "technical" "medium")"
+  artifact_policy="$(policy_json "technical" "medium" "document")"
+  allowed_message_id="$(seed_message "$conv" "$owner" "vscode" "fallback eligible memory $sentinel" "$policy" "{}")"
+  blocked_message_id="$(seed_message "$conv" "$owner" "vscode" "fallback blocked finance memory $blocked" "$(policy_json "finance" "medium")" "{}")"
+  allowed_source_refs="$(jq -nc --arg id "$allowed_message_id" '[{ref_type:"message",ref_id:$id,support_kind:"direct"}]')"
+  blocked_source_refs="$(jq -nc --arg id "$blocked_message_id" '[{ref_type:"message",ref_id:$id,support_kind:"direct"}]')"
+  allowed_artifact_pair="$(seed_artifact "$owner" "vscode" "$conv" "fallback-allowed" "fallback allowed artifact $artifact_sentinel" "$artifact_policy" "completed" "complete" "$allowed_artifact_vector" "text/markdown" "fallback-allowed.md" "$allowed_source_refs")"
+  allowed_artifact_id="${allowed_artifact_pair%%:*}"
+  seed_active_memory_item_for_source_ref "$owner" "derived_text" "${allowed_artifact_pair#*:}" "fallback active artifact lifecycle"
+  blocked_artifact_pair="$(seed_artifact "$owner" "vscode" "$conv" "fallback-blocked" "fallback blocked artifact $blocked_artifact_sentinel" "$(policy_json "finance" "medium" "code")" "completed" "complete" "$blocked_artifact_vector" "text/plain" "fallback-blocked.py" "$blocked_source_refs")"
+  blocked_artifact_id="${blocked_artifact_pair%%:*}"
+  provider_post "/fixture/sentinels" "$(jq -nc \
+    --arg sentinel "$sentinel" \
+    --arg artifact "$artifact_sentinel" \
+    --arg blocked "$blocked" \
+    --arg blocked_artifact "$blocked_artifact_sentinel" \
+    '{sentinels:{fallback_allowed:$sentinel,fallback_artifact:$artifact,fallback_blocked:$blocked,fallback_blocked_artifact:$blocked_artifact}}')"
   provider_post "/fixture/fail-next-primary"
+  bms_observer_reset
   before="$(retrieval_log_count)"
-  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "What from memory tests fallback scoped context?" "private" "desktop_private" "false")"
-  after="$(retrieval_log_count)"
-  test $((after - before)) -eq 1 || { echo "wave3b-composed-smoke assertion failed: fallback scenario did not issue exactly one BMS retrieval" >&2; exit 1; }
+  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "$query" "private" "desktop_private" "true" "0")"
+  after="$(wait_retrieval_log_delta "$before" 1 "$scenario exactly one normal CO to BMS retrieval")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   calls="$(fetch_provider_calls "$request_id")"
   trace="$(fetch_trace "$request_id")"
-  assert_jq "$calls" '[.calls[] | select(.kind=="chat")] | length == 2' "$scenario two provider attempts"
+  observer_capture="$(bms_observer_requests)"
+  assert_jq_arg "$observer_capture" rid "$request_id" '.request_count == 1 and .forwarded_count == 1 and ([.requests[]? | select(.request_id == $rid and .method == "POST" and (.path | test("^/v2/conversations/[^/]+/retrieve$")))] | length) == 1' "$scenario observer captured exactly one normal CO retrieval"
+  assert_jq "$calls" '[.calls[] | select(.kind=="chat")] | length == 2' "$scenario exactly two provider attempts"
+  assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .status] == ["failed","ok"]' "$scenario first provider attempt fails and fallback succeeds"
   assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .normalized_messages] | .[0] == .[1]' "$scenario normalized messages identical"
   assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .prompt_fingerprint] | .[0] == .[1]' "$scenario prompt fingerprints identical"
   assert_jq "$calls" '[.calls[] | select(.kind=="chat") | .message_count] | .[0] == .[1]' "$scenario message counts identical"
+  assert_jq "$calls" '[.calls[] | select(.kind=="chat") | (.normalized_messages | map(.role))] | .[0] == .[1]' "$scenario role sequence identical"
+  assert_jq "$trace" '(.model_calls | length) == 2 and [.model_calls[].status] == ["failed","ok"] and [.model_calls[].attempt_ordinal] == [1,2]' "$scenario persisted two provider attempts with failure then success"
+  assert_jq "$trace" '.model_calls[0].prompt_fingerprint == .model_calls[1].prompt_fingerprint and .model_calls[0].prompt_message_count == .model_calls[1].prompt_message_count and .model_calls[0].prompt_role_sequence == .model_calls[1].prompt_role_sequence' "$scenario per-attempt prompt identity evidence identical"
+  assert_jq "$trace" '.model_calls[0].retained_semantic_message_ids == .model_calls[1].retained_semantic_message_ids and .model_calls[0].retained_artifact_ids == .model_calls[1].retained_artifact_ids and (.model_calls[0].retained_semantic_message_ids | length) > 0 and (.model_calls[0].retained_artifact_ids | length) > 0' "$scenario per-attempt retained IDs identical and non-empty"
+  assert_jq_arg "$trace" id "$allowed_message_id" '(.model_calls[0].retained_semantic_message_ids | index($id)) != null and (.model_calls[1].retained_semantic_message_ids | index($id)) != null' "$scenario allowed semantic memory visible to both attempts"
+  assert_jq_arg "$trace" id "$allowed_artifact_id" '(.model_calls[0].retained_artifact_ids | index($id)) != null and (.model_calls[1].retained_artifact_ids | index($id)) != null' "$scenario allowed artifact visible to both attempts"
+  assert_jq_arg "$trace" id "$blocked_message_id" '([.model_calls[]?.retained_semantic_message_ids[]? | select(. == $id)] | length) == 0' "$scenario blocked semantic memory absent from both attempts"
+  assert_jq_arg "$trace" id "$blocked_artifact_id" '([.model_calls[]?.retained_artifact_ids[]? | select(. == $id)] | length) == 0' "$scenario blocked artifact absent from both attempts"
+  assert_jq_arg "$trace" id "$allowed_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 1' "$scenario allowed semantic retained after BMS result validation"
+  assert_jq_arg "$trace" id "$allowed_artifact_id" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario allowed artifact retained after BMS result validation"
+  assert_jq_arg "$trace" id "$blocked_message_id" '([.retrieval.bundle.semantic[]? | select(.message_id == $id)] | length) == 0' "$scenario omitted semantic record does not reappear"
+  assert_jq_arg "$trace" id "$blocked_artifact_id" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 0' "$scenario omitted artifact record does not reappear"
   assert_provider_sentinel "$calls" "$request_id" "fallback_allowed" true "2"
+  assert_provider_sentinel "$calls" "$request_id" "fallback_artifact" true "2"
   assert_provider_sentinel "$calls" "$request_id" "fallback_blocked" false "2"
+  assert_provider_sentinel "$calls" "$request_id" "fallback_blocked_artifact" false "2"
   assert_jq "$trace" '.retrieval.prompt_assembly.provider_fallback_context.same_sanitized_messages_reused == true' "$scenario bounded trace fallback identity"
-  record_scenario "$scenario" "A8 assertions passed"
+  record_scenario "$scenario" "A8 assertions passed with normal_bms_delta=$((after - before)) provider_attempts=2 retained_semantic_id=$allowed_message_id retained_artifact_id=$allowed_artifact_id"
   mark_acceptance "A8" "$scenario"
 }
 
 scenario_privacy_safe_diagnostics() {
   local scenario="privacy_safe_diagnostics"
-  local owner="owner-wave3b-s6" conv msg="W3B_PRIV_MSG_91a" artifact="W3B_PRIV_ART_82b" meta="W3B_PRIV_META_73c" url="W3B_PRIV_URL_64d" cred="W3B_PRIV_CRED_55e" rel="W3B_PRIV_REL_46f"
+  local owner="owner-wave3b-s6" conv msg="W3B_PRIV_MSG_91a" artifact="W3B_PRIV_ART_82b" meta="W3B_PRIV_META_73c" url="W3B_PRIV_URL_64d" cred="W3B_PRIV_CRED_55e" provenance="W3B_PRIV_PROV_38d" rel="W3B_PRIV_REL_46f" query query_vector artifact_vector
   conv="$(resolve_conversation "$owner" "vscode" "wave3b privacy")"
-  local policy
-  policy="$(policy_json "project" "high" "code")"
-  seed_message "$conv" "$owner" "vscode" "privacy message content $msg" "$policy" "$(jq -nc --arg meta "$meta" '{internal_metadata:$meta}')" >/dev/null
-  seed_artifact "$owner" "vscode" "$conv" "privacy" "privacy artifact snippet $artifact object url $url credential $cred provenance $rel" "$policy" "completed" "complete" >/dev/null
-  provider_post "/fixture/sentinels" "$(jq -nc --arg msg "$msg" --arg artifact "$artifact" --arg meta "$meta" --arg url "$url" --arg cred "$cred" --arg rel "$rel" '{sentinels:{privacy_msg:$msg,privacy_artifact:$artifact,privacy_meta:$meta,privacy_url:$url,privacy_credential:$cred,privacy_relationship:$rel}}')"
+  query="What from memory can be safely summarized for public glasses?"
+  query_vector="$(provider_embedding_vector "$query")"
+  artifact_vector="$(json_vector_for_score "$query_vector" "0.997")"
+  local policy message_id artifact_pair artifact_id derived_id source_refs restricted_entity restricted_rel relationship_fixture
+  policy="$(policy_json "project" "medium" "code")"
+  message_id="$(seed_message "$conv" "$owner" "vscode" "privacy message content $msg" "$policy" "$(jq -nc --arg meta "$meta" '{credential_bearing_metadata:{api_token:$meta}}')")"
+  source_refs="$(jq -nc --arg msg_id "$message_id" --arg cred "$cred" --arg provenance "$provenance" '[{ref_type:"message",ref_id:$msg_id,support_kind:"direct",metadata:{credential_hint:$cred,provenance_marker:$provenance},note:$provenance}]')"
+  artifact_pair="$(seed_artifact "$owner" "vscode" "$conv" "privacy" "privacy artifact snippet $artifact" "$policy" "completed" "complete" "$artifact_vector" "text/plain" "privacy.py" "$source_refs")"
+  artifact_id="${artifact_pair%%:*}"
+  derived_id="${artifact_pair#*:}"
+  seed_active_memory_item_for_source_ref "$owner" "derived_text" "$derived_id" "privacy active artifact lifecycle"
+  psql_exec >/dev/null -c "UPDATE artifacts SET object_uri = 'https://storage.invalid/private/$url?token=$cred' WHERE id = '$artifact_id';"
+  restricted_entity="repo:privacy-restricted"
+  restricted_rel="rel_privacy_restricted"
+  cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "project:wave3b" "Wave 3B Project")" '{request_id:"rid-wave3b-privacy-project",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",entity:$entity}')" >/dev/null
+  cr_post "/v1/relationships/entities/upsert" "$(jq -nc --arg owner "$owner" --argjson entity "$(relationship_entity_json "$restricted_entity" "Restricted privacy repo" "repository" "technical")" '{request_id:"rid-wave3b-privacy-entity",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",entity:$entity}')" >/dev/null
+  relationship_fixture="$(jq -nc \
+    --arg owner "$owner" \
+    --arg rid "$restricted_rel" \
+    --arg entity "$restricted_entity" \
+    --arg relsent "$rel" \
+    --argjson edge "$(relationship_edge_json "$restricted_rel" "$restricted_entity" "active" "restricted" "" "references" "project_context")" \
+    '{request_id:"rid-wave3b-privacy-rel",owner_id:$owner,conversation_id:"conv-privacy",surface:"dev",edge:($edge + {relationship_id:$rid,object_entity_id:$entity,source_type:"explicit_user_confirmation",source_refs_json:[$relsent],sensitivity_level:"restricted"}),evidence:[{evidence_type:"user_confirmation",source_ref:$relsent,summary:$relsent,confidence_delta:0.1}]}')"
+  assert_jq_arg "$relationship_fixture" sentinel "$rel" '.edge.source_refs_json == [$sentinel] and .evidence[0].source_ref == $sentinel and .evidence[0].summary == $sentinel' "$scenario restricted relationship fixture contains sentinel in source refs and evidence"
+  cr_post "/v1/relationships/edges/upsert" "$relationship_fixture" >/dev/null
+  local message_row artifact_row derived_row
+  message_row="$(psql_value -c "SELECT content || '|' || metadata::text FROM messages WHERE id = '$message_id';")"
+  artifact_row="$(psql_value -c "SELECT object_uri FROM artifacts WHERE id = '$artifact_id';")"
+  derived_row="$(psql_value -c "SELECT derivation_params::text FROM derived_text WHERE id = '$derived_id';")"
+  assert_not_contains "$message_row" "__missing_privacy_fixture__" "$scenario message fixture inspected"
+  for sentinel in "$msg" "$meta"; do assert_not_contains "$sentinel" "__impossible__" "$scenario message sentinel defined"; done
+  case "$message_row" in *"$msg"*"$meta"*) ;; *) echo "wave3b-composed-smoke assertion failed: $scenario message content/metadata sentinels missing before CO" >&2; exit 1 ;; esac
+  case "$artifact_row" in *"$url"*"$cred"*) ;; *) echo "wave3b-composed-smoke assertion failed: $scenario artifact object_uri URL/credential sentinels missing before CO" >&2; exit 1 ;; esac
+  case "$derived_row" in *"$cred"*"$provenance"*) ;; *) echo "wave3b-composed-smoke assertion failed: $scenario provenance metadata sentinels missing before CO" >&2; exit 1 ;; esac
+  provider_post "/fixture/sentinels" "$(jq -nc \
+    --arg msg "$msg" --arg artifact "$artifact" --arg meta "$meta" --arg url "$url" --arg cred "$cred" --arg provenance "$provenance" --arg rel "$rel" \
+    '{sentinels:{privacy_msg:$msg,privacy_artifact:$artifact,privacy_meta:$meta,privacy_url:$url,privacy_credential:$cred,privacy_provenance:$provenance,privacy_relationship:$rel}}')"
   local response request_id trace calls
-  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "What from memory can be safely summarized for public glasses?" "private" "glasses_public_or_semi_public" "true")"
+  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "$query" "private" "glasses_public_or_semi_public" "true")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
   assert_provider_chat_calls "$calls" "$request_id" "1"
-  for label in privacy_msg privacy_artifact privacy_meta privacy_url privacy_credential privacy_relationship; do
+  for label in privacy_msg privacy_artifact privacy_meta privacy_url privacy_credential privacy_provenance privacy_relationship; do
     local sentinel
-    sentinel="$(jq -r --arg label "$label" '.sentinels[$label]' <<<"$(jq -nc --arg msg "$msg" --arg artifact "$artifact" --arg meta "$meta" --arg url "$url" --arg cred "$cred" --arg rel "$rel" '{sentinels:{privacy_msg:$msg,privacy_artifact:$artifact,privacy_meta:$meta,privacy_url:$url,privacy_credential:$cred,privacy_relationship:$rel}}')")"
+    sentinel="$(jq -r --arg label "$label" '.sentinels[$label]' <<<"$(jq -nc --arg msg "$msg" --arg artifact "$artifact" --arg meta "$meta" --arg url "$url" --arg cred "$cred" --arg provenance "$provenance" --arg rel "$rel" '{sentinels:{privacy_msg:$msg,privacy_artifact:$artifact,privacy_meta:$meta,privacy_url:$url,privacy_credential:$cred,privacy_provenance:$provenance,privacy_relationship:$rel}}')")"
     assert_not_contains "$response" "$sentinel" "$label-response"
     assert_not_contains "$trace" "$sentinel" "$label-trace"
     assert_not_contains "$calls" "$sentinel" "$label-provider"
   done
+  assert_provider_sentinel "$calls" "$request_id" "privacy_msg" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "privacy_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "privacy_url" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "privacy_credential" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "privacy_provenance" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "privacy_relationship" false "1"
   assert_jq "$response" '.sources == []' "$scenario public sources empty"
-  assert_jq "$trace" '.retrieval.prompt_assembly.privacy_context.enforcement_required == true and (.references | length == 0)' "$scenario privacy trace suppressed references"
+  assert_jq "$trace" '.retrieval.prompt_assembly.privacy_context.enforcement_required == true and (.references | length == 0) and .artifacts.reason == "privacy_suppressed" and (.artifacts.included_ids == []) and (.artifacts | has("ids") | not)' "$scenario privacy trace suppressed references and artifact ids"
   assert_jq "$trace" '.retrieval.prompt_assembly.retrieval.bundle == null or .retrieval.prompt_assembly.retrieval.bundle.semantic == null or (.retrieval.prompt_assembly.retrieval.bundle.semantic | length == 0)' "$scenario no unrestricted bundle payload"
-  assert_jq "$trace" '((.model_calls // []) | all((.prompt_message_count // .message_count // 0) >= 0 and (.prompt_fingerprint | type == "string"))) and ((.model_call // {}) | (.prompt_fingerprint? // "" | type == "string"))' "$scenario bounded model-call evidence retained"
-  record_scenario "$scenario" "A9 assertions passed"
+  assert_jq "$trace" '((.model_calls // []) | all((.prompt_message_count // .message_count // 0) >= 0 and (.prompt_fingerprint | type == "string") and (has("retained_semantic_message_ids") | not) and (has("retained_artifact_ids") | not))) and ((.model_call // {}) | (.prompt_fingerprint? // "" | type == "string"))' "$scenario bounded model-call evidence retained without private retained IDs"
+  assert_jq "$trace" '.retrieval.bundle.privacy_suppressed == true and (.retrieval.bundle.semantic_item_count // 0) >= 1 and (.retrieval.bundle.artifact_count // 0) >= 1' "$scenario bounded counts retained"
+  assert_jq "$trace" '.retrieval.prompt_assembly.result_boundary.validation_status == "filtered" and (.retrieval.prompt_assembly.result_boundary.retained_counts.semantic // 0) >= 1 and (.retrieval.prompt_assembly.result_boundary.retained_counts.artifact_refs // 0) >= 1 and (.retrieval.prompt_assembly.result_boundary.omission_counts_by_reason | type == "object")' "$scenario bounded structural summaries retained"
+  assert_jq "$calls" '([.calls[] | select(.kind=="chat") | .normalized_messages[]? | select(.content | contains("privacy message content") or contains("privacy artifact snippet"))] | length) == 0' "$scenario privacy suppression before provider prompt assembly"
+  assert_not_contains "$response $trace $calls" "$message_id" "privacy-message-id-suppressed"
+  assert_not_contains "$response $trace $calls" "$artifact_id" "privacy-artifact-id-suppressed"
+  record_scenario "$scenario" "A9 assertions passed with structural sentinels message_id=$message_id artifact_id=$artifact_id derived_id=$derived_id"
   mark_acceptance "A9" "$scenario"
 }
 

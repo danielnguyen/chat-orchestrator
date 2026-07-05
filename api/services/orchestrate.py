@@ -1177,8 +1177,6 @@ def _apply_persona_containment_result_boundary(
             "snippet": item["snippet"],
             "source_ref": source_ref,
             "source_availability": "available",
-            "freshness_state": "active",
-            "durable_status": "active",
             "policy_metadata": metadata,
         }
         for key in (
@@ -1413,6 +1411,7 @@ def _provider_attempt_evidence(
         "attempt_ordinal": max(1, ordinal),
         "prompt_fingerprint": prompt_fingerprint.get("fingerprint"),
         "prompt_message_count": prompt_fingerprint.get("message_count"),
+        "prompt_role_sequence": prompt_fingerprint.get("role_sequence"),
         "retained_semantic_message_count": len(semantic_ids),
         "retained_artifact_count": len(artifact_ids),
         "retained_semantic_message_ids": semantic_ids,

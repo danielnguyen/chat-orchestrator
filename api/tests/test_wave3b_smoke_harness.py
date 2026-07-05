@@ -131,6 +131,8 @@ def test_wave3b_harness_selftest_exercises_packet_labels():
     assert 'assert_packet_label_for_selection "CO-3A" "harness"' in source
     assert 'assert_packet_label_for_selection "CO-3B" "shared-memory"' in source
     assert 'assert_packet_label_for_selection "CO-3D" "artifact"' in source
+    assert 'assert_packet_label_for_selection "CO-3E" "fallback-privacy"' in source
+    assert 'assert_packet_label_for_selection "CO-3E" "privacy-fallback"' in source
     assert 'packet: $packet' in source
 
 
@@ -430,3 +432,13 @@ def test_wave3b_artifact_focused_label_is_co3d_only_for_artifact():
     assert 'selected_scenarios[0]}" = "artifact"' in labeler
     assert 'echo "CO-3D"' in labeler
     assert 'selected_scenarios=(artifact)' in source
+
+
+def test_wave3b_fallback_privacy_focused_label_is_co3e_order_independent():
+    source = _script()
+    labeler = source[source.index("focused_packet_label()") : source.index("assert_packet_label_for_selection()")]
+    assert "has_fallback=false" in labeler
+    assert "has_privacy=false" in labeler
+    assert 'echo "CO-3E"' in labeler
+    assert 'selected_scenarios=(fallback privacy)' in source
+    assert 'selected_scenarios=(privacy fallback)' in source

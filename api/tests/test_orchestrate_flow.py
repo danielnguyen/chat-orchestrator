@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 from services.orchestrate import (
+    _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,
     _relationship_projection_allows,
     orchestrate_chat,
@@ -11223,6 +11224,132 @@ def _assert_private_wave2e_values_absent(value):
         assert sentinel not in serialized
 
 
+def _mandatory_project_policy():
+    return {
+        "enforcement_mode": "mandatory",
+        "allowed_memory_domains": ["technical"],
+        "blocked_memory_domains": [],
+        "artifact_access_policy": {
+            "enforcement_mode": "mandatory",
+            "allowed_content_classes": ["code"],
+            "allowed_domains": ["technical"],
+            "maximum_sensitivity": "medium",
+            "surface_content_capabilities": ["code"],
+            "reason_codes": ["artifact_policy_applied"],
+        },
+    }
+
+
+def _artifact_lifecycle_bundle(*, freshness_state_marker=Ellipsis, durable_status_marker=Ellipsis):
+    artifact = {
+        "owner_id": "owner",
+        "evidence_role": "derived",
+        "artifact_id": "artifact-lifecycle",
+        "file_path": "api/lifecycle.py",
+        "snippet": "def lifecycle_fixture(): pass",
+        "relevance_score": 0.9,
+        "source_ref": {"ref_type": "derived_text", "ref_id": "derived-lifecycle"},
+        "source_availability": "available",
+        "source_checks": [
+            {
+                "ref_type": "message",
+                "ref_id": "semantic-message-1",
+                "support_kind": "direct",
+                "availability": "available",
+            }
+        ],
+        "provenance": {
+            "derived_id": "derived-lifecycle",
+            "owner_id": "owner",
+            "derivation_type": "derived_text",
+            "source_refs": [
+                {
+                    "ref_type": "message",
+                    "ref_id": "semantic-message-1",
+                    "support_kind": "direct",
+                }
+            ],
+            "derivation_version": "v1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "active",
+            "effective_status": "active",
+            "confidence": 0.9,
+            "explanation": "bounded provenance",
+            "generation_trace_id": "trace-1",
+            "compatibility_defaults": [],
+            "provenance_status": "complete",
+            "retrieval_reason": "semantic_match",
+        },
+        "policy_metadata": {
+            "memory_domains": ["technical"],
+            "sensitivity": "medium",
+            "content_class": "code",
+            "entity_ids": [],
+            "relationship_ids": [],
+            "relationship_scopes": [],
+        },
+    }
+    if freshness_state_marker is not Ellipsis:
+        artifact["freshness_state"] = freshness_state_marker
+    if durable_status_marker is not Ellipsis:
+        artifact["durable_status"] = durable_status_marker
+    return {
+        "request_id": "rid-lifecycle",
+        "conversation_id": "conv-1",
+        "bundle": {
+            "recent": [],
+            "semantic": [],
+            "artifact_refs": [artifact],
+            "observed_metadata": {},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("freshness_state", "durable_status", "expected"),
+    [
+        (Ellipsis, Ellipsis, {}),
+        (
+            "unknown_freshness",
+            "rebuilding",
+            {"freshness_state": "unknown_freshness", "durable_status": "rebuilding"},
+        ),
+        ("active", "active", {"freshness_state": "active", "durable_status": "active"}),
+    ],
+)
+def test_wave3b_artifact_lifecycle_state_is_not_fabricated_by_result_boundary(
+    freshness_state,
+    durable_status,
+    expected,
+):
+    bundle = _artifact_lifecycle_bundle(
+        freshness_state_marker=freshness_state,
+        durable_status_marker=durable_status,
+    )
+
+    filtered, trace = _apply_persona_containment_result_boundary(
+        retrieval_bundle=bundle,
+        request_id="rid-lifecycle",
+        conversation_id="conv-1",
+        owner_id="owner",
+        retrieval={"scope": "conversation", "min_score": 0},
+        containment_policy=_mandatory_project_policy(),
+        relationship_projection=None,
+    )
+
+    assert trace["validation_status"] == "filtered"
+    artifact = filtered["bundle"]["artifact_refs"][0]
+    for field in ("freshness_state", "durable_status"):
+        if field in expected:
+            assert artifact[field] == expected[field]
+        else:
+            assert field not in artifact
+    if expected.get("freshness_state") != "active":
+        assert artifact.get("freshness_state") != "active"
+    if expected.get("durable_status") != "active":
+        assert artifact.get("durable_status") != "active"
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
@@ -11246,6 +11373,22 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
     assert memory_store.retrieve_calls[0]["conversation_id"] == "conv-1"
     _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
     trace = memory_store.trace_calls[0]["payload"]
+    source_response = await memory_store.retrieve_bundle(
+        request_id="rid-wave2e-additive-fixture",
+        conversation_id="conv-1",
+        owner_id="owner",
+        query="fixture",
+        retrieval={},
+    )
+    assert source_response["raw_bundle"]["semantic"][0]["content"] == (
+        "PRIVATE-DIAGNOSTIC-SENTINEL-RAW-BUNDLE"
+    )
+    assert source_response["augmented_bundle"]["semantic"][0]["content"] == (
+        "PRIVATE-DIAGNOSTIC-SENTINEL-AUG-BUNDLE"
+    )
+    assert source_response["comparison"]["private_query"] == (
+        "PRIVATE-DIAGNOSTIC-SENTINEL-QUERY"
+    )
     doctrine = trace["retrieval"]["bundle"]["doctrine_summary"]
     assert doctrine == {
         "diagnostics_status": "included",
@@ -11281,6 +11424,9 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
     assert trace["owner_id"] == "owner"
     assert trace["prompt"]["token_accounting"]["budget_enforcement"] == "enforced"
     assert trace["prompt"]["prompt_budget"]["status"] == "not_required"
+    assert "raw_bundle" not in trace["retrieval"]["bundle"]
+    assert "augmented_bundle" not in trace["retrieval"]["bundle"]
+    assert "comparison" not in trace["retrieval"]["bundle"]
     _assert_private_wave2e_values_absent(out)
     _assert_private_wave2e_values_absent(trace)
 
@@ -11434,6 +11580,18 @@ async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_
         prompt_trace["provider_fallback_context"]["prompt_fingerprint"]
         == prompt_trace["provider_prompt"]["fingerprint"]
     )
+    model_calls = trace["model_calls"]
+    assert [call["status"] for call in model_calls] == ["failed", "ok"]
+    assert [call["attempt_ordinal"] for call in model_calls] == [1, 2]
+    assert model_calls[0]["prompt_fingerprint"] == model_calls[1]["prompt_fingerprint"]
+    assert model_calls[0]["prompt_message_count"] == model_calls[1]["prompt_message_count"]
+    assert model_calls[0]["prompt_role_sequence"] == model_calls[1]["prompt_role_sequence"]
+    assert model_calls[0]["retained_semantic_message_ids"] == model_calls[1][
+        "retained_semantic_message_ids"
+    ]
+    assert model_calls[0]["retained_artifact_ids"] == model_calls[1]["retained_artifact_ids"]
+    assert model_calls[0]["retained_semantic_message_ids"]
+    assert model_calls[0]["retained_artifact_ids"]
     _assert_private_wave2e_values_absent(out)
     _assert_private_wave2e_values_absent(trace)
 
