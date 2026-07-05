@@ -246,7 +246,7 @@ cr_post() {
 }
 
 co_chat() {
-  local owner="$1" client="$2" surface="$3" conversation="$4" text="$5" sensitivity="${6:-private}" surface_category="${7:-desktop_private}" include_artifacts="${8:-false}"
+  local owner="$1" client="$2" surface="$3" conversation="$4" text="$5" sensitivity="${6:-private}" surface_category="${7:-desktop_private}" include_artifacts="${8:-false}" min_score="${9:-0}"
   curl_json "CO POST /v1/chat" -X POST "http://127.0.0.1:14361/v1/chat" \
     -H "X-API-Key: smoke-orchestrator-key" \
     -H "Content-Type: application/json" \
@@ -259,6 +259,7 @@ co_chat() {
       --arg sensitivity "$sensitivity" \
       --arg surface_category "$surface_category" \
       --argjson include_artifacts "$include_artifacts" \
+      --argjson min_score "$min_score" \
       '{
         owner_id:$owner,
         client_id:$client,
@@ -272,7 +273,7 @@ co_chat() {
         messages:[{role:"user",content:$text}],
         retrieval:{
           k:3,
-          min_score:0,
+          min_score:$min_score,
           scope:"owner",
           time_window:"all",
           retrieval_mode:"balanced",
@@ -571,31 +572,48 @@ seed_message() {
 }
 
 seed_artifact() {
-  local owner="$1" client="$2" conversation="$3" suffix="$4" text="$5" policy="$6" status="${7:-completed}" provenance_status="${8:-complete}"
-  local artifact_id derived_id file_path object_uri derived_status
+  local owner="$1" client="$2" conversation="$3" suffix="$4" text="$5" policy="$6" status="${7:-completed}" provenance_status="${8:-complete}" vector="${9-}" mime="${10:-text/plain}" filename="${11:-}" source_refs="${12:-}"
+  local artifact_id derived_id file_path object_uri derived_status retrieval_policy_valid
   artifact_id="$(uuid_for "wave3b-artifact-$suffix")"
   derived_id="$(uuid_for "wave3b-derived-$suffix")"
-  file_path="wave3b/$suffix.txt"
+  if [ -z "$filename" ]; then
+    filename="$suffix.txt"
+  fi
+  file_path="wave3b/$filename"
   object_uri="memory://wave3b/$suffix"
   derived_status="$provenance_status"
   if [ "$status" = "completed" ] && [ "$provenance_status" = "complete" ]; then
     derived_status="active"
+  fi
+  if [ -z "$source_refs" ]; then
+    source_refs="$(jq -nc --arg id "$derived_id" '[{ref_type:"derived_text",ref_id:$id,support_kind:"direct"}]')"
+  fi
+  if jq -e '(.memory_domains // []) | length > 0' <<<"$policy" >/dev/null 2>&1; then
+    retrieval_policy_valid=true
+  else
+    retrieval_policy_valid=false
   fi
   if ! psql_exec >/dev/null <<SQL
 INSERT INTO artifacts (
   id, owner_id, client_id, conversation_id, filename, mime, size, object_uri,
   source_surface, status, source_kind, repo_name, file_path, policy_metadata, completed_at
 ) VALUES (
-  '$artifact_id', '$owner', '$client', '$conversation', '$suffix.txt', 'text/plain',
+  '$artifact_id', '$owner', '$client', '$conversation', '$filename', '$mime',
   length('$text'), '$object_uri', 'wave3b-smoke', '$status', 'text', 'wave3b-repo',
   '$file_path', '$policy'::jsonb, CASE WHEN '$status' = 'completed' THEN now() ELSE NULL END
 )
-ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status;
+ON CONFLICT (id) DO UPDATE SET
+  filename = EXCLUDED.filename,
+  mime = EXCLUDED.mime,
+  status = EXCLUDED.status,
+  file_path = EXCLUDED.file_path,
+  policy_metadata = EXCLUDED.policy_metadata,
+  completed_at = EXCLUDED.completed_at;
 INSERT INTO derived_text (id, artifact_id, kind, language, text, derivation_params)
 VALUES (
   '$derived_id', '$artifact_id', 'derived_text', 'en', '$text',
   jsonb_build_object(
-    'source_refs', jsonb_build_array(jsonb_build_object('ref_type','derived_text','ref_id','$derived_id')),
+    'source_refs', '$source_refs'::jsonb,
     'status', '$derived_status',
     'effective_status', '$derived_status',
     'provenance_status', '$provenance_status',
@@ -610,14 +628,15 @@ SQL
     echo "wave3b-composed-smoke fixture failed: artifact-sql-$suffix" >&2
     exit 1
   fi
-  qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$conversation" "$file_path" "$policy" "$derived_status"
+  qdrant_upsert_derived "$derived_id" "$artifact_id" "$owner" "$client" "$conversation" "$file_path" "$policy" "$derived_status" "$vector" "$retrieval_policy_valid"
   echo "$artifact_id:$derived_id"
 }
 
 qdrant_upsert_derived() {
-  local derived_id="$1" artifact_id="$2" owner="$3" client="$4" conversation="$5" file_path="$6" policy="$7" status="$8"
-  local vector
-  vector="$(json_vector)"
+  local derived_id="$1" artifact_id="$2" owner="$3" client="$4" conversation="$5" file_path="$6" policy="$7" status="$8" vector="${9-}" retrieval_policy_valid="${10:-true}"
+  if [ -z "$vector" ]; then
+    vector="$(json_vector)"
+  fi
   jq -nc \
     --arg id "$derived_id" \
     --arg artifact "$artifact_id" \
@@ -626,6 +645,7 @@ qdrant_upsert_derived() {
     --arg conversation "$conversation" \
     --arg path "$file_path" \
     --arg status "$status" \
+    --argjson retrieval_policy_valid "$retrieval_policy_valid" \
     --argjson vector "$vector" \
     --argjson policy "$policy" \
     '{
@@ -643,7 +663,7 @@ qdrant_upsert_derived() {
           repo_name:"wave3b-repo",
           chunk_index:0,
           derivation_status:$status,
-          retrieval_policy_valid:true,
+          retrieval_policy_valid:$retrieval_policy_valid,
           memory_domains:$policy.memory_domains,
           sensitivity:$policy.sensitivity,
           entity_ids:($policy.entity_ids // []),
@@ -766,6 +786,25 @@ qdrant_message_scores() {
         limit:$limit,
         with_payload:true,
         filter:{must:[{key:"owner_id",match:{value:$owner}}]}
+      }')"
+}
+
+qdrant_artifact_scores() {
+  local owner="$1" query_vector="$2" limit="${3:-32}"
+  curl_json "Qdrant artifact score evidence" -X POST "http://127.0.0.1:14391/collections/messages/points/search" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc \
+      --arg owner "$owner" \
+      --argjson vector "$query_vector" \
+      --argjson limit "$limit" \
+      '{
+        vector:$vector,
+        limit:$limit,
+        with_payload:true,
+        filter:{must:[
+          {key:"owner_id",match:{value:$owner}},
+          {key:"ref_type",match:{value:"derived_text"}}
+        ]}
       }')"
 }
 
@@ -959,6 +998,36 @@ score_for_message_id() {
   jq -r --arg id "$message_id" '[.result[]? | select(.payload.message_id == $id) | .score] | first // empty' <<<"$score_json"
 }
 
+assert_artifact_score_ordering() {
+  local score_json="$1" eligible_derived_id="$2" crowd_ids_json="$3" min_crowd="$4" effective_limit="$5" label="$6"
+  if ! jq -e \
+    --arg eligible "$eligible_derived_id" \
+    --argjson crowd "$crowd_ids_json" \
+    --argjson min_crowd "$min_crowd" \
+    --argjson effective_limit "$effective_limit" \
+    '
+      (.result | type == "array")
+      and ($min_crowd > $effective_limit)
+      and ([.result[] | select(.payload.derived_text_id == $eligible)] | length == 1)
+      and (
+        [.result[] | select(.payload.derived_text_id as $id | $crowd | index($id))]
+        | length >= $min_crowd
+      )
+      and (
+        ([.result[] | select(.payload.derived_text_id == $eligible)][0].score) as $eligible_score
+        | ([.result[] | select(.payload.derived_text_id as $id | $crowd | index($id)) | select(.score > $eligible_score)] | length) >= $min_crowd
+      )
+    ' <<<"$score_json" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: artifact score ordering label=$label" >&2
+    exit 1
+  fi
+}
+
+score_for_derived_text_id() {
+  local score_json="$1" derived_text_id="$2"
+  jq -r --arg id "$derived_text_id" '[.result[]? | select(.payload.derived_text_id == $id) | .score] | first // empty' <<<"$score_json"
+}
+
 assert_ids_absent_from_json() {
   local json="$1" ids_json="$2" label="$3"
   if ! jq -n -e --argjson ids "$ids_json" --arg text "$json" '
@@ -1047,6 +1116,8 @@ focused_packet_label() {
   fi
   if [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 1 ] && [ "${selected_scenarios[0]}" = "shared_memory" ]; then
     echo "CO-3B"
+  elif [ "$full_suite" != true ] && [ "${#selected_scenarios[@]}" -eq 1 ] && [ "${selected_scenarios[0]}" = "artifact" ]; then
+    echo "CO-3D"
   else
     echo "CO-3A"
   fi
@@ -1149,6 +1220,11 @@ run_harness_selftest() {
   harness_only=false
   focused_composed_selected=true
   assert_packet_label_for_selection "CO-3C" "relationship-restraint"
+  selected_scenarios=(artifact)
+  full_suite=false
+  harness_only=false
+  focused_composed_selected=true
+  assert_packet_label_for_selection "CO-3D" "artifact"
   selected_scenarios=("${saved_selected_scenarios[@]}")
   full_suite="$saved_full_suite"
   harness_only="$saved_harness_only"
@@ -1514,36 +1590,192 @@ scenario_restraint_zero_call() {
 
 scenario_artifact_policy() {
   local scenario="artifact_policy_prelimit_filtering"
-  local owner="owner-wave3b-s4" conv eligible="W3B_ARTIFACT_ELIGIBLE_3b1" blocked="W3B_ARTIFACT_BLOCKED_2aa" credential="W3B_ARTIFACT_CREDENTIAL_5c9"
+  local owner="owner-wave3b-s4" conv query effective_limit=3
+  local eligible_code="W3B_ARTIFACT_ELIGIBLE_CODE_3b1" eligible_doc="W3B_ARTIFACT_ELIGIBLE_DOC_4c2"
+  local blocked="W3B_ARTIFACT_BLOCKED_2aa" outside="W3B_ARTIFACT_OUTSIDE_6bc" sensitive="W3B_ARTIFACT_SENSITIVE_7cd"
+  local unsupported="W3B_ARTIFACT_UNSUPPORTED_8de" malformed="W3B_ARTIFACT_MALFORMED_9ef" incomplete="W3B_ARTIFACT_INCOMPLETE_1f0"
+  local unavailable="W3B_ARTIFACT_UNAVAILABLE_2f1" irrelevant="W3B_ARTIFACT_IRRELEVANT_3f2" credential="W3B_ARTIFACT_CREDENTIAL_5c9"
   conv="$(resolve_conversation "$owner" "vscode" "wave3b artifacts")"
-  local eligible_policy blocked_policy outside_policy sensitive_policy malformed_policy
-  eligible_policy="$(policy_json "project" "medium" "code")"
+  query="What from memory should I use from allowed project artifacts for Wave 3B?"
+  local query_vector eligible_code_vector eligible_doc_vector crowd_vector irrelevant_vector
+  query_vector="$(provider_embedding_vector "$query")"
+  eligible_code_vector="$(json_vector_for_score "$query_vector" "0.62")"
+  eligible_doc_vector="$(json_vector_for_score "$query_vector" "0.61")"
+  crowd_vector="$(json_vector_for_score "$query_vector" "0.98")"
+  irrelevant_vector="$(json_vector_for_score "$query_vector" "0.10")"
+
+  local code_policy doc_policy blocked_policy outside_policy sensitive_policy unsupported_policy malformed_policy
+  code_policy="$(policy_json "project" "medium" "code")"
+  doc_policy="$(policy_json "project" "medium" "document")"
   blocked_policy="$(policy_json "finance" "medium" "code")"
   outside_policy="$(policy_json "personal" "medium" "code")"
   sensitive_policy="$(policy_json "project" "restricted" "code")"
+  unsupported_policy="$(policy_json "project" "medium" "image")"
   malformed_policy='{"memory_domains":[],"sensitivity":"medium","content_class":"code"}'
-  local eligible_artifact_pair eligible_artifact_id
-  eligible_artifact_pair="$(seed_artifact "$owner" "vscode" "$conv" "eligible" "eligible project code artifact $eligible" "$eligible_policy" "completed" "complete")"
-  eligible_artifact_id="${eligible_artifact_pair%%:*}"
-  seed_artifact "$owner" "vscode" "$conv" "blocked" "blocked domain artifact $blocked $credential" "$blocked_policy" "completed" "complete" >/dev/null
-  seed_artifact "$owner" "vscode" "$conv" "outside" "outside domain artifact $blocked" "$outside_policy" "completed" "complete" >/dev/null
-  seed_artifact "$owner" "vscode" "$conv" "sensitive" "restricted artifact $blocked" "$sensitive_policy" "completed" "complete" >/dev/null
-  seed_artifact "$owner" "vscode" "$conv" "malformed" "malformed metadata artifact $blocked" "$malformed_policy" "completed" "complete" >/dev/null
-  seed_artifact "$owner" "vscode" "$conv" "incomplete" "incomplete provenance artifact $blocked" "$eligible_policy" "pending" "building" >/dev/null
-  provider_post "/fixture/sentinels" "$(jq -nc --arg eligible "$eligible" --arg blocked "$blocked" --arg credential "$credential" '{sentinels:{eligible_artifact:$eligible,blocked_artifact:$blocked,artifact_credential:$credential}}')"
 
-  local response request_id trace calls
-  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "What from memory should I use from allowed project artifacts?" "private" "desktop_private" "true")"
+  local eligible_code_pair eligible_doc_pair blocked_pair outside_pair sensitive_pair unsupported_pair malformed_pair incomplete_pair unavailable_pair irrelevant_pair
+  local eligible_code_artifact eligible_code_derived eligible_doc_artifact eligible_doc_derived
+  local blocked_artifact blocked_derived outside_artifact outside_derived sensitive_artifact sensitive_derived unsupported_artifact unsupported_derived
+  local malformed_artifact malformed_derived incomplete_artifact incomplete_derived unavailable_artifact unavailable_derived irrelevant_artifact irrelevant_derived
+  local missing_source_ref
+  missing_source_ref="$(jq -nc --arg id "$(uuid_for "wave3b-missing-artifact-source")" '[{ref_type:"derived_text",ref_id:$id,support_kind:"direct"}]')"
+
+  eligible_code_pair="$(seed_artifact "$owner" "vscode" "$conv" "eligible-code" "eligible project code artifact $eligible_code" "$code_policy" "completed" "complete" "$eligible_code_vector" "text/plain" "eligible-code.py")"
+  eligible_doc_pair="$(seed_artifact "$owner" "vscode" "$conv" "eligible-doc" "eligible project document artifact $eligible_doc" "$doc_policy" "completed" "complete" "$eligible_doc_vector" "text/markdown" "eligible-doc.md")"
+  blocked_pair="$(seed_artifact "$owner" "vscode" "$conv" "blocked-domain" "blocked domain artifact $blocked $credential" "$blocked_policy" "completed" "complete" "$crowd_vector" "text/plain" "blocked-domain.py")"
+  outside_pair="$(seed_artifact "$owner" "vscode" "$conv" "outside-domain" "outside domain artifact $outside $credential" "$outside_policy" "completed" "complete" "$crowd_vector" "text/plain" "outside-domain.py")"
+  sensitive_pair="$(seed_artifact "$owner" "vscode" "$conv" "too-sensitive" "restricted artifact $sensitive $credential" "$sensitive_policy" "completed" "complete" "$crowd_vector" "text/plain" "too-sensitive.py")"
+  unsupported_pair="$(seed_artifact "$owner" "vscode" "$conv" "unsupported-class" "unsupported image artifact $unsupported $credential" "$unsupported_policy" "completed" "complete" "$crowd_vector" "image/png" "unsupported.png")"
+  malformed_pair="$(seed_artifact "$owner" "vscode" "$conv" "malformed-policy" "malformed metadata artifact $malformed $credential" "$malformed_policy" "completed" "complete" "$crowd_vector" "text/plain" "malformed-policy.py")"
+  incomplete_pair="$(seed_artifact "$owner" "vscode" "$conv" "incomplete-lifecycle" "incomplete lifecycle artifact $incomplete $credential" "$code_policy" "pending" "building" "$crowd_vector" "text/plain" "incomplete-lifecycle.py")"
+  unavailable_pair="$(seed_artifact "$owner" "vscode" "$conv" "unavailable-source" "unavailable source artifact $unavailable $credential" "$code_policy" "completed" "complete" "$crowd_vector" "text/plain" "unavailable-source.py" "$missing_source_ref")"
+  irrelevant_pair="$(seed_artifact "$owner" "vscode" "$conv" "irrelevant" "irrelevant project artifact $irrelevant $credential" "$code_policy" "completed" "complete" "$irrelevant_vector" "text/plain" "irrelevant.py")"
+
+  eligible_code_artifact="${eligible_code_pair%%:*}"; eligible_code_derived="${eligible_code_pair#*:}"
+  eligible_doc_artifact="${eligible_doc_pair%%:*}"; eligible_doc_derived="${eligible_doc_pair#*:}"
+  blocked_artifact="${blocked_pair%%:*}"; blocked_derived="${blocked_pair#*:}"
+  outside_artifact="${outside_pair%%:*}"; outside_derived="${outside_pair#*:}"
+  sensitive_artifact="${sensitive_pair%%:*}"; sensitive_derived="${sensitive_pair#*:}"
+  unsupported_artifact="${unsupported_pair%%:*}"; unsupported_derived="${unsupported_pair#*:}"
+  malformed_artifact="${malformed_pair%%:*}"; malformed_derived="${malformed_pair#*:}"
+  incomplete_artifact="${incomplete_pair%%:*}"; incomplete_derived="${incomplete_pair#*:}"
+  unavailable_artifact="${unavailable_pair%%:*}"; unavailable_derived="${unavailable_pair#*:}"
+  irrelevant_artifact="${irrelevant_pair%%:*}"; irrelevant_derived="${irrelevant_pair#*:}"
+
+  local fixture_ids_json negative_artifact_ids_json crowd_derived_ids_json all_negative_sentinels_json
+  fixture_ids_json="$(jq -nc \
+    --arg code "$eligible_code_artifact" --arg code_derived "$eligible_code_derived" \
+    --arg doc "$eligible_doc_artifact" --arg doc_derived "$eligible_doc_derived" \
+    --arg blocked "$blocked_artifact" --arg blocked_derived "$blocked_derived" \
+    --arg outside "$outside_artifact" --arg outside_derived "$outside_derived" \
+    --arg sensitive "$sensitive_artifact" --arg sensitive_derived "$sensitive_derived" \
+    --arg unsupported "$unsupported_artifact" --arg unsupported_derived "$unsupported_derived" \
+    --arg malformed "$malformed_artifact" --arg malformed_derived "$malformed_derived" \
+    --arg incomplete "$incomplete_artifact" --arg incomplete_derived "$incomplete_derived" \
+    --arg unavailable "$unavailable_artifact" --arg unavailable_derived "$unavailable_derived" \
+    --arg irrelevant "$irrelevant_artifact" --arg irrelevant_derived "$irrelevant_derived" \
+    '{
+      positive:{eligible_code:{artifact_id:$code,derived_text_id:$code_derived,content_class:"code"},eligible_document:{artifact_id:$doc,derived_text_id:$doc_derived,content_class:"document"}},
+      negative:{
+        blocked_domain:{artifact_id:$blocked,derived_text_id:$blocked_derived},
+        outside_domain:{artifact_id:$outside,derived_text_id:$outside_derived},
+        sensitivity_above_ceiling:{artifact_id:$sensitive,derived_text_id:$sensitive_derived},
+        unsupported_content_class:{artifact_id:$unsupported,derived_text_id:$unsupported_derived},
+        malformed_policy_metadata:{artifact_id:$malformed,derived_text_id:$malformed_derived},
+        incomplete_lifecycle:{artifact_id:$incomplete,derived_text_id:$incomplete_derived},
+        unavailable_source:{artifact_id:$unavailable,derived_text_id:$unavailable_derived},
+        irrelevant:{artifact_id:$irrelevant,derived_text_id:$irrelevant_derived}
+      }
+    }')"
+  assert_jq "$fixture_ids_json" '(.positive | to_entries | length) == 2 and (.negative | to_entries | length) == 8 and ([.. | objects | select(has("artifact_id") and has("derived_text_id")) | select(.artifact_id != "" and .derived_text_id != "")] | length) == 10' "$scenario every artifact fixture group created"
+  negative_artifact_ids_json="$(jq -c '[.negative[] | .artifact_id]' <<<"$fixture_ids_json")"
+  crowd_derived_ids_json="$(jq -c '[.negative.blocked_domain.derived_text_id,.negative.outside_domain.derived_text_id,.negative.sensitivity_above_ceiling.derived_text_id,.negative.unsupported_content_class.derived_text_id,.negative.malformed_policy_metadata.derived_text_id,.negative.incomplete_lifecycle.derived_text_id,.negative.unavailable_source.derived_text_id]' <<<"$fixture_ids_json")"
+  all_negative_sentinels_json="$(jq -nc --arg blocked "$blocked" --arg outside "$outside" --arg sensitive "$sensitive" --arg unsupported "$unsupported" --arg malformed "$malformed" --arg incomplete "$incomplete" --arg unavailable "$unavailable" --arg irrelevant "$irrelevant" '[$blocked,$outside,$sensitive,$unsupported,$malformed,$incomplete,$unavailable,$irrelevant]')"
+
+  provider_post "/fixture/sentinels" "$(jq -nc \
+    --arg eligible_code "$eligible_code" --arg eligible_doc "$eligible_doc" \
+    --arg blocked "$blocked" --arg outside "$outside" --arg sensitive "$sensitive" --arg unsupported "$unsupported" \
+    --arg malformed "$malformed" --arg incomplete "$incomplete" --arg unavailable "$unavailable" --arg irrelevant "$irrelevant" \
+    --arg credential "$credential" \
+    '{sentinels:{eligible_artifact_code:$eligible_code,eligible_artifact_doc:$eligible_doc,blocked_artifact:$blocked,outside_artifact:$outside,sensitive_artifact:$sensitive,unsupported_artifact:$unsupported,malformed_artifact:$malformed,incomplete_artifact:$incomplete,unavailable_artifact:$unavailable,irrelevant_artifact:$irrelevant,artifact_credential:$credential}}')"
+
+  local score_evidence eligible_score min_ineligible_score
+  score_evidence="$(qdrant_artifact_scores "$owner" "$query_vector" 32)"
+  assert_artifact_score_ordering "$score_evidence" "$eligible_code_derived" "$crowd_derived_ids_json" "7" "$effective_limit" "$scenario ineligible artifact crowd scores above eligible"
+  eligible_score="$(score_for_derived_text_id "$score_evidence" "$eligible_code_derived")"
+  min_ineligible_score="$(jq -r --argjson crowd "$crowd_derived_ids_json" '[.result[]? | select(.payload.derived_text_id as $id | $crowd | index($id)) | .score] | min // empty' <<<"$score_evidence")"
+  assert_jq_arg "$score_evidence" id "$irrelevant_derived" '([.result[]? | select(.payload.derived_text_id == $id)] | length) == 1' "$scenario irrelevant artifact score evidence present"
+
+  local direct_policy direct_bms_request direct_bms_response
+  direct_policy="$(jq -nc '{
+    enforcement_mode:"mandatory",
+    allowed_memory_domains:["project"],
+    blocked_memory_domains:[],
+    artifact_access_policy:{
+      enforcement_mode:"mandatory",
+      allowed_content_classes:["document","code"],
+      allowed_domains:["project"],
+      maximum_sensitivity:"high",
+      surface_content_capabilities:["document","code"],
+      reason_codes:["artifact_policy_applied","restricted_artifact_access_blocked"]
+    },
+    relationship_scope_projection:null
+  }')"
+  direct_bms_request="wave3b-direct-artifact"
+  direct_bms_response="$(bms_retrieve_bundle "$conv" "$direct_bms_request" "$(jq -nc \
+    --arg request_id "$direct_bms_request" \
+    --arg owner "$owner" \
+    --arg query "$query" \
+    --argjson policy "$direct_policy" \
+    '{
+      request_id:$request_id,
+      owner_id:$owner,
+      query:$query,
+      retrieval:{k:3,min_score:0.5,scope:"owner",time_window:"all",retrieval_mode:"balanced"},
+      include_artifacts:true,
+      containment_policy:$policy
+    }')")"
+  if ! jq -e \
+    --arg code "$eligible_code_artifact" \
+    --arg doc "$eligible_doc_artifact" \
+    --argjson negatives "$negative_artifact_ids_json" \
+    --argjson limit "$effective_limit" \
+    --argjson min_ineligible "$min_ineligible_score" \
+    '
+      .bundle.retrieval_debug.containment_policy.pre_limit_policy_filter_applied == true
+      and ((.bundle.retrieval_debug.artifact_ranked // 0) <= $limit)
+      and ((.bundle.retrieval_debug.truth_qualification.derivative_omissions_by_reason.missing_derivative_source_record // 0) >= 1)
+      and ((.diagnostics.reason_codes // [] | index("mandatory_containment_applied")) != null)
+      and ((.diagnostics.reason_codes // [] | index("source_missing_or_unavailable")) != null)
+      and ([.bundle.artifact_refs[]? | select(.artifact_id == $code)] | length) == 1
+      and ([.bundle.artifact_refs[]? | select(.artifact_id == $doc)] | length) == 1
+      and ([.bundle.artifact_refs[]? | select(.artifact_id as $id | $negatives | index($id))] | length) == 0
+      and ([.bundle.artifact_refs[]?] | length) <= $limit
+      and ([.bundle.artifact_refs[]? | select(.artifact_id == $code) | .relevance_score] | first) < $min_ineligible
+    ' <<<"$direct_bms_response" >/dev/null; then
+    echo "wave3b-composed-smoke assertion failed: $scenario direct BMS artifact pre-limit mandatory filtering before limiting" >&2
+    exit 1
+  fi
+  assert_ids_absent_from_json "$direct_bms_response" "$negative_artifact_ids_json" "artifact-direct-bms-negative-artifact-ids"
+
+  local before after response request_id trace calls
+  before="$(retrieval_log_count)"
+  response="$(co_chat "$owner" "vscode" "vscode" "$conv" "$query" "private" "desktop_private" "true" "0.5")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  after="$(wait_retrieval_log_delta "$before" 1 "$scenario normal CO artifact request BMS retrieval boundary")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
-  assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated"' "$scenario artifact policy validated"
-  assert_provider_sentinel "$calls" "$request_id" "eligible_artifact" true "1"
+  assert_jq "$trace" '.retrieval.prompt_assembly.persona_containment.artifact_request_status == "mandatory_policy_forwarded" and .retrieval.prompt_assembly.persona_containment.artifact_result_status == "validated" and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains // [] | index("project")) != null' "$scenario artifact policy validated"
+  assert_jq "$trace" '.retrieval.prompt_assembly.result_boundary.artifact_policy_applied == true and .retrieval.prompt_assembly.result_boundary.validation_status == "filtered" and (.retrieval.prompt_assembly.result_boundary.retained_counts.artifact_refs // 0) >= 2' "$scenario CO artifact result boundary validated"
+  assert_jq_arg "$trace" id "$eligible_code_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible code artifact retained by CO"
+  assert_jq_arg "$trace" id "$eligible_doc_artifact" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id == $id)] | length) == 1' "$scenario eligible document artifact retained by CO"
+  assert_jq_argjson "$trace" negatives "$negative_artifact_ids_json" '([.retrieval.bundle.artifact_refs[]? | select(.artifact_id as $id | $negatives | index($id))] | length) == 0' "$scenario negative artifacts absent from CO retained bundle"
+  assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"
+  assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_doc" true "1"
   assert_provider_sentinel "$calls" "$request_id" "blocked_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "outside_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "sensitive_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "unsupported_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "malformed_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "incomplete_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "unavailable_artifact" false "1"
+  assert_provider_sentinel "$calls" "$request_id" "irrelevant_artifact" false "1"
   assert_provider_sentinel "$calls" "$request_id" "artifact_credential" false "1"
+  assert_ids_absent_from_json "$response" "$negative_artifact_ids_json" "artifact-response-negative-artifact-ids"
+  assert_ids_absent_from_json "$calls" "$negative_artifact_ids_json" "artifact-provider-negative-artifact-ids"
+  assert_ids_absent_from_json "$trace" "$negative_artifact_ids_json" "artifact-trace-negative-artifact-ids"
   assert_not_contains "$response $trace $calls" "$credential" "artifact-credential"
-  assert_public_source_allowlist "$response" "$eligible_artifact_id" "$scenario public sources allowlist"
-  record_scenario "$scenario" "A6 and artifact A7 assertions passed"
+  while IFS= read -r sentinel; do
+    [ -n "$sentinel" ] || continue
+    assert_not_contains "$response $trace $calls" "$sentinel" "artifact-negative-sentinel"
+  done < <(jq -r '.[]' <<<"$all_negative_sentinels_json")
+  assert_public_source_allowlist "$response" "$eligible_code_artifact" "$scenario public sources allowlist"
+  assert_jq_argjson "$response" negatives "$negative_artifact_ids_json" '(.sources | length > 0) and ([.sources[]? | select(.artifact_id as $id | $negatives | index($id))] | length) == 0' "$scenario public sources exclude negative artifacts"
+  for forbidden in "$credential" "memory://wave3b" "object_uri" "download_url" "signed_url" "credentials" "policy_metadata" "provenance" "source_checks" "freshness_state" "durable_status"; do
+    assert_not_contains "$response" "$forbidden" "artifact-public-source-forbidden-$forbidden"
+  done
+  record_scenario "$scenario" "A6 and artifact A7 assertions passed with artifact_limit=$effective_limit crowd_count=7 eligible_code_artifact=$eligible_code_artifact eligible_doc_artifact=$eligible_doc_artifact eligible_score=$eligible_score min_ineligible_score=$min_ineligible_score normal_bms_delta=$((after - before))"
   mark_acceptance "A6" "$scenario"
   mark_acceptance "A7_artifact" "$scenario"
 }

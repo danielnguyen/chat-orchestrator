@@ -116,6 +116,7 @@ def test_wave3b_harness_selftest_exercises_packet_labels():
     assert "focused_packet_label()" in source
     assert 'assert_packet_label_for_selection "CO-3A" "harness"' in source
     assert 'assert_packet_label_for_selection "CO-3B" "shared-memory"' in source
+    assert 'assert_packet_label_for_selection "CO-3D" "artifact"' in source
     assert 'packet: $packet' in source
 
 
@@ -300,3 +301,81 @@ def test_wave3b_shared_memory_denial_does_not_reuse_authorized_personas():
     assert "persona-c-canonical-sentinel" in scenario
     assert "persona-c-trace-canonical-id" in scenario
     assert '"web" "$conv_unauthorized"' not in scenario
+
+
+def test_wave3b_artifact_scenario_creates_all_required_fixture_groups():
+    source = _script()
+    scenario = source[
+        source.index("scenario_artifact_policy()") : source.index("scenario_fallback_identity()")
+    ]
+    for token in (
+        "eligible-code",
+        "eligible-doc",
+        "blocked-domain",
+        "outside-domain",
+        "too-sensitive",
+        "unsupported-class",
+        "malformed-policy",
+        "incomplete-lifecycle",
+        "unavailable-source",
+        "irrelevant",
+    ):
+        assert token in scenario
+    assert "(.positive | to_entries | length) == 2" in scenario
+    assert "(.negative | to_entries | length) == 8" in scenario
+    assert "fixture failed: artifact-sql-" in source
+    assert "|| true" not in scenario
+
+
+def test_wave3b_artifact_scenario_proves_score_crowding_and_direct_bms_filtering():
+    source = _script()
+    scenario = source[
+        source.index("scenario_artifact_policy()") : source.index("scenario_fallback_identity()")
+    ]
+    assert "effective_limit=3" in scenario
+    assert 'json_vector_for_score "$query_vector" "0.62"' in scenario
+    assert 'json_vector_for_score "$query_vector" "0.98"' in scenario
+    assert "qdrant_artifact_scores" in scenario
+    assert "assert_artifact_score_ordering" in scenario
+    assert "crowd_count=7" in scenario
+    assert "eligible_score" in scenario
+    assert "min_ineligible_score" in scenario
+    assert 'direct_bms_response="$(bms_retrieve_bundle' in scenario
+    assert "pre_limit_policy_filter_applied == true" in scenario
+    assert "missing_derivative_source_record" in scenario
+    assert "source_missing_or_unavailable" in scenario
+    assert 'select(.artifact_id == $code)' in scenario
+    assert 'select(.artifact_id as $id | $negatives | index($id))' in scenario
+
+
+def test_wave3b_artifact_scenario_ties_normal_co_provider_and_public_sources():
+    source = _script()
+    scenario = source[
+        source.index("scenario_artifact_policy()") : source.index("scenario_fallback_identity()")
+    ]
+    normal_before = scenario.index('before="$(retrieval_log_count)"')
+    normal_call = scenario.index('response="$(co_chat')
+    normal_after = scenario.index('after="$(wait_retrieval_log_delta')
+    assert normal_before < normal_call < normal_after
+    assert '"true" "0.5"' in scenario
+    assert "normal CO artifact request BMS retrieval boundary" in scenario
+    assert "artifact_request_status == \"mandatory_policy_forwarded\"" in scenario
+    assert "eligible code artifact retained by CO" in scenario
+    assert "eligible document artifact retained by CO" in scenario
+    assert 'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_code" true "1"' in scenario
+    assert 'assert_provider_sentinel "$calls" "$request_id" "eligible_artifact_doc" true "1"' in scenario
+    assert "artifact-provider-negative-artifact-ids" in scenario
+    assert "assert_public_source_allowlist" in scenario
+    assert "artifact-public-source-forbidden" in scenario
+    assert 'mark_acceptance "A6"' in scenario
+    assert 'mark_acceptance "A7_artifact"' in scenario
+    for row in ("A1", "A2", "A3", "A4", "A5", "A8", "A9"):
+        assert f'mark_acceptance "{row}"' not in scenario
+
+
+def test_wave3b_artifact_focused_label_is_co3d_only_for_artifact():
+    source = _script()
+    labeler = source[source.index("focused_packet_label()") : source.index("assert_packet_label_for_selection()")]
+    assert 'selected_scenarios[0]}" = "artifact"' in labeler
+    assert 'echo "CO-3D"' in labeler
+    assert 'selected_scenarios=(artifact)' in source
