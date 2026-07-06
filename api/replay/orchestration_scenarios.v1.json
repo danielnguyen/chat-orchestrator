@@ -1668,6 +1668,361 @@
                 },
                 "runtime_terminal_status": "completed"
             }
+        },
+        {
+            "scenario": "wave3c-world-state-read-lifecycle",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "runtime.world_state.read",
+            "wave3c_exposure_denied": ["draft.local_message"],
+            "expected": {
+                "outcome": {
+                    "status": "ok",
+                    "answer_category": "other"
+                },
+                "trace": {
+                    "capabilities": {
+                        "exposure": {
+                            "exposed_capability_ids": ["runtime.world_state.read"],
+                            "blocked_capability_ids": ["draft.local_message"],
+                            "descriptor_count": 1
+                        },
+                        "validation": {
+                            "validation_status": "ok",
+                            "capability_id": "runtime.world_state.read",
+                            "provider_tool_name": "runtime_world_state_read"
+                        },
+                        "execution": {
+                            "response_status": "executed",
+                            "executor_called": true,
+                            "executor_call_count": 1,
+                            "executor_result_status": "ok",
+                            "selection_status": "allowed",
+                            "dispatch_status": "allowed"
+                        },
+                        "follow_up": {
+                            "status": "completed",
+                            "call_count": 1,
+                            "used_final_text": true
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 2,
+                "provider_tool_names": [["runtime_world_state_read"], []],
+                "runtime_terminal_status": "completed"
+            }
+        },
+        {
+            "scenario": "wave3c-local-draft-lifecycle",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "draft.local_message",
+            "expected": {
+                "outcome": {
+                    "status": "ok",
+                    "answer_category": "other"
+                },
+                "trace": {
+                    "capabilities": {
+                        "validation": {
+                            "validation_status": "ok",
+                            "capability_id": "draft.local_message",
+                            "provider_tool_name": "draft_local_message"
+                        },
+                        "execution": {
+                            "response_status": "executed",
+                            "executor_called": true,
+                            "executor_call_count": 1,
+                            "executor_result_status": "ok",
+                            "selection_status": "allowed",
+                            "dispatch_status": "allowed",
+                            "executor_result": {
+                                "local": true,
+                                "sent": false
+                            }
+                        },
+                        "follow_up": {
+                            "status": "completed",
+                            "call_count": 1,
+                            "used_final_text": true
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 2,
+                "provider_tool_names": [["draft_local_message", "runtime_world_state_read"], []],
+                "runtime_terminal_status": "completed"
+            }
+        },
+        {
+            "scenario": "wave3c-revalidation-lifecycle",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "runtime.world_state.read",
+            "wave3c_mode": "revalidation",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "executed",
+                            "executor_called": true,
+                            "executor_call_count": 1,
+                            "selection_status": "allowed",
+                            "dispatch_status": "allowed",
+                            "revalidation": {
+                                "status": "verified",
+                                "revalidator_id": "trusted_refresh",
+                                "verification_call_count": 1,
+                                "verification_success_count": 1,
+                                "verification_failure_count": 0,
+                                "rerun_selection_status": "allowed"
+                            }
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 2
+            }
+        },
+        {
+            "scenario": "wave3c-confirmation-lifecycle",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "draft.local_message",
+            "wave3c_mode": "confirmation",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "executed",
+                            "executor_called": true,
+                            "executor_call_count": 1,
+                            "selection_status": "confirmation_required",
+                            "dispatch_status": "allowed",
+                            "dispatch_confirmation_ref_present": true,
+                            "confirmation": {
+                                "status": "accepted",
+                                "challenge_ref_present": true,
+                                "accepted": true,
+                                "call_count": 1,
+                                "confirmed_challenge_ref": "challenge-wave3c"
+                            }
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 2
+            }
+        },
+        {
+            "scenario": "wave3c-recursive-follow-up-blocked",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "draft.local_message",
+            "wave3c_mode": "recursive_follow_up",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "follow_up": {
+                            "status": "recursive_tool_call_blocked",
+                            "call_count": 1,
+                            "used_final_text": false,
+                            "reason_code": "recursive_tool_call_blocked"
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 2
+            }
+        },
+        {
+            "scenario": "wave3c-fallback-same-descriptor-once",
+            "category": "wave3c_capability_lifecycle",
+            "provider": "fallback_success",
+            "fallback_model": "gpt-4o-mini-fallback",
+            "wave3c_capability": "draft.local_message",
+            "expected": {
+                "outcome": {
+                    "status": "degraded"
+                },
+                "trace": {
+                    "fallback": {
+                        "triggered": true,
+                        "reason": "provider_error"
+                    },
+                    "capabilities": {
+                        "fallback": {
+                            "same_descriptor_fingerprint": true,
+                            "blocked_after_dispatch": true
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 3
+            }
+        },
+        {
+            "scenario": "wave3c-authorization-failures-no-fallback",
+            "category": "wave3c_capability_lifecycle",
+            "fallback_model": "gpt-4o-mini-fallback",
+            "wave3c_capability": "draft.local_message",
+            "wave3c_mode": "dispatch_denied",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "dispatch_denied",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "dispatch_status": "authorization_denied"
+                        },
+                        "follow_up": {
+                            "status": "not_attempted",
+                            "call_count": 0
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-selection-denial-zero-executor",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "draft.local_message",
+            "wave3c_mode": "selection_denied",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "authorization_denied",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_status": "authorization_denied",
+                            "dispatch_status": "not_requested"
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-hidden-capability-validation-zero-executor",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "draft.local_message",
+            "wave3c_exposure_denied": ["draft.local_message"],
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "exposure": {
+                            "exposed_capability_ids": ["runtime.world_state.read"],
+                            "blocked_capability_ids": ["draft.local_message"],
+                            "descriptor_count": 1
+                        },
+                        "validation": {
+                            "validation_status": "rejected",
+                            "capability_id": "draft.local_message",
+                            "provider_tool_name": "draft_local_message",
+                            "reason_code": "capability_not_exposed"
+                        },
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "capability_not_exposed",
+                            "executor_called": false,
+                            "executor_call_count": 0
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-multiple-call-validation-zero-executor",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_mode": "multiple_call_validation_failure",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "validation": {
+                            "validation_status": "rejected",
+                            "reason_code": "multiple_capability_calls"
+                        },
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "multiple_capability_calls",
+                            "executor_called": false,
+                            "executor_call_count": 0
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-revalidation-failure-zero-executor",
+            "category": "wave3c_capability_lifecycle",
+            "wave3c_capability": "runtime.world_state.read",
+            "wave3c_mode": "revalidation_failed",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "verification_failed",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_status": "revalidation_required",
+                            "dispatch_status": "not_requested",
+                            "revalidation": {
+                                "status": "failed",
+                                "verification_call_count": 1,
+                                "verification_success_count": 0,
+                                "verification_failure_count": 1,
+                                "rerun_selection_status": null,
+                                "reason_code": "verification_failed"
+                            }
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
         }
     ]
 }

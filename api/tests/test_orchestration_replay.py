@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from clients.memory_store import MemoryStoreClient
 from services.orchestration_replay import (
@@ -6,6 +8,7 @@ from services.orchestration_replay import (
     load_corpus,
     project_snapshot,
     run_scenario,
+    run_wave3c_smoke_report,
 )
 
 
@@ -164,6 +167,7 @@ def test_required_orchestration_replay_categories_are_present():
         "wave3b_co3_relationship_projection",
         "wave3b_co3_privacy_sanitization",
         "wave3b_co3_malformed_mandatory_response",
+        "wave3c_capability_lifecycle",
     } <= categories
 
 
@@ -243,6 +247,56 @@ async def test_model_attempts_and_backward_compatible_summary_are_truthful():
     no_fallback_fixture = next(item for item in load_corpus() if item["category"] == "no_fallback")
     no_fallback = await run_scenario(no_fallback_fixture)
     assert len(no_fallback["trace"]["model_calls"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_wave3c_capability_lifecycle_replay_smoke_report_is_complete():
+    report = await run_wave3c_smoke_report()
+
+    assert report == {
+        "scenario_count": 11,
+        "passed_count": 11,
+        "failed_count": 0,
+        "capability_lifecycle_scenarios": [
+            "wave3c-world-state-read-lifecycle",
+            "wave3c-local-draft-lifecycle",
+            "wave3c-revalidation-lifecycle",
+            "wave3c-confirmation-lifecycle",
+            "wave3c-recursive-follow-up-blocked",
+            "wave3c-fallback-same-descriptor-once",
+            "wave3c-authorization-failures-no-fallback",
+            "wave3c-selection-denial-zero-executor",
+            "wave3c-hidden-capability-validation-zero-executor",
+            "wave3c-multiple-call-validation-zero-executor",
+            "wave3c-revalidation-failure-zero-executor",
+        ],
+        "privacy_assertions_passed": True,
+        "no_repeat_dispatch_assertions_passed": True,
+        "failures": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_wave3c_replay_projects_bounded_privacy_safe_capability_trace():
+    snapshot = await _snapshot_for_scenario("wave3c-world-state-read-lifecycle")
+    capabilities = snapshot["trace"]["capabilities"]
+
+    assert capabilities["exposure"]["exposed_capability_ids"] == [
+        "runtime.world_state.read"
+    ]
+    assert capabilities["exposure"]["blocked_capability_ids"] == ["draft.local_message"]
+    assert capabilities["validation"]["provider_tool_name"] == "runtime_world_state_read"
+    assert capabilities["validation"]["capability_id"] == "runtime.world_state.read"
+    assert capabilities["execution"]["executor_call_count"] == 1
+    assert capabilities["follow_up"]["summary"]["result_summary"][
+        "included_claim_count"
+    ] == 1
+    serialized = json.dumps(snapshot, sort_keys=True)
+    assert "PRIVATE-WAVE3C-WORLD-VALUE" not in serialized
+    assert "value_json" not in serialized
+    assert "expected_value_digest" not in serialized
+    assert "credentials" not in serialized
+    assert_snapshot_privacy_safe(snapshot)
 
 
 @pytest.mark.asyncio
