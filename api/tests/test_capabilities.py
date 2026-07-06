@@ -5,6 +5,9 @@ import json
 import pytest
 from services.capabilities import (
     CapabilityValidationError,
+    RevalidationOutput,
+    Revalidator,
+    RevalidatorEntry,
     argument_digest,
     authorize_and_execute_capability,
     descriptor_fingerprint,
@@ -25,6 +28,8 @@ class FakeRuntime:
         phase_decisions: dict[str, dict[str, object]] | None = None,
         world_state_response: dict[str, object] | None = None,
         world_state_error: Exception | None = None,
+        verification_error: Exception | None = None,
+        verification_response: dict[str, object] | None = None,
     ):
         self.denied = denied or set()
         self.malformed = malformed
@@ -44,8 +49,11 @@ class FakeRuntime:
             },
         }
         self.world_state_error = world_state_error
+        self.verification_error = verification_error
+        self.verification_response = verification_response or {"claim": {"status": "verified"}}
         self.calls = []
         self.world_state_calls = []
+        self.world_state_verification_calls = []
         self.executor_calls = 0
 
     async def authorize_capability(self, **kwargs):
@@ -53,6 +61,8 @@ class FakeRuntime:
         if self.malformed:
             return {"result": "bad"}
         phase_decision = self.phase_decisions.get(kwargs["authorization_phase"])
+        if isinstance(phase_decision, list):
+            phase_decision = phase_decision.pop(0)
         if phase_decision is not None:
             return {
                 "result": {
@@ -92,6 +102,12 @@ class FakeRuntime:
         if self.world_state_error is not None:
             raise self.world_state_error
         return self.world_state_response
+
+    async def world_state_claim_verify(self, **kwargs):
+        self.world_state_verification_calls.append(kwargs)
+        if self.verification_error is not None:
+            raise self.verification_error
+        return self.verification_response
 
 
 def _completion(message: dict[str, object]) -> dict[str, object]:
@@ -137,7 +153,7 @@ def _validated(provider_tool_name: str, arguments: dict[str, object]):
     )
 
 
-async def _execute(runtime: FakeRuntime, validation_result):
+async def _execute(runtime: FakeRuntime, validation_result, revalidators=None):
     return await authorize_and_execute_capability(
         runtime=runtime,
         request_id="rid",
@@ -148,7 +164,46 @@ async def _execute(runtime: FakeRuntime, validation_result):
         runtime_turn_id="rtturn_1",
         active_persona_id="technical_architect",
         validation_result=validation_result,
+        revalidators=revalidators,
     )
+
+
+def _trusted_revalidator(
+    *,
+    outputs: list[RevalidationOutput | dict[str, object]] | None = None,
+    raises: Exception | None = None,
+    revalidator_id: str = "trusted_refresh",
+) -> Revalidator:
+    entry = RevalidatorEntry(
+        revalidator_id=revalidator_id,
+        verifier_id="cr-verifier-local",
+        verification_source_type="tool_output",
+        verification_source_ref="local-deterministic-revalidator",
+        supported_domains=("active_repository",),
+        supported_attributes=("branch",),
+        resulting_authority="verified_tool_output",
+        resulting_confidence=0.9,
+        resulting_freshness_state="fresh",
+        ttl_seconds=300,
+        revalidation_interval_seconds=120,
+    )
+
+    def verify(claim_ids):
+        if raises is not None:
+            raise raises
+        if outputs is not None:
+            return outputs
+        return [
+            RevalidationOutput(
+                claim_id=claim_id,
+                expected_value_digest=f"wsvalue_{claim_id}",
+                observed_at="2026-07-06T00:00:00+00:00",
+                verified_at="2026-07-06T00:00:01+00:00",
+            )
+            for claim_id in claim_ids
+        ]
+
+    return Revalidator(entry=entry, verify=verify)
 
 
 def test_production_registry_contains_exact_executor_bound_entries():
@@ -607,6 +662,336 @@ async def test_authorization_blocks_are_zero_executor(
     assert result.trace["authorization"][phase]["status"] == decision_code
     assert "challenge-1" in json.dumps(result.trace) or decision_code != "confirmation_required"
     assert "claim-1" not in json.dumps(result.trace)
+
+
+@pytest.mark.asyncio
+async def test_revalidation_success_verifies_reruns_selection_then_dispatches_once():
+    validation_result = _validated("runtime_world_state_read", {"output_mode": "summary"})
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+            ],
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        },
+    )
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        {"trusted_refresh": _trusted_revalidator()},
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "selection",
+        "dispatch",
+    ]
+    assert runtime.calls[0]["argument_digest"] == validation_result.argument_digest
+    assert runtime.calls[1]["argument_digest"] == validation_result.argument_digest
+    assert len(runtime.world_state_verification_calls) == 1
+    verify_call = runtime.world_state_verification_calls[0]
+    assert verify_call == {
+        "request_id": "rid:runtime.world_state.read:verify:0",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "world_state_claim_id": "claim-1",
+        "expected_value_digest": "wsvalue_claim-1",
+        "verifier_id": "cr-verifier-local",
+        "verification_source_type": "tool_output",
+        "verification_source_ref": "local-deterministic-revalidator",
+        "observed_at": "2026-07-06T00:00:00+00:00",
+        "verified_at": "2026-07-06T00:00:01+00:00",
+        "resulting_authority": "verified_tool_output",
+        "resulting_confidence": 0.9,
+        "resulting_freshness_state": "fresh",
+        "resulting_ttl_seconds": 300,
+        "resulting_revalidation_interval_seconds": 120,
+    }
+    assert result.trace["revalidation"] == {
+        "status": "verified",
+        "revalidator_id": "trusted_refresh",
+        "selected_claim_count": 1,
+        "configured_revalidator_matched": True,
+        "verification_call_count": 1,
+        "verification_success_count": 1,
+        "verification_failure_count": 0,
+        "rerun_selection_status": "allowed",
+        "reason_code": "verified",
+    }
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+    assert "claim-1" not in json.dumps(result.trace)
+    assert "wsvalue_claim-1" not in json.dumps(result.trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "revalidators", "reason_code"),
+    [
+        (
+            {"revalidator_id": "missing", "world_state_claim_ids": ["claim-1"]},
+            {},
+            "unknown_revalidator_id",
+        ),
+        (None, {"trusted_refresh": _trusted_revalidator()}, "malformed_revalidation_selector"),
+        (
+            {
+                "revalidator_id": "trusted_refresh",
+                "world_state_claim_ids": [],
+            },
+            {"trusted_refresh": _trusted_revalidator()},
+            "malformed_revalidation_selector",
+        ),
+    ],
+)
+async def test_revalidation_selector_failures_are_zero_executor(
+    selector,
+    revalidators,
+    reason_code,
+):
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "revalidation_required",
+                "reason_codes": ["world_state_revalidation_required"],
+                "revalidation_selector": selector,
+            }
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+        revalidators,
+    )
+
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.world_state_calls == []
+    assert runtime.world_state_verification_calls == []
+    assert result.trace["revalidation"]["reason_code"] == reason_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revalidator", "reason_code"),
+    [
+        (_trusted_revalidator(raises=RuntimeError("down")), "revalidator_unavailable"),
+        (
+            _trusted_revalidator(
+                outputs=[
+                    RevalidationOutput(
+                        claim_id="claim-1",
+                        expected_value_digest="wsvalue_claim-1",
+                        observed_at="2026-07-06T00:00:00+00:00",
+                        verified_at="2026-07-06T00:00:01+00:00",
+                        status="failed",
+                        reason_code="source_unavailable",
+                    )
+                ]
+            ),
+            "source_unavailable",
+        ),
+        (_trusted_revalidator(outputs=[{"claim_id": "claim-1"}]), "malformed_revalidator_output"),
+    ],
+)
+async def test_revalidator_output_failures_are_zero_executor(revalidator, reason_code):
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "revalidation_required",
+                "reason_codes": ["world_state_revalidation_required"],
+                "revalidation_selector": {
+                    "revalidator_id": "trusted_refresh",
+                    "world_state_claim_ids": ["claim-1"],
+                },
+            }
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+        {"trusted_refresh": revalidator},
+    )
+
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.world_state_verification_calls == []
+    assert result.trace["revalidation"]["reason_code"] == reason_code
+
+
+@pytest.mark.asyncio
+async def test_cr_verification_failure_blocks_with_zero_executor():
+    runtime = FakeRuntime(
+        verification_error=RuntimeError("verify failed"),
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "revalidation_required",
+                "reason_codes": ["world_state_revalidation_required"],
+                "revalidation_selector": {
+                    "revalidator_id": "trusted_refresh",
+                    "world_state_claim_ids": ["claim-1"],
+                },
+            }
+        },
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+        {"trusted_refresh": _trusted_revalidator()},
+    )
+
+    assert len(runtime.world_state_verification_calls) == 1
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert result.trace["revalidation"]["reason_code"] == "verification_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rerun_decision", "expected_reason"),
+    [
+        (
+            {
+                "allowed": False,
+                "decision_code": "authorization_denied",
+                "reason_codes": ["capability_domain_denied"],
+            },
+            "capability_domain_denied",
+        ),
+        (
+            {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-rerun",
+            },
+            "confirmation_required",
+        ),
+        (
+            {
+                "allowed": False,
+                "decision_code": "revalidation_required",
+                "reason_codes": ["world_state_revalidation_required"],
+                "revalidation_selector": {
+                    "revalidator_id": "trusted_refresh",
+                    "world_state_claim_ids": ["claim-1"],
+                },
+            },
+            "revalidation_loop_blocked",
+        ),
+    ],
+)
+async def test_rerun_selection_blocks_without_loop_or_executor(
+    rerun_decision,
+    expected_reason,
+):
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                rerun_decision,
+            ],
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+        {"trusted_refresh": _trusted_revalidator()},
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "selection",
+    ]
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert result.trace["revalidation"]["reason_code"] == expected_reason
+    if expected_reason == "confirmation_required":
+        assert (
+            result.trace["authorization"]["selection"]["confirmation_challenge_ref"]
+            == "challenge-rerun"
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_after_revalidation_is_still_required_and_can_block():
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+            ],
+            "dispatch": {
+                "allowed": False,
+                "decision_code": "authorization_denied",
+                "reason_codes": ["capability_domain_denied"],
+            },
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+        {"trusted_refresh": _trusted_revalidator()},
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "selection",
+        "dispatch",
+    ]
+    assert result.trace["revalidation"]["status"] == "verified"
+    assert result.trace["authorization"]["dispatch"]["status"] == "authorization_denied"
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
 
 
 @pytest.mark.asyncio

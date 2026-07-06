@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 CAPABILITY_DESCRIPTOR_VERSION = "co.capability-descriptor.v1"
@@ -67,6 +68,56 @@ class CapabilityValidationResult:
 class CapabilityExecutionResult:
     response_text: str
     trace: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RevalidatorEntry:
+    revalidator_id: str
+    verifier_id: str
+    verification_source_type: str
+    verification_source_ref: str
+    supported_domains: tuple[str, ...] = ()
+    supported_attributes: tuple[str, ...] = ()
+    resulting_authority: str = "verified_tool_output"
+    resulting_confidence: float = 1.0
+    resulting_freshness_state: str = "fresh"
+    ttl_seconds: int | None = None
+    revalidation_interval_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class RevalidationOutput:
+    claim_id: str
+    expected_value_digest: str
+    observed_at: str
+    verified_at: str
+    source_type: str | None = None
+    source_ref: str | None = None
+    resulting_authority: str | None = None
+    confidence: float | None = None
+    freshness_state: str | None = None
+    ttl_seconds: int | None = None
+    revalidation_interval_seconds: int | None = None
+    status: str = "verified"
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True)
+class Revalidator:
+    entry: RevalidatorEntry
+    verify: Any
+
+
+@dataclass(frozen=True)
+class _AuthorizationResult:
+    trace: dict[str, Any]
+    revalidation_selector: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _RevalidationResult:
+    trace: dict[str, Any]
+    selection: _AuthorizationResult | None = None
 
 
 PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
@@ -141,6 +192,10 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
 def production_capability_registry() -> tuple[CapabilityEntry, ...]:
     validate_production_registry(PRODUCTION_CAPABILITIES)
     return PRODUCTION_CAPABILITIES
+
+
+def production_revalidator_registry() -> dict[str, Revalidator]:
+    return {}
 
 
 def validate_production_registry(entries: tuple[CapabilityEntry, ...]) -> None:
@@ -395,6 +450,7 @@ async def authorize_and_execute_capability(
     runtime_turn_id: str | None,
     active_persona_id: str | None,
     validation_result: CapabilityValidationResult,
+    revalidators: dict[str, Revalidator] | None = None,
 ) -> CapabilityExecutionResult:
     entry = capability_by_id(validation_result.capability_id)
     trace = {
@@ -403,6 +459,7 @@ async def authorize_and_execute_capability(
             "selection": _authorization_empty_trace("not_requested"),
             "dispatch": _authorization_empty_trace("not_requested"),
         },
+        "revalidation": _revalidation_empty_trace("not_required"),
         "executor_binding": entry.executor_binding if entry else None,
         "executor_called": False,
         "executor_call_count": 0,
@@ -438,12 +495,40 @@ async def authorize_and_execute_capability(
         argument_digest_value=validation_result.argument_digest,
         confirmation_challenge_ref=None,
     )
-    trace["authorization"]["selection"] = selection
-    if selection["status"] != "allowed":
+    trace["authorization"]["selection"] = selection.trace
+    if selection.trace["status"] == "revalidation_required":
+        configured_revalidators = (
+            revalidators if revalidators is not None else production_revalidator_registry()
+        )
+        revalidation = await _perform_revalidation(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            active_persona_id=active_persona_id,
+            entry=entry,
+            argument_digest_value=validation_result.argument_digest,
+            selector=selection.revalidation_selector,
+            revalidators=configured_revalidators,
+        )
+        trace["revalidation"] = revalidation.trace
+        if revalidation.selection is not None:
+            trace["authorization"]["selection"] = revalidation.selection.trace
+        if revalidation.trace["status"] != "verified" or revalidation.selection is None:
+            return _capability_not_executed(
+                trace,
+                revalidation.trace.get("reason_code") or "revalidation_failed",
+                _revalidation_failure_text(revalidation.trace),
+            )
+        selection = revalidation.selection
+    if selection.trace["status"] != "allowed":
         return _capability_not_executed(
             trace,
-            _authorization_failure_reason(selection),
-            _authorization_failure_text(selection),
+            _authorization_failure_reason(selection.trace),
+            _authorization_failure_text(selection.trace),
         )
 
     dispatch_digest = argument_digest(
@@ -472,14 +557,14 @@ async def authorize_and_execute_capability(
         entry=entry,
         phase="dispatch",
         argument_digest_value=dispatch_digest,
-        confirmation_challenge_ref=selection.get("confirmation_challenge_ref"),
+        confirmation_challenge_ref=selection.trace.get("confirmation_challenge_ref"),
     )
-    trace["authorization"]["dispatch"] = dispatch
-    if dispatch["status"] != "allowed":
+    trace["authorization"]["dispatch"] = dispatch.trace
+    if dispatch.trace["status"] != "allowed":
         return _capability_not_executed(
             trace,
-            _authorization_failure_reason(dispatch),
-            _authorization_failure_text(dispatch),
+            _authorization_failure_reason(dispatch.trace),
+            _authorization_failure_text(dispatch.trace),
         )
 
     trace["executor_called"] = True
@@ -670,7 +755,7 @@ async def _authorize_capability_phase(
     phase: str,
     argument_digest_value: str,
     confirmation_challenge_ref: str | None,
-) -> dict[str, Any]:
+) -> _AuthorizationResult:
     try:
         response = await runtime.authorize_capability(
             request_id=request_id,
@@ -699,10 +784,10 @@ async def _authorize_capability_phase(
             confirmation_challenge_ref=confirmation_challenge_ref,
         )
     except Exception:
-        return _authorization_empty_trace("unavailable")
+        return _AuthorizationResult(_authorization_empty_trace("unavailable"))
     result = response.get("result") if isinstance(response, dict) else None
     if not isinstance(result, dict) or not isinstance(result.get("allowed"), bool):
-        return _authorization_empty_trace("malformed")
+        return _AuthorizationResult(_authorization_empty_trace("malformed"))
     decision_code = _bounded_string(result.get("decision_code"), "authorization_denied", 80)
     reason_codes = _bounded_string_list(result.get("reason_codes"), 8, 80)
     status = "allowed" if result["allowed"] else decision_code
@@ -719,7 +804,11 @@ async def _authorize_capability_phase(
         "relationship_id_count": len(result.get("relationship_ids_used") or []),
         "world_state_claim_id_count": len(result.get("world_state_claim_ids_used") or []),
     }
-    return trace
+    selector = result.get("revalidation_selector")
+    return _AuthorizationResult(
+        trace=trace,
+        revalidation_selector=selector if isinstance(selector, dict) else None,
+    )
 
 
 def _authorization_empty_trace(status: str) -> dict[str, Any]:
@@ -733,6 +822,302 @@ def _authorization_empty_trace(status: str) -> dict[str, Any]:
         "relationship_id_count": 0,
         "world_state_claim_id_count": 0,
     }
+
+
+def _revalidation_empty_trace(status: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "revalidator_id": None,
+        "selected_claim_count": 0,
+        "configured_revalidator_matched": False,
+        "verification_call_count": 0,
+        "verification_success_count": 0,
+        "verification_failure_count": 0,
+        "rerun_selection_status": None,
+        "reason_code": status,
+    }
+
+
+async def _perform_revalidation(
+    *,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    active_persona_id: str,
+    entry: CapabilityEntry,
+    argument_digest_value: str,
+    selector: dict[str, Any] | None,
+    revalidators: dict[str, Revalidator],
+) -> _RevalidationResult:
+    parsed_selector, reason = _parse_revalidation_selector(selector)
+    trace = _revalidation_empty_trace("required")
+    if parsed_selector is None:
+        trace.update({"status": "malformed", "reason_code": reason})
+        return _RevalidationResult(trace)
+    revalidator_id = parsed_selector["revalidator_id"]
+    claim_ids = parsed_selector["claim_ids"]
+    trace.update(
+        {
+            "revalidator_id": revalidator_id,
+            "selected_claim_count": len(claim_ids),
+            "reason_code": "revalidation_required",
+        }
+    )
+    revalidator = revalidators.get(revalidator_id)
+    if revalidator is None:
+        trace.update({"status": "blocked", "reason_code": "unknown_revalidator_id"})
+        return _RevalidationResult(trace)
+    if revalidator.entry.revalidator_id != revalidator_id:
+        trace.update({"status": "blocked", "reason_code": "mismatched_revalidator_id"})
+        return _RevalidationResult(trace)
+    trace["configured_revalidator_matched"] = True
+    outputs: list[RevalidationOutput] = []
+    try:
+        raw_outputs = revalidator.verify(tuple(claim_ids))
+        if hasattr(raw_outputs, "__await__"):
+            raw_outputs = await raw_outputs
+    except Exception:
+        trace.update({"status": "failed", "reason_code": "revalidator_unavailable"})
+        return _RevalidationResult(trace)
+    if not isinstance(raw_outputs, list) or len(raw_outputs) != len(claim_ids):
+        trace.update({"status": "malformed", "reason_code": "malformed_revalidator_output"})
+        return _RevalidationResult(trace)
+    for item in raw_outputs:
+        output = _coerce_revalidation_output(item)
+        if output is None or output.claim_id not in claim_ids:
+            trace.update({"status": "malformed", "reason_code": "malformed_revalidator_output"})
+            return _RevalidationResult(trace)
+        if output.status != "verified":
+            trace.update(
+                {
+                    "status": "failed",
+                    "reason_code": output.reason_code or "revalidator_failed",
+                }
+            )
+            return _RevalidationResult(trace)
+        outputs.append(output)
+    if sorted(output.claim_id for output in outputs) != sorted(claim_ids):
+        trace.update({"status": "blocked", "reason_code": "revalidator_claim_mismatch"})
+        return _RevalidationResult(trace)
+    if not hasattr(runtime, "world_state_claim_verify"):
+        trace.update({"status": "failed", "reason_code": "verification_unavailable"})
+        return _RevalidationResult(trace)
+    for index, output in enumerate(sorted(outputs, key=lambda item: item.claim_id)):
+        verification_payload = _verification_payload(
+            output=output,
+            entry=revalidator.entry,
+            request_id=f"{request_id}:{entry.capability_id}:verify:{index}",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+        )
+        if verification_payload is None:
+            trace.update(
+                {"status": "blocked", "reason_code": "inadequate_revalidator_output"}
+            )
+            return _RevalidationResult(trace)
+        trace["verification_call_count"] += 1
+        try:
+            response = await runtime.world_state_claim_verify(**verification_payload)
+        except Exception:
+            trace["verification_failure_count"] += 1
+            trace.update({"status": "failed", "reason_code": "verification_failed"})
+            return _RevalidationResult(trace)
+        if not isinstance(response, dict) or not isinstance(response.get("claim"), dict):
+            trace["verification_failure_count"] += 1
+            trace.update({"status": "malformed", "reason_code": "malformed_verification"})
+            return _RevalidationResult(trace)
+        trace["verification_success_count"] += 1
+    rerun = await _authorize_capability_phase(
+        runtime=runtime,
+        request_id=f"{request_id}:{entry.capability_id}:selection:rerun",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        active_persona_id=active_persona_id,
+        entry=entry,
+        phase="selection",
+        argument_digest_value=argument_digest_value,
+        confirmation_challenge_ref=None,
+    )
+    trace["rerun_selection_status"] = rerun.trace["status"]
+    if rerun.trace["status"] == "allowed":
+        trace.update({"status": "verified", "reason_code": "verified"})
+        return _RevalidationResult(trace, selection=rerun)
+    if rerun.trace["status"] == "revalidation_required":
+        trace.update({"status": "blocked", "reason_code": "revalidation_loop_blocked"})
+    elif rerun.trace["status"] == "confirmation_required":
+        trace.update({"status": "blocked", "reason_code": "confirmation_required"})
+    else:
+        trace.update(
+            {
+                "status": "blocked",
+                "reason_code": _authorization_failure_reason(rerun.trace),
+            }
+        )
+    return _RevalidationResult(trace, selection=rerun)
+
+
+def _parse_revalidation_selector(value: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(value, dict) or set(value) != {"revalidator_id", "world_state_claim_ids"}:
+        return None, "malformed_revalidation_selector"
+    revalidator_id = value.get("revalidator_id")
+    claim_ids = value.get("world_state_claim_ids")
+    if not isinstance(revalidator_id, str) or not _SAFE_LABEL.fullmatch(revalidator_id):
+        return None, "malformed_revalidation_selector"
+    if not isinstance(claim_ids, list) or not claim_ids or len(claim_ids) > 64:
+        return None, "malformed_revalidation_selector"
+    cleaned: list[str] = []
+    for claim_id in claim_ids:
+        if not isinstance(claim_id, str) or not _SAFE_LABEL.fullmatch(claim_id):
+            return None, "malformed_revalidation_selector"
+        if claim_id not in cleaned:
+            cleaned.append(claim_id)
+    if len(cleaned) != len(claim_ids):
+        return None, "malformed_revalidation_selector"
+    return {"revalidator_id": revalidator_id, "claim_ids": cleaned}, "ok"
+
+
+def _coerce_revalidation_output(value: Any) -> RevalidationOutput | None:
+    if isinstance(value, RevalidationOutput):
+        return value
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        "claim_id",
+        "expected_value_digest",
+        "observed_at",
+        "verified_at",
+        "source_type",
+        "source_ref",
+        "resulting_authority",
+        "confidence",
+        "freshness_state",
+        "ttl_seconds",
+        "revalidation_interval_seconds",
+        "status",
+        "reason_code",
+    }
+    if set(value) - allowed:
+        return None
+    try:
+        return RevalidationOutput(
+            claim_id=value["claim_id"],
+            expected_value_digest=value["expected_value_digest"],
+            observed_at=value["observed_at"],
+            verified_at=value["verified_at"],
+            source_type=value.get("source_type"),
+            source_ref=value.get("source_ref"),
+            resulting_authority=value.get("resulting_authority"),
+            confidence=value.get("confidence"),
+            freshness_state=value.get("freshness_state"),
+            ttl_seconds=value.get("ttl_seconds"),
+            revalidation_interval_seconds=value.get("revalidation_interval_seconds"),
+            status=value.get("status", "verified"),
+            reason_code=value.get("reason_code"),
+        )
+    except KeyError:
+        return None
+
+
+def _verification_payload(
+    *,
+    output: RevalidationOutput,
+    entry: RevalidatorEntry,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(output.claim_id, str) or not _SAFE_LABEL.fullmatch(output.claim_id):
+        return None
+    if not isinstance(output.expected_value_digest, str) or not output.expected_value_digest:
+        return None
+    source_type = output.source_type or entry.verification_source_type
+    source_ref = output.source_ref or entry.verification_source_ref
+    authority = output.resulting_authority or entry.resulting_authority
+    freshness = output.freshness_state or entry.resulting_freshness_state
+    confidence = output.confidence if output.confidence is not None else entry.resulting_confidence
+    if (
+        not isinstance(source_type, str)
+        or not _SAFE_LABEL.fullmatch(source_type)
+        or not isinstance(source_ref, str)
+        or not source_ref
+        or len(source_ref) > 240
+        or not isinstance(authority, str)
+        or not isinstance(freshness, str)
+        or not isinstance(entry.verifier_id, str)
+        or not _SAFE_LABEL.fullmatch(entry.verifier_id)
+        or not isinstance(confidence, int | float)
+        or isinstance(confidence, bool)
+        or confidence < 0.0
+        or confidence > 1.0
+        or _parse_timestamp(output.observed_at) is None
+        or _parse_timestamp(output.verified_at) is None
+    ):
+        return None
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "surface": surface,
+        "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+        "world_state_claim_id": output.claim_id,
+        "expected_value_digest": output.expected_value_digest,
+        "verifier_id": entry.verifier_id,
+        "verification_source_type": source_type,
+        "verification_source_ref": source_ref,
+        "observed_at": output.observed_at,
+        "verified_at": output.verified_at,
+        "resulting_authority": authority,
+        "resulting_confidence": float(confidence),
+        "resulting_freshness_state": freshness,
+    }
+    ttl_seconds = output.ttl_seconds if output.ttl_seconds is not None else entry.ttl_seconds
+    interval_seconds = (
+        output.revalidation_interval_seconds
+        if output.revalidation_interval_seconds is not None
+        else entry.revalidation_interval_seconds
+    )
+    if ttl_seconds is not None:
+        if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            return None
+        payload["resulting_ttl_seconds"] = ttl_seconds
+    if interval_seconds is not None:
+        if not isinstance(interval_seconds, int) or interval_seconds <= 0:
+            return None
+        payload["resulting_revalidation_interval_seconds"] = interval_seconds
+    return payload
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _revalidation_failure_text(trace: dict[str, Any]) -> str:
+    if trace.get("rerun_selection_status") == "revalidation_required":
+        return "That capability still requires revalidation before execution."
+    return (
+        "That capability requires revalidation before execution, but revalidation "
+        "could not be completed safely."
+    )
 
 
 def _authorization_failure_reason(summary: dict[str, Any]) -> str:

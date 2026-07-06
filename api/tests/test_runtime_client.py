@@ -445,3 +445,62 @@ async def test_authorize_capability_posts_expected_exposure_payload():
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_world_state_claim_verify_posts_expected_structural_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"claim": {"world_state_claim_id": json["world_state_claim_id"]}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.world_state_claim_verify(
+        request_id="rid:verify",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        world_state_claim_id="claim-1",
+        expected_value_digest="wsvalue_claim-1",
+        verifier_id="cr-verifier-local",
+        verification_source_type="tool_output",
+        verification_source_ref="local-deterministic-revalidator",
+        observed_at="2026-07-06T00:00:00+00:00",
+        verified_at="2026-07-06T00:00:01+00:00",
+        resulting_authority="verified_tool_output",
+        resulting_confidence=0.9,
+        resulting_freshness_state="fresh",
+        resulting_ttl_seconds=300,
+        resulting_revalidation_interval_seconds=120,
+    )
+
+    assert calls == [
+        (
+            "/v1/world-state/claims/verify",
+            {
+                "request_id": "rid:verify",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "world_state_claim_id": "claim-1",
+                "expected_value_digest": "wsvalue_claim-1",
+                "verification_source_type": "tool_output",
+                "verification_source_ref": "local-deterministic-revalidator",
+                "observed_at": "2026-07-06T00:00:00+00:00",
+                "verified_at": "2026-07-06T00:00:01+00:00",
+                "resulting_authority": "verified_tool_output",
+                "resulting_confidence": 0.9,
+                "resulting_freshness_state": "fresh",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "verifier_id": "cr-verifier-local",
+                "resulting_ttl_seconds": 300,
+                "resulting_revalidation_interval_seconds": 120,
+            },
+        )
+    ]

@@ -2,6 +2,7 @@ import json
 
 import httpx
 import pytest
+from services.capabilities import RevalidationOutput, Revalidator, RevalidatorEntry
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,
@@ -770,6 +771,7 @@ class CapabilityRuntime(FakeRuntime):
     ):
         super().__init__(**kwargs)
         self.capability_authorization_calls = []
+        self.world_state_verification_calls = []
         self.phase_decisions = phase_decisions or {
             "exposure": {
                 "allowed": True,
@@ -799,6 +801,8 @@ class CapabilityRuntime(FakeRuntime):
                 "reason_codes": ["authorization_denied"],
             },
         )
+        if isinstance(decision, list):
+            decision = decision.pop(0)
         return {
             "result": {
                 "allowed": decision.get("allowed", False),
@@ -810,6 +814,37 @@ class CapabilityRuntime(FakeRuntime):
                 "world_state_claim_ids_used": [],
             }
         }
+
+    async def world_state_claim_verify(self, **kwargs):
+        self.world_state_verification_calls.append(kwargs)
+        return {"claim": {"world_state_claim_id": kwargs["world_state_claim_id"]}}
+
+
+def _capability_revalidators() -> dict[str, Revalidator]:
+    entry = RevalidatorEntry(
+        revalidator_id="trusted_refresh",
+        verifier_id="cr-verifier-local",
+        verification_source_type="tool_output",
+        verification_source_ref="local-deterministic-revalidator",
+        resulting_authority="verified_tool_output",
+        resulting_confidence=0.9,
+        resulting_freshness_state="fresh",
+        ttl_seconds=300,
+        revalidation_interval_seconds=120,
+    )
+
+    def verify(claim_ids):
+        return [
+            RevalidationOutput(
+                claim_id=claim_id,
+                expected_value_digest=f"wsvalue_{claim_id}",
+                observed_at="2026-07-06T00:00:00+00:00",
+                verified_at="2026-07-06T00:00:01+00:00",
+            )
+            for claim_id in claim_ids
+        ]
+
+    return {"trusted_refresh": Revalidator(entry=entry, verify=verify)}
 
 
 class FakeLiteLLM:
@@ -8919,6 +8954,72 @@ async def test_orchestrate_executes_world_state_read_after_selection_and_dispatc
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_revalidates_then_executes_world_state_read(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(
+        phase_decisions={
+            "exposure": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+            ],
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        }
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read current repository state."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-revalidated-read",
+        capability_revalidators=_capability_revalidators(),
+    )
+
+    assert out["answer"] == "I read bounded runtime world state and found 0 matching claim(s)."
+    phases = [
+        call["authorization_phase"]
+        for call in runtime.capability_authorization_calls
+        if call["capability_id"] == "runtime.world_state.read"
+    ]
+    assert phases == ["exposure", "selection", "selection", "dispatch"]
+    assert len(runtime.world_state_verification_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["revalidation"]["status"] == "verified"
+    assert trace["execution"]["executor_called"] is True
+    assert trace["execution"]["executor_call_count"] == 1
+    assert "wsvalue_claim-1" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_executes_local_unsent_draft_after_selection_and_dispatch(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
@@ -8955,6 +9056,75 @@ async def test_orchestrate_executes_local_unsent_draft_after_selection_and_dispa
     ]
     assert trace["execution"]["executor_called"] is True
     assert trace["execution"]["executor_call_count"] == 1
+    assert trace["execution"]["executor_result"]["local"] is True
+    assert trace["execution"]["executor_result"]["sent"] is False
+    assert "PRIVATE-DRAFT-BODY" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_revalidates_then_executes_local_unsent_draft(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(
+        phase_decisions={
+            "exposure": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+            ],
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        }
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "draft_local_message",
+                {"body": "PRIVATE-DRAFT-BODY", "recipient_label": "reviewer"},
+            )
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-revalidated-draft",
+        capability_revalidators=_capability_revalidators(),
+    )
+
+    assert out["answer"] == "I created a local unsent draft. Nothing was sent."
+    phases = [
+        call["authorization_phase"]
+        for call in runtime.capability_authorization_calls
+        if call["capability_id"] == "draft.local_message"
+    ]
+    assert phases == ["exposure", "selection", "selection", "dispatch"]
+    assert len(runtime.world_state_verification_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["revalidation"]["status"] == "verified"
     assert trace["execution"]["executor_result"]["local"] is True
     assert trace["execution"]["executor_result"]["sent"] is False
     assert "PRIVATE-DRAFT-BODY" not in json.dumps(trace)

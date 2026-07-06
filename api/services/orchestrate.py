@@ -3838,6 +3838,7 @@ async def orchestrate_chat(
     dsa_enabled: bool = False,
     prompt_output_token_reserve: int = 2048,
     prompt_context_safety_margin: int = 256,
+    capability_revalidators: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     surface = payload.get("surface", "unknown")
@@ -4865,6 +4866,7 @@ async def orchestrate_chat(
                     runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
                     active_persona_id=runtime_identity_trace.get("active_persona_id"),
                     validation_result=validation_result,
+                    revalidators=capability_revalidators,
                 )
                 prompt.trace["capabilities"]["execution"] = execution_result.trace
                 raw_answer = execution_result.response_text

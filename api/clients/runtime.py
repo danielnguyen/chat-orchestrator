@@ -169,6 +169,57 @@ class RuntimeClient:
             payload["requested_domains"] = requested_domains
         return await self._post("/v1/world-state/resolve", json=payload)
 
+    async def world_state_claim_verify(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        world_state_claim_id: str,
+        expected_value_digest: str,
+        verification_source_type: str,
+        verification_source_ref: str,
+        observed_at: str,
+        verified_at: str,
+        resulting_authority: str,
+        resulting_confidence: float,
+        resulting_freshness_state: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        verifier_id: str | None = None,
+        resulting_ttl_seconds: int | None = None,
+        resulting_revalidation_interval_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "world_state_claim_id": world_state_claim_id,
+            "expected_value_digest": expected_value_digest,
+            "verification_source_type": verification_source_type,
+            "verification_source_ref": verification_source_ref,
+            "observed_at": observed_at,
+            "verified_at": verified_at,
+            "resulting_authority": resulting_authority,
+            "resulting_confidence": resulting_confidence,
+            "resulting_freshness_state": resulting_freshness_state,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if verifier_id is not None:
+            payload["verifier_id"] = verifier_id
+        if resulting_ttl_seconds is not None:
+            payload["resulting_ttl_seconds"] = resulting_ttl_seconds
+        if resulting_revalidation_interval_seconds is not None:
+            payload["resulting_revalidation_interval_seconds"] = (
+                resulting_revalidation_interval_seconds
+            )
+        return await self._post("/v1/world-state/claims/verify", json=payload)
+
     async def relationship_select(
         self,
         *,
