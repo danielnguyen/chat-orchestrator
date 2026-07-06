@@ -684,6 +684,81 @@ def provider_text(completion: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
+def capability_follow_up_summary(
+    *,
+    execution_result: CapabilityExecutionResult,
+) -> dict[str, Any]:
+    trace = execution_result.trace
+    capability_id = _bounded_optional_string(trace.get("capability_id"), 120)
+    provider_tool_name = _bounded_optional_string(trace.get("provider_tool_name"), 80)
+    entry = capability_by_id(capability_id) if capability_id else None
+    executor_result = trace.get("executor_result")
+    executor_result = executor_result if isinstance(executor_result, dict) else {}
+    summary: dict[str, Any] = {
+        "capability_id": capability_id,
+        "provider_tool_name": provider_tool_name,
+        "operation_class": entry.operation_class if entry else None,
+        "executor_result_status": _bounded_string(
+            trace.get("executor_result_status"),
+            "unknown",
+            80,
+        ),
+        "response_status": _bounded_string(trace.get("response_status"), "unknown", 80),
+    }
+    if capability_id == "draft.local_message":
+        summary["result_summary"] = {
+            "local": executor_result.get("local") is True,
+            "sent": executor_result.get("sent") is True,
+            "recipient_present": executor_result.get("recipient_present") is True,
+            "subject_present": executor_result.get("subject_present") is True,
+            "body_char_count": _bounded_int(executor_result.get("body_char_count"), 2000),
+            "format": _bounded_optional_string(executor_result.get("format"), 40),
+        }
+    elif capability_id == "runtime.world_state.read":
+        summary["result_summary"] = {
+            "output_mode": _bounded_optional_string(executor_result.get("output_mode"), 40),
+            "included_claim_count": _bounded_int(
+                executor_result.get("included_claim_count"),
+                10000,
+            ),
+            "excluded_claim_count": _bounded_int(
+                executor_result.get("excluded_claim_count"),
+                10000,
+            ),
+            "domain_count": _bounded_int(executor_result.get("domain_count"), 100),
+            "domains": _bounded_string_list(executor_result.get("domains"), 8, 80),
+            "stale_count": _bounded_int(executor_result.get("stale_count"), 10000),
+            "aging_count": _bounded_int(executor_result.get("aging_count"), 10000),
+            "expired_count": _bounded_int(executor_result.get("expired_count"), 10000),
+            "conflicted_count": _bounded_int(
+                executor_result.get("conflicted_count"),
+                10000,
+            ),
+        }
+    else:
+        summary["result_summary"] = {"status": "unsupported_capability"}
+    return summary
+
+
+def ensure_draft_local_unsent_truth(text: str, *, capability_summary: dict[str, Any]) -> str:
+    if capability_summary.get("capability_id") != "draft.local_message":
+        return text
+    result_summary = capability_summary.get("result_summary")
+    if not isinstance(result_summary, dict):
+        return text
+    if result_summary.get("local") is not True or result_summary.get("sent") is not False:
+        return "I created a local unsent draft. Nothing was sent."
+    lowered = text.lower()
+    local_present = "local" in lowered
+    unsent_present = "unsent" in lowered or "not sent" in lowered or "nothing was sent" in lowered
+    if local_present and unsent_present:
+        return text
+    suffix = " It is local and unsent; nothing was sent."
+    if not text.strip():
+        return "I created a local unsent draft. Nothing was sent."
+    return f"{text.rstrip()}{suffix}"
+
+
 def _normalize_world_state_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     if "requested_domains" in arguments:
@@ -1594,6 +1669,14 @@ def _bounded_string_list(value: Any, max_items: int, max_length: int) -> list[st
         if len(out) >= max_items:
             break
     return out
+
+
+def _bounded_int(value: Any, maximum: int) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if value < 0:
+        return None
+    return min(value, maximum)
 
 
 def _canonical_json(value: Any) -> str:

@@ -869,6 +869,23 @@ class FakeLiteLLM:
         return {"choices": [{"message": {"content": self.content}}]}
 
 
+class SequenceLiteLLM(FakeLiteLLM):
+    def __init__(
+        self,
+        completions: list[dict[str, object] | BaseException],
+    ):
+        super().__init__()
+        self.completions = list(completions)
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        index = len(self.calls) - 1
+        result = self.completions[index] if index < len(self.completions) else self.completions[-1]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
 class FailingLiteLLM(FakeLiteLLM):
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
@@ -8128,6 +8145,39 @@ def _first_party_chat_payload(
     return payload
 
 
+def _route_files_with_fallback(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: primary-model\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: fallback-model\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  primary-model:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "  fallback-model:\n"
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
+        encoding="utf-8",
+    )
+    return rules, models
+
+
+def _text_completion(content: str) -> dict[str, object]:
+    return {"choices": [{"message": {"content": content}}]}
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_default_chat_does_not_emit_style_guidance(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
@@ -9229,6 +9279,561 @@ async def test_orchestrate_invalid_provider_capability_request_is_zero_executor(
     assert [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_local_draft_uses_one_provider_follow_up_without_tools(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            _text_completion("The local unsent draft is ready."),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-draft-follow-up",
+    )
+
+    assert out["answer"] == "The local unsent draft is ready."
+    assert len(litellm.calls) == 2
+    assert "tools" not in litellm.calls[1]
+    assert "PRIVATE-DRAFT-BODY" not in json.dumps(litellm.calls[1]["messages"])
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["dispatch_completed"] is True
+    assert trace["executor_call_count"] == 1
+    assert trace["follow_up"]["status"] == "completed"
+    assert trace["follow_up"]["call_count"] == 1
+    assert trace["follow_up"]["used_final_text"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_world_state_read_follow_up_gets_bounded_summary_only(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    runtime.world_state_response = {
+        "included_claims": [
+            {
+                "world_state_claim_id": "claim-1",
+                "entity_id": "repo-1",
+                "attribute": "branch",
+                "domain": "active_repository",
+                "value_json": "PRIVATE-WORLD-VALUE",
+            }
+        ],
+        "excluded_claim_summaries": [{"world_state_claim_id": "claim-2"}],
+        "prompt_content": "World state: PRIVATE-WORLD-VALUE",
+        "trace": {
+            "included_claim_count": 1,
+            "excluded_claim_count": 1,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 0,
+            "confirmation_required": False,
+        },
+    }
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "runtime_world_state_read",
+                {"requested_domains": ["active_repository"], "output_mode": "structured"},
+            ),
+            _text_completion("I found one bounded repository claim."),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read current repository state."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-world-follow-up",
+    )
+
+    assert out["answer"] == "I found one bounded repository claim."
+    follow_up_payload = json.dumps(litellm.calls[1]["messages"], sort_keys=True)
+    assert "PRIVATE-WORLD-VALUE" not in follow_up_payload
+    assert "value_json" not in follow_up_payload
+    assert "tools" not in litellm.calls[1]
+    assert "included_claim_count" in follow_up_payload
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["follow_up"]["summary"]["result_summary"]["included_claim_count"] == 1
+    assert "PRIVATE-WORLD-VALUE" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_draft_follow_up_cannot_omit_local_unsent_truth(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            _text_completion("Draft ready."),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-draft-truthful-follow-up",
+    )
+
+    assert out["answer"] == "Draft ready. It is local and unsent; nothing was sent."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["follow_up"]["call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_follow_up_failure_uses_executor_text_without_second_executor(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            RuntimeError("follow-up failed"),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-draft-follow-up-fails",
+    )
+
+    assert out["answer"] == "I created a local unsent draft. Nothing was sent."
+    assert len(litellm.calls) == 2
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["follow_up"]["status"] == "failed"
+    assert trace["follow_up"]["call_count"] == 1
+    assert trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("follow_up_completion", "reason_code"),
+    [
+        (
+            _tool_completion("runtime_world_state_read", {"output_mode": "summary"}),
+            "recursive_tool_call_blocked",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "draft_local_message",
+                                        "arguments": "{\"body\":\"one\"}",
+                                    }
+                                },
+                                {
+                                    "function": {
+                                        "name": "runtime_world_state_read",
+                                        "arguments": "{}",
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+            "multiple_tool_calls_blocked",
+        ),
+    ],
+)
+async def test_orchestrate_follow_up_tool_calls_are_blocked_without_executor_replay(
+    tmp_path,
+    follow_up_completion,
+    reason_code,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            follow_up_completion,
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-cap-follow-up-{reason_code}",
+    )
+
+    assert out["answer"] == "I created a local unsent draft. Nothing was sent."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["follow_up"]["status"] == "recursive_tool_call_blocked"
+    assert trace["follow_up"]["reason_code"] == reason_code
+    assert trace["follow_up"]["call_count"] == 1
+    assert trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_primary_failure_fallback_uses_same_descriptors_and_can_dispatch(
+    tmp_path,
+):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            RuntimeError("primary failed"),
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            _text_completion("The local unsent draft is ready."),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-fallback-dispatch",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == "The local unsent draft is ready."
+    assert len(litellm.calls) == 3
+    assert litellm.calls[0]["tools"] == litellm.calls[1]["tools"]
+    assert "tools" not in litellm.calls[2]
+    phases = [
+        call["authorization_phase"]
+        for call in runtime.capability_authorization_calls
+        if call["capability_id"] == "draft.local_message"
+    ]
+    assert phases == ["exposure", "selection", "dispatch"]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["fallback"]["same_descriptor_fingerprint"] is True
+    assert trace["fallback"]["blocked_after_dispatch"] is True
+    assert trace["dispatch_completed"] is True
+    assert trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_primary_completed_dispatch_blocks_fallback_replay(tmp_path):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            RuntimeError("follow-up failed"),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-dispatch-blocks-fallback",
+    )
+
+    assert out["answer"] == "I created a local unsent draft. Nothing was sent."
+    assert len(litellm.calls) == 2
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    assert trace_payload["fallback"] == {"triggered": False, "reason": None}
+    capabilities = trace_payload["retrieval"]["prompt_assembly"]["capabilities"]
+    assert capabilities["fallback"]["blocked_after_dispatch"] is True
+    assert capabilities["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_validation_failure_does_not_invoke_fallback_retry(tmp_path):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "draft_local_message",
+                                        "arguments": "{\"body\":\"one\"}",
+                                    }
+                                },
+                                {
+                                    "function": {
+                                        "name": "runtime_world_state_read",
+                                        "arguments": "{}",
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+            _tool_completion("draft_local_message", {"body": "should-not-run"}),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Use several tools."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-validation-no-fallback",
+    )
+
+    assert out["answer"] == "I could not use that capability request safely."
+    assert len(litellm.calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["validation"]["reason_code"] == "multiple_capability_calls"
+    assert trace["executor_call_count"] == 0
+    assert trace["follow_up"]["status"] == "not_attempted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase_decisions", "payload_overrides", "expected_reason"),
+    [
+        (
+            {
+                "exposure": {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+                "selection": {
+                    "allowed": False,
+                    "decision_code": "authorization_denied",
+                    "reason_codes": ["authorization_denied"],
+                },
+            },
+            {},
+            "authorization_denied",
+        ),
+        (
+            {
+                "exposure": {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+                "selection": {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "unknown_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+            },
+            {},
+            "unknown_revalidator_id",
+        ),
+        (
+            {
+                "exposure": {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+                "selection": {
+                    "allowed": False,
+                    "decision_code": "confirmation_required",
+                    "reason_codes": ["confirmation_required"],
+                    "challenge_ref": "challenge-1",
+                },
+            },
+            {},
+            "confirmation_missing",
+        ),
+    ],
+)
+async def test_orchestrate_blocked_capability_paths_do_not_invoke_fallback_retry(
+    tmp_path,
+    phase_decisions,
+    payload_overrides,
+    expected_reason,
+):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(phase_decisions=phase_decisions)
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            _tool_completion("draft_local_message", {"body": "should-not-run"}),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note.", **payload_overrides),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-cap-blocked-{expected_reason}",
+    )
+
+    assert len(litellm.calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["failure_reason_code"] == expected_reason
+    assert trace["executor_call_count"] == 0
+    assert trace["follow_up"]["status"] == "not_attempted"
+    assert out["answer"] in {
+        "I could not use that capability request safely.",
+        (
+            "That capability requires revalidation before execution, but revalidation "
+            "could not be completed safely."
+        ),
+        "That capability needs confirmation before execution.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_executor_failure_does_not_fabricate_success_or_fallback_retry(
+    tmp_path,
+):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+
+    async def fail_execute(**kwargs):
+        runtime.world_state_calls.append(kwargs)
+        if kwargs["request_id"].endswith(":execute"):
+            raise RuntimeError("executor failed")
+        return runtime.world_state_response
+
+    runtime.world_state_resolve = fail_execute
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion("runtime_world_state_read", {"output_mode": "summary"}),
+            _tool_completion("draft_local_message", {"body": "should-not-run"}),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read current repository state."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-executor-failure-no-fallback",
+    )
+
+    assert out["answer"] == "I could not complete that capability request."
+    assert len(litellm.calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["response_status"] == "executor_failed"
+    assert trace["executor_call_count"] == 1
+    assert trace["follow_up"]["status"] == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_follow_up_and_fallback_trace_remains_privacy_safe(tmp_path):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = SequenceLiteLLM(
+        [
+            RuntimeError("primary failed"),
+            _tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"}),
+            _text_completion("The local unsent draft is ready."),
+        ]
+    )
+
+    await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-privacy-safe-trace",
+    )
+
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    serialized = json.dumps(trace, sort_keys=True)
+    assert "PRIVATE-DRAFT-BODY" not in serialized
+    assert "tool_calls" not in serialized
+    assert "expected_value_digest" not in serialized
+    assert "credentials" not in serialized
+    assert trace["fallback"]["same_descriptor_fingerprint"] is True
+    assert trace["follow_up"]["summary"]["result_summary"] == {
+        "local": True,
+        "sent": False,
+        "recipient_present": False,
+        "subject_present": False,
+        "body_char_count": 18,
+        "format": "plain_text",
+    }
 
 
 @pytest.mark.asyncio

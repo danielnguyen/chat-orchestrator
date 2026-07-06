@@ -21,7 +21,9 @@ from services.briefing import generate_brief
 from services.capabilities import (
     CapabilityValidationError,
     authorize_and_execute_capability,
+    capability_follow_up_summary,
     capability_validation_failure_trace,
+    ensure_draft_local_unsent_truth,
     filter_capability_descriptors_for_exposure,
     parse_provider_capability_request,
     provider_text,
@@ -1429,6 +1431,111 @@ def _provider_attempt_evidence(
         "retained_semantic_message_ids": semantic_ids,
         "retained_artifact_ids": artifact_ids,
     }
+
+
+def _capability_follow_up_empty_trace(status: str = "not_attempted") -> dict[str, Any]:
+    return {
+        "status": status,
+        "call_count": 0,
+        "used_final_text": False,
+        "reason_code": status,
+    }
+
+
+def _capability_fallback_trace(
+    *,
+    descriptor_fingerprint_value: Any,
+) -> dict[str, Any]:
+    return {
+        "primary_descriptor_fingerprint": _sanitize_trace_string(
+            descriptor_fingerprint_value,
+            max_length=120,
+        ),
+        "descriptor_fingerprint": None,
+        "same_descriptor_fingerprint": None,
+        "blocked_after_dispatch": False,
+    }
+
+
+def _capability_follow_up_messages(summary: dict[str, Any]) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Produce the final user-facing answer from this bounded capability result. "
+                "Do not request or describe tool calls. Do not include raw private values. "
+                "For local drafts, clearly state that the draft is local and unsent."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {"capability_result": summary},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+async def _attempt_capability_follow_up(
+    *,
+    litellm: Any,
+    request_id: str,
+    model: str,
+    execution_result: Any,
+) -> tuple[str, dict[str, Any]]:
+    summary = capability_follow_up_summary(execution_result=execution_result)
+    trace = {
+        **_capability_follow_up_empty_trace("attempted"),
+        "call_count": 1,
+        "summary": summary,
+    }
+    try:
+        completion = await litellm.chat(
+            request_id=f"{request_id}:capability-follow-up",
+            model=model,
+            messages=_capability_follow_up_messages(summary),
+        )
+    except Exception:
+        trace.update({"status": "failed", "reason_code": "provider_follow_up_failed"})
+        return execution_result.response_text, trace
+    try:
+        recursive_request = parse_provider_capability_request(completion)
+    except CapabilityValidationError as exc:
+        reason = (
+            "multiple_tool_calls_blocked"
+            if exc.reason_code == "multiple_capability_calls"
+            else "recursive_tool_call_blocked"
+        )
+        trace.update(
+            {
+                "status": "recursive_tool_call_blocked",
+                "reason_code": reason,
+            }
+        )
+        return execution_result.response_text, trace
+    if recursive_request is not None:
+        trace.update(
+            {
+                "status": "recursive_tool_call_blocked",
+                "reason_code": "recursive_tool_call_blocked",
+            }
+        )
+        return execution_result.response_text, trace
+    text = provider_text(completion).strip()
+    if not text:
+        trace.update({"status": "malformed", "reason_code": "empty_follow_up_text"})
+        return execution_result.response_text, trace
+    final_text = ensure_draft_local_unsent_truth(text, capability_summary=summary)
+    trace.update(
+        {
+            "status": "completed",
+            "used_final_text": True,
+            "reason_code": "completed",
+        }
+    )
+    return final_text, trace
 
 
 def _sanitize_model_call_for_privacy(model_call: dict[str, Any]) -> dict[str, Any]:
@@ -4654,6 +4761,14 @@ async def orchestrate_chat(
                 "validation_status": "not_requested",
                 "schema_version": capability_exposure_trace.get("schema_version"),
             },
+            "follow_up": _capability_follow_up_empty_trace(),
+            "fallback": _capability_fallback_trace(
+                descriptor_fingerprint_value=capability_exposure_trace.get(
+                    "descriptor_fingerprint"
+                )
+            ),
+            "dispatch_completed": False,
+            "executor_call_count": 0,
         }
 
         await _advance_runtime_turn(
@@ -4723,6 +4838,14 @@ async def orchestrate_chat(
                     "prompt_fingerprint": prompt_fingerprint["fingerprint"],
                     "message_count": prompt_fingerprint["message_count"],
                 }
+                fallback_fingerprint = capability_exposure_trace.get("descriptor_fingerprint")
+                prompt.trace["capabilities"]["fallback"].update(
+                    {
+                        "descriptor_fingerprint": fallback_fingerprint,
+                        "same_descriptor_fingerprint": fallback_fingerprint
+                        == capability_exposure_trace.get("descriptor_fingerprint"),
+                    }
+                )
                 selected_model = fallback_attempt.model
                 selected_provider = fallback_attempt.provider
                 fallback_started = perf_counter()
@@ -4870,7 +4993,32 @@ async def orchestrate_chat(
                     capability_confirmation=payload.get("capability_confirmation"),
                 )
                 prompt.trace["capabilities"]["execution"] = execution_result.trace
-                raw_answer = execution_result.response_text
+                executor_call_count = execution_result.trace.get("executor_call_count")
+                if isinstance(executor_call_count, int):
+                    prompt.trace["capabilities"]["executor_call_count"] = executor_call_count
+                dispatch_completed = (
+                    execution_result.trace.get("executor_called") is True
+                    and execution_result.trace.get("executor_call_count") == 1
+                )
+                prompt.trace["capabilities"]["dispatch_completed"] = dispatch_completed
+                if dispatch_completed:
+                    prompt.trace["capabilities"]["fallback"]["blocked_after_dispatch"] = True
+                if execution_result.trace.get("response_status") == "executed":
+                    raw_answer, follow_up_trace = await _attempt_capability_follow_up(
+                        litellm=litellm,
+                        request_id=request_id,
+                        model=selected_model,
+                        execution_result=execution_result,
+                    )
+                    prompt.trace["capabilities"]["follow_up"] = follow_up_trace
+                else:
+                    raw_answer = execution_result.response_text
+            else:
+                prompt.trace["capabilities"]["follow_up"] = (
+                    _capability_follow_up_empty_trace()
+                )
+                prompt.trace["capabilities"]["dispatch_completed"] = False
+                prompt.trace["capabilities"]["executor_call_count"] = 0
         except CapabilityValidationError as exc:
             requested_capability_id = None
             requested_provider_tool_name = None
@@ -4889,6 +5037,9 @@ async def orchestrate_chat(
                 "failure_reason_code": exc.reason_code,
                 "response_status": "not_executed",
             }
+            prompt.trace["capabilities"]["follow_up"] = _capability_follow_up_empty_trace()
+            prompt.trace["capabilities"]["dispatch_completed"] = False
+            prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
         response_review = review_response(
             ResponseReviewInput(
