@@ -17,6 +17,7 @@ class LiteLLMClient:
         request_id: str,
         model: str,
         messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -24,7 +25,10 @@ class LiteLLMClient:
         if request_id:
             headers["X-Request-ID"] = request_id
 
-        payload = {"model": model, "messages": messages}
+        payload: dict[str, Any] = {"model": model, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/v1/chat/completions",

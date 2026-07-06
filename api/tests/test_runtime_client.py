@@ -392,3 +392,56 @@ async def test_evaluate_privacy_context_rejects_invalid_enums():
             sensitivity_level="normal",
             sensitivity_domains=[],
         )
+
+
+@pytest.mark.asyncio
+async def test_authorize_capability_posts_expected_exposure_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"result": {"allowed": True}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.authorize_capability(
+        request_id="rid:cap:exposure",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        active_persona_id="technical_architect",
+        authorization_phase="exposure",
+        capability_id="runtime.world_state.read",
+        capability_domain="software_architecture",
+        operation_class="read",
+        supported_surfaces=["dev", "vscode"],
+    )
+
+    assert calls == [
+        (
+            "/v1/capabilities/authorize",
+            {
+                "request_id": "rid:cap:exposure",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "active_persona_id": "technical_architect",
+                "authorization_phase": "exposure",
+                "capability_id": "runtime.world_state.read",
+                "capability_domain": "software_architecture",
+                "operation_class": "read",
+                "argument_digest": None,
+                "supported_surfaces": ["dev", "vscode"],
+                "relationship_requirements": [],
+                "selected_relationship_ids": [],
+                "world_state_requirements": [],
+                "selected_world_state_claim_ids": [],
+                "confirmation_challenge_ref": None,
+            },
+        )
+    ]

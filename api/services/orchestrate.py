@@ -18,6 +18,14 @@ from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
 from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
+from services.capabilities import (
+    CapabilityValidationError,
+    capability_validation_failure_trace,
+    filter_capability_descriptors_for_exposure,
+    parse_provider_capability_request,
+    provider_text,
+    validate_and_digest_capability_request,
+)
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
 from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
@@ -4473,6 +4481,18 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
+        capability_descriptors, capability_exposure_trace = (
+            await filter_capability_descriptors_for_exposure(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            )
+        )
 
         handoff = build_assistant_handoff(
             request_id=request_id,
@@ -4626,6 +4646,13 @@ async def orchestrate_chat(
             **prompt_fingerprint,
             "rebuilt_between_attempts": False,
         }
+        prompt.trace["capabilities"] = {
+            "exposure": capability_exposure_trace,
+            "validation": {
+                "validation_status": "not_requested",
+                "schema_version": capability_exposure_trace.get("schema_version"),
+            },
+        }
 
         await _advance_runtime_turn(
             runtime=runtime,
@@ -4639,6 +4666,7 @@ async def orchestrate_chat(
                 request_id=request_id,
                 model=selected_model,
                 messages=messages,
+                tools=capability_descriptors,
             )
             model_calls.append(
                 {
@@ -4652,6 +4680,12 @@ async def orchestrate_chat(
                         ordinal=1,
                         prompt_fingerprint=prompt_fingerprint,
                         prompt_trace=prompt.trace,
+                    ),
+                    "capability_descriptor_fingerprint": capability_exposure_trace.get(
+                        "descriptor_fingerprint"
+                    ),
+                    "capability_descriptor_count": capability_exposure_trace.get(
+                        "descriptor_count"
                     ),
                 }
             )
@@ -4669,6 +4703,12 @@ async def orchestrate_chat(
                         ordinal=1,
                         prompt_fingerprint=prompt_fingerprint,
                         prompt_trace=prompt.trace,
+                    ),
+                    "capability_descriptor_fingerprint": capability_exposure_trace.get(
+                        "descriptor_fingerprint"
+                    ),
+                    "capability_descriptor_count": capability_exposure_trace.get(
+                        "descriptor_count"
                     ),
                 }
             )
@@ -4689,6 +4729,7 @@ async def orchestrate_chat(
                         request_id=request_id,
                         model=selected_model,
                         messages=messages,
+                        tools=capability_descriptors,
                     )
                     model_calls.append(
                         {
@@ -4702,6 +4743,12 @@ async def orchestrate_chat(
                                 ordinal=2,
                                 prompt_fingerprint=prompt_fingerprint,
                                 prompt_trace=prompt.trace,
+                            ),
+                            "capability_descriptor_fingerprint": capability_exposure_trace.get(
+                                "descriptor_fingerprint"
+                            ),
+                            "capability_descriptor_count": capability_exposure_trace.get(
+                                "descriptor_count"
                             ),
                         }
                     )
@@ -4720,6 +4767,12 @@ async def orchestrate_chat(
                                 ordinal=2,
                                 prompt_fingerprint=prompt_fingerprint,
                                 prompt_trace=prompt.trace,
+                            ),
+                            "capability_descriptor_fingerprint": capability_exposure_trace.get(
+                                "descriptor_fingerprint"
+                            ),
+                            "capability_descriptor_count": capability_exposure_trace.get(
+                                "descriptor_count"
                             ),
                         }
                     )
@@ -4788,7 +4841,29 @@ async def orchestrate_chat(
                 )
                 raise
 
-        raw_answer = completion["choices"][0]["message"]["content"]
+        raw_answer = provider_text(completion)
+        capability_request = None
+        try:
+            capability_request = parse_provider_capability_request(completion)
+            if capability_request is not None:
+                validation_result = validate_and_digest_capability_request(
+                    request=capability_request,
+                    exposed_capability_ids=capability_exposure_trace.get(
+                        "exposed_capability_ids",
+                        [],
+                    ),
+                )
+                prompt.trace["capabilities"]["validation"] = validation_result.trace
+                raw_answer = "Capability request validated and deferred for authorization."
+        except CapabilityValidationError as exc:
+            requested_capability_id = None
+            if capability_request is not None:
+                requested_capability_id = capability_request.capability_id
+            prompt.trace["capabilities"]["validation"] = capability_validation_failure_trace(
+                exc.reason_code,
+                requested_capability_id,
+            )
+            raw_answer = "I could not use that capability request safely."
         response_review = review_response(
             ResponseReviewInput(
                 candidate_text=raw_answer,

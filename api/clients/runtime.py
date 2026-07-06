@@ -200,6 +200,50 @@ class RuntimeClient:
             payload["relationship_types"] = relationship_types
         return await self._post("/v1/relationships/select", json=payload)
 
+    async def authorize_capability(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str | None,
+        active_persona_id: str,
+        authorization_phase: str,
+        capability_id: str,
+        capability_domain: str,
+        operation_class: str,
+        argument_digest: str | None = None,
+        supported_surfaces: list[str] | None = None,
+        relationship_requirements: list[dict[str, Any]] | None = None,
+        selected_relationship_ids: list[str] | None = None,
+        world_state_requirements: list[dict[str, Any]] | None = None,
+        selected_world_state_claim_ids: list[str] | None = None,
+        confirmation_challenge_ref: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "active_persona_id": active_persona_id,
+            "authorization_phase": authorization_phase,
+            "capability_id": capability_id,
+            "capability_domain": capability_domain,
+            "operation_class": operation_class,
+            "argument_digest": argument_digest,
+            "supported_surfaces": supported_surfaces or [],
+            "relationship_requirements": relationship_requirements or [],
+            "selected_relationship_ids": selected_relationship_ids or [],
+            "world_state_requirements": world_state_requirements or [],
+            "selected_world_state_claim_ids": selected_world_state_claim_ids or [],
+            "confirmation_challenge_ref": confirmation_challenge_ref,
+        }
+        return await self._post("/v1/capabilities/authorize", json=payload)
+
     async def compile_companion_policy(
         self,
         *,
