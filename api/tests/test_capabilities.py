@@ -32,6 +32,8 @@ class FakeRuntime:
         verification_response: dict[str, object] | None = None,
         confirmation_error: Exception | None = None,
         confirmation_response: dict[str, object] | None = None,
+        relationship_response: dict[str, object] | None = None,
+        relationship_error: Exception | None = None,
     ):
         self.denied = denied or set()
         self.malformed = malformed
@@ -55,10 +57,13 @@ class FakeRuntime:
         self.verification_response = verification_response
         self.confirmation_error = confirmation_error
         self.confirmation_response = confirmation_response
+        self.relationship_response = relationship_response
+        self.relationship_error = relationship_error
         self.calls = []
         self.confirmation_calls = []
         self.world_state_calls = []
         self.world_state_verification_calls = []
+        self.relationship_calls = []
         self.executor_calls = 0
 
     async def authorize_capability(self, **kwargs):
@@ -92,12 +97,23 @@ class FakeRuntime:
                     ),
                 }
             }
-        allowed = kwargs["capability_id"] not in self.denied
+        relationship_ids = kwargs.get("selected_relationship_ids") or []
+        requires_relationship = (
+            kwargs["capability_id"] == "runtime.relationship_context.read"
+        )
+        allowed = (
+            kwargs["capability_id"] not in self.denied
+            and (not requires_relationship or bool(relationship_ids))
+        )
+        reason = "allowed" if allowed else "capability_domain_denied"
+        if requires_relationship and not relationship_ids:
+            reason = "missing_relationship_context"
         return {
             "result": {
                 "allowed": allowed,
                 "decision_code": "allowed" if allowed else "authorization_denied",
-                "reason_codes": ["allowed" if allowed else "capability_domain_denied"],
+                "reason_codes": [reason],
+                "relationship_ids_used": relationship_ids if allowed else [],
             }
         }
 
@@ -145,6 +161,29 @@ class FakeRuntime:
             "confirmation_state": "accepted",
         }
 
+    async def relationship_select(self, **kwargs):
+        self.executor_calls += 1
+        self.relationship_calls.append(kwargs)
+        if self.relationship_error is not None:
+            raise self.relationship_error
+        if self.relationship_response is not None:
+            return self.relationship_response
+        return {
+            "selected_relationships": [{"relationship_id": "rel_project"}],
+            "prompt_content": None,
+            "retrieval_scope_projection": {
+                "applied": True,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"],
+            },
+            "trace": {
+                "selected_relationship_count": 1,
+                "excluded_relationship_count": 0,
+            },
+        }
+
 
 def _completion(message: dict[str, object]) -> dict[str, object]:
     return {"choices": [{"message": message}]}
@@ -185,7 +224,11 @@ def _validated(provider_tool_name: str, arguments: dict[str, object]):
     assert request is not None
     return validate_and_digest_capability_request(
         request=request,
-        exposed_capability_ids=["runtime.world_state.read", "draft.local_message"],
+        exposed_capability_ids=[
+            "runtime.world_state.read",
+            "draft.local_message",
+            "runtime.relationship_context.read",
+        ],
     )
 
 
@@ -194,6 +237,7 @@ async def _execute(
     validation_result,
     revalidators=None,
     confirmation=None,
+    selected_relationship_ids=None,
 ):
     return await authorize_and_execute_capability(
         runtime=runtime,
@@ -205,6 +249,7 @@ async def _execute(
         runtime_turn_id="rtturn_1",
         active_persona_id="technical_architect",
         validation_result=validation_result,
+        selected_relationship_ids=selected_relationship_ids,
         revalidators=revalidators,
         capability_confirmation=confirmation,
     )
@@ -254,12 +299,14 @@ def test_production_registry_contains_exact_executor_bound_entries():
     assert [entry.capability_id for entry in registry] == [
         "runtime.world_state.read",
         "draft.local_message",
+        "runtime.relationship_context.read",
     ]
     assert all(entry.executor_binding for entry in registry)
     assert all(not entry.capability_id.startswith("test.") for entry in registry)
     assert [entry.provider_tool_name for entry in registry] == [
         "runtime_world_state_read",
         "draft_local_message",
+        "runtime_relationship_context_read",
     ]
     assert all(entry.provider_tool_name != entry.capability_id for entry in registry)
     assert all("." not in entry.provider_tool_name for entry in registry)
@@ -274,21 +321,24 @@ def test_provider_descriptors_are_deterministic_and_fingerprint_stable():
     assert first == second
     assert [item["metadata"]["capability_id"] for item in first] == [
         "draft.local_message",
+        "runtime.relationship_context.read",
         "runtime.world_state.read",
     ]
     assert [item["function"]["name"] for item in first] == [
         "draft_local_message",
+        "runtime_relationship_context_read",
         "runtime_world_state_read",
     ]
     assert [item["metadata"]["provider_tool_name"] for item in first] == [
         "draft_local_message",
+        "runtime_relationship_context_read",
         "runtime_world_state_read",
     ]
     assert descriptor_fingerprint(first) == descriptor_fingerprint(second)
 
 
 @pytest.mark.asyncio
-async def test_exposure_authorization_allows_both_production_capabilities():
+async def test_exposure_authorization_allows_non_relationship_capabilities_without_context():
     runtime = FakeRuntime()
     descriptors, trace = await filter_capability_descriptors_for_exposure(
         runtime=runtime,
@@ -306,12 +356,52 @@ async def test_exposure_authorization_allows_both_production_capabilities():
         "runtime.world_state.read",
         "draft.local_message",
     ]
-    assert trace["blocked_capability_ids"] == []
+    assert trace["blocked_capability_ids"] == ["runtime.relationship_context.read"]
+    assert trace["blocked_reasons"] == {
+        "runtime.relationship_context.read": "missing_relationship_context"
+    }
     assert len(descriptors) == 2
     assert [call["capability_id"] for call in runtime.calls] == [
         "runtime.world_state.read",
         "draft.local_message",
+        "runtime.relationship_context.read",
     ]
+
+
+@pytest.mark.asyncio
+async def test_relationship_gated_descriptor_exposed_with_selected_relationship_context():
+    runtime = FakeRuntime()
+    descriptors, trace = await filter_capability_descriptors_for_exposure(
+        runtime=runtime,
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        active_persona_id="technical_architect",
+        selected_relationship_ids=["rel_project"],
+    )
+
+    descriptor_ids = [item["metadata"]["capability_id"] for item in descriptors]
+    descriptor_names = [item["function"]["name"] for item in descriptors]
+    assert "runtime.relationship_context.read" in descriptor_ids
+    assert "runtime_relationship_context_read" in descriptor_names
+    assert trace["blocked_capability_ids"] == []
+    relationship_call = [
+        call
+        for call in runtime.calls
+        if call["capability_id"] == "runtime.relationship_context.read"
+    ][0]
+    assert relationship_call["relationship_requirements"] == [
+        {
+            "relationship_scope": "project_context",
+            "relationship_type": "works_on",
+            "required_status": "active",
+            "minimum_confidence": 0.8,
+        }
+    ]
+    assert relationship_call["selected_relationship_ids"] == ["rel_project"]
 
 
 @pytest.mark.asyncio
@@ -331,9 +421,13 @@ async def test_exposure_denial_removes_descriptor_from_provider_payload():
     descriptor_names = [item["function"]["name"] for item in descriptors]
     assert descriptor_ids == ["runtime.world_state.read"]
     assert descriptor_names == ["runtime_world_state_read"]
-    assert trace["blocked_capability_ids"] == ["draft.local_message"]
+    assert trace["blocked_capability_ids"] == [
+        "draft.local_message",
+        "runtime.relationship_context.read",
+    ]
     assert trace["blocked_reasons"] == {
-        "draft.local_message": "capability_domain_denied"
+        "draft.local_message": "capability_domain_denied",
+        "runtime.relationship_context.read": "missing_relationship_context",
     }
 
 
@@ -393,6 +487,19 @@ def test_provider_world_state_tool_name_maps_to_internal_capability_id():
     assert request is not None
     assert request.capability_id == "runtime.world_state.read"
     assert request.provider_tool_name == "runtime_world_state_read"
+
+
+def test_provider_relationship_context_tool_name_maps_to_internal_capability_id():
+    request = parse_provider_capability_request(
+        _call(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        )
+    )
+
+    assert request is not None
+    assert request.capability_id == "runtime.relationship_context.read"
+    assert request.provider_tool_name == "runtime_relationship_context_read"
 
 
 @pytest.mark.parametrize(
@@ -482,9 +589,30 @@ def test_unknown_and_hidden_provider_tool_names_are_rejected(
     assert exc.value.reason_code == reason
 
 
+def test_hidden_relationship_gated_provider_call_rejected_before_executor():
+    request = parse_provider_capability_request(
+        _call(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        )
+    )
+
+    with pytest.raises(CapabilityValidationError) as exc:
+        validate_and_digest_capability_request(
+            request=request,
+            exposed_capability_ids=["runtime.world_state.read", "draft.local_message"],
+        )
+
+    assert exc.value.reason_code == "capability_not_exposed"
+
+
 @pytest.mark.parametrize(
     "provider_tool_name",
-    ["draft.local_message", "runtime.world_state.read"],
+    [
+        "draft.local_message",
+        "runtime.world_state.read",
+        "runtime.relationship_context.read",
+    ],
 )
 def test_dotted_internal_id_as_provider_tool_name_is_rejected(provider_tool_name):
     with pytest.raises(CapabilityValidationError) as exc:
@@ -659,6 +787,174 @@ async def test_local_message_draft_authorizes_selection_before_dispatch_and_neve
     }
     assert result.response_text == "I created a local unsent draft. Nothing was sent."
     assert "send nothing" not in json.dumps(result.trace)
+
+
+@pytest.mark.asyncio
+async def test_relationship_context_read_passes_selected_relationships_and_executes_once():
+    runtime = FakeRuntime()
+
+    result = await _execute(
+        runtime,
+        _validated(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        ),
+        selected_relationship_ids=["rel_project"],
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "dispatch",
+    ]
+    assert [call["selected_relationship_ids"] for call in runtime.calls] == [
+        ["rel_project"],
+        ["rel_project"],
+    ]
+    assert runtime.calls[0]["relationship_requirements"] == [
+        {
+            "relationship_scope": "project_context",
+            "relationship_type": "works_on",
+            "required_status": "active",
+            "minimum_confidence": 0.8,
+        }
+    ]
+    assert len(runtime.relationship_calls) == 1
+    assert runtime.relationship_calls[0]["requested_scopes"] == ["project_context"]
+    assert runtime.relationship_calls[0]["relationship_types"] == ["works_on"]
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+    assert result.trace["authorization"]["selection"]["relationship_ids"] == ["rel_project"]
+    assert result.trace["authorization"]["dispatch"]["relationship_ids"] == ["rel_project"]
+    assert result.trace["executor_result"]["relationship_ids"] == ["rel_project"]
+    assert (
+        result.response_text
+        == "I read bounded project relationship context and found 1 authorized relationship(s)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_relationship_context_missing_selection_is_zero_executor():
+    runtime = FakeRuntime()
+
+    result = await _execute(
+        runtime,
+        _validated(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        ),
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == ["selection"]
+    assert runtime.calls[0]["selected_relationship_ids"] == []
+    assert result.trace["authorization"]["selection"]["status"] == "authorization_denied"
+    assert result.trace["authorization"]["selection"]["reason_codes"] == [
+        "missing_relationship_context"
+    ]
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.relationship_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason_code", "phase"),
+    [
+        ("revoked_relationship", "selection"),
+        ("restricted_relationship", "selection"),
+        ("conflicted_relationship", "selection"),
+        ("expired_relationship", "selection"),
+        ("provisional_relationship", "selection"),
+        ("low_confidence_relationship", "selection"),
+        ("relationship_scope_mismatch", "selection"),
+        ("relationship_type_mismatch", "dispatch"),
+        ("persona_relationship_scope_denied", "dispatch"),
+        ("surface_relationship_scope_denied", "dispatch"),
+    ],
+)
+async def test_relationship_context_ineligible_relationships_are_zero_executor(
+    reason_code,
+    phase,
+):
+    decisions = _allowed_phase_decisions()
+    decisions[phase] = {
+        "allowed": False,
+        "decision_code": "authorization_denied",
+        "reason_codes": [reason_code],
+        "relationship_ids_used": [],
+    }
+    runtime = FakeRuntime(phase_decisions=decisions)
+
+    result = await _execute(
+        runtime,
+        _validated(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        ),
+        selected_relationship_ids=["rel_project"],
+    )
+
+    assert result.trace["authorization"][phase]["status"] == "authorization_denied"
+    assert result.trace["authorization"][phase]["reason_codes"] == [reason_code]
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.relationship_calls == []
+
+
+@pytest.mark.asyncio
+async def test_relationship_context_trace_omits_raw_evidence_source_refs_and_scores():
+    runtime = FakeRuntime(
+        relationship_response={
+            "selected_relationships": [
+                {
+                    "relationship_id": "rel_project",
+                    "raw_evidence": "PRIVATE-REL-EVIDENCE",
+                    "source_refs": [{"ref_id": "PRIVATE-SOURCE"}],
+                    "private_details": "PRIVATE-REL-DETAILS",
+                    "hidden_graph_score": 0.99,
+                }
+            ],
+            "prompt_content": "PRIVATE-REL-PROMPT",
+            "retrieval_scope_projection": {
+                "applied": True,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"],
+            },
+            "trace": {
+                "selected_relationship_count": 1,
+                "excluded_relationship_count": 0,
+                "relationship_edges_used": ["rel_project"],
+                "relationship_edges_excluded": [],
+                "relationship_exclusion_reasons": {},
+                "hidden_graph_score": 0.99,
+            },
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        _validated(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        ),
+        selected_relationship_ids=["rel_project"],
+    )
+
+    serialized = json.dumps(result.trace, sort_keys=True)
+    assert "rel_project" in serialized
+    assert "eligible_relationship_scope_selected" in serialized
+    for forbidden in (
+        "PRIVATE-REL-EVIDENCE",
+        "PRIVATE-SOURCE",
+        "PRIVATE-REL-DETAILS",
+        "PRIVATE-REL-PROMPT",
+        "hidden_graph_score",
+        "raw_evidence",
+        "source_refs",
+        "private_details",
+    ):
+        assert forbidden not in serialized
 
 
 @pytest.mark.asyncio

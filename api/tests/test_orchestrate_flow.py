@@ -803,14 +803,30 @@ class CapabilityRuntime(FakeRuntime):
         )
         if isinstance(decision, list):
             decision = decision.pop(0)
+        selected_relationship_ids = kwargs.get("selected_relationship_ids") or []
+        requires_relationship = (
+            kwargs["capability_id"] == "runtime.relationship_context.read"
+        )
+        allowed = decision.get("allowed", False)
+        reason_codes = decision.get("reason_codes", ["authorization_denied"])
+        decision_code = decision.get("decision_code", "authorization_denied")
+        relationship_ids_used = decision.get(
+            "relationship_ids_used",
+            selected_relationship_ids if allowed and selected_relationship_ids else [],
+        )
+        if requires_relationship and not selected_relationship_ids and allowed:
+            allowed = False
+            decision_code = "authorization_denied"
+            reason_codes = ["missing_relationship_context"]
+            relationship_ids_used = []
         return {
             "result": {
-                "allowed": decision.get("allowed", False),
-                "decision_code": decision.get("decision_code", "authorization_denied"),
-                "reason_codes": decision.get("reason_codes", ["authorization_denied"]),
+                "allowed": allowed,
+                "decision_code": decision_code,
+                "reason_codes": reason_codes,
                 "challenge_ref": decision.get("challenge_ref"),
                 "revalidation_selector": decision.get("revalidation_selector"),
-                "relationship_ids_used": [],
+                "relationship_ids_used": relationship_ids_used,
                 "world_state_claim_ids_used": [],
             }
         }
@@ -9112,6 +9128,185 @@ async def test_orchestrate_executes_local_unsent_draft_after_selection_and_dispa
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_hides_relationship_gated_descriptor_without_context(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    litellm = FakeLiteLLM(completion=_text_completion("No tool needed."))
+
+    await orchestrate_chat(
+        payload=_first_party_chat_payload("Can you inspect project relationships?"),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-rel-hidden",
+    )
+
+    tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
+    assert "runtime_relationship_context_read" not in tool_names
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert "runtime.relationship_context.read" in trace["exposure"]["blocked_capability_ids"]
+    assert trace["exposure"]["blocked_reasons"][
+        "runtime.relationship_context.read"
+    ] == "missing_relationship_context"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_exposes_and_dispatches_relationship_gated_capability(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(relationship_response=_scoped_relationship_response())
+    litellm = FakeLiteLLM(
+        completion=_tool_completion(
+            "runtime_relationship_context_read",
+            {"relationship_scope": "project_context", "relationship_type": "works_on"},
+        )
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read project relationship context."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-rel-allowed",
+    )
+
+    assert out["answer"] == (
+        "I read bounded project relationship context and found 1 authorized "
+        "relationship(s)."
+    )
+    tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
+    assert "runtime_relationship_context_read" in tool_names
+    phases = [
+        call["authorization_phase"]
+        for call in runtime.capability_authorization_calls
+        if call["capability_id"] == "runtime.relationship_context.read"
+    ]
+    assert phases == ["exposure", "selection", "dispatch"]
+    relationship_calls = [
+        call for call in runtime.relationship_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(relationship_calls) == 1
+    assert relationship_calls[0]["requested_scopes"] == ["project_context"]
+    assert relationship_calls[0]["relationship_types"] == ["works_on"]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["authorization"]["selection"]["relationship_ids"] == [
+        "rel_project"
+    ]
+    assert trace["execution"]["authorization"]["dispatch"]["relationship_ids"] == [
+        "rel_project"
+    ]
+    assert trace["execution"]["executor_result"]["relationship_ids"] == ["rel_project"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_hidden_relationship_gated_call_is_rejected_before_executor(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read project relationship context."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "runtime_relationship_context_read",
+                {"relationship_scope": "project_context", "relationship_type": "works_on"},
+            )
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-rel-hidden-call",
+    )
+
+    assert out["answer"] == "I could not use that capability request safely."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["validation"]["reason_code"] == "capability_not_exposed"
+    assert trace["execution"]["executor_called"] is False
+    assert trace["execution"]["executor_call_count"] == 0
+    assert [
+        call for call in runtime.relationship_calls if call["request_id"].endswith(":execute")
+    ] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "revoked_relationship",
+        "restricted_relationship",
+        "conflicted_relationship",
+        "expired_relationship",
+        "low_confidence_relationship",
+        "relationship_scope_mismatch",
+    ],
+)
+async def test_orchestrate_relationship_selection_denial_is_zero_executor(
+    tmp_path,
+    reason_code,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(
+        relationship_response=_scoped_relationship_response(),
+        phase_decisions={
+            "exposure": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "selection": {
+                "allowed": False,
+                "decision_code": "authorization_denied",
+                "reason_codes": [reason_code],
+                "relationship_ids_used": [],
+            },
+        },
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read project relationship context."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "runtime_relationship_context_read",
+                {"relationship_scope": "project_context", "relationship_type": "works_on"},
+            )
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-cap-rel-denied-{reason_code}",
+    )
+
+    assert out["answer"] == "I could not use that capability request safely."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["authorization"]["selection"]["reason_codes"] == [reason_code]
+    assert trace["execution"]["executor_called"] is False
+    assert trace["execution"]["executor_call_count"] == 0
+    assert [
+        call for call in runtime.relationship_calls if call["request_id"].endswith(":execute")
+    ] == []
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_revalidates_then_executes_local_unsent_draft(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
@@ -9559,6 +9754,88 @@ async def test_orchestrate_primary_failure_fallback_uses_same_descriptors_and_ca
     assert trace["fallback"]["blocked_after_dispatch"] is True
     assert trace["dispatch_completed"] is True
     assert trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_relationship_fallback_reuses_same_filtered_descriptors(
+    tmp_path,
+):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(relationship_response=_scoped_relationship_response())
+    litellm = SequenceLiteLLM(
+        [
+            RuntimeError("primary failed"),
+            _tool_completion(
+                "runtime_relationship_context_read",
+                {"relationship_scope": "project_context", "relationship_type": "works_on"},
+            ),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read project relationship context."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-rel-fallback",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == (
+        "I read bounded project relationship context and found 1 authorized "
+        "relationship(s)."
+    )
+    assert len(litellm.calls) == 3
+    assert litellm.calls[0]["tools"] == litellm.calls[1]["tools"]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["fallback"]["same_descriptor_fingerprint"] is True
+    assert trace["fallback"]["blocked_after_dispatch"] is True
+    assert trace["dispatch_completed"] is True
+    assert trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_relationship_completed_dispatch_blocks_fallback_replay(tmp_path):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(relationship_response=_scoped_relationship_response())
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "runtime_relationship_context_read",
+                {"relationship_scope": "project_context", "relationship_type": "works_on"},
+            ),
+            RuntimeError("follow-up failed"),
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read project relationship context."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-rel-dispatch-blocks-fallback",
+    )
+
+    assert out["answer"] == (
+        "I read bounded project relationship context and found 1 authorized "
+        "relationship(s)."
+    )
+    assert len(litellm.calls) == 2
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    assert trace_payload["fallback"] == {"triggered": False, "reason": None}
+    capabilities = trace_payload["retrieval"]["prompt_assembly"]["capabilities"]
+    assert capabilities["fallback"]["blocked_after_dispatch"] is True
+    assert capabilities["executor_call_count"] == 1
 
 
 @pytest.mark.asyncio

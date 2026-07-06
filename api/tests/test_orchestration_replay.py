@@ -8,6 +8,7 @@ from services.orchestration_replay import (
     load_corpus,
     project_snapshot,
     run_scenario,
+    run_wave3c_r_smoke_report,
     run_wave3c_smoke_report,
 )
 
@@ -168,7 +169,20 @@ def test_required_orchestration_replay_categories_are_present():
         "wave3b_co3_privacy_sanitization",
         "wave3b_co3_malformed_mandatory_response",
         "wave3c_capability_lifecycle",
+        "wave3c_r_relationship_capability",
     } <= categories
+
+
+@pytest.mark.asyncio
+async def test_wave3c_r_smoke_report_includes_relationship_assertions():
+    report = await run_wave3c_r_smoke_report()
+
+    assert report["scenario_count"] == 9
+    assert report["failed_count"] == 0
+    assert report["relationship_gated_scenarios_included"] is True
+    assert report["privacy_assertions_passed"] is True
+    assert report["no_repeat_dispatch_assertions_passed"] is True
+    assert report["descriptor_fingerprint_assertion_passed"] is True
 
 
 def test_wave2d_prompt_budget_replay_corpus_is_complete():
@@ -284,7 +298,10 @@ async def test_wave3c_replay_projects_bounded_privacy_safe_capability_trace():
     assert capabilities["exposure"]["exposed_capability_ids"] == [
         "runtime.world_state.read"
     ]
-    assert capabilities["exposure"]["blocked_capability_ids"] == ["draft.local_message"]
+    assert capabilities["exposure"]["blocked_capability_ids"] == [
+        "draft.local_message",
+        "runtime.relationship_context.read",
+    ]
     assert capabilities["validation"]["provider_tool_name"] == "runtime_world_state_read"
     assert capabilities["validation"]["capability_id"] == "runtime.world_state.read"
     assert capabilities["execution"]["executor_call_count"] == 1

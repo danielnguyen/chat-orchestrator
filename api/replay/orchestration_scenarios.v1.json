@@ -1683,7 +1683,10 @@
                     "capabilities": {
                         "exposure": {
                             "exposed_capability_ids": ["runtime.world_state.read"],
-                            "blocked_capability_ids": ["draft.local_message"],
+                            "blocked_capability_ids": [
+                                "draft.local_message",
+                                "runtime.relationship_context.read"
+                            ],
                             "descriptor_count": 1
                         },
                         "validation": {
@@ -1941,7 +1944,10 @@
                     "capabilities": {
                         "exposure": {
                             "exposed_capability_ids": ["runtime.world_state.read"],
-                            "blocked_capability_ids": ["draft.local_message"],
+                            "blocked_capability_ids": [
+                                "draft.local_message",
+                                "runtime.relationship_context.read"
+                            ],
                             "descriptor_count": 1
                         },
                         "validation": {
@@ -2016,6 +2022,266 @@
                                 "rerun_selection_status": null,
                                 "reason_code": "verification_failed"
                             }
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-active-relationship-dispatch",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "exposure": {
+                            "descriptor_count": 3
+                        },
+                        "validation": {
+                            "validation_status": "ok",
+                            "capability_id": "runtime.relationship_context.read",
+                            "provider_tool_name": "runtime_relationship_context_read"
+                        },
+                        "execution": {
+                            "response_status": "executed",
+                            "executor_called": true,
+                            "executor_call_count": 1,
+                            "executor_result_status": "ok",
+                            "selection_status": "allowed",
+                            "selection_relationship_id_count": 1,
+                            "selection_relationship_ids": ["rel_project"],
+                            "dispatch_status": "allowed",
+                            "dispatch_relationship_id_count": 1,
+                            "dispatch_relationship_ids": ["rel_project"],
+                            "executor_result": {
+                                "relationship_id_count": 1,
+                                "relationship_ids": ["rel_project"],
+                                "relationship_scopes": ["project_context"],
+                                "reason_codes": ["eligible_relationship_scope_selected"]
+                            }
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 2
+            }
+        },
+        {
+            "scenario": "wave3c-r-missing-relationship-hides-descriptor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "exposure": {
+                            "descriptor_count": 2,
+                            "blocked_capability_ids": ["runtime.relationship_context.read"]
+                        },
+                        "validation": {
+                            "validation_status": "rejected",
+                            "capability_id": "runtime.relationship_context.read",
+                            "provider_tool_name": "runtime_relationship_context_read",
+                            "reason_code": "capability_not_exposed"
+                        },
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "capability_not_exposed",
+                            "executor_called": false,
+                            "executor_call_count": 0
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-hidden-descriptor-call-zero-executor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "relationship_projection": {
+                "applied": false,
+                "relationship_ids": [],
+                "entity_ids": [],
+                "relationship_scopes": [],
+                "reason_codes": ["no_eligible_relationship_scope"]
+            },
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "validation": {
+                            "validation_status": "rejected",
+                            "capability_id": "runtime.relationship_context.read",
+                            "reason_code": "capability_not_exposed"
+                        },
+                        "execution": {
+                            "executor_called": false,
+                            "executor_call_count": 0
+                        },
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-revoked-relationship-zero-executor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "wave3c_r_relationship_denial": "revoked_relationship",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "revoked_relationship",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_status": "authorization_denied",
+                            "selection_reason_codes": ["revoked_relationship"]
+                        },
+                        "dispatch_completed": false,
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-restricted-relationship-zero-executor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "wave3c_r_relationship_denial": "restricted_relationship",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "failure_reason_code": "restricted_relationship",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_reason_codes": ["restricted_relationship"]
+                        },
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-conflicted-relationship-zero-executor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "wave3c_r_relationship_denial": "conflicted_relationship",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "failure_reason_code": "conflicted_relationship",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_reason_codes": ["conflicted_relationship"]
+                        },
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-expired-relationship-zero-executor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "wave3c_r_relationship_denial": "expired_relationship",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "failure_reason_code": "expired_relationship",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_reason_codes": ["expired_relationship"]
+                        },
+                        "executor_call_count": 0
+                    }
+                },
+                "provider_attempt_count": 1
+            }
+        },
+        {
+            "scenario": "wave3c-r-fallback-same-descriptor-fingerprint",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "provider": "fallback_success",
+            "fallback_model": "gpt-4o-mini-fallback",
+            "expected": {
+                "outcome": {
+                    "status": "degraded"
+                },
+                "trace": {
+                    "capabilities": {
+                        "fallback": {
+                            "same_descriptor_fingerprint": true,
+                            "blocked_after_dispatch": true
+                        },
+                        "dispatch_completed": true,
+                        "executor_call_count": 1
+                    }
+                },
+                "provider_attempt_count": 3
+            }
+        },
+        {
+            "scenario": "wave3c-r-dispatch-denial-zero-executor",
+            "category": "wave3c_r_relationship_capability",
+            "wave3c_capability": "runtime.relationship_context.read",
+            "wave3c_r_active_relationship": true,
+            "wave3c_r_dispatch_denial": "relationship_dispatch_denied",
+            "expected": {
+                "outcome": {
+                    "status": "ok"
+                },
+                "trace": {
+                    "capabilities": {
+                        "execution": {
+                            "response_status": "not_executed",
+                            "failure_reason_code": "relationship_dispatch_denied",
+                            "executor_called": false,
+                            "executor_call_count": 0,
+                            "selection_status": "allowed",
+                            "dispatch_status": "authorization_denied",
+                            "dispatch_reason_codes": ["relationship_dispatch_denied"]
                         },
                         "dispatch_completed": false,
                         "executor_call_count": 0
