@@ -1649,6 +1649,7 @@ def _privacy_safe_wave4_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "status": trace.get("status", "composed"),
         "privacy_suppressed": True,
+        "provider_context_included": False,
         "recall": {
             "candidate_count": recall.get("candidate_count", 0),
             "decision_count": recall.get("decision_count", 0),
@@ -1664,6 +1665,7 @@ def _privacy_safe_wave4_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
             "episode_status": dependency.get("episode_status"),
         },
         "omission_count": trace.get("omission_count", 0),
+        "final_callback_applied": trace.get("final_callback_applied"),
     }
 
 
@@ -4630,14 +4632,23 @@ async def orchestrate_chat(
             world_state=world_state,
             relationship_context=relationship_context,
         )
+        privacy_prompt_suppressed = privacy_context_enabled and privacy_policy_requires_suppression(
+            privacy_context
+        )
         provider_retrieval_bundle = (
             _empty_retrieval_bundle(
                 request_id=request_id,
                 conversation_id=conversation_id,
                 reason="privacy_prompt_suppression",
             )
-            if privacy_context_enabled and privacy_policy_requires_suppression(privacy_context)
+            if privacy_prompt_suppressed
             else retrieval_bundle
+        )
+        provider_wave4_messages = (
+            [] if privacy_prompt_suppressed else wave4_composition.prompt_messages
+        )
+        provider_wave4_trace = (
+            _privacy_safe_wave4_trace(wave4_trace) if privacy_prompt_suppressed else wave4_trace
         )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
@@ -4706,7 +4717,7 @@ async def orchestrate_chat(
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
                         "dsa": dsa_trace,
-                        "memory_episode_recall_composition": wave4_trace,
+                        "memory_episode_recall_composition": provider_wave4_trace,
                     },
                     surface_presence_trace=surface_presence_trace,
                     dsa_trace=dsa_trace,
@@ -4822,8 +4833,8 @@ async def orchestrate_chat(
                 interrupt_trace=interrupt_trace,
                 external_context_pack=external_context_pack,
                 dsa_trace=dsa_trace,
-                wave4_memory_messages=wave4_composition.prompt_messages,
-                wave4_memory_trace=wave4_trace,
+                wave4_memory_messages=provider_wave4_messages,
+                wave4_memory_trace=provider_wave4_trace,
                 prompt_budget_contract=PromptBudgetContract(
                     attempts=provider_attempt_plan,
                     output_token_reserve=prompt_output_token_reserve,
@@ -4866,7 +4877,7 @@ async def orchestrate_chat(
                 "relationship_context": relationship_context_trace,
                 "runtime": runtime_trace,
                 "dsa": dsa_trace,
-                "memory_episode_recall_composition": wave4_trace,
+                "memory_episode_recall_composition": provider_wave4_trace,
                 "message_count": 0,
             }
             await _create_error_trace(
@@ -5216,7 +5227,7 @@ async def orchestrate_chat(
         prompt.trace["response_review"] = response_review.to_trace()
         prompt.trace["response_action"] = response_action.to_trace()
         candidate_answer = response_action.candidate_text
-        if wave4_composition.explicit_callbacks:
+        if wave4_composition.explicit_callbacks and not privacy_prompt_suppressed:
             callback_text = wave4_composition.explicit_callbacks[0]
             if callback_text and callback_text not in candidate_answer:
                 candidate_answer = f"{callback_text}\n\n{candidate_answer}"

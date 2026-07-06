@@ -1100,6 +1100,84 @@ class BundledMemoryStore(FakeMemoryStore):
         return self.bundle
 
 
+class Wave4PrivacyMemoryStore(FakeMemoryStore):
+    memory_text = "WAVE4_PRIVATE_MEMORY_TEXT"
+    episode_text = "WAVE4_PRIVATE_EPISODE_TEXT"
+
+    async def retrieve_bundle(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "bundle": {
+                "recent": [],
+                "semantic": [
+                    {
+                        "owner_id": "owner",
+                        "conversation_id": kwargs["conversation_id"],
+                        "message_id": "wave4-private-message",
+                        "memory_id": "wave4-private-memory",
+                        "created_at": "2026-07-06T00:00:00+00:00",
+                        "role": "assistant",
+                        "content": self.memory_text,
+                        "score": 0.95,
+                        "salience_score": 0.95,
+                        "promotion_state": "promoted",
+                        "source_ref": {
+                            "ref_type": "memory_item",
+                            "ref_id": "wave4-private-memory",
+                        },
+                    }
+                ],
+                "artifact_refs": [],
+                "observed_metadata": {"has_code_like_content": False},
+            },
+        }
+
+    async def select_recall(self, **kwargs):
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "decision_count": 1,
+            "decisions": [
+                {
+                    "candidate_id": "wave4-private-memory",
+                    "candidate_type": "memory_item",
+                    "decision": "mention",
+                    "mention_strategy": "light_callback",
+                    "prompt_eligible": True,
+                    "reason": {"rule_id": "light_callback_allowed"},
+                }
+            ],
+        }
+
+    async def retrieve_episode_callbacks(self, **kwargs):
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "decision_count": 1,
+            "decisions": [
+                {
+                    "episode_id": "wave4-private-episode",
+                    "decision": "include",
+                    "callback_strategy": "explicit_callback",
+                    "callback_score": 0.95,
+                    "prompt_eligible": True,
+                    "reasons": ["useful_continuity"],
+                    "episode": {
+                        "episode_id": "wave4-private-episode",
+                        "title": "Private episode",
+                        "summary": self.episode_text,
+                        "episode_type": "successful_mitigation",
+                        "source_refs": [
+                            {"ref_type": "message", "ref_id": "wave4-private-episode-message"}
+                        ],
+                    },
+                }
+            ],
+        }
+
+
 def _write_router_files(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
@@ -11696,6 +11774,86 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
     assert prompt_trace["response_action"]["action_taken"] == "template_fallback"
     assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
     assert trace_payload["model_call"]["brief"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_suppresses_wave4_prompt_layer_and_fallback(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: gpt-4o-mini\n"
+        "          provider: cloud\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="voice_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            voice_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        )
+    )
+    memory_store = Wave4PrivacyMemoryStore()
+    litellm = FakeLiteLLM(fail_first=True, content="provider answer")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface_context={"surface_category": "voice_private"},
+            messages=[{"role": "user", "content": "Use the private callback."}],
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-wave4-privacy-fallback",
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "Sensitive details are withheld from voice output."
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
+    provider_messages = json.dumps(litellm.calls, sort_keys=True)
+    assert Wave4PrivacyMemoryStore.memory_text not in provider_messages
+    assert Wave4PrivacyMemoryStore.episode_text not in provider_messages
+
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
+    wave4_trace = prompt_trace["memory_episode_recall_composition"]
+    assert wave4_trace["privacy_suppressed"] is True
+    assert wave4_trace["provider_context_included"] is False
+    assert wave4_trace["recall"]["decision_count"] == 1
+    assert wave4_trace["episodes"]["prompt_eligible_count"] == 1
+    assert wave4_trace["final_callback_applied"] is False
+    wave4_layer = next(
+        layer
+        for layer in prompt_trace["layers"]
+        if layer["name"] == "memory_episode_recall_composition"
+    )
+    assert wave4_layer["included"] is False
+    assert wave4_layer["metadata"]["privacy_suppressed"] is True
+    assert "provider_fallback_context" in prompt_trace
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+    serialized_trace = json.dumps(trace_payload, sort_keys=True)
+    assert Wave4PrivacyMemoryStore.memory_text not in serialized_trace
+    assert Wave4PrivacyMemoryStore.episode_text not in serialized_trace
 
 
 def _privacy_error_bundle(request_id="rid-privacy-error"):
