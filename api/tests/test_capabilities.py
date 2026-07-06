@@ -38,13 +38,13 @@ def _completion(message: dict[str, object]) -> dict[str, object]:
     return {"choices": [{"message": message}]}
 
 
-def _call(capability_id: str, arguments: dict[str, object]) -> dict[str, object]:
+def _call(provider_tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
     return _completion(
         {
             "tool_calls": [
                 {
                     "function": {
-                        "name": capability_id,
+                        "name": provider_tool_name,
                         "arguments": json.dumps(arguments),
                     }
                 }
@@ -62,6 +62,12 @@ def test_production_registry_contains_exact_executor_bound_entries():
     ]
     assert all(entry.executor_binding for entry in registry)
     assert all(not entry.capability_id.startswith("test.") for entry in registry)
+    assert [entry.provider_tool_name for entry in registry] == [
+        "runtime_world_state_read",
+        "draft_local_message",
+    ]
+    assert all(entry.provider_tool_name != entry.capability_id for entry in registry)
+    assert all("." not in entry.provider_tool_name for entry in registry)
 
 
 def test_provider_descriptors_are_deterministic_and_fingerprint_stable():
@@ -75,13 +81,22 @@ def test_provider_descriptors_are_deterministic_and_fingerprint_stable():
         "draft.local_message",
         "runtime.world_state.read",
     ]
+    assert [item["function"]["name"] for item in first] == [
+        "draft_local_message",
+        "runtime_world_state_read",
+    ]
+    assert [item["metadata"]["provider_tool_name"] for item in first] == [
+        "draft_local_message",
+        "runtime_world_state_read",
+    ]
     assert descriptor_fingerprint(first) == descriptor_fingerprint(second)
 
 
 @pytest.mark.asyncio
 async def test_exposure_authorization_allows_both_production_capabilities():
+    runtime = FakeRuntime()
     descriptors, trace = await filter_capability_descriptors_for_exposure(
-        runtime=FakeRuntime(),
+        runtime=runtime,
         request_id="rid",
         owner_id="owner",
         conversation_id="conv",
@@ -98,6 +113,10 @@ async def test_exposure_authorization_allows_both_production_capabilities():
     ]
     assert trace["blocked_capability_ids"] == []
     assert len(descriptors) == 2
+    assert [call["capability_id"] for call in runtime.calls] == [
+        "runtime.world_state.read",
+        "draft.local_message",
+    ]
 
 
 @pytest.mark.asyncio
@@ -114,7 +133,9 @@ async def test_exposure_denial_removes_descriptor_from_provider_payload():
     )
 
     descriptor_ids = [item["metadata"]["capability_id"] for item in descriptors]
+    descriptor_names = [item["function"]["name"] for item in descriptors]
     assert descriptor_ids == ["runtime.world_state.read"]
+    assert descriptor_names == ["runtime_world_state_read"]
     assert trace["blocked_capability_ids"] == ["draft.local_message"]
     assert trace["blocked_reasons"] == {
         "draft.local_message": "capability_domain_denied"
@@ -160,12 +181,23 @@ def test_provider_normal_text_has_no_capability_request():
 
 def test_exactly_one_provider_capability_call_parses_successfully():
     request = parse_provider_capability_request(
-        _call("draft.local_message", {"body": "hello"})
+        _call("draft_local_message", {"body": "hello"})
     )
 
     assert request is not None
     assert request.capability_id == "draft.local_message"
+    assert request.provider_tool_name == "draft_local_message"
     assert request.arguments == {"body": "hello"}
+
+
+def test_provider_world_state_tool_name_maps_to_internal_capability_id():
+    request = parse_provider_capability_request(
+        _call("runtime_world_state_read", {"output_mode": "structured"})
+    )
+
+    assert request is not None
+    assert request.capability_id == "runtime.world_state.read"
+    assert request.provider_tool_name == "runtime_world_state_read"
 
 
 @pytest.mark.parametrize(
@@ -177,13 +209,13 @@ def test_exactly_one_provider_capability_call_parses_successfully():
                     "tool_calls": [
                         {
                             "function": {
-                                "name": "draft.local_message",
+                                "name": "draft_local_message",
                                 "arguments": "{\"body\":\"one\"}",
                             }
                         },
                         {
                             "function": {
-                                "name": "runtime.world_state.read",
+                                "name": "runtime_world_state_read",
                                 "arguments": "{}",
                             }
                         },
@@ -192,14 +224,14 @@ def test_exactly_one_provider_capability_call_parses_successfully():
             ),
             "multiple_capability_calls",
         ),
-        (_call("draft.local_message", {"body": "x" * 5000}), "oversized_arguments"),
+        (_call("draft_local_message", {"body": "x" * 5000}), "oversized_arguments"),
         (
             _completion(
                 {
                     "tool_calls": [
                         {
                             "function": {
-                                "name": "draft.local_message",
+                                "name": "draft_local_message",
                                 "arguments": "{bad",
                             }
                         }
@@ -227,18 +259,24 @@ def test_provider_capability_call_rejections(completion, reason):
 
 
 @pytest.mark.parametrize(
-    ("capability_id", "exposed_ids", "reason"),
+    ("provider_tool_name", "exposed_ids", "reason"),
     [
-        ("integration.send_message", ["draft.local_message"], "unknown_capability_id"),
-        ("draft.local_message", [], "capability_not_exposed"),
+        ("integration_send_message", ["draft.local_message"], "unknown_capability_id"),
+        ("draft_local_message", [], "capability_not_exposed"),
     ],
 )
-def test_unknown_and_hidden_capability_ids_are_rejected(
-    capability_id,
+def test_unknown_and_hidden_provider_tool_names_are_rejected(
+    provider_tool_name,
     exposed_ids,
     reason,
 ):
-    request = parse_provider_capability_request(_call(capability_id, {"body": "hello"}))
+    if reason == "unknown_capability_id":
+        with pytest.raises(CapabilityValidationError) as exc:
+            parse_provider_capability_request(_call(provider_tool_name, {"body": "hello"}))
+        assert exc.value.reason_code == reason
+        return
+
+    request = parse_provider_capability_request(_call(provider_tool_name, {"body": "hello"}))
 
     with pytest.raises(CapabilityValidationError) as exc:
         validate_and_digest_capability_request(
@@ -247,6 +285,17 @@ def test_unknown_and_hidden_capability_ids_are_rejected(
         )
 
     assert exc.value.reason_code == reason
+
+
+@pytest.mark.parametrize(
+    "provider_tool_name",
+    ["draft.local_message", "runtime.world_state.read"],
+)
+def test_dotted_internal_id_as_provider_tool_name_is_rejected(provider_tool_name):
+    with pytest.raises(CapabilityValidationError) as exc:
+        parse_provider_capability_request(_call(provider_tool_name, {"body": "hello"}))
+
+    assert exc.value.reason_code == "unknown_capability_id"
 
 
 @pytest.mark.parametrize(
@@ -259,7 +308,7 @@ def test_unknown_and_hidden_capability_ids_are_rejected(
     ],
 )
 def test_schema_invalid_draft_arguments_are_rejected(arguments):
-    request = parse_provider_capability_request(_call("draft.local_message", arguments))
+    request = parse_provider_capability_request(_call("draft_local_message", arguments))
 
     with pytest.raises(CapabilityValidationError) as exc:
         validate_and_digest_capability_request(
@@ -273,7 +322,7 @@ def test_schema_invalid_draft_arguments_are_rejected(arguments):
 def test_world_state_arguments_normalize_and_digest_stably_without_raw_trace():
     request = parse_provider_capability_request(
         _call(
-            "runtime.world_state.read",
+            "runtime_world_state_read",
             {
                 "requested_domains": ["runtime_surface", "active_repository"],
                 "output_mode": "structured",
@@ -302,7 +351,7 @@ def test_world_state_arguments_normalize_and_digest_stably_without_raw_trace():
 def test_draft_arguments_normalize_and_digest_stably_without_raw_trace():
     request = parse_provider_capability_request(
         _call(
-            "draft.local_message",
+            "draft_local_message",
             {
                 "body": "  Hello Daniel  ",
                 "recipient_label": "reviewer",

@@ -4857,11 +4857,14 @@ async def orchestrate_chat(
                 raw_answer = "Capability request validated and deferred for authorization."
         except CapabilityValidationError as exc:
             requested_capability_id = None
+            requested_provider_tool_name = None
             if capability_request is not None:
                 requested_capability_id = capability_request.capability_id
+                requested_provider_tool_name = capability_request.provider_tool_name
             prompt.trace["capabilities"]["validation"] = capability_validation_failure_trace(
                 exc.reason_code,
                 requested_capability_id,
+                requested_provider_tool_name,
             )
             raw_answer = "I could not use that capability request safely."
         response_review = review_response(

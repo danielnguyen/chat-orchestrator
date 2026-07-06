@@ -12,7 +12,7 @@ async def test_litellm_chat_includes_capability_descriptors_as_tools(monkeypatch
     tools = [
         {
             "type": "function",
-            "function": {"name": "draft.local_message", "parameters": {"type": "object"}},
+            "function": {"name": "draft_local_message", "parameters": {"type": "object"}},
         }
     ]
 

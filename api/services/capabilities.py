@@ -11,6 +11,7 @@ CAPABILITY_ARGUMENT_SCHEMA_VERSION = "co.capability-args.v1"
 MAX_ARGUMENT_BYTES = 4096
 
 _SAFE_ID = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
+_SAFE_PROVIDER_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9_.:@/-]{1,120}$")
 _WORLD_STATE_DOMAINS = {
     "active_project",
@@ -35,6 +36,7 @@ class CapabilityValidationError(ValueError):
 @dataclass(frozen=True)
 class CapabilityEntry:
     capability_id: str
+    provider_tool_name: str
     operation_class: str
     capability_domain: str
     supported_surfaces: tuple[str, ...]
@@ -48,6 +50,7 @@ class CapabilityEntry:
 @dataclass(frozen=True)
 class ParsedCapabilityRequest:
     capability_id: str
+    provider_tool_name: str
     arguments: dict[str, Any]
 
 
@@ -63,6 +66,7 @@ class CapabilityValidationResult:
 PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
     CapabilityEntry(
         capability_id="runtime.world_state.read",
+        provider_tool_name="runtime_world_state_read",
         operation_class="read",
         capability_domain="software_architecture",
         supported_surfaces=("dev", "vscode"),
@@ -97,6 +101,7 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
     ),
     CapabilityEntry(
         capability_id="draft.local_message",
+        provider_tool_name="draft_local_message",
         operation_class="draft",
         capability_domain="software_architecture",
         supported_surfaces=("dev", "vscode"),
@@ -141,6 +146,13 @@ def validate_production_registry(entries: tuple[CapabilityEntry, ...]) -> None:
             raise RuntimeError(f"missing_executor_binding:{entry.capability_id}")
         if not _SAFE_ID.fullmatch(entry.capability_id):
             raise RuntimeError(f"invalid_capability_id:{entry.capability_id}")
+        if not _SAFE_PROVIDER_TOOL_NAME.fullmatch(entry.provider_tool_name):
+            raise RuntimeError(f"invalid_provider_tool_name:{entry.capability_id}")
+        if entry.provider_tool_name == entry.capability_id:
+            raise RuntimeError(f"provider_tool_name_not_distinct:{entry.capability_id}")
+    provider_names = [entry.provider_tool_name for entry in entries]
+    if len(provider_names) != len(set(provider_names)):
+        raise RuntimeError("duplicate_provider_tool_name")
 
 
 def capability_by_id(capability_id: str) -> CapabilityEntry | None:
@@ -150,16 +162,24 @@ def capability_by_id(capability_id: str) -> CapabilityEntry | None:
     return None
 
 
+def capability_by_provider_tool_name(provider_tool_name: str) -> CapabilityEntry | None:
+    for entry in production_capability_registry():
+        if entry.provider_tool_name == provider_tool_name:
+            return entry
+    return None
+
+
 def provider_descriptor(entry: CapabilityEntry) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": entry.capability_id,
+            "name": entry.provider_tool_name,
             "description": entry.descriptor_metadata["description"],
             "parameters": entry.argument_schema,
         },
         "metadata": {
             "capability_id": entry.capability_id,
+            "provider_tool_name": entry.provider_tool_name,
             "operation_class": entry.operation_class,
             "capability_domain": entry.capability_domain,
             "privacy_classification": entry.privacy_classification,
@@ -330,7 +350,14 @@ def validate_and_digest_capability_request(
     if entry is None:
         raise CapabilityValidationError("unknown_capability_id")
     normalized = normalize_arguments(entry, request.arguments)
-    digest = f"capargs_{hashlib.sha256(_canonical_json(normalized).encode('utf-8')).hexdigest()}"
+    digest_material = {
+        "capability_id": entry.capability_id,
+        "arguments": normalized,
+    }
+    digest = (
+        f"capargs_"
+        f"{hashlib.sha256(_canonical_json(digest_material).encode('utf-8')).hexdigest()}"
+    )
     return CapabilityValidationResult(
         capability_id=entry.capability_id,
         schema_version=CAPABILITY_ARGUMENT_SCHEMA_VERSION,
@@ -338,6 +365,7 @@ def validate_and_digest_capability_request(
         argument_digest=digest,
         trace={
             "capability_id": entry.capability_id,
+            "provider_tool_name": entry.provider_tool_name,
             "schema_version": CAPABILITY_ARGUMENT_SCHEMA_VERSION,
             "validation_status": "ok",
             "argument_digest": digest,
@@ -349,6 +377,7 @@ def validate_and_digest_capability_request(
 def capability_validation_failure_trace(
     reason_code: str,
     capability_id: str | None = None,
+    provider_tool_name: str | None = None,
 ) -> dict[str, Any]:
     trace = {
         "schema_version": CAPABILITY_ARGUMENT_SCHEMA_VERSION,
@@ -357,6 +386,8 @@ def capability_validation_failure_trace(
     }
     if capability_id:
         trace["capability_id"] = capability_id[:120]
+    if provider_tool_name:
+        trace["provider_tool_name"] = provider_tool_name[:80]
     return trace
 
 
@@ -444,9 +475,14 @@ def _completion_message(completion: dict[str, Any]) -> dict[str, Any] | None:
     return message if isinstance(message, dict) else None
 
 
-def _request_from_parts(capability_id: Any, arguments: Any) -> ParsedCapabilityRequest:
-    if not isinstance(capability_id, str) or not _SAFE_ID.fullmatch(capability_id):
-        raise CapabilityValidationError("malformed_capability_id")
+def _request_from_parts(provider_tool_name: Any, arguments: Any) -> ParsedCapabilityRequest:
+    if not isinstance(provider_tool_name, str) or not _SAFE_PROVIDER_TOOL_NAME.fullmatch(
+        provider_tool_name
+    ):
+        raise CapabilityValidationError("unknown_capability_id")
+    entry = capability_by_provider_tool_name(provider_tool_name)
+    if entry is None:
+        raise CapabilityValidationError("unknown_capability_id")
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
@@ -454,7 +490,11 @@ def _request_from_parts(capability_id: Any, arguments: Any) -> ParsedCapabilityR
             raise CapabilityValidationError("malformed_arguments") from exc
     if not isinstance(arguments, dict):
         raise CapabilityValidationError("malformed_arguments")
-    return ParsedCapabilityRequest(capability_id=capability_id, arguments=arguments)
+    return ParsedCapabilityRequest(
+        capability_id=entry.capability_id,
+        provider_tool_name=provider_tool_name,
+        arguments=arguments,
+    )
 
 
 def _bounded_reason(result: dict[str, Any]) -> str:
