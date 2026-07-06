@@ -699,16 +699,55 @@ class ReplayRuntime:
         exposure_denied = set(self.scenario.get("wave3c_exposure_denied", []))
         if phase == "exposure":
             allowed = capability_id not in exposure_denied
+            if (
+                capability_id == "runtime.relationship_context.read"
+                and not kwargs.get("selected_relationship_ids")
+            ):
+                allowed = False
             return {
                 "result": {
                     "allowed": allowed,
                     "decision_code": "allowed" if allowed else "authorization_denied",
-                    "reason_codes": ["allowed" if allowed else "capability_domain_denied"],
+                    "reason_codes": [
+                        "allowed"
+                        if allowed
+                        else (
+                            "missing_relationship_context"
+                            if capability_id == "runtime.relationship_context.read"
+                            and not kwargs.get("selected_relationship_ids")
+                            else "capability_domain_denied"
+                        )
+                    ],
+                    "relationship_ids_used": (
+                        kwargs.get("selected_relationship_ids") or []
+                    )
+                    if allowed
+                    else [],
                 }
             }
         if phase == "selection":
             count = self.capability_selection_counts.get(capability_id, 0)
             self.capability_selection_counts[capability_id] = count + 1
+            relationship_reason = self.scenario.get("wave3c_r_relationship_denial")
+            if capability_id == "runtime.relationship_context.read":
+                if not kwargs.get("selected_relationship_ids"):
+                    return {
+                        "result": {
+                            "allowed": False,
+                            "decision_code": "authorization_denied",
+                            "reason_codes": ["missing_relationship_context"],
+                            "relationship_ids_used": [],
+                        }
+                    }
+                if isinstance(relationship_reason, str):
+                    return {
+                        "result": {
+                            "allowed": False,
+                            "decision_code": "authorization_denied",
+                            "reason_codes": [relationship_reason],
+                            "relationship_ids_used": [],
+                        }
+                    }
             if mode == "selection_denied":
                 return {
                     "result": {
@@ -746,12 +785,27 @@ class ReplayRuntime:
                     "reason_codes": ["dispatch_denied"],
                 }
             }
+        if (
+            phase == "dispatch"
+            and capability_id == "runtime.relationship_context.read"
+            and self.scenario.get("wave3c_r_dispatch_denial")
+        ):
+            reason = self.scenario["wave3c_r_dispatch_denial"]
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "authorization_denied",
+                    "reason_codes": [reason],
+                    "relationship_ids_used": [],
+                }
+            }
         return {
             "result": {
                 "allowed": True,
                 "decision_code": "allowed",
                 "reason_codes": ["allowed"],
                 "challenge_ref": kwargs.get("confirmation_challenge_ref"),
+                "relationship_ids_used": kwargs.get("selected_relationship_ids") or [],
             }
         }
 
@@ -790,6 +844,14 @@ class ReplayRuntime:
         self._record("cr_relationships", kwargs["request_id"])
         self._maybe_fail()
         projection = self.scenario.get("relationship_projection")
+        if self.scenario.get("wave3c_r_active_relationship") is True:
+            projection = {
+                "applied": True,
+                "relationship_ids": ["rel_project"],
+                "entity_ids": ["entity_repo"],
+                "relationship_scopes": ["project_context"],
+                "reason_codes": ["eligible_relationship_scope_selected"],
+            }
         if not isinstance(projection, dict):
             projection = {
                 "applied": False,
@@ -799,16 +861,22 @@ class ReplayRuntime:
                 "reason_codes": ["no_eligible_relationship_scope"],
             }
         return {
-            "selected_relationships": [],
-            "prompt_content": None,
+            "selected_relationships": (
+                [{"relationship_id": "rel_project"}] if projection.get("applied") else []
+            ),
+            "prompt_content": (
+                "Relationship context:\n- bounded project context."
+                if projection.get("applied")
+                else None
+            ),
             "retrieval_scope_projection": projection,
             "trace": {
-                "selected_relationship_count": 0,
+                "selected_relationship_count": 1 if projection.get("applied") else 0,
                 "excluded_relationship_count": 0,
-                "relationship_edges_used": [],
+                "relationship_edges_used": projection.get("relationship_ids", []),
                 "relationship_edges_excluded": [],
                 "relationship_exclusion_reasons": {},
-                "relationship_context_overlay_applied": False,
+                "relationship_context_overlay_applied": bool(projection.get("applied")),
                 "relationship_conflicts": [],
                 "relationship_confirmation_required": False,
                 "active_persona_id": kwargs.get("active_persona_id"),
@@ -1084,7 +1152,10 @@ class ReplayProvider:
             if capability == "draft.local_message":
                 return {"choices": [{"message": {"content": "The local unsent draft is ready."}}]}
             return {"choices": [{"message": {"content": "I found one bounded repository claim."}}]}
-        if self.scenario.get("category") == "wave3c_capability_lifecycle":
+        if self.scenario.get("category") in {
+            "wave3c_capability_lifecycle",
+            "wave3c_r_relationship_capability",
+        }:
             mode = self.scenario.get("wave3c_mode")
             if mode == "multiple_call_validation_failure":
                 return {
@@ -1114,6 +1185,14 @@ class ReplayProvider:
                 return _tool_completion(
                     "draft_local_message",
                     {"body": "PRIVATE-WAVE3C-DRAFT-BODY", "recipient_label": "reviewer"},
+                )
+            if capability == "runtime.relationship_context.read":
+                return _tool_completion(
+                    "runtime_relationship_context_read",
+                    {
+                        "relationship_scope": "project_context",
+                        "relationship_type": "works_on",
+                    },
                 )
             return _tool_completion(
                 "runtime_world_state_read",
@@ -1569,11 +1648,23 @@ def _capability_trace_projection(capabilities: dict[str, Any]) -> dict[str, Any]
                     "subject_present",
                     "body_char_count",
                     "format",
+                    "selected_relationship_count",
+                    "excluded_relationship_count",
+                    "relationship_id_count",
+                    "relationship_ids",
+                    "relationship_scopes",
+                    "reason_codes",
                 )
                 if key in executor_result
             },
             "selection_status": selection.get("status"),
+            "selection_relationship_id_count": selection.get("relationship_id_count"),
+            "selection_relationship_ids": selection.get("relationship_ids"),
+            "selection_reason_codes": selection.get("reason_codes"),
             "dispatch_status": dispatch.get("status"),
+            "dispatch_relationship_id_count": dispatch.get("relationship_id_count"),
+            "dispatch_relationship_ids": dispatch.get("relationship_ids"),
+            "dispatch_reason_codes": dispatch.get("reason_codes"),
             "dispatch_confirmation_ref_present": (
                 dispatch.get("confirmation_challenge_ref") is not None
             ),
@@ -1894,5 +1985,76 @@ async def run_wave3c_smoke_report(
         "capability_lifecycle_scenarios": [fixture["scenario"] for fixture in fixtures],
         "privacy_assertions_passed": privacy_assertions_passed,
         "no_repeat_dispatch_assertions_passed": no_repeat_assertions_passed,
+        "failures": failures,
+    }
+
+
+async def run_wave3c_r_smoke_report(
+    path: Path = DEFAULT_CORPUS_PATH,
+) -> dict[str, Any]:
+    fixtures = [
+        fixture
+        for fixture in load_corpus(path)
+        if fixture.get("category") == "wave3c_r_relationship_capability"
+    ]
+    failures = []
+    privacy_assertions_passed = True
+    no_repeat_assertions_passed = True
+    descriptor_fingerprint_assertion_passed = True
+    for fixture in fixtures:
+        snapshot = await run_scenario(fixture)
+        try:
+            assert_snapshot_privacy_safe(snapshot)
+            expected = fixture["expected"]
+            compare_snapshot(
+                expected,
+                project_snapshot(snapshot, expected),
+                fixture["scenario"],
+            )
+        except AssertionError as exc:
+            failures.append({"scenario": fixture["scenario"], "error": str(exc)})
+            privacy_assertions_passed = False
+        capabilities = snapshot["trace"]["capabilities"]
+        executor_count = capabilities.get("executor_call_count")
+        if executor_count not in {0, 1}:
+            no_repeat_assertions_passed = False
+            failures.append(
+                {
+                    "scenario": fixture["scenario"],
+                    "error": f"executor repeated: {executor_count}",
+                }
+            )
+        if capabilities.get("dispatch_completed") and executor_count != 1:
+            no_repeat_assertions_passed = False
+            failures.append(
+                {
+                    "scenario": fixture["scenario"],
+                    "error": "dispatch completion without exactly one executor",
+                }
+            )
+        fallback = capabilities.get("fallback")
+        fallback = fallback if isinstance(fallback, dict) else {}
+        if (
+            fixture.get("fallback_model")
+            and fallback.get("same_descriptor_fingerprint") is not True
+        ):
+            descriptor_fingerprint_assertion_passed = False
+            failures.append(
+                {
+                    "scenario": fixture["scenario"],
+                    "error": "fallback descriptor fingerprint changed",
+                }
+            )
+    return {
+        "scenario_count": len(fixtures),
+        "passed_count": len(fixtures) - len(failures),
+        "failed_count": len(failures),
+        "relationship_gated_scenarios": [fixture["scenario"] for fixture in fixtures],
+        "relationship_gated_scenarios_included": len(fixtures) > 0,
+        "privacy_assertions_passed": privacy_assertions_passed,
+        "no_repeat_dispatch_assertions_passed": no_repeat_assertions_passed,
+        "descriptor_fingerprint_assertion_passed": (
+            descriptor_fingerprint_assertion_passed
+        ),
         "failures": failures,
     }

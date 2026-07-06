@@ -98,6 +98,23 @@ def _relationship_context_disabled_trace() -> dict[str, Any]:
     return {"attempted": False, "status": "disabled", "included": False}
 
 
+def _selected_relationship_ids_from_trace(trace: dict[str, Any] | None) -> list[str]:
+    if not isinstance(trace, dict):
+        return []
+    value = trace.get("relationship_edges_used")
+    if not isinstance(value, list):
+        return []
+    selected: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not SAFE_SCOPE_ID.fullmatch(item):
+            continue
+        if item not in selected:
+            selected.append(item)
+        if len(selected) >= 64:
+            break
+    return selected
+
+
 def _interaction_governance_disabled_trace() -> dict[str, Any]:
     return {
         "attempted": False,
@@ -4600,6 +4617,9 @@ async def orchestrate_chat(
                 runtime_session_id=runtime_session_trace.get("runtime_session_id"),
                 runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
                 active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                selected_relationship_ids=_selected_relationship_ids_from_trace(
+                    relationship_context_trace
+                ),
             )
         )
 
@@ -4989,6 +5009,9 @@ async def orchestrate_chat(
                     runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
                     active_persona_id=runtime_identity_trace.get("active_persona_id"),
                     validation_result=validation_result,
+                    selected_relationship_ids=_selected_relationship_ids_from_trace(
+                        relationship_context_trace
+                    ),
                     revalidators=capability_revalidators,
                     capability_confirmation=payload.get("capability_confirmation"),
                 )

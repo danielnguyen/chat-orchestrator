@@ -26,6 +26,16 @@ _WORLD_STATE_DOMAINS = {
 _WORLD_STATE_OUTPUT_MODES = {"summary", "structured"}
 _DRAFT_TONES = {"neutral", "warm", "direct"}
 _DRAFT_FORMATS = {"plain_text", "markdown"}
+_RELATIONSHIP_CONTEXT_SCOPES = {"project_context"}
+_RELATIONSHIP_CONTEXT_TYPES = {"works_on"}
+_RELATIONSHIP_CONTEXT_REQUIREMENTS = [
+    {
+        "relationship_scope": "project_context",
+        "relationship_type": "works_on",
+        "required_status": "active",
+        "minimum_confidence": 0.8,
+    }
+]
 
 
 class CapabilityValidationError(ValueError):
@@ -194,6 +204,44 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
             },
         },
     ),
+    CapabilityEntry(
+        capability_id="runtime.relationship_context.read",
+        provider_tool_name="runtime_relationship_context_read",
+        operation_class="read",
+        capability_domain="software_architecture",
+        supported_surfaces=("dev", "vscode"),
+        executor_binding="cr_relationship_context_read",
+        descriptor_metadata={
+            "display_name": "Read project relationship context",
+            "description": (
+                "Read bounded project relationship-context availability and counts."
+            ),
+        },
+        privacy_classification="relationship_context",
+        authorization_requirements={
+            "authorization_phases": ["exposure", "selection", "dispatch"],
+            "relationship_requirements": _RELATIONSHIP_CONTEXT_REQUIREMENTS,
+            "world_state_requirements": [],
+        },
+        argument_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "relationship_scope": {
+                    "type": "string",
+                    "enum": sorted(_RELATIONSHIP_CONTEXT_SCOPES),
+                },
+                "relationship_type": {
+                    "type": "string",
+                    "enum": sorted(_RELATIONSHIP_CONTEXT_TYPES),
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": sorted(_WORLD_STATE_OUTPUT_MODES),
+                },
+            },
+        },
+    ),
 )
 
 
@@ -208,7 +256,11 @@ def production_revalidator_registry() -> dict[str, Revalidator]:
 
 def validate_production_registry(entries: tuple[CapabilityEntry, ...]) -> None:
     ids = [entry.capability_id for entry in entries]
-    if ids != ["runtime.world_state.read", "draft.local_message"]:
+    if ids != [
+        "runtime.world_state.read",
+        "draft.local_message",
+        "runtime.relationship_context.read",
+    ]:
         raise RuntimeError("production_capability_registry_unexpected_ids")
     for entry in entries:
         if not entry.executor_binding:
@@ -281,6 +333,7 @@ async def filter_capability_descriptors_for_exposure(
     runtime_session_id: str | None,
     runtime_turn_id: str | None,
     active_persona_id: str | None,
+    selected_relationship_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates = list(production_capability_registry())
     candidate_ids = [entry.capability_id for entry in candidates]
@@ -330,7 +383,7 @@ async def filter_capability_descriptors_for_exposure(
                     "relationship_requirements",
                     [],
                 ),
-                selected_relationship_ids=[],
+                selected_relationship_ids=_safe_selected_ids(selected_relationship_ids),
                 world_state_requirements=entry.authorization_requirements.get(
                     "world_state_requirements",
                     [],
@@ -458,6 +511,7 @@ async def authorize_and_execute_capability(
     runtime_turn_id: str | None,
     active_persona_id: str | None,
     validation_result: CapabilityValidationResult,
+    selected_relationship_ids: list[str] | None = None,
     revalidators: dict[str, Revalidator] | None = None,
     capability_confirmation: dict[str, Any] | None = None,
 ) -> CapabilityExecutionResult:
@@ -507,6 +561,7 @@ async def authorize_and_execute_capability(
         entry=entry,
         phase="selection",
         argument_digest_value=validation_result.argument_digest,
+        selected_relationship_ids=selected_relationship_ids,
         confirmation_challenge_ref=None,
     )
     trace["authorization"]["selection"] = selection.trace
@@ -525,6 +580,7 @@ async def authorize_and_execute_capability(
             active_persona_id=active_persona_id,
             entry=entry,
             argument_digest_value=validation_result.argument_digest,
+            selected_relationship_ids=selected_relationship_ids,
             selector=selection.revalidation_selector,
             revalidators=configured_revalidators,
         )
@@ -594,6 +650,7 @@ async def authorize_and_execute_capability(
         entry=entry,
         phase="dispatch",
         argument_digest_value=dispatch_digest,
+        selected_relationship_ids=selected_relationship_ids,
         confirmation_challenge_ref=confirmed_challenge_ref,
     )
     trace["authorization"]["dispatch"] = dispatch.trace
@@ -673,6 +730,8 @@ def normalize_arguments(entry: CapabilityEntry, arguments: dict[str, Any]) -> di
         return _normalize_world_state_arguments(arguments)
     if entry.capability_id == "draft.local_message":
         return _normalize_draft_arguments(arguments)
+    if entry.capability_id == "runtime.relationship_context.read":
+        return _normalize_relationship_context_arguments(arguments)
     raise CapabilityValidationError("unknown_capability_id")
 
 
@@ -733,6 +792,32 @@ def capability_follow_up_summary(
             "conflicted_count": _bounded_int(
                 executor_result.get("conflicted_count"),
                 10000,
+            ),
+        }
+    elif capability_id == "runtime.relationship_context.read":
+        summary["result_summary"] = {
+            "output_mode": _bounded_optional_string(executor_result.get("output_mode"), 40),
+            "selected_relationship_count": _bounded_int(
+                executor_result.get("selected_relationship_count"),
+                10000,
+            ),
+            "relationship_id_count": _bounded_int(
+                executor_result.get("relationship_id_count"),
+                10000,
+            ),
+            "excluded_relationship_count": _bounded_int(
+                executor_result.get("excluded_relationship_count"),
+                10000,
+            ),
+            "relationship_scopes": _bounded_string_list(
+                executor_result.get("relationship_scopes"),
+                8,
+                80,
+            ),
+            "reason_codes": _bounded_string_list(
+                executor_result.get("reason_codes"),
+                8,
+                80,
             ),
         }
     else:
@@ -806,6 +891,26 @@ def _normalize_draft_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {key: normalized[key] for key in sorted(normalized)}
 
 
+def _normalize_relationship_context_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    if "relationship_scope" in arguments:
+        value = arguments["relationship_scope"]
+        if not isinstance(value, str) or value not in _RELATIONSHIP_CONTEXT_SCOPES:
+            raise CapabilityValidationError("schema_invalid_arguments")
+        normalized["relationship_scope"] = value
+    if "relationship_type" in arguments:
+        value = arguments["relationship_type"]
+        if not isinstance(value, str) or value not in _RELATIONSHIP_CONTEXT_TYPES:
+            raise CapabilityValidationError("schema_invalid_arguments")
+        normalized["relationship_type"] = value
+    if "output_mode" in arguments:
+        value = arguments["output_mode"]
+        if not isinstance(value, str) or value not in _WORLD_STATE_OUTPUT_MODES:
+            raise CapabilityValidationError("schema_invalid_arguments")
+        normalized["output_mode"] = value
+    return {key: normalized[key] for key in sorted(normalized)}
+
+
 def _completion_message(completion: dict[str, Any]) -> dict[str, Any] | None:
     choices = completion.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -866,6 +971,7 @@ async def _authorize_capability_phase(
     entry: CapabilityEntry,
     phase: str,
     argument_digest_value: str,
+    selected_relationship_ids: list[str] | None,
     confirmation_challenge_ref: str | None,
 ) -> _AuthorizationResult:
     try:
@@ -887,7 +993,7 @@ async def _authorize_capability_phase(
                 "relationship_requirements",
                 [],
             ),
-            selected_relationship_ids=[],
+            selected_relationship_ids=_safe_selected_ids(selected_relationship_ids),
             world_state_requirements=entry.authorization_requirements.get(
                 "world_state_requirements",
                 [],
@@ -902,6 +1008,7 @@ async def _authorize_capability_phase(
         return _AuthorizationResult(_authorization_empty_trace("malformed"))
     decision_code = _bounded_string(result.get("decision_code"), "authorization_denied", 80)
     reason_codes = _bounded_string_list(result.get("reason_codes"), 8, 80)
+    relationship_ids_used = _safe_selected_ids(result.get("relationship_ids_used"))
     status = "allowed" if result["allowed"] else decision_code
     trace = {
         "status": status,
@@ -913,7 +1020,8 @@ async def _authorize_capability_phase(
         "revalidation_selector": _revalidation_selector_summary(
             result.get("revalidation_selector")
         ),
-        "relationship_id_count": len(result.get("relationship_ids_used") or []),
+        "relationship_id_count": len(relationship_ids_used),
+        "relationship_ids": relationship_ids_used[:16],
         "world_state_claim_id_count": len(result.get("world_state_claim_ids_used") or []),
     }
     selector = result.get("revalidation_selector")
@@ -932,6 +1040,7 @@ def _authorization_empty_trace(status: str) -> dict[str, Any]:
         "confirmation_challenge_ref": None,
         "revalidation_selector": None,
         "relationship_id_count": 0,
+        "relationship_ids": [],
         "world_state_claim_id_count": 0,
     }
 
@@ -979,6 +1088,7 @@ async def _perform_revalidation(
     active_persona_id: str,
     entry: CapabilityEntry,
     argument_digest_value: str,
+    selected_relationship_ids: list[str] | None,
     selector: dict[str, Any] | None,
     revalidators: dict[str, Revalidator],
 ) -> _RevalidationResult:
@@ -1075,6 +1185,7 @@ async def _perform_revalidation(
         entry=entry,
         phase="selection",
         argument_digest_value=argument_digest_value,
+        selected_relationship_ids=selected_relationship_ids,
         confirmation_challenge_ref=None,
     )
     trace["rerun_selection_status"] = rerun.trace["status"]
@@ -1500,6 +1611,17 @@ async def _execute_capability(
             active_persona_id=active_persona_id,
             normalized_arguments=normalized_arguments,
         )
+    if entry.capability_id == "runtime.relationship_context.read":
+        return await _execute_relationship_context_read(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id,
+            normalized_arguments=normalized_arguments,
+        )
     if entry.capability_id == "draft.local_message":
         return _execute_local_message_draft(normalized_arguments)
     return {
@@ -1576,6 +1698,79 @@ async def _execute_world_state_read(
     }
 
 
+async def _execute_relationship_context_read(
+    *,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    active_persona_id: str,
+    normalized_arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if not hasattr(runtime, "relationship_select"):
+        return _executor_failure("relationship_context_read_unavailable")
+    response = await runtime.relationship_select(
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        active_persona_id=active_persona_id,
+        requested_scopes=[normalized_arguments.get("relationship_scope", "project_context")],
+        relationship_types=[normalized_arguments.get("relationship_type", "works_on")],
+    )
+    if not isinstance(response, dict):
+        return _executor_failure("malformed_relationship_context_response")
+    trace = response.get("trace")
+    projection = response.get("retrieval_scope_projection")
+    selected_relationships = response.get("selected_relationships")
+    if not isinstance(trace, dict):
+        return _executor_failure("malformed_relationship_context_response")
+    relationship_ids = _safe_selected_ids(
+        projection.get("relationship_ids") if isinstance(projection, dict) else None
+    )
+    reason_codes = _bounded_string_list(
+        projection.get("reason_codes") if isinstance(projection, dict) else None,
+        8,
+        80,
+    )
+    relationship_scopes = _bounded_string_list(
+        projection.get("relationship_scopes") if isinstance(projection, dict) else None,
+        8,
+        80,
+    )
+    selected_count = len(selected_relationships) if isinstance(selected_relationships, list) else 0
+    output_mode = normalized_arguments.get("output_mode", "summary")
+    result_trace = {
+        "status": "ok",
+        "output_mode": output_mode,
+        "selected_relationship_count": _bounded_int(
+            trace.get("selected_relationship_count"),
+            10000,
+        ),
+        "excluded_relationship_count": _bounded_int(
+            trace.get("excluded_relationship_count"),
+            10000,
+        ),
+        "relationship_id_count": len(relationship_ids),
+        "relationship_ids": relationship_ids[:16],
+        "relationship_scopes": relationship_scopes,
+        "selected_relationship_record_count": selected_count,
+        "reason_codes": reason_codes,
+    }
+    return {
+        "status": "ok",
+        "reason_code": "executed",
+        "trace": result_trace,
+        "response_text": (
+            "I read bounded project relationship context and found "
+            f"{len(relationship_ids)} authorized relationship(s)."
+        ),
+    }
+
+
 def _execute_local_message_draft(normalized_arguments: dict[str, Any]) -> dict[str, Any]:
     body = normalized_arguments.get("body")
     if not isinstance(body, str) or not body:
@@ -1645,6 +1840,20 @@ def _revalidation_selector_summary(value: Any) -> dict[str, Any] | None:
         "revalidator_id": _bounded_optional_string(value.get("revalidator_id"), 120),
         "world_state_claim_id_count": len(claim_ids) if isinstance(claim_ids, list) else 0,
     }
+
+
+def _safe_selected_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _SAFE_LABEL.fullmatch(item):
+            continue
+        if item not in cleaned:
+            cleaned.append(item)
+        if len(cleaned) >= 64:
+            break
+    return cleaned
 
 
 def _bounded_optional_string(value: Any, max_length: int) -> str | None:

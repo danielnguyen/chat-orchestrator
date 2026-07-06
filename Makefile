@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 
 DEV_COMPOSE := docker-compose.yml
 
-.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test prompt-budget-test prompt-budget-smoke composed-smoke artifact-composed-smoke wave2e-retrieval-smoke wave3b-composed-smoke wave3c-composed-smoke smoke dev-start dev-start-reload
+.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test prompt-budget-test prompt-budget-smoke composed-smoke artifact-composed-smoke wave2e-retrieval-smoke wave3b-composed-smoke wave3c-composed-smoke wave3c-r-composed-smoke smoke dev-start dev-start-reload
 
 dev-up:
 	@docker compose -f $(DEV_COMPOSE) up -d
@@ -50,6 +50,9 @@ wave3b-composed-smoke:
 
 wave3c-composed-smoke:
 	@cd api && ./.venv/bin/python wave3c_composed_smoke.py
+
+wave3c-r-composed-smoke:
+	@cd api && ./.venv/bin/python wave3c_r_composed_smoke.py
 
 smoke:
 	@set -euo pipefail; \
