@@ -50,7 +50,7 @@ class FakeRuntime:
         }
         self.world_state_error = world_state_error
         self.verification_error = verification_error
-        self.verification_response = verification_response or {"claim": {"status": "verified"}}
+        self.verification_response = verification_response
         self.calls = []
         self.world_state_calls = []
         self.world_state_verification_calls = []
@@ -107,7 +107,22 @@ class FakeRuntime:
         self.world_state_verification_calls.append(kwargs)
         if self.verification_error is not None:
             raise self.verification_error
-        return self.verification_response
+        if self.verification_response is not None:
+            return self.verification_response
+        return {
+            "claim": {
+                "world_state_claim_id": kwargs["world_state_claim_id"],
+                "verification_verifier_id": kwargs["verifier_id"],
+                "verification_source_type": kwargs["verification_source_type"],
+                "verification_source_ref": kwargs["verification_source_ref"],
+                "last_verified_runtime_session_id": kwargs["runtime_session_id"],
+                "last_verified_runtime_turn_id": kwargs["runtime_turn_id"],
+                "state_authority": kwargs["resulting_authority"],
+                "confidence": kwargs["resulting_confidence"],
+                "freshness_state": kwargs["resulting_freshness_state"],
+                "effective_freshness_state": kwargs["resulting_freshness_state"],
+            }
+        }
 
 
 def _completion(message: dict[str, object]) -> dict[str, object]:
@@ -871,6 +886,83 @@ async def test_cr_verification_failure_blocks_with_zero_executor():
     assert result.trace["executor_called"] is False
     assert result.trace["executor_call_count"] == 0
     assert result.trace["revalidation"]["reason_code"] == "verification_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verification_response",
+    [
+        {
+            "claim": {
+                "world_state_claim_id": "different-claim",
+                "verification_verifier_id": "cr-verifier-local",
+                "verification_source_type": "tool_output",
+                "verification_source_ref": "local-deterministic-revalidator",
+                "value_json": "PRIVATE-RAW-VERIFY-PAYLOAD",
+            }
+        },
+        {
+            "claim": {
+                "verification_verifier_id": "cr-verifier-local",
+                "verification_source_type": "tool_output",
+                "verification_source_ref": "local-deterministic-revalidator",
+                "value_json": "PRIVATE-RAW-VERIFY-PAYLOAD",
+            }
+        },
+    ],
+)
+async def test_cr_verification_claim_mismatch_blocks_before_rerun_or_dispatch(
+    verification_response,
+):
+    runtime = FakeRuntime(
+        verification_response=verification_response,
+        phase_decisions={
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                },
+            ],
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        },
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+        {"trusted_refresh": _trusted_revalidator()},
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == ["selection"]
+    assert len(runtime.world_state_verification_calls) == 1
+    assert runtime.world_state_calls == []
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert result.trace["authorization"]["dispatch"]["status"] == "not_requested"
+    assert result.trace["revalidation"]["status"] == "blocked"
+    assert result.trace["revalidation"]["reason_code"] == "verification_claim_mismatch"
+    assert result.trace["revalidation"]["verification_call_count"] == 1
+    assert result.trace["revalidation"]["verification_success_count"] == 0
+    assert result.trace["revalidation"]["verification_failure_count"] == 1
+    assert result.trace["revalidation"]["rerun_selection_status"] is None
+    serialized_trace = json.dumps(result.trace)
+    assert "wsvalue_claim-1" not in serialized_trace
+    assert "PRIVATE-RAW-VERIFY-PAYLOAD" not in serialized_trace
+    assert "different-claim" not in serialized_trace
 
 
 @pytest.mark.asyncio

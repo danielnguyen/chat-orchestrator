@@ -929,9 +929,9 @@ async def _perform_revalidation(
             trace["verification_failure_count"] += 1
             trace.update({"status": "failed", "reason_code": "verification_failed"})
             return _RevalidationResult(trace)
-        if not isinstance(response, dict) or not isinstance(response.get("claim"), dict):
+        if not _verification_response_matches_request(response, verification_payload):
             trace["verification_failure_count"] += 1
-            trace.update({"status": "malformed", "reason_code": "malformed_verification"})
+            trace.update({"status": "blocked", "reason_code": "verification_claim_mismatch"})
             return _RevalidationResult(trace)
         trace["verification_success_count"] += 1
     rerun = await _authorize_capability_phase(
@@ -1099,6 +1099,59 @@ def _verification_payload(
             return None
         payload["resulting_revalidation_interval_seconds"] = interval_seconds
     return payload
+
+
+def _verification_response_matches_request(
+    response: Any,
+    verification_payload: dict[str, Any],
+) -> bool:
+    if not isinstance(response, dict):
+        return False
+    claim = response.get("claim")
+    if not isinstance(claim, dict):
+        return False
+    if claim.get("world_state_claim_id") != verification_payload["world_state_claim_id"]:
+        return False
+
+    optional_exact_matches = {
+        "verification_verifier_id": "verifier_id",
+        "verification_source_type": "verification_source_type",
+        "verification_source_ref": "verification_source_ref",
+        "last_verified_runtime_session_id": "runtime_session_id",
+        "last_verified_runtime_turn_id": "runtime_turn_id",
+    }
+    for claim_key, payload_key in optional_exact_matches.items():
+        if claim_key in claim and claim[claim_key] != verification_payload[payload_key]:
+            return False
+
+    if "confidence" in claim and not _bounded_confidence(claim["confidence"]):
+        return False
+    if "state_authority" in claim and (
+        not isinstance(claim["state_authority"], str)
+        or not _SAFE_LABEL.fullmatch(claim["state_authority"])
+    ):
+        return False
+    for freshness_key in ("freshness_state", "effective_freshness_state"):
+        if freshness_key in claim and (
+            not isinstance(claim[freshness_key], str)
+            or not _SAFE_LABEL.fullmatch(claim[freshness_key])
+        ):
+            return False
+    for source_key in ("verification_source_type", "verification_source_ref"):
+        if source_key in claim and not isinstance(claim[source_key], str):
+            return False
+    if "verification_source_ref" in claim and len(claim["verification_source_ref"]) > 240:
+        return False
+    return True
+
+
+def _bounded_confidence(value: Any) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and value >= 0.0
+        and value <= 1.0
+    )
 
 
 def _parse_timestamp(value: str) -> datetime | None:
