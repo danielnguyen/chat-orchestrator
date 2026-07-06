@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 
 DEV_COMPOSE := docker-compose.yml
 
-.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint replay-test prompt-budget-test prompt-budget-smoke composed-smoke artifact-composed-smoke wave2e-retrieval-smoke wave3b-composed-smoke wave3c-composed-smoke wave3c-r-composed-smoke wave4-composed-smoke smoke dev-start dev-start-reload
+.PHONY: dev-up dev-down dev-reset dev-logs dev-test dev-install dev-lint process-naming-check replay-test prompt-budget-test prompt-budget-smoke composed-smoke artifact-composed-smoke wave2e-retrieval-smoke wave3b-composed-smoke wave3c-composed-smoke wave3c-r-composed-smoke wave4-composed-smoke smoke dev-start dev-start-reload
 
 dev-up:
 	@docker compose -f $(DEV_COMPOSE) up -d
@@ -26,6 +26,9 @@ dev-install:
 
 dev-lint:
 	@cd api && RUFF_CACHE_DIR="$${RUFF_CACHE_DIR:-/tmp/chat-orchestrator-ruff-cache}" ./.venv/bin/python -m ruff check .
+
+process-naming-check:
+	@./scripts/check_process_naming.py
 
 replay-test:
 	@cd api && ./.venv/bin/python -m pytest -q tests/test_orchestration_replay.py
