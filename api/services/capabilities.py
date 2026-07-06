@@ -63,6 +63,12 @@ class CapabilityValidationResult:
     trace: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CapabilityExecutionResult:
+    response_text: str
+    trace: dict[str, Any]
+
+
 PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
     CapabilityEntry(
         capability_id="runtime.world_state.read",
@@ -350,14 +356,7 @@ def validate_and_digest_capability_request(
     if entry is None:
         raise CapabilityValidationError("unknown_capability_id")
     normalized = normalize_arguments(entry, request.arguments)
-    digest_material = {
-        "capability_id": entry.capability_id,
-        "arguments": normalized,
-    }
-    digest = (
-        f"capargs_"
-        f"{hashlib.sha256(_canonical_json(digest_material).encode('utf-8')).hexdigest()}"
-    )
+    digest = argument_digest(entry.capability_id, normalized)
     return CapabilityValidationResult(
         capability_id=entry.capability_id,
         schema_version=CAPABILITY_ARGUMENT_SCHEMA_VERSION,
@@ -371,6 +370,152 @@ def validate_and_digest_capability_request(
             "argument_digest": digest,
             "reason_code": "validated",
         },
+    )
+
+
+def argument_digest(capability_id: str, normalized_arguments: dict[str, Any]) -> str:
+    digest_material = {
+        "capability_id": capability_id,
+        "arguments": normalized_arguments,
+    }
+    return (
+        f"capargs_"
+        f"{hashlib.sha256(_canonical_json(digest_material).encode('utf-8')).hexdigest()}"
+    )
+
+
+async def authorize_and_execute_capability(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    active_persona_id: str | None,
+    validation_result: CapabilityValidationResult,
+) -> CapabilityExecutionResult:
+    entry = capability_by_id(validation_result.capability_id)
+    trace = {
+        **validation_result.trace,
+        "authorization": {
+            "selection": _authorization_empty_trace("not_requested"),
+            "dispatch": _authorization_empty_trace("not_requested"),
+        },
+        "executor_binding": entry.executor_binding if entry else None,
+        "executor_called": False,
+        "executor_call_count": 0,
+        "executor_result_status": "not_called",
+        "failure_reason_code": None,
+        "response_status": "not_executed",
+    }
+    if (
+        runtime is None
+        or entry is None
+        or not runtime_session_id
+        or not runtime_turn_id
+        or not active_persona_id
+        or not hasattr(runtime, "authorize_capability")
+    ):
+        return _capability_not_executed(
+            trace,
+            "authorization_context_unavailable",
+            "I could not use that capability request safely.",
+        )
+
+    selection = await _authorize_capability_phase(
+        runtime=runtime,
+        request_id=f"{request_id}:{entry.capability_id}:selection",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        active_persona_id=active_persona_id,
+        entry=entry,
+        phase="selection",
+        argument_digest_value=validation_result.argument_digest,
+        confirmation_challenge_ref=None,
+    )
+    trace["authorization"]["selection"] = selection
+    if selection["status"] != "allowed":
+        return _capability_not_executed(
+            trace,
+            _authorization_failure_reason(selection),
+            _authorization_failure_text(selection),
+        )
+
+    dispatch_digest = argument_digest(
+        validation_result.capability_id,
+        validation_result.normalized_arguments,
+    )
+    if dispatch_digest != validation_result.argument_digest:
+        return _capability_not_executed(
+            trace,
+            "argument_digest_mismatch",
+            (
+                "I could not use that capability request because its arguments changed "
+                "before execution."
+            ),
+        )
+
+    dispatch = await _authorize_capability_phase(
+        runtime=runtime,
+        request_id=f"{request_id}:{entry.capability_id}:dispatch",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        active_persona_id=active_persona_id,
+        entry=entry,
+        phase="dispatch",
+        argument_digest_value=dispatch_digest,
+        confirmation_challenge_ref=selection.get("confirmation_challenge_ref"),
+    )
+    trace["authorization"]["dispatch"] = dispatch
+    if dispatch["status"] != "allowed":
+        return _capability_not_executed(
+            trace,
+            _authorization_failure_reason(dispatch),
+            _authorization_failure_text(dispatch),
+        )
+
+    trace["executor_called"] = True
+    trace["executor_call_count"] = 1
+    try:
+        executor_result = await _execute_capability(
+            runtime=runtime,
+            request_id=f"{request_id}:{entry.capability_id}:execute",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id,
+            entry=entry,
+            normalized_arguments=validation_result.normalized_arguments,
+        )
+    except Exception:
+        return _capability_not_executed(
+            trace,
+            "executor_failed",
+            "I could not complete that capability request.",
+            executor_failed=True,
+        )
+    trace["executor_result_status"] = executor_result["status"]
+    trace["executor_result"] = executor_result["trace"]
+    if executor_result["status"] != "ok":
+        return _capability_not_executed(
+            trace,
+            executor_result["reason_code"],
+            "I could not complete that capability request.",
+            executor_failed=True,
+        )
+    trace["response_status"] = "executed"
+    return CapabilityExecutionResult(
+        response_text=executor_result["response_text"],
+        trace=trace,
     )
 
 
@@ -509,6 +654,314 @@ def _bounded_reason(result: dict[str, Any]) -> str:
         if isinstance(decision_code, str) and decision_code
         else "authorization_denied"
     )
+
+
+async def _authorize_capability_phase(
+    *,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    active_persona_id: str,
+    entry: CapabilityEntry,
+    phase: str,
+    argument_digest_value: str,
+    confirmation_challenge_ref: str | None,
+) -> dict[str, Any]:
+    try:
+        response = await runtime.authorize_capability(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            active_persona_id=active_persona_id,
+            authorization_phase=phase,
+            capability_id=entry.capability_id,
+            capability_domain=entry.capability_domain,
+            operation_class=entry.operation_class,
+            argument_digest=argument_digest_value,
+            supported_surfaces=list(entry.supported_surfaces),
+            relationship_requirements=entry.authorization_requirements.get(
+                "relationship_requirements",
+                [],
+            ),
+            selected_relationship_ids=[],
+            world_state_requirements=entry.authorization_requirements.get(
+                "world_state_requirements",
+                [],
+            ),
+            selected_world_state_claim_ids=[],
+            confirmation_challenge_ref=confirmation_challenge_ref,
+        )
+    except Exception:
+        return _authorization_empty_trace("unavailable")
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict) or not isinstance(result.get("allowed"), bool):
+        return _authorization_empty_trace("malformed")
+    decision_code = _bounded_string(result.get("decision_code"), "authorization_denied", 80)
+    reason_codes = _bounded_string_list(result.get("reason_codes"), 8, 80)
+    status = "allowed" if result["allowed"] else decision_code
+    trace = {
+        "status": status,
+        "phase": phase,
+        "allowed": bool(result["allowed"]),
+        "decision_code": decision_code,
+        "reason_codes": reason_codes,
+        "confirmation_challenge_ref": _bounded_optional_string(result.get("challenge_ref"), 120),
+        "revalidation_selector": _revalidation_selector_summary(
+            result.get("revalidation_selector")
+        ),
+        "relationship_id_count": len(result.get("relationship_ids_used") or []),
+        "world_state_claim_id_count": len(result.get("world_state_claim_ids_used") or []),
+    }
+    return trace
+
+
+def _authorization_empty_trace(status: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "allowed": False,
+        "decision_code": status,
+        "reason_codes": [status],
+        "confirmation_challenge_ref": None,
+        "revalidation_selector": None,
+        "relationship_id_count": 0,
+        "world_state_claim_id_count": 0,
+    }
+
+
+def _authorization_failure_reason(summary: dict[str, Any]) -> str:
+    status = summary.get("status")
+    if status in {"confirmation_required", "revalidation_required"}:
+        return str(status)
+    reason_codes = summary.get("reason_codes")
+    if isinstance(reason_codes, list):
+        for reason in reason_codes:
+            if isinstance(reason, str) and reason:
+                return reason[:80]
+    return _bounded_string(summary.get("decision_code"), "authorization_denied", 80)
+
+
+def _authorization_failure_text(summary: dict[str, Any]) -> str:
+    status = summary.get("status")
+    if status == "confirmation_required":
+        return "That capability needs confirmation before execution."
+    if status == "revalidation_required":
+        return "That capability requires revalidation before execution."
+    return "I could not use that capability request safely."
+
+
+def _capability_not_executed(
+    trace: dict[str, Any],
+    reason_code: str,
+    response_text: str,
+    *,
+    executor_failed: bool = False,
+) -> CapabilityExecutionResult:
+    trace["failure_reason_code"] = reason_code
+    trace["response_status"] = "executor_failed" if executor_failed else "not_executed"
+    if executor_failed:
+        trace["executor_result_status"] = "failed"
+    return CapabilityExecutionResult(response_text=response_text, trace=trace)
+
+
+async def _execute_capability(
+    *,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    active_persona_id: str,
+    entry: CapabilityEntry,
+    normalized_arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if entry.capability_id == "runtime.world_state.read":
+        return await _execute_world_state_read(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id,
+            normalized_arguments=normalized_arguments,
+        )
+    if entry.capability_id == "draft.local_message":
+        return _execute_local_message_draft(normalized_arguments)
+    return {
+        "status": "failed",
+        "reason_code": "executor_binding_unavailable",
+        "trace": {"status": "failed", "reason_code": "executor_binding_unavailable"},
+        "response_text": "",
+    }
+
+
+async def _execute_world_state_read(
+    *,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    active_persona_id: str,
+    normalized_arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if not hasattr(runtime, "world_state_resolve"):
+        return _executor_failure("world_state_read_unavailable")
+    response = await runtime.world_state_resolve(
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        active_persona_id=active_persona_id,
+        requested_domains=normalized_arguments.get("requested_domains"),
+    )
+    if not isinstance(response, dict):
+        return _executor_failure("malformed_world_state_response")
+    trace = response.get("trace")
+    included_claims = response.get("included_claims")
+    excluded_claims = response.get("excluded_claim_summaries", [])
+    if not isinstance(trace, dict) or not isinstance(included_claims, list):
+        return _executor_failure("malformed_world_state_response")
+    filtered_claims = _filter_world_state_claims(
+        included_claims,
+        entity_id=normalized_arguments.get("entity_id"),
+        attribute=normalized_arguments.get("attribute"),
+    )
+    domains = sorted(
+        {
+            claim.get("domain")
+            for claim in filtered_claims
+            if isinstance(claim, dict) and isinstance(claim.get("domain"), str)
+        }
+    )
+    output_mode = normalized_arguments.get("output_mode", "summary")
+    result_trace = {
+        "status": "ok",
+        "output_mode": output_mode,
+        "included_claim_count": len(filtered_claims),
+        "excluded_claim_count": len(excluded_claims) if isinstance(excluded_claims, list) else 0,
+        "domain_count": len(domains),
+        "domains": domains[:8],
+        "stale_count": trace.get("stale_count", 0),
+        "aging_count": trace.get("aging_count", 0),
+        "expired_count": trace.get("expired_count", 0),
+        "conflicted_count": trace.get("conflicted_count", 0),
+        "confirmation_required": bool(trace.get("confirmation_required", False)),
+    }
+    return {
+        "status": "ok",
+        "reason_code": "executed",
+        "trace": result_trace,
+        "response_text": (
+            "I read bounded runtime world state and found "
+            f"{len(filtered_claims)} matching claim(s)."
+        ),
+    }
+
+
+def _execute_local_message_draft(normalized_arguments: dict[str, Any]) -> dict[str, Any]:
+    body = normalized_arguments.get("body")
+    if not isinstance(body, str) or not body:
+        return _executor_failure("draft_construction_failed")
+    material = _canonical_json(
+        {
+            "body": body,
+            "recipient_label": normalized_arguments.get("recipient_label"),
+            "subject": normalized_arguments.get("subject"),
+        }
+    )
+    draft_id = f"draft_{hashlib.sha256(material.encode('utf-8')).hexdigest()[:16]}"
+    result_trace = {
+        "status": "ok",
+        "draft_id": draft_id,
+        "local": True,
+        "sent": False,
+        "recipient_present": bool(normalized_arguments.get("recipient_label")),
+        "subject_present": bool(normalized_arguments.get("subject")),
+        "body_char_count": len(body),
+        "tone": _bounded_optional_string(normalized_arguments.get("tone"), 40),
+        "format": _bounded_optional_string(
+            normalized_arguments.get("format", "plain_text"),
+            40,
+        ),
+    }
+    return {
+        "status": "ok",
+        "reason_code": "executed",
+        "trace": result_trace,
+        "response_text": "I created a local unsent draft. Nothing was sent.",
+    }
+
+
+def _executor_failure(reason_code: str) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "reason_code": reason_code,
+        "trace": {"status": "failed", "reason_code": reason_code},
+        "response_text": "",
+    }
+
+
+def _filter_world_state_claims(
+    claims: list[Any],
+    *,
+    entity_id: str | None,
+    attribute: str | None,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        if entity_id is not None and claim.get("entity_id") != entity_id:
+            continue
+        if attribute is not None and claim.get("attribute") != attribute:
+            continue
+        filtered.append(claim)
+    return filtered
+
+
+def _revalidation_selector_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    claim_ids = value.get("world_state_claim_ids")
+    return {
+        "revalidator_id": _bounded_optional_string(value.get("revalidator_id"), 120),
+        "world_state_claim_id_count": len(claim_ids) if isinstance(claim_ids, list) else 0,
+    }
+
+
+def _bounded_optional_string(value: Any, max_length: int) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:max_length]
+
+
+def _bounded_string(value: Any, default: str, max_length: int) -> str:
+    if not isinstance(value, str) or not value:
+        return default
+    return value[:max_length]
+
+
+def _bounded_string_list(value: Any, max_items: int, max_length: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item:
+            out.append(item[:max_length])
+        if len(out) >= max_items:
+            break
+    return out
 
 
 def _canonical_json(value: Any) -> str:

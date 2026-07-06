@@ -761,16 +761,76 @@ class FakeRuntime:
         return {"reset": True}
 
 
+class CapabilityRuntime(FakeRuntime):
+    def __init__(
+        self,
+        *,
+        phase_decisions: dict[str, dict[str, object]] | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.capability_authorization_calls = []
+        self.phase_decisions = phase_decisions or {
+            "exposure": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "selection": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        }
+
+    async def authorize_capability(self, **kwargs):
+        self.capability_authorization_calls.append(kwargs)
+        self.call_order.append(f"authorize:{kwargs['authorization_phase']}")
+        decision = self.phase_decisions.get(
+            kwargs["authorization_phase"],
+            {
+                "allowed": False,
+                "decision_code": "authorization_denied",
+                "reason_codes": ["authorization_denied"],
+            },
+        )
+        return {
+            "result": {
+                "allowed": decision.get("allowed", False),
+                "decision_code": decision.get("decision_code", "authorization_denied"),
+                "reason_codes": decision.get("reason_codes", ["authorization_denied"]),
+                "challenge_ref": decision.get("challenge_ref"),
+                "revalidation_selector": decision.get("revalidation_selector"),
+                "relationship_ids_used": [],
+                "world_state_claim_ids_used": [],
+            }
+        }
+
+
 class FakeLiteLLM:
-    def __init__(self, *, fail_first: bool = False, content: str = "hello"):
+    def __init__(
+        self,
+        *,
+        fail_first: bool = False,
+        content: str = "hello",
+        completion: dict[str, object] | None = None,
+    ):
         self.calls = []
         self.fail_first = fail_first
         self.content = content
+        self.completion = completion
 
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
         if self.fail_first and len(self.calls) == 1:
             raise RuntimeError("primary failed")
+        if self.completion is not None:
+            return self.completion
         return {"choices": [{"message": {"content": self.content}}]}
 
 
@@ -828,6 +888,25 @@ def _http_status_error(
         request=request,
         response=response,
     )
+
+
+def _tool_completion(provider_tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": provider_tool_name,
+                                "arguments": json.dumps(arguments),
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
 
 
 def _memory_item(
@@ -8773,6 +8852,213 @@ async def test_orchestrate_live_chat_flow_threads_runtime_identity_and_turn_stat
     assert presentation["warnings"]["companion_warning_count"] == 0
     handoff = prompt_trace["handoff"]
     assert handoff["warnings"]["interrupt_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_executes_world_state_read_after_selection_and_dispatch(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+    runtime.world_state_response = {
+        "included_claims": [
+            {
+                "world_state_claim_id": "claim-1",
+                "entity_id": "repo-1",
+                "attribute": "branch",
+                "domain": "active_repository",
+                "value_json": "PRIVATE-WORLD-VALUE",
+            }
+        ],
+        "excluded_claim_summaries": [],
+        "prompt_content": "World state: PRIVATE-WORLD-VALUE",
+        "trace": {
+            "included_claim_count": 1,
+            "excluded_claim_count": 0,
+            "stale_count": 0,
+            "aging_count": 0,
+            "expired_count": 0,
+            "conflicted_count": 0,
+            "confirmation_required": False,
+        },
+    }
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read current repository state."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "runtime_world_state_read",
+                {"requested_domains": ["active_repository"], "output_mode": "structured"},
+            )
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-world-read",
+    )
+
+    assert out["answer"] == "I read bounded runtime world state and found 1 matching claim(s)."
+    phases = [
+        call["authorization_phase"]
+        for call in runtime.capability_authorization_calls
+        if call["capability_id"] == "runtime.world_state.read"
+    ]
+    assert phases == ["exposure", "selection", "dispatch"]
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert execute_calls[0]["requested_domains"] == ["active_repository"]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["executor_called"] is True
+    assert trace["execution"]["executor_call_count"] == 1
+    assert trace["execution"]["executor_result_status"] == "ok"
+    assert "PRIVATE-WORLD-VALUE" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_executes_local_unsent_draft_after_selection_and_dispatch(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a local note."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "draft_local_message",
+                {"body": "PRIVATE-DRAFT-BODY", "recipient_label": "reviewer"},
+            )
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-draft",
+    )
+
+    assert out["answer"] == "I created a local unsent draft. Nothing was sent."
+    phases = [
+        call["authorization_phase"]
+        for call in runtime.capability_authorization_calls
+        if call["capability_id"] == "draft.local_message"
+    ]
+    assert phases == ["exposure", "selection", "dispatch"]
+    assert [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ] == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["executor_called"] is True
+    assert trace["execution"]["executor_call_count"] == 1
+    assert trace["execution"]["executor_result"]["local"] is True
+    assert trace["execution"]["executor_result"]["sent"] is False
+    assert "PRIVATE-DRAFT-BODY" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_dispatch_denial_is_zero_executor(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime(
+        phase_decisions={
+            "exposure": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "selection": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+            "dispatch": {
+                "allowed": False,
+                "decision_code": "authorization_denied",
+                "reason_codes": ["capability_domain_denied"],
+            },
+        }
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Read current repository state."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-dispatch-denied",
+    )
+
+    assert out["answer"] == "I could not use that capability request safely."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["execution"]["authorization"]["dispatch"]["status"] == "authorization_denied"
+    assert trace["execution"]["executor_called"] is False
+    assert trace["execution"]["executor_call_count"] == 0
+    assert [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_invalid_provider_capability_request_is_zero_executor(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = CapabilityRuntime()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Use several tools."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "draft_local_message",
+                                        "arguments": "{\"body\":\"one\"}",
+                                    }
+                                },
+                                {
+                                    "function": {
+                                        "name": "runtime_world_state_read",
+                                        "arguments": "{}",
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-cap-multiple-invalid",
+    )
+
+    assert out["answer"] == "I could not use that capability request safely."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
+    assert trace["validation"]["reason_code"] == "multiple_capability_calls"
+    assert trace["execution"]["executor_called"] is False
+    assert trace["execution"]["executor_call_count"] == 0
+    assert [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ] == []
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.capabilities import (
     CapabilityValidationError,
+    authorize_and_execute_capability,
     capability_validation_failure_trace,
     filter_capability_descriptors_for_exposure,
     parse_provider_capability_request,
@@ -4854,7 +4855,19 @@ async def orchestrate_chat(
                     ),
                 )
                 prompt.trace["capabilities"]["validation"] = validation_result.trace
-                raw_answer = "Capability request validated and deferred for authorization."
+                execution_result = await authorize_and_execute_capability(
+                    runtime=runtime,
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                    runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                    active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                    validation_result=validation_result,
+                )
+                prompt.trace["capabilities"]["execution"] = execution_result.trace
+                raw_answer = execution_result.response_text
         except CapabilityValidationError as exc:
             requested_capability_id = None
             requested_provider_tool_name = None
@@ -4866,6 +4879,13 @@ async def orchestrate_chat(
                 requested_capability_id,
                 requested_provider_tool_name,
             )
+            prompt.trace["capabilities"]["execution"] = {
+                "executor_called": False,
+                "executor_call_count": 0,
+                "executor_result_status": "not_called",
+                "failure_reason_code": exc.reason_code,
+                "response_status": "not_executed",
+            }
             raw_answer = "I could not use that capability request safely."
         response_review = review_response(
             ResponseReviewInput(

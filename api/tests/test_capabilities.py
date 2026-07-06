@@ -5,6 +5,8 @@ import json
 import pytest
 from services.capabilities import (
     CapabilityValidationError,
+    argument_digest,
+    authorize_and_execute_capability,
     descriptor_fingerprint,
     filter_capability_descriptors_for_exposure,
     parse_provider_capability_request,
@@ -15,15 +17,66 @@ from services.capabilities import (
 
 
 class FakeRuntime:
-    def __init__(self, *, denied: set[str] | None = None, malformed: bool = False):
+    def __init__(
+        self,
+        *,
+        denied: set[str] | None = None,
+        malformed: bool = False,
+        phase_decisions: dict[str, dict[str, object]] | None = None,
+        world_state_response: dict[str, object] | None = None,
+        world_state_error: Exception | None = None,
+    ):
         self.denied = denied or set()
         self.malformed = malformed
+        self.phase_decisions = phase_decisions or {}
+        self.world_state_response = world_state_response or {
+            "included_claims": [],
+            "excluded_claim_summaries": [],
+            "prompt_content": None,
+            "trace": {
+                "included_claim_count": 0,
+                "excluded_claim_count": 0,
+                "stale_count": 0,
+                "aging_count": 0,
+                "expired_count": 0,
+                "conflicted_count": 0,
+                "confirmation_required": False,
+            },
+        }
+        self.world_state_error = world_state_error
         self.calls = []
+        self.world_state_calls = []
+        self.executor_calls = 0
 
     async def authorize_capability(self, **kwargs):
         self.calls.append(kwargs)
         if self.malformed:
             return {"result": "bad"}
+        phase_decision = self.phase_decisions.get(kwargs["authorization_phase"])
+        if phase_decision is not None:
+            return {
+                "result": {
+                    "allowed": phase_decision.get("allowed", False),
+                    "decision_code": phase_decision.get(
+                        "decision_code",
+                        "authorization_denied",
+                    ),
+                    "reason_codes": phase_decision.get(
+                        "reason_codes",
+                        [phase_decision.get("decision_code", "authorization_denied")],
+                    ),
+                    "challenge_ref": phase_decision.get("challenge_ref"),
+                    "revalidation_selector": phase_decision.get("revalidation_selector"),
+                    "relationship_ids_used": phase_decision.get(
+                        "relationship_ids_used",
+                        [],
+                    ),
+                    "world_state_claim_ids_used": phase_decision.get(
+                        "world_state_claim_ids_used",
+                        [],
+                    ),
+                }
+            }
         allowed = kwargs["capability_id"] not in self.denied
         return {
             "result": {
@@ -32,6 +85,13 @@ class FakeRuntime:
                 "reason_codes": ["allowed" if allowed else "capability_domain_denied"],
             }
         }
+
+    async def world_state_resolve(self, **kwargs):
+        self.executor_calls += 1
+        self.world_state_calls.append(kwargs)
+        if self.world_state_error is not None:
+            raise self.world_state_error
+        return self.world_state_response
 
 
 def _completion(message: dict[str, object]) -> dict[str, object]:
@@ -50,6 +110,44 @@ def _call(provider_tool_name: str, arguments: dict[str, object]) -> dict[str, ob
                 }
             ]
         }
+    )
+
+
+def _allowed_phase_decisions() -> dict[str, dict[str, object]]:
+    return {
+        "selection": {
+            "allowed": True,
+            "decision_code": "allowed",
+            "reason_codes": ["allowed"],
+        },
+        "dispatch": {
+            "allowed": True,
+            "decision_code": "allowed",
+            "reason_codes": ["allowed"],
+        },
+    }
+
+
+def _validated(provider_tool_name: str, arguments: dict[str, object]):
+    request = parse_provider_capability_request(_call(provider_tool_name, arguments))
+    assert request is not None
+    return validate_and_digest_capability_request(
+        request=request,
+        exposed_capability_ids=["runtime.world_state.read", "draft.local_message"],
+    )
+
+
+async def _execute(runtime: FakeRuntime, validation_result):
+    return await authorize_and_execute_capability(
+        runtime=runtime,
+        request_id="rid",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        active_persona_id="technical_architect",
+        validation_result=validation_result,
     )
 
 
@@ -376,3 +474,214 @@ def test_draft_arguments_normalize_and_digest_stably_without_raw_trace():
     serialized_trace = json.dumps(first.trace)
     assert "Hello Daniel" not in serialized_trace
     assert "recipient_label" not in serialized_trace
+
+
+@pytest.mark.asyncio
+async def test_world_state_read_authorizes_selection_before_dispatch_and_executes_once():
+    runtime = FakeRuntime(
+        phase_decisions=_allowed_phase_decisions(),
+        world_state_response={
+            "included_claims": [
+                {
+                    "world_state_claim_id": "claim-1",
+                    "entity_id": "repo-1",
+                    "attribute": "branch",
+                    "domain": "active_repository",
+                    "value_json": "PRIVATE-RAW-VALUE",
+                }
+            ],
+            "excluded_claim_summaries": [],
+            "prompt_content": "World state: PRIVATE-RAW-VALUE",
+            "trace": {
+                "included_claim_count": 1,
+                "excluded_claim_count": 0,
+                "stale_count": 0,
+                "aging_count": 0,
+                "expired_count": 0,
+                "conflicted_count": 0,
+                "confirmation_required": False,
+            },
+        },
+    )
+
+    result = await _execute(
+        runtime,
+        _validated(
+            "runtime_world_state_read",
+            {
+                "requested_domains": ["active_repository"],
+                "entity_id": "repo-1",
+                "attribute": "branch",
+                "output_mode": "structured",
+            },
+        ),
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "dispatch",
+    ]
+    assert runtime.world_state_calls[0]["requested_domains"] == ["active_repository"]
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+    assert result.trace["executor_result_status"] == "ok"
+    assert result.trace["executor_result"]["included_claim_count"] == 1
+    assert "PRIVATE-RAW-VALUE" not in json.dumps(result.trace)
+    assert "PRIVATE-RAW-VALUE" not in result.response_text
+
+
+@pytest.mark.asyncio
+async def test_local_message_draft_authorizes_selection_before_dispatch_and_never_sends():
+    runtime = FakeRuntime(phase_decisions=_allowed_phase_decisions())
+
+    result = await _execute(
+        runtime,
+        _validated(
+            "draft_local_message",
+            {"body": "send nothing", "recipient_label": "reviewer", "subject": "Draft"},
+        ),
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "dispatch",
+    ]
+    assert runtime.world_state_calls == []
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+    assert result.trace["executor_result"] == {
+        "status": "ok",
+        "draft_id": result.trace["executor_result"]["draft_id"],
+        "local": True,
+        "sent": False,
+        "recipient_present": True,
+        "subject_present": True,
+        "body_char_count": 12,
+        "tone": None,
+        "format": "plain_text",
+    }
+    assert result.response_text == "I created a local unsent draft. Nothing was sent."
+    assert "send nothing" not in json.dumps(result.trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "decision_code", "expected_text"),
+    [
+        ("selection", "authorization_denied", "could not use"),
+        ("dispatch", "authorization_denied", "could not use"),
+        ("selection", "confirmation_required", "needs confirmation"),
+        ("dispatch", "confirmation_required", "needs confirmation"),
+        ("selection", "revalidation_required", "requires revalidation"),
+        ("dispatch", "revalidation_required", "requires revalidation"),
+    ],
+)
+async def test_authorization_blocks_are_zero_executor(
+    phase,
+    decision_code,
+    expected_text,
+):
+    decisions = _allowed_phase_decisions()
+    decisions[phase] = {
+        "allowed": False,
+        "decision_code": decision_code,
+        "reason_codes": [decision_code],
+        "challenge_ref": "challenge-1" if decision_code == "confirmation_required" else None,
+        "revalidation_selector": (
+            {"revalidator_id": "trusted-refresh", "world_state_claim_ids": ["claim-1"]}
+            if decision_code == "revalidation_required"
+            else None
+        ),
+    }
+    runtime = FakeRuntime(phase_decisions=decisions)
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+    )
+
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.world_state_calls == []
+    assert expected_text in result.response_text
+    assert result.trace["authorization"][phase]["status"] == decision_code
+    assert "challenge-1" in json.dumps(result.trace) or decision_code != "confirmation_required"
+    assert "claim-1" not in json.dumps(result.trace)
+
+
+@pytest.mark.asyncio
+async def test_argument_mutation_between_selection_and_dispatch_fails_closed():
+    validation_result = _validated("draft_local_message", {"body": "original"})
+    validation_result.normalized_arguments["body"] = "mutated"
+    runtime = FakeRuntime(phase_decisions=_allowed_phase_decisions())
+
+    result = await _execute(runtime, validation_result)
+
+    assert [call["authorization_phase"] for call in runtime.calls] == ["selection"]
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert result.trace["failure_reason_code"] == "argument_digest_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_executor_failure_does_not_fabricate_success():
+    runtime = FakeRuntime(
+        phase_decisions=_allowed_phase_decisions(),
+        world_state_error=RuntimeError("runtime down"),
+    )
+
+    result = await _execute(
+        runtime,
+        _validated("runtime_world_state_read", {"output_mode": "summary"}),
+    )
+
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+    assert result.trace["executor_result_status"] == "failed"
+    assert result.trace["response_status"] == "executor_failed"
+    assert "success" not in result.response_text.lower()
+
+
+def test_malformed_hidden_and_multiple_provider_requests_have_no_executor_path():
+    with pytest.raises(CapabilityValidationError) as multiple:
+        parse_provider_capability_request(
+            _completion(
+                {
+                    "tool_calls": [
+                        {"function": {"name": "draft_local_message", "arguments": "{}"}},
+                        {"function": {"name": "runtime_world_state_read", "arguments": "{}"}},
+                    ]
+                }
+            )
+        )
+    assert multiple.value.reason_code == "multiple_capability_calls"
+
+    with pytest.raises(CapabilityValidationError) as hidden:
+        parse_provider_capability_request(_call("hidden_tool", {}))
+    assert hidden.value.reason_code == "unknown_capability_id"
+
+    with pytest.raises(CapabilityValidationError) as malformed:
+        parse_provider_capability_request(
+            _completion(
+                {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "draft_local_message",
+                                "arguments": "{bad",
+                            }
+                        }
+                    ]
+                }
+            )
+        )
+    assert malformed.value.reason_code == "malformed_arguments"
+
+
+def test_argument_digest_helper_matches_validation_digest():
+    validation_result = _validated("draft_local_message", {"body": "hello"})
+
+    assert validation_result.argument_digest == argument_digest(
+        validation_result.capability_id,
+        validation_result.normalized_arguments,
+    )
