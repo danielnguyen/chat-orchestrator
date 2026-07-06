@@ -504,3 +504,51 @@ async def test_world_state_claim_verify_posts_expected_structural_payload():
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_confirm_capability_posts_expected_structural_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {
+            "confirmation_challenge_ref": json["confirmation_challenge_ref"],
+            "confirmation_state": "accepted",
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.confirm_capability(
+        request_id="rid:confirm",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        confirmation_challenge_ref="challenge-1",
+        capability_id="draft.local_message",
+        operation_class="draft",
+        argument_digest="capargs_123",
+        confirmed=True,
+    )
+
+    assert calls == [
+        (
+            "/v1/capabilities/confirm",
+            {
+                "request_id": "rid:confirm",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "confirmation_challenge_ref": "challenge-1",
+                "capability_id": "draft.local_message",
+                "operation_class": "draft",
+                "argument_digest": "capargs_123",
+                "confirmed": True,
+            },
+        )
+    ]

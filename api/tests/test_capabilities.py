@@ -30,6 +30,8 @@ class FakeRuntime:
         world_state_error: Exception | None = None,
         verification_error: Exception | None = None,
         verification_response: dict[str, object] | None = None,
+        confirmation_error: Exception | None = None,
+        confirmation_response: dict[str, object] | None = None,
     ):
         self.denied = denied or set()
         self.malformed = malformed
@@ -51,7 +53,10 @@ class FakeRuntime:
         self.world_state_error = world_state_error
         self.verification_error = verification_error
         self.verification_response = verification_response
+        self.confirmation_error = confirmation_error
+        self.confirmation_response = confirmation_response
         self.calls = []
+        self.confirmation_calls = []
         self.world_state_calls = []
         self.world_state_verification_calls = []
         self.executor_calls = 0
@@ -124,6 +129,22 @@ class FakeRuntime:
             }
         }
 
+    async def confirm_capability(self, **kwargs):
+        self.confirmation_calls.append(kwargs)
+        if self.confirmation_error is not None:
+            raise self.confirmation_error
+        if self.confirmation_response is not None:
+            return self.confirmation_response
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs["runtime_turn_id"],
+            "confirmation_challenge_ref": kwargs["confirmation_challenge_ref"],
+            "confirmation_state": "accepted",
+        }
+
 
 def _completion(message: dict[str, object]) -> dict[str, object]:
     return {"choices": [{"message": message}]}
@@ -168,7 +189,12 @@ def _validated(provider_tool_name: str, arguments: dict[str, object]):
     )
 
 
-async def _execute(runtime: FakeRuntime, validation_result, revalidators=None):
+async def _execute(
+    runtime: FakeRuntime,
+    validation_result,
+    revalidators=None,
+    confirmation=None,
+):
     return await authorize_and_execute_capability(
         runtime=runtime,
         request_id="rid",
@@ -180,6 +206,7 @@ async def _execute(runtime: FakeRuntime, validation_result, revalidators=None):
         active_persona_id="technical_architect",
         validation_result=validation_result,
         revalidators=revalidators,
+        capability_confirmation=confirmation,
     )
 
 
@@ -680,6 +707,353 @@ async def test_authorization_blocks_are_zero_executor(
 
 
 @pytest.mark.asyncio
+async def test_valid_structured_confirmation_calls_cr_then_dispatches_with_confirmed_ref():
+    validation_result = _validated("draft_local_message", {"body": "confirm me"})
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-1",
+            },
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        confirmation={
+            "challenge_ref": "challenge-1",
+            "capability_id": validation_result.capability_id,
+            "argument_digest": validation_result.argument_digest,
+            "confirmed": True,
+        },
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "dispatch",
+    ]
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.confirmation_calls[0] == {
+        "request_id": "rid:draft.local_message:confirm",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "confirmation_challenge_ref": "challenge-1",
+        "capability_id": "draft.local_message",
+        "operation_class": "draft",
+        "argument_digest": validation_result.argument_digest,
+        "confirmed": True,
+    }
+    assert runtime.calls[1]["confirmation_challenge_ref"] == "challenge-1"
+    assert result.trace["confirmation"]["status"] == "accepted"
+    assert result.trace["confirmation"]["call_count"] == 1
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirmation", "expected_reason"),
+    [
+        (None, "confirmation_missing"),
+        (
+            {
+                "challenge_ref": "challenge-1",
+                "capability_id": "runtime.world_state.read",
+                "argument_digest": "wrong",
+                "confirmed": True,
+            },
+            "confirmation_capability_mismatch",
+        ),
+        (
+            {
+                "challenge_ref": "challenge-1",
+                "capability_id": "draft.local_message",
+                "argument_digest": "wrong",
+                "confirmed": True,
+            },
+            "confirmation_argument_digest_mismatch",
+        ),
+        (
+            {
+                "challenge_ref": "bad ref with spaces",
+                "capability_id": "draft.local_message",
+                "argument_digest": "filled-by-test",
+                "confirmed": True,
+            },
+            "malformed_challenge_ref",
+        ),
+        (
+            {
+                "challenge_ref": "challenge-1",
+                "capability_id": "draft.local_message",
+                "argument_digest": "filled-by-test",
+                "confirmed": False,
+            },
+            "confirmation_not_confirmed",
+        ),
+        (
+            {
+                "challenge_ref": "challenge-1",
+                "capability_id": "draft.local_message",
+                "argument_digest": "filled-by-test",
+            },
+            "confirmation_not_confirmed",
+        ),
+    ],
+)
+async def test_structured_confirmation_shape_failures_are_zero_executor(
+    confirmation,
+    expected_reason,
+):
+    validation_result = _validated("draft_local_message", {"body": "confirm me"})
+    if isinstance(confirmation, dict) and confirmation.get("argument_digest") == "filled-by-test":
+        confirmation["argument_digest"] = validation_result.argument_digest
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-1",
+            },
+        }
+    )
+
+    result = await _execute(runtime, validation_result, confirmation=confirmation)
+
+    assert result.trace["confirmation"]["reason_code"] == expected_reason
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.confirmation_calls == []
+    assert runtime.world_state_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirmation_response", "confirmation_error", "expected_status", "expected_reason"),
+    [
+        (None, RuntimeError("offline"), "failed", "confirmation_unavailable"),
+        ("not-a-dict", None, "malformed", "malformed_confirmation_response"),
+        (
+            {"confirmation_state": "accepted", "confirmation_challenge_ref": "other"},
+            None,
+            "malformed",
+            "confirmation_response_mismatch",
+        ),
+        (
+            {"confirmation_state": "rejected", "confirmation_challenge_ref": "challenge-1"},
+            None,
+            "failed",
+            "rejected",
+        ),
+        (
+            {"confirmation_state": "expired", "confirmation_challenge_ref": "challenge-1"},
+            None,
+            "failed",
+            "expired",
+        ),
+        (
+            {"confirmation_state": "consumed", "confirmation_challenge_ref": "challenge-1"},
+            None,
+            "failed",
+            "consumed",
+        ),
+    ],
+)
+async def test_cr_confirmation_failures_are_zero_executor(
+    confirmation_response,
+    confirmation_error,
+    expected_status,
+    expected_reason,
+):
+    validation_result = _validated("draft_local_message", {"body": "confirm me"})
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-1",
+            },
+        },
+        confirmation_response=confirmation_response,
+        confirmation_error=confirmation_error,
+    )
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        confirmation={
+            "challenge_ref": "challenge-1",
+            "capability_id": validation_result.capability_id,
+            "argument_digest": validation_result.argument_digest,
+            "confirmed": True,
+        },
+    )
+
+    assert result.trace["confirmation"]["status"] == expected_status
+    assert result.trace["confirmation"]["reason_code"] == expected_reason
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert len(runtime.confirmation_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmation_after_revalidation_rerun_can_confirm_then_dispatch():
+    validation_result = _validated("runtime_world_state_read", {"output_mode": "summary"})
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": [
+                {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["world_state_revalidation_required"],
+                    "revalidation_selector": {
+                        "revalidator_id": "trusted_refresh",
+                        "world_state_claim_ids": ["claim-1"],
+                    },
+                },
+                {
+                    "allowed": False,
+                    "decision_code": "confirmation_required",
+                    "reason_codes": ["confirmation_required"],
+                    "challenge_ref": "challenge-rerun",
+                },
+            ],
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        },
+    )
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        {"trusted_refresh": _trusted_revalidator()},
+        confirmation={
+            "challenge_ref": "challenge-rerun",
+            "capability_id": validation_result.capability_id,
+            "argument_digest": validation_result.argument_digest,
+            "confirmed": True,
+        },
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == [
+        "selection",
+        "selection",
+        "dispatch",
+    ]
+    assert runtime.calls[2]["confirmation_challenge_ref"] == "challenge-rerun"
+    assert result.trace["revalidation"]["status"] == "verified"
+    assert result.trace["confirmation"]["status"] == "accepted"
+    assert result.trace["executor_called"] is True
+    assert result.trace["executor_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_mutation_after_confirmation_before_dispatch_fails_closed():
+    validation_result = _validated("draft_local_message", {"body": "confirm me"})
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-1",
+            },
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        }
+    )
+    original_confirm = runtime.confirm_capability
+
+    async def mutate_then_confirm(**kwargs):
+        validation_result.normalized_arguments["body"] = "mutated"
+        return await original_confirm(**kwargs)
+
+    runtime.confirm_capability = mutate_then_confirm
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        confirmation={
+            "challenge_ref": "challenge-1",
+            "capability_id": validation_result.capability_id,
+            "argument_digest": validation_result.argument_digest,
+            "confirmed": True,
+        },
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == ["selection"]
+    assert result.trace["confirmation"]["status"] == "accepted"
+    assert result.trace["failure_reason_code"] == "argument_digest_mismatch"
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_confirmation_trace_omits_raw_arguments_provider_payload_and_user_prose():
+    validation_result = _validated("draft_local_message", {"body": "PRIVATE RAW BODY"})
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-1",
+            },
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        }
+    )
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        confirmation={
+            "challenge_ref": "challenge-1",
+            "capability_id": validation_result.capability_id,
+            "argument_digest": validation_result.argument_digest,
+            "confirmed": True,
+            "raw_user_prose": "yes please use PRIVATE RAW BODY",
+        },
+    )
+
+    serialized = json.dumps(result.trace["confirmation"])
+    assert "PRIVATE RAW BODY" not in serialized
+    assert "raw_user_prose" not in serialized
+    assert result.trace["confirmation"] == {
+        "status": "accepted",
+        "challenge_ref_present": True,
+        "accepted": True,
+        "call_count": 1,
+        "reason_code": "accepted",
+        "capability_id": "draft.local_message",
+        "argument_digest": validation_result.argument_digest,
+        "confirmed_challenge_ref": "challenge-1",
+    }
+
+
+@pytest.mark.asyncio
 async def test_revalidation_success_verifies_reruns_selection_then_dispatches_once():
     validation_result = _validated("runtime_world_state_read", {"output_mode": "summary"})
     runtime = FakeRuntime(
@@ -1033,12 +1407,15 @@ async def test_rerun_selection_blocks_without_loop_or_executor(
     ]
     assert result.trace["executor_called"] is False
     assert result.trace["executor_call_count"] == 0
-    assert result.trace["revalidation"]["reason_code"] == expected_reason
     if expected_reason == "confirmation_required":
+        assert result.trace["revalidation"]["reason_code"] == "verified"
+        assert result.trace["failure_reason_code"] == "confirmation_missing"
         assert (
             result.trace["authorization"]["selection"]["confirmation_challenge_ref"]
             == "challenge-rerun"
         )
+    else:
+        assert result.trace["revalidation"]["reason_code"] == expected_reason
 
 
 @pytest.mark.asyncio

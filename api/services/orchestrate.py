@@ -4867,6 +4867,7 @@ async def orchestrate_chat(
                     active_persona_id=runtime_identity_trace.get("active_persona_id"),
                     validation_result=validation_result,
                     revalidators=capability_revalidators,
+                    capability_confirmation=payload.get("capability_confirmation"),
                 )
                 prompt.trace["capabilities"]["execution"] = execution_result.trace
                 raw_answer = execution_result.response_text

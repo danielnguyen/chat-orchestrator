@@ -295,6 +295,38 @@ class RuntimeClient:
         }
         return await self._post("/v1/capabilities/authorize", json=payload)
 
+    async def confirm_capability(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        confirmation_challenge_ref: str,
+        capability_id: str,
+        operation_class: str,
+        argument_digest: str,
+        confirmed: bool,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/capabilities/confirm",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "surface": surface,
+                "runtime_session_id": runtime_session_id,
+                "runtime_turn_id": runtime_turn_id,
+                "confirmation_challenge_ref": confirmation_challenge_ref,
+                "capability_id": capability_id,
+                "operation_class": operation_class,
+                "argument_digest": argument_digest,
+                "confirmed": confirmed,
+            },
+        )
+
     async def compile_companion_policy(
         self,
         *,

@@ -120,6 +120,14 @@ class _RevalidationResult:
     selection: _AuthorizationResult | None = None
 
 
+@dataclass(frozen=True)
+class _ConfirmationInput:
+    challenge_ref: str
+    capability_id: str
+    argument_digest: str
+    confirmed: bool
+
+
 PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
     CapabilityEntry(
         capability_id="runtime.world_state.read",
@@ -451,6 +459,7 @@ async def authorize_and_execute_capability(
     active_persona_id: str | None,
     validation_result: CapabilityValidationResult,
     revalidators: dict[str, Revalidator] | None = None,
+    capability_confirmation: dict[str, Any] | None = None,
 ) -> CapabilityExecutionResult:
     entry = capability_by_id(validation_result.capability_id)
     trace = {
@@ -460,6 +469,11 @@ async def authorize_and_execute_capability(
             "dispatch": _authorization_empty_trace("not_requested"),
         },
         "revalidation": _revalidation_empty_trace("not_required"),
+        "confirmation": _confirmation_empty_trace(
+            "not_required",
+            validation_result.capability_id,
+            validation_result.argument_digest,
+        ),
         "executor_binding": entry.executor_binding if entry else None,
         "executor_called": False,
         "executor_call_count": 0,
@@ -524,7 +538,30 @@ async def authorize_and_execute_capability(
                 _revalidation_failure_text(revalidation.trace),
             )
         selection = revalidation.selection
-    if selection.trace["status"] != "allowed":
+    confirmed_challenge_ref = None
+    if selection.trace["status"] == "confirmation_required":
+        confirmation = await _confirm_capability_challenge(
+            runtime=runtime,
+            request_id=f"{request_id}:{entry.capability_id}:confirm",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            entry=entry,
+            argument_digest_value=validation_result.argument_digest,
+            challenge_ref=selection.trace.get("confirmation_challenge_ref"),
+            capability_confirmation=capability_confirmation,
+        )
+        trace["confirmation"] = confirmation.trace
+        if confirmation.trace["status"] != "accepted":
+            return _capability_not_executed(
+                trace,
+                confirmation.trace.get("reason_code") or "confirmation_required",
+                _confirmation_failure_text(confirmation.trace),
+            )
+        confirmed_challenge_ref = confirmation.trace.get("confirmed_challenge_ref")
+    elif selection.trace["status"] != "allowed":
         return _capability_not_executed(
             trace,
             _authorization_failure_reason(selection.trace),
@@ -557,7 +594,7 @@ async def authorize_and_execute_capability(
         entry=entry,
         phase="dispatch",
         argument_digest_value=dispatch_digest,
-        confirmation_challenge_ref=selection.trace.get("confirmation_challenge_ref"),
+        confirmation_challenge_ref=confirmed_challenge_ref,
     )
     trace["authorization"]["dispatch"] = dispatch.trace
     if dispatch.trace["status"] != "allowed":
@@ -824,6 +861,23 @@ def _authorization_empty_trace(status: str) -> dict[str, Any]:
     }
 
 
+def _confirmation_empty_trace(
+    status: str,
+    capability_id: str | None = None,
+    argument_digest_value: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "challenge_ref_present": False,
+        "accepted": False,
+        "call_count": 0,
+        "reason_code": status,
+        "capability_id": _bounded_optional_string(capability_id, 120),
+        "argument_digest": _bounded_optional_string(argument_digest_value, 120),
+        "confirmed_challenge_ref": None,
+    }
+
+
 def _revalidation_empty_trace(status: str) -> dict[str, Any]:
     return {
         "status": status,
@@ -949,13 +1003,11 @@ async def _perform_revalidation(
         confirmation_challenge_ref=None,
     )
     trace["rerun_selection_status"] = rerun.trace["status"]
-    if rerun.trace["status"] == "allowed":
+    if rerun.trace["status"] in {"allowed", "confirmation_required"}:
         trace.update({"status": "verified", "reason_code": "verified"})
         return _RevalidationResult(trace, selection=rerun)
     if rerun.trace["status"] == "revalidation_required":
         trace.update({"status": "blocked", "reason_code": "revalidation_loop_blocked"})
-    elif rerun.trace["status"] == "confirmation_required":
-        trace.update({"status": "blocked", "reason_code": "confirmation_required"})
     else:
         trace.update(
             {
@@ -964,6 +1016,125 @@ async def _perform_revalidation(
             }
         )
     return _RevalidationResult(trace, selection=rerun)
+
+
+async def _confirm_capability_challenge(
+    *,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    entry: CapabilityEntry,
+    argument_digest_value: str,
+    challenge_ref: Any,
+    capability_confirmation: dict[str, Any] | None,
+) -> _AuthorizationResult:
+    trace = _confirmation_empty_trace(
+        "required",
+        entry.capability_id,
+        argument_digest_value,
+    )
+    trace["challenge_ref_present"] = isinstance(challenge_ref, str) and bool(challenge_ref)
+    parsed, reason = _parse_confirmation_input(
+        capability_confirmation,
+        entry=entry,
+        argument_digest_value=argument_digest_value,
+        expected_challenge_ref=challenge_ref,
+    )
+    if parsed is None:
+        trace.update({"status": "blocked", "reason_code": reason})
+        return _AuthorizationResult(trace)
+    if not hasattr(runtime, "confirm_capability"):
+        trace.update({"status": "failed", "reason_code": "confirmation_unavailable"})
+        return _AuthorizationResult(trace)
+    trace["call_count"] = 1
+    try:
+        response = await runtime.confirm_capability(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            confirmation_challenge_ref=parsed.challenge_ref,
+            capability_id=entry.capability_id,
+            operation_class=entry.operation_class,
+            argument_digest=argument_digest_value,
+            confirmed=parsed.confirmed,
+        )
+    except Exception:
+        trace.update({"status": "failed", "reason_code": "confirmation_unavailable"})
+        return _AuthorizationResult(trace)
+    if not isinstance(response, dict):
+        trace.update({"status": "malformed", "reason_code": "malformed_confirmation_response"})
+        return _AuthorizationResult(trace)
+    state = response.get("confirmation_state")
+    confirmed_ref = response.get("confirmation_challenge_ref")
+    if state != "accepted":
+        trace.update(
+            {
+                "status": "failed",
+                "reason_code": _bounded_string(state, "confirmation_rejected", 80),
+            }
+        )
+        return _AuthorizationResult(trace)
+    if confirmed_ref != parsed.challenge_ref:
+        trace.update(
+            {
+                "status": "malformed",
+                "reason_code": "confirmation_response_mismatch",
+            }
+        )
+        return _AuthorizationResult(trace)
+    trace.update(
+        {
+            "status": "accepted",
+            "accepted": True,
+            "reason_code": "accepted",
+            "confirmed_challenge_ref": parsed.challenge_ref,
+        }
+    )
+    return _AuthorizationResult(trace)
+
+
+def _parse_confirmation_input(
+    value: dict[str, Any] | None,
+    *,
+    entry: CapabilityEntry,
+    argument_digest_value: str,
+    expected_challenge_ref: Any,
+) -> tuple[_ConfirmationInput | None, str]:
+    if not isinstance(expected_challenge_ref, str) or not _SAFE_LABEL.fullmatch(
+        expected_challenge_ref
+    ):
+        return None, "malformed_challenge_ref"
+    if not isinstance(value, dict):
+        return None, "confirmation_missing"
+    if value.get("confirmed") is not True:
+        return None, "confirmation_not_confirmed"
+    challenge_ref = value.get("challenge_ref")
+    capability_id = value.get("capability_id")
+    argument_digest_candidate = value.get("argument_digest")
+    if not isinstance(challenge_ref, str) or not _SAFE_LABEL.fullmatch(challenge_ref):
+        return None, "malformed_challenge_ref"
+    if challenge_ref != expected_challenge_ref:
+        return None, "confirmation_challenge_mismatch"
+    if capability_id != entry.capability_id:
+        return None, "confirmation_capability_mismatch"
+    if argument_digest_candidate != argument_digest_value:
+        return None, "confirmation_argument_digest_mismatch"
+    return (
+        _ConfirmationInput(
+            challenge_ref=challenge_ref,
+            capability_id=capability_id,
+            argument_digest=argument_digest_candidate,
+            confirmed=True,
+        ),
+        "accepted",
+    )
 
 
 def _parse_revalidation_selector(value: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str]:
@@ -1192,6 +1363,12 @@ def _authorization_failure_text(summary: dict[str, Any]) -> str:
     if status == "revalidation_required":
         return "That capability requires revalidation before execution."
     return "I could not use that capability request safely."
+
+
+def _confirmation_failure_text(summary: dict[str, Any]) -> str:
+    if summary.get("reason_code") == "confirmation_missing":
+        return "That capability needs confirmation before execution."
+    return "I could not use that capability confirmation safely."
 
 
 def _capability_not_executed(
