@@ -157,7 +157,37 @@ def load_allowlist(path: Path) -> list[dict[str, Any]]:
     entries = payload.get("entries")
     if not isinstance(entries, list):
         raise ValueError("allowlist must contain an entries list")
+    validate_allowlist_entries(entries)
     return entries
+
+
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def validate_allowlist_entries(entries: list[Any]) -> None:
+    for index, entry in enumerate(entries):
+        label = f"allowlist entry {index}"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be an object")
+        if not _non_empty_string(entry.get("path")):
+            raise ValueError(f"{label} must include a non-empty path")
+        if not (_non_empty_string(entry.get("token")) or _non_empty_string(entry.get("pattern"))):
+            raise ValueError(f"{label} must include token or pattern")
+        for field in ("bucket", "reason"):
+            if not _non_empty_string(entry.get(field)):
+                raise ValueError(f"{label} must include a non-empty {field}")
+        if "removal_required_later" not in entry:
+            raise ValueError(f"{label} must include removal_required_later")
+        if not isinstance(entry["removal_required_later"], bool):
+            raise ValueError(f"{label} removal_required_later must be a boolean")
+        if not (
+            _non_empty_string(entry.get("reviewed_at"))
+            or _non_empty_string(entry.get("reviewed_by"))
+        ):
+            raise ValueError(f"{label} must include reviewed_at or reviewed_by")
+        if not _non_empty_string(entry.get("context_contains")):
+            raise ValueError(f"{label} must include non-empty context_contains")
 
 
 def allowlist_matches(finding: Finding, entry: dict[str, Any]) -> bool:
