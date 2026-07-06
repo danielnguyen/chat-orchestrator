@@ -111,6 +111,7 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
         "relationship_context",
         "runtime_overlay",
         "external_source_context",
+        "memory_episode_recall_composition",
     ]
     assert out.trace["truncation"] == {"applied": False, "reason": None}
     assert out.trace["style"]["status"] == "not_requested"
@@ -146,6 +147,7 @@ def test_assemble_prompt_marks_empty_layers_omitted():
         "relationship_context",
         "runtime_overlay",
         "external_source_context",
+        "memory_episode_recall_composition",
         "retrieval_augmentation",
         "recent_history",
     ]

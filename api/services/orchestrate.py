@@ -32,6 +32,10 @@ from services.capabilities import (
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
 from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
+from services.memory_recall_composition import (
+    build_recall_candidates,
+    compose_memory_recall_context,
+)
 from services.privacy_context import (
     apply_privacy_boundary,
     derive_privacy_context,
@@ -410,9 +414,7 @@ def _validate_relationship_projection(value: Any) -> tuple[dict[str, Any] | None
         return None, "malformed_relationship_scope_projection"
     if value.get("applied") is True and not relationship_ids and not entity_ids:
         return None, "empty_applied_relationship_scope_projection"
-    if value.get("applied") is False and (
-        relationship_ids or entity_ids or relationship_scopes
-    ):
+    if value.get("applied") is False and (relationship_ids or entity_ids or relationship_scopes):
         return None, "contradictory_unapplied_relationship_scope_projection"
     return {
         "applied": value["applied"],
@@ -664,10 +666,7 @@ def _relationship_projection_allows(
     metadata: dict[str, Any],
     relationship_projection: dict[str, Any] | None,
 ) -> tuple[bool, str | None]:
-    if (
-        not isinstance(relationship_projection, dict)
-        or "applied" not in relationship_projection
-    ):
+    if not isinstance(relationship_projection, dict) or "applied" not in relationship_projection:
         return True, None
     record_relationships = set(metadata.get("relationship_ids") or [])
     record_entities = set(metadata.get("entity_ids") or [])
@@ -928,22 +927,34 @@ def _valid_artifact_provenance(value: Any, *, owner_id: str) -> tuple[bool, str 
     ):
         return False, "malformed_provenance"
     for key in ("generation_trace_id", "retrieval_reason"):
-        if value.get(key) is not None and _bounded_contract_text(
-            value.get(key),
-            max_length=160,
-        ) is None:
+        if (
+            value.get(key) is not None
+            and _bounded_contract_text(
+                value.get(key),
+                max_length=160,
+            )
+            is None
+        ):
             return False, "malformed_provenance"
-    if value.get("explanation") is not None and _bounded_contract_text(
-        value.get("explanation"),
-        max_length=500,
-    ) is None:
+    if (
+        value.get("explanation") is not None
+        and _bounded_contract_text(
+            value.get("explanation"),
+            max_length=500,
+        )
+        is None
+    ):
         return False, "malformed_provenance"
     compatibility_defaults = value.get("compatibility_defaults", [])
-    if compatibility_defaults is not None and _sanitize_trace_string_list(
-        compatibility_defaults,
-        limit=20,
-        item_max_length=80,
-    ) != compatibility_defaults:
+    if (
+        compatibility_defaults is not None
+        and _sanitize_trace_string_list(
+            compatibility_defaults,
+            limit=20,
+            item_max_length=80,
+        )
+        != compatibility_defaults
+    ):
         return False, "malformed_provenance"
     return True, None
 
@@ -968,10 +979,7 @@ def _retained_observed_metadata(
             estimated_chars += len(snippet)
             has_code_like_content = has_code_like_content or bool(CODE_LIKE_RE.search(snippet))
         policy_metadata = item.get("policy_metadata")
-        if (
-            isinstance(policy_metadata, dict)
-            and policy_metadata.get("content_class") == "code"
-        ):
+        if isinstance(policy_metadata, dict) and policy_metadata.get("content_class") == "code":
             has_code_like_content = True
     return {
         "mime_types": mime_types,
@@ -1263,9 +1271,11 @@ def _apply_persona_containment_result_boundary(
         semantic=retained_semantic,
         artifacts=retained_artifacts,
     )
-    token_estimate_total = max(1, observed_metadata["estimated_chars"] // 4) if (
-        observed_metadata["estimated_chars"] > 0
-    ) else 0
+    token_estimate_total = (
+        max(1, observed_metadata["estimated_chars"] // 4)
+        if (observed_metadata["estimated_chars"] > 0)
+        else 0
+    )
     filtered_bundle = {
         "request_id": request_id,
         "conversation_id": conversation_id,
@@ -1435,9 +1445,9 @@ def _provider_attempt_evidence(
     semantic_ids = [
         item for item in retained.get("semantic_message_ids") or [] if isinstance(item, str)
     ][:20]
-    artifact_ids = [
-        item for item in retained.get("artifact_ids") or [] if isinstance(item, str)
-    ][:20]
+    artifact_ids = [item for item in retained.get("artifact_ids") or [] if isinstance(item, str)][
+        :20
+    ]
     return {
         "attempt_ordinal": max(1, ordinal),
         "prompt_fingerprint": prompt_fingerprint.get("fingerprint"),
@@ -1596,6 +1606,88 @@ def _trace_references(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
             if len(references) >= 20:
                 return references
     return references
+
+
+def _recall_context(
+    *,
+    surface: str,
+    sensitivity: Any,
+    requested_scene: Any,
+    interaction_governance: dict[str, Any] | None,
+    companion_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    scene_id = None
+    if isinstance(companion_trace, dict):
+        scene_id = companion_trace.get("scene_id")
+    if not isinstance(scene_id, str) or not scene_id:
+        scene_id = requested_scene if isinstance(requested_scene, str) else None
+    urgency = "medium"
+    if isinstance(interaction_governance, dict):
+        posture = interaction_governance.get("response_posture")
+        if posture == "tactical":
+            urgency = "high"
+        elif posture in {"reflective", "supportive"}:
+            urgency = "low"
+    normalized_sensitivity = sensitivity if isinstance(sensitivity, str) else "private"
+    if normalized_sensitivity in {"public", "low"}:
+        recall_sensitivity = "low"
+    elif normalized_sensitivity in {"high", "local_only", "restricted"}:
+        recall_sensitivity = "high"
+    else:
+        recall_sensitivity = "medium"
+    return {
+        "scene_id": scene_id,
+        "surface": surface,
+        "urgency": urgency,
+        "sensitivity": recall_sensitivity,
+    }
+
+
+def _privacy_safe_memory_recall_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(trace, dict):
+        return {"status": "privacy_suppressed"}
+    recall = trace.get("recall") if isinstance(trace.get("recall"), dict) else {}
+    episodes = trace.get("episodes") if isinstance(trace.get("episodes"), dict) else {}
+    dependency = trace.get("dependency") if isinstance(trace.get("dependency"), dict) else {}
+    return {
+        "status": trace.get("status", "composed"),
+        "privacy_suppressed": True,
+        "provider_context_included": False,
+        "recall": {
+            "candidate_count": recall.get("candidate_count", 0),
+            "decision_count": recall.get("decision_count", 0),
+            "suppressed_count": len(recall.get("suppressed_ids") or []),
+            "strategy_counts": recall.get("strategy_counts", {}),
+        },
+        "episodes": {
+            "decision_count": episodes.get("decision_count", 0),
+            "prompt_eligible_count": episodes.get("prompt_eligible_count", 0),
+        },
+        "dependency": {
+            "recall_status": dependency.get("recall_status"),
+            "episode_status": dependency.get("episode_status"),
+        },
+        "omission_count": trace.get("omission_count", 0),
+        "final_callback_applied": trace.get("final_callback_applied"),
+    }
+
+
+def _privacy_safe_brief_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    safe = {
+        key: value
+        for key, value in metadata.items()
+        if key not in {"raw_model_answer", "shaped_answer"}
+    }
+    grounding = safe.get("grounding")
+    if isinstance(grounding, dict):
+        safe["grounding"] = {
+            "source_count": grounding.get("source_count", 0),
+            "uncertainty_count": grounding.get("uncertainty_count", 0),
+            "omission_count": grounding.get("omission_count", 0),
+            "conflict_count": grounding.get("conflict_count", 0),
+            "privacy_suppressed": True,
+        }
+    return safe
 
 
 SAFE_DOCTRINE_CODE = re.compile(r"^[a-z0-9_.:-]{1,120}$")
@@ -1945,14 +2037,8 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         "provider_fallback_context": trace.get("provider_fallback_context", {}),
         "result_boundary": trace.get("result_boundary", {}),
         "token_accounting": {
-            "status": (
-                "estimated"
-                if prompt_budget
-                else "estimate_unavailable"
-            ),
-            "budget_enforcement": (
-                "enforced" if prompt_budget else "not_enforced"
-            ),
+            "status": ("estimated" if prompt_budget else "estimate_unavailable"),
+            "budget_enforcement": ("enforced" if prompt_budget else "not_enforced"),
         },
         "prompt_budget": prompt_budget,
     }
@@ -4342,9 +4428,7 @@ async def orchestrate_chat(
                 ),
             }
             if persona_containment_enabled:
-                retrieve_bundle_kwargs["containment_policy"] = (
-                    mandatory_policy.containment_policy
-                )
+                retrieve_bundle_kwargs["containment_policy"] = mandatory_policy.containment_policy
             else:
                 if retrieval_boundary.allowed_memory_domains is not None:
                     retrieve_bundle_kwargs["allowed_memory_domains"] = (
@@ -4430,6 +4514,63 @@ async def orchestrate_chat(
             surface=surface,
             requested_scene=payload.get("requested_scene"),
         )
+        recall_context = _recall_context(
+            surface=surface,
+            sensitivity=effective_payload.get("sensitivity", "private"),
+            requested_scene=payload.get("requested_scene"),
+            interaction_governance=interaction_governance,
+            companion_trace=companion_trace,
+        )
+        recall_response = None
+        episode_response = None
+        memory_recall_dependency_trace: dict[str, Any] = {
+            "recall_status": "not_requested",
+            "episode_status": "not_requested",
+        }
+        recall_candidates = build_recall_candidates(retrieval_bundle)
+        if recall_candidates and hasattr(memory_store, "select_recall"):
+            try:
+                recall_response = await memory_store.select_recall(
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    context=recall_context,
+                    candidates=recall_candidates,
+                )
+                memory_recall_dependency_trace["recall_status"] = "included"
+            except Exception:
+                recall_response = None
+                memory_recall_dependency_trace["recall_status"] = "dependency_unavailable"
+                memory_recall_dependency_trace["recall_failure_policy"] = (
+                    "no_additional_recall_context"
+                )
+        elif recall_candidates:
+            memory_recall_dependency_trace["recall_status"] = "client_unavailable"
+        if hasattr(memory_store, "retrieve_episode_callbacks"):
+            try:
+                episode_response = await memory_store.retrieve_episode_callbacks(
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    context=recall_context,
+                    limit=10,
+                )
+                memory_recall_dependency_trace["episode_status"] = "included"
+            except Exception:
+                episode_response = None
+                memory_recall_dependency_trace["episode_status"] = "dependency_unavailable"
+                memory_recall_dependency_trace["episode_failure_policy"] = "no_episode_callbacks"
+        else:
+            memory_recall_dependency_trace["episode_status"] = "client_unavailable"
+        memory_recall_composition = compose_memory_recall_context(
+            retrieval_bundle=retrieval_bundle,
+            recall_response=recall_response,
+            episode_response=episode_response,
+        )
+        retrieval_bundle = memory_recall_composition.retrieval_bundle
+        memory_recall_trace = {
+            **memory_recall_composition.trace,
+            "dependency": memory_recall_dependency_trace,
+            "context": recall_context,
+        }
         interrupt_trace = await _resolve_interrupt_policy(
             runtime=runtime,
             interrupt_policy_mode=interrupt_policy_mode,
@@ -4496,15 +4637,25 @@ async def orchestrate_chat(
             world_state=world_state,
             relationship_context=relationship_context,
         )
+        privacy_prompt_suppressed = privacy_context_enabled and privacy_policy_requires_suppression(
+            privacy_context
+        )
         provider_retrieval_bundle = (
             _empty_retrieval_bundle(
                 request_id=request_id,
                 conversation_id=conversation_id,
                 reason="privacy_prompt_suppression",
             )
-            if privacy_context_enabled
-            and privacy_policy_requires_suppression(privacy_context)
+            if privacy_prompt_suppressed
             else retrieval_bundle
+        )
+        provider_memory_recall_messages = (
+            [] if privacy_prompt_suppressed else memory_recall_composition.prompt_messages
+        )
+        provider_memory_recall_trace = (
+            _privacy_safe_memory_recall_trace(memory_recall_trace)
+            if privacy_prompt_suppressed
+            else memory_recall_trace
         )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
@@ -4573,6 +4724,7 @@ async def orchestrate_chat(
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
                         "dsa": dsa_trace,
+                        "memory_episode_recall_composition": provider_memory_recall_trace,
                     },
                     surface_presence_trace=surface_presence_trace,
                     dsa_trace=dsa_trace,
@@ -4607,20 +4759,21 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
-        capability_descriptors, capability_exposure_trace = (
-            await filter_capability_descriptors_for_exposure(
-                runtime=runtime,
-                request_id=request_id,
-                owner_id=payload["owner_id"],
-                conversation_id=conversation_id,
-                surface=surface,
-                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-                active_persona_id=runtime_identity_trace.get("active_persona_id"),
-                selected_relationship_ids=_selected_relationship_ids_from_trace(
-                    relationship_context_trace
-                ),
-            )
+        (
+            capability_descriptors,
+            capability_exposure_trace,
+        ) = await filter_capability_descriptors_for_exposure(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            selected_relationship_ids=_selected_relationship_ids_from_trace(
+                relationship_context_trace
+            ),
         )
 
         handoff = build_assistant_handoff(
@@ -4687,6 +4840,8 @@ async def orchestrate_chat(
                 interrupt_trace=interrupt_trace,
                 external_context_pack=external_context_pack,
                 dsa_trace=dsa_trace,
+                memory_recall_messages=provider_memory_recall_messages,
+                memory_recall_trace=provider_memory_recall_trace,
                 prompt_budget_contract=PromptBudgetContract(
                     attempts=provider_attempt_plan,
                     output_token_reserve=prompt_output_token_reserve,
@@ -4729,6 +4884,7 @@ async def orchestrate_chat(
                 "relationship_context": relationship_context_trace,
                 "runtime": runtime_trace,
                 "dsa": dsa_trace,
+                "memory_episode_recall_composition": provider_memory_recall_trace,
                 "message_count": 0,
             }
             await _create_error_trace(
@@ -4783,9 +4939,7 @@ async def orchestrate_chat(
             },
             "follow_up": _capability_follow_up_empty_trace(),
             "fallback": _capability_fallback_trace(
-                descriptor_fingerprint_value=capability_exposure_trace.get(
-                    "descriptor_fingerprint"
-                )
+                descriptor_fingerprint_value=capability_exposure_trace.get("descriptor_fingerprint")
             ),
             "dispatch_completed": False,
             "executor_call_count": 0,
@@ -5037,9 +5191,7 @@ async def orchestrate_chat(
                 else:
                     raw_answer = execution_result.response_text
             else:
-                prompt.trace["capabilities"]["follow_up"] = (
-                    _capability_follow_up_empty_trace()
-                )
+                prompt.trace["capabilities"]["follow_up"] = _capability_follow_up_empty_trace()
                 prompt.trace["capabilities"]["dispatch_completed"] = False
                 prompt.trace["capabilities"]["executor_call_count"] = 0
         except CapabilityValidationError as exc:
@@ -5082,6 +5234,13 @@ async def orchestrate_chat(
         prompt.trace["response_review"] = response_review.to_trace()
         prompt.trace["response_action"] = response_action.to_trace()
         candidate_answer = response_action.candidate_text
+        if memory_recall_composition.explicit_callbacks and not privacy_prompt_suppressed:
+            callback_text = memory_recall_composition.explicit_callbacks[0]
+            if callback_text and callback_text not in candidate_answer:
+                candidate_answer = f"{callback_text}\n\n{candidate_answer}"
+            prompt.trace["memory_episode_recall_composition"]["final_callback_applied"] = True
+        else:
+            prompt.trace["memory_episode_recall_composition"]["final_callback_applied"] = False
         answer = candidate_answer
         brief_metadata = {"enabled": False}
         if effective_payload.get("response_mode") == "brief":
@@ -5092,6 +5251,7 @@ async def orchestrate_chat(
                 surface=effective_payload.get("surface", payload.get("surface", "chat")),
                 source="explicit_user_request",
                 explicit_request=True,
+                grounding=memory_recall_composition.brief_grounding,
             )
             answer = brief_result.rendered
             brief_metadata = {
@@ -5140,11 +5300,7 @@ async def orchestrate_chat(
         if privacy_boundary.enforced:
             answer_sources = []
             if brief_metadata.get("enabled") is True:
-                brief_metadata = {
-                    key: value
-                    for key, value in brief_metadata.items()
-                    if key not in {"raw_model_answer", "shaped_answer"}
-                }
+                brief_metadata = _privacy_safe_brief_metadata(brief_metadata)
                 brief_metadata["text_suppressed"] = True
         prompt.trace["privacy_context"] = {
             **prompt.trace.get("privacy_context", privacy_context_trace),
@@ -5213,6 +5369,17 @@ async def orchestrate_chat(
         )
         if privacy_boundary.enforced and isinstance(persisted_prompt_trace, dict):
             persisted_prompt_trace.pop("retained_source_ids", None)
+            persisted_prompt_trace["memory_episode_recall_composition"] = (
+                _privacy_safe_memory_recall_trace(
+                    persisted_prompt_trace.get("memory_episode_recall_composition")
+                )
+            )
+            for layer in persisted_prompt_trace.get("layers") or []:
+                if (
+                    isinstance(layer, dict)
+                    and layer.get("name") == "memory_episode_recall_composition"
+                ):
+                    layer["metadata"] = _privacy_safe_memory_recall_trace(layer.get("metadata"))
             prompt_budget = persisted_prompt_trace.get("prompt_budget")
             if isinstance(prompt_budget, dict):
                 prompt_budget.pop("retained_source_ids", None)

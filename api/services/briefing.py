@@ -231,9 +231,7 @@ class DepthExpander:
     def render(self, brief: BriefSchema, *, brief_type: str, depth_level: int) -> str:
         labels = STATUS_TEMPLATE_LIBRARY.get(brief_type, STATUS_TEMPLATE_LIBRARY["general"])
         lead = (
-            brief.net_assessment
-            or brief.status
-            or "No clear conclusion available from the input."
+            brief.net_assessment or brief.status or "No clear conclusion available from the input."
         )
 
         if depth_level == 0:
@@ -304,6 +302,7 @@ def generate_brief(
     surface: str = "chat",
     source: BriefSource = "explicit_user_request",
     explicit_request: bool = True,
+    grounding: dict[str, Any] | None = None,
 ) -> BriefResult:
     selected_type = brief_type if brief_type in VALID_BRIEF_TYPES else "general"
     selected_depth = min(max(int(depth_level), 0), 3)
@@ -315,6 +314,31 @@ def generate_brief(
         brief_type=selected_type,
         depth_level=selected_depth,
     )
+    grounding = grounding if isinstance(grounding, dict) else {}
+    if grounding:
+        additions: list[str] = []
+        sources = grounding.get("sources") if isinstance(grounding.get("sources"), list) else []
+        uncertainty = (
+            grounding.get("uncertainty") if isinstance(grounding.get("uncertainty"), list) else []
+        )
+        omissions = (
+            grounding.get("omissions") if isinstance(grounding.get("omissions"), list) else []
+        )
+        conflicts = (
+            grounding.get("conflicts") if isinstance(grounding.get("conflicts"), list) else []
+        )
+        if sources:
+            kinds = sorted({str(item.get("kind")) for item in sources if isinstance(item, dict)})
+            additions.append(f"Grounding: {len(sources)} source refs ({', '.join(kinds[:4])}).")
+        if uncertainty or conflicts:
+            additions.append(
+                "Uncertainty: source freshness, conflict, or confidence needs qualification."
+            )
+        if omissions:
+            additions.append(f"Omissions: {len(omissions)} source(s) omitted or suppressed.")
+        if additions:
+            expanded = f"{expanded}\n" + "\n".join(additions)
+
     rendered, formatter = SurfaceFormatter().format(expanded, surface=selected_surface)
     debug = {
         "enabled": True,
@@ -325,5 +349,17 @@ def generate_brief(
         "compression_ratio": _compression_ratio(content, rendered),
         "source": source,
         "explicit_request": explicit_request,
+        "grounding": {
+            "source_count": len(grounding.get("sources") or []),
+            "uncertainty_count": len(grounding.get("uncertainty") or []),
+            "omission_count": len(grounding.get("omissions") or []),
+            "conflict_count": len(grounding.get("conflicts") or []),
+            "sources": grounding.get("sources", [])[:20],
+            "uncertainty": grounding.get("uncertainty", [])[:12],
+            "omissions": grounding.get("omissions", [])[:20],
+            "conflicts": grounding.get("conflicts", [])[:12],
+        }
+        if grounding
+        else {"source_count": 0, "uncertainty_count": 0, "omission_count": 0, "conflict_count": 0},
     }
     return BriefResult(rendered=rendered, brief=brief, debug=debug)

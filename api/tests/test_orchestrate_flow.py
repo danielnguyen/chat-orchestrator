@@ -254,9 +254,7 @@ class Wave2EMemoryStore(FakeMemoryStore):
                         ],
                         "raw_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-RAW-ID"],
                         "augmented_result_ids": ["PRIVATE-DIAGNOSTIC-SENTINEL-AUG-ID"],
-                        "comparison": {
-                            "private": "PRIVATE-DIAGNOSTIC-SENTINEL-COMPARISON"
-                        },
+                        "comparison": {"private": "PRIVATE-DIAGNOSTIC-SENTINEL-COMPARISON"},
                         "query": "PRIVATE-DIAGNOSTIC-SENTINEL-QUERY",
                         "error": "PRIVATE-DIAGNOSTIC-SENTINEL-ERROR",
                         "provenance_summary": {
@@ -804,9 +802,7 @@ class CapabilityRuntime(FakeRuntime):
         if isinstance(decision, list):
             decision = decision.pop(0)
         selected_relationship_ids = kwargs.get("selected_relationship_ids") or []
-        requires_relationship = (
-            kwargs["capability_id"] == "runtime.relationship_context.read"
-        )
+        requires_relationship = kwargs["capability_id"] == "runtime.relationship_context.read"
         allowed = decision.get("allowed", False)
         reason_codes = decision.get("reason_codes", ["authorization_denied"])
         decision_code = decision.get("decision_code", "authorization_denied")
@@ -1098,6 +1094,84 @@ class BundledMemoryStore(FakeMemoryStore):
     async def retrieve_bundle(self, **kwargs):
         self.retrieve_calls.append(kwargs)
         return self.bundle
+
+
+class MemoryRecallPrivacyMemoryStore(FakeMemoryStore):
+    memory_text = "WAVE4_PRIVATE_MEMORY_TEXT"
+    episode_text = "WAVE4_PRIVATE_EPISODE_TEXT"
+
+    async def retrieve_bundle(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "bundle": {
+                "recent": [],
+                "semantic": [
+                    {
+                        "owner_id": "owner",
+                        "conversation_id": kwargs["conversation_id"],
+                        "message_id": "wave4-private-message",
+                        "memory_id": "wave4-private-memory",
+                        "created_at": "2026-07-06T00:00:00+00:00",
+                        "role": "assistant",
+                        "content": self.memory_text,
+                        "score": 0.95,
+                        "salience_score": 0.95,
+                        "promotion_state": "promoted",
+                        "source_ref": {
+                            "ref_type": "memory_item",
+                            "ref_id": "wave4-private-memory",
+                        },
+                    }
+                ],
+                "artifact_refs": [],
+                "observed_metadata": {"has_code_like_content": False},
+            },
+        }
+
+    async def select_recall(self, **kwargs):
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "decision_count": 1,
+            "decisions": [
+                {
+                    "candidate_id": "wave4-private-memory",
+                    "candidate_type": "memory_item",
+                    "decision": "mention",
+                    "mention_strategy": "light_callback",
+                    "prompt_eligible": True,
+                    "reason": {"rule_id": "light_callback_allowed"},
+                }
+            ],
+        }
+
+    async def retrieve_episode_callbacks(self, **kwargs):
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "decision_count": 1,
+            "decisions": [
+                {
+                    "episode_id": "wave4-private-episode",
+                    "decision": "include",
+                    "callback_strategy": "explicit_callback",
+                    "callback_score": 0.95,
+                    "prompt_eligible": True,
+                    "reasons": ["useful_continuity"],
+                    "episode": {
+                        "episode_id": "wave4-private-episode",
+                        "title": "Private episode",
+                        "summary": self.episode_text,
+                        "episode_type": "successful_mitigation",
+                        "source_refs": [
+                            {"ref_type": "message", "ref_id": "wave4-private-episode-message"}
+                        ],
+                    },
+                }
+            ],
+        }
 
 
 def _write_router_files(tmp_path):
@@ -1885,8 +1959,7 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
         "excluded_claim_summaries": [{"world_state_claim_id": "wsclaim_2"}],
         "prompt_content": (
-            'World state:\n- active_repository/branch_status: {"branch": "main"} '
-            "(fresh)"
+            'World state:\n- active_repository/branch_status: {"branch": "main"} ' "(fresh)"
         ),
         "trace": {
             "active_persona_id": "technical_architect",
@@ -2238,8 +2311,7 @@ async def test_orchestrate_relationship_context_layer_order_when_all_relevant_la
         "included_claims": [{"world_state_claim_id": "wsclaim_1"}],
         "excluded_claim_summaries": [],
         "prompt_content": (
-            'World state:\n- active_repository/branch_status: {"branch": "main"} '
-            "(fresh)"
+            'World state:\n- active_repository/branch_status: {"branch": "main"} ' "(fresh)"
         ),
         "trace": {
             "active_persona_id": "technical_architect",
@@ -2532,9 +2604,7 @@ async def test_orchestrate_persona_containment_and_restraint_run_before_retrieva
     assert runtime.call_order.index("persona_containment") < runtime.call_order.index(
         "relationship_context"
     )
-    assert runtime.call_order.index("relationship_context") < runtime.call_order.index(
-        "restraint"
-    )
+    assert runtime.call_order.index("relationship_context") < runtime.call_order.index("restraint")
     assert runtime.call_order.index("restraint") < runtime.call_order.index("start_turn")
     assert runtime.call_order.index("start_turn") < runtime.call_order.index("retrieval_bundle")
     assert runtime.call_order.index("retrieval_bundle") < runtime.call_order.index(
@@ -2664,14 +2734,10 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
     }
     assert persona_trace["artifact_request_status"] == "mandatory_policy_forwarded"
     assert (
-        persona_trace["artifact_request_reason"]
-        == "artifact_search_governed_by_mandatory_policy"
+        persona_trace["artifact_request_reason"] == "artifact_search_governed_by_mandatory_policy"
     )
     assert persona_trace["artifact_result_status"] == "validated"
-    assert (
-        persona_trace["artifact_result_reason"]
-        == "mandatory_artifact_result_boundary_applied"
-    )
+    assert persona_trace["artifact_result_reason"] == "mandatory_artifact_result_boundary_applied"
     result_boundary = trace_payload["retrieval"]["prompt_assembly"]["result_boundary"]
     assert result_boundary["validation_status"] == "filtered"
     assert result_boundary["retained_counts"] == {
@@ -2747,17 +2813,13 @@ async def test_wave3b_mandatory_artifact_policy_omits_ineligible_artifact_truthf
     ]
     assert persona_trace["artifact_request_status"] == "mandatory_policy_forwarded"
     assert (
-        persona_trace["artifact_request_reason"]
-        == "artifact_search_governed_by_mandatory_policy"
+        persona_trace["artifact_request_reason"] == "artifact_search_governed_by_mandatory_policy"
     )
     assert persona_trace["artifact_result_status"] == "validated"
-    assert (
-        persona_trace["artifact_result_reason"]
-        == "mandatory_artifact_result_boundary_applied"
-    )
-    result_boundary = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["result_boundary"]
+    assert persona_trace["artifact_result_reason"] == "mandatory_artifact_result_boundary_applied"
+    result_boundary = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "result_boundary"
+    ]
     assert result_boundary["artifact_policy_applied"] is True
     assert result_boundary["retained_counts"]["artifact_refs"] == 0
     assert result_boundary["omission_counts_by_reason"]["memory_domain_not_allowed"] == 1
@@ -2921,9 +2983,7 @@ async def test_wave3b_relationship_trace_preserves_bounded_exclusions_without_br
         "trace": {
             "relationship_edges_used": ["rel_project"],
             "relationship_edges_excluded": ["rel_blocked"],
-            "relationship_exclusion_reasons": {
-                "rel_blocked": "blocked_for_active_persona"
-            },
+            "relationship_exclusion_reasons": {"rel_blocked": "blocked_for_active_persona"},
             "relationship_context_overlay_applied": False,
             "relationship_conflicts": ["relationship_scope_conflict"],
             "relationship_confirmation_required": True,
@@ -2978,9 +3038,12 @@ async def test_wave3b_relationship_trace_preserves_bounded_exclusions_without_br
         "relationship_scopes": ["project_context"],
         "reason_codes": ["eligible_relationship_scope_selected"],
     }
-    assert "rel_blocked" not in prompt_trace["retrieval_dispatch"][
-        "relationship_scope_projection"
-    ]["relationship_ids"]
+    assert (
+        "rel_blocked"
+        not in prompt_trace["retrieval_dispatch"]["relationship_scope_projection"][
+            "relationship_ids"
+        ]
+    )
     relationship_trace = prompt_trace["relationship_context"]
     assert relationship_trace["relationship_edges_used"] == ["rel_project"]
     assert relationship_trace["relationship_edges_excluded"] == ["rel_blocked"]
@@ -3031,9 +3094,9 @@ async def test_wave3b_relationship_trace_keeps_empty_exclusions_when_none_return
         request_id="rid-wave3b-relationship-empty-exclusions",
     )
 
-    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["relationship_context"]
+    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "relationship_context"
+    ]
     assert relationship_trace["relationship_edges_excluded"] == []
     assert relationship_trace["relationship_exclusion_reasons"] == {}
     assert relationship_trace["relationship_conflicts"] == []
@@ -4151,9 +4214,7 @@ async def test_wave3b_restraint_suppression_produces_zero_bms_calls(
     assert persona_trace["artifact_result_reason"] == expected_reason
     assert prompt_trace["result_boundary"]["artifact_policy_applied"] is False
     assert prompt_trace["result_boundary"]["validation_status"] == "not_applied"
-    doctrine = memory_store.trace_calls[0]["payload"]["retrieval"]["bundle"][
-        "doctrine_summary"
-    ]
+    doctrine = memory_store.trace_calls[0]["payload"]["retrieval"]["bundle"]["doctrine_summary"]
     assert doctrine == {"diagnostics_status": "absent"}
     retrieval_bundle = memory_store.trace_calls[0]["payload"]["retrieval"]["bundle"]
     assert retrieval_bundle["recent_count"] == 0
@@ -4436,9 +4497,9 @@ async def test_wave3b_malformed_relationship_projection_drops_private_prompt_tex
     assert trace["suppression_or_dependency_reason"] == (
         "contradictory_unapplied_relationship_scope_projection"
     )
-    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["relationship_context"]
+    relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "relationship_context"
+    ]
     assert relationship_trace["status"] == "failed"
     assert relationship_trace["relationship_id_count"] == 0
 
@@ -4619,10 +4680,7 @@ async def test_wave3b_disabled_containment_preserves_legacy_request_and_persiste
     assert persona_trace["artifact_request_status"] == "not_enforced"
     assert persona_trace["artifact_request_reason"] == "artifact_request_not_enforced"
     assert persona_trace["artifact_result_status"] == "not_applied"
-    assert (
-        persona_trace["artifact_result_reason"]
-        == "artifact_result_suppression_not_applied"
-    )
+    assert persona_trace["artifact_result_reason"] == "artifact_result_suppression_not_applied"
 
 
 @pytest.mark.asyncio
@@ -9010,9 +9068,7 @@ async def test_orchestrate_executes_world_state_read_after_selection_and_dispatc
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
     ]
     assert execute_calls[0]["requested_domains"] == ["active_repository"]
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["executor_called"] is True
     assert trace["execution"]["executor_call_count"] == 1
     assert trace["execution"]["executor_result_status"] == "ok"
@@ -9076,9 +9132,7 @@ async def test_orchestrate_revalidates_then_executes_world_state_read(tmp_path):
     ]
     assert phases == ["exposure", "selection", "selection", "dispatch"]
     assert len(runtime.world_state_verification_calls) == 1
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["revalidation"]["status"] == "verified"
     assert trace["execution"]["executor_called"] is True
     assert trace["execution"]["executor_call_count"] == 1
@@ -9117,9 +9171,7 @@ async def test_orchestrate_executes_local_unsent_draft_after_selection_and_dispa
     assert [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
     ] == []
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["executor_called"] is True
     assert trace["execution"]["executor_call_count"] == 1
     assert trace["execution"]["executor_result"]["local"] is True
@@ -9147,13 +9199,12 @@ async def test_orchestrate_hides_relationship_gated_descriptor_without_context(t
 
     tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
     assert "runtime_relationship_context_read" not in tool_names
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert "runtime.relationship_context.read" in trace["exposure"]["blocked_capability_ids"]
-    assert trace["exposure"]["blocked_reasons"][
-        "runtime.relationship_context.read"
-    ] == "missing_relationship_context"
+    assert (
+        trace["exposure"]["blocked_reasons"]["runtime.relationship_context.read"]
+        == "missing_relationship_context"
+    )
 
 
 @pytest.mark.asyncio
@@ -9180,8 +9231,7 @@ async def test_orchestrate_exposes_and_dispatches_relationship_gated_capability(
     )
 
     assert out["answer"] == (
-        "I read bounded project relationship context and found 1 authorized "
-        "relationship(s)."
+        "I read bounded project relationship context and found 1 authorized " "relationship(s)."
     )
     tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
     assert "runtime_relationship_context_read" in tool_names
@@ -9197,15 +9247,9 @@ async def test_orchestrate_exposes_and_dispatches_relationship_gated_capability(
     assert len(relationship_calls) == 1
     assert relationship_calls[0]["requested_scopes"] == ["project_context"]
     assert relationship_calls[0]["relationship_types"] == ["works_on"]
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
-    assert trace["execution"]["authorization"]["selection"]["relationship_ids"] == [
-        "rel_project"
-    ]
-    assert trace["execution"]["authorization"]["dispatch"]["relationship_ids"] == [
-        "rel_project"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
+    assert trace["execution"]["authorization"]["selection"]["relationship_ids"] == ["rel_project"]
+    assert trace["execution"]["authorization"]["dispatch"]["relationship_ids"] == ["rel_project"]
     assert trace["execution"]["executor_result"]["relationship_ids"] == ["rel_project"]
 
 
@@ -9232,9 +9276,7 @@ async def test_orchestrate_hidden_relationship_gated_call_is_rejected_before_exe
     )
 
     assert out["answer"] == "I could not use that capability request safely."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["validation"]["reason_code"] == "capability_not_exposed"
     assert trace["execution"]["executor_called"] is False
     assert trace["execution"]["executor_call_count"] == 0
@@ -9295,9 +9337,7 @@ async def test_orchestrate_relationship_selection_denial_is_zero_executor(
     )
 
     assert out["answer"] == "I could not use that capability request safely."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["authorization"]["selection"]["reason_codes"] == [reason_code]
     assert trace["execution"]["executor_called"] is False
     assert trace["execution"]["executor_call_count"] == 0
@@ -9366,9 +9406,7 @@ async def test_orchestrate_revalidates_then_executes_local_unsent_draft(tmp_path
     ]
     assert phases == ["exposure", "selection", "selection", "dispatch"]
     assert len(runtime.world_state_verification_calls) == 1
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["revalidation"]["status"] == "verified"
     assert trace["execution"]["executor_result"]["local"] is True
     assert trace["execution"]["executor_result"]["sent"] is False
@@ -9413,9 +9451,7 @@ async def test_orchestrate_dispatch_denial_is_zero_executor(tmp_path):
     )
 
     assert out["answer"] == "I could not use that capability request safely."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["authorization"]["dispatch"]["status"] == "authorization_denied"
     assert trace["execution"]["executor_called"] is False
     assert trace["execution"]["executor_call_count"] == 0
@@ -9442,7 +9478,7 @@ async def test_orchestrate_invalid_provider_capability_request_is_zero_executor(
                                 {
                                     "function": {
                                         "name": "draft_local_message",
-                                        "arguments": "{\"body\":\"one\"}",
+                                        "arguments": '{"body":"one"}',
                                     }
                                 },
                                 {
@@ -9465,9 +9501,7 @@ async def test_orchestrate_invalid_provider_capability_request_is_zero_executor(
     )
 
     assert out["answer"] == "I could not use that capability request safely."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["validation"]["reason_code"] == "multiple_capability_calls"
     assert trace["execution"]["executor_called"] is False
     assert trace["execution"]["executor_call_count"] == 0
@@ -9503,9 +9537,7 @@ async def test_orchestrate_local_draft_uses_one_provider_follow_up_without_tools
     assert len(litellm.calls) == 2
     assert "tools" not in litellm.calls[1]
     assert "PRIVATE-DRAFT-BODY" not in json.dumps(litellm.calls[1]["messages"])
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["dispatch_completed"] is True
     assert trace["executor_call_count"] == 1
     assert trace["follow_up"]["status"] == "completed"
@@ -9567,9 +9599,7 @@ async def test_orchestrate_world_state_read_follow_up_gets_bounded_summary_only(
     assert "value_json" not in follow_up_payload
     assert "tools" not in litellm.calls[1]
     assert "included_claim_count" in follow_up_payload
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["follow_up"]["summary"]["result_summary"]["included_claim_count"] == 1
     assert "PRIVATE-WORLD-VALUE" not in json.dumps(trace)
 
@@ -9598,9 +9628,7 @@ async def test_orchestrate_draft_follow_up_cannot_omit_local_unsent_truth(tmp_pa
     )
 
     assert out["answer"] == "Draft ready. It is local and unsent; nothing was sent."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["follow_up"]["call_count"] == 1
 
 
@@ -9631,9 +9659,7 @@ async def test_orchestrate_follow_up_failure_uses_executor_text_without_second_e
 
     assert out["answer"] == "I created a local unsent draft. Nothing was sent."
     assert len(litellm.calls) == 2
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["follow_up"]["status"] == "failed"
     assert trace["follow_up"]["call_count"] == 1
     assert trace["executor_call_count"] == 1
@@ -9656,7 +9682,7 @@ async def test_orchestrate_follow_up_failure_uses_executor_text_without_second_e
                                 {
                                     "function": {
                                         "name": "draft_local_message",
-                                        "arguments": "{\"body\":\"one\"}",
+                                        "arguments": '{"body":"one"}',
                                     }
                                 },
                                 {
@@ -9701,9 +9727,7 @@ async def test_orchestrate_follow_up_tool_calls_are_blocked_without_executor_rep
     )
 
     assert out["answer"] == "I created a local unsent draft. Nothing was sent."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["follow_up"]["status"] == "recursive_tool_call_blocked"
     assert trace["follow_up"]["reason_code"] == reason_code
     assert trace["follow_up"]["call_count"] == 1
@@ -9747,9 +9771,7 @@ async def test_orchestrate_primary_failure_fallback_uses_same_descriptors_and_ca
         if call["capability_id"] == "draft.local_message"
     ]
     assert phases == ["exposure", "selection", "dispatch"]
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["fallback"]["same_descriptor_fingerprint"] is True
     assert trace["fallback"]["blocked_after_dispatch"] is True
     assert trace["dispatch_completed"] is True
@@ -9786,14 +9808,11 @@ async def test_orchestrate_relationship_fallback_reuses_same_filtered_descriptor
 
     assert out["status"] == "degraded"
     assert out["answer"] == (
-        "I read bounded project relationship context and found 1 authorized "
-        "relationship(s)."
+        "I read bounded project relationship context and found 1 authorized " "relationship(s)."
     )
     assert len(litellm.calls) == 3
     assert litellm.calls[0]["tools"] == litellm.calls[1]["tools"]
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["fallback"]["same_descriptor_fingerprint"] is True
     assert trace["fallback"]["blocked_after_dispatch"] is True
     assert trace["dispatch_completed"] is True
@@ -9827,8 +9846,7 @@ async def test_orchestrate_relationship_completed_dispatch_blocks_fallback_repla
     )
 
     assert out["answer"] == (
-        "I read bounded project relationship context and found 1 authorized "
-        "relationship(s)."
+        "I read bounded project relationship context and found 1 authorized " "relationship(s)."
     )
     assert len(litellm.calls) == 2
     trace_payload = memory_store.trace_calls[0]["payload"]
@@ -9885,7 +9903,7 @@ async def test_orchestrate_validation_failure_does_not_invoke_fallback_retry(tmp
                                 {
                                     "function": {
                                         "name": "draft_local_message",
-                                        "arguments": "{\"body\":\"one\"}",
+                                        "arguments": '{"body":"one"}',
                                     }
                                 },
                                 {
@@ -9916,9 +9934,7 @@ async def test_orchestrate_validation_failure_does_not_invoke_fallback_retry(tmp
 
     assert out["answer"] == "I could not use that capability request safely."
     assert len(litellm.calls) == 1
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["validation"]["reason_code"] == "multiple_capability_calls"
     assert trace["executor_call_count"] == 0
     assert trace["follow_up"]["status"] == "not_attempted"
@@ -10011,9 +10027,7 @@ async def test_orchestrate_blocked_capability_paths_do_not_invoke_fallback_retry
     )
 
     assert len(litellm.calls) == 1
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["failure_reason_code"] == expected_reason
     assert trace["executor_call_count"] == 0
     assert trace["follow_up"]["status"] == "not_attempted"
@@ -10062,9 +10076,7 @@ async def test_orchestrate_executor_failure_does_not_fabricate_success_or_fallba
 
     assert out["answer"] == "I could not complete that capability request."
     assert len(litellm.calls) == 1
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     assert trace["execution"]["response_status"] == "executor_failed"
     assert trace["executor_call_count"] == 1
     assert trace["follow_up"]["status"] == "not_attempted"
@@ -10094,9 +10106,7 @@ async def test_orchestrate_follow_up_and_fallback_trace_remains_privacy_safe(tmp
         request_id="rid-cap-privacy-safe-trace",
     )
 
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capabilities"
-    ]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
     serialized = json.dumps(trace, sort_keys=True)
     assert "PRIVATE-DRAFT-BODY" not in serialized
     assert "tool_calls" not in serialized
@@ -11698,6 +11708,86 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
     assert trace_payload["model_call"]["brief"]["enabled"] is True
 
 
+@pytest.mark.asyncio
+async def test_orchestrate_privacy_suppresses_wave4_prompt_layer_and_fallback(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: gpt-4o-mini\n"
+        "          provider: cloud\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="voice_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            voice_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        )
+    )
+    memory_store = MemoryRecallPrivacyMemoryStore()
+    litellm = FakeLiteLLM(fail_first=True, content="provider answer")
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface_context={"surface_category": "voice_private"},
+            messages=[{"role": "user", "content": "Use the private callback."}],
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-wave4-privacy-fallback",
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "Sensitive details are withheld from voice output."
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
+    provider_messages = json.dumps(litellm.calls, sort_keys=True)
+    assert MemoryRecallPrivacyMemoryStore.memory_text not in provider_messages
+    assert MemoryRecallPrivacyMemoryStore.episode_text not in provider_messages
+
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
+    memory_recall_trace = prompt_trace["memory_episode_recall_composition"]
+    assert memory_recall_trace["privacy_suppressed"] is True
+    assert memory_recall_trace["provider_context_included"] is False
+    assert memory_recall_trace["recall"]["decision_count"] == 1
+    assert memory_recall_trace["episodes"]["prompt_eligible_count"] == 1
+    assert memory_recall_trace["final_callback_applied"] is False
+    memory_recall_layer = next(
+        layer
+        for layer in prompt_trace["layers"]
+        if layer["name"] == "memory_episode_recall_composition"
+    )
+    assert memory_recall_layer["included"] is False
+    assert memory_recall_layer["metadata"]["privacy_suppressed"] is True
+    assert "provider_fallback_context" in prompt_trace
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+    serialized_trace = json.dumps(trace_payload, sort_keys=True)
+    assert MemoryRecallPrivacyMemoryStore.memory_text not in serialized_trace
+    assert MemoryRecallPrivacyMemoryStore.episode_text not in serialized_trace
+
+
 def _privacy_error_bundle(request_id="rid-privacy-error"):
     return {
         "request_id": request_id,
@@ -12841,9 +12931,7 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
     assert source_response["augmented_bundle"]["semantic"][0]["content"] == (
         "PRIVATE-DIAGNOSTIC-SENTINEL-AUG-BUNDLE"
     )
-    assert source_response["comparison"]["private_query"] == (
-        "PRIVATE-DIAGNOSTIC-SENTINEL-QUERY"
-    )
+    assert source_response["comparison"]["private_query"] == ("PRIVATE-DIAGNOSTIC-SENTINEL-QUERY")
     doctrine = trace["retrieval"]["bundle"]["doctrine_summary"]
     assert doctrine == {
         "diagnostics_status": "included",
@@ -13041,9 +13129,10 @@ async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_
     assert model_calls[0]["prompt_fingerprint"] == model_calls[1]["prompt_fingerprint"]
     assert model_calls[0]["prompt_message_count"] == model_calls[1]["prompt_message_count"]
     assert model_calls[0]["prompt_role_sequence"] == model_calls[1]["prompt_role_sequence"]
-    assert model_calls[0]["retained_semantic_message_ids"] == model_calls[1][
-        "retained_semantic_message_ids"
-    ]
+    assert (
+        model_calls[0]["retained_semantic_message_ids"]
+        == model_calls[1]["retained_semantic_message_ids"]
+    )
     assert model_calls[0]["retained_artifact_ids"] == model_calls[1]["retained_artifact_ids"]
     assert model_calls[0]["retained_semantic_message_ids"]
     assert model_calls[0]["retained_artifact_ids"]
