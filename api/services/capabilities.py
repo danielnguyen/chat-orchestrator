@@ -1072,7 +1072,6 @@ async def _confirm_capability_challenge(
         trace.update({"status": "malformed", "reason_code": "malformed_confirmation_response"})
         return _AuthorizationResult(trace)
     state = response.get("confirmation_state")
-    confirmed_ref = response.get("confirmation_challenge_ref")
     if state != "accepted":
         trace.update(
             {
@@ -1081,7 +1080,15 @@ async def _confirm_capability_challenge(
             }
         )
         return _AuthorizationResult(trace)
-    if confirmed_ref != parsed.challenge_ref:
+    expected_response = {
+        "request_id": request_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+        "confirmation_challenge_ref": parsed.challenge_ref,
+    }
+    if not _confirmation_response_matches(response, expected_response):
         trace.update(
             {
                 "status": "malformed",
@@ -1098,6 +1105,16 @@ async def _confirm_capability_challenge(
         }
     )
     return _AuthorizationResult(trace)
+
+
+def _confirmation_response_matches(
+    response: dict[str, Any],
+    expected: dict[str, str],
+) -> bool:
+    for key, value in expected.items():
+        if response.get(key) != value:
+            return False
+    return True
 
 
 def _parse_confirmation_input(

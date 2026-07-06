@@ -763,6 +763,80 @@ async def test_valid_structured_confirmation_calls_cr_then_dispatches_with_confi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("field", "bad_value", "missing"),
+    [
+        ("request_id", "other-request", False),
+        ("owner_id", "other-owner", False),
+        ("conversation_id", "other-conv", False),
+        ("runtime_session_id", "other-session", False),
+        ("runtime_turn_id", "other-turn", False),
+        ("owner_id", None, True),
+    ],
+)
+async def test_cr_confirmation_response_binding_mismatch_is_zero_executor(
+    field,
+    bad_value,
+    missing,
+):
+    validation_result = _validated("draft_local_message", {"body": "PRIVATE RAW BODY"})
+    response = {
+        "request_id": "rid:draft.local_message:confirm",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "confirmation_challenge_ref": "challenge-1",
+        "confirmation_state": "accepted",
+    }
+    if missing:
+        response.pop(field)
+    else:
+        response[field] = bad_value
+    runtime = FakeRuntime(
+        phase_decisions={
+            "selection": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-1",
+            },
+            "dispatch": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+            },
+        },
+        confirmation_response=response,
+    )
+
+    result = await _execute(
+        runtime,
+        validation_result,
+        confirmation={
+            "challenge_ref": "challenge-1",
+            "capability_id": validation_result.capability_id,
+            "argument_digest": validation_result.argument_digest,
+            "confirmed": True,
+            "raw_provider_payload": "PRIVATE RAW BODY",
+            "raw_user_prose": "please confirm PRIVATE RAW BODY",
+        },
+    )
+
+    assert [call["authorization_phase"] for call in runtime.calls] == ["selection"]
+    assert result.trace["confirmation"]["status"] == "malformed"
+    assert result.trace["confirmation"]["reason_code"] == "confirmation_response_mismatch"
+    assert result.trace["executor_called"] is False
+    assert result.trace["executor_call_count"] == 0
+    assert runtime.world_state_calls == []
+    assert len(runtime.confirmation_calls) == 1
+    serialized_trace = json.dumps(result.trace)
+    assert "PRIVATE RAW BODY" not in serialized_trace
+    assert "raw_provider_payload" not in serialized_trace
+    assert "raw_user_prose" not in serialized_trace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("confirmation", "expected_reason"),
     [
         (None, "confirmation_missing"),
