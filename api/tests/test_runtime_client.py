@@ -392,3 +392,163 @@ async def test_evaluate_privacy_context_rejects_invalid_enums():
             sensitivity_level="normal",
             sensitivity_domains=[],
         )
+
+
+@pytest.mark.asyncio
+async def test_authorize_capability_posts_expected_exposure_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"result": {"allowed": True}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.authorize_capability(
+        request_id="rid:cap:exposure",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        active_persona_id="technical_architect",
+        authorization_phase="exposure",
+        capability_id="runtime.world_state.read",
+        capability_domain="software_architecture",
+        operation_class="read",
+        supported_surfaces=["dev", "vscode"],
+    )
+
+    assert calls == [
+        (
+            "/v1/capabilities/authorize",
+            {
+                "request_id": "rid:cap:exposure",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "active_persona_id": "technical_architect",
+                "authorization_phase": "exposure",
+                "capability_id": "runtime.world_state.read",
+                "capability_domain": "software_architecture",
+                "operation_class": "read",
+                "argument_digest": None,
+                "supported_surfaces": ["dev", "vscode"],
+                "relationship_requirements": [],
+                "selected_relationship_ids": [],
+                "world_state_requirements": [],
+                "selected_world_state_claim_ids": [],
+                "confirmation_challenge_ref": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_world_state_claim_verify_posts_expected_structural_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"claim": {"world_state_claim_id": json["world_state_claim_id"]}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.world_state_claim_verify(
+        request_id="rid:verify",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        world_state_claim_id="claim-1",
+        expected_value_digest="wsvalue_claim-1",
+        verifier_id="cr-verifier-local",
+        verification_source_type="tool_output",
+        verification_source_ref="local-deterministic-revalidator",
+        observed_at="2026-07-06T00:00:00+00:00",
+        verified_at="2026-07-06T00:00:01+00:00",
+        resulting_authority="verified_tool_output",
+        resulting_confidence=0.9,
+        resulting_freshness_state="fresh",
+        resulting_ttl_seconds=300,
+        resulting_revalidation_interval_seconds=120,
+    )
+
+    assert calls == [
+        (
+            "/v1/world-state/claims/verify",
+            {
+                "request_id": "rid:verify",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "world_state_claim_id": "claim-1",
+                "expected_value_digest": "wsvalue_claim-1",
+                "verification_source_type": "tool_output",
+                "verification_source_ref": "local-deterministic-revalidator",
+                "observed_at": "2026-07-06T00:00:00+00:00",
+                "verified_at": "2026-07-06T00:00:01+00:00",
+                "resulting_authority": "verified_tool_output",
+                "resulting_confidence": 0.9,
+                "resulting_freshness_state": "fresh",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "verifier_id": "cr-verifier-local",
+                "resulting_ttl_seconds": 300,
+                "resulting_revalidation_interval_seconds": 120,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_confirm_capability_posts_expected_structural_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {
+            "confirmation_challenge_ref": json["confirmation_challenge_ref"],
+            "confirmation_state": "accepted",
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.confirm_capability(
+        request_id="rid:confirm",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        confirmation_challenge_ref="challenge-1",
+        capability_id="draft.local_message",
+        operation_class="draft",
+        argument_digest="capargs_123",
+        confirmed=True,
+    )
+
+    assert calls == [
+        (
+            "/v1/capabilities/confirm",
+            {
+                "request_id": "rid:confirm",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "confirmation_challenge_ref": "challenge-1",
+                "capability_id": "draft.local_message",
+                "operation_class": "draft",
+                "argument_digest": "capargs_123",
+                "confirmed": True,
+            },
+        )
+    ]

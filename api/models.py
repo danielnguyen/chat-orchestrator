@@ -96,6 +96,15 @@ class ExternalContextRequest(BaseModel):
     max_results: Optional[int] = Field(default=None, ge=1, le=20)
 
 
+class CapabilityConfirmationInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    challenge_ref: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    capability_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    argument_digest: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    confirmed: Optional[bool] = None
+
+
 class ChatRequest(BaseModel):
     owner_id: str
     client_id: Optional[str] = None
@@ -114,6 +123,7 @@ class ChatRequest(BaseModel):
     brief_depth: Optional[BriefDepth] = None
     brief_type: BriefType = "general"
     interrupt_policy_mode: InterruptPolicyMode = "off"
+    capability_confirmation: Optional[CapabilityConfirmationInput] = None
 
 
 class ChatResponse(BaseModel):

@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from services.capabilities import (
+    RevalidationOutput,
+    Revalidator,
+    RevalidatorEntry,
+    argument_digest,
+)
 from services.orchestrate import orchestrate_chat
 
 DEFAULT_CORPUS_PATH = (
@@ -573,6 +579,7 @@ class ReplayRuntime:
         self.scenario = scenario
         self.calls = calls
         self.terminal_status: str | None = None
+        self.capability_selection_counts: dict[str, int] = {}
 
     def _record(self, name: str, request_id: str, **details: Any) -> None:
         self.calls.append({"name": name, "request_id": request_id, **details})
@@ -641,13 +648,142 @@ class ReplayRuntime:
     async def world_state_resolve(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_world_state", kwargs["request_id"])
         self._maybe_fail()
+        if str(kwargs["request_id"]).endswith(":execute"):
+            return {
+                "included_claims": [
+                    {
+                        "world_state_claim_id": "claim-wave3c",
+                        "entity_id": "repo-1",
+                        "attribute": "branch",
+                        "domain": "active_repository",
+                        "value_json": "PRIVATE-WAVE3C-WORLD-VALUE",
+                    }
+                ],
+                "excluded_claim_summaries": [{"world_state_claim_id": "claim-hidden"}],
+                "prompt_content": "World state: PRIVATE-WAVE3C-WORLD-VALUE",
+                "trace": {
+                    "included_claim_count": 1,
+                    "excluded_claim_count": 1,
+                    "stale_count": 0,
+                    "aging_count": 0,
+                    "expired_count": 0,
+                    "conflicted_count": 0,
+                    "confirmation_required": False,
+                },
+            }
         return {
             "included_claims": [],
             "prompt_content": None,
             "trace": {
                 "included_claim_count": 0,
                 "excluded_claim_count": 0,
+                "stale_count": 0,
+                "aging_count": 0,
+                "expired_count": 0,
+                "conflicted_count": 0,
+                "confirmation_required": False,
             },
+        }
+
+    async def authorize_capability(self, **kwargs: Any) -> dict[str, Any]:
+        phase = kwargs["authorization_phase"]
+        capability_id = kwargs["capability_id"]
+        self._record(
+            f"cr_capability_{phase}",
+            kwargs["request_id"],
+            capability_id=capability_id,
+            argument_digest_present=kwargs.get("argument_digest") is not None,
+            confirmation_ref_present=kwargs.get("confirmation_challenge_ref") is not None,
+        )
+        mode = self.scenario.get("wave3c_mode")
+        exposure_denied = set(self.scenario.get("wave3c_exposure_denied", []))
+        if phase == "exposure":
+            allowed = capability_id not in exposure_denied
+            return {
+                "result": {
+                    "allowed": allowed,
+                    "decision_code": "allowed" if allowed else "authorization_denied",
+                    "reason_codes": ["allowed" if allowed else "capability_domain_denied"],
+                }
+            }
+        if phase == "selection":
+            count = self.capability_selection_counts.get(capability_id, 0)
+            self.capability_selection_counts[capability_id] = count + 1
+            if mode == "selection_denied":
+                return {
+                    "result": {
+                        "allowed": False,
+                        "decision_code": "authorization_denied",
+                        "reason_codes": ["authorization_denied"],
+                    }
+                }
+            if mode in {"revalidation", "revalidation_failed"} and count == 0:
+                return {
+                    "result": {
+                        "allowed": False,
+                        "decision_code": "revalidation_required",
+                        "reason_codes": ["world_state_revalidation_required"],
+                        "revalidation_selector": {
+                            "revalidator_id": "trusted_refresh",
+                            "world_state_claim_ids": ["claim-wave3c"],
+                        },
+                    }
+                }
+            if mode == "confirmation":
+                return {
+                    "result": {
+                        "allowed": False,
+                        "decision_code": "confirmation_required",
+                        "reason_codes": ["confirmation_required"],
+                        "challenge_ref": "challenge-wave3c",
+                    }
+                }
+        if phase == "dispatch" and mode == "dispatch_denied":
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "authorization_denied",
+                    "reason_codes": ["dispatch_denied"],
+                }
+            }
+        return {
+            "result": {
+                "allowed": True,
+                "decision_code": "allowed",
+                "reason_codes": ["allowed"],
+                "challenge_ref": kwargs.get("confirmation_challenge_ref"),
+            }
+        }
+
+    async def world_state_claim_verify(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_world_state_verify", kwargs["request_id"])
+        if self.scenario.get("wave3c_mode") == "revalidation_failed":
+            raise BoundaryFailure("verification_failed")
+        return {
+            "claim": {
+                "world_state_claim_id": kwargs["world_state_claim_id"],
+                "verification_verifier_id": kwargs["verifier_id"],
+                "verification_source_type": kwargs["verification_source_type"],
+                "verification_source_ref": kwargs["verification_source_ref"],
+                "last_verified_runtime_session_id": kwargs["runtime_session_id"],
+                "last_verified_runtime_turn_id": kwargs["runtime_turn_id"],
+                "state_authority": kwargs["resulting_authority"],
+                "confidence": kwargs["resulting_confidence"],
+                "freshness_state": kwargs["resulting_freshness_state"],
+                "effective_freshness_state": kwargs["resulting_freshness_state"],
+            }
+        }
+
+    async def confirm_capability(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("cr_capability_confirm", kwargs["request_id"])
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs["runtime_turn_id"],
+            "confirmation_challenge_ref": kwargs["confirmation_challenge_ref"],
+            "confirmation_state": "accepted",
         }
 
     async def relationship_select(self, **kwargs: Any) -> dict[str, Any]:
@@ -900,6 +1036,7 @@ class ReplayProvider:
 
     async def chat(self, **kwargs: Any) -> dict[str, Any]:
         messages = kwargs.get("messages") or []
+        tools = kwargs.get("tools") or []
         if self.attempt == 0:
             self.calls.append({"name": "prompt_assembly", "request_id": kwargs["request_id"]})
         self.attempt += 1
@@ -917,6 +1054,8 @@ class ReplayProvider:
                     if isinstance(message, dict)
                 ],
                 "prompt_evidence": _provider_prompt_evidence(messages),
+                "tool_names": _provider_tool_names(tools),
+                "tool_fingerprint": _tool_fingerprint(tools),
                 "has_beta": "Beta"
                 in "\n".join(
                     message.get("content", "") for message in messages if isinstance(message, dict)
@@ -937,6 +1076,49 @@ class ReplayProvider:
                 request=request,
                 response=response,
             )
+        if str(kwargs["request_id"]).endswith(":capability-follow-up"):
+            mode = self.scenario.get("wave3c_mode")
+            if mode == "recursive_follow_up":
+                return _tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+            capability = self.scenario.get("wave3c_capability")
+            if capability == "draft.local_message":
+                return {"choices": [{"message": {"content": "The local unsent draft is ready."}}]}
+            return {"choices": [{"message": {"content": "I found one bounded repository claim."}}]}
+        if self.scenario.get("category") == "wave3c_capability_lifecycle":
+            mode = self.scenario.get("wave3c_mode")
+            if mode == "multiple_call_validation_failure":
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "draft_local_message",
+                                            "arguments": "{\"body\":\"one\"}",
+                                        }
+                                    },
+                                    {
+                                        "function": {
+                                            "name": "runtime_world_state_read",
+                                            "arguments": "{}",
+                                        }
+                                    },
+                                ]
+                            }
+                        }
+                    ]
+                }
+            capability = self.scenario.get("wave3c_capability", "runtime.world_state.read")
+            if capability == "draft.local_message":
+                return _tool_completion(
+                    "draft_local_message",
+                    {"body": "PRIVATE-WAVE3C-DRAFT-BODY", "recipient_label": "reviewer"},
+                )
+            return _tool_completion(
+                "runtime_world_state_read",
+                {"requested_domains": ["active_repository"], "output_mode": "structured"},
+            )
         joined = "\n".join(message.get("content", "") for message in kwargs["messages"])
         if "Current memory evidence:" in joined and "Current plan is Alpha." in joined:
             content = "Current plan is Alpha."
@@ -947,6 +1129,45 @@ class ReplayProvider:
         else:
             content = "neutral response"
         return {"choices": [{"message": {"content": content}}]}
+
+
+def _tool_completion(provider_tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": provider_tool_name,
+                                "arguments": json.dumps(arguments),
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+
+def _provider_tool_names(tools: Any) -> list[str]:
+    if not isinstance(tools, list):
+        return []
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.append(function["name"])
+    return names
+
+
+def _tool_fingerprint(tools: Any) -> str:
+    if not isinstance(tools, list):
+        tools = []
+    payload = json.dumps(tools, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _provider_prompt_evidence(messages: Any) -> dict[str, bool]:
@@ -1024,6 +1245,24 @@ def _payload(scenario: dict[str, Any]) -> dict[str, Any]:
         payload["external_context_enabled"] = bool(scenario.get("external_context_enabled"))
     if isinstance(scenario.get("external_context"), dict):
         payload["external_context"] = scenario["external_context"]
+    if scenario.get("wave3c_mode") == "confirmation":
+        capability = scenario.get("wave3c_capability", "draft.local_message")
+        if capability == "draft.local_message":
+            normalized_args = {
+                "body": "PRIVATE-WAVE3C-DRAFT-BODY",
+                "recipient_label": "reviewer",
+            }
+        else:
+            normalized_args = {
+                "output_mode": "structured",
+                "requested_domains": ["active_repository"],
+            }
+        payload["capability_confirmation"] = {
+            "challenge_ref": "challenge-wave3c",
+            "capability_id": capability,
+            "argument_digest": argument_digest(capability, normalized_args),
+            "confirmed": True,
+        }
     return payload
 
 
@@ -1105,6 +1344,8 @@ def _normalize(
     result_boundary = result_boundary if isinstance(result_boundary, dict) else {}
     persona_containment = raw_prompt.get("persona_containment")
     persona_containment = persona_containment if isinstance(persona_containment, dict) else {}
+    capabilities = raw_prompt.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
     return {
         "schema_version": "orchestration-replay-v1",
         "scenario": scenario["scenario"],
@@ -1118,7 +1359,11 @@ def _normalize(
             "answer_category": _answer_category(result),
         },
         "call_order": [call["name"] for call in calls],
-        "request_ids": [call["request_id"] for call in calls if call.get("request_id") is not None],
+        "request_ids": [
+            str(call["request_id"]).split(":", 1)[0]
+            for call in calls
+            if call.get("request_id") is not None
+        ],
         "trace": {
             "persisted": memory.trace is not None,
             "status": trace.get("status"),
@@ -1246,6 +1491,7 @@ def _normalize(
                     "post_budget_survivor_filter_removed_sources"
                 ),
             },
+            "capabilities": _capability_trace_projection(capabilities),
         },
         "provider_attempt_count": len(provider_attempts),
         "provider_fingerprints": [
@@ -1256,9 +1502,150 @@ def _normalize(
         "provider_prompt_evidence": [
             attempt.get("prompt_evidence") for attempt in provider_attempts
         ],
+        "provider_tool_names": [attempt.get("tool_names") for attempt in provider_attempts],
+        "provider_tool_fingerprints": [
+            attempt.get("tool_fingerprint") for attempt in provider_attempts
+        ],
         "sources_count": len(result.get("sources", [])) if result else 0,
         "runtime_terminal_status": runtime.terminal_status,
     }
+
+
+def _capability_trace_projection(capabilities: dict[str, Any]) -> dict[str, Any]:
+    exposure = capabilities.get("exposure")
+    exposure = exposure if isinstance(exposure, dict) else {}
+    validation = capabilities.get("validation")
+    validation = validation if isinstance(validation, dict) else {}
+    execution = capabilities.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    authorization = execution.get("authorization")
+    authorization = authorization if isinstance(authorization, dict) else {}
+    selection = authorization.get("selection")
+    selection = selection if isinstance(selection, dict) else {}
+    dispatch = authorization.get("dispatch")
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    revalidation = execution.get("revalidation")
+    revalidation = revalidation if isinstance(revalidation, dict) else {}
+    confirmation = execution.get("confirmation")
+    confirmation = confirmation if isinstance(confirmation, dict) else {}
+    follow_up = capabilities.get("follow_up")
+    follow_up = follow_up if isinstance(follow_up, dict) else {}
+    fallback = capabilities.get("fallback")
+    fallback = fallback if isinstance(fallback, dict) else {}
+    executor_result = execution.get("executor_result")
+    executor_result = executor_result if isinstance(executor_result, dict) else {}
+    follow_summary = follow_up.get("summary")
+    follow_summary = follow_summary if isinstance(follow_summary, dict) else {}
+    return {
+        "exposure": {
+            "status": exposure.get("status"),
+            "exposed_capability_ids": exposure.get("exposed_capability_ids"),
+            "blocked_capability_ids": exposure.get("blocked_capability_ids"),
+            "descriptor_count": exposure.get("descriptor_count"),
+            "descriptor_fingerprint": exposure.get("descriptor_fingerprint"),
+        },
+        "validation": {
+            "validation_status": validation.get("validation_status"),
+            "capability_id": validation.get("capability_id"),
+            "provider_tool_name": validation.get("provider_tool_name"),
+            "argument_digest": validation.get("argument_digest"),
+            "reason_code": validation.get("reason_code"),
+        },
+        "execution": {
+            "response_status": execution.get("response_status"),
+            "failure_reason_code": execution.get("failure_reason_code"),
+            "executor_called": execution.get("executor_called"),
+            "executor_call_count": execution.get("executor_call_count"),
+            "executor_result_status": execution.get("executor_result_status"),
+            "executor_result": {
+                key: executor_result.get(key)
+                for key in (
+                    "included_claim_count",
+                    "excluded_claim_count",
+                    "domain_count",
+                    "local",
+                    "sent",
+                    "recipient_present",
+                    "subject_present",
+                    "body_char_count",
+                    "format",
+                )
+                if key in executor_result
+            },
+            "selection_status": selection.get("status"),
+            "dispatch_status": dispatch.get("status"),
+            "dispatch_confirmation_ref_present": (
+                dispatch.get("confirmation_challenge_ref") is not None
+            ),
+            "revalidation": {
+                "status": revalidation.get("status"),
+                "revalidator_id": revalidation.get("revalidator_id"),
+                "verification_call_count": revalidation.get("verification_call_count"),
+                "verification_success_count": revalidation.get(
+                    "verification_success_count"
+                ),
+                "verification_failure_count": revalidation.get(
+                    "verification_failure_count"
+                ),
+                "rerun_selection_status": revalidation.get("rerun_selection_status"),
+                "reason_code": revalidation.get("reason_code"),
+            },
+            "confirmation": {
+                "status": confirmation.get("status"),
+                "challenge_ref_present": confirmation.get("challenge_ref_present"),
+                "accepted": confirmation.get("accepted"),
+                "call_count": confirmation.get("call_count"),
+                "reason_code": confirmation.get("reason_code"),
+                "confirmed_challenge_ref": confirmation.get("confirmed_challenge_ref"),
+            },
+        },
+        "follow_up": {
+            "status": follow_up.get("status"),
+            "call_count": follow_up.get("call_count"),
+            "used_final_text": follow_up.get("used_final_text"),
+            "reason_code": follow_up.get("reason_code"),
+            "summary": follow_summary,
+        },
+        "fallback": {
+            "primary_descriptor_fingerprint": fallback.get(
+                "primary_descriptor_fingerprint"
+            ),
+            "descriptor_fingerprint": fallback.get("descriptor_fingerprint"),
+            "same_descriptor_fingerprint": fallback.get("same_descriptor_fingerprint"),
+            "blocked_after_dispatch": fallback.get("blocked_after_dispatch"),
+        },
+        "dispatch_completed": capabilities.get("dispatch_completed"),
+        "executor_call_count": capabilities.get("executor_call_count"),
+    }
+
+
+def _wave3c_revalidators() -> dict[str, Revalidator]:
+    entry = RevalidatorEntry(
+        revalidator_id="trusted_refresh",
+        verifier_id="cr-verifier-local",
+        verification_source_type="tool_output",
+        verification_source_ref="local-deterministic-revalidator",
+        supported_domains=("active_repository",),
+        supported_attributes=("branch",),
+        resulting_authority="verified_tool_output",
+        resulting_confidence=0.9,
+        resulting_freshness_state="fresh",
+        ttl_seconds=300,
+        revalidation_interval_seconds=120,
+    )
+
+    def verify(claim_ids: list[str]) -> list[RevalidationOutput]:
+        return [
+            RevalidationOutput(
+                claim_id=claim_id,
+                expected_value_digest=f"wsvalue_{claim_id}",
+                observed_at="2026-07-06T00:00:00+00:00",
+                verified_at="2026-07-06T00:00:01+00:00",
+            )
+            for claim_id in claim_ids
+        ]
+
+    return {"trusted_refresh": Revalidator(entry=entry, verify=verify)}
 
 
 def _router_files_for_scenario(scenario: dict[str, Any], directory: Path) -> tuple[Path, Path]:
@@ -1334,6 +1721,12 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                     memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
                     privacy_context_enabled=bool(scenario.get("privacy_context_enabled")),
                     request_id=request_id,
+                    capability_revalidators=(
+                        _wave3c_revalidators()
+                        if scenario.get("wave3c_mode")
+                        in {"revalidation", "revalidation_failed"}
+                        else None
+                    ),
                     prompt_output_token_reserve=scenario.get(
                         "prompt_output_token_reserve",
                         0,
@@ -1367,6 +1760,12 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                 memory_hygiene_enabled=scenario.get("memory_hygiene_enabled", True),
                 privacy_context_enabled=bool(scenario.get("privacy_context_enabled")),
                 request_id=request_id,
+                capability_revalidators=(
+                    _wave3c_revalidators()
+                    if scenario.get("wave3c_mode")
+                    in {"revalidation", "revalidation_failed"}
+                    else None
+                ),
             )
     except Exception as exc:  # replay snapshots intentionally cover failures
         error = exc
@@ -1430,6 +1829,70 @@ def assert_snapshot_privacy_safe(value: Any, path: str = "$") -> None:
             assert_snapshot_privacy_safe(nested, f"{path}[{index}]")
     elif isinstance(value, str):
         lowered = value.lower()
-        for banned in ("bearer ", "api-key", "traceback", "provider failure fixture"):
+        for banned in (
+            "bearer ",
+            "api-key",
+            "traceback",
+            "provider failure fixture",
+            "private-wave3c-world-value",
+            "private-wave3c-draft-body",
+            "wsvalue_",
+            "expected_value_digest",
+            "credentials",
+            "tool_calls",
+        ):
             if banned in lowered:
                 raise AssertionError(f"privacy-unsafe replay value at {path}")
+
+
+async def run_wave3c_smoke_report(
+    path: Path = DEFAULT_CORPUS_PATH,
+) -> dict[str, Any]:
+    fixtures = [
+        fixture
+        for fixture in load_corpus(path)
+        if fixture.get("category") == "wave3c_capability_lifecycle"
+    ]
+    failures = []
+    privacy_assertions_passed = True
+    no_repeat_assertions_passed = True
+    for fixture in fixtures:
+        snapshot = await run_scenario(fixture)
+        try:
+            assert_snapshot_privacy_safe(snapshot)
+            expected = fixture["expected"]
+            compare_snapshot(
+                expected,
+                project_snapshot(snapshot, expected),
+                fixture["scenario"],
+            )
+        except AssertionError as exc:
+            failures.append({"scenario": fixture["scenario"], "error": str(exc)})
+            privacy_assertions_passed = False
+        capabilities = snapshot["trace"]["capabilities"]
+        executor_count = capabilities.get("executor_call_count")
+        if executor_count not in {0, 1}:
+            no_repeat_assertions_passed = False
+            failures.append(
+                {
+                    "scenario": fixture["scenario"],
+                    "error": f"executor repeated: {executor_count}",
+                }
+            )
+        if capabilities.get("dispatch_completed") and executor_count != 1:
+            no_repeat_assertions_passed = False
+            failures.append(
+                {
+                    "scenario": fixture["scenario"],
+                    "error": "dispatch completion without exactly one executor",
+                }
+            )
+    return {
+        "scenario_count": len(fixtures),
+        "passed_count": len(fixtures) - len(failures),
+        "failed_count": len(failures),
+        "capability_lifecycle_scenarios": [fixture["scenario"] for fixture in fixtures],
+        "privacy_assertions_passed": privacy_assertions_passed,
+        "no_repeat_dispatch_assertions_passed": no_repeat_assertions_passed,
+        "failures": failures,
+    }
