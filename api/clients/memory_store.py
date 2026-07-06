@@ -108,6 +108,50 @@ class MemoryStoreClient:
             raise RuntimeError("retrieval_request_id_mismatch")
         return response
 
+    async def select_recall(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        context: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/v1/internal/recall/select",
+            request_id=request_id,
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "context": context,
+                "candidates": candidates,
+            },
+        )
+        if response.get("request_id") != request_id or response.get("owner_id") != owner_id:
+            raise RuntimeError("recall_response_context_mismatch")
+        return response
+
+    async def retrieve_episode_callbacks(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        context: dict[str, Any],
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/v1/internal/episodes/retrieve",
+            request_id=request_id,
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "context": context,
+                "limit": limit,
+            },
+        )
+        if response.get("request_id") != request_id or response.get("owner_id") != owner_id:
+            raise RuntimeError("episode_response_context_mismatch")
+        return response
+
     async def resolve_profile(
         self,
         *,

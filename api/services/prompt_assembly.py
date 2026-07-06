@@ -362,6 +362,8 @@ def _apply_prompt_budget(
     runtime_messages: list[dict[str, str]],
     retrieval_bundle: dict[str, Any],
     external_context_pack: dict[str, Any] | None,
+    wave4_memory_messages: list[dict[str, str]],
+    wave4_memory_trace: dict[str, Any] | None,
     current_messages: list[dict[str, str]],
 ) -> PromptBudgetResult:
     effective_budget, profile_trace = validate_budget_contract(contract)
@@ -419,6 +421,13 @@ def _apply_prompt_budget(
                     "external_source_context",
                     build_external_context_messages(working_external),
                     external_context_trace(working_external),
+                ),
+                (
+                    "memory_episode_recall_composition",
+                    []
+                    if "memory_episode_recall_composition" in omitted_whole_layers
+                    else wave4_memory_messages or [],
+                    wave4_memory_trace or {"status": "not_requested"},
                 ),
                 (
                     "retrieval_augmentation",
@@ -1098,6 +1107,8 @@ def assemble_prompt(
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     dsa_trace: dict[str, Any] | None = None,
+    wave4_memory_messages: list[dict[str, str]] | None = None,
+    wave4_memory_trace: dict[str, Any] | None = None,
     prompt_budget_contract: PromptBudgetContract | None = None,
 ) -> PromptAssembly:
     messages: list[dict[str, str]] = []
@@ -1588,6 +1599,23 @@ def assemble_prompt(
         )
     )
 
+    wave4_messages = [
+        item
+        for item in (wave4_memory_messages or [])
+        if isinstance(item, dict)
+        and item.get("role") == "system"
+        and isinstance(item.get("content"), str)
+        and item.get("content")
+    ]
+    messages.extend(wave4_messages)
+    layers.append(
+        _layer_trace(
+            "memory_episode_recall_composition",
+            wave4_messages,
+            metadata=wave4_memory_trace or {"status": "not_requested"},
+        )
+    )
+
     retrieval_messages = build_retrieval_messages(retrieval_bundle)
     messages.extend(retrieval_messages)
     layers.append(
@@ -1626,6 +1654,8 @@ def assemble_prompt(
                 runtime_messages=runtime_messages,
                 retrieval_bundle=retrieval_bundle,
                 external_context_pack=external_context_pack,
+                wave4_memory_messages=wave4_messages,
+                wave4_memory_trace=wave4_memory_trace,
                 current_messages=current_messages,
             )
         except PromptBudgetError:
@@ -1684,6 +1714,8 @@ def assemble_prompt(
         or {"attempted": False, "status": "not_requested"},
         "runtime": runtime_trace_out or {"attempted": False, "status": "not_requested"},
         "dsa": dsa_trace or {"enabled": False, "called": False, "status": "disabled"},
+        "memory_episode_recall_composition": wave4_memory_trace
+        or {"status": "not_requested"},
         "message_count": len(messages),
     }
     if prompt_budget_trace_out is not None:
