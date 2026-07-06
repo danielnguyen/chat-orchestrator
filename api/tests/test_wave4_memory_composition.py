@@ -1,6 +1,6 @@
 from services.briefing import generate_brief
+from services.memory_recall_composition import compose_memory_recall_context
 from services.prompt_assembly import assemble_prompt
-from services.wave4_memory_composition import compose_wave4_context
 
 
 def _bundle(*items):
@@ -82,7 +82,7 @@ def _episode(episode_id, *, eligible=True, strategy="light_callback", reason="ok
 
 
 def test_promoted_memory_included_and_low_value_memory_suppressed():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(
             _memory("mem-promoted", "promoted fact"),
             _memory("mem-low", "low value fact"),
@@ -102,7 +102,7 @@ def test_promoted_memory_included_and_low_value_memory_suppressed():
 
 
 def test_stale_memory_qualified_or_suppressed():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(_memory("mem-stale", "historical fact", state="stale")),
         recall_response=_recall(
             _decision("mem-stale", "implicit", decision="implicit_only", prompt_eligible=False)
@@ -116,7 +116,7 @@ def test_stale_memory_qualified_or_suppressed():
 
 
 def test_corrected_fact_replaces_or_suppresses_old_memory():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(
             _memory("old", "old fact", state="demoted"),
             _memory("new", "corrected fact", state="corrected_replacement"),
@@ -131,7 +131,7 @@ def test_corrected_fact_replaces_or_suppresses_old_memory():
 
 
 def test_meaningful_episode_callback_included():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(),
         recall_response=None,
         episode_response=_episodes(_episode("ep-meaningful")),
@@ -142,7 +142,7 @@ def test_meaningful_episode_callback_included():
 
 
 def test_awkward_episode_callback_suppressed():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(),
         recall_response=None,
         episode_response=_episodes(
@@ -155,7 +155,7 @@ def test_awkward_episode_callback_suppressed():
 
 
 def test_scene_inappropriate_episode_callback_suppressed():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(),
         recall_response=None,
         episode_response=_episodes(_episode("ep-scene", eligible=False, reason="scene_mismatch")),
@@ -166,7 +166,7 @@ def test_scene_inappropriate_episode_callback_suppressed():
 
 
 def test_recall_implicit_used_without_explicit_mention():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(_memory("mem-implicit", "implicit context")),
         recall_response=_recall(
             _decision("mem-implicit", "implicit", decision="implicit_only", prompt_eligible=False)
@@ -179,7 +179,7 @@ def test_recall_implicit_used_without_explicit_mention():
 
 
 def test_recall_light_explicit_mentioned_briefly():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(_memory("mem-light", "light callback context")),
         recall_response=_recall(_decision("mem-light", "light_callback")),
         episode_response=None,
@@ -189,7 +189,7 @@ def test_recall_light_explicit_mentioned_briefly():
 
 
 def test_recall_strong_explicit_used_when_continuity_is_the_point():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(_memory("mem-strong", "strong continuity context")),
         recall_response=_recall(_decision("mem-strong", "explicit_callback")),
         episode_response=None,
@@ -200,7 +200,7 @@ def test_recall_strong_explicit_used_when_continuity_is_the_point():
 
 
 def test_recall_suppress_absent_from_prompt_and_answer():
-    out = compose_wave4_context(
+    out = compose_memory_recall_context(
         retrieval_bundle=_bundle(_memory("mem-suppress", "do not surface")),
         recall_response=_recall(
             _decision("mem-suppress", "none", decision="suppress", prompt_eligible=False)
@@ -214,7 +214,7 @@ def test_recall_suppress_absent_from_prompt_and_answer():
 
 
 def test_source_grounded_brief_with_uncertainty_and_omissions():
-    composition = compose_wave4_context(
+    composition = compose_memory_recall_context(
         retrieval_bundle=_bundle(
             _memory("mem-current", "current fact"),
             _memory("mem-stale", "stale fact", state="stale"),
@@ -235,7 +235,7 @@ def test_source_grounded_brief_with_uncertainty_and_omissions():
 
 
 def test_provider_fallback_preserves_suppressed_context_boundary():
-    composition = compose_wave4_context(
+    composition = compose_memory_recall_context(
         retrieval_bundle=_bundle(_memory("mem-suppress", "fallback must not restore")),
         recall_response=_recall(
             _decision("mem-suppress", "none", decision="suppress", prompt_eligible=False)
@@ -246,8 +246,8 @@ def test_provider_fallback_preserves_suppressed_context_boundary():
         profile={"prompt_overlay": ""},
         retrieval_bundle=composition.retrieval_bundle,
         current_messages=[{"role": "user", "content": "answer"}],
-        wave4_memory_messages=composition.prompt_messages,
-        wave4_memory_trace=composition.trace,
+        memory_recall_messages=composition.prompt_messages,
+        memory_recall_trace=composition.trace,
     )
     first_attempt = [msg["content"] for msg in assembled.messages]
     second_attempt = [msg["content"] for msg in assembled.messages]

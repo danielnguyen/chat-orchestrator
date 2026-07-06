@@ -32,6 +32,10 @@ from services.capabilities import (
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
 from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
+from services.memory_recall_composition import (
+    build_recall_candidates,
+    compose_memory_recall_context,
+)
 from services.privacy_context import (
     apply_privacy_boundary,
     derive_privacy_context,
@@ -54,7 +58,6 @@ from services.response_shape import (
 from services.routing_contract import routing_trace_metadata
 from services.style_envelope import build_style_guidance_block, resolve_style_envelope
 from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
-from services.wave4_memory_composition import build_recall_candidates, compose_wave4_context
 
 
 def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
@@ -1605,7 +1608,7 @@ def _trace_references(retrieval_bundle: dict[str, Any]) -> list[dict[str, str]]:
     return references
 
 
-def _wave4_context(
+def _recall_context(
     *,
     surface: str,
     sensitivity: Any,
@@ -1640,7 +1643,7 @@ def _wave4_context(
     }
 
 
-def _privacy_safe_wave4_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
+def _privacy_safe_memory_recall_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(trace, dict):
         return {"status": "privacy_suppressed"}
     recall = trace.get("recall") if isinstance(trace.get("recall"), dict) else {}
@@ -4511,7 +4514,7 @@ async def orchestrate_chat(
             surface=surface,
             requested_scene=payload.get("requested_scene"),
         )
-        wave4_context = _wave4_context(
+        recall_context = _recall_context(
             surface=surface,
             sensitivity=effective_payload.get("sensitivity", "private"),
             requested_scene=payload.get("requested_scene"),
@@ -4520,7 +4523,7 @@ async def orchestrate_chat(
         )
         recall_response = None
         episode_response = None
-        wave4_dependency_trace: dict[str, Any] = {
+        memory_recall_dependency_trace: dict[str, Any] = {
             "recall_status": "not_requested",
             "episode_status": "not_requested",
         }
@@ -4530,41 +4533,43 @@ async def orchestrate_chat(
                 recall_response = await memory_store.select_recall(
                     request_id=request_id,
                     owner_id=payload["owner_id"],
-                    context=wave4_context,
+                    context=recall_context,
                     candidates=recall_candidates,
                 )
-                wave4_dependency_trace["recall_status"] = "included"
+                memory_recall_dependency_trace["recall_status"] = "included"
             except Exception:
                 recall_response = None
-                wave4_dependency_trace["recall_status"] = "dependency_unavailable"
-                wave4_dependency_trace["recall_failure_policy"] = "no_additional_recall_context"
+                memory_recall_dependency_trace["recall_status"] = "dependency_unavailable"
+                memory_recall_dependency_trace["recall_failure_policy"] = (
+                    "no_additional_recall_context"
+                )
         elif recall_candidates:
-            wave4_dependency_trace["recall_status"] = "client_unavailable"
+            memory_recall_dependency_trace["recall_status"] = "client_unavailable"
         if hasattr(memory_store, "retrieve_episode_callbacks"):
             try:
                 episode_response = await memory_store.retrieve_episode_callbacks(
                     request_id=request_id,
                     owner_id=payload["owner_id"],
-                    context=wave4_context,
+                    context=recall_context,
                     limit=10,
                 )
-                wave4_dependency_trace["episode_status"] = "included"
+                memory_recall_dependency_trace["episode_status"] = "included"
             except Exception:
                 episode_response = None
-                wave4_dependency_trace["episode_status"] = "dependency_unavailable"
-                wave4_dependency_trace["episode_failure_policy"] = "no_episode_callbacks"
+                memory_recall_dependency_trace["episode_status"] = "dependency_unavailable"
+                memory_recall_dependency_trace["episode_failure_policy"] = "no_episode_callbacks"
         else:
-            wave4_dependency_trace["episode_status"] = "client_unavailable"
-        wave4_composition = compose_wave4_context(
+            memory_recall_dependency_trace["episode_status"] = "client_unavailable"
+        memory_recall_composition = compose_memory_recall_context(
             retrieval_bundle=retrieval_bundle,
             recall_response=recall_response,
             episode_response=episode_response,
         )
-        retrieval_bundle = wave4_composition.retrieval_bundle
-        wave4_trace = {
-            **wave4_composition.trace,
-            "dependency": wave4_dependency_trace,
-            "context": wave4_context,
+        retrieval_bundle = memory_recall_composition.retrieval_bundle
+        memory_recall_trace = {
+            **memory_recall_composition.trace,
+            "dependency": memory_recall_dependency_trace,
+            "context": recall_context,
         }
         interrupt_trace = await _resolve_interrupt_policy(
             runtime=runtime,
@@ -4644,11 +4649,13 @@ async def orchestrate_chat(
             if privacy_prompt_suppressed
             else retrieval_bundle
         )
-        provider_wave4_messages = (
-            [] if privacy_prompt_suppressed else wave4_composition.prompt_messages
+        provider_memory_recall_messages = (
+            [] if privacy_prompt_suppressed else memory_recall_composition.prompt_messages
         )
-        provider_wave4_trace = (
-            _privacy_safe_wave4_trace(wave4_trace) if privacy_prompt_suppressed else wave4_trace
+        provider_memory_recall_trace = (
+            _privacy_safe_memory_recall_trace(memory_recall_trace)
+            if privacy_prompt_suppressed
+            else memory_recall_trace
         )
         signals = _compute_signals(effective_payload, retrieval_bundle)
         registry = _load_model_registry(model_registry_path)
@@ -4717,7 +4724,7 @@ async def orchestrate_chat(
                         "relationship_context": _relationship_context_disabled_trace(),
                         "runtime": runtime_trace,
                         "dsa": dsa_trace,
-                        "memory_episode_recall_composition": provider_wave4_trace,
+                        "memory_episode_recall_composition": provider_memory_recall_trace,
                     },
                     surface_presence_trace=surface_presence_trace,
                     dsa_trace=dsa_trace,
@@ -4833,8 +4840,8 @@ async def orchestrate_chat(
                 interrupt_trace=interrupt_trace,
                 external_context_pack=external_context_pack,
                 dsa_trace=dsa_trace,
-                wave4_memory_messages=provider_wave4_messages,
-                wave4_memory_trace=provider_wave4_trace,
+                memory_recall_messages=provider_memory_recall_messages,
+                memory_recall_trace=provider_memory_recall_trace,
                 prompt_budget_contract=PromptBudgetContract(
                     attempts=provider_attempt_plan,
                     output_token_reserve=prompt_output_token_reserve,
@@ -4877,7 +4884,7 @@ async def orchestrate_chat(
                 "relationship_context": relationship_context_trace,
                 "runtime": runtime_trace,
                 "dsa": dsa_trace,
-                "memory_episode_recall_composition": provider_wave4_trace,
+                "memory_episode_recall_composition": provider_memory_recall_trace,
                 "message_count": 0,
             }
             await _create_error_trace(
@@ -5227,8 +5234,8 @@ async def orchestrate_chat(
         prompt.trace["response_review"] = response_review.to_trace()
         prompt.trace["response_action"] = response_action.to_trace()
         candidate_answer = response_action.candidate_text
-        if wave4_composition.explicit_callbacks and not privacy_prompt_suppressed:
-            callback_text = wave4_composition.explicit_callbacks[0]
+        if memory_recall_composition.explicit_callbacks and not privacy_prompt_suppressed:
+            callback_text = memory_recall_composition.explicit_callbacks[0]
             if callback_text and callback_text not in candidate_answer:
                 candidate_answer = f"{callback_text}\n\n{candidate_answer}"
             prompt.trace["memory_episode_recall_composition"]["final_callback_applied"] = True
@@ -5244,7 +5251,7 @@ async def orchestrate_chat(
                 surface=effective_payload.get("surface", payload.get("surface", "chat")),
                 source="explicit_user_request",
                 explicit_request=True,
-                grounding=wave4_composition.brief_grounding,
+                grounding=memory_recall_composition.brief_grounding,
             )
             answer = brief_result.rendered
             brief_metadata = {
@@ -5362,15 +5369,17 @@ async def orchestrate_chat(
         )
         if privacy_boundary.enforced and isinstance(persisted_prompt_trace, dict):
             persisted_prompt_trace.pop("retained_source_ids", None)
-            persisted_prompt_trace["memory_episode_recall_composition"] = _privacy_safe_wave4_trace(
-                persisted_prompt_trace.get("memory_episode_recall_composition")
+            persisted_prompt_trace["memory_episode_recall_composition"] = (
+                _privacy_safe_memory_recall_trace(
+                    persisted_prompt_trace.get("memory_episode_recall_composition")
+                )
             )
             for layer in persisted_prompt_trace.get("layers") or []:
                 if (
                     isinstance(layer, dict)
                     and layer.get("name") == "memory_episode_recall_composition"
                 ):
-                    layer["metadata"] = _privacy_safe_wave4_trace(layer.get("metadata"))
+                    layer["metadata"] = _privacy_safe_memory_recall_trace(layer.get("metadata"))
             prompt_budget = persisted_prompt_trace.get("prompt_budget")
             if isinstance(prompt_budget, dict):
                 prompt_budget.pop("retained_source_ids", None)

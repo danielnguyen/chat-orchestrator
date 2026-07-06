@@ -11,7 +11,7 @@ CURRENT_STATES = {"active", "promoted", "reinforced", "corrected_replacement"}
 
 
 @dataclass(frozen=True)
-class Wave4Composition:
+class MemoryRecallComposition:
     retrieval_bundle: dict[str, Any]
     prompt_messages: list[dict[str, str]]
     explicit_callbacks: list[str]
@@ -182,12 +182,12 @@ def _brief_source(
     return out
 
 
-def compose_wave4_context(
+def compose_memory_recall_context(
     *,
     retrieval_bundle: dict[str, Any],
     recall_response: dict[str, Any] | None,
     episode_response: dict[str, Any] | None,
-) -> Wave4Composition:
+) -> MemoryRecallComposition:
     working = deepcopy(retrieval_bundle) if isinstance(retrieval_bundle, dict) else {}
     bundle = working.setdefault("bundle", {})
     if not isinstance(bundle, dict):
@@ -334,7 +334,7 @@ def compose_wave4_context(
         "omissions": omissions[:20],
         "conflicts": [],
     }
-    return Wave4Composition(
+    return MemoryRecallComposition(
         retrieval_bundle=working,
         prompt_messages=prompt_messages,
         explicit_callbacks=explicit_callbacks[:4],
