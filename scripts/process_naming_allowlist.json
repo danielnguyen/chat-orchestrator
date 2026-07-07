@@ -101,17 +101,6 @@
       "reviewed_at": "2026-07-06",
       "reviewed_by": "Codex",
       "removal_required_later": false
-    },
-    {
-      "path": "api/services/memory_recall_composition.py",
-      "token": "Wave",
-      "pattern": "wave",
-      "bucket": "historical runtime wording debt",
-      "reason": "Existing production prompt text contains historical delivery wording; this PR baselines it without changing runtime behavior.",
-      "context_contains": "Wave 4 memory and episode composition:",
-      "reviewed_at": "2026-07-06",
-      "reviewed_by": "Codex",
-      "removal_required_later": true
     }
   ]
 }
