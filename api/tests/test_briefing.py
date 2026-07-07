@@ -1,4 +1,75 @@
 from services.briefing import generate_brief, normalize_surface
+from services.memory_recall_composition import compose_memory_recall_context
+
+
+def _brief_bundle(*items):
+    return {
+        "request_id": "rid-brief",
+        "conversation_id": "conv-brief",
+        "bundle": {"recent": [], "semantic": list(items), "artifact_refs": []},
+    }
+
+
+def _brief_memory(memory_id, content, *, state="promoted"):
+    return {
+        "message_id": f"msg-{memory_id}",
+        "memory_id": memory_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-brief",
+        "role": "assistant",
+        "content": content,
+        "score": 0.9,
+        "salience_score": 0.9,
+        "promotion_state": state,
+        "source_ref": {"ref_type": "memory_item", "ref_id": memory_id},
+    }
+
+
+def _brief_recall_decision(candidate_id, strategy, *, decision="mention", prompt_eligible=True):
+    return {
+        "candidate_id": candidate_id,
+        "candidate_type": "memory_item",
+        "decision": decision,
+        "mention_strategy": strategy,
+        "prompt_eligible": prompt_eligible,
+        "reason": {"rule_id": f"{strategy}_test"},
+    }
+
+
+def _brief_recall_response(*decisions):
+    return {
+        "request_id": "rid-brief",
+        "owner_id": "owner",
+        "decision_count": len(decisions),
+        "decisions": list(decisions),
+    }
+
+
+def _brief_episode_response(*decisions):
+    return {
+        "request_id": "rid-brief",
+        "owner_id": "owner",
+        "decision_count": len(decisions),
+        "decisions": list(decisions),
+    }
+
+
+def _brief_episode_decision(episode_id):
+    return {
+        "episode_id": episode_id,
+        "decision": "include",
+        "callback_strategy": "light_callback",
+        "callback_score": 0.8,
+        "prompt_eligible": True,
+        "reasons": ["ok"],
+        "episode": {
+            "episode_id": episode_id,
+            "title": f"title {episode_id}",
+            "summary": f"summary {episode_id}",
+            "episode_type": "successful_mitigation",
+            "source_refs": [{"ref_type": "message", "ref_id": f"msg-{episode_id}"}],
+        },
+    }
 
 
 def test_tier_0_is_one_line_and_conclusion_first():
@@ -145,3 +216,24 @@ def test_surface_normalization():
     assert normalize_surface("mobile") == "telegram"
     assert normalize_surface("car") == "voice"
     assert normalize_surface("vscode") == "chat"
+
+
+def test_source_grounded_brief_with_uncertainty_and_omissions():
+    composition = compose_memory_recall_context(
+        retrieval_bundle=_brief_bundle(
+            _brief_memory("mem-current", "current fact"),
+            _brief_memory("mem-stale", "stale fact", state="stale"),
+            _brief_memory("mem-suppressed", "suppressed fact", state="suppressed"),
+        ),
+        recall_response=_brief_recall_response(_brief_recall_decision("mem-current", "light_callback")),
+        episode_response=_brief_episode_response(_brief_episode_decision("ep-brief")),
+    )
+    result = generate_brief(
+        content="Net: continue. Recommendation: use grounded context. Next: verify.",
+        grounding=composition.brief_grounding,
+    )
+
+    assert "Grounding:" in result.rendered
+    assert "Uncertainty:" in result.rendered
+    assert "Omissions:" in result.rendered
+    assert result.debug["grounding"]["source_count"] >= 2

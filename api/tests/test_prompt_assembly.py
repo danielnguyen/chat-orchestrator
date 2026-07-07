@@ -1,5 +1,6 @@
 from services.assistant_handoff import build_assistant_handoff
 from services.companion_presentation import build_companion_presentation
+from services.memory_recall_composition import compose_memory_recall_context
 from services.prompt_assembly import assemble_prompt
 
 
@@ -1554,3 +1555,235 @@ def test_assemble_prompt_accepts_presentation_adapter_and_adds_summary_trace():
     ]
     assert out.trace["presentation"]["companion"].get("content") is None
     assert out.trace["presentation"]["runtime"].get("content") is None
+
+
+def _recall_bundle(*items):
+    return {
+        "request_id": "rid-memory",
+        "conversation_id": "conv-memory",
+        "bundle": {"recent": [], "semantic": list(items), "artifact_refs": []},
+    }
+
+
+def _memory_item(
+    memory_id,
+    content,
+    *,
+    state="promoted",
+    score=0.9,
+    salience=0.9,
+    source_id=None,
+):
+    return {
+        "message_id": f"msg-{memory_id}",
+        "memory_id": memory_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-memory",
+        "role": "assistant",
+        "content": content,
+        "score": score,
+        "salience_score": salience,
+        "promotion_state": state,
+        "source_ref": {"ref_type": "memory_item", "ref_id": source_id or memory_id},
+    }
+
+
+def _recall_response(*decisions):
+    return {
+        "request_id": "rid-memory",
+        "owner_id": "owner",
+        "decision_count": len(decisions),
+        "decisions": list(decisions),
+    }
+
+
+def _recall_decision(candidate_id, strategy, *, decision="mention", prompt_eligible=True):
+    return {
+        "candidate_id": candidate_id,
+        "candidate_type": "memory_item",
+        "decision": decision,
+        "mention_strategy": strategy,
+        "prompt_eligible": prompt_eligible,
+        "reason": {"rule_id": f"{strategy}_test"},
+    }
+
+
+def _episode_response(*decisions):
+    return {
+        "request_id": "rid-memory",
+        "owner_id": "owner",
+        "decision_count": len(decisions),
+        "decisions": list(decisions),
+    }
+
+
+def _episode_decision(episode_id, *, eligible=True, strategy="light_callback", reason="ok"):
+    return {
+        "episode_id": episode_id,
+        "decision": "include" if eligible else "suppress",
+        "callback_strategy": strategy if eligible else "none",
+        "callback_score": 0.8 if eligible else 0.1,
+        "prompt_eligible": eligible,
+        "reasons": [reason],
+        "episode": {
+            "episode_id": episode_id,
+            "title": f"title {episode_id}",
+            "summary": f"summary {episode_id}",
+            "episode_type": "successful_mitigation",
+            "source_refs": [{"ref_type": "message", "ref_id": f"msg-{episode_id}"}],
+        },
+    }
+
+
+def test_promoted_memory_included_and_low_value_memory_suppressed():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(
+            _memory_item("mem-promoted", "promoted fact"),
+            _memory_item("mem-low", "low value fact"),
+        ),
+        recall_response=_recall_response(
+            _recall_decision("mem-promoted", "light_callback"),
+            _recall_decision("mem-low", "none", decision="suppress", prompt_eligible=False),
+        ),
+        episode_response=None,
+    )
+
+    retained = out.retrieval_bundle["bundle"]["semantic"]
+    assert [item["memory_id"] for item in retained] == ["mem-promoted"]
+    assert "promoted fact" in out.prompt_messages[0]["content"]
+    assert "low value fact" not in out.prompt_messages[0]["content"]
+    assert "mem-low" in out.trace["recall"]["suppressed_ids"]
+
+
+def test_stale_memory_qualified_or_suppressed():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(_memory_item("mem-stale", "historical fact", state="stale")),
+        recall_response=_recall_response(
+            _recall_decision("mem-stale", "implicit", decision="implicit_only", prompt_eligible=False)
+        ),
+        episode_response=None,
+    )
+
+    assert out.retrieval_bundle["bundle"]["semantic"][0]["memory_id"] == "mem-stale"
+    assert out.brief_grounding["uncertainty"]
+    assert "Use implicitly" in out.prompt_messages[0]["content"]
+
+
+def test_corrected_fact_replaces_or_suppresses_old_memory():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(
+            _memory_item("old", "old fact", state="demoted"),
+            _memory_item("new", "corrected fact", state="corrected_replacement"),
+        ),
+        recall_response=_recall_response(_recall_decision("new", "light_callback")),
+        episode_response=None,
+    )
+
+    assert [item["memory_id"] for item in out.retrieval_bundle["bundle"]["semantic"]] == ["new"]
+    assert "corrected fact" in out.prompt_messages[0]["content"]
+    assert "old" in out.trace["recall"]["suppressed_ids"]
+
+
+def test_meaningful_episode_callback_included():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(),
+        recall_response=None,
+        episode_response=_episode_response(_episode_decision("ep-meaningful")),
+    )
+
+    assert out.trace["episodes"]["included_episode_ids"] == ["ep-meaningful"]
+    assert "summary ep-meaningful" in out.prompt_messages[0]["content"]
+
+
+def test_awkward_episode_callback_suppressed():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(),
+        recall_response=None,
+        episode_response=_episode_response(
+            _episode_decision("ep-awkward", eligible=False, reason="awkward_or_tangential")
+        ),
+    )
+
+    assert out.prompt_messages == []
+    assert out.brief_grounding["omissions"][0]["reason"] == "awkward_or_tangential"
+
+
+def test_scene_inappropriate_episode_callback_suppressed():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(),
+        recall_response=None,
+        episode_response=_episode_response(_episode_decision("ep-scene", eligible=False, reason="scene_mismatch")),
+    )
+
+    assert out.prompt_messages == []
+    assert out.brief_grounding["omissions"][0]["reason"] == "scene_mismatch"
+
+
+def test_recall_implicit_used_without_explicit_mention():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(_memory_item("mem-implicit", "implicit context")),
+        recall_response=_recall_response(
+            _recall_decision("mem-implicit", "implicit", decision="implicit_only", prompt_eligible=False)
+        ),
+        episode_response=None,
+    )
+
+    assert "Use implicitly" in out.prompt_messages[0]["content"]
+    assert out.explicit_callbacks == []
+
+
+def test_recall_light_explicit_mentioned_briefly():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(_memory_item("mem-light", "light callback context")),
+        recall_response=_recall_response(_recall_decision("mem-light", "light_callback")),
+        episode_response=None,
+    )
+
+    assert out.explicit_callbacks == ["light callback context"]
+
+
+def test_recall_strong_explicit_used_when_continuity_is_the_point():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(_memory_item("mem-strong", "strong continuity context")),
+        recall_response=_recall_response(_recall_decision("mem-strong", "explicit_callback")),
+        episode_response=None,
+    )
+
+    assert out.explicit_callbacks == ["strong continuity context"]
+    assert "Direct continuity callback allowed" in out.prompt_messages[0]["content"]
+
+
+def test_recall_suppress_absent_from_prompt_and_answer():
+    out = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(_memory_item("mem-suppress", "do not surface")),
+        recall_response=_recall_response(
+            _recall_decision("mem-suppress", "none", decision="suppress", prompt_eligible=False)
+        ),
+        episode_response=None,
+    )
+
+    assert out.retrieval_bundle["bundle"]["semantic"] == []
+    assert out.prompt_messages == []
+    assert out.explicit_callbacks == []
+
+
+def test_provider_fallback_preserves_suppressed_context_boundary():
+    composition = compose_memory_recall_context(
+        retrieval_bundle=_recall_bundle(_memory_item("mem-suppress", "fallback must not restore")),
+        recall_response=_recall_response(
+            _recall_decision("mem-suppress", "none", decision="suppress", prompt_eligible=False)
+        ),
+        episode_response=None,
+    )
+    assembled = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle=composition.retrieval_bundle,
+        current_messages=[{"role": "user", "content": "answer"}],
+        memory_recall_messages=composition.prompt_messages,
+        memory_recall_trace=composition.trace,
+    )
+    first_attempt = [msg["content"] for msg in assembled.messages]
+    second_attempt = [msg["content"] for msg in assembled.messages]
+
+    assert first_attempt == second_attempt
+    assert all("fallback must not restore" not in content for content in second_attempt)
