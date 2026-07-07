@@ -6114,6 +6114,136 @@ async def test_orchestrate_memory_hygiene_submits_metadata_only_and_dedupes_shar
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_retrieved_memory_does_not_contaminate_runtime_or_storage_writes(
+    tmp_path,
+):
+    sentinel = "RETRIEVED_MEMORY_STORAGE_BOUNDARY_SENTINEL"
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = BundledMemoryStore(
+        _retrieval_bundle_for_hygiene(
+            semantic=[
+                {
+                    **_memory_item(
+                        section="semantic",
+                        ref_type="message",
+                        ref_id="storage-boundary-memory",
+                        content=f"retrieved memory {sentinel}",
+                        memory_id="storage-boundary-memory",
+                        freshness_state="active",
+                        source_kind="message",
+                        confidence=0.93,
+                    ),
+                    "policy_metadata": {
+                        "memory_domains": ["technical"],
+                        "sensitivity": "medium",
+                    },
+                }
+            ]
+        )
+    )
+    runtime = FakeRuntime(
+        restraint_response={
+            "request_id": "rid-restraint",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "vscode",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "restraint_policy": "normal",
+                "domains": ["output"],
+                "reason": "normal_turn",
+                "prompt_overlay": None,
+                "confidence": 0.88,
+                "reason_summary": ["normal_turn"],
+                "retrieval_suppressed": False,
+                "personalization_suppressed": False,
+                "proactive_output_suppressed": False,
+                "brevity_preferred": False,
+                "clarification_preferred": False,
+            },
+        },
+        privacy_context_response=_privacy_runtime_response(
+            request_id="rid-storage-boundary",
+            owner_id="owner",
+            conversation_id="conv-1",
+            surface="vscode",
+            runtime_session_id="rtsession_1",
+            runtime_turn_id="rtturn_1",
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=True,
+            screen_detail_allowed=True,
+        ),
+        memory_hygiene_response={
+            "result": {
+                "decisions": [
+                    {
+                        "item_ref": {
+                            "ref_type": "message",
+                            "ref_id": "storage-boundary-memory",
+                        },
+                        "freshness_state": "active",
+                        "use_allowed": True,
+                        "mention_as_current_allowed": True,
+                        "framing": "current",
+                    }
+                ]
+            }
+        },
+    )
+    litellm = FakeLiteLLM(content="safe answer")
+
+    out = await orchestrate_chat(
+        payload={
+            "owner_id": "owner",
+            "client_id": "vscode",
+            "surface": "vscode",
+            "surface_context": {"surface_category": "desktop_private"},
+            "messages": [{"role": "user", "content": "Use stored context."}],
+            "sensitivity": "private",
+        },
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-storage-boundary",
+        companion_policy_enabled=True,
+        enable_runtime_overlays=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        memory_hygiene_enabled=True,
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "safe answer"
+    assert sentinel in json.dumps(memory_store.bundle, sort_keys=True)
+
+    runtime_call_groups = {
+        "session": runtime.session_calls,
+        "turn_start": runtime.turn_start_calls,
+        "turn_update": runtime.turn_update_calls,
+        "turn_complete": runtime.turn_complete_calls,
+        "identity": runtime.identity_calls,
+        "companion": runtime.companion_calls,
+        "persona_containment": runtime.persona_containment_calls,
+        "relationship": runtime.relationship_calls,
+        "restraint": runtime.restraint_calls,
+        "memory_hygiene": runtime.memory_hygiene_calls,
+        "privacy_context": runtime.privacy_context_calls,
+    }
+    for calls in runtime_call_groups.values():
+        assert sentinel not in json.dumps(calls, sort_keys=True)
+
+    assert sentinel not in json.dumps(
+        {"added_messages": memory_store.added_messages},
+        sort_keys=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_memory_hygiene_same_ref_id_different_ref_types_do_not_collide(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = BundledMemoryStore(
