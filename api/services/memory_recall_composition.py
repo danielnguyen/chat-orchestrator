@@ -285,7 +285,7 @@ def compose_memory_recall_context(
                 "role": "system",
                 "content": "\n".join(
                     [
-                        "Wave 4 memory and episode composition:",
+                        "Memory and episode recall guidance:",
                         *prompt_lines[:8],
                         *episode_lines[:6],
                         (
