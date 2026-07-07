@@ -190,7 +190,7 @@ class FakeMemoryStore:
         return {"trace_id": "t-1", "request_id": kwargs["request_id"]}
 
 
-class Wave2EMemoryStore(FakeMemoryStore):
+class RetrievalDiagnosticsMemoryStore(FakeMemoryStore):
     def __init__(self, *, diagnostics: object | None = None, malformed_bundle: bool = False):
         super().__init__()
         self.diagnostics = diagnostics
@@ -1097,8 +1097,8 @@ class BundledMemoryStore(FakeMemoryStore):
 
 
 class MemoryRecallPrivacyMemoryStore(FakeMemoryStore):
-    memory_text = "WAVE4_PRIVATE_MEMORY_TEXT"
-    episode_text = "WAVE4_PRIVATE_EPISODE_TEXT"
+    memory_text = "PRIVATE_MEMORY_RECALL_TEXT"
+    episode_text = "PRIVATE_EPISODE_RECALL_TEXT"
 
     async def retrieve_bundle(self, **kwargs):
         self.retrieve_calls.append(kwargs)
@@ -1111,8 +1111,8 @@ class MemoryRecallPrivacyMemoryStore(FakeMemoryStore):
                     {
                         "owner_id": "owner",
                         "conversation_id": kwargs["conversation_id"],
-                        "message_id": "wave4-private-message",
-                        "memory_id": "wave4-private-memory",
+                        "message_id": "private-memory-recall-message",
+                        "memory_id": "private-memory-recall",
                         "created_at": "2026-07-06T00:00:00+00:00",
                         "role": "assistant",
                         "content": self.memory_text,
@@ -1121,7 +1121,7 @@ class MemoryRecallPrivacyMemoryStore(FakeMemoryStore):
                         "promotion_state": "promoted",
                         "source_ref": {
                             "ref_type": "memory_item",
-                            "ref_id": "wave4-private-memory",
+                            "ref_id": "private-memory-recall",
                         },
                     }
                 ],
@@ -1137,7 +1137,7 @@ class MemoryRecallPrivacyMemoryStore(FakeMemoryStore):
             "decision_count": 1,
             "decisions": [
                 {
-                    "candidate_id": "wave4-private-memory",
+                    "candidate_id": "private-memory-recall",
                     "candidate_type": "memory_item",
                     "decision": "mention",
                     "mention_strategy": "light_callback",
@@ -1154,19 +1154,19 @@ class MemoryRecallPrivacyMemoryStore(FakeMemoryStore):
             "decision_count": 1,
             "decisions": [
                 {
-                    "episode_id": "wave4-private-episode",
+                    "episode_id": "private-episode-recall",
                     "decision": "include",
                     "callback_strategy": "explicit_callback",
                     "callback_score": 0.95,
                     "prompt_eligible": True,
                     "reasons": ["useful_continuity"],
                     "episode": {
-                        "episode_id": "wave4-private-episode",
+                        "episode_id": "private-episode-recall",
                         "title": "Private episode",
                         "summary": self.episode_text,
                         "episode_type": "successful_mitigation",
                         "source_refs": [
-                            {"ref_type": "message", "ref_id": "wave4-private-episode-message"}
+                            {"ref_type": "message", "ref_id": "private-episode-recall-message"}
                         ],
                     },
                 }
@@ -2756,7 +2756,7 @@ async def test_orchestrate_containment_lock_omits_unexpected_artifacts_and_trace
 
 
 @pytest.mark.asyncio
-async def test_wave3b_mandatory_artifact_policy_omits_ineligible_artifact_truthfully(
+async def test_mandatory_artifact_policy_omits_ineligible_artifact_truthfully(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -2801,7 +2801,7 @@ async def test_wave3b_mandatory_artifact_policy_omits_ineligible_artifact_truthf
         allow_manual_override=True,
         interaction_governance_enabled=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-artifact-policy-omission",
+        request_id="rid-result-boundary-artifact-policy-omission",
     )
 
     assert out["sources"] == []
@@ -2886,7 +2886,7 @@ def _persona_response_with_artifact_policy(policy):
 
 
 @pytest.mark.asyncio
-async def test_wave3b_valid_containment_sends_exact_mandatory_bms_policy(tmp_path):
+async def test_valid_containment_sends_exact_mandatory_bms_policy(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime(
         restraint_response=_allowed_restraint_response(),
@@ -2916,7 +2916,7 @@ async def test_wave3b_valid_containment_sends_exact_mandatory_bms_policy(tmp_pat
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-policy",
+        request_id="rid-containment-policy",
     )
 
     assert len(memory_store.retrieve_calls) == 1
@@ -2951,7 +2951,7 @@ async def test_wave3b_valid_containment_sends_exact_mandatory_bms_policy(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_wave3b_relationship_trace_preserves_bounded_exclusions_without_broadening_projection(
+async def test_relationship_trace_preserves_bounded_exclusions_without_broadening_projection(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -3016,7 +3016,7 @@ async def test_wave3b_relationship_trace_preserves_bounded_exclusions_without_br
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-relationship-exclusions",
+        request_id="rid-relationship-exclusions",
     )
 
     call = memory_store.retrieve_calls[0]
@@ -3067,7 +3067,7 @@ async def test_wave3b_relationship_trace_preserves_bounded_exclusions_without_br
 
 
 @pytest.mark.asyncio
-async def test_wave3b_relationship_trace_keeps_empty_exclusions_when_none_returned(tmp_path):
+async def test_relationship_trace_keeps_empty_exclusions_when_none_returned(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime(
         restraint_response=_allowed_restraint_response(),
@@ -3091,7 +3091,7 @@ async def test_wave3b_relationship_trace_keeps_empty_exclusions_when_none_return
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-relationship-empty-exclusions",
+        request_id="rid-relationship-empty-exclusions",
     )
 
     relationship_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
@@ -3191,7 +3191,7 @@ def _co2_provenance_without(field):
     return item
 
 
-class Wave3BResultBoundaryMemoryStore(FakeMemoryStore):
+class ResultBoundaryMemoryStore(FakeMemoryStore):
     async def retrieve_bundle(self, **kwargs):
         self.retrieve_calls.append(kwargs)
         return {
@@ -3240,9 +3240,9 @@ class Wave3BResultBoundaryMemoryStore(FakeMemoryStore):
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_filters_messages_artifacts_and_sources(tmp_path):
+async def test_result_boundary_filters_messages_artifacts_and_sources(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
-    memory_store = Wave3BResultBoundaryMemoryStore()
+    memory_store = ResultBoundaryMemoryStore()
     litellm = FakeLiteLLM()
 
     out = await orchestrate_chat(
@@ -3264,7 +3264,7 @@ async def test_wave3b_result_boundary_filters_messages_artifacts_and_sources(tmp
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-result-boundary",
+        request_id="rid-result-boundary",
     )
 
     prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
@@ -3293,18 +3293,18 @@ async def test_wave3b_result_boundary_filters_messages_artifacts_and_sources(tmp
     assert [item["artifact_id"] for item in retrieval["artifact_refs"]] == ["artifact-good"]
 
 
-def test_wave3b_relationship_projection_requires_selected_relationship_id():
+def test_relationship_projection_requires_selected_relationship_id():
     projection = {
         "applied": True,
         "relationship_ids": ["rel-good"],
-        "entity_ids": ["project:wave3b", "repo:good"],
+        "entity_ids": ["project:alpha", "repo:good"],
         "relationship_scopes": ["project_context"],
     }
 
     allowed, reason = _relationship_projection_allows(
         {
             "relationship_ids": ["rel-good"],
-            "entity_ids": ["project:wave3b", "repo:good"],
+            "entity_ids": ["project:alpha", "repo:good"],
             "relationship_scopes": ["project_context"],
         },
         projection,
@@ -3314,7 +3314,7 @@ def test_wave3b_relationship_projection_requires_selected_relationship_id():
     allowed, reason = _relationship_projection_allows(
         {
             "relationship_ids": ["rel-excluded"],
-            "entity_ids": ["project:wave3b", "repo:excluded"],
+            "entity_ids": ["project:alpha", "repo:excluded"],
             "relationship_scopes": ["project_context"],
         },
         projection,
@@ -3356,13 +3356,13 @@ def test_wave3b_relationship_projection_requires_selected_relationship_id():
         "reason_codes": ["no_eligible_relationship_scope"],
     }
     allowed, reason = _relationship_projection_allows(
-        {"relationship_ids": ["rel-good"], "entity_ids": ["project:wave3b"]},
+        {"relationship_ids": ["rel-good"], "entity_ids": ["project:alpha"]},
         empty_projection,
     )
     assert (allowed, reason) == (False, "relationship_projection_mismatch")
 
     allowed, reason = _relationship_projection_allows(
-        {"entity_ids": ["project:wave3b"]},
+        {"entity_ids": ["project:alpha"]},
         empty_projection,
     )
     assert (allowed, reason) == (True, None)
@@ -3375,7 +3375,7 @@ def test_wave3b_relationship_projection_requires_selected_relationship_id():
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_rejects_domain_valid_records_without_relationship_identity(
+async def test_result_boundary_rejects_domain_valid_records_without_relationship_identity(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -3441,7 +3441,7 @@ async def test_wave3b_result_boundary_rejects_domain_valid_records_without_relat
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-relationship-identityless-result",
+        request_id="rid-relationship-identityless-result",
     )
 
     prompt_text = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
@@ -3468,10 +3468,10 @@ async def test_wave3b_result_boundary_rejects_domain_valid_records_without_relat
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_envelope_mismatch_fails_closed(tmp_path):
+async def test_result_boundary_envelope_mismatch_fails_closed(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
 
-    class MismatchedEnvelopeMemoryStore(Wave3BResultBoundaryMemoryStore):
+    class MismatchedEnvelopeMemoryStore(ResultBoundaryMemoryStore):
         async def retrieve_bundle(self, **kwargs):
             response = await super().retrieve_bundle(**kwargs)
             response["request_id"] = "wrong-request"
@@ -3497,7 +3497,7 @@ async def test_wave3b_result_boundary_envelope_mismatch_fails_closed(tmp_path):
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-envelope",
+        request_id="rid-result-boundary-envelope",
     )
 
     prompt_text = "\n".join(message["content"] for message in litellm.calls[0]["messages"])
@@ -3515,7 +3515,7 @@ async def test_wave3b_result_boundary_envelope_mismatch_fails_closed(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_fallback_reuses_same_prompt_identity(tmp_path):
+async def test_result_boundary_fallback_reuses_same_prompt_identity(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
     rules.write_text(
@@ -3541,7 +3541,7 @@ async def test_wave3b_result_boundary_fallback_reuses_same_prompt_identity(tmp_p
         "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
-    memory_store = Wave3BResultBoundaryMemoryStore()
+    memory_store = ResultBoundaryMemoryStore()
     litellm = FakeLiteLLM(fail_first=True)
 
     await orchestrate_chat(
@@ -3563,7 +3563,7 @@ async def test_wave3b_result_boundary_fallback_reuses_same_prompt_identity(tmp_p
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-fallback-identity",
+        request_id="rid-result-boundary-fallback-identity",
     )
 
     trace = memory_store.trace_calls[0]["payload"]
@@ -3582,7 +3582,7 @@ async def test_wave3b_result_boundary_fallback_reuses_same_prompt_identity(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_removes_observed_metadata_and_auxiliary_side_channels(
+async def test_result_boundary_removes_observed_metadata_and_auxiliary_side_channels(
     tmp_path,
 ):
     rules = tmp_path / "rules.yaml"
@@ -3692,7 +3692,7 @@ async def test_wave3b_result_boundary_removes_observed_metadata_and_auxiliary_si
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-side-channel",
+        request_id="rid-result-boundary-side-channel",
     )
 
     assert out["selected_model"] == "general-model"
@@ -3716,7 +3716,7 @@ async def test_wave3b_result_boundary_removes_observed_metadata_and_auxiliary_si
     assert "augmented_bundle" not in serialized_trace
 
 
-def test_wave3b_result_boundary_preserves_only_allowlisted_retrieval_debug():
+def test_result_boundary_preserves_only_allowlisted_retrieval_debug():
     assert _bounded_retrieval_debug(
         {
             "degraded": True,
@@ -3814,7 +3814,7 @@ def test_wave3b_result_boundary_preserves_only_allowlisted_retrieval_debug():
         ),
     ],
 )
-async def test_wave3b_result_boundary_rejects_malformed_source_and_provenance(
+async def test_result_boundary_rejects_malformed_source_and_provenance(
     tmp_path,
     artifact_overrides,
     reason,
@@ -3860,7 +3860,7 @@ async def test_wave3b_result_boundary_rejects_malformed_source_and_provenance(
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id=f"rid-wave3b-{reason}",
+        request_id=f"rid-result-boundary-{reason}",
     )
 
     assert out["sources"] == []
@@ -3871,7 +3871,7 @@ async def test_wave3b_result_boundary_rejects_malformed_source_and_provenance(
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_allows_valid_bounded_provenance_and_public_sources(
+async def test_result_boundary_allows_valid_bounded_provenance_and_public_sources(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -3927,7 +3927,7 @@ async def test_wave3b_result_boundary_allows_valid_bounded_provenance_and_public
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-public-sources",
+        request_id="rid-result-boundary-public-sources",
     )
 
     assert "eligible artifact snippet" in json.dumps(litellm.calls[0]["messages"])
@@ -3955,7 +3955,7 @@ async def test_wave3b_result_boundary_allows_valid_bounded_provenance_and_public
 
 
 @pytest.mark.asyncio
-async def test_wave3b_result_boundary_allows_event_log_provenance_source_refs(
+async def test_result_boundary_allows_event_log_provenance_source_refs(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -4009,7 +4009,7 @@ async def test_wave3b_result_boundary_allows_event_log_provenance_source_refs(
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-event-log-provenance",
+        request_id="rid-result-boundary-event-log-provenance",
     )
 
     assert [source["artifact_id"] for source in out["sources"]] == ["artifact-event"]
@@ -4032,7 +4032,7 @@ async def test_wave3b_result_boundary_allows_event_log_provenance_source_refs(
         (0.8, ["artifact-score"], None),
     ],
 )
-async def test_wave3b_result_boundary_requires_valid_relevance_score_when_min_score_set(
+async def test_result_boundary_requires_valid_relevance_score_when_min_score_set(
     tmp_path,
     score,
     expected_sources,
@@ -4079,7 +4079,7 @@ async def test_wave3b_result_boundary_requires_valid_relevance_score_when_min_sc
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-relevance-score",
+        request_id="rid-result-boundary-relevance-score",
     )
 
     assert [source["artifact_id"] for source in out["sources"]] == expected_sources
@@ -4100,7 +4100,7 @@ async def test_wave3b_result_boundary_requires_valid_relevance_score_when_min_sc
         ("infinite", [], "malformed_relevance_score"),
     ],
 )
-async def test_wave3b_result_boundary_allows_missing_optional_score_without_min_score(
+async def test_result_boundary_allows_missing_optional_score_without_min_score(
     tmp_path,
     artifact_mutation,
     expected_sources,
@@ -4146,7 +4146,7 @@ async def test_wave3b_result_boundary_allows_missing_optional_score_without_min_
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-optional-score",
+        request_id="rid-result-boundary-optional-score",
     )
 
     assert [source["artifact_id"] for source in out["sources"]] == expected_sources
@@ -4173,7 +4173,7 @@ async def test_wave3b_result_boundary_allows_missing_optional_score_without_min_
         ),
     ],
 )
-async def test_wave3b_restraint_suppression_produces_zero_bms_calls(
+async def test_restraint_retrieval_suppression_produces_zero_bms_calls(
     tmp_path,
     restraint_result,
     expected_reason,
@@ -4198,7 +4198,7 @@ async def test_wave3b_restraint_suppression_produces_zero_bms_calls(
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id=f"rid-wave3b-{expected_reason}",
+        request_id=f"rid-restraint-{expected_reason}",
     )
 
     assert memory_store.retrieve_calls == []
@@ -4225,7 +4225,7 @@ async def test_wave3b_restraint_suppression_produces_zero_bms_calls(
 
 
 @pytest.mark.asyncio
-async def test_wave3b_restraint_unsuppressed_result_allows_bms_call(tmp_path):
+async def test_restraint_retrieval_unsuppressed_result_allows_bms_call(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     response = _allowed_restraint_response()
     response["result"].update(
@@ -4248,7 +4248,7 @@ async def test_wave3b_restraint_unsuppressed_result_allows_bms_call(tmp_path):
         allow_manual_override=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
-        request_id="rid-wave3b-restraint-unsuppressed",
+        request_id="rid-restraint-unsuppressed",
     )
 
     assert len(memory_store.retrieve_calls) == 1
@@ -4261,7 +4261,7 @@ async def test_wave3b_restraint_unsuppressed_result_allows_bms_call(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_wave3b_malformed_mandatory_containment_fails_closed_without_legacy_bms_call(
+async def test_malformed_mandatory_containment_fails_closed_without_legacy_bms_call(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -4293,7 +4293,7 @@ async def test_wave3b_malformed_mandatory_containment_fails_closed_without_legac
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-malformed-containment",
+        request_id="rid-containment-malformed",
     )
 
     assert memory_store.retrieve_calls == []
@@ -4373,7 +4373,7 @@ async def test_wave3b_malformed_mandatory_containment_fails_closed_without_legac
         ),
     ],
 )
-async def test_wave3b_invalid_artifact_policy_fields_fail_closed(
+async def test_invalid_artifact_policy_fields_fail_closed(
     tmp_path,
     policy,
     expected_reason,
@@ -4397,7 +4397,7 @@ async def test_wave3b_invalid_artifact_policy_fields_fail_closed(
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id=f"rid-wave3b-artifact-{expected_reason}",
+        request_id=f"rid-result-boundary-artifact-{expected_reason}",
     )
 
     assert memory_store.retrieve_calls == []
@@ -4408,7 +4408,7 @@ async def test_wave3b_invalid_artifact_policy_fields_fail_closed(
 
 
 @pytest.mark.asyncio
-async def test_wave3b_relationship_failure_under_mandatory_containment_fails_closed(tmp_path):
+async def test_relationship_failure_under_mandatory_containment_fails_closed(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     runtime = FakeRuntime(
@@ -4438,7 +4438,7 @@ async def test_wave3b_relationship_failure_under_mandatory_containment_fails_clo
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-relationship-failure",
+        request_id="rid-relationship-failure",
     )
 
     assert memory_store.retrieve_calls == []
@@ -4451,7 +4451,7 @@ async def test_wave3b_relationship_failure_under_mandatory_containment_fails_clo
 
 
 @pytest.mark.asyncio
-async def test_wave3b_malformed_relationship_projection_drops_private_prompt_text(tmp_path):
+async def test_malformed_relationship_projection_drops_private_prompt_text(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
@@ -4484,7 +4484,7 @@ async def test_wave3b_malformed_relationship_projection_drops_private_prompt_tex
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-relationship-private-prompt",
+        request_id="rid-relationship-private-prompt",
     )
 
     assert memory_store.retrieve_calls == []
@@ -4505,7 +4505,7 @@ async def test_wave3b_malformed_relationship_projection_drops_private_prompt_tex
 
 
 @pytest.mark.asyncio
-async def test_wave3b_unapplied_projection_with_relationship_ids_fails_closed(tmp_path):
+async def test_unapplied_projection_with_relationship_ids_fails_closed(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -4534,7 +4534,7 @@ async def test_wave3b_unapplied_projection_with_relationship_ids_fails_closed(tm
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-unapplied-with-ids",
+        request_id="rid-relationship-unapplied-with-ids",
     )
 
     assert memory_store.retrieve_calls == []
@@ -4547,7 +4547,7 @@ async def test_wave3b_unapplied_projection_with_relationship_ids_fails_closed(tm
 
 
 @pytest.mark.asyncio
-async def test_wave3b_applied_false_relationship_projection_permits_retrieval(tmp_path):
+async def test_applied_false_relationship_projection_permits_retrieval(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -4565,7 +4565,7 @@ async def test_wave3b_applied_false_relationship_projection_permits_retrieval(tm
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-applied-false",
+        request_id="rid-relationship-applied-false",
     )
 
     assert len(memory_store.retrieve_calls) == 1
@@ -4580,7 +4580,7 @@ async def test_wave3b_applied_false_relationship_projection_permits_retrieval(tm
 
 
 @pytest.mark.asyncio
-async def test_wave3b_neutral_policy_metadata_persisted_without_persona_ownership(tmp_path):
+async def test_neutral_policy_metadata_persisted_without_persona_ownership(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -4598,7 +4598,7 @@ async def test_wave3b_neutral_policy_metadata_persisted_without_persona_ownershi
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-neutral-policy",
+        request_id="rid-containment-neutral-policy",
     )
 
     assert [call["role"] for call in memory_store.added_messages] == ["user", "assistant"]
@@ -4615,7 +4615,7 @@ async def test_wave3b_neutral_policy_metadata_persisted_without_persona_ownershi
 
 
 @pytest.mark.asyncio
-async def test_wave3b_failed_classification_preserves_unclassified_messages(tmp_path):
+async def test_failed_classification_preserves_unclassified_messages(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
     runtime = FakeRuntime()
@@ -4635,7 +4635,7 @@ async def test_wave3b_failed_classification_preserves_unclassified_messages(tmp_
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=True,
-        request_id="rid-wave3b-unclassified",
+        request_id="rid-containment-unclassified",
     )
 
     assert [call.get("policy_metadata") for call in memory_store.added_messages] == [None, None]
@@ -4649,7 +4649,7 @@ async def test_wave3b_failed_classification_preserves_unclassified_messages(tmp_
 
 
 @pytest.mark.asyncio
-async def test_wave3b_disabled_containment_preserves_legacy_request_and_persistence(tmp_path):
+async def test_disabled_containment_preserves_legacy_request_and_persistence(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -4667,7 +4667,7 @@ async def test_wave3b_disabled_containment_preserves_legacy_request_and_persiste
         model_registry_path=str(models),
         allow_manual_override=True,
         persona_containment_enabled=False,
-        request_id="rid-wave3b-legacy",
+        request_id="rid-containment-disabled",
     )
 
     assert len(memory_store.retrieve_calls) == 1
@@ -11709,7 +11709,7 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_privacy_suppresses_wave4_prompt_layer_and_fallback(tmp_path):
+async def test_orchestrate_privacy_suppresses_recall_prompt_layer_and_fallback(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
     rules.write_text(
@@ -11755,7 +11755,7 @@ async def test_orchestrate_privacy_suppresses_wave4_prompt_layer_and_fallback(tm
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-wave4-privacy-fallback",
+        request_id="rid-privacy-fallback",
         privacy_context_enabled=True,
     )
 
@@ -12749,7 +12749,7 @@ async def test_orchestrate_prompt_budget_dropped_artifact_is_absent_from_sources
     assert prompt_trace["retained_source_ids"]["artifact_ids"] == []
 
 
-def _assert_private_wave2e_values_absent(value):
+def _assert_private_retrieval_diagnostics_values_absent(value):
     serialized = json.dumps(value, sort_keys=True, default=str)
     for sentinel in (
         "PRIVATE-DIAGNOSTIC-SENTINEL",
@@ -12862,7 +12862,7 @@ def _artifact_lifecycle_bundle(*, freshness_state_marker=Ellipsis, durable_statu
         ("active", "active", {"freshness_state": "active", "durable_status": "active"}),
     ],
 )
-def test_wave3b_artifact_lifecycle_state_is_not_fabricated_by_result_boundary(
+def test_artifact_lifecycle_state_is_not_fabricated_by_result_boundary(
     freshness_state,
     durable_status,
     expected,
@@ -12898,7 +12898,7 @@ def test_wave3b_artifact_lifecycle_state_is_not_fabricated_by_result_boundary(
 @pytest.mark.asyncio
 async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
-    memory_store = Wave2EMemoryStore()
+    memory_store = RetrievalDiagnosticsMemoryStore()
     litellm = FakeLiteLLM(content="safe answer")
 
     out = await orchestrate_chat(
@@ -12908,18 +12908,18 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-wave2e-additive",
+        request_id="rid-retrieval-diagnostics-additive",
     )
 
     assert out["answer"] == "safe answer"
     assert out["sources"][0]["snippet"] == "def entrypoint(): pass"
-    assert memory_store.retrieve_calls[0]["request_id"] == "rid-wave2e-additive"
+    assert memory_store.retrieve_calls[0]["request_id"] == "rid-retrieval-diagnostics-additive"
     assert memory_store.retrieve_calls[0]["owner_id"] == "owner"
     assert memory_store.retrieve_calls[0]["conversation_id"] == "conv-1"
-    _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
+    _assert_private_retrieval_diagnostics_values_absent(litellm.calls[0]["messages"])
     trace = memory_store.trace_calls[0]["payload"]
     source_response = await memory_store.retrieve_bundle(
-        request_id="rid-wave2e-additive-fixture",
+        request_id="rid-retrieval-diagnostics-additive-fixture",
         conversation_id="conv-1",
         owner_id="owner",
         query="fixture",
@@ -12962,7 +12962,7 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
             "artifact_omission_reasons": ["missing_derivative_source_record"],
         },
     }
-    assert trace["request_id"] == "rid-wave2e-additive"
+    assert trace["request_id"] == "rid-retrieval-diagnostics-additive"
     assert trace["conversation_id"] == "conv-1"
     assert trace["owner_id"] == "owner"
     assert trace["prompt"]["token_accounting"]["budget_enforcement"] == "enforced"
@@ -12970,14 +12970,16 @@ async def test_orchestrate_accepts_additive_bms_diagnostics_without_exposure(tmp
     assert "raw_bundle" not in trace["retrieval"]["bundle"]
     assert "augmented_bundle" not in trace["retrieval"]["bundle"]
     assert "comparison" not in trace["retrieval"]["bundle"]
-    _assert_private_wave2e_values_absent(out)
-    _assert_private_wave2e_values_absent(trace)
+    _assert_private_retrieval_diagnostics_values_absent(out)
+    _assert_private_retrieval_diagnostics_values_absent(trace)
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_optional_malformed_diagnostics_do_not_discard_valid_bundle(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
-    memory_store = Wave2EMemoryStore(diagnostics="PRIVATE-DIAGNOSTIC-SENTINEL-BAD-DIAG")
+    memory_store = RetrievalDiagnosticsMemoryStore(
+        diagnostics="PRIVATE-DIAGNOSTIC-SENTINEL-BAD-DIAG"
+    )
     litellm = FakeLiteLLM(content="safe answer")
 
     out = await orchestrate_chat(
@@ -12987,22 +12989,22 @@ async def test_orchestrate_optional_malformed_diagnostics_do_not_discard_valid_b
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-wave2e-malformed-optional",
+        request_id="rid-retrieval-diagnostics-malformed-optional",
     )
 
     assert out["answer"] == "safe answer"
     assert len(litellm.calls) == 1
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["retrieval"]["bundle"]["doctrine_summary"] == {"diagnostics_status": "invalid"}
-    _assert_private_wave2e_values_absent(out)
-    _assert_private_wave2e_values_absent(trace)
-    _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
+    _assert_private_retrieval_diagnostics_values_absent(out)
+    _assert_private_retrieval_diagnostics_values_absent(trace)
+    _assert_private_retrieval_diagnostics_values_absent(litellm.calls[0]["messages"])
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_drops_unknown_lowercase_doctrine_identity_fields(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
-    memory_store = Wave2EMemoryStore(
+    memory_store = RetrievalDiagnosticsMemoryStore(
         diagnostics={
             "contract_version": "private_contract_version",
             "mode": "private_retrieval_mode",
@@ -13042,7 +13044,7 @@ async def test_orchestrate_drops_unknown_lowercase_doctrine_identity_fields(tmp_
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-wave2e-private-identity-fields",
+        request_id="rid-retrieval-diagnostics-private-identity-fields",
     )
 
     trace = memory_store.trace_calls[0]["payload"]
@@ -13064,9 +13066,9 @@ async def test_orchestrate_drops_unknown_lowercase_doctrine_identity_fields(tmp_
     assert doctrine["validation"]["artifact_omission_reasons"] == [
         "missing_derivative_source_record"
     ]
-    _assert_private_wave2e_values_absent(litellm.calls[0]["messages"])
-    _assert_private_wave2e_values_absent(out)
-    _assert_private_wave2e_values_absent(trace)
+    _assert_private_retrieval_diagnostics_values_absent(litellm.calls[0]["messages"])
+    _assert_private_retrieval_diagnostics_values_absent(out)
+    _assert_private_retrieval_diagnostics_values_absent(trace)
 
 
 @pytest.mark.asyncio
@@ -13098,7 +13100,7 @@ async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_
         "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
-    memory_store = Wave2EMemoryStore()
+    memory_store = RetrievalDiagnosticsMemoryStore()
     litellm = FakeLiteLLM(fail_first=True, content="safe answer")
 
     out = await orchestrate_chat(
@@ -13108,14 +13110,14 @@ async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-wave2e-provider-fallback",
+        request_id="rid-retrieval-diagnostics-provider-fallback",
     )
 
     assert out["status"] == "degraded"
     assert len(litellm.calls) == 2
     assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
     for call in litellm.calls:
-        _assert_private_wave2e_values_absent(call["messages"])
+        _assert_private_retrieval_diagnostics_values_absent(call["messages"])
     trace = memory_store.trace_calls[0]["payload"]
     prompt_trace = trace["retrieval"]["prompt_assembly"]
     assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
@@ -13136,8 +13138,8 @@ async def test_orchestrate_provider_fallback_reuses_sanitized_messages_with_bms_
     assert model_calls[0]["retained_artifact_ids"] == model_calls[1]["retained_artifact_ids"]
     assert model_calls[0]["retained_semantic_message_ids"]
     assert model_calls[0]["retained_artifact_ids"]
-    _assert_private_wave2e_values_absent(out)
-    _assert_private_wave2e_values_absent(trace)
+    _assert_private_retrieval_diagnostics_values_absent(out)
+    _assert_private_retrieval_diagnostics_values_absent(trace)
 
 
 @pytest.mark.asyncio
@@ -13159,16 +13161,16 @@ async def test_orchestrate_bms_unavailable_remains_bounded(tmp_path):
             rules_path=str(rules),
             model_registry_path=str(models),
             allow_manual_override=True,
-            request_id="rid-wave2e-bms-down",
+            request_id="rid-retrieval-diagnostics-bms-down",
         )
-    assert memory_store.retrieve_calls[0]["request_id"] == "rid-wave2e-bms-down"
+    assert memory_store.retrieve_calls[0]["request_id"] == "rid-retrieval-diagnostics-bms-down"
     assert memory_store.trace_calls == []
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_malformed_required_bundle_still_fails(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
-    memory_store = Wave2EMemoryStore(malformed_bundle=True)
+    memory_store = RetrievalDiagnosticsMemoryStore(malformed_bundle=True)
 
     with pytest.raises(AttributeError):
         await orchestrate_chat(
@@ -13178,6 +13180,6 @@ async def test_orchestrate_malformed_required_bundle_still_fails(tmp_path):
             rules_path=str(rules),
             model_registry_path=str(models),
             allow_manual_override=True,
-            request_id="rid-wave2e-malformed-required",
+            request_id="rid-retrieval-diagnostics-malformed-required",
         )
     assert memory_store.trace_calls == []
