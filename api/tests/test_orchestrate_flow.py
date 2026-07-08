@@ -5767,6 +5767,88 @@ async def test_orchestrate_brief_mode_shapes_persisted_answer_and_traces_raw_ans
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_brief_mode_includes_external_context_grounding(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(
+        content=(
+            "Net: use the maintenance source. "
+            "Risk: one source is stale. "
+            "Recommendation: qualify the date. "
+            "Next: verify the source row."
+        )
+    )
+    dsa = FakeDSA(
+        response={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "vehicle_log_primary:row-44",
+                    "source_name": "Vehicle Log",
+                    "title": "Battery replacement",
+                    "text": "Battery replacement. Date: 2025-07-12.",
+                    "retrieved_at": "2026-07-08T12:00:00Z",
+                    "freshness_state": "stale",
+                    "warnings": ["stale_from_source"],
+                },
+                {
+                    "source_name": "Vehicle Log",
+                    "title": "Unreferenced maintenance row",
+                    "text": "This row has no source ref.",
+                    "retrieved_at": "2026-07-08T12:01:00Z",
+                },
+            ],
+        }
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Brief the battery replacement evidence.",
+            external_context_enabled=True,
+            response_mode="brief",
+            brief_depth=1,
+            brief_type="project_status",
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        dsa=dsa,
+        dsa_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-brief-dsa-grounding",
+    )
+
+    assert out["status"] == "ok"
+    trace_payload = memory_store.trace_calls[0]["payload"]
+    brief = trace_payload["model_call"]["brief"]
+    grounding = brief["grounding"]
+    assert grounding["source_count"] >= 3
+    assert grounding["uncertainty_count"] == 1
+    assert grounding["omission_count"] == 1
+    external_sources = [
+        source for source in grounding["sources"] if source.get("kind") == "external_context"
+    ]
+    assert external_sources == [
+        {
+            "kind": "external_context",
+            "id": "vehicle_log_primary:row-44",
+            "state": "stale",
+            "source_ref": "vehicle_log_primary:row-44",
+            "source_name": "Vehicle Log",
+            "title": "Battery replacement",
+            "retrieved_at": "2026-07-08T12:00:00Z",
+        }
+    ]
+    assert grounding["uncertainty"] == ["vehicle_log_primary:row-44: stale"]
+    assert grounding["omissions"] == [
+        {"reason": "missing_external_source_ref", "source_id": "Vehicle Log"}
+    ]
+    assert "Battery replacement. Date: 2025-07-12." not in str(brief)
+    assert "This row has no source ref." not in str(brief)
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_normal_mode_does_not_shape_or_add_raw_answer_trace(tmp_path):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
