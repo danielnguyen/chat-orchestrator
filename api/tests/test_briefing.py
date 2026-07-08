@@ -237,3 +237,31 @@ def test_source_grounded_brief_with_uncertainty_and_omissions():
     assert "Uncertainty:" in result.rendered
     assert "Omissions:" in result.rendered
     assert result.debug["grounding"]["source_count"] >= 2
+
+
+def test_external_source_grounding_is_reported_without_source_text():
+    result = generate_brief(
+        content="Net: continue with the grounded answer. Next: cite bounded context.",
+        grounding={
+            "sources": [
+                {
+                    "kind": "external_context",
+                    "id": "calendar:evt-7",
+                    "state": "retrieved",
+                    "source_ref": "calendar:evt-7",
+                    "source_name": "Calendar",
+                    "retrieved_at": "2026-07-08T12:00:00Z",
+                }
+            ],
+            "uncertainty": ["sheet:row-4: unknown_freshness"],
+            "omissions": [{"reason": "missing_external_source_ref", "source_id": "unknown"}],
+            "conflicts": [],
+        },
+    )
+
+    assert "Grounding: 1 source refs (external_context)." in result.rendered
+    assert "Uncertainty:" in result.rendered
+    assert "Omissions:" in result.rendered
+    grounding = result.debug["grounding"]
+    assert grounding["sources"][0]["source_ref"] == "calendar:evt-7"
+    assert "source text" not in str(grounding).lower()

@@ -1690,6 +1690,160 @@ def _privacy_safe_brief_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def _merge_brief_grounding(*groundings: dict[str, Any] | None) -> dict[str, Any]:
+    sources: list[dict[str, Any]] = []
+    uncertainty: list[str] = []
+    omissions: list[dict[str, str]] = []
+    conflicts: list[str] = []
+    for grounding in groundings:
+        if not isinstance(grounding, dict):
+            continue
+        source_items = grounding.get("sources")
+        if isinstance(source_items, list):
+            sources.extend(item for item in source_items if isinstance(item, dict))
+        uncertainty_items = grounding.get("uncertainty")
+        if isinstance(uncertainty_items, list):
+            uncertainty.extend(item for item in uncertainty_items if isinstance(item, str))
+        omission_items = grounding.get("omissions")
+        if isinstance(omission_items, list):
+            omissions.extend(item for item in omission_items if isinstance(item, dict))
+        conflict_items = grounding.get("conflicts")
+        if isinstance(conflict_items, list):
+            conflicts.extend(item for item in conflict_items if isinstance(item, str))
+    return {
+        "source_count": len(sources),
+        "sources": sources[:20],
+        "uncertainty": uncertainty[:12],
+        "omissions": omissions[:20],
+        "conflicts": conflicts[:12],
+    }
+
+
+def _retained_external_source_refs(prompt_trace: dict[str, Any] | None) -> set[str] | None:
+    if not isinstance(prompt_trace, dict):
+        return None
+    layers = prompt_trace.get("layers")
+    if not isinstance(layers, list):
+        return None
+    for layer in layers:
+        if not isinstance(layer, dict) or layer.get("name") != "external_source_context":
+            continue
+        if layer.get("included") is not True:
+            return set()
+        metadata = layer.get("metadata") if isinstance(layer.get("metadata"), dict) else {}
+        refs = metadata.get("source_refs")
+        if not isinstance(refs, list):
+            return set()
+        retained: set[str] = set()
+        for ref in refs:
+            sanitized = _sanitize_trace_string(ref, max_length=240)
+            if sanitized:
+                retained.add(sanitized)
+        return retained
+    return None
+
+
+def _external_context_brief_grounding(
+    *,
+    context_pack: dict[str, Any] | None,
+    dsa_trace: dict[str, Any] | None,
+    prompt_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    sources: list[dict[str, Any]] = []
+    uncertainty: list[str] = []
+    omissions: list[dict[str, str]] = []
+    retained_refs = _retained_external_source_refs(prompt_trace)
+
+    if not isinstance(context_pack, dict):
+        if isinstance(dsa_trace, dict) and dsa_trace.get("enabled") is True:
+            reason = _sanitize_trace_string(dsa_trace.get("reason"), max_length=80)
+            status = _sanitize_trace_string(dsa_trace.get("status"), max_length=80)
+            omissions.append(
+                {
+                    "reason": reason or status or "external_context_unavailable",
+                    "source_id": "external_context",
+                }
+            )
+        return {
+            "source_count": 0,
+            "sources": [],
+            "uncertainty": [],
+            "omissions": omissions,
+            "conflicts": [],
+        }
+
+    items = context_pack.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    for index, item in enumerate(items[:20], start=1):
+        if not isinstance(item, dict):
+            omissions.append(
+                {"reason": "malformed_external_context_item", "source_id": f"external:{index}"}
+            )
+            continue
+        source_ref = _sanitize_trace_string(item.get("source_ref"), max_length=240)
+        source_name = _sanitize_trace_string(item.get("source_name"), max_length=120)
+        if not source_ref:
+            omissions.append(
+                {"reason": "missing_external_source_ref", "source_id": source_name or "unknown"}
+            )
+            continue
+        if retained_refs is not None and source_ref not in retained_refs:
+            omissions.append(
+                {"reason": "external_context_prompt_omitted", "source_id": source_ref}
+            )
+            continue
+
+        retrieved_at = _sanitize_trace_string(item.get("retrieved_at"), max_length=80)
+        freshness_state = (
+            _sanitize_trace_string(item.get("freshness_state"), max_length=80)
+            or ("retrieved" if retrieved_at else "unknown_freshness")
+        )
+        warnings = _sanitize_trace_string_list(
+            item.get("warnings"),
+            limit=6,
+            item_max_length=80,
+        )
+        lowered_markers = " ".join([freshness_state, *warnings]).lower()
+        if not retrieved_at:
+            uncertainty.append(f"{source_ref}: unknown_freshness")
+        elif any(marker in lowered_markers for marker in ("stale", "expired", "outdated")):
+            uncertainty.append(f"{source_ref}: {freshness_state}")
+
+        source: dict[str, Any] = {
+            "kind": "external_context",
+            "id": source_ref,
+            "state": freshness_state,
+            "source_ref": source_ref,
+        }
+        if source_name:
+            source["source_name"] = source_name
+        title = _sanitize_trace_string(item.get("title"), max_length=160)
+        if title:
+            source["title"] = title
+        if retrieved_at:
+            source["retrieved_at"] = retrieved_at
+        sources.append(source)
+
+    errors = context_pack.get("errors")
+    if isinstance(errors, list):
+        for error in errors[:12]:
+            if not isinstance(error, dict):
+                continue
+            code = _sanitize_trace_string(error.get("code"), max_length=80)
+            if code:
+                omissions.append({"reason": code, "source_id": "external_context"})
+
+    return {
+        "source_count": len(sources),
+        "sources": sources[:20],
+        "uncertainty": uncertainty[:12],
+        "omissions": omissions[:20],
+        "conflicts": [],
+    }
+
+
 SAFE_DOCTRINE_CODE = re.compile(r"^[a-z0-9_.:-]{1,120}$")
 SAFE_DOCTRINE_STATUS = re.compile(r"^[a-z0-9_.:-]{1,80}$")
 DOCTRINE_REASON_CODES = {
@@ -2387,6 +2541,10 @@ def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
                 "title": item.get("title"),
                 "text": text,
                 "retrieved_at": item.get("retrieved_at"),
+                "freshness_state": _sanitize_trace_string(
+                    item.get("freshness_state"),
+                    max_length=80,
+                ),
                 "warnings": item.get("warnings", []),
                 "sensitivity": item.get("sensitivity"),
                 "sensitivity_level": item.get("sensitivity_level"),
@@ -5244,6 +5402,14 @@ async def orchestrate_chat(
         answer = candidate_answer
         brief_metadata = {"enabled": False}
         if effective_payload.get("response_mode") == "brief":
+            brief_grounding = _merge_brief_grounding(
+                memory_recall_composition.brief_grounding,
+                _external_context_brief_grounding(
+                    context_pack=external_context_pack,
+                    dsa_trace=dsa_trace,
+                    prompt_trace=prompt.trace,
+                ),
+            )
             brief_result = generate_brief(
                 content=candidate_answer,
                 brief_type=effective_payload.get("brief_type", "general"),
@@ -5251,7 +5417,7 @@ async def orchestrate_chat(
                 surface=effective_payload.get("surface", payload.get("surface", "chat")),
                 source="explicit_user_request",
                 explicit_request=True,
-                grounding=memory_recall_composition.brief_grounding,
+                grounding=brief_grounding,
             )
             answer = brief_result.rendered
             brief_metadata = {
