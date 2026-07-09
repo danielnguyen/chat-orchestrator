@@ -317,6 +317,7 @@ class FakeRuntime:
         privacy_context_response=None,
         capability_match_response=None,
         capability_discovery_response=None,
+        capability_authority_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
@@ -326,6 +327,7 @@ class FakeRuntime:
         privacy_context_error: Exception | None = None,
         capability_match_error: Exception | None = None,
         capability_discovery_error: Exception | None = None,
+        capability_authority_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -345,6 +347,7 @@ class FakeRuntime:
         self.privacy_context_calls = []
         self.capability_match_calls = []
         self.capability_discovery_calls = []
+        self.capability_authority_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -628,6 +631,22 @@ class FakeRuntime:
                 "blocked_examples": [],
             },
         }
+        self.capability_authority_response = capability_authority_response or {
+            "request_id": "rid-capability-authority",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "active_persona_id": "technical_architect",
+            "result": {
+                "capability_id": "office_lights_on",
+                "risk_level": "low_reversible",
+                "authority_level": "execute_low_risk",
+                "requires_confirmation": False,
+                "allowed": True,
+                "reason_summary": ["registered_capability", "low_reversible_execution"],
+                "action_taken": False,
+            },
+        }
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
@@ -637,6 +656,7 @@ class FakeRuntime:
         self.privacy_context_error = privacy_context_error
         self.capability_match_error = capability_match_error
         self.capability_discovery_error = capability_discovery_error
+        self.capability_authority_error = capability_authority_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -806,6 +826,15 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.capability_discovery_response
+
+    async def action_authority(self, **kwargs):
+        self.capability_authority_calls.append(kwargs)
+        self.call_order.append("capability_authority")
+        if self.capability_authority_error is not None:
+            raise self.capability_authority_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.capability_authority_response
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
@@ -1403,6 +1432,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "action_taken": False,
         "match": {"attempted": False, "status": "disabled"},
         "discovery": {"attempted": False, "status": "disabled"},
+        "authority": {"attempted": False, "status": "disabled"},
     }
     presentation = trace_payload["retrieval"]["prompt_assembly"]["presentation"]
     assert presentation["routing"]["selected_model"] == "gpt-4o-mini"
@@ -1552,6 +1582,7 @@ async def test_orchestrate_capability_registry_disabled_does_not_call_runtime_me
 
     assert runtime.capability_match_calls == []
     assert runtime.capability_discovery_calls == []
+    assert runtime.capability_authority_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "capability_registry"
     ]
@@ -1610,6 +1641,24 @@ async def test_orchestrate_consumes_capability_match_without_execution(tmp_path)
         }
     ]
     assert runtime.capability_discovery_calls == []
+    assert runtime.capability_authority_calls == [
+        {
+            "request_id": "rid-capability-match-consumed:capability-authority",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "vscode",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "active_persona_id": "technical_architect",
+            "capability_id": "office_lights_on",
+            "target_resolution_state": "resolved",
+            "world_state_freshness": "unknown",
+            "consequence_flags": {},
+            "interaction_governance_kind": None,
+            "interaction_governance_tension": None,
+            "user_authorization_signal": "explicit",
+        }
+    ]
     assert "did not execute" in out["answer"]
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "capability_registry"
@@ -1622,11 +1671,49 @@ async def test_orchestrate_consumes_capability_match_without_execution(tmp_path)
     assert trace["match"]["capability"]["risk_level"] == "low_reversible"
     assert trace["match"]["capability"]["requires_confirmation"] is False
     assert trace["match"]["reason_codes"] == ["matched"]
+    assert trace["authority"] == {
+        "attempted": True,
+        "status": "included",
+        "capability_id": "office_lights_on",
+        "risk_level": "low_reversible",
+        "authority_level": "execute_low_risk",
+        "requires_confirmation": False,
+        "allowed": True,
+        "reason_summary": ["registered_capability", "low_reversible_execution"],
+        "action_taken": False,
+    }
     capabilities_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "capabilities"
     ]
     assert capabilities_trace["dispatch_completed"] is False
     assert capabilities_trace["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_unmatched_capability_does_not_call_authority_or_execute(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = CapabilityRuntime()
+    memory_store = FakeMemoryStore()
+
+    await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Do something unknown."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="I cannot do that here."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-no-match",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert runtime.capability_match_calls
+    assert runtime.capability_authority_calls == []
+    assert runtime.capability_authorization_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["match"]["matched"] is False
+    assert trace["capability_registry"]["authority"]["attempted"] is False
+    assert trace["capabilities"]["executor_call_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1653,7 +1740,18 @@ async def test_orchestrate_registry_context_blocks_provider_tool_execution(tmp_p
                     "verification_supported": False,
                 },
             }
-        }
+        },
+        capability_authority_response={
+            "result": {
+                "capability_id": "draft_notification",
+                "risk_level": "low_reversible",
+                "authority_level": "prepare_only",
+                "requires_confirmation": False,
+                "allowed": True,
+                "reason_summary": ["registered_capability", "prepare_only"],
+                "action_taken": False,
+            }
+        },
     )
     memory_store = FakeMemoryStore()
 
@@ -1676,6 +1774,7 @@ async def test_orchestrate_registry_context_blocks_provider_tool_execution(tmp_p
 
     assert out["answer"] == "I found a registered capability, but I did not execute it."
     assert runtime.capability_authorization_calls == []
+    assert runtime.capability_authority_calls[0]["capability_id"] == "draft_notification"
     assert runtime.world_state_verification_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["action_taken"] is False
@@ -1737,6 +1836,7 @@ async def test_orchestrate_consumes_capability_discovery_examples(tmp_path):
 
     assert runtime.capability_match_calls == []
     assert runtime.capability_discovery_calls[0]["active_persona_id"] == "technical_architect"
+    assert runtime.capability_authority_calls == []
     assert any(
         msg["role"] == "system"
         and "Turn on office lights" in msg["content"]
@@ -1813,6 +1913,291 @@ async def test_orchestrate_capability_registry_malformed_response_is_conservativ
     assert trace["match"]["attempted"] is True
     assert trace["match"]["status"] == "failed"
     assert trace["action_taken"] is False
+    assert runtime.capability_authority_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_matched_capability_requires_confirmation_without_execution(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response={
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["matched"],
+                "capability": {
+                    "capability_id": "jellyfin_restart",
+                    "display_name": "Restart media service",
+                    "domain": "home_infrastructure",
+                    "description": "Restarts a local media service.",
+                    "operation_kind": "restart",
+                    "risk_level": "medium_requires_confirmation",
+                    "requires_confirmation": True,
+                    "allowed_surfaces": ["dev"],
+                    "allowed_personas": ["technical_architect"],
+                    "reversible": True,
+                    "dry_run_supported": True,
+                    "verification_supported": True,
+                },
+            }
+        },
+        capability_authority_response={
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "risk_level": "medium_requires_confirmation",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        },
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Restart media service."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-confirm-first",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "That action requires explicit confirmation before I proceed. I did not execute it."
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["authority"]["requires_confirmation"] is True
+    assert trace["capability_registry"]["authority"]["allowed"] is False
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_blocked_authority_refuses_without_execution(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response={
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["matched"],
+                "capability": {
+                    "capability_id": "external_purchase",
+                    "display_name": "External purchase",
+                    "domain": "commerce",
+                    "description": "Attempts an external purchase.",
+                    "operation_kind": "blocked_external_action",
+                    "risk_level": "blocked",
+                    "requires_confirmation": True,
+                    "allowed_surfaces": ["dev"],
+                    "allowed_personas": ["technical_architect"],
+                    "reversible": False,
+                    "dry_run_supported": False,
+                    "verification_supported": False,
+                },
+            }
+        },
+        capability_authority_response={
+            "result": {
+                "capability_id": "external_purchase",
+                "risk_level": "blocked",
+                "authority_level": "blocked",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "execution_blocked"],
+                "action_taken": False,
+            }
+        },
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Buy this externally."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-blocked",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "That registered capability is not available for execution here. I did not execute it."
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["authority"]["authority_level"] == "blocked"
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_low_risk_authority_still_does_not_execute(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = CapabilityRuntime(
+        capability_match_response={
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["matched"],
+                "capability": {
+                    "capability_id": "office_lights_on",
+                    "display_name": "Turn on office lights",
+                    "domain": "home_automation",
+                    "description": "Turns on office lights through the local automation layer.",
+                    "operation_kind": "state_change",
+                    "risk_level": "low_reversible",
+                    "requires_confirmation": False,
+                    "allowed_surfaces": ["dev"],
+                    "allowed_personas": ["technical_architect"],
+                    "reversible": True,
+                    "dry_run_supported": True,
+                    "verification_supported": True,
+                },
+            }
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Turn on office lights."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "draft_local_message",
+                {"body": "PRIVATE-DRAFT-BODY", "recipient_label": "reviewer"},
+            )
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-low-risk-no-execute",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I found that this is allowed as a low-risk capability, but I did not execute it."
+    )
+    assert runtime.capability_authorization_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["authority"]["authority_level"] == "execute_low_risk"
+    assert trace["capabilities"]["execution"]["executor_called"] is False
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_malformed_authority_response_is_conservative(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response={
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["matched"],
+                "capability": {
+                    "capability_id": "office_lights_on",
+                    "display_name": "Turn on office lights",
+                    "domain": "home_automation",
+                    "description": "Turns on office lights.",
+                    "operation_kind": "state_change",
+                    "risk_level": "low_reversible",
+                    "requires_confirmation": False,
+                    "allowed_surfaces": ["dev"],
+                    "allowed_personas": ["technical_architect"],
+                    "reversible": True,
+                    "dry_run_supported": True,
+                    "verification_supported": True,
+                },
+            }
+        },
+        capability_authority_response={"result": {"action_taken": True}},
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Turn on office lights."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-bad-authority",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == "I found a matching registered capability, but I did not execute it."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capability_registry"
+    ]
+    assert trace["reason"] == "malformed_capability_authority_response"
+    assert trace["authority"] == {
+        "attempted": True,
+        "status": "failed",
+        "reason": "malformed_capability_authority_response",
+        "action_taken": False,
+    }
+    assert "action_taken': True" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_authority_failure_is_conservative(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response={
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["matched"],
+                "capability": {
+                    "capability_id": "office_lights_on",
+                    "display_name": "Turn on office lights",
+                    "domain": "home_automation",
+                    "description": "Turns on office lights.",
+                    "operation_kind": "state_change",
+                    "risk_level": "low_reversible",
+                    "requires_confirmation": False,
+                    "allowed_surfaces": ["dev"],
+                    "allowed_personas": ["technical_architect"],
+                    "reversible": True,
+                    "dry_run_supported": True,
+                    "verification_supported": True,
+                },
+            }
+        },
+        capability_authority_error=RuntimeError("private authority outage detail"),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Turn on office lights."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-authority-fallback",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == "I found a matching registered capability, but I did not execute it."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capability_registry"
+    ]
+    assert trace["reason"] == "capability_authority_unavailable"
+    assert trace["authority"] == {
+        "attempted": True,
+        "status": "failed",
+        "reason": "capability_authority_unavailable",
+        "action_taken": False,
+    }
+    assert "private authority outage detail" not in str(trace)
 
 
 @pytest.mark.asyncio
