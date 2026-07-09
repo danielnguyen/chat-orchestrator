@@ -102,6 +102,17 @@ def _relationship_context_disabled_trace() -> dict[str, Any]:
     return {"attempted": False, "status": "disabled", "included": False}
 
 
+def _capability_registry_disabled_trace() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "status": "disabled",
+        "context_included": False,
+        "action_taken": False,
+        "match": {"attempted": False, "status": "disabled"},
+        "discovery": {"attempted": False, "status": "disabled"},
+    }
+
+
 def _selected_relationship_ids_from_trace(trace: dict[str, Any] | None) -> list[str]:
     if not isinstance(trace, dict):
         return []
@@ -1352,6 +1363,267 @@ def _sanitize_trace_int(
 
 def _sanitize_trace_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _capability_discovery_requested(text: str) -> bool:
+    normalized = " ".join(text.casefold().split())
+    return any(
+        phrase in normalized
+        for phrase in (
+            "what can you control",
+            "what actions can you take",
+            "what capabilities do you have",
+            "what can you do",
+        )
+    )
+
+
+def _capability_registry_base_trace(*, enabled: bool, reason: str | None = None) -> dict[str, Any]:
+    status = "not_requested" if enabled else "disabled"
+    trace = {
+        "enabled": enabled,
+        "status": status,
+        "context_included": False,
+        "action_taken": False,
+        "match": {"attempted": False, "status": status},
+        "discovery": {"attempted": False, "status": status},
+    }
+    if reason is not None:
+        trace["reason"] = reason
+    return trace
+
+
+def _safe_capability_example(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    capability_id = _sanitize_trace_string(value.get("capability_id"), max_length=120)
+    display_name = _sanitize_trace_string(value.get("display_name"), max_length=120)
+    operation_kind = _sanitize_trace_string(value.get("operation_kind"), max_length=80)
+    risk_level = _sanitize_trace_string(value.get("risk_level"), max_length=80)
+    reason_codes = _sanitize_trace_string_list(value.get("reason_codes"), limit=8)
+    if capability_id is None and display_name is None:
+        return None
+    return {
+        "capability_id": capability_id,
+        "display_name": display_name,
+        "operation_kind": operation_kind,
+        "risk_level": risk_level,
+        "reason_codes": reason_codes or [],
+    }
+
+
+def _safe_capability_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    capability_id = _sanitize_trace_string(value.get("capability_id"), max_length=120)
+    if capability_id is None:
+        return None
+    return {
+        "capability_id": capability_id,
+        "display_name": _sanitize_trace_string(value.get("display_name"), max_length=120),
+        "domain": _sanitize_trace_string(value.get("domain"), max_length=80),
+        "operation_kind": _sanitize_trace_string(value.get("operation_kind"), max_length=80),
+        "risk_level": _sanitize_trace_string(value.get("risk_level"), max_length=80),
+        "requires_confirmation": _sanitize_trace_bool(value.get("requires_confirmation")),
+        "reversible": _sanitize_trace_bool(value.get("reversible")),
+        "dry_run_supported": _sanitize_trace_bool(value.get("dry_run_supported")),
+        "verification_supported": _sanitize_trace_bool(value.get("verification_supported")),
+    }
+
+
+def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str, str]]:
+    if trace.get("context_included") is not True:
+        return []
+    discovery = trace.get("discovery") if isinstance(trace.get("discovery"), dict) else {}
+    if discovery.get("status") == "included":
+        allowed = discovery.get("allowed_examples") if isinstance(discovery, dict) else []
+        blocked = discovery.get("blocked_examples") if isinstance(discovery, dict) else []
+        lines = [
+            "Capability registry context:",
+            "- Summarize only the listed allowed and unavailable examples.",
+            "- Do not mention internal endpoints or tracing details.",
+            "- Do not say that an action was completed.",
+        ]
+        allowed_names = [
+            item.get("display_name") or item.get("capability_id")
+            for item in allowed[:6]
+            if isinstance(item, dict) and (item.get("display_name") or item.get("capability_id"))
+        ]
+        blocked_names = [
+            item.get("display_name") or item.get("capability_id")
+            for item in blocked[:6]
+            if isinstance(item, dict) and (item.get("display_name") or item.get("capability_id"))
+        ]
+        if allowed_names:
+            lines.append(f"- Allowed examples: {', '.join(allowed_names)}.")
+        if blocked_names:
+            lines.append(f"- Unavailable examples: {', '.join(blocked_names)}.")
+        return [{"role": "system", "content": "\n".join(lines)}]
+
+    match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
+    capability = match.get("capability") if isinstance(match.get("capability"), dict) else None
+    if match.get("matched") is True and capability:
+        label = capability.get("display_name") or capability.get("capability_id")
+        operation_kind = capability.get("operation_kind")
+        risk_level = capability.get("risk_level")
+        requires_confirmation = capability.get("requires_confirmation")
+        lines = [
+            "Capability registry context:",
+            f"- The runtime matched a registered capability: {label}.",
+            "- Treat this as registry context only; do not execute the action.",
+            "- Do not say that the action was completed.",
+        ]
+        if operation_kind:
+            lines.append(f"- Operation kind: {operation_kind}.")
+        if risk_level:
+            lines.append(f"- Risk level: {risk_level}.")
+        if requires_confirmation is not None:
+            lines.append(f"- Requires confirmation: {str(requires_confirmation).lower()}.")
+        return [{"role": "system", "content": "\n".join(lines)}]
+    return []
+
+
+def _capability_completion_claim(text: str) -> bool:
+    normalized = " ".join(text.casefold().split())
+    return any(
+        claim in normalized
+        for claim in (
+            "done",
+            "completed",
+            "i turned",
+            "i restarted",
+            "i sent",
+            "i changed",
+            "it is on",
+        )
+    )
+
+
+def _apply_capability_registry_response_boundary(text: str, trace: dict[str, Any]) -> str:
+    match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
+    if (
+        match.get("matched") is True
+        and trace.get("action_taken") is False
+        and _capability_completion_claim(text)
+    ):
+        capability = match.get("capability") if isinstance(match.get("capability"), dict) else {}
+        label = capability.get("display_name") or capability.get("capability_id")
+        if isinstance(label, str) and label:
+            return f"I found the registered capability for {label}, but I did not execute it."
+        return "I found a matching registered capability, but I did not execute it."
+    return text
+
+
+async def _resolve_capability_registry_context(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    active_persona_id: str | None,
+    current_user_text: str,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    if not enabled:
+        return [], _capability_registry_disabled_trace()
+    if runtime is None:
+        return [], _capability_registry_base_trace(
+            enabled=True,
+            reason="runtime_client_not_configured",
+        )
+    if not active_persona_id:
+        return [], _capability_registry_base_trace(
+            enabled=True,
+            reason="active_persona_unavailable",
+        )
+
+    discovery_requested = _capability_discovery_requested(current_user_text)
+    trace = _capability_registry_base_trace(enabled=True)
+    try:
+        if discovery_requested:
+            response = await runtime.discover_capabilities(
+                request_id=f"{request_id}:capability-discovery",
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface=surface,
+                active_persona_id=active_persona_id,
+            )
+            result = response.get("result") if isinstance(response, dict) else None
+            if not isinstance(result, dict) or result.get("action_taken") is not False:
+                trace["status"] = "failed"
+                trace["reason"] = "malformed_capability_discovery_response"
+                trace["discovery"] = {
+                    "attempted": True,
+                    "status": "failed",
+                    "reason": "malformed_capability_discovery_response",
+                }
+                return [], trace
+            allowed = [
+                safe
+                for item in (result.get("allowed_examples") or [])
+                if (safe := _safe_capability_example(item)) is not None
+            ][:16]
+            blocked = [
+                safe
+                for item in (result.get("blocked_examples") or [])
+                if (safe := _safe_capability_example(item)) is not None
+            ][:16]
+            trace.update({"status": "included", "context_included": True})
+            trace["discovery"] = {
+                "attempted": True,
+                "status": "included",
+                "registry_available": _sanitize_trace_bool(result.get("registry_available")),
+                "reason_codes": _sanitize_trace_string_list(result.get("reason_codes"), limit=8)
+                or [],
+                "allowed_examples": allowed,
+                "blocked_examples": blocked,
+                "allowed_count": len(allowed),
+                "blocked_count": len(blocked),
+            }
+        else:
+            response = await runtime.match_capability(
+                request_id=f"{request_id}:capability-match",
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface=surface,
+                active_persona_id=active_persona_id,
+                current_user_text=current_user_text,
+            )
+            result = response.get("result") if isinstance(response, dict) else None
+            if not isinstance(result, dict) or result.get("action_taken") is not False:
+                trace["status"] = "failed"
+                trace["reason"] = "malformed_capability_match_response"
+                trace["match"] = {
+                    "attempted": True,
+                    "status": "failed",
+                    "reason": "malformed_capability_match_response",
+                }
+                return [], trace
+            capability = _safe_capability_record(result.get("capability"))
+            matched = _sanitize_trace_bool(result.get("capability_matched"))
+            reason_codes = _sanitize_trace_string_list(result.get("reason_codes"), limit=8) or []
+            trace.update({"status": "included", "context_included": bool(capability)})
+            trace["match"] = {
+                "attempted": True,
+                "status": "included",
+                "matched": matched,
+                "matched_capability_id": capability.get("capability_id") if capability else None,
+                "capability": capability,
+                "reason_codes": reason_codes,
+            }
+    except Exception:
+        trace["status"] = "failed"
+        trace["reason"] = "capability_registry_unavailable"
+        key = "discovery" if discovery_requested else "match"
+        trace[key] = {
+            "attempted": True,
+            "status": "failed",
+            "reason": "capability_registry_unavailable",
+        }
+        return [], trace
+
+    return _capability_registry_prompt_messages(trace), trace
 
 
 def _safe_error_summary(error: BaseException) -> dict[str, str]:
@@ -4200,6 +4472,7 @@ async def orchestrate_chat(
     restraint_enabled: bool = False,
     memory_hygiene_enabled: bool = False,
     privacy_context_enabled: bool = False,
+    capability_registry_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -4242,6 +4515,8 @@ async def orchestrate_chat(
     persona_containment_trace: dict[str, Any] = _persona_containment_disabled_trace()
     restraint: dict[str, Any] | None = None
     restraint_trace: dict[str, Any] = _restraint_disabled_trace()
+    capability_registry_messages: list[dict[str, str]] = []
+    capability_registry_trace: dict[str, Any] = _capability_registry_disabled_trace()
     mandatory_policy = MandatoryRetrievalPolicy(
         containment_policy=None,
         relationship_context=None,
@@ -4770,6 +5045,18 @@ async def orchestrate_chat(
                 runtime_session_id=runtime_session_trace.get("runtime_session_id"),
                 active_persona_id=runtime_identity_trace.get("active_persona_id"),
             )
+        capability_registry_messages, capability_registry_trace = (
+            await _resolve_capability_registry_context(
+                runtime=runtime,
+                enabled=capability_registry_enabled,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                current_user_text=last_user_text,
+            )
+        )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -4880,6 +5167,7 @@ async def orchestrate_chat(
                         "privacy_context": privacy_context_trace,
                         "world_state": world_state_trace,
                         "relationship_context": _relationship_context_disabled_trace(),
+                        "capability_registry": capability_registry_trace,
                         "runtime": runtime_trace,
                         "dsa": dsa_trace,
                         "memory_episode_recall_composition": provider_memory_recall_trace,
@@ -4917,22 +5205,35 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
-        (
-            capability_descriptors,
-            capability_exposure_trace,
-        ) = await filter_capability_descriptors_for_exposure(
-            runtime=runtime,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            active_persona_id=runtime_identity_trace.get("active_persona_id"),
-            selected_relationship_ids=_selected_relationship_ids_from_trace(
-                relationship_context_trace
-            ),
-        )
+        if capability_registry_enabled:
+            capability_descriptors = []
+            capability_exposure_trace = {
+                "schema_version": "capability-exposure.v1",
+                "status": "not_requested",
+                "reason": "registry_context_only",
+                "descriptor_count": 0,
+                "descriptor_fingerprint": None,
+                "exposed_capability_ids": [],
+                "blocked_capability_ids": [],
+                "blocked_reasons": {},
+            }
+        else:
+            (
+                capability_descriptors,
+                capability_exposure_trace,
+            ) = await filter_capability_descriptors_for_exposure(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                selected_relationship_ids=_selected_relationship_ids_from_trace(
+                    relationship_context_trace
+                ),
+            )
 
         handoff = build_assistant_handoff(
             request_id=request_id,
@@ -4964,7 +5265,7 @@ async def orchestrate_chat(
             prompt = assemble_prompt(
                 profile=profile,
                 retrieval_bundle=provider_retrieval_bundle,
-                current_messages=effective_payload["messages"],
+                current_messages=[*capability_registry_messages, *effective_payload["messages"]],
                 handoff=handoff,
                 presentation=presentation,
                 style_guidance=style_guidance,
@@ -5040,6 +5341,7 @@ async def orchestrate_chat(
                 "privacy_context": privacy_context_trace,
                 "world_state": world_state_trace,
                 "relationship_context": relationship_context_trace,
+                "capability_registry": capability_registry_trace,
                 "runtime": runtime_trace,
                 "dsa": dsa_trace,
                 "memory_episode_recall_composition": provider_memory_recall_trace,
@@ -5077,6 +5379,7 @@ async def orchestrate_chat(
             )
             raise RuntimeError(budget_error.reason) from budget_error
         messages = prompt.messages
+        prompt.trace["capability_registry"] = capability_registry_trace
         prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
         prompt.trace["result_boundary"] = result_boundary_trace
         _apply_post_budget_survivor_trace(
@@ -5298,56 +5601,76 @@ async def orchestrate_chat(
                 )
                 raise
 
-        raw_answer = provider_text(completion)
+        raw_answer = _apply_capability_registry_response_boundary(
+            provider_text(completion),
+            capability_registry_trace,
+        )
         capability_request = None
         try:
             capability_request = parse_provider_capability_request(completion)
             if capability_request is not None:
-                validation_result = validate_and_digest_capability_request(
-                    request=capability_request,
-                    exposed_capability_ids=capability_exposure_trace.get(
-                        "exposed_capability_ids",
-                        [],
-                    ),
-                )
-                prompt.trace["capabilities"]["validation"] = validation_result.trace
-                execution_result = await authorize_and_execute_capability(
-                    runtime=runtime,
-                    request_id=request_id,
-                    owner_id=payload["owner_id"],
-                    conversation_id=conversation_id,
-                    surface=surface,
-                    runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-                    runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-                    active_persona_id=runtime_identity_trace.get("active_persona_id"),
-                    validation_result=validation_result,
-                    selected_relationship_ids=_selected_relationship_ids_from_trace(
-                        relationship_context_trace
-                    ),
-                    revalidators=capability_revalidators,
-                    capability_confirmation=payload.get("capability_confirmation"),
-                )
-                prompt.trace["capabilities"]["execution"] = execution_result.trace
-                executor_call_count = execution_result.trace.get("executor_call_count")
-                if isinstance(executor_call_count, int):
-                    prompt.trace["capabilities"]["executor_call_count"] = executor_call_count
-                dispatch_completed = (
-                    execution_result.trace.get("executor_called") is True
-                    and execution_result.trace.get("executor_call_count") == 1
-                )
-                prompt.trace["capabilities"]["dispatch_completed"] = dispatch_completed
-                if dispatch_completed:
-                    prompt.trace["capabilities"]["fallback"]["blocked_after_dispatch"] = True
-                if execution_result.trace.get("response_status") == "executed":
-                    raw_answer, follow_up_trace = await _attempt_capability_follow_up(
-                        litellm=litellm,
-                        request_id=request_id,
-                        model=selected_model,
-                        execution_result=execution_result,
-                    )
-                    prompt.trace["capabilities"]["follow_up"] = follow_up_trace
+                if capability_registry_trace.get("context_included") is True:
+                    prompt.trace["capabilities"]["validation"] = {
+                        "validation_status": "not_requested",
+                        "reason_code": "registry_context_only",
+                    }
+                    prompt.trace["capabilities"]["execution"] = {
+                        "executor_called": False,
+                        "executor_call_count": 0,
+                        "executor_result_status": "not_called",
+                        "failure_reason_code": "registry_context_only",
+                        "response_status": "not_executed",
+                    }
+                    prompt.trace["capabilities"]["follow_up"] = _capability_follow_up_empty_trace()
+                    prompt.trace["capabilities"]["dispatch_completed"] = False
+                    prompt.trace["capabilities"]["executor_call_count"] = 0
+                    raw_answer = "I found a registered capability, but I did not execute it."
                 else:
-                    raw_answer = execution_result.response_text
+                    validation_result = validate_and_digest_capability_request(
+                        request=capability_request,
+                        exposed_capability_ids=capability_exposure_trace.get(
+                            "exposed_capability_ids",
+                            [],
+                        ),
+                    )
+                    prompt.trace["capabilities"]["validation"] = validation_result.trace
+                    execution_result = await authorize_and_execute_capability(
+                        runtime=runtime,
+                        request_id=request_id,
+                        owner_id=payload["owner_id"],
+                        conversation_id=conversation_id,
+                        surface=surface,
+                        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                        active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                        validation_result=validation_result,
+                        selected_relationship_ids=_selected_relationship_ids_from_trace(
+                            relationship_context_trace
+                        ),
+                        revalidators=capability_revalidators,
+                        capability_confirmation=payload.get("capability_confirmation"),
+                    )
+                    prompt.trace["capabilities"]["execution"] = execution_result.trace
+                    executor_call_count = execution_result.trace.get("executor_call_count")
+                    if isinstance(executor_call_count, int):
+                        prompt.trace["capabilities"]["executor_call_count"] = executor_call_count
+                    dispatch_completed = (
+                        execution_result.trace.get("executor_called") is True
+                        and execution_result.trace.get("executor_call_count") == 1
+                    )
+                    prompt.trace["capabilities"]["dispatch_completed"] = dispatch_completed
+                    if dispatch_completed:
+                        prompt.trace["capabilities"]["fallback"]["blocked_after_dispatch"] = True
+                    if execution_result.trace.get("response_status") == "executed":
+                        raw_answer, follow_up_trace = await _attempt_capability_follow_up(
+                            litellm=litellm,
+                            request_id=request_id,
+                            model=selected_model,
+                            execution_result=execution_result,
+                        )
+                        prompt.trace["capabilities"]["follow_up"] = follow_up_trace
+                    else:
+                        raw_answer = execution_result.response_text
             else:
                 prompt.trace["capabilities"]["follow_up"] = _capability_follow_up_empty_trace()
                 prompt.trace["capabilities"]["dispatch_completed"] = False
