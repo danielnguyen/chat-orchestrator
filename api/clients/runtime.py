@@ -295,6 +295,48 @@ class RuntimeClient:
         }
         return await self._post("/v1/capabilities/authorize", json=payload)
 
+    async def match_capability(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        active_persona_id: str,
+        current_user_text: str,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/capabilities/match",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "surface": surface,
+                "active_persona_id": active_persona_id,
+                "current_user_text": current_user_text,
+            },
+        )
+
+    async def discover_capabilities(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        active_persona_id: str,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/capabilities/discover",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "surface": surface,
+                "active_persona_id": active_persona_id,
+            },
+        )
+
     async def confirm_capability(
         self,
         *,
