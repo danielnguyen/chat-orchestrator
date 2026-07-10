@@ -499,6 +499,63 @@ async def test_action_authority_posts_expected_bounded_payload():
 
 
 @pytest.mark.asyncio
+async def test_action_flow_posts_expected_bounded_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"result": {"execution_allowed": False, "action_taken": False}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.action_flow(
+        request_id="rid:cap:flow",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        active_persona_id="technical_architect",
+        capability_id="office_lights_on",
+        flow_intent="preview_requested",
+        target_resolution_state="resolved",
+        target_label="office lights",
+        world_state_freshness="unknown",
+        affects_multiple_systems=False,
+        consequence_flags={"external_consequence": False},
+        interaction_governance_kind="command",
+        interaction_governance_tension="low",
+        user_authorization_signal="explicit",
+    )
+
+    assert calls == [
+        (
+            "/v1/capabilities/flow",
+            {
+                "request_id": "rid:cap:flow",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "active_persona_id": "technical_architect",
+                "capability_id": "office_lights_on",
+                "flow_intent": "preview_requested",
+                "target_resolution_state": "resolved",
+                "world_state_freshness": "unknown",
+                "affects_multiple_systems": False,
+                "consequence_flags": {"external_consequence": False},
+                "user_authorization_signal": "explicit",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "target_label": "office lights",
+                "interaction_governance_kind": "command",
+                "interaction_governance_tension": "low",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_world_state_claim_verify_posts_expected_structural_payload():
     client = RuntimeClient("http://runtime.local", None)
     calls: list[tuple[str, dict[str, object]]] = []
