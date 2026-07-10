@@ -514,6 +514,7 @@ async def authorize_and_execute_capability(
     selected_relationship_ids: list[str] | None = None,
     revalidators: dict[str, Revalidator] | None = None,
     capability_confirmation: dict[str, Any] | None = None,
+    post_execution_verification_required: bool = False,
 ) -> CapabilityExecutionResult:
     entry = capability_by_id(validation_result.capability_id)
     trace = {
@@ -532,6 +533,16 @@ async def authorize_and_execute_capability(
         "executor_called": False,
         "executor_call_count": 0,
         "executor_result_status": "not_called",
+        "post_execution_verification": {
+            "required": post_execution_verification_required,
+            "method": (
+                "capability_verification"
+                if post_execution_verification_required
+                else None
+            ),
+            "status": "pending" if post_execution_verification_required else "not_required",
+            "reason_code": None,
+        },
         "failure_reason_code": None,
         "response_status": "not_executed",
     }
@@ -691,11 +702,118 @@ async def authorize_and_execute_capability(
             "I could not complete that capability request.",
             executor_failed=True,
         )
+    if post_execution_verification_required:
+        verification = _post_execution_verification(entry, executor_result)
+        trace["post_execution_verification"] = verification
+        if verification["status"] != "verified":
+            trace["failure_reason_code"] = verification["reason_code"]
+            trace["response_status"] = "executed_unverified"
+            return CapabilityExecutionResult(
+                response_text=(
+                    "I read bounded runtime world state, but I could not verify the "
+                    "result safely."
+                ),
+                trace=trace,
+            )
+        trace["response_status"] = "executed_verified"
+        return CapabilityExecutionResult(
+            response_text=(
+                "I read bounded runtime world state and verified the result: found "
+                f"{verification['matching_claim_count']} matching claim(s)."
+            ),
+            trace=trace,
+        )
     trace["response_status"] = "executed"
     return CapabilityExecutionResult(
         response_text=executor_result["response_text"],
         trace=trace,
     )
+
+
+def _post_execution_verification(
+    entry: CapabilityEntry,
+    executor_result: dict[str, Any],
+) -> dict[str, Any]:
+    failed = {
+        "required": True,
+        "method": "capability_verification",
+        "status": "failed",
+        "reason_code": "verification_result_malformed",
+    }
+    if entry.capability_id != "runtime.world_state.read":
+        return {**failed, "reason_code": "verification_not_supported"}
+    try:
+        result = _verify_world_state_read_result(executor_result)
+    except Exception:
+        return failed
+    if not isinstance(result, dict):
+        return failed
+    status = result.get("status")
+    reason_code = result.get("reason_code")
+    matching_claim_count = result.get("matching_claim_count")
+    if status != "verified":
+        return {
+            **failed,
+            "reason_code": (
+                reason_code[:80]
+                if isinstance(reason_code, str) and reason_code
+                else "verification_failed"
+            ),
+        }
+    if (
+        not isinstance(matching_claim_count, int)
+        or isinstance(matching_claim_count, bool)
+        or matching_claim_count < 0
+    ):
+        return failed
+    return {
+        "required": True,
+        "method": "capability_verification",
+        "status": "verified",
+        "reason_code": "bounded_result_verified",
+        "matching_claim_count": matching_claim_count,
+    }
+
+
+def _verify_world_state_read_result(executor_result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(executor_result, dict) or executor_result.get("status") != "ok":
+        return {"status": "failed", "reason_code": "executor_result_not_ok"}
+    result = executor_result.get("trace")
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return {"status": "failed", "reason_code": "executor_result_malformed"}
+    if result.get("output_mode") not in _WORLD_STATE_OUTPUT_MODES:
+        return {"status": "failed", "reason_code": "executor_result_malformed"}
+    count_fields = (
+        "included_claim_count",
+        "excluded_claim_count",
+        "domain_count",
+        "stale_count",
+        "aging_count",
+        "expired_count",
+        "conflicted_count",
+    )
+    if any(
+        not isinstance(result.get(field), int)
+        or isinstance(result.get(field), bool)
+        or result[field] < 0
+        for field in count_fields
+    ):
+        return {"status": "failed", "reason_code": "executor_result_malformed"}
+    domains = result.get("domains")
+    if (
+        not isinstance(domains, list)
+        or len(domains) > 8
+        or any(not isinstance(domain, str) or not domain for domain in domains)
+        or result["domain_count"] != len(domains)
+        or domains != sorted(set(domains))
+        or result.get("confirmation_required") is not False
+    ):
+        return {"status": "failed", "reason_code": "executor_result_malformed"}
+    return {
+        "status": "verified",
+        "reason_code": "bounded_result_verified",
+        "matching_claim_count": result["included_claim_count"],
+    }
 
 
 def capability_validation_failure_trace(
@@ -1581,6 +1699,12 @@ def _capability_not_executed(
     *,
     executor_failed: bool = False,
 ) -> CapabilityExecutionResult:
+    verification = trace.get("post_execution_verification")
+    if isinstance(verification, dict) and verification.get("status") == "pending":
+        verification["status"] = "not_attempted"
+        verification["reason_code"] = (
+            "executor_not_successful" if executor_failed else "execution_not_started"
+        )
     trace["failure_reason_code"] = reason_code
     trace["response_status"] = "executor_failed" if executor_failed else "not_executed"
     if executor_failed:

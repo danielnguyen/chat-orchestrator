@@ -2,6 +2,7 @@ import json
 
 import httpx
 import pytest
+import services.capabilities as capability_service
 from clients.runtime import RuntimeClient
 from services.capabilities import RevalidationOutput, Revalidator, RevalidatorEntry
 from services.orchestrate import (
@@ -1618,6 +1619,56 @@ def _capability_match_response(
     }
 
 
+def _world_state_registry_runtime(
+    *,
+    authority_allowed: bool = True,
+    authority_requires_confirmation: bool = False,
+    authority_level: str = "answer_only",
+    execution_allowed: bool = True,
+    confirmation_required: bool = False,
+    verification_required: bool = True,
+    verification_supported: bool = True,
+    verification_method: str | None = "capability_verification",
+) -> CapabilityRuntime:
+    return CapabilityRuntime(
+        capability_match_response=_capability_match_response(
+            capability_id="runtime.world_state.read",
+            display_name="Read runtime world state",
+            domain="runtime_context",
+            operation_kind="read_only",
+            risk_level="low_read_only",
+            requires_confirmation=False,
+            reversible=True,
+            verification_supported=True,
+        ),
+        capability_authority_response={
+            "result": {
+                "capability_id": "runtime.world_state.read",
+                "risk_level": "read_only",
+                "authority_level": authority_level,
+                "requires_confirmation": authority_requires_confirmation,
+                "allowed": authority_allowed,
+                "reason_summary": ["registered_capability", "read_only_authority"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="runtime.world_state.read",
+            confirmation_required=confirmation_required,
+            confirmation_text=(
+                "Confirm reading bounded runtime world state."
+                if confirmation_required
+                else None
+            ),
+            execution_allowed=execution_allowed,
+            verification_required=verification_required,
+            verification_supported=verification_supported,
+            verification_method=verification_method,
+            reason_summary=["registered_capability", "execution_allowed_by_policy"],
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_runtime_client_capability_match_posts_expected_payload():
     client = RuntimeClient("http://runtime.local", None)
@@ -2685,6 +2736,293 @@ async def test_orchestrate_action_flow_verification_is_future_required(tmp_path)
     action_flow = trace["capability_registry"]["action_flow"]
     assert action_flow["verification_required"] is True
     assert action_flow["verification_method"] == "capability_verification"
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies_result(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+    completion = _tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+    completion["choices"][0]["message"]["content"] = "Done. Successfully verified everything."
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(completion=completion),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-world-state-verified",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I read bounded runtime world state and verified the result: found "
+        "0 matching claim(s)."
+    )
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    execution = trace["capabilities"]["execution"]
+    assert execution["executor_called"] is True
+    assert execution["executor_call_count"] == 1
+    assert execution["executor_result_status"] == "ok"
+    assert execution["post_execution_verification"] == {
+        "required": True,
+        "method": "capability_verification",
+        "status": "verified",
+        "reason_code": "bounded_result_verified",
+        "matching_claim_count": 0,
+    }
+    assert execution["response_status"] == "executed_verified"
+    assert trace["capabilities"]["dispatch_completed"] is True
+    assert trace["capabilities"]["executor_call_count"] == 1
+    assert trace["capabilities"]["follow_up"]["status"] == "not_attempted"
+    assert trace["capabilities"]["follow_up"]["call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_reports_registry_world_state_verification_failure(tmp_path, monkeypatch):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+    monkeypatch.setattr(
+        capability_service,
+        "_verify_world_state_read_result",
+        lambda _result: {"status": "failed", "reason_code": "result_check_failed"},
+    )
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-world-state-unverified",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I read bounded runtime world state, but I could not verify the result safely."
+    )
+    assert "verified the result" not in out["answer"].casefold()
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    execution = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]["execution"]
+    assert execution["executor_result_status"] == "ok"
+    assert execution["post_execution_verification"]["status"] == "failed"
+    assert execution["post_execution_verification"]["reason_code"] == "result_check_failed"
+    assert execution["response_status"] == "executed_unverified"
+
+
+@pytest.mark.parametrize(
+    "verification_result",
+    [None, {"status": "verified"}, "malformed"],
+)
+@pytest.mark.asyncio
+async def test_orchestrate_does_not_claim_success_for_missing_verification_result(
+    tmp_path,
+    monkeypatch,
+    verification_result,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+    monkeypatch.setattr(
+        capability_service,
+        "_verify_world_state_read_result",
+        lambda _result: verification_result,
+    )
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-world-state-missing-verification",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert "could not verify the result safely" in out["answer"]
+    assert "verified the result" not in out["answer"].casefold()
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    execution = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]["execution"]
+    assert execution["post_execution_verification"]["status"] == "failed"
+    assert execution["response_status"] == "executed_unverified"
+
+
+@pytest.mark.parametrize(
+    ("runtime_kwargs", "expected_answer_fragment"),
+    [
+        (
+            {
+                "authority_allowed": False,
+                "authority_level": "suggest_only",
+            },
+            "did not execute",
+        ),
+        ({"execution_allowed": False}, "did not execute"),
+        (
+            {
+                "authority_allowed": False,
+                "authority_requires_confirmation": True,
+                "authority_level": "execute_after_confirmation",
+                "execution_allowed": False,
+                "confirmation_required": True,
+            },
+            "No action was taken",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrate_blocks_exact_registry_read_when_policy_does_not_allow_execution(
+    tmp_path,
+    runtime_kwargs,
+    expected_answer_fragment,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime(**runtime_kwargs)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-world-state-policy-block",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert expected_answer_fragment in out["answer"]
+    assert [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ] == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_blocks_provider_registry_identity_mismatch(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "draft_local_message",
+                {"body": "PRIVATE-DRAFT-BODY"},
+            )
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-capability-mismatch",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "This action is allowed by policy, but I did not execute it. "
+        "Verification would be required after execution."
+    )
+    assert [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ] == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["validation"]["reason_code"] == "registry_context_only"
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_keeps_other_registry_capabilities_non_executing(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = CapabilityRuntime(
+        capability_match_response=_capability_match_response(
+            capability_id="draft_notification",
+            display_name="Draft notification",
+            domain="notifications",
+            operation_kind="draft_or_prepare",
+            risk_level="low_reversible",
+        ),
+        capability_authority_response={
+            "result": {
+                "capability_id": "draft_notification",
+                "risk_level": "low_reversible",
+                "authority_level": "prepare_only",
+                "requires_confirmation": False,
+                "allowed": True,
+                "reason_summary": ["registered_capability"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="draft_notification",
+            execution_allowed=True,
+            verification_required=True,
+            verification_supported=True,
+            verification_method="capability_verification",
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Draft a notification."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("draft_local_message", {"body": "PRIVATE-DRAFT-BODY"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-draft-still-blocked",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert "did not execute" in out["answer"]
+    assert runtime.capability_authorization_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capabilities"]["executor_call_count"] == 0
 
 

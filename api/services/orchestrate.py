@@ -1591,6 +1591,47 @@ def _safe_action_flow_decision(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _registry_allows_exact_capability_execution(trace: dict[str, Any]) -> bool:
+    match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
+    capability = match.get("capability") if isinstance(match.get("capability"), dict) else {}
+    authority = trace.get("authority") if isinstance(trace.get("authority"), dict) else {}
+    action_flow = (
+        trace.get("action_flow") if isinstance(trace.get("action_flow"), dict) else {}
+    )
+    capability_id = "runtime.world_state.read"
+    return all(
+        (
+            trace.get("enabled") is True,
+            trace.get("status") == "included",
+            trace.get("context_included") is True,
+            trace.get("action_taken") is False,
+            match.get("status") == "included",
+            match.get("matched") is True,
+            match.get("matched_capability_id") == capability_id,
+            capability.get("capability_id") == capability_id,
+            capability.get("operation_kind") == "read_only",
+            capability.get("risk_level") == "low_read_only",
+            capability.get("requires_confirmation") is False,
+            capability.get("verification_supported") is True,
+            authority.get("status") == "included",
+            authority.get("capability_id") == capability_id,
+            authority.get("risk_level") == "read_only",
+            authority.get("authority_level") == "answer_only",
+            authority.get("requires_confirmation") is False,
+            authority.get("allowed") is True,
+            authority.get("action_taken") is False,
+            action_flow.get("status") == "included",
+            action_flow.get("capability_id") == capability_id,
+            action_flow.get("confirmation_required") is False,
+            action_flow.get("execution_allowed") is True,
+            action_flow.get("verification_required") is True,
+            action_flow.get("verification_supported") is True,
+            action_flow.get("verification_method") == "capability_verification",
+            action_flow.get("action_taken") is False,
+        )
+    )
+
+
 def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str, str]]:
     if trace.get("context_included") is not True:
         return []
@@ -1634,9 +1675,21 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
         lines = [
             "Capability registry context:",
             f"- The runtime matched a registered capability: {label}.",
-            "- Treat this as registry context only; do not execute the action.",
-            "- Do not say that the action was completed.",
         ]
+        if _registry_allows_exact_capability_execution(trace):
+            lines.extend(
+                [
+                    "- You may request only runtime.world_state.read through its exposed tool.",
+                    "- Do not claim execution or verification from provider prose.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- Treat this as registry context only; do not execute the action.",
+                    "- Do not say that the action was completed.",
+                ]
+            )
         if authority.get("status") == "included":
             lines.append(f"- Authority level: {authority.get('authority_level')}.")
             lines.append(f"- Authority risk level: {authority.get('risk_level')}.")
@@ -5633,7 +5686,9 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
-        if capability_registry_enabled:
+        if capability_registry_enabled and not _registry_allows_exact_capability_execution(
+            capability_registry_trace
+        ):
             capability_descriptors = []
             capability_exposure_trace = {
                 "schema_version": "capability-exposure.v1",
@@ -6037,7 +6092,14 @@ async def orchestrate_chat(
         try:
             capability_request = parse_provider_capability_request(completion)
             if capability_request is not None:
-                if capability_registry_trace.get("context_included") is True:
+                registry_execution_allowed = (
+                    _registry_allows_exact_capability_execution(capability_registry_trace)
+                    and capability_request.capability_id == "runtime.world_state.read"
+                )
+                if (
+                    capability_registry_trace.get("context_included") is True
+                    and not registry_execution_allowed
+                ):
                     prompt.trace["capabilities"]["validation"] = {
                         "validation_status": "not_requested",
                         "reason_code": "registry_context_only",
@@ -6079,6 +6141,7 @@ async def orchestrate_chat(
                         ),
                         revalidators=capability_revalidators,
                         capability_confirmation=payload.get("capability_confirmation"),
+                        post_execution_verification_required=registry_execution_allowed,
                     )
                     prompt.trace["capabilities"]["execution"] = execution_result.trace
                     executor_call_count = execution_result.trace.get("executor_call_count")
