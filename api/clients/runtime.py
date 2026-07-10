@@ -337,6 +337,46 @@ class RuntimeClient:
             },
         )
 
+    async def action_authority(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        active_persona_id: str,
+        capability_id: str,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
+        target_resolution_state: str = "resolved",
+        world_state_freshness: str = "unknown",
+        consequence_flags: dict[str, bool] | None = None,
+        interaction_governance_kind: str | None = None,
+        interaction_governance_tension: str | None = None,
+        user_authorization_signal: str = "explicit",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "active_persona_id": active_persona_id,
+            "capability_id": capability_id,
+            "target_resolution_state": target_resolution_state,
+            "world_state_freshness": world_state_freshness,
+            "consequence_flags": consequence_flags or {},
+            "user_authorization_signal": user_authorization_signal,
+        }
+        if runtime_session_id is not None:
+            payload["runtime_session_id"] = runtime_session_id
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if interaction_governance_kind is not None:
+            payload["interaction_governance_kind"] = interaction_governance_kind
+        if interaction_governance_tension is not None:
+            payload["interaction_governance_tension"] = interaction_governance_tension
+        return await self._post("/v1/capabilities/authority", json=payload)
+
     async def confirm_capability(
         self,
         *,

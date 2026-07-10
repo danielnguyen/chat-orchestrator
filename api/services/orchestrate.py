@@ -110,6 +110,7 @@ def _capability_registry_disabled_trace() -> dict[str, Any]:
         "action_taken": False,
         "match": {"attempted": False, "status": "disabled"},
         "discovery": {"attempted": False, "status": "disabled"},
+        "authority": {"attempted": False, "status": "disabled"},
     }
 
 
@@ -1387,6 +1388,7 @@ def _capability_registry_base_trace(*, enabled: bool, reason: str | None = None)
         "action_taken": False,
         "match": {"attempted": False, "status": status},
         "discovery": {"attempted": False, "status": status},
+        "authority": {"attempted": False, "status": status},
     }
     if reason is not None:
         trace["reason"] = reason
@@ -1431,6 +1433,51 @@ def _safe_capability_record(value: Any) -> dict[str, Any] | None:
     }
 
 
+VALID_ACTION_RISK_LEVELS = {
+    "read_only",
+    "low_reversible",
+    "medium_requires_confirmation",
+    "high_requires_confirmation",
+    "blocked",
+}
+VALID_ACTION_AUTHORITY_LEVELS = {
+    "answer_only",
+    "suggest_only",
+    "prepare_only",
+    "execute_low_risk",
+    "execute_after_confirmation",
+    "blocked",
+}
+
+
+def _safe_action_authority_decision(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get("action_taken") is not False:
+        return None
+    capability_id = _sanitize_trace_string(value.get("capability_id"), max_length=120)
+    risk_level = _sanitize_trace_string(value.get("risk_level"), max_length=80)
+    authority_level = _sanitize_trace_string(value.get("authority_level"), max_length=80)
+    requires_confirmation = _sanitize_trace_bool(value.get("requires_confirmation"))
+    allowed = _sanitize_trace_bool(value.get("allowed"))
+    if (
+        capability_id is None
+        or risk_level not in VALID_ACTION_RISK_LEVELS
+        or authority_level not in VALID_ACTION_AUTHORITY_LEVELS
+        or requires_confirmation is None
+        or allowed is None
+    ):
+        return None
+    return {
+        "capability_id": capability_id,
+        "risk_level": risk_level,
+        "authority_level": authority_level,
+        "requires_confirmation": requires_confirmation,
+        "allowed": allowed,
+        "reason_summary": _sanitize_trace_string_list(value.get("reason_summary"), limit=16)
+        or [],
+        "action_taken": False,
+    }
+
+
 def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str, str]]:
     if trace.get("context_included") is not True:
         return []
@@ -1463,6 +1510,7 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
     match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
     capability = match.get("capability") if isinstance(match.get("capability"), dict) else None
     if match.get("matched") is True and capability:
+        authority = trace.get("authority") if isinstance(trace.get("authority"), dict) else {}
         label = capability.get("display_name") or capability.get("capability_id")
         operation_kind = capability.get("operation_kind")
         risk_level = capability.get("risk_level")
@@ -1473,6 +1521,14 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
             "- Treat this as registry context only; do not execute the action.",
             "- Do not say that the action was completed.",
         ]
+        if authority.get("status") == "included":
+            lines.append(f"- Authority level: {authority.get('authority_level')}.")
+            lines.append(f"- Authority risk level: {authority.get('risk_level')}.")
+            lines.append(
+                "- Authority requires confirmation: "
+                f"{str(authority.get('requires_confirmation')).lower()}."
+            )
+            lines.append(f"- Authority allowed: {str(authority.get('allowed')).lower()}.")
         if operation_kind:
             lines.append(f"- Operation kind: {operation_kind}.")
         if risk_level:
@@ -1500,6 +1556,9 @@ def _capability_completion_claim(text: str) -> bool:
 
 
 def _apply_capability_registry_response_boundary(text: str, trace: dict[str, Any]) -> str:
+    override = _capability_registry_forced_response(trace)
+    if override is not None:
+        return override
     match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
     if (
         match.get("matched") is True
@@ -1514,6 +1573,44 @@ def _apply_capability_registry_response_boundary(text: str, trace: dict[str, Any
     return text
 
 
+def _capability_registry_forced_response(trace: dict[str, Any]) -> str | None:
+    match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
+    if match.get("matched") is not True or trace.get("action_taken") is not False:
+        return None
+    authority = trace.get("authority") if isinstance(trace.get("authority"), dict) else {}
+    if authority.get("status") == "failed":
+        return "I found a matching registered capability, but I did not execute it."
+    authority_level = authority.get("authority_level")
+    requires_confirmation = authority.get("requires_confirmation")
+    if authority_level == "blocked":
+        return "That registered capability is not available for execution here. I did not execute it."
+    if authority_level == "execute_after_confirmation" or requires_confirmation is True:
+        return "That action requires explicit confirmation before I proceed. I did not execute it."
+    if authority_level == "execute_low_risk":
+        return "I found that this is allowed as a low-risk capability, but I did not execute it."
+    return None
+
+
+def _authority_context_inputs(
+    interaction_governance_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    trace = interaction_governance_trace if isinstance(interaction_governance_trace, dict) else {}
+    return {
+        "target_resolution_state": "resolved",
+        "world_state_freshness": "unknown",
+        "consequence_flags": {},
+        "interaction_governance_kind": _sanitize_trace_string(
+            trace.get("interaction_kind"),
+            max_length=80,
+        ),
+        "interaction_governance_tension": _sanitize_trace_string(
+            trace.get("tension_level"),
+            max_length=80,
+        ),
+        "user_authorization_signal": "explicit",
+    }
+
+
 async def _resolve_capability_registry_context(
     *,
     runtime: Any | None,
@@ -1522,8 +1619,11 @@ async def _resolve_capability_registry_context(
     owner_id: str,
     conversation_id: str,
     surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
     active_persona_id: str | None,
     current_user_text: str,
+    interaction_governance_trace: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not enabled:
         return [], _capability_registry_disabled_trace()
@@ -1612,15 +1712,60 @@ async def _resolve_capability_registry_context(
                 "capability": capability,
                 "reason_codes": reason_codes,
             }
+            if matched is True and capability:
+                authority_inputs = _authority_context_inputs(interaction_governance_trace)
+                authority_response = await runtime.action_authority(
+                    request_id=f"{request_id}:capability-authority",
+                    owner_id=owner_id,
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_id,
+                    runtime_turn_id=runtime_turn_id,
+                    active_persona_id=active_persona_id,
+                    capability_id=capability["capability_id"],
+                    **authority_inputs,
+                )
+                authority_result = (
+                    authority_response.get("result")
+                    if isinstance(authority_response, dict)
+                    else None
+                )
+                authority = _safe_action_authority_decision(authority_result)
+                if authority is None:
+                    trace["status"] = "failed"
+                    trace["reason"] = "malformed_capability_authority_response"
+                    trace["authority"] = {
+                        "attempted": True,
+                        "status": "failed",
+                        "reason": "malformed_capability_authority_response",
+                        "action_taken": False,
+                    }
+                    return _capability_registry_prompt_messages(trace), trace
+                trace["authority"] = {
+                    "attempted": True,
+                    "status": "included",
+                    **authority,
+                }
     except Exception:
         trace["status"] = "failed"
-        trace["reason"] = "capability_registry_unavailable"
         key = "discovery" if discovery_requested else "match"
-        trace[key] = {
+        if (
+            not discovery_requested
+            and isinstance(trace.get("match"), dict)
+            and trace["match"].get("matched") is True
+        ):
+            trace["reason"] = "capability_authority_unavailable"
+            key = "authority"
+        else:
+            trace["reason"] = "capability_registry_unavailable"
+        failure_trace = {
             "attempted": True,
             "status": "failed",
-            "reason": "capability_registry_unavailable",
+            "reason": trace["reason"],
         }
+        if key == "authority":
+            failure_trace["action_taken"] = False
+        trace[key] = failure_trace
         return [], trace
 
     return _capability_registry_prompt_messages(trace), trace
@@ -5053,8 +5198,11 @@ async def orchestrate_chat(
                 owner_id=payload["owner_id"],
                 conversation_id=conversation_id,
                 surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
                 active_persona_id=runtime_identity_trace.get("active_persona_id"),
                 current_user_text=last_user_text,
+                interaction_governance_trace=interaction_governance_trace,
             )
         )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
@@ -5624,7 +5772,9 @@ async def orchestrate_chat(
                     prompt.trace["capabilities"]["follow_up"] = _capability_follow_up_empty_trace()
                     prompt.trace["capabilities"]["dispatch_completed"] = False
                     prompt.trace["capabilities"]["executor_call_count"] = 0
-                    raw_answer = "I found a registered capability, but I did not execute it."
+                    raw_answer = _capability_registry_forced_response(
+                        capability_registry_trace
+                    ) or "I found a registered capability, but I did not execute it."
                 else:
                     validation_result = validate_and_digest_capability_request(
                         request=capability_request,
