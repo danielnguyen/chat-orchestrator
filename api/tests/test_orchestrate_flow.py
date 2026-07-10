@@ -318,6 +318,7 @@ class FakeRuntime:
         capability_match_response=None,
         capability_discovery_response=None,
         capability_authority_response=None,
+        capability_flow_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
@@ -328,6 +329,7 @@ class FakeRuntime:
         capability_match_error: Exception | None = None,
         capability_discovery_error: Exception | None = None,
         capability_authority_error: Exception | None = None,
+        capability_flow_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -348,6 +350,7 @@ class FakeRuntime:
         self.capability_match_calls = []
         self.capability_discovery_calls = []
         self.capability_authority_calls = []
+        self.capability_flow_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -647,6 +650,30 @@ class FakeRuntime:
                 "action_taken": False,
             },
         }
+        self.capability_flow_response = capability_flow_response or {
+            "request_id": "rid-capability-flow",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "active_persona_id": "technical_architect",
+            "result": {
+                "capability_id": "office_lights_on",
+                "dry_run_required": False,
+                "dry_run_supported": True,
+                "dry_run_effects": [],
+                "confirmation_required": False,
+                "confirmation_text": None,
+                "execution_allowed": True,
+                "verification_required": False,
+                "verification_supported": True,
+                "verification_method": None,
+                "reason_summary": [
+                    "registered_capability",
+                    "execution_allowed_by_policy",
+                ],
+                "action_taken": False,
+            },
+        }
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
@@ -657,6 +684,7 @@ class FakeRuntime:
         self.capability_match_error = capability_match_error
         self.capability_discovery_error = capability_discovery_error
         self.capability_authority_error = capability_authority_error
+        self.capability_flow_error = capability_flow_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -835,6 +863,15 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.capability_authority_response
+
+    async def action_flow(self, **kwargs):
+        self.capability_flow_calls.append(kwargs)
+        self.call_order.append("capability_flow")
+        if self.capability_flow_error is not None:
+            raise self.capability_flow_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        return self.capability_flow_response
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
@@ -1433,6 +1470,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "match": {"attempted": False, "status": "disabled"},
         "discovery": {"attempted": False, "status": "disabled"},
         "authority": {"attempted": False, "status": "disabled"},
+        "action_flow": {"attempted": False, "status": "disabled"},
     }
     presentation = trace_payload["retrieval"]["prompt_assembly"]["presentation"]
     assert presentation["routing"]["selected_model"] == "gpt-4o-mini"
@@ -1490,6 +1528,94 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         "original_review_status": "clear",
     }
     assert trace_payload["router_decision"]["routing_contract"]["selected_model"] == "gpt-4o-mini"
+
+
+def _dry_run_effect(
+    *,
+    capability_id: str = "office_lights_on",
+    display_name: str = "Turn on office lights",
+    operation_kind: str = "state_change",
+    intended_effect: str = "Would turn on the office lights.",
+    target_label: str | None = "office lights",
+    reversible: bool = True,
+    consequence_summary: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "capability_id": capability_id,
+        "display_name": display_name,
+        "operation_kind": operation_kind,
+        "target_label": target_label,
+        "intended_effect": intended_effect,
+        "reversible": reversible,
+        "consequence_summary": consequence_summary or [],
+    }
+
+
+def _action_flow_response(
+    *,
+    capability_id: str = "office_lights_on",
+    dry_run_required: bool = False,
+    dry_run_supported: bool = True,
+    dry_run_effects: list[dict[str, object]] | None = None,
+    confirmation_required: bool = False,
+    confirmation_text: str | None = None,
+    execution_allowed: bool = True,
+    verification_required: bool = False,
+    verification_supported: bool = False,
+    verification_method: str | None = None,
+    reason_summary: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "result": {
+            "capability_id": capability_id,
+            "dry_run_required": dry_run_required,
+            "dry_run_supported": dry_run_supported,
+            "dry_run_effects": dry_run_effects or [],
+            "confirmation_required": confirmation_required,
+            "confirmation_text": confirmation_text,
+            "execution_allowed": execution_allowed,
+            "verification_required": verification_required,
+            "verification_supported": verification_supported,
+            "verification_method": verification_method,
+            "reason_summary": reason_summary or ["registered_capability"],
+            "action_taken": False,
+        }
+    }
+
+
+def _capability_match_response(
+    *,
+    capability_id: str = "office_lights_on",
+    display_name: str = "Turn on office lights",
+    domain: str = "home_automation",
+    operation_kind: str = "state_change",
+    risk_level: str = "low_reversible",
+    requires_confirmation: bool = False,
+    reversible: bool = True,
+    dry_run_supported: bool = True,
+    verification_supported: bool = True,
+) -> dict[str, object]:
+    return {
+        "result": {
+            "capability_matched": True,
+            "action_taken": False,
+            "reason_codes": ["matched"],
+            "capability": {
+                "capability_id": capability_id,
+                "display_name": display_name,
+                "domain": domain,
+                "description": f"{display_name} through the registered capability.",
+                "operation_kind": operation_kind,
+                "risk_level": risk_level,
+                "requires_confirmation": requires_confirmation,
+                "allowed_surfaces": ["dev"],
+                "allowed_personas": ["technical_architect"],
+                "reversible": reversible,
+                "dry_run_supported": dry_run_supported,
+                "verification_supported": verification_supported,
+            },
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -1583,6 +1709,7 @@ async def test_orchestrate_capability_registry_disabled_does_not_call_runtime_me
     assert runtime.capability_match_calls == []
     assert runtime.capability_discovery_calls == []
     assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "capability_registry"
     ]
@@ -1659,6 +1786,30 @@ async def test_orchestrate_consumes_capability_match_without_execution(tmp_path)
             "user_authorization_signal": "explicit",
         }
     ]
+    assert runtime.capability_flow_calls == [
+        {
+            "request_id": "rid-capability-match-consumed:capability-flow",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "vscode",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "active_persona_id": "technical_architect",
+            "capability_id": "office_lights_on",
+            "target_resolution_state": "resolved",
+            "world_state_freshness": "unknown",
+            "consequence_flags": {},
+            "interaction_governance_kind": None,
+            "interaction_governance_tension": None,
+            "user_authorization_signal": "explicit",
+            "flow_intent": "execution_requested",
+            "affects_multiple_systems": False,
+            "target_label": None,
+        }
+    ]
+    assert runtime.call_order.index("capability_authority") < runtime.call_order.index(
+        "capability_flow"
+    )
     assert "did not execute" in out["answer"]
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "capability_registry"
@@ -1680,6 +1831,22 @@ async def test_orchestrate_consumes_capability_match_without_execution(tmp_path)
         "requires_confirmation": False,
         "allowed": True,
         "reason_summary": ["registered_capability", "low_reversible_execution"],
+        "action_taken": False,
+    }
+    assert trace["action_flow"] == {
+        "attempted": True,
+        "status": "included",
+        "capability_id": "office_lights_on",
+        "dry_run_required": False,
+        "dry_run_supported": True,
+        "dry_run_effects": [],
+        "confirmation_required": False,
+        "confirmation_text": None,
+        "execution_allowed": True,
+        "verification_required": False,
+        "verification_supported": True,
+        "verification_method": None,
+        "reason_summary": ["registered_capability", "execution_allowed_by_policy"],
         "action_taken": False,
     }
     capabilities_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
@@ -1709,10 +1876,12 @@ async def test_orchestrate_unmatched_capability_does_not_call_authority_or_execu
 
     assert runtime.capability_match_calls
     assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
     assert runtime.capability_authorization_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["match"]["matched"] is False
     assert trace["capability_registry"]["authority"]["attempted"] is False
+    assert trace["capability_registry"]["action_flow"]["attempted"] is False
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -1752,6 +1921,12 @@ async def test_orchestrate_registry_context_blocks_provider_tool_execution(tmp_p
                 "action_taken": False,
             }
         },
+        capability_flow_response=_action_flow_response(
+            capability_id="draft_notification",
+            execution_allowed=True,
+            verification_supported=False,
+            reason_summary=["registered_capability", "prepare_only"],
+        ),
     )
     memory_store = FakeMemoryStore()
 
@@ -1772,12 +1947,14 @@ async def test_orchestrate_registry_context_blocks_provider_tool_execution(tmp_p
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == "I found a registered capability, but I did not execute it."
+    assert out["answer"] == "This action is allowed by policy, but I did not execute it."
     assert runtime.capability_authorization_calls == []
     assert runtime.capability_authority_calls[0]["capability_id"] == "draft_notification"
+    assert runtime.capability_flow_calls[0]["capability_id"] == "draft_notification"
     assert runtime.world_state_verification_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["action_taken"] is False
+    assert trace["capability_registry"]["action_flow"]["status"] == "included"
     assert trace["capabilities"]["validation"]["reason_code"] == "registry_context_only"
     assert trace["capabilities"]["execution"] == {
         "executor_called": False,
@@ -1837,6 +2014,7 @@ async def test_orchestrate_consumes_capability_discovery_examples(tmp_path):
     assert runtime.capability_match_calls == []
     assert runtime.capability_discovery_calls[0]["active_persona_id"] == "technical_architect"
     assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
     assert any(
         msg["role"] == "system"
         and "Turn on office lights" in msg["content"]
@@ -1885,6 +2063,7 @@ async def test_orchestrate_capability_registry_failure_is_conservative(tmp_path)
     }
     assert trace["action_taken"] is False
     assert "private outage detail" not in str(trace)
+    assert runtime.capability_flow_calls == []
 
 
 @pytest.mark.asyncio
@@ -1914,6 +2093,7 @@ async def test_orchestrate_capability_registry_malformed_response_is_conservativ
     assert trace["match"]["status"] == "failed"
     assert trace["action_taken"] is False
     assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
 
 
 @pytest.mark.asyncio
@@ -1952,6 +2132,31 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
                 "action_taken": False,
             }
         },
+        capability_flow_response=_action_flow_response(
+            capability_id="jellyfin_restart",
+            dry_run_required=True,
+            dry_run_effects=[
+                _dry_run_effect(
+                    capability_id="jellyfin_restart",
+                    display_name="Restart media service",
+                    operation_kind="restart",
+                    intended_effect="Would restart the media service.",
+                    target_label="media server",
+                    reversible=False,
+                    consequence_summary=["difficult_to_reverse"],
+                )
+            ],
+            confirmation_required=True,
+            confirmation_text=(
+                "Confirm Restart media service for media server. "
+                "This may interrupt streaming."
+            ),
+            execution_allowed=False,
+            verification_required=True,
+            verification_supported=True,
+            verification_method="capability_verification",
+            reason_summary=["registered_capability", "confirmation_required"],
+        ),
     )
     memory_store = FakeMemoryStore()
 
@@ -1967,12 +2172,14 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == (
-        "That action requires explicit confirmation before I proceed. I did not execute it."
-    )
+    assert "Preview: Would restart the media service." in out["answer"]
+    assert "Confirm Restart media service for media server." in out["answer"]
+    assert "No action was taken." in out["answer"]
+    assert "Verification would be required after execution." in out["answer"]
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["authority"]["requires_confirmation"] is True
     assert trace["capability_registry"]["authority"]["allowed"] is False
+    assert trace["capability_registry"]["action_flow"]["confirmation_required"] is True
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -2012,6 +2219,16 @@ async def test_orchestrate_blocked_authority_refuses_without_execution(tmp_path)
                 "action_taken": False,
             }
         },
+        capability_flow_response=_action_flow_response(
+            capability_id="external_purchase",
+            dry_run_required=False,
+            dry_run_supported=False,
+            confirmation_required=False,
+            execution_allowed=False,
+            verification_required=False,
+            verification_supported=False,
+            reason_summary=["registered_capability", "execution_blocked"],
+        ),
     )
     memory_store = FakeMemoryStore()
 
@@ -2027,11 +2244,10 @@ async def test_orchestrate_blocked_authority_refuses_without_execution(tmp_path)
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == (
-        "That registered capability is not available for execution here. I did not execute it."
-    )
+    assert out["answer"] == "I found a matching registered capability, but I did not execute it."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["authority"]["authority_level"] == "blocked"
+    assert trace["capability_registry"]["action_flow"]["execution_allowed"] is False
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -2059,7 +2275,13 @@ async def test_orchestrate_low_risk_authority_still_does_not_execute(tmp_path):
                     "verification_supported": True,
                 },
             }
-        }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="office_lights_on",
+            execution_allowed=True,
+            verification_supported=False,
+            reason_summary=["registered_capability", "execution_allowed_by_policy"],
+        ),
     )
     memory_store = FakeMemoryStore()
 
@@ -2080,12 +2302,11 @@ async def test_orchestrate_low_risk_authority_still_does_not_execute(tmp_path):
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == (
-        "I found that this is allowed as a low-risk capability, but I did not execute it."
-    )
+    assert out["answer"] == "This action is allowed by policy, but I did not execute it."
     assert runtime.capability_authorization_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["authority"]["authority_level"] == "execute_low_risk"
+    assert trace["capability_registry"]["action_flow"]["execution_allowed"] is True
     assert trace["capabilities"]["execution"]["executor_called"] is False
     assert trace["capabilities"]["executor_call_count"] == 0
 
@@ -2142,6 +2363,8 @@ async def test_orchestrate_malformed_authority_response_is_conservative(tmp_path
         "reason": "malformed_capability_authority_response",
         "action_taken": False,
     }
+    assert trace["action_flow"]["attempted"] is False
+    assert runtime.capability_flow_calls == []
     assert "action_taken': True" not in str(trace)
 
 
@@ -2197,7 +2420,272 @@ async def test_orchestrate_authority_failure_is_conservative(tmp_path):
         "reason": "capability_authority_unavailable",
         "action_taken": False,
     }
+    assert trace["action_flow"]["attempted"] is False
+    assert runtime.capability_flow_calls == []
     assert "private authority outage detail" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_malformed_action_flow_response_is_conservative(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response=_capability_match_response(),
+        capability_flow_response={"result": {"action_taken": True}},
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Turn on office lights."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-bad-flow",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == "I found a matching registered capability, but I did not execute it."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["reason"] == "malformed_capability_flow_response"
+    assert trace["capability_registry"]["action_flow"] == {
+        "attempted": True,
+        "status": "failed",
+        "reason": "malformed_capability_flow_response",
+        "action_taken": False,
+    }
+    assert trace["capabilities"]["executor_call_count"] == 0
+    assert "action_taken': True" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_flow_failure_is_conservative(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response=_capability_match_response(),
+        capability_flow_error=RuntimeError("private flow outage detail"),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Turn on office lights."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-flow-fallback",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == "I found a matching registered capability, but I did not execute it."
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["reason"] == "capability_flow_unavailable"
+    assert trace["capability_registry"]["action_flow"] == {
+        "attempted": True,
+        "status": "failed",
+        "reason": "capability_flow_unavailable",
+        "action_taken": False,
+    }
+    assert trace["capabilities"]["executor_call_count"] == 0
+    assert "private flow outage detail" not in str(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_flow_dry_run_preview_says_no_action(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response=_capability_match_response(),
+        capability_flow_response=_action_flow_response(
+            dry_run_required=True,
+            dry_run_effects=[_dry_run_effect()],
+            execution_allowed=False,
+            verification_supported=False,
+            reason_summary=["preview_requested", "dry_run_required"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "What would happen if you turn on office lights?",
+                }
+            ]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="I turned them on."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-flow-preview",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == "Preview: Would turn on the office lights. No action was taken."
+    assert runtime.capability_flow_calls[0]["flow_intent"] == "preview_requested"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    action_flow = trace["capability_registry"]["action_flow"]
+    assert action_flow["dry_run_required"] is True
+    assert action_flow["dry_run_effects"][0]["intended_effect"] == (
+        "Would turn on the office lights."
+    )
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_flow_confirmation_uses_scoped_text(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        capability_match_response=_capability_match_response(
+            capability_id="jellyfin_restart",
+            display_name="Restart Jellyfin",
+            domain="media_operations",
+            operation_kind="restart",
+            risk_level="medium_service_interruption",
+            requires_confirmation=True,
+            reversible=False,
+        ),
+        capability_authority_response={
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "risk_level": "medium_requires_confirmation",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="jellyfin_restart",
+            dry_run_required=False,
+            confirmation_required=True,
+            confirmation_text=(
+                "Confirm Restart Jellyfin for media server. "
+                "This may be difficult to reverse."
+            ),
+            execution_allowed=False,
+            verification_supported=True,
+            reason_summary=["registered_capability", "confirmation_required"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Restart Jellyfin."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Restarted Jellyfin."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-flow-confirm",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "Confirm Restart Jellyfin for media server. This may be difficult to reverse. "
+        "No action was taken. Verification would be available after execution."
+    )
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    action_flow = trace["capability_registry"]["action_flow"]
+    assert action_flow["confirmation_required"] is True
+    assert action_flow["confirmation_text"] == (
+        "Confirm Restart Jellyfin for media server. This may be difficult to reverse."
+    )
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_flow_allowed_by_policy_does_not_execute(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = CapabilityRuntime(
+        capability_match_response=_capability_match_response(),
+        capability_flow_response=_action_flow_response(
+            execution_allowed=True,
+            verification_supported=False,
+            reason_summary=["registered_capability", "execution_allowed_by_policy"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Turn on office lights."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-flow-allowed",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == "This action is allowed by policy, but I did not execute it."
+    assert "completed" not in out["answer"].casefold()
+    assert "turned" not in out["answer"].casefold()
+    assert runtime.capability_authorization_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["action_flow"]["execution_allowed"] is True
+    assert trace["capabilities"]["dispatch_completed"] is False
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_flow_verification_is_future_required(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = CapabilityRuntime(
+        capability_match_response=_capability_match_response(
+            capability_id="jellyfin_restart",
+            display_name="Restart Jellyfin",
+            domain="media_operations",
+            operation_kind="restart",
+            risk_level="medium_service_interruption",
+            requires_confirmation=True,
+            reversible=False,
+        ),
+        capability_flow_response=_action_flow_response(
+            capability_id="jellyfin_restart",
+            execution_allowed=True,
+            verification_required=True,
+            verification_supported=True,
+            verification_method="capability_verification",
+            reason_summary=["registered_capability", "execution_allowed_by_policy"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Restart Jellyfin."),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Restarted Jellyfin. Health check passed."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-capability-flow-verification-required",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "This action is allowed by policy, but I did not execute it. "
+        "Verification would be required after execution."
+    )
+    lowered = out["answer"].casefold()
+    assert "passed" not in lowered
+    assert "succeeded" not in lowered
+    assert "failed" not in lowered
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    action_flow = trace["capability_registry"]["action_flow"]
+    assert action_flow["verification_required"] is True
+    assert action_flow["verification_method"] == "capability_verification"
+    assert trace["capabilities"]["executor_call_count"] == 0
 
 
 @pytest.mark.asyncio

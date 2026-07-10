@@ -111,6 +111,7 @@ def _capability_registry_disabled_trace() -> dict[str, Any]:
         "match": {"attempted": False, "status": "disabled"},
         "discovery": {"attempted": False, "status": "disabled"},
         "authority": {"attempted": False, "status": "disabled"},
+        "action_flow": {"attempted": False, "status": "disabled"},
     }
 
 
@@ -1389,6 +1390,7 @@ def _capability_registry_base_trace(*, enabled: bool, reason: str | None = None)
         "match": {"attempted": False, "status": status},
         "discovery": {"attempted": False, "status": status},
         "authority": {"attempted": False, "status": status},
+        "action_flow": {"attempted": False, "status": status},
     }
     if reason is not None:
         trace["reason"] = reason
@@ -1448,6 +1450,15 @@ VALID_ACTION_AUTHORITY_LEVELS = {
     "execute_after_confirmation",
     "blocked",
 }
+VALID_ACTION_OPERATION_KINDS = {
+    "read_only",
+    "state_change",
+    "restart",
+    "notification",
+    "draft_or_prepare",
+    "blocked_external_action",
+}
+VALID_ACTION_FLOW_VERIFICATION_METHODS = {"capability_verification"}
 
 
 def _safe_action_authority_decision(value: Any) -> dict[str, Any] | None:
@@ -1474,6 +1485,108 @@ def _safe_action_authority_decision(value: Any) -> dict[str, Any] | None:
         "allowed": allowed,
         "reason_summary": _sanitize_trace_string_list(value.get("reason_summary"), limit=16)
         or [],
+        "action_taken": False,
+    }
+
+
+def _safe_dry_run_effect(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    capability_id = _sanitize_trace_string(value.get("capability_id"), max_length=120)
+    display_name = _sanitize_trace_string(value.get("display_name"), max_length=120)
+    operation_kind = _sanitize_trace_string(value.get("operation_kind"), max_length=80)
+    target_label = _sanitize_trace_string(value.get("target_label"), max_length=120)
+    intended_effect = _sanitize_trace_string(value.get("intended_effect"), max_length=600)
+    reversible = _sanitize_trace_bool(value.get("reversible"))
+    if (
+        capability_id is None
+        or display_name is None
+        or operation_kind not in VALID_ACTION_OPERATION_KINDS
+        or intended_effect is None
+        or reversible is None
+    ):
+        return None
+    return {
+        "capability_id": capability_id,
+        "display_name": display_name,
+        "operation_kind": operation_kind,
+        "target_label": target_label,
+        "intended_effect": intended_effect,
+        "reversible": reversible,
+        "consequence_summary": _sanitize_trace_string_list(
+            value.get("consequence_summary"),
+            limit=8,
+            item_max_length=80,
+        ),
+    }
+
+
+def _safe_confirmation_text(value: Any, *, required: bool) -> str | None:
+    text = _sanitize_trace_string(value, max_length=500)
+    if text is None:
+        return None
+    vague = {"are you sure?", "confirm?", "please confirm.", "please confirm"}
+    if required and text.casefold().strip() in vague:
+        return None
+    return text
+
+
+def _safe_action_flow_decision(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get("action_taken") is not False:
+        return None
+    capability_id = _sanitize_trace_string(value.get("capability_id"), max_length=120)
+    dry_run_required = _sanitize_trace_bool(value.get("dry_run_required"))
+    dry_run_supported = _sanitize_trace_bool(value.get("dry_run_supported"))
+    confirmation_required = _sanitize_trace_bool(value.get("confirmation_required"))
+    execution_allowed = _sanitize_trace_bool(value.get("execution_allowed"))
+    verification_required = _sanitize_trace_bool(value.get("verification_required"))
+    verification_supported = _sanitize_trace_bool(value.get("verification_supported"))
+    verification_method = value.get("verification_method")
+    if verification_method is not None:
+        verification_method = _sanitize_trace_string(verification_method, max_length=80)
+        if verification_method not in VALID_ACTION_FLOW_VERIFICATION_METHODS:
+            return None
+    if (
+        capability_id is None
+        or dry_run_required is None
+        or dry_run_supported is None
+        or confirmation_required is None
+        or execution_allowed is None
+        or verification_required is None
+        or verification_supported is None
+    ):
+        return None
+    raw_effects = value.get("dry_run_effects")
+    if not isinstance(raw_effects, list):
+        return None
+    dry_run_effects: list[dict[str, Any]] = []
+    for item in raw_effects[:4]:
+        effect = _safe_dry_run_effect(item)
+        if effect is None:
+            return None
+        dry_run_effects.append(effect)
+    confirmation_text = _safe_confirmation_text(
+        value.get("confirmation_text"),
+        required=confirmation_required,
+    )
+    if confirmation_required and confirmation_text is None:
+        return None
+    return {
+        "capability_id": capability_id,
+        "dry_run_required": dry_run_required,
+        "dry_run_supported": dry_run_supported,
+        "dry_run_effects": dry_run_effects,
+        "confirmation_required": confirmation_required,
+        "confirmation_text": confirmation_text,
+        "execution_allowed": execution_allowed,
+        "verification_required": verification_required,
+        "verification_supported": verification_supported,
+        "verification_method": verification_method,
+        "reason_summary": _sanitize_trace_string_list(
+            value.get("reason_summary"),
+            limit=16,
+            item_max_length=80,
+        ),
         "action_taken": False,
     }
 
@@ -1511,6 +1624,9 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
     capability = match.get("capability") if isinstance(match.get("capability"), dict) else None
     if match.get("matched") is True and capability:
         authority = trace.get("authority") if isinstance(trace.get("authority"), dict) else {}
+        action_flow = (
+            trace.get("action_flow") if isinstance(trace.get("action_flow"), dict) else {}
+        )
         label = capability.get("display_name") or capability.get("capability_id")
         operation_kind = capability.get("operation_kind")
         risk_level = capability.get("risk_level")
@@ -1529,6 +1645,30 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
                 f"{str(authority.get('requires_confirmation')).lower()}."
             )
             lines.append(f"- Authority allowed: {str(authority.get('allowed')).lower()}.")
+        if action_flow.get("status") == "included":
+            lines.append(
+                "- Flow dry-run required: "
+                f"{str(action_flow.get('dry_run_required')).lower()}."
+            )
+            lines.append(
+                "- Flow confirmation required: "
+                f"{str(action_flow.get('confirmation_required')).lower()}."
+            )
+            lines.append(
+                "- Flow execution allowed by policy: "
+                f"{str(action_flow.get('execution_allowed')).lower()}."
+            )
+            if action_flow.get("confirmation_text"):
+                lines.append(f"- Scoped confirmation: {action_flow['confirmation_text']}")
+            dry_run_effects = action_flow.get("dry_run_effects")
+            if isinstance(dry_run_effects, list) and dry_run_effects:
+                intended_effect = dry_run_effects[0].get("intended_effect")
+                if isinstance(intended_effect, str) and intended_effect:
+                    lines.append(f"- Dry-run preview: {intended_effect}")
+            if action_flow.get("verification_required") is True:
+                lines.append("- Verification would be required after execution.")
+            elif action_flow.get("verification_supported") is True:
+                lines.append("- Verification would be available after execution.")
         if operation_kind:
             lines.append(f"- Operation kind: {operation_kind}.")
         if risk_level:
@@ -1573,10 +1713,74 @@ def _apply_capability_registry_response_boundary(text: str, trace: dict[str, Any
     return text
 
 
+def _ensure_sentence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    return stripped if stripped[-1] in ".!?" else f"{stripped}."
+
+
+def _action_flow_verification_note(action_flow: dict[str, Any]) -> str:
+    if action_flow.get("verification_required") is True:
+        return " Verification would be required after execution."
+    if action_flow.get("verification_supported") is True:
+        return " Verification would be available after execution."
+    return ""
+
+
+def _action_flow_preview_text(action_flow: dict[str, Any]) -> str | None:
+    dry_run_effects = action_flow.get("dry_run_effects")
+    if isinstance(dry_run_effects, list) and dry_run_effects:
+        first_effect = dry_run_effects[0]
+        if isinstance(first_effect, dict):
+            intended_effect = first_effect.get("intended_effect")
+            if isinstance(intended_effect, str) and intended_effect.strip():
+                return _ensure_sentence(intended_effect)
+    if action_flow.get("dry_run_required") is True:
+        return "The registered capability would be previewed before execution."
+    return None
+
+
+def _action_flow_forced_response(action_flow: dict[str, Any]) -> str | None:
+    if action_flow.get("status") == "failed":
+        return "I found a matching registered capability, but I did not execute it."
+    if action_flow.get("status") != "included":
+        return None
+
+    verification_note = _action_flow_verification_note(action_flow)
+    preview = _action_flow_preview_text(action_flow)
+    confirmation_text = action_flow.get("confirmation_text")
+    if action_flow.get("confirmation_required") is True and isinstance(
+        confirmation_text,
+        str,
+    ):
+        confirmation_sentence = _ensure_sentence(confirmation_text)
+        if preview:
+            return (
+                f"Preview: {preview} {confirmation_sentence} "
+                f"No action was taken.{verification_note}"
+            )
+        return f"{confirmation_sentence} No action was taken.{verification_note}"
+    if preview:
+        return f"Preview: {preview} No action was taken.{verification_note}"
+    if action_flow.get("execution_allowed") is True:
+        return (
+            "This action is allowed by policy, but I did not execute it."
+            f"{verification_note}"
+        )
+    return f"I found a matching registered capability, but I did not execute it.{verification_note}"
+
+
 def _capability_registry_forced_response(trace: dict[str, Any]) -> str | None:
     match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
     if match.get("matched") is not True or trace.get("action_taken") is not False:
         return None
+    action_flow = (
+        trace.get("action_flow") if isinstance(trace.get("action_flow"), dict) else {}
+    )
+    action_flow_response = _action_flow_forced_response(action_flow)
+    if action_flow_response is not None:
+        return action_flow_response
     authority = trace.get("authority") if isinstance(trace.get("authority"), dict) else {}
     if authority.get("status") == "failed":
         return "I found a matching registered capability, but I did not execute it."
@@ -1611,6 +1815,36 @@ def _authority_context_inputs(
     }
 
 
+def _action_flow_intent(current_user_text: str) -> str:
+    normalized = " ".join(current_user_text.casefold().split())
+    preview_markers = (
+        "what would happen",
+        "what would it do",
+        "what happens if",
+        "preview",
+        "dry run",
+        "dry-run",
+        "show me what",
+        "what would",
+    )
+    if any(marker in normalized for marker in preview_markers):
+        return "preview_requested"
+    return "execution_requested"
+
+
+def _action_flow_context_inputs(
+    *,
+    current_user_text: str,
+    interaction_governance_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        **_authority_context_inputs(interaction_governance_trace),
+        "flow_intent": _action_flow_intent(current_user_text),
+        "affects_multiple_systems": False,
+        "target_label": None,
+    }
+
+
 async def _resolve_capability_registry_context(
     *,
     runtime: Any | None,
@@ -1640,6 +1874,7 @@ async def _resolve_capability_registry_context(
 
     discovery_requested = _capability_discovery_requested(current_user_text)
     trace = _capability_registry_base_trace(enabled=True)
+    runtime_operation = "discovery" if discovery_requested else "match"
     try:
         if discovery_requested:
             response = await runtime.discover_capabilities(
@@ -1682,6 +1917,7 @@ async def _resolve_capability_registry_context(
                 "blocked_count": len(blocked),
             }
         else:
+            runtime_operation = "match"
             response = await runtime.match_capability(
                 request_id=f"{request_id}:capability-match",
                 owner_id=owner_id,
@@ -1714,6 +1950,7 @@ async def _resolve_capability_registry_context(
             }
             if matched is True and capability:
                 authority_inputs = _authority_context_inputs(interaction_governance_trace)
+                runtime_operation = "authority"
                 authority_response = await runtime.action_authority(
                     request_id=f"{request_id}:capability-authority",
                     owner_id=owner_id,
@@ -1746,13 +1983,56 @@ async def _resolve_capability_registry_context(
                     "status": "included",
                     **authority,
                 }
+                flow_inputs = _action_flow_context_inputs(
+                    current_user_text=current_user_text,
+                    interaction_governance_trace=interaction_governance_trace,
+                )
+                runtime_operation = "action_flow"
+                action_flow_response = await runtime.action_flow(
+                    request_id=f"{request_id}:capability-flow",
+                    owner_id=owner_id,
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_id,
+                    runtime_turn_id=runtime_turn_id,
+                    active_persona_id=active_persona_id,
+                    capability_id=capability["capability_id"],
+                    **flow_inputs,
+                )
+                action_flow_result = (
+                    action_flow_response.get("result")
+                    if isinstance(action_flow_response, dict)
+                    else None
+                )
+                action_flow = _safe_action_flow_decision(action_flow_result)
+                if action_flow is None:
+                    trace["status"] = "failed"
+                    trace["reason"] = "malformed_capability_flow_response"
+                    trace["action_flow"] = {
+                        "attempted": True,
+                        "status": "failed",
+                        "reason": "malformed_capability_flow_response",
+                        "action_taken": False,
+                    }
+                    return _capability_registry_prompt_messages(trace), trace
+                trace["action_flow"] = {
+                    "attempted": True,
+                    "status": "included",
+                    **action_flow,
+                }
     except Exception:
         trace["status"] = "failed"
         key = "discovery" if discovery_requested else "match"
-        if (
-            not discovery_requested
-            and isinstance(trace.get("match"), dict)
-            and trace["match"].get("matched") is True
+        if runtime_operation == "action_flow":
+            trace["reason"] = "capability_flow_unavailable"
+            key = "action_flow"
+        elif (
+            runtime_operation == "authority"
+            or (
+                not discovery_requested
+                and isinstance(trace.get("match"), dict)
+                and trace["match"].get("matched") is True
+            )
         ):
             trace["reason"] = "capability_authority_unavailable"
             key = "authority"
@@ -1763,10 +2043,10 @@ async def _resolve_capability_registry_context(
             "status": "failed",
             "reason": trace["reason"],
         }
-        if key == "authority":
+        if key in {"authority", "action_flow"}:
             failure_trace["action_taken"] = False
         trace[key] = failure_trace
-        return [], trace
+        return _capability_registry_prompt_messages(trace), trace
 
     return _capability_registry_prompt_messages(trace), trace
 
