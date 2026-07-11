@@ -334,8 +334,12 @@ async def filter_capability_descriptors_for_exposure(
     runtime_turn_id: str | None,
     active_persona_id: str | None,
     selected_relationship_ids: list[str] | None = None,
+    allowed_capability_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates = list(production_capability_registry())
+    if allowed_capability_ids is not None:
+        allowed_ids = set(allowed_capability_ids)
+        candidates = [entry for entry in candidates if entry.capability_id in allowed_ids]
     candidate_ids = [entry.capability_id for entry in candidates]
     trace: dict[str, Any] = {
         "status": "failed_closed",

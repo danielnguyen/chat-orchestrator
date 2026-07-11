@@ -5701,6 +5701,11 @@ async def orchestrate_chat(
                 "blocked_reasons": {},
             }
         else:
+            allowed_capability_ids = (
+                ["runtime.world_state.read"]
+                if _registry_allows_exact_capability_execution(capability_registry_trace)
+                else None
+            )
             (
                 capability_descriptors,
                 capability_exposure_trace,
@@ -5716,6 +5721,7 @@ async def orchestrate_chat(
                 selected_relationship_ids=_selected_relationship_ids_from_trace(
                     relationship_context_trace
                 ),
+                allowed_capability_ids=allowed_capability_ids,
             )
 
         handoff = build_assistant_handoff(

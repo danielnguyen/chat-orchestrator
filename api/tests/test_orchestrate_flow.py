@@ -2746,13 +2746,14 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
     memory_store = FakeMemoryStore()
     completion = _tool_completion("runtime_world_state_read", {"output_mode": "summary"})
     completion["choices"][0]["message"]["content"] = "Done. Successfully verified everything."
+    litellm = FakeLiteLLM(completion=completion)
 
     out = await orchestrate_chat(
         payload=_base_payload(
             messages=[{"role": "user", "content": "Read current runtime world state."}]
         ),
         memory_store=memory_store,
-        litellm=FakeLiteLLM(completion=completion),
+        litellm=litellm,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -2765,11 +2766,18 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
         "I read bounded runtime world state and verified the result: found "
         "0 matching claim(s)."
     )
+    tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
+    assert tool_names == ["runtime_world_state_read"]
     execute_calls = [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
     ]
     assert len(execute_calls) == 1
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    exposure = trace["capabilities"]["exposure"]
+    assert exposure["candidate_capability_ids"] == ["runtime.world_state.read"]
+    assert exposure["exposed_capability_ids"] == ["runtime.world_state.read"]
+    assert exposure["blocked_capability_ids"] == []
+    assert exposure["descriptor_count"] == 1
     execution = trace["capabilities"]["execution"]
     assert execution["executor_called"] is True
     assert execution["executor_call_count"] == 1
@@ -2942,18 +2950,19 @@ async def test_orchestrate_blocks_provider_registry_identity_mismatch(tmp_path):
     rules, models = _write_router_files(tmp_path)
     runtime = _world_state_registry_runtime()
     memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(
+        completion=_tool_completion(
+            "draft_local_message",
+            {"body": "PRIVATE-DRAFT-BODY"},
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_base_payload(
             messages=[{"role": "user", "content": "Read current runtime world state."}]
         ),
         memory_store=memory_store,
-        litellm=FakeLiteLLM(
-            completion=_tool_completion(
-                "draft_local_message",
-                {"body": "PRIVATE-DRAFT-BODY"},
-            )
-        ),
+        litellm=litellm,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -2966,11 +2975,14 @@ async def test_orchestrate_blocks_provider_registry_identity_mismatch(tmp_path):
         "This action is allowed by policy, but I did not execute it. "
         "Verification would be required after execution."
     )
+    tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
+    assert tool_names == ["runtime_world_state_read"]
     assert [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
     ] == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capabilities"]["validation"]["reason_code"] == "registry_context_only"
+    assert trace["capabilities"]["execution"]["executor_call_count"] == 0
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -10925,16 +10937,17 @@ async def test_orchestrate_executes_world_state_read_after_selection_and_dispatc
             "confirmation_required": False,
         },
     }
+    litellm = FakeLiteLLM(
+        completion=_tool_completion(
+            "runtime_world_state_read",
+            {"requested_domains": ["active_repository"], "output_mode": "structured"},
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload("Read current repository state."),
         memory_store=memory_store,
-        litellm=FakeLiteLLM(
-            completion=_tool_completion(
-                "runtime_world_state_read",
-                {"requested_domains": ["active_repository"], "output_mode": "structured"},
-            )
-        ),
+        litellm=litellm,
         runtime=runtime,
         rules_path=str(rules),
         model_registry_path=str(models),
@@ -10943,6 +10956,8 @@ async def test_orchestrate_executes_world_state_read_after_selection_and_dispatc
     )
 
     assert out["answer"] == "I read bounded runtime world state and found 1 matching claim(s)."
+    tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
+    assert tool_names == ["draft_local_message", "runtime_world_state_read"]
     phases = [
         call["authorization_phase"]
         for call in runtime.capability_authorization_calls
