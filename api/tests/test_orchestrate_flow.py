@@ -2235,6 +2235,393 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_traces_governance_to_scoped_confirmation_without_execution(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        interaction_governance_response={
+            "request_id": "rid-governance",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "interaction_kind": "command",
+                "tension_level": "low",
+                "literal_command_confidence": 0.91,
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "clarifying_question_allowed": False,
+                "action_allowed": False,
+                "requires_confirmation": True,
+                "persona_scope_hint": "technical_architect",
+                "privacy_sensitivity_hint": "normal",
+                "response_posture": "direct",
+                "confidence": 0.93,
+                "reason_summary": ["direct_command"],
+            },
+        },
+        capability_match_response=_capability_match_response(
+            capability_id="jellyfin_restart",
+            display_name="Restart media service",
+            domain="home_infrastructure",
+            operation_kind="restart",
+            risk_level="medium_requires_confirmation",
+            requires_confirmation=True,
+            reversible=True,
+            verification_supported=True,
+        ),
+        capability_authority_response={
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "risk_level": "medium_requires_confirmation",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="jellyfin_restart",
+            dry_run_required=False,
+            confirmation_required=True,
+            confirmation_text=(
+                "Confirm Restart media service for media server. "
+                "This may interrupt streaming."
+            ),
+            execution_allowed=False,
+            verification_required=True,
+            verification_supported=True,
+            verification_method="capability_verification",
+            reason_summary=["registered_capability", "confirmation_required"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Restart media service."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-governance-confirm-link",
+        runtime=runtime,
+        interaction_governance_enabled=True,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "Confirm Restart media service for media server. "
+        "This may interrupt streaming. No action was taken. "
+        "Verification would be required after execution."
+    )
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == "command"
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "low"
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] == "command"
+    assert runtime.capability_flow_calls[0]["interaction_governance_tension"] == "low"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["interaction_governance"]["interaction_kind"] == "command"
+    assert trace["interaction_governance"]["tension_level"] == "low"
+    assert trace["capability_registry"]["decision_provenance"] == {
+        "governance_available": True,
+        "interaction_kind": "command",
+        "tension_level": "low",
+        "forwarded_to_authority": True,
+        "forwarded_to_action_flow": True,
+        "confirmation_required": True,
+        "scoped_confirmation_text_present": True,
+        "execution_allowed": False,
+    }
+    assert trace["capability_registry"]["action_flow"]["confirmation_required"] is True
+    assert trace["capability_registry"]["action_flow"]["confirmation_text"] == (
+        "Confirm Restart media service for media server. This may interrupt streaming."
+    )
+    assert trace["capability_registry"]["action_flow"]["execution_allowed"] is False
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_traces_high_tension_governance_suppression_without_execution(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        interaction_governance_response={
+            "request_id": "rid-governance",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "interaction_kind": "vent_or_expression",
+                "tension_level": "high",
+                "literal_command_confidence": 0.24,
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "clarifying_question_allowed": True,
+                "action_allowed": False,
+                "requires_confirmation": True,
+                "persona_scope_hint": "technical_architect",
+                "privacy_sensitivity_hint": "normal",
+                "response_posture": "supportive",
+                "confidence": 0.89,
+                "reason_summary": ["vent_or_expression", "high_tension"],
+            },
+        },
+        capability_match_response=_capability_match_response(),
+        capability_authority_response={
+            "result": {
+                "capability_id": "office_lights_on",
+                "risk_level": "low_reversible",
+                "authority_level": "suggest_only",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "governance_suppressed"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="office_lights_on",
+            confirmation_required=False,
+            execution_allowed=False,
+            verification_supported=True,
+            reason_summary=["registered_capability", "governance_suppressed"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "I am so frustrated, just turn on the office lights.",
+                }
+            ]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-governance-suppression-link",
+        runtime=runtime,
+        interaction_governance_enabled=True,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I found a matching registered capability, but I did not execute it. "
+        "Verification would be available after execution."
+    )
+    assert "Done" not in out["answer"]
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == (
+        "vent_or_expression"
+    )
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "high"
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] == (
+        "vent_or_expression"
+    )
+    assert runtime.capability_flow_calls[0]["interaction_governance_tension"] == "high"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["decision_provenance"] == {
+        "governance_available": True,
+        "interaction_kind": "vent_or_expression",
+        "tension_level": "high",
+        "forwarded_to_authority": True,
+        "forwarded_to_action_flow": True,
+        "confirmation_required": False,
+        "scoped_confirmation_text_present": False,
+        "execution_allowed": False,
+    }
+    assert trace["capability_registry"]["authority"]["allowed"] is False
+    assert trace["capability_registry"]["action_flow"]["execution_allowed"] is False
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_governance_malformed_provenance_is_unavailable_without_values(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        interaction_governance_response={"request_id": "rid-governance"},
+        capability_match_response=_capability_match_response(
+            capability_id="jellyfin_restart",
+            display_name="Restart media service",
+            domain="home_infrastructure",
+            operation_kind="restart",
+            risk_level="medium_requires_confirmation",
+            requires_confirmation=True,
+            reversible=True,
+            verification_supported=True,
+        ),
+        capability_authority_response={
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "risk_level": "medium_requires_confirmation",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="jellyfin_restart",
+            confirmation_required=True,
+            confirmation_text="Confirm Restart media service for media server.",
+            execution_allowed=False,
+            verification_supported=True,
+            reason_summary=["registered_capability", "confirmation_required"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Restart media service."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-governance-malformed-link",
+        runtime=runtime,
+        interaction_governance_enabled=True,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "Confirm Restart media service for media server. No action was taken. "
+        "Verification would be available after execution."
+    )
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] is None
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] is None
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] is None
+    assert runtime.capability_flow_calls[0]["interaction_governance_tension"] is None
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["interaction_governance"]["omission_reason"] == (
+        "malformed_interaction_governance_response"
+    )
+    assert trace["capability_registry"]["decision_provenance"] == {
+        "governance_available": False,
+        "interaction_kind": None,
+        "tension_level": None,
+        "forwarded_to_authority": False,
+        "forwarded_to_action_flow": False,
+        "confirmation_required": True,
+        "scoped_confirmation_text_present": True,
+        "execution_allowed": False,
+        "unavailable_reason": "malformed_interaction_governance_response",
+    }
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_unknown_governance_values_are_not_available_provenance(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime(
+        interaction_governance_response={
+            "request_id": "rid-governance",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "interaction_kind": "surface_action",
+                "tension_level": "urgent",
+                "literal_command_confidence": 0.78,
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "clarifying_question_allowed": True,
+                "action_allowed": False,
+                "requires_confirmation": True,
+                "persona_scope_hint": "technical_architect",
+                "privacy_sensitivity_hint": "normal",
+                "response_posture": "direct",
+                "confidence": 0.81,
+                "reason_summary": ["surface_action"],
+            },
+        },
+        capability_match_response=_capability_match_response(
+            capability_id="jellyfin_restart",
+            display_name="Restart media service",
+            domain="home_infrastructure",
+            operation_kind="restart",
+            risk_level="medium_requires_confirmation",
+            requires_confirmation=True,
+            reversible=True,
+            verification_supported=True,
+        ),
+        capability_authority_response={
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "risk_level": "medium_requires_confirmation",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        },
+        capability_flow_response=_action_flow_response(
+            capability_id="jellyfin_restart",
+            confirmation_required=True,
+            confirmation_text="Confirm Restart media service for media server.",
+            execution_allowed=False,
+            verification_supported=True,
+            reason_summary=["registered_capability", "confirmation_required"],
+        ),
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": "Restart media service."}]),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="Done."),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-governance-unknown-values",
+        runtime=runtime,
+        interaction_governance_enabled=True,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "Confirm Restart media service for media server. No action was taken. "
+        "Verification would be available after execution."
+    )
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] is None
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] is None
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] is None
+    assert runtime.capability_flow_calls[0]["interaction_governance_tension"] is None
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capability_registry"]["decision_provenance"] == {
+        "governance_available": False,
+        "interaction_kind": None,
+        "tension_level": None,
+        "forwarded_to_authority": False,
+        "forwarded_to_action_flow": False,
+        "confirmation_required": True,
+        "scoped_confirmation_text_present": True,
+        "execution_allowed": False,
+        "unavailable_reason": "interaction_governance_unusable",
+    }
+    assert "surface_action" not in str(trace["capability_registry"]["decision_provenance"])
+    assert "urgent" not in str(trace["capability_registry"]["decision_provenance"])
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_blocked_authority_refuses_without_execution(tmp_path):
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
@@ -2400,14 +2787,26 @@ async def test_orchestrate_malformed_authority_response_is_conservative(tmp_path
         allow_manual_override=True,
         request_id="rid-capability-bad-authority",
         runtime=runtime,
+        interaction_governance_enabled=True,
         capability_registry_enabled=True,
     )
 
     assert out["answer"] == "I found a matching registered capability, but I did not execute it."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capability_registry"
-    ]
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == "question"
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "low"
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    trace = prompt_trace["capability_registry"]
     assert trace["reason"] == "malformed_capability_authority_response"
+    assert trace["decision_provenance"] == {
+        "governance_available": True,
+        "interaction_kind": "question",
+        "tension_level": "low",
+        "forwarded_to_authority": True,
+        "forwarded_to_action_flow": False,
+        "confirmation_required": None,
+        "scoped_confirmation_text_present": None,
+        "execution_allowed": None,
+    }
     assert trace["authority"] == {
         "attempted": True,
         "status": "failed",
@@ -2416,6 +2815,7 @@ async def test_orchestrate_malformed_authority_response_is_conservative(tmp_path
     }
     assert trace["action_flow"]["attempted"] is False
     assert runtime.capability_flow_calls == []
+    assert prompt_trace["capabilities"]["executor_call_count"] == 0
     assert "action_taken': True" not in str(trace)
 
 
@@ -2457,14 +2857,26 @@ async def test_orchestrate_authority_failure_is_conservative(tmp_path):
         allow_manual_override=True,
         request_id="rid-capability-authority-fallback",
         runtime=runtime,
+        interaction_governance_enabled=True,
         capability_registry_enabled=True,
     )
 
     assert out["answer"] == "I found a matching registered capability, but I did not execute it."
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "capability_registry"
-    ]
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == "question"
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "low"
+    prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    trace = prompt_trace["capability_registry"]
     assert trace["reason"] == "capability_authority_unavailable"
+    assert trace["decision_provenance"] == {
+        "governance_available": True,
+        "interaction_kind": "question",
+        "tension_level": "low",
+        "forwarded_to_authority": True,
+        "forwarded_to_action_flow": False,
+        "confirmation_required": None,
+        "scoped_confirmation_text_present": None,
+        "execution_allowed": None,
+    }
     assert trace["authority"] == {
         "attempted": True,
         "status": "failed",
@@ -2473,6 +2885,7 @@ async def test_orchestrate_authority_failure_is_conservative(tmp_path):
     }
     assert trace["action_flow"]["attempted"] is False
     assert runtime.capability_flow_calls == []
+    assert prompt_trace["capabilities"]["executor_call_count"] == 0
     assert "private authority outage detail" not in str(trace)
 
 
@@ -2494,12 +2907,27 @@ async def test_orchestrate_malformed_action_flow_response_is_conservative(tmp_pa
         allow_manual_override=True,
         request_id="rid-capability-bad-flow",
         runtime=runtime,
+        interaction_governance_enabled=True,
         capability_registry_enabled=True,
     )
 
     assert out["answer"] == "I found a matching registered capability, but I did not execute it."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["reason"] == "malformed_capability_flow_response"
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == "question"
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "low"
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] == "question"
+    assert runtime.capability_flow_calls[0]["interaction_governance_tension"] == "low"
+    assert trace["capability_registry"]["decision_provenance"] == {
+        "governance_available": True,
+        "interaction_kind": "question",
+        "tension_level": "low",
+        "forwarded_to_authority": True,
+        "forwarded_to_action_flow": True,
+        "confirmation_required": None,
+        "scoped_confirmation_text_present": None,
+        "execution_allowed": None,
+    }
     assert trace["capability_registry"]["action_flow"] == {
         "attempted": True,
         "status": "failed",
@@ -2528,12 +2956,27 @@ async def test_orchestrate_action_flow_failure_is_conservative(tmp_path):
         allow_manual_override=True,
         request_id="rid-capability-flow-fallback",
         runtime=runtime,
+        interaction_governance_enabled=True,
         capability_registry_enabled=True,
     )
 
     assert out["answer"] == "I found a matching registered capability, but I did not execute it."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["reason"] == "capability_flow_unavailable"
+    assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == "question"
+    assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "low"
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] == "question"
+    assert runtime.capability_flow_calls[0]["interaction_governance_tension"] == "low"
+    assert trace["capability_registry"]["decision_provenance"] == {
+        "governance_available": True,
+        "interaction_kind": "question",
+        "tension_level": "low",
+        "forwarded_to_authority": True,
+        "forwarded_to_action_flow": True,
+        "confirmation_required": None,
+        "scoped_confirmation_text_present": None,
+        "execution_allowed": None,
+    }
     assert trace["capability_registry"]["action_flow"] == {
         "attempted": True,
         "status": "failed",
@@ -6445,6 +6888,7 @@ async def test_orchestrate_interaction_governance_injects_tactical_prompt_guidan
         "included": True,
         "runtime_call_status": "included",
         "interaction_kind": "tense_debugging",
+        "tension_level": "high",
         "response_posture": "tactical",
         "commentary_allowed": False,
         "humor_allowed": False,
