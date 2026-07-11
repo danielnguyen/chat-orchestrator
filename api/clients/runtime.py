@@ -424,6 +424,52 @@ class RuntimeClient:
             payload["interaction_governance_tension"] = interaction_governance_tension
         return await self._post("/v1/capabilities/flow", json=payload)
 
+    async def action_summary(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str | None,
+        capability_id: str,
+        active_persona_id: str,
+        risk_level: str,
+        authority_level: str,
+        confirmation_status: str,
+        policy_reason_codes: list[str],
+        execution_status: str,
+        verification_status: str,
+        execution_reason_code: str | None = None,
+        verification_reason_code: str | None = None,
+        degradation_reason: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "capability_id": capability_id,
+            "active_persona_id": active_persona_id,
+            "risk_level": risk_level,
+            "authority_level": authority_level,
+            "confirmation_status": confirmation_status,
+            "policy_reason_codes": policy_reason_codes,
+            "execution_status": execution_status,
+            "verification_status": verification_status,
+        }
+        if runtime_turn_id is not None:
+            payload["runtime_turn_id"] = runtime_turn_id
+        if execution_reason_code is not None:
+            payload["execution_reason_code"] = execution_reason_code
+        if verification_reason_code is not None:
+            payload["verification_reason_code"] = verification_reason_code
+        if degradation_reason is not None:
+            payload["degradation_reason"] = degradation_reason
+        return await self._post("/v1/capabilities/action-summary", json=payload)
+
     async def confirm_capability(
         self,
         *,
