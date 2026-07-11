@@ -320,6 +320,7 @@ class FakeRuntime:
         capability_discovery_response=None,
         capability_authority_response=None,
         capability_flow_response=None,
+        action_summary_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
@@ -331,6 +332,7 @@ class FakeRuntime:
         capability_discovery_error: Exception | None = None,
         capability_authority_error: Exception | None = None,
         capability_flow_error: Exception | None = None,
+        action_summary_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -352,6 +354,7 @@ class FakeRuntime:
         self.capability_discovery_calls = []
         self.capability_authority_calls = []
         self.capability_flow_calls = []
+        self.action_summary_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -675,6 +678,7 @@ class FakeRuntime:
                 "action_taken": False,
             },
         }
+        self.action_summary_response = action_summary_response
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
@@ -686,6 +690,7 @@ class FakeRuntime:
         self.capability_discovery_error = capability_discovery_error
         self.capability_authority_error = capability_authority_error
         self.capability_flow_error = capability_flow_error
+        self.action_summary_error = action_summary_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -873,6 +878,68 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.capability_flow_response
+
+    async def action_summary(self, **kwargs):
+        self.action_summary_calls.append(kwargs)
+        self.call_order.append("action_summary")
+        if self.action_summary_error is not None:
+            raise self.action_summary_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        if self.action_summary_response is not None:
+            return self.action_summary_response
+        capability_id = kwargs["capability_id"]
+        execution_status = kwargs["execution_status"]
+        verification_status = kwargs["verification_status"]
+        if execution_status == "blocked_by_policy":
+            summary = f"Action {capability_id} was blocked by policy. No action was taken."
+        elif execution_status == "cancelled_by_user":
+            summary = f"Action {capability_id} was cancelled. No action was taken."
+        elif execution_status == "not_attempted":
+            summary = f"Action {capability_id} was not attempted. No action was taken."
+        elif execution_status == "failed":
+            summary = f"Action {capability_id} failed after execution was attempted."
+        elif execution_status == "unknown":
+            summary = (
+                f"The execution state for action {capability_id} could not be confirmed. "
+                "No success is claimed."
+            )
+        elif verification_status == "passed":
+            summary = f"Action {capability_id} was executed and verification passed."
+        elif verification_status == "failed":
+            summary = f"Action {capability_id} was executed, but verification failed."
+        elif verification_status == "unknown":
+            summary = (
+                f"Action {capability_id} was executed, but verification could not be confirmed."
+            )
+        elif verification_status == "not_supported":
+            summary = f"Action {capability_id} was executed. Verification is not supported."
+        else:
+            summary = f"Action {capability_id} was executed. Verification was not required."
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs.get("runtime_turn_id"),
+            "result": {
+                "action_id": "act_testsummary",
+                "capability_id": capability_id,
+                "requested_by": "conversation_participant",
+                "surface_type": kwargs["surface"],
+                "active_persona_id": kwargs["active_persona_id"],
+                "risk_level": kwargs["risk_level"],
+                "authority_level": kwargs["authority_level"],
+                "confirmation_status": kwargs["confirmation_status"],
+                "execution_status": execution_status,
+                "verification_status": verification_status,
+                "degradation_reason": kwargs.get("degradation_reason"),
+                "policy_reason_codes": kwargs["policy_reason_codes"],
+                "execution_reason_code": kwargs.get("execution_reason_code"),
+                "verification_reason_code": kwargs.get("verification_reason_code"),
+                "user_visible_summary": summary,
+            },
+        }
 
     async def reset(self, **kwargs):
         self.reset_calls.append(kwargs)
@@ -1761,6 +1828,7 @@ async def test_orchestrate_capability_registry_disabled_does_not_call_runtime_me
     assert runtime.capability_discovery_calls == []
     assert runtime.capability_authority_calls == []
     assert runtime.capability_flow_calls == []
+    assert runtime.action_summary_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "capability_registry"
     ]
@@ -1929,10 +1997,12 @@ async def test_orchestrate_unmatched_capability_does_not_call_authority_or_execu
     assert runtime.capability_authority_calls == []
     assert runtime.capability_flow_calls == []
     assert runtime.capability_authorization_calls == []
+    assert runtime.action_summary_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["match"]["matched"] is False
     assert trace["capability_registry"]["authority"]["attempted"] is False
     assert trace["capability_registry"]["action_flow"]["attempted"] is False
+    assert trace["capabilities"]["action_summary"]["status"] == "not_applicable"
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -2066,6 +2136,7 @@ async def test_orchestrate_consumes_capability_discovery_examples(tmp_path):
     assert runtime.capability_discovery_calls[0]["active_persona_id"] == "technical_architect"
     assert runtime.capability_authority_calls == []
     assert runtime.capability_flow_calls == []
+    assert runtime.action_summary_calls == []
     assert any(
         msg["role"] == "system"
         and "Turn on office lights" in msg["content"]
@@ -2416,8 +2487,7 @@ async def test_orchestrate_traces_high_tension_governance_suppression_without_ex
     )
 
     assert out["answer"] == (
-        "I found a matching registered capability, but I did not execute it. "
-        "Verification would be available after execution."
+        "Action office_lights_on was blocked by policy. No action was taken."
     )
     assert "Done" not in out["answer"]
     assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == (
@@ -2682,10 +2752,17 @@ async def test_orchestrate_blocked_authority_refuses_without_execution(tmp_path)
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == "I found a matching registered capability, but I did not execute it."
+    assert out["answer"] == (
+        "Action external_purchase was blocked by policy. No action was taken."
+    )
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["authority"]["authority_level"] == "blocked"
     assert trace["capability_registry"]["action_flow"]["execution_allowed"] is False
+    assert len(runtime.action_summary_calls) == 1
+    assert runtime.action_summary_calls[0]["execution_status"] == "blocked_by_policy"
+    assert runtime.action_summary_calls[0]["verification_status"] == "not_required"
+    assert runtime.action_summary_calls[0]["degradation_reason"] == "execution_blocked"
+    assert trace["capabilities"]["action_summary"]["status"] == "included"
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -3029,6 +3106,10 @@ async def test_orchestrate_action_flow_dry_run_preview_says_no_action(tmp_path):
     assert action_flow["dry_run_effects"][0]["intended_effect"] == (
         "Would turn on the office lights."
     )
+    assert len(runtime.action_summary_calls) == 1
+    assert runtime.action_summary_calls[0]["execution_status"] == "not_attempted"
+    assert runtime.action_summary_calls[0]["verification_status"] == "not_required"
+    assert trace["capabilities"]["action_summary"]["status"] == "included"
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -3093,6 +3174,11 @@ async def test_orchestrate_action_flow_confirmation_uses_scoped_text(tmp_path):
     assert action_flow["confirmation_text"] == (
         "Confirm Restart Jellyfin for media server. This may be difficult to reverse."
     )
+    assert len(runtime.action_summary_calls) == 1
+    assert runtime.action_summary_calls[0]["confirmation_status"] == "required_pending"
+    assert runtime.action_summary_calls[0]["execution_status"] == "not_attempted"
+    assert runtime.action_summary_calls[0]["verification_status"] == "not_required"
+    assert trace["capabilities"]["action_summary"]["status"] == "included"
     assert trace["capabilities"]["executor_call_count"] == 0
 
 
@@ -3206,8 +3292,7 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
     )
 
     assert out["answer"] == (
-        "I read bounded runtime world state and verified the result: found "
-        "0 matching claim(s)."
+        "Action runtime.world_state.read was executed and verification passed."
     )
     tool_names = [item["function"]["name"] for item in litellm.calls[0]["tools"]]
     assert tool_names == ["runtime_world_state_read"]
@@ -3233,6 +3318,43 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
         "matching_claim_count": 0,
     }
     assert execution["response_status"] == "executed_verified"
+    assert runtime.action_summary_calls == [
+        {
+            "request_id": "rid-registry-world-state-verified:action-summary",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "vscode",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "capability_id": "runtime.world_state.read",
+            "active_persona_id": "technical_architect",
+            "risk_level": "read_only",
+            "authority_level": "answer_only",
+            "confirmation_status": "not_required",
+            "policy_reason_codes": [
+                "registered_capability",
+                "read_only_authority",
+                "execution_allowed_by_policy",
+            ],
+            "execution_status": "executed",
+            "execution_reason_code": "adapter_completed",
+            "verification_status": "passed",
+            "verification_reason_code": "bounded_result_verified",
+            "degradation_reason": None,
+        }
+    ]
+    assert trace["capabilities"]["action_summary"] == {
+        "attempted": True,
+        "status": "included",
+        "reason": "action_summary_included",
+        "action_id": "act_testsummary",
+        "capability_id": "runtime.world_state.read",
+        "confirmation_status": "not_required",
+        "execution_status": "executed",
+        "verification_status": "passed",
+        "degradation_reason": None,
+        "user_visible_summary_present": True,
+    }
     assert trace["capabilities"]["dispatch_completed"] is True
     assert trace["capabilities"]["executor_call_count"] == 1
     assert trace["capabilities"]["follow_up"]["status"] == "not_attempted"
@@ -3267,7 +3389,7 @@ async def test_orchestrate_reports_registry_world_state_verification_failure(tmp
     )
 
     assert out["answer"] == (
-        "I read bounded runtime world state, but I could not verify the result safely."
+        "Action runtime.world_state.read was executed, but verification failed."
     )
     assert "verified the result" not in out["answer"].casefold()
     execute_calls = [
@@ -3281,6 +3403,312 @@ async def test_orchestrate_reports_registry_world_state_verification_failure(tmp
     assert execution["post_execution_verification"]["status"] == "failed"
     assert execution["post_execution_verification"]["reason_code"] == "result_check_failed"
     assert execution["response_status"] == "executed_unverified"
+    assert len(runtime.action_summary_calls) == 1
+    summary_call = runtime.action_summary_calls[0]
+    assert summary_call["execution_status"] == "executed"
+    assert summary_call["verification_status"] == "failed"
+    assert summary_call["verification_reason_code"] == "result_check_failed"
+    assert summary_call["degradation_reason"] == "result_check_failed"
+    action_summary = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["capabilities"]["action_summary"]
+    assert action_summary["status"] == "included"
+    assert action_summary["execution_status"] == "executed"
+    assert action_summary["verification_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_executor_failure_uses_action_summary_without_retry(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+
+    async def fail_execute(**kwargs):
+        runtime.world_state_calls.append(kwargs)
+        if kwargs["request_id"].endswith(":execute"):
+            raise RuntimeError("PRIVATE-EXECUTOR-DETAIL")
+        return runtime.world_state_response
+
+    runtime.world_state_resolve = fail_execute
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-world-state-executor-failed",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "Action runtime.world_state.read failed after execution was attempted."
+    )
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    assert len(runtime.action_summary_calls) == 1
+    summary_call = runtime.action_summary_calls[0]
+    assert summary_call["execution_status"] == "failed"
+    assert summary_call["verification_status"] == "unknown"
+    assert summary_call["degradation_reason"] == "executor_failed"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["executor_call_count"] == 1
+    assert trace["capabilities"]["follow_up"]["call_count"] == 0
+    assert trace["capabilities"]["action_summary"]["status"] == "included"
+    assert "PRIVATE-EXECUTOR-DETAIL" not in str(trace["capabilities"]["action_summary"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_summary_unavailable_preserves_execution_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    runtime.action_summary_error = RuntimeError("PRIVATE-SUMMARY-ERROR")
+    memory_store = FakeMemoryStore()
+    verification_calls = 0
+    original_verifier = capability_service._verify_world_state_read_result
+
+    def count_verification(result):
+        nonlocal verification_calls
+        verification_calls += 1
+        return original_verifier(result)
+
+    monkeypatch.setattr(
+        capability_service,
+        "_verify_world_state_read_result",
+        count_verification,
+    )
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-summary-unavailable",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I read bounded runtime world state and verified the result: found "
+        "0 matching claim(s)."
+    )
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    assert verification_calls == 1
+    assert len(runtime.action_summary_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["action_summary"]["status"] == "unavailable"
+    assert trace["capabilities"]["action_summary"]["reason"] == (
+        "action_summary_unavailable"
+    )
+    assert "PRIVATE-SUMMARY-ERROR" not in str(trace["capabilities"]["action_summary"])
+
+
+@pytest.mark.parametrize("returned_degradation", ["different_failure", None])
+@pytest.mark.asyncio
+async def test_orchestrate_rejects_mismatched_degradation_after_verification_failure(
+    tmp_path,
+    monkeypatch,
+    returned_degradation,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+    verification_calls = 0
+
+    def fail_verification(_result):
+        nonlocal verification_calls
+        verification_calls += 1
+        return {"status": "failed", "reason_code": "result_check_failed"}
+
+    monkeypatch.setattr(
+        capability_service,
+        "_verify_world_state_read_result",
+        fail_verification,
+    )
+    default_action_summary = runtime.action_summary
+
+    async def mismatched_action_summary(**kwargs):
+        response = await default_action_summary(**kwargs)
+        response["result"]["degradation_reason"] = returned_degradation
+        return response
+
+    runtime.action_summary = mismatched_action_summary
+    litellm = FakeLiteLLM(
+        completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+    )
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-summary-degradation-mismatch",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I read bounded runtime world state, but I could not verify the result safely."
+    )
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    assert verification_calls == 1
+    assert len(runtime.action_summary_calls) == 1
+    assert runtime.action_summary_calls[0]["execution_status"] == "executed"
+    assert runtime.action_summary_calls[0]["verification_status"] == "failed"
+    assert runtime.action_summary_calls[0]["degradation_reason"] == "result_check_failed"
+    assert len(litellm.calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["executor_call_count"] == 1
+    assert trace["capabilities"]["action_summary"]["status"] == "mismatched"
+    assert trace["capabilities"]["action_summary"]["action_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("response_kind", "expected_status"),
+    [
+        ("malformed", "malformed"),
+        ("mismatched", "mismatched"),
+        ("unexpected_degradation", "mismatched"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrate_rejects_invalid_action_summary_response(
+    tmp_path,
+    response_kind,
+    expected_status,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+    default_action_summary = runtime.action_summary
+
+    async def invalid_action_summary(**kwargs):
+        response = await default_action_summary(**kwargs)
+        if response_kind == "malformed":
+            response["result"]["execution_status"] = "provider_private_text"
+        elif response_kind == "mismatched":
+            response["request_id"] = "rid:mismatched"
+        else:
+            response["result"]["degradation_reason"] = "different_failure"
+        return response
+
+    runtime.action_summary = invalid_action_summary
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-registry-summary-{response_kind}",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I read bounded runtime world state and verified the result: found "
+        "0 matching claim(s)."
+    )
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    assert len(runtime.action_summary_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["action_summary"]["status"] == expected_status
+    assert trace["capabilities"]["action_summary"]["action_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_action_summary_submission_and_trace_are_privacy_safe(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    sentinel = "PRIVATE_PROMPT credential=https://private.example/token"
+    runtime = _world_state_registry_runtime()
+    runtime.world_state_response["raw_adapter_output"] = sentinel
+    memory_store = FakeMemoryStore()
+    completion = _tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+    completion["choices"][0]["message"]["content"] = sentinel
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Read current runtime world state. {sentinel}",
+                }
+            ]
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(completion=completion),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-summary-private",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert len(runtime.action_summary_calls) == 1
+    summary_call = runtime.action_summary_calls[0]
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert sentinel not in str(summary_call)
+    assert sentinel not in str(trace["capabilities"]["action_summary"])
+    assert sentinel not in out["answer"]
+    assert "raw_adapter_output" not in str(summary_call)
+    assert "normalized_arguments" not in str(summary_call)
+    assert "exception" not in str(trace["capabilities"]["action_summary"])
+
+    invalid_runtime = _world_state_registry_runtime()
+    invalid_memory_store = FakeMemoryStore()
+    invalid_out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=invalid_memory_store,
+        litellm=FakeLiteLLM(
+            completion=_tool_completion(
+                "runtime_world_state_read",
+                {"output_mode": "summary", "credential": sentinel},
+            )
+        ),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-summary-private-arguments",
+        runtime=invalid_runtime,
+        capability_registry_enabled=True,
+    )
+    assert len(invalid_runtime.action_summary_calls) == 1
+    assert sentinel not in str(invalid_runtime.action_summary_calls[0])
+    assert sentinel not in invalid_out["answer"]
 
 
 @pytest.mark.parametrize(
@@ -3318,7 +3746,7 @@ async def test_orchestrate_does_not_claim_success_for_missing_verification_resul
         capability_registry_enabled=True,
     )
 
-    assert "could not verify the result safely" in out["answer"]
+    assert "verification failed" in out["answer"]
     assert "verified the result" not in out["answer"].casefold()
     execute_calls = [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
@@ -3339,9 +3767,9 @@ async def test_orchestrate_does_not_claim_success_for_missing_verification_resul
                 "authority_allowed": False,
                 "authority_level": "suggest_only",
             },
-            "did not execute",
+                "No action was taken",
         ),
-        ({"execution_allowed": False}, "did not execute"),
+        ({"execution_allowed": False}, "No action was taken"),
         (
             {
                 "authority_allowed": False,

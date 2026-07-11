@@ -556,6 +556,66 @@ async def test_action_flow_posts_expected_bounded_payload():
 
 
 @pytest.mark.asyncio
+async def test_action_summary_posts_exact_bounded_payload():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"result": {"action_id": "act_123"}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    await client.action_summary(
+        request_id="rid:cap:summary",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        capability_id="runtime.world_state.read",
+        active_persona_id="technical_architect",
+        risk_level="read_only",
+        authority_level="answer_only",
+        confirmation_status="not_required",
+        policy_reason_codes=["registered_capability", "execution_allowed_by_policy"],
+        execution_status="executed",
+        execution_reason_code="adapter_completed",
+        verification_status="failed",
+        verification_reason_code="result_check_failed",
+        degradation_reason="result_check_failed",
+    )
+
+    assert calls == [
+        (
+            "/v1/capabilities/action-summary",
+            {
+                "request_id": "rid:cap:summary",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "capability_id": "runtime.world_state.read",
+                "active_persona_id": "technical_architect",
+                "risk_level": "read_only",
+                "authority_level": "answer_only",
+                "confirmation_status": "not_required",
+                "policy_reason_codes": [
+                    "registered_capability",
+                    "execution_allowed_by_policy",
+                ],
+                "execution_status": "executed",
+                "execution_reason_code": "adapter_completed",
+                "verification_status": "failed",
+                "verification_reason_code": "result_check_failed",
+                "degradation_reason": "result_check_failed",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_world_state_claim_verify_posts_expected_structural_payload():
     client = RuntimeClient("http://runtime.local", None)
     calls: list[tuple[str, dict[str, object]]] = []

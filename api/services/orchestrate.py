@@ -1466,6 +1466,34 @@ VALID_ACTION_OPERATION_KINDS = {
     "blocked_external_action",
 }
 VALID_ACTION_FLOW_VERIFICATION_METHODS = {"capability_verification"}
+VALID_ACTION_CONFIRMATION_STATUSES = {
+    "not_required",
+    "required_pending",
+    "accepted",
+    "rejected",
+    "expired",
+    "cancelled",
+    "unknown",
+}
+VALID_ACTION_EXECUTION_STATUSES = {
+    "not_attempted",
+    "blocked_by_policy",
+    "cancelled_by_user",
+    "executed",
+    "partially_executed",
+    "failed",
+    "unknown",
+}
+VALID_ACTION_VERIFICATION_STATUSES = {
+    "not_supported",
+    "not_required",
+    "passed",
+    "failed",
+    "unknown",
+}
+ACTION_SUMMARY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
+ACTION_SUMMARY_ID = re.compile(r"^act_[A-Za-z0-9]{1,59}$")
+ACTION_SUMMARY_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 VALID_INTERACTION_GOVERNANCE_KINDS = {
     "command",
     "question",
@@ -1608,6 +1636,554 @@ def _safe_action_flow_decision(value: Any) -> dict[str, Any] | None:
         ),
         "action_taken": False,
     }
+
+
+def _action_summary_empty_trace(
+    *,
+    status: str = "not_applicable",
+    reason: str = "not_applicable",
+) -> dict[str, Any]:
+    return {
+        "attempted": False,
+        "status": status,
+        "reason": reason,
+        "action_id": None,
+        "capability_id": None,
+        "confirmation_status": None,
+        "execution_status": None,
+        "verification_status": None,
+        "degradation_reason": None,
+        "user_visible_summary_present": False,
+    }
+
+
+def _safe_action_summary_identifier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 120
+        or ACTION_SUMMARY_IDENTIFIER.fullmatch(cleaned) is None
+    ):
+        return None
+    return cleaned
+
+
+def _safe_action_summary_code(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 64
+        or ACTION_SUMMARY_CODE.fullmatch(cleaned) is None
+    ):
+        return None
+    return cleaned
+
+
+def _safe_action_summary_codes(*values: Any, limit: int = 16) -> list[str]:
+    codes: list[str] = []
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            code = _safe_action_summary_code(item)
+            if code is not None and code not in codes:
+                codes.append(code)
+            if len(codes) >= limit:
+                return codes
+    return codes
+
+
+def _action_summary_confirmation_status(
+    action_flow: dict[str, Any],
+    execution: dict[str, Any],
+) -> str:
+    confirmation = (
+        execution.get("confirmation")
+        if isinstance(execution.get("confirmation"), dict)
+        else {}
+    )
+    confirmation_state = _safe_action_summary_code(confirmation.get("status"))
+    confirmation_reason = _safe_action_summary_code(confirmation.get("reason_code"))
+    flow_reasons = _safe_action_summary_codes(action_flow.get("reason_summary"))
+    evidence = {confirmation_state, confirmation_reason, *flow_reasons}
+    if "accepted" in evidence or confirmation.get("accepted") is True:
+        return "accepted"
+    if evidence & {"confirmation_cancelled", "cancelled"}:
+        return "cancelled"
+    if evidence & {"confirmation_rejected", "rejected"}:
+        return "rejected"
+    if evidence & {"confirmation_expired", "expired"}:
+        return "expired"
+    if action_flow.get("confirmation_required") is False:
+        return "not_required"
+    if action_flow.get("confirmation_required") is True:
+        return "required_pending"
+    return "unknown"
+
+
+def _action_summary_policy_blocked(
+    authority: dict[str, Any],
+    action_flow: dict[str, Any],
+    confirmation_status: str,
+) -> bool:
+    if confirmation_status == "required_pending":
+        return False
+    if authority.get("authority_level") == "blocked":
+        return True
+    if authority.get("allowed") is False:
+        return True
+    return action_flow.get("execution_allowed") is False
+
+
+def _action_summary_degradation_from_policy(policy_reason_codes: list[str]) -> str:
+    generic = {
+        "registered_capability",
+        "execution_not_allowed",
+        "execution_allowed_by_policy",
+        "confirmation_required",
+        "read_only_authority",
+        "low_reversible_execution",
+    }
+    for code in reversed(policy_reason_codes):
+        if code not in generic:
+            return code
+    return "policy_blocked"
+
+
+def _action_summary_outcome(
+    *,
+    authority: dict[str, Any],
+    action_flow: dict[str, Any],
+    execution: dict[str, Any],
+    policy_reason_codes: list[str],
+) -> dict[str, Any]:
+    confirmation_status = _action_summary_confirmation_status(action_flow, execution)
+    response_status = _safe_action_summary_code(execution.get("response_status"))
+    failure_reason = _safe_action_summary_code(execution.get("failure_reason_code"))
+    verification = (
+        execution.get("post_execution_verification")
+        if isinstance(execution.get("post_execution_verification"), dict)
+        else {}
+    )
+    verification_state = _safe_action_summary_code(verification.get("status"))
+    verification_reason = _safe_action_summary_code(verification.get("reason_code"))
+
+    outcome: dict[str, Any] = {
+        "confirmation_status": confirmation_status,
+        "execution_status": "unknown",
+        "verification_status": "unknown",
+        "execution_reason_code": "execution_state_unknown",
+        "verification_reason_code": None,
+        "degradation_reason": "execution_state_unknown",
+    }
+    if response_status == "executed_verified":
+        outcome.update(
+            {
+                "execution_status": "executed",
+                "verification_status": "passed",
+                "execution_reason_code": "adapter_completed",
+                "verification_reason_code": verification_reason
+                or "bounded_result_verified",
+                "degradation_reason": None,
+            }
+        )
+    elif response_status == "executed_unverified":
+        failed_verification = verification_state == "failed"
+        degradation = verification_reason or "verification_unknown"
+        outcome.update(
+            {
+                "execution_status": "executed",
+                "verification_status": "failed" if failed_verification else "unknown",
+                "execution_reason_code": "adapter_completed",
+                "verification_reason_code": verification_reason,
+                "degradation_reason": degradation,
+            }
+        )
+    elif response_status == "executed":
+        verification_status = (
+            "not_supported"
+            if action_flow.get("verification_supported") is False
+            else "not_required"
+        )
+        outcome.update(
+            {
+                "execution_status": "executed",
+                "verification_status": verification_status,
+                "execution_reason_code": "adapter_completed",
+                "verification_reason_code": None,
+                "degradation_reason": None,
+            }
+        )
+    elif response_status == "executor_failed":
+        degradation = failure_reason or "executor_failed"
+        outcome.update(
+            {
+                "execution_status": "failed",
+                "verification_status": "unknown",
+                "execution_reason_code": degradation,
+                "verification_reason_code": None,
+                "degradation_reason": degradation,
+            }
+        )
+    else:
+        preview = bool(
+            action_flow.get("dry_run_required") is True
+            and action_flow.get("dry_run_effects")
+        )
+        if confirmation_status == "cancelled":
+            outcome.update(
+                {
+                    "execution_status": "cancelled_by_user",
+                    "verification_status": "not_required",
+                    "execution_reason_code": "cancelled_by_user",
+                    "verification_reason_code": None,
+                    "degradation_reason": None,
+                }
+            )
+        elif preview or confirmation_status in {
+            "required_pending",
+            "rejected",
+            "expired",
+        }:
+            outcome.update(
+                {
+                    "execution_status": "not_attempted",
+                    "verification_status": "not_required",
+                    "execution_reason_code": None,
+                    "verification_reason_code": None,
+                    "degradation_reason": None,
+                }
+            )
+        elif _action_summary_policy_blocked(
+            authority,
+            action_flow,
+            confirmation_status,
+        ):
+            degradation = _action_summary_degradation_from_policy(policy_reason_codes)
+            outcome.update(
+                {
+                    "execution_status": "blocked_by_policy",
+                    "verification_status": "not_required",
+                    "execution_reason_code": "policy_blocked",
+                    "verification_reason_code": None,
+                    "degradation_reason": degradation,
+                }
+            )
+        elif response_status in {None, "not_executed"}:
+            outcome.update(
+                {
+                    "execution_status": "not_attempted",
+                    "verification_status": "not_required",
+                    "execution_reason_code": None,
+                    "verification_reason_code": None,
+                    "degradation_reason": None,
+                }
+            )
+    return outcome
+
+
+def _safe_action_summary_response(
+    value: Any,
+    *,
+    expected: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(value, dict):
+        return None, "malformed"
+    envelope_fields = (
+        "request_id",
+        "owner_id",
+        "conversation_id",
+        "runtime_session_id",
+    )
+    for field in envelope_fields:
+        received = _safe_action_summary_identifier(value.get(field))
+        if received is None:
+            return None, "malformed"
+        if received != expected[field]:
+            return None, "mismatched"
+    received_turn = value.get("runtime_turn_id")
+    if received_turn is not None:
+        received_turn = _safe_action_summary_identifier(received_turn)
+        if received_turn is None:
+            return None, "malformed"
+    if received_turn != expected.get("runtime_turn_id"):
+        return None, "mismatched"
+
+    result = value.get("result")
+    if not isinstance(result, dict):
+        return None, "malformed"
+    raw_action_id = result.get("action_id")
+    action_id = raw_action_id.strip() if isinstance(raw_action_id, str) else None
+    capability_id = _safe_action_summary_identifier(result.get("capability_id"))
+    requested_by = _sanitize_trace_string(result.get("requested_by"), max_length=64)
+    surface_type = _safe_action_summary_identifier(result.get("surface_type"))
+    active_persona_id = _safe_action_summary_identifier(
+        result.get("active_persona_id")
+    )
+    risk_level = _sanitize_trace_string(result.get("risk_level"), max_length=64)
+    authority_level = _sanitize_trace_string(result.get("authority_level"), max_length=64)
+    confirmation_status = _sanitize_trace_string(
+        result.get("confirmation_status"), max_length=64
+    )
+    execution_status = _sanitize_trace_string(
+        result.get("execution_status"), max_length=64
+    )
+    verification_status = _sanitize_trace_string(
+        result.get("verification_status"), max_length=64
+    )
+    degradation_reason = result.get("degradation_reason")
+    if degradation_reason is not None:
+        degradation_reason = _safe_action_summary_code(degradation_reason)
+        if degradation_reason is None:
+            return None, "malformed"
+    execution_reason_code = result.get("execution_reason_code")
+    if execution_reason_code is not None:
+        execution_reason_code = _safe_action_summary_code(execution_reason_code)
+        if execution_reason_code is None:
+            return None, "malformed"
+    verification_reason_code = result.get("verification_reason_code")
+    if verification_reason_code is not None:
+        verification_reason_code = _safe_action_summary_code(verification_reason_code)
+        if verification_reason_code is None:
+            return None, "malformed"
+    raw_policy_reasons = result.get("policy_reason_codes")
+    policy_reason_codes = _safe_action_summary_codes(raw_policy_reasons)
+    if not isinstance(raw_policy_reasons, list) or len(policy_reason_codes) != len(
+        raw_policy_reasons
+    ):
+        return None, "malformed"
+    raw_user_visible_summary = result.get("user_visible_summary")
+    user_visible_summary = (
+        raw_user_visible_summary.strip()
+        if isinstance(raw_user_visible_summary, str)
+        and 0 < len(raw_user_visible_summary.strip()) <= 500
+        else None
+    )
+    if (
+        action_id is None
+        or len(action_id) > 64
+        or ACTION_SUMMARY_ID.fullmatch(action_id) is None
+        or capability_id is None
+        or requested_by != "conversation_participant"
+        or surface_type is None
+        or active_persona_id is None
+        or risk_level not in VALID_ACTION_RISK_LEVELS
+        or authority_level not in VALID_ACTION_AUTHORITY_LEVELS
+        or confirmation_status not in VALID_ACTION_CONFIRMATION_STATUSES
+        or execution_status not in VALID_ACTION_EXECUTION_STATUSES
+        or verification_status not in VALID_ACTION_VERIFICATION_STATUSES
+        or user_visible_summary is None
+    ):
+        return None, "malformed"
+
+    matching_fields = {
+        "capability_id": capability_id,
+        "surface": surface_type,
+        "active_persona_id": active_persona_id,
+        "risk_level": risk_level,
+        "authority_level": authority_level,
+        "confirmation_status": confirmation_status,
+        "execution_status": execution_status,
+        "verification_status": verification_status,
+        "policy_reason_codes": policy_reason_codes,
+        "execution_reason_code": execution_reason_code,
+        "verification_reason_code": verification_reason_code,
+        "degradation_reason": degradation_reason,
+    }
+    if any(expected.get(field) != received for field, received in matching_fields.items()):
+        return None, "mismatched"
+    return (
+        {
+            "action_id": action_id,
+            "capability_id": capability_id,
+            "requested_by": requested_by,
+            "surface_type": surface_type,
+            "active_persona_id": active_persona_id,
+            "risk_level": risk_level,
+            "authority_level": authority_level,
+            "confirmation_status": confirmation_status,
+            "execution_status": execution_status,
+            "verification_status": verification_status,
+            "degradation_reason": degradation_reason,
+            "policy_reason_codes": policy_reason_codes,
+            "execution_reason_code": execution_reason_code,
+            "verification_reason_code": verification_reason_code,
+            "user_visible_summary": user_visible_summary,
+        },
+        "included",
+    )
+
+
+async def _compose_action_summary(
+    *,
+    runtime: Any | None,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: Any,
+    runtime_turn_id: Any,
+    active_persona_id: Any,
+    capability_registry_trace: dict[str, Any],
+    capability_execution_trace: Any,
+) -> tuple[dict[str, Any], str | None]:
+    match = (
+        capability_registry_trace.get("match")
+        if isinstance(capability_registry_trace.get("match"), dict)
+        else {}
+    )
+    if (
+        capability_registry_trace.get("enabled") is not True
+        or match.get("status") != "included"
+        or match.get("matched") is not True
+    ):
+        return _action_summary_empty_trace(), None
+
+    authority = (
+        capability_registry_trace.get("authority")
+        if isinstance(capability_registry_trace.get("authority"), dict)
+        else {}
+    )
+    action_flow = (
+        capability_registry_trace.get("action_flow")
+        if isinstance(capability_registry_trace.get("action_flow"), dict)
+        else {}
+    )
+    capability_id = _safe_action_summary_identifier(match.get("matched_capability_id"))
+    safe_session_id = _safe_action_summary_identifier(runtime_session_id)
+    safe_turn_id = (
+        _safe_action_summary_identifier(runtime_turn_id)
+        if runtime_turn_id is not None
+        else None
+    )
+    safe_persona_id = _safe_action_summary_identifier(active_persona_id)
+    safe_request_id = _safe_action_summary_identifier(f"{request_id}:action-summary")
+    safe_owner_id = _safe_action_summary_identifier(owner_id)
+    safe_conversation_id = _safe_action_summary_identifier(conversation_id)
+    safe_surface = _safe_action_summary_identifier(surface)
+    if (
+        authority.get("status") != "included"
+        or action_flow.get("status") != "included"
+        or capability_id is None
+        or authority.get("capability_id") != capability_id
+        or action_flow.get("capability_id") != capability_id
+        or authority.get("risk_level") not in VALID_ACTION_RISK_LEVELS
+        or authority.get("authority_level") not in VALID_ACTION_AUTHORITY_LEVELS
+        or safe_session_id is None
+        or (runtime_turn_id is not None and safe_turn_id is None)
+        or safe_persona_id is None
+        or safe_request_id is None
+        or safe_owner_id is None
+        or safe_conversation_id is None
+        or safe_surface is None
+    ):
+        return (
+            _action_summary_empty_trace(
+                status="policy_context_unavailable",
+                reason="bounded_policy_context_unavailable",
+            ),
+            None,
+        )
+    if runtime is None or not hasattr(runtime, "action_summary"):
+        return (
+            _action_summary_empty_trace(
+                status="unavailable",
+                reason="action_summary_unavailable",
+            ),
+            None,
+        )
+
+    policy_reason_codes = _safe_action_summary_codes(
+        authority.get("reason_summary"),
+        action_flow.get("reason_summary"),
+    )
+    execution = (
+        capability_execution_trace
+        if isinstance(capability_execution_trace, dict)
+        else {}
+    )
+    outcome = _action_summary_outcome(
+        authority=authority,
+        action_flow=action_flow,
+        execution=execution,
+        policy_reason_codes=policy_reason_codes,
+    )
+    submission = {
+        "request_id": safe_request_id,
+        "owner_id": safe_owner_id,
+        "conversation_id": safe_conversation_id,
+        "surface": safe_surface,
+        "runtime_session_id": safe_session_id,
+        "runtime_turn_id": safe_turn_id,
+        "capability_id": capability_id,
+        "active_persona_id": safe_persona_id,
+        "risk_level": authority["risk_level"],
+        "authority_level": authority["authority_level"],
+        "confirmation_status": outcome["confirmation_status"],
+        "policy_reason_codes": policy_reason_codes,
+        "execution_status": outcome["execution_status"],
+        "execution_reason_code": outcome["execution_reason_code"],
+        "verification_status": outcome["verification_status"],
+        "verification_reason_code": outcome["verification_reason_code"],
+        "degradation_reason": outcome["degradation_reason"],
+    }
+    try:
+        response = await runtime.action_summary(**submission)
+    except Exception:
+        trace = _action_summary_empty_trace(
+            status="unavailable",
+            reason="action_summary_unavailable",
+        )
+        trace["attempted"] = True
+        trace["capability_id"] = capability_id
+        trace["confirmation_status"] = outcome["confirmation_status"]
+        trace["execution_status"] = outcome["execution_status"]
+        trace["verification_status"] = outcome["verification_status"]
+        trace["degradation_reason"] = outcome["degradation_reason"]
+        return trace, None
+
+    summary, response_status = _safe_action_summary_response(
+        response,
+        expected=submission,
+    )
+    if summary is None:
+        trace = _action_summary_empty_trace(
+            status=response_status,
+            reason=f"action_summary_{response_status}",
+        )
+        trace["attempted"] = True
+        trace["capability_id"] = capability_id
+        trace["confirmation_status"] = outcome["confirmation_status"]
+        trace["execution_status"] = outcome["execution_status"]
+        trace["verification_status"] = outcome["verification_status"]
+        trace["degradation_reason"] = outcome["degradation_reason"]
+        return trace, None
+
+    trace = {
+        "attempted": True,
+        "status": "included",
+        "reason": "action_summary_included",
+        "action_id": summary["action_id"],
+        "capability_id": summary["capability_id"],
+        "confirmation_status": summary["confirmation_status"],
+        "execution_status": summary["execution_status"],
+        "verification_status": summary["verification_status"],
+        "degradation_reason": summary["degradation_reason"],
+        "user_visible_summary_present": True,
+    }
+    replacement = None
+    if summary["execution_status"] in {"executed", "failed", "unknown"}:
+        replacement = summary["user_visible_summary"]
+    elif (
+        summary["execution_status"] == "blocked_by_policy"
+        and "no action was taken" in summary["user_visible_summary"].casefold()
+    ):
+        replacement = summary["user_visible_summary"]
+    return trace, replacement
 
 
 def _registry_allows_exact_capability_execution(trace: dict[str, Any]) -> bool:
@@ -6026,6 +6602,7 @@ async def orchestrate_chat(
                 "validation_status": "not_requested",
                 "schema_version": capability_exposure_trace.get("schema_version"),
             },
+            "action_summary": _action_summary_empty_trace(),
             "follow_up": _capability_follow_up_empty_trace(),
             "fallback": _capability_fallback_trace(
                 descriptor_fingerprint_value=capability_exposure_trace.get("descriptor_fingerprint")
@@ -6335,6 +6912,21 @@ async def orchestrate_chat(
             prompt.trace["capabilities"]["dispatch_completed"] = False
             prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
+        action_summary_trace, action_summary_answer = await _compose_action_summary(
+            runtime=runtime,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            capability_registry_trace=capability_registry_trace,
+            capability_execution_trace=prompt.trace["capabilities"].get("execution"),
+        )
+        prompt.trace["capabilities"]["action_summary"] = action_summary_trace
+        if action_summary_answer is not None:
+            raw_answer = action_summary_answer
         response_review = review_response(
             ResponseReviewInput(
                 candidate_text=raw_answer,
