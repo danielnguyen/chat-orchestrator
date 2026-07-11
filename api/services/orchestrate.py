@@ -1466,6 +1466,18 @@ VALID_ACTION_OPERATION_KINDS = {
     "blocked_external_action",
 }
 VALID_ACTION_FLOW_VERIFICATION_METHODS = {"capability_verification"}
+VALID_INTERACTION_GOVERNANCE_KINDS = {
+    "command",
+    "question",
+    "brainstorm",
+    "joke_or_playful",
+    "vent_or_expression",
+    "mistake_or_failure_report",
+    "tense_debugging",
+    "high_impact_decision",
+    "ambiguous",
+}
+VALID_INTERACTION_GOVERNANCE_TENSION_LEVELS = {"low", "medium", "high"}
 
 
 def _safe_action_authority_decision(value: Any) -> dict[str, Any] | None:
@@ -1891,6 +1903,10 @@ def _interaction_governance_policy_values(
     trace = interaction_governance_trace if isinstance(interaction_governance_trace, dict) else {}
     interaction_kind = _sanitize_policy_trace_label(trace.get("interaction_kind"))
     tension_level = _sanitize_policy_trace_label(trace.get("tension_level"))
+    if interaction_kind not in VALID_INTERACTION_GOVERNANCE_KINDS:
+        interaction_kind = None
+    if tension_level not in VALID_INTERACTION_GOVERNANCE_TENSION_LEVELS:
+        tension_level = None
     available = (
         trace.get("status") == "included"
         and trace.get("included") is True
@@ -1961,7 +1977,7 @@ def _preserve_interaction_governance_trace_inputs(
     tension_level = _sanitize_policy_trace_label(
         interaction_governance_trace.get("tension_level"),
     )
-    if tension_level is not None:
+    if tension_level in VALID_INTERACTION_GOVERNANCE_TENSION_LEVELS:
         trace["tension_level"] = tension_level
 
 
@@ -2104,6 +2120,10 @@ async def _resolve_capability_registry_context(
                 )
                 authority_inputs = _authority_context_inputs(interaction_governance_trace)
                 runtime_operation = "authority"
+                _mark_governance_forwarded(
+                    trace["decision_provenance"],
+                    authority=True,
+                )
                 authority_response = await runtime.action_authority(
                     request_id=f"{request_id}:capability-authority",
                     owner_id=owner_id,
@@ -2131,10 +2151,6 @@ async def _resolve_capability_registry_context(
                         "action_taken": False,
                     }
                     return _capability_registry_prompt_messages(trace), trace
-                _mark_governance_forwarded(
-                    trace["decision_provenance"],
-                    authority=True,
-                )
                 trace["authority"] = {
                     "attempted": True,
                     "status": "included",
@@ -2145,6 +2161,10 @@ async def _resolve_capability_registry_context(
                     interaction_governance_trace=interaction_governance_trace,
                 )
                 runtime_operation = "action_flow"
+                _mark_governance_forwarded(
+                    trace["decision_provenance"],
+                    action_flow=True,
+                )
                 action_flow_response = await runtime.action_flow(
                     request_id=f"{request_id}:capability-flow",
                     owner_id=owner_id,
@@ -2172,10 +2192,6 @@ async def _resolve_capability_registry_context(
                         "action_taken": False,
                     }
                     return _capability_registry_prompt_messages(trace), trace
-                _mark_governance_forwarded(
-                    trace["decision_provenance"],
-                    action_flow=True,
-                )
                 _record_action_flow_policy_outcome(
                     trace["decision_provenance"],
                     action_flow,
