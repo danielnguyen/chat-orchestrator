@@ -1367,6 +1367,13 @@ def _sanitize_trace_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _sanitize_policy_trace_label(value: Any, *, max_length: int = 80) -> str | None:
+    cleaned = _sanitize_trace_string(value, max_length=max_length)
+    if cleaned is None or not SAFE_POLICY_LABEL.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
 def _capability_discovery_requested(text: str) -> bool:
     normalized = " ".join(text.casefold().split())
     return any(
@@ -1851,21 +1858,111 @@ def _capability_registry_forced_response(trace: dict[str, Any]) -> str | None:
 def _authority_context_inputs(
     interaction_governance_trace: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    trace = interaction_governance_trace if isinstance(interaction_governance_trace, dict) else {}
+    governance_values = _interaction_governance_policy_values(interaction_governance_trace)
     return {
         "target_resolution_state": "resolved",
         "world_state_freshness": "unknown",
         "consequence_flags": {},
-        "interaction_governance_kind": _sanitize_trace_string(
-            trace.get("interaction_kind"),
-            max_length=80,
-        ),
-        "interaction_governance_tension": _sanitize_trace_string(
-            trace.get("tension_level"),
-            max_length=80,
-        ),
+        "interaction_governance_kind": governance_values["interaction_kind"],
+        "interaction_governance_tension": governance_values["tension_level"],
         "user_authorization_signal": "explicit",
     }
+
+
+def _interaction_governance_unavailable_reason(
+    trace: dict[str, Any] | None,
+) -> str:
+    if not isinstance(trace, dict):
+        return "interaction_governance_not_requested"
+    reason = _sanitize_policy_trace_label(trace.get("omission_reason"))
+    if reason is not None:
+        return reason
+    status = _sanitize_policy_trace_label(trace.get("status"))
+    if status == "disabled":
+        return "interaction_governance_disabled"
+    if status in {"failed", "malformed", "unusable"}:
+        return "interaction_governance_unavailable"
+    return "interaction_governance_unusable"
+
+
+def _interaction_governance_policy_values(
+    interaction_governance_trace: dict[str, Any] | None,
+) -> dict[str, str | bool | None]:
+    trace = interaction_governance_trace if isinstance(interaction_governance_trace, dict) else {}
+    interaction_kind = _sanitize_policy_trace_label(trace.get("interaction_kind"))
+    tension_level = _sanitize_policy_trace_label(trace.get("tension_level"))
+    available = (
+        trace.get("status") == "included"
+        and trace.get("included") is True
+        and interaction_kind is not None
+        and tension_level is not None
+    )
+    return {
+        "available": available,
+        "interaction_kind": interaction_kind if available else None,
+        "tension_level": tension_level if available else None,
+        "unavailable_reason": None
+        if available
+        else _interaction_governance_unavailable_reason(interaction_governance_trace),
+    }
+
+
+def _action_policy_decision_provenance(
+    interaction_governance_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    governance_values = _interaction_governance_policy_values(interaction_governance_trace)
+    provenance: dict[str, Any] = {
+        "governance_available": governance_values["available"],
+        "interaction_kind": governance_values["interaction_kind"],
+        "tension_level": governance_values["tension_level"],
+        "forwarded_to_authority": False,
+        "forwarded_to_action_flow": False,
+        "confirmation_required": None,
+        "scoped_confirmation_text_present": None,
+        "execution_allowed": None,
+    }
+    if governance_values["available"] is not True:
+        provenance["unavailable_reason"] = governance_values["unavailable_reason"]
+    return provenance
+
+
+def _mark_governance_forwarded(
+    provenance: dict[str, Any],
+    *,
+    authority: bool = False,
+    action_flow: bool = False,
+) -> None:
+    if provenance.get("governance_available") is not True:
+        return
+    if authority:
+        provenance["forwarded_to_authority"] = True
+    if action_flow:
+        provenance["forwarded_to_action_flow"] = True
+
+
+def _record_action_flow_policy_outcome(
+    provenance: dict[str, Any],
+    action_flow: dict[str, Any],
+) -> None:
+    provenance["confirmation_required"] = action_flow.get("confirmation_required")
+    provenance["scoped_confirmation_text_present"] = bool(action_flow.get("confirmation_text"))
+    provenance["execution_allowed"] = action_flow.get("execution_allowed")
+
+
+def _preserve_interaction_governance_trace_inputs(
+    prompt_trace: dict[str, Any],
+    interaction_governance_trace: dict[str, Any] | None,
+) -> None:
+    if not isinstance(interaction_governance_trace, dict):
+        return
+    trace = prompt_trace.get("interaction_governance")
+    if not isinstance(trace, dict):
+        return
+    tension_level = _sanitize_policy_trace_label(
+        interaction_governance_trace.get("tension_level"),
+    )
+    if tension_level is not None:
+        trace["tension_level"] = tension_level
 
 
 def _action_flow_intent(current_user_text: str) -> str:
@@ -2002,6 +2099,9 @@ async def _resolve_capability_registry_context(
                 "reason_codes": reason_codes,
             }
             if matched is True and capability:
+                trace["decision_provenance"] = _action_policy_decision_provenance(
+                    interaction_governance_trace,
+                )
                 authority_inputs = _authority_context_inputs(interaction_governance_trace)
                 runtime_operation = "authority"
                 authority_response = await runtime.action_authority(
@@ -2031,6 +2131,10 @@ async def _resolve_capability_registry_context(
                         "action_taken": False,
                     }
                     return _capability_registry_prompt_messages(trace), trace
+                _mark_governance_forwarded(
+                    trace["decision_provenance"],
+                    authority=True,
+                )
                 trace["authority"] = {
                     "attempted": True,
                     "status": "included",
@@ -2068,6 +2172,14 @@ async def _resolve_capability_registry_context(
                         "action_taken": False,
                     }
                     return _capability_registry_prompt_messages(trace), trace
+                _mark_governance_forwarded(
+                    trace["decision_provenance"],
+                    action_flow=True,
+                )
+                _record_action_flow_policy_outcome(
+                    trace["decision_provenance"],
+                    action_flow,
+                )
                 trace["action_flow"] = {
                     "attempted": True,
                     "status": "included",
@@ -2098,6 +2210,12 @@ async def _resolve_capability_registry_context(
         }
         if key in {"authority", "action_flow"}:
             failure_trace["action_taken"] = False
+            if isinstance(trace.get("decision_provenance"), dict):
+                _mark_governance_forwarded(
+                    trace["decision_provenance"],
+                    authority=key == "authority",
+                    action_flow=key == "action_flow",
+                )
         trace[key] = failure_trace
         return _capability_registry_prompt_messages(trace), trace
 
@@ -4367,6 +4485,7 @@ async def _resolve_interaction_governance(
         "included": True,
         "runtime_call_status": "included",
         "interaction_kind": result.get("interaction_kind"),
+        "tension_level": result.get("tension_level"),
         "response_posture": result.get("response_posture"),
         "commentary_allowed": result.get("commentary_allowed"),
         "humor_allowed": result.get("humor_allowed"),
@@ -5798,6 +5917,10 @@ async def orchestrate_chat(
                         profile.get("prompt_budget") if isinstance(profile, dict) else None
                     ),
                 ),
+            )
+            _preserve_interaction_governance_trace_inputs(
+                prompt.trace,
+                interaction_governance_trace,
             )
         except PromptBudgetError as budget_error:
             truncation_applied = bool(budget_error.trace.get("omission_or_truncation_occurred"))
