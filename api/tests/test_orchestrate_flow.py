@@ -498,7 +498,7 @@ class FakeRuntime:
             "request_id": "rid-governance",
             "owner_id": "owner",
             "conversation_id": "conv-1",
-            "surface": "vscode",
+            "surface": "dev",
             "runtime_session_id": "rtsession_1",
             "runtime_turn_id": "rtturn_1",
             "result": {
@@ -1470,7 +1470,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         payload={
             "owner_id": "owner",
             "client_id": "vscode",
-            "surface": "dev",
+            "surface": "vscode",
             "messages": [{"role": "user", "content": "hi"}],
             "sensitivity": "private",
             "model_override": None,
@@ -3521,11 +3521,85 @@ async def test_orchestrate_action_summary_unavailable_preserves_execution_outcom
     assert "PRIVATE-SUMMARY-ERROR" not in str(trace["capabilities"]["action_summary"])
 
 
-@pytest.mark.parametrize("response_kind", ["malformed", "mismatched"])
+@pytest.mark.parametrize("returned_degradation", ["different_failure", None])
+@pytest.mark.asyncio
+async def test_orchestrate_rejects_mismatched_degradation_after_verification_failure(
+    tmp_path,
+    monkeypatch,
+    returned_degradation,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    memory_store = FakeMemoryStore()
+    verification_calls = 0
+
+    def fail_verification(_result):
+        nonlocal verification_calls
+        verification_calls += 1
+        return {"status": "failed", "reason_code": "result_check_failed"}
+
+    monkeypatch.setattr(
+        capability_service,
+        "_verify_world_state_read_result",
+        fail_verification,
+    )
+    default_action_summary = runtime.action_summary
+
+    async def mismatched_action_summary(**kwargs):
+        response = await default_action_summary(**kwargs)
+        response["result"]["degradation_reason"] = returned_degradation
+        return response
+
+    runtime.action_summary = mismatched_action_summary
+    litellm = FakeLiteLLM(
+        completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"})
+    )
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}]
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-registry-summary-degradation-mismatch",
+        runtime=runtime,
+        capability_registry_enabled=True,
+    )
+
+    assert out["answer"] == (
+        "I read bounded runtime world state, but I could not verify the result safely."
+    )
+    execute_calls = [
+        call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
+    ]
+    assert len(execute_calls) == 1
+    assert verification_calls == 1
+    assert len(runtime.action_summary_calls) == 1
+    assert runtime.action_summary_calls[0]["execution_status"] == "executed"
+    assert runtime.action_summary_calls[0]["verification_status"] == "failed"
+    assert runtime.action_summary_calls[0]["degradation_reason"] == "result_check_failed"
+    assert len(litellm.calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["executor_call_count"] == 1
+    assert trace["capabilities"]["action_summary"]["status"] == "mismatched"
+    assert trace["capabilities"]["action_summary"]["action_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("response_kind", "expected_status"),
+    [
+        ("malformed", "malformed"),
+        ("mismatched", "mismatched"),
+        ("unexpected_degradation", "mismatched"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_orchestrate_rejects_invalid_action_summary_response(
     tmp_path,
     response_kind,
+    expected_status,
 ):
     rules, models = _write_router_files(tmp_path)
     runtime = _world_state_registry_runtime()
@@ -3536,8 +3610,10 @@ async def test_orchestrate_rejects_invalid_action_summary_response(
         response = await default_action_summary(**kwargs)
         if response_kind == "malformed":
             response["result"]["execution_status"] = "provider_private_text"
-        else:
+        elif response_kind == "mismatched":
             response["request_id"] = "rid:mismatched"
+        else:
+            response["result"]["degradation_reason"] = "different_failure"
         return response
 
     runtime.action_summary = invalid_action_summary
@@ -3567,7 +3643,7 @@ async def test_orchestrate_rejects_invalid_action_summary_response(
     assert len(execute_calls) == 1
     assert len(runtime.action_summary_calls) == 1
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
-    assert trace["capabilities"]["action_summary"]["status"] == response_kind
+    assert trace["capabilities"]["action_summary"]["status"] == expected_status
     assert trace["capabilities"]["action_summary"]["action_id"] is None
 
 

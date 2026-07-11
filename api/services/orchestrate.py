@@ -1992,6 +1992,7 @@ def _safe_action_summary_response(
         "policy_reason_codes": policy_reason_codes,
         "execution_reason_code": execution_reason_code,
         "verification_reason_code": verification_reason_code,
+        "degradation_reason": degradation_reason,
     }
     if any(expected.get(field) != received for field, received in matching_fields.items()):
         return None, "mismatched"
