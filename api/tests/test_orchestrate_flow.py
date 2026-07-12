@@ -13048,6 +13048,16 @@ class ComposedJellyfinRuntime(CapabilityRuntime):
 
     async def action_flow(self, **kwargs):
         self.capability_flow_calls.append(kwargs)
+        intent = kwargs.get("flow_intent")
+        cancelled = intent == "confirmation_cancelled"
+        confirmed = intent == "confirmation_received"
+        reasons = ["registered_capability", "confirmation_required"]
+        if cancelled:
+            reasons.extend(["confirmation_cancelled", "execution_not_allowed"])
+        elif confirmed:
+            reasons.extend(["confirmation_received", "execution_allowed_by_policy"])
+        else:
+            reasons.append("execution_not_allowed")
         return {
             "result": {
                 "capability_id": "jellyfin_restart",
@@ -13056,11 +13066,11 @@ class ComposedJellyfinRuntime(CapabilityRuntime):
                 "dry_run_effects": [],
                 "confirmation_required": True,
                 "confirmation_text": "Confirm restart of service:jellyfin.",
-                "execution_allowed": True,
-                "verification_required": True,
+                "execution_allowed": confirmed,
+                "verification_required": not cancelled,
                 "verification_supported": True,
                 "verification_method": "capability_verification",
-                "reason_summary": ["registered_capability", "confirmation_required"],
+                "reason_summary": reasons,
                 "action_taken": False,
             }
         }
@@ -13280,7 +13290,7 @@ async def test_orchestrate_jellyfin_two_turn_continuation_skips_model_rediscover
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_jellyfin_false_continuation_records_rejection_once(tmp_path):
+async def test_orchestrate_jellyfin_cancelled_policy_records_rejection_once(tmp_path):
     rules, models = _write_router_files(tmp_path)
     memory_store = FakeMemoryStore()
     runtime = ComposedJellyfinRuntime()
@@ -13300,6 +13310,19 @@ async def test_orchestrate_jellyfin_false_continuation_records_rejection_once(tm
         capability_registry_enabled=True,
         jellyfin_operations=operations.binding(),
     )
+    provider_before = len(litellm.calls)
+    revalidation_before = len(
+        [item for item in operations.status_inputs if item["purpose"] == "revalidation"]
+    )
+    verification_before = len(runtime.world_state_verification_calls)
+    confirmation_before = len(runtime.confirmation_calls)
+    dispatch_before = runtime.dispatch_count
+    restart_before = len(operations.restart_inputs)
+    post_status_before = len(
+        [item for item in operations.status_inputs if item["purpose"] == "post_restart"]
+    )
+    summary_before = len(runtime.action_summary_calls)
+    authorization_before = len(runtime.capability_authorization_calls)
     rejected = await orchestrate_chat(
         payload=_jellyfin_chat_payload(
             "no",
@@ -13318,15 +13341,112 @@ async def test_orchestrate_jellyfin_false_continuation_records_rejection_once(tm
         capability_registry_enabled=True,
         jellyfin_operations=operations.binding(),
     )
-    assert len(litellm.calls) == 1
-    assert len(runtime.confirmation_calls) == 1
-    assert runtime.confirmation_calls[0]["confirmed"] is False
-    assert runtime.dispatch_count == 0
-    assert operations.restart_inputs == []
-    assert len(runtime.action_summary_calls) == 2
-    assert runtime.action_summary_calls[1]["confirmation_status"] == "rejected"
-    assert runtime.action_summary_calls[1]["execution_status"] == "not_attempted"
-    assert "No action was taken" in rejected["answer"]
+    assert len(litellm.calls) - provider_before == 0
+    assert (
+        len(
+            [
+                item
+                for item in operations.status_inputs
+                if item["purpose"] == "revalidation"
+            ]
+        )
+        - revalidation_before
+        == 1
+    )
+    assert len(runtime.world_state_verification_calls) - verification_before == 1
+    assert len(runtime.confirmation_calls) - confirmation_before == 1
+    assert runtime.confirmation_calls[-1]["confirmed"] is False
+    assert runtime.confirmation_calls[-1]["confirmation_challenge_ref"] == (
+        first["pending_action"]["challenge_ref"]
+    )
+    assert runtime.dispatch_count - dispatch_before == 0
+    assert len(operations.restart_inputs) - restart_before == 0
+    assert (
+        len(
+            [
+                item
+                for item in operations.status_inputs
+                if item["purpose"] == "post_restart"
+            ]
+        )
+        - post_status_before
+        == 0
+    )
+    assert len(runtime.action_summary_calls) - summary_before == 1
+    summary = runtime.action_summary_calls[-1]
+    assert summary["confirmation_status"] == "rejected"
+    assert summary["execution_status"] == "not_attempted"
+    assert summary["verification_status"] == "not_required"
+
+    second_authorizations = runtime.capability_authorization_calls[
+        authorization_before:
+    ]
+    selections = [
+        item
+        for item in second_authorizations
+        if item.get("authorization_" + "pha" + "se") == "selection"
+    ]
+    assert len(selections) == 2
+    assert all(
+        item["confirmation_challenge_ref"]
+        == first["pending_action"]["challenge_ref"]
+        for item in selections
+    )
+
+    second_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]
+    action_flow = second_trace["capability_registry"]["action_flow"]
+    assert action_flow["confirmation_required"] is True
+    assert action_flow["execution_allowed"] is False
+    assert action_flow["verification_required"] is False
+    assert action_flow["verification_supported"] is True
+    assert action_flow["verification_method"] == "capability_verification"
+    assert {"confirmation_cancelled", "execution_not_allowed"}.issubset(
+        action_flow["reason_summary"]
+    )
+    assert second_trace["capabilities"]["exposure"]["exposed_capability_ids"] == [
+        "jellyfin_restart"
+    ]
+    execution = second_trace["capabilities"]["execution"]
+    selection = execution["authorization"]["selection"]
+    confirmation = execution["confirmation"]
+    assert selection["confirmation_challenge_ref"] == first["pending_action"][
+        "challenge_ref"
+    ]
+    assert selection["challenge_expires_at"] == first["pending_action"][
+        "challenge_expires_at"
+    ]
+    assert confirmation["status"] == "rejected"
+    assert confirmation["accepted"] is False
+    assert confirmation["call_count"] == 1
+    assert confirmation["reason_code"] == "confirmation_rejected"
+    assert confirmation["confirmed_challenge_ref"] == first["pending_action"][
+        "challenge_ref"
+    ]
+    assert execution["response_status"] == "not_executed"
+    assert execution["restart_call_count"] == 0
+    assert execution["post_restart_verification_call_count"] == 0
+    assert second_trace["capabilities"]["provider_call_count"] == 0
+    assert second_trace["capabilities"]["action_summary_call_count"] == 1
+    assert "rejected" in rejected["answer"].casefold()
+    assert "no action was taken" in rejected["answer"].casefold()
+    protected = json.dumps(
+        {
+            "answer": rejected["answer"],
+            "adapter": operations.status_inputs + operations.restart_inputs,
+            "summary": summary,
+            "trace": second_trace,
+        },
+        sort_keys=True,
+    )
+    assert "registry_context_only" not in protected
+    for sentinel in (
+        "PRIVATE-SIGNATURE-SENTINEL",
+        "PRIVATE-OBJECT-URI-SENTINEL",
+        "minioadmin",
+    ):
+        assert sentinel not in protected
 
 
 @pytest.mark.asyncio
