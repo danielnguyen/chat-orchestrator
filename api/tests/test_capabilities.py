@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 
 import pytest
+from models import ChatRequest, ChatResponse
+from pydantic import ValidationError
 from services.capabilities import (
     CapabilityValidationError,
+    JellyfinOperations,
     RevalidationOutput,
     Revalidator,
     RevalidatorEntry,
@@ -12,6 +15,7 @@ from services.capabilities import (
     authorize_and_execute_capability,
     descriptor_fingerprint,
     filter_capability_descriptors_for_exposure,
+    parse_pending_action_confirmation,
     parse_provider_capability_request,
     production_capability_registry,
     provider_descriptors,
@@ -228,6 +232,7 @@ def _validated(provider_tool_name: str, arguments: dict[str, object]):
             "runtime.world_state.read",
             "draft.local_message",
             "runtime.relationship_context.read",
+            "jellyfin_restart",
         ],
     )
 
@@ -300,6 +305,7 @@ def test_production_registry_contains_exact_executor_bound_entries():
         "runtime.world_state.read",
         "draft.local_message",
         "runtime.relationship_context.read",
+        "jellyfin_restart",
     ]
     assert all(entry.executor_binding for entry in registry)
     assert all(not entry.capability_id.startswith("test.") for entry in registry)
@@ -307,6 +313,7 @@ def test_production_registry_contains_exact_executor_bound_entries():
         "runtime_world_state_read",
         "draft_local_message",
         "runtime_relationship_context_read",
+        "jellyfin_safe_restart",
     ]
     assert all(entry.provider_tool_name != entry.capability_id for entry in registry)
     assert all("." not in entry.provider_tool_name for entry in registry)
@@ -321,16 +328,19 @@ def test_provider_descriptors_are_deterministic_and_fingerprint_stable():
     assert first == second
     assert [item["metadata"]["capability_id"] for item in first] == [
         "draft.local_message",
+        "jellyfin_restart",
         "runtime.relationship_context.read",
         "runtime.world_state.read",
     ]
     assert [item["function"]["name"] for item in first] == [
         "draft_local_message",
+        "jellyfin_safe_restart",
         "runtime_relationship_context_read",
         "runtime_world_state_read",
     ]
     assert [item["metadata"]["provider_tool_name"] for item in first] == [
         "draft_local_message",
+        "jellyfin_safe_restart",
         "runtime_relationship_context_read",
         "runtime_world_state_read",
     ]
@@ -1909,3 +1919,604 @@ def test_argument_digest_helper_matches_validation_digest():
         validation_result.capability_id,
         validation_result.normalized_arguments,
     )
+
+
+_PENDING_EXPIRES_AT = "2026-07-12T01:00:00+00:00"
+_JELLYFIN_CLAIMS = [{"claim_id": "claim_jellyfin_safe", "value_digest": "wsvalue_safe"}]
+
+
+def _pending_envelope(digest: str) -> dict[str, object]:
+    return {
+        "schema_version": "co.pending-action.v1",
+        "status": "pending_confirmation",
+        "capability_id": "jellyfin_restart",
+        "target": "service:jellyfin",
+        "argument_digest": digest,
+        "challenge_ref": "challenge-jellyfin-1",
+        "challenge_expires_at": _PENDING_EXPIRES_AT,
+        "confirmation_text": "Confirm restart of service:jellyfin.",
+    }
+
+
+class JellyfinStateMachine:
+    def __init__(
+        self,
+        *,
+        restart_status="completed",
+        health_status="healthy",
+        safety_status="safe",
+    ):
+        self.restart_status = restart_status
+        self.health_status = health_status
+        self.safety_status = safety_status
+        self.status_inputs = []
+        self.restart_inputs = []
+
+    async def status(self, value):
+        self.status_inputs.append(value)
+        state = self.safety_status if value["purpose"] == "revalidation" else self.health_status
+        if isinstance(state, BaseException):
+            raise state
+        if state == "malformed":
+            return {"status": "unknown"}
+        claims = value["claims"]
+        if state == "mismatched":
+            state = "safe" if value["purpose"] == "revalidation" else "healthy"
+            claims = [{"claim_id": "claim_other", "value_digest": "wsvalue_other"}]
+        return {
+            "status": state,
+            "reason_code": f"simulated_{state}",
+            "observed_at": "2026-07-12T00:00:00+00:00",
+            "verified_at": "2026-07-12T00:00:01+00:00",
+            "claims": claims,
+        }
+
+    async def restart(self, value):
+        self.restart_inputs.append(value)
+        if isinstance(self.restart_status, BaseException):
+            raise self.restart_status
+        if self.restart_status == "malformed":
+            return {"status": "completed", "reason_code": "simulated", "extra": "ignore"}
+        return {
+            "status": self.restart_status,
+            "reason_code": f"simulated_{self.restart_status}",
+        }
+
+    def binding(self):
+        return JellyfinOperations(
+            effect_mode="simulated",
+            status=self.status,
+            restart=self.restart,
+        )
+
+
+class JellyfinPolicyRuntime:
+    def __init__(self, *, selector_claim_id="claim_jellyfin_safe"):
+        self.authorization_calls = []
+        self.verification_calls = []
+        self.confirmation_calls = []
+        self.selection_count = 0
+        self.dispatch_count = 0
+        self.consumed = False
+        self.selector_claim_id = selector_claim_id
+
+    async def authorize_capability(self, **kwargs):
+        self.authorization_calls.append(kwargs)
+        stage = kwargs.get("authorization_" + "pha" + "se")
+        if stage == "exposure":
+            return {"result": {"allowed": True, "decision_code": "allowed"}}
+        if stage == "dispatch":
+            self.dispatch_count += 1
+            allowed = not self.consumed
+            self.consumed = self.consumed or allowed
+            return {
+                "result": {
+                    "allowed": allowed,
+                    "decision_code": "allowed" if allowed else "challenge_consumed",
+                    "reason_codes": ["allowed" if allowed else "challenge_consumed"],
+                    "challenge_ref": kwargs.get("confirmation_challenge_ref"),
+                    "world_state_claim_ids_used": ["claim_jellyfin_safe"],
+                }
+            }
+        self.selection_count += 1
+        incoming = kwargs.get("confirmation_challenge_ref")
+        if self.consumed:
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "challenge_consumed",
+                    "reason_codes": ["challenge_consumed"],
+                }
+            }
+        if incoming not in {None, "challenge-jellyfin-1"}:
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "challenge_mismatch",
+                    "reason_codes": ["challenge_mismatch"],
+                }
+            }
+        if self.selection_count % 2 == 1:
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["revalidation_required"],
+                    "challenge_ref": incoming,
+                    "revalidation_selector": {
+                        "revalidator_id": "jellyfin_status",
+                        "world_state_claim_ids": [self.selector_claim_id],
+                    },
+                    "world_state_claim_ids_used": [self.selector_claim_id],
+                }
+            }
+        return {
+            "result": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-jellyfin-1",
+                "challenge_expires_at": _PENDING_EXPIRES_AT,
+                "world_state_claim_ids_used": ["claim_jellyfin_safe"],
+            }
+        }
+
+    async def world_state_claim_verify(self, **kwargs):
+        self.verification_calls.append(kwargs)
+        return {
+            "claim": {
+                "world_state_claim_id": kwargs["world_state_claim_id"],
+                "verification_verifier_id": kwargs["verifier_id"],
+                "verification_source_type": kwargs["verification_source_type"],
+                "verification_source_ref": kwargs["verification_source_ref"],
+                "last_verified_runtime_session_id": kwargs["runtime_session_id"],
+                "last_verified_runtime_turn_id": kwargs["runtime_turn_id"],
+            }
+        }
+
+    async def confirm_capability(self, **kwargs):
+        self.confirmation_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs["runtime_turn_id"],
+            "confirmation_challenge_ref": kwargs["confirmation_challenge_ref"],
+            "confirmation_state": "accepted" if kwargs["confirmed"] else "rejected",
+        }
+
+
+def _jellyfin_validation():
+    return _validated("jellyfin_safe_restart", {"target": "service:jellyfin"})
+
+
+async def _jellyfin_execute(runtime, adapter, confirmation=None):
+    return await authorize_and_execute_capability(
+        runtime=runtime,
+        request_id="rid-jellyfin",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_jellyfin",
+        runtime_turn_id="rtturn_jellyfin",
+        active_persona_id="technical_architect",
+        validation_result=_jellyfin_validation(),
+        selected_world_state_claims=_JELLYFIN_CLAIMS,
+        jellyfin_operations=adapter.binding(),
+        capability_confirmation=confirmation,
+    )
+
+
+def test_pending_action_models_retain_bounded_input_and_output():
+    digest = _jellyfin_validation().argument_digest
+    pending = _pending_envelope(digest)
+    request = ChatRequest(
+        owner_id="owner",
+        surface="dev",
+        messages=[{"role": "user", "content": "yes"}],
+        capability_confirmation={"pending_action": pending, "confirmed": True},
+    )
+    dumped = request.model_dump()
+    assert dumped["capability_confirmation"] == {
+        "challenge_ref": None,
+        "capability_id": None,
+        "argument_digest": None,
+        "confirmed": True,
+        "pending_action": pending,
+    }
+    continuation, reason = parse_pending_action_confirmation(
+        dumped["capability_confirmation"]
+    )
+    assert reason is None
+    assert continuation.challenge_ref == "challenge-jellyfin-1"
+    response = ChatResponse(
+        request_id="rid",
+        conversation_id="conv",
+        profile_name="dev",
+        selected_model="local-model",
+        answer="Confirmation is pending.",
+        status="ok",
+        pending_action=pending,
+    )
+    assert response.model_dump()["pending_action"] == pending
+
+
+@pytest.mark.parametrize(
+    "confirmation",
+    [
+        {
+            "pending_action": {**_pending_envelope("capargs_valid"), "extra": "no"},
+            "confirmed": True,
+        },
+        {
+            "pending_action": {
+                **_pending_envelope("capargs_valid"),
+                "challenge_ref": "",
+            },
+            "confirmed": True,
+        },
+        {"pending_action": _pending_envelope("capargs_valid"), "confirmed": True, "extra": "no"},
+    ],
+)
+def test_pending_action_models_reject_unknown_or_malformed_fields(confirmation):
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            owner_id="owner",
+            messages=[{"role": "user", "content": "yes"}],
+            capability_confirmation=confirmation,
+        )
+
+
+def test_legacy_flat_confirmation_model_remains_accepted():
+    request = ChatRequest(
+        owner_id="owner",
+        messages=[{"role": "user", "content": "confirm"}],
+        capability_confirmation={
+            "challenge_ref": "challenge-1",
+            "capability_id": "draft.local_message",
+            "argument_digest": "capargs_legacy",
+            "confirmed": True,
+        },
+    )
+    assert request.capability_confirmation.pending_action is None
+    assert request.capability_confirmation.confirmed is True
+
+
+def test_jellyfin_descriptor_and_fixed_target_are_exact():
+    entry = production_capability_registry()[-1]
+    descriptor = provider_descriptors([entry])[0]
+    assert descriptor["metadata"] == {
+        "capability_id": "jellyfin_restart",
+        "provider_tool_name": "jellyfin_safe_restart",
+        "operation_class": "high_impact",
+        "capability_domain": "media_operations",
+        "privacy_classification": "bounded_service_action",
+        "descriptor_version": "co.capability-descriptor.v1",
+        "schema_version": "co.capability-args.v1",
+        "local_only": False,
+    }
+    assert entry.supported_surfaces == ("desktop", "dev")
+    assert entry.enabled_surfaces == ("dev",)
+    assert entry.enabled_personas == ("technical_architect",)
+    assert descriptor["function"]["parameters"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["target"],
+        "properties": {"target": {"type": "string", "enum": ["service:jellyfin"]}},
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"target": "service:other"},
+        {"target": "https://service.invalid"},
+        {"target": "media-host"},
+        {"target": "restart jellyfin"},
+        {"target": "service:jellyfin", "force": True},
+    ],
+)
+def test_jellyfin_rejects_every_non_exact_argument_shape(arguments):
+    request = parse_provider_capability_request(_call("jellyfin_safe_restart", arguments))
+    with pytest.raises(CapabilityValidationError) as exc:
+        validate_and_digest_capability_request(
+            request=request,
+            exposed_capability_ids=["jellyfin_restart"],
+        )
+    assert exc.value.reason_code == "schema_invalid_arguments"
+
+
+@pytest.mark.asyncio
+async def test_jellyfin_first_turn_and_accepted_continuation_keep_one_challenge():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    first = await _jellyfin_execute(runtime, adapter)
+    digest = _jellyfin_validation().argument_digest
+    first_status_calls = [
+        item for item in adapter.status_inputs if item["purpose"] == "revalidation"
+    ]
+
+    assert first.trace["response_status"] == "pending_confirmation"
+    first_selection = first.trace["authorization"]["selection"]
+    assert first_selection["confirmation_challenge_ref"] == "challenge-jellyfin-1"
+    assert first.trace["authorization"]["selection"]["challenge_expires_at"] == _PENDING_EXPIRES_AT
+    assert first.trace["revalidation"]["status_call_count"] == len(first_status_calls) == 1
+    assert first.trace["confirmation"]["call_count"] == 0
+    assert runtime.dispatch_count == 0
+    assert adapter.restart_inputs == []
+
+    before_second = len(first_status_calls)
+    second = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {"pending_action": _pending_envelope(digest), "confirmed": True},
+    )
+    after_second = len(
+        [item for item in adapter.status_inputs if item["purpose"] == "revalidation"]
+    )
+    second_status_calls = after_second - before_second
+
+    assert second.trace["response_status"] == "executed_verified"
+    second_selection = second.trace["authorization"]["selection"]
+    assert second_selection["confirmation_challenge_ref"] == "challenge-jellyfin-1"
+    assert second.trace["authorization"]["selection"]["challenge_expires_at"] == _PENDING_EXPIRES_AT
+    assert second.trace["confirmation"]["status"] == "accepted"
+    assert second.trace["confirmation"]["call_count"] == 1
+    assert second.trace["revalidation"]["status_call_count"] == second_status_calls == 1
+    second_dispatch = second.trace["authorization"]["dispatch"]
+    assert second_dispatch["confirmation_challenge_ref"] == "challenge-jellyfin-1"
+    assert runtime.dispatch_count == 1
+    assert len(adapter.restart_inputs) == 1
+    assert len([item for item in adapter.status_inputs if item["purpose"] == "revalidation"]) == 2
+    assert len([item for item in adapter.status_inputs if item["purpose"] == "post_restart"]) == 1
+    assert second.trace["effect_mode"] == "simulated"
+    assert second.trace["restart_call_count"] == 1
+    assert second.trace["post_restart_verification_call_count"] == 1
+
+    replay = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {"pending_action": _pending_envelope(digest), "confirmed": True},
+    )
+    assert replay.trace["failure_reason_code"] == "challenge_consumed"
+    assert len(adapter.restart_inputs) == 1
+    assert runtime.dispatch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_jellyfin_rejection_records_once_without_dispatch():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    await _jellyfin_execute(runtime, adapter)
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {
+            "pending_action": _pending_envelope(_jellyfin_validation().argument_digest),
+            "confirmed": False,
+        },
+    )
+    assert result.trace["confirmation"]["status"] == "rejected"
+    assert result.trace["confirmation"]["call_count"] == 1
+    assert runtime.dispatch_count == 0
+    assert adapter.restart_inputs == []
+    assert "No action was taken" in result.response_text
+
+
+@pytest.mark.asyncio
+async def test_mixed_pending_and_legacy_identity_fails_before_dependencies():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {
+            "pending_action": _pending_envelope(_jellyfin_validation().argument_digest),
+            "confirmed": True,
+            "challenge_ref": "challenge-jellyfin-1",
+        },
+    )
+    assert result.trace["failure_reason_code"] == "mixed_confirmation_shapes"
+    assert runtime.authorization_calls == []
+    assert runtime.confirmation_calls == []
+    assert adapter.status_inputs == []
+    assert adapter.restart_inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "persona", "with_adapter", "with_claim", "reason"),
+    [
+        ("desktop", "technical_architect", True, True, "surface_not_enabled"),
+        ("dev", "general_assistant", True, True, "persona_not_enabled"),
+        ("dev", "technical_architect", False, True, "jellyfin_operations_unavailable"),
+        ("dev", "technical_architect", True, False, "restart_safe_claim_unavailable"),
+    ],
+)
+async def test_jellyfin_exposure_fails_closed_when_local_inputs_are_missing(
+    surface,
+    persona,
+    with_adapter,
+    with_claim,
+    reason,
+):
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    descriptors, trace = await filter_capability_descriptors_for_exposure(
+        runtime=runtime,
+        request_id="rid-exposure",
+        owner_id="owner",
+        conversation_id="conv",
+        surface=surface,
+        runtime_session_id="rtsession_jellyfin",
+        runtime_turn_id="rtturn_jellyfin",
+        active_persona_id=persona,
+        selected_world_state_claims=_JELLYFIN_CLAIMS if with_claim else [],
+        jellyfin_operations=adapter.binding() if with_adapter else None,
+        allowed_capability_ids=["jellyfin_restart"],
+    )
+    assert descriptors == []
+    assert trace["blocked_reasons"] == {"jellyfin_restart": reason}
+    assert runtime.authorization_calls == []
+
+
+@pytest.mark.asyncio
+async def test_jellyfin_exposure_sends_exact_registered_metadata_without_full_world_check():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    descriptors, trace = await filter_capability_descriptors_for_exposure(
+        runtime=runtime,
+        request_id="rid-exposure",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_jellyfin",
+        runtime_turn_id="rtturn_jellyfin",
+        active_persona_id="technical_architect",
+        selected_world_state_claims=_JELLYFIN_CLAIMS,
+        jellyfin_operations=adapter.binding(),
+        allowed_capability_ids=["jellyfin_restart"],
+    )
+    assert [item["function"]["name"] for item in descriptors] == ["jellyfin_safe_restart"]
+    assert trace["exposed_capability_ids"] == ["jellyfin_restart"]
+    call = runtime.authorization_calls[0]
+    assert call["capability_domain"] == "media_operations"
+    assert call["operation_class"] == "high_impact"
+    assert call["supported_surfaces"] == ["desktop", "dev"]
+    assert call["world_state_requirements"] == []
+    assert call["selected_world_state_claim_ids"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("capability_id", "draft.local_message", "pending_action_mismatch"),
+        ("target", "service:other", "pending_action_mismatch"),
+        ("argument_digest", "capargs_wrong", "pending_action_digest_mismatch"),
+    ],
+)
+async def test_invalid_pending_identity_creates_no_challenge_or_adapter_call(
+    field,
+    value,
+    reason,
+):
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    pending = _pending_envelope(_jellyfin_validation().argument_digest)
+    pending[field] = value
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {"pending_action": pending, "confirmed": True},
+    )
+    assert result.trace["failure_reason_code"] == reason
+    assert runtime.authorization_calls == []
+    assert runtime.confirmation_calls == []
+    assert adapter.status_inputs == []
+    assert adapter.restart_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_wrong_challenge_is_denied_without_revalidation_or_replacement():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    pending = _pending_envelope(_jellyfin_validation().argument_digest)
+    pending["challenge_ref"] = "challenge-other"
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {"pending_action": pending, "confirmed": True},
+    )
+    assert result.trace["failure_reason_code"] == "challenge_mismatch"
+    assert result.trace["authorization"]["selection"]["confirmation_challenge_ref"] is None
+    assert runtime.confirmation_calls == []
+    assert adapter.status_inputs == []
+    assert adapter.restart_inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "safety_status",
+    ["unsafe", "unknown", "failed", RuntimeError("offline"), "malformed", "mismatched"],
+)
+async def test_jellyfin_revalidation_failures_never_issue_challenge_or_restart(safety_status):
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine(safety_status=safety_status)
+    result = await _jellyfin_execute(runtime, adapter)
+    actual_status_calls = len(
+        [item for item in adapter.status_inputs if item["purpose"] == "revalidation"]
+    )
+    assert result.trace["response_status"] == "not_executed"
+    assert result.trace["revalidation"]["status_call_count"] == actual_status_calls == 1
+    assert result.trace["authorization"]["selection"]["confirmation_challenge_ref"] is None
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
+    assert adapter.restart_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_jellyfin_missing_selected_digest_records_zero_actual_status_calls():
+    runtime = JellyfinPolicyRuntime(selector_claim_id="claim_jellyfin_other")
+    adapter = JellyfinStateMachine()
+
+    result = await _jellyfin_execute(runtime, adapter)
+
+    assert adapter.status_inputs == []
+    assert result.trace["revalidation"]["status_call_count"] == 0
+    assert result.trace["revalidation"]["reason_code"] == "revalidator_claim_mismatch"
+    assert runtime.verification_calls == []
+    assert runtime.selection_count == 1
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
+    assert adapter.restart_inputs == []
+    assert (
+        result.trace["authorization"]["selection"]["confirmation_challenge_ref"]
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("restart_status", "health_status", "response_status", "restart_count", "verify_count"),
+    [
+        ("failed", "healthy", "executor_failed", 1, 0),
+        ("unknown", "healthy", "executor_unknown", 1, 0),
+        (RuntimeError("offline"), "healthy", "executor_failed", 1, 0),
+        ("malformed", "healthy", "executor_failed", 1, 0),
+        ("completed", "unhealthy", "executed_unverified", 1, 1),
+        ("completed", "unknown", "executed_unverified", 1, 1),
+        ("completed", "failed", "executed_unverified", 1, 1),
+        ("completed", RuntimeError("offline"), "executed_unverified", 1, 1),
+        ("completed", "malformed", "executed_unverified", 1, 1),
+        ("completed", "mismatched", "executed_unverified", 1, 1),
+    ],
+)
+async def test_jellyfin_failure_outcomes_never_retry_or_claim_verified_success(
+    restart_status,
+    health_status,
+    response_status,
+    restart_count,
+    verify_count,
+):
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine(
+        restart_status=restart_status,
+        health_status=health_status,
+    )
+    await _jellyfin_execute(runtime, adapter)
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {
+            "pending_action": _pending_envelope(_jellyfin_validation().argument_digest),
+            "confirmed": True,
+        },
+    )
+    assert result.trace["response_status"] == response_status
+    assert len(adapter.restart_inputs) == restart_count
+    post_calls = [item for item in adapter.status_inputs if item["purpose"] == "post_restart"]
+    assert len(post_calls) == verify_count
+    assert "verified it is healthy" not in result.response_text

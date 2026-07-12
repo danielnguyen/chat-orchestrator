@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 Role = Literal["user", "assistant", "system", "tool"]
 BriefType = Literal[
@@ -96,13 +96,27 @@ class ExternalContextRequest(BaseModel):
     max_results: Optional[int] = Field(default=None, ge=1, le=20)
 
 
+class PendingActionEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["co.pending-action.v1"]
+    status: Literal["pending_confirmation"]
+    capability_id: str = Field(min_length=1, max_length=120)
+    target: str = Field(min_length=1, max_length=120)
+    argument_digest: str = Field(min_length=1, max_length=120)
+    challenge_ref: str = Field(min_length=1, max_length=120)
+    challenge_expires_at: str = Field(min_length=1, max_length=64)
+    confirmation_text: str = Field(min_length=1, max_length=500)
+
+
 class CapabilityConfirmationInput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     challenge_ref: Optional[str] = Field(default=None, min_length=1, max_length=120)
     capability_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
     argument_digest: Optional[str] = Field(default=None, min_length=1, max_length=120)
     confirmed: Optional[bool] = None
+    pending_action: Optional[PendingActionEnvelope] = None
 
 
 class ChatRequest(BaseModel):
@@ -134,6 +148,14 @@ class ChatResponse(BaseModel):
     answer: str
     status: Literal["ok", "degraded", "failed"]
     sources: List[Dict[str, Any]] = Field(default_factory=list)
+    pending_action: Optional[PendingActionEnvelope] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_pending_action(self, handler):
+        serialized = handler(self)
+        if self.pending_action is None:
+            serialized.pop("pending_action", None)
+        return serialized
 
 
 class BriefStructuredInput(BaseModel):
