@@ -13040,7 +13040,7 @@ class ComposedJellyfinRuntime(CapabilityRuntime):
                 "risk_level": "medium_requires_confirmation",
                 "authority_level": "execute_after_confirmation",
                 "requires_confirmation": True,
-                "allowed": True,
+                "allowed": False,
                 "reason_summary": ["registered_capability", "confirmation_required"],
                 "action_taken": False,
             }
@@ -13396,6 +13396,10 @@ async def test_orchestrate_jellyfin_cancelled_policy_records_rejection_once(tmp_
     second_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
         "prompt_assembly"
     ]
+    authority = second_trace["capability_registry"]["authority"]
+    assert authority["authority_level"] == "execute_after_confirmation"
+    assert authority["requires_confirmation"] is True
+    assert authority["allowed"] is False
     action_flow = second_trace["capability_registry"]["action_flow"]
     assert action_flow["confirmation_required"] is True
     assert action_flow["execution_allowed"] is False

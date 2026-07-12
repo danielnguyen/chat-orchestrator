@@ -2273,7 +2273,7 @@ def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
                 authority.get("risk_level") == "medium_requires_confirmation",
                 authority.get("authority_level") == "execute_after_confirmation",
                 authority.get("requires_confirmation") is True,
-                authority.get("allowed") is True,
+                authority.get("allowed") is False,
                 _jellyfin_registry_allows_processing(action_flow),
             )
         )
