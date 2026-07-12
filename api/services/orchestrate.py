@@ -19,12 +19,19 @@ from router.engine import evaluate_route
 from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.capabilities import (
+    JELLYFIN_CAPABILITY_ID,
+    JELLYFIN_PROVIDER_TOOL_NAME,
+    JELLYFIN_TARGET,
     CapabilityValidationError,
+    JellyfinOperations,
+    ParsedCapabilityRequest,
+    PendingActionContinuation,
     authorize_and_execute_capability,
     capability_follow_up_summary,
     capability_validation_failure_trace,
     ensure_draft_local_unsent_truth,
     filter_capability_descriptors_for_exposure,
+    parse_pending_action_confirmation,
     parse_provider_capability_request,
     provider_text,
     validate_and_digest_capability_request,
@@ -1708,15 +1715,16 @@ def _action_summary_confirmation_status(
     )
     confirmation_state = _safe_action_summary_code(confirmation.get("status"))
     confirmation_reason = _safe_action_summary_code(confirmation.get("reason_code"))
+    execution_reason = _safe_action_summary_code(execution.get("failure_reason_code"))
     flow_reasons = _safe_action_summary_codes(action_flow.get("reason_summary"))
-    evidence = {confirmation_state, confirmation_reason, *flow_reasons}
+    evidence = {confirmation_state, confirmation_reason, execution_reason, *flow_reasons}
     if "accepted" in evidence or confirmation.get("accepted") is True:
         return "accepted"
     if evidence & {"confirmation_cancelled", "cancelled"}:
         return "cancelled"
     if evidence & {"confirmation_rejected", "rejected"}:
         return "rejected"
-    if evidence & {"confirmation_expired", "expired"}:
+    if evidence & {"confirmation_expired", "challenge_expired", "expired"}:
         return "expired"
     if action_flow.get("confirmation_required") is False:
         return "not_required"
@@ -2186,15 +2194,15 @@ async def _compose_action_summary(
     return trace, replacement
 
 
-def _registry_allows_exact_capability_execution(trace: dict[str, Any]) -> bool:
+def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
     match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
     capability = match.get("capability") if isinstance(match.get("capability"), dict) else {}
     authority = trace.get("authority") if isinstance(trace.get("authority"), dict) else {}
     action_flow = (
         trace.get("action_flow") if isinstance(trace.get("action_flow"), dict) else {}
     )
-    capability_id = "runtime.world_state.read"
-    return all(
+    capability_id = match.get("matched_capability_id")
+    common = all(
         (
             trace.get("enabled") is True,
             trace.get("status") == "included",
@@ -2202,27 +2210,50 @@ def _registry_allows_exact_capability_execution(trace: dict[str, Any]) -> bool:
             trace.get("action_taken") is False,
             match.get("status") == "included",
             match.get("matched") is True,
-            match.get("matched_capability_id") == capability_id,
+            capability_id in {"runtime.world_state.read", JELLYFIN_CAPABILITY_ID},
             capability.get("capability_id") == capability_id,
+            authority.get("capability_id") == capability_id,
+            action_flow.get("capability_id") == capability_id,
+            authority.get("status") == "included",
+            authority.get("action_taken") is False,
+            action_flow.get("status") == "included",
+            action_flow.get("action_taken") is False,
+        )
+    )
+    if not common:
+        return False
+    if capability_id == JELLYFIN_CAPABILITY_ID:
+        return all(
+            (
+                capability.get("domain") == "media_operations",
+                capability.get("operation_kind") == "restart",
+                capability.get("risk_level") == "medium_service_interruption",
+                capability.get("requires_confirmation") is True,
+                capability.get("verification_supported") is True,
+                authority.get("risk_level") == "medium_requires_confirmation",
+                authority.get("authority_level") == "execute_after_confirmation",
+                authority.get("requires_confirmation") is True,
+                action_flow.get("confirmation_required") is True,
+                action_flow.get("verification_required") is True,
+                action_flow.get("verification_supported") is True,
+                action_flow.get("verification_method") == "capability_verification",
+            )
+        )
+    return all(
+        (
             capability.get("operation_kind") == "read_only",
             capability.get("risk_level") == "low_read_only",
             capability.get("requires_confirmation") is False,
             capability.get("verification_supported") is True,
-            authority.get("status") == "included",
-            authority.get("capability_id") == capability_id,
             authority.get("risk_level") == "read_only",
             authority.get("authority_level") == "answer_only",
             authority.get("requires_confirmation") is False,
             authority.get("allowed") is True,
-            authority.get("action_taken") is False,
-            action_flow.get("status") == "included",
-            action_flow.get("capability_id") == capability_id,
             action_flow.get("confirmation_required") is False,
             action_flow.get("execution_allowed") is True,
             action_flow.get("verification_required") is True,
             action_flow.get("verification_supported") is True,
             action_flow.get("verification_method") == "capability_verification",
-            action_flow.get("action_taken") is False,
         )
     )
 
@@ -2271,13 +2302,21 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
             "Capability registry context:",
             f"- The runtime matched a registered capability: {label}.",
         ]
-        if _registry_allows_exact_capability_execution(trace):
-            lines.extend(
-                [
-                    "- You may request only runtime.world_state.read through its exposed tool.",
-                    "- Do not claim execution or verification from provider prose.",
-                ]
-            )
+        if _registry_allows_exact_capability(trace):
+            if capability.get("capability_id") == JELLYFIN_CAPABILITY_ID:
+                lines.extend(
+                    [
+                        "- You may request only jellyfin_safe_restart for service:jellyfin.",
+                        "- Confirmation and execution are controlled outside provider prose.",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "- You may request only runtime.world_state.read through its exposed tool.",
+                        "- Do not claim execution or verification from provider prose.",
+                    ]
+                )
         else:
             lines.extend(
                 [
@@ -2443,6 +2482,58 @@ def _capability_registry_forced_response(trace: dict[str, Any]) -> str | None:
     return None
 
 
+def _pending_action_envelope(
+    *,
+    execution: dict[str, Any],
+    registry_trace: dict[str, Any],
+) -> dict[str, Any] | None:
+    if (
+        execution.get("capability_id") != JELLYFIN_CAPABILITY_ID
+        or execution.get("response_status") != "pending_confirmation"
+    ):
+        return None
+    authorization = (
+        execution.get("authorization")
+        if isinstance(execution.get("authorization"), dict)
+        else {}
+    )
+    selection = (
+        authorization.get("selection")
+        if isinstance(authorization.get("selection"), dict)
+        else {}
+    )
+    action_flow = (
+        registry_trace.get("action_flow")
+        if isinstance(registry_trace.get("action_flow"), dict)
+        else {}
+    )
+    challenge_ref = _sanitize_trace_string(
+        selection.get("confirmation_challenge_ref"),
+        max_length=120,
+    )
+    expires_at = _sanitize_trace_string(
+        selection.get("challenge_expires_at"),
+        max_length=64,
+    )
+    digest = _sanitize_trace_string(execution.get("argument_digest"), max_length=120)
+    confirmation_text = _safe_confirmation_text(
+        action_flow.get("confirmation_text"),
+        required=True,
+    )
+    if None in {challenge_ref, expires_at, digest, confirmation_text}:
+        return None
+    return {
+        "schema_version": "co.pending-action.v1",
+        "status": "pending_confirmation",
+        "capability_id": JELLYFIN_CAPABILITY_ID,
+        "target": JELLYFIN_TARGET,
+        "argument_digest": digest,
+        "challenge_ref": challenge_ref,
+        "challenge_expires_at": expires_at,
+        "confirmation_text": confirmation_text,
+    }
+
+
 def _authority_context_inputs(
     interaction_governance_trace: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -2585,6 +2676,137 @@ def _action_flow_context_inputs(
         "affects_multiple_systems": False,
         "target_label": None,
     }
+
+
+async def _resolve_jellyfin_continuation_policy(
+    *,
+    runtime: Any | None,
+    enabled: bool,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    active_persona_id: str | None,
+    continuation: PendingActionContinuation,
+    interaction_governance_trace: dict[str, Any] | None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    trace = _capability_registry_base_trace(enabled=enabled)
+    if not enabled:
+        return [], trace
+    if runtime is None or not active_persona_id:
+        trace.update(
+            {
+                "status": "failed",
+                "reason": "runtime_context_unavailable",
+            }
+        )
+        return [], trace
+    capability = {
+        "capability_id": JELLYFIN_CAPABILITY_ID,
+        "display_name": "Restart Jellyfin",
+        "domain": "media_operations",
+        "operation_kind": "restart",
+        "risk_level": "medium_service_interruption",
+        "requires_confirmation": True,
+        "reversible": False,
+        "dry_run_supported": True,
+        "verification_supported": True,
+    }
+    trace.update({"status": "included", "context_included": True})
+    trace["match"] = {
+        "attempted": False,
+        "status": "included",
+        "matched": True,
+        "matched_capability_id": JELLYFIN_CAPABILITY_ID,
+        "capability": capability,
+        "reason_codes": ["bounded_continuation"],
+    }
+    trace["decision_provenance"] = _action_policy_decision_provenance(
+        interaction_governance_trace,
+    )
+    try:
+        _mark_governance_forwarded(trace["decision_provenance"], authority=True)
+        authority_response = await runtime.action_authority(
+            request_id=f"{request_id}:capability-authority",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            active_persona_id=active_persona_id,
+            capability_id=JELLYFIN_CAPABILITY_ID,
+            **_authority_context_inputs(interaction_governance_trace),
+        )
+        authority_result = (
+            authority_response.get("result")
+            if isinstance(authority_response, dict)
+            else None
+        )
+        authority = _safe_action_authority_decision(authority_result)
+        if authority is None:
+            trace.update(
+                {
+                    "status": "failed",
+                    "reason": "malformed_capability_authority_response",
+                    "authority": {
+                        "attempted": True,
+                        "status": "failed",
+                        "action_taken": False,
+                    },
+                }
+            )
+            return _capability_registry_prompt_messages(trace), trace
+        trace["authority"] = {"attempted": True, "status": "included", **authority}
+        _mark_governance_forwarded(trace["decision_provenance"], action_flow=True)
+        flow_response = await runtime.action_flow(
+            request_id=f"{request_id}:capability-flow",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            active_persona_id=active_persona_id,
+            capability_id=JELLYFIN_CAPABILITY_ID,
+            **_authority_context_inputs(interaction_governance_trace),
+            flow_intent=(
+                "confirmation_received"
+                if continuation.confirmed
+                else "confirmation_cancelled"
+            ),
+            affects_multiple_systems=False,
+            target_label=JELLYFIN_TARGET,
+        )
+        flow_result = flow_response.get("result") if isinstance(flow_response, dict) else None
+        action_flow = _safe_action_flow_decision(flow_result)
+        if action_flow is None:
+            trace.update(
+                {
+                    "status": "failed",
+                    "reason": "malformed_capability_flow_response",
+                    "action_flow": {
+                        "attempted": True,
+                        "status": "failed",
+                        "action_taken": False,
+                    },
+                }
+            )
+            return _capability_registry_prompt_messages(trace), trace
+        _record_action_flow_policy_outcome(trace["decision_provenance"], action_flow)
+        trace["action_flow"] = {
+            "attempted": True,
+            "status": "included",
+            **action_flow,
+        }
+    except Exception:
+        trace.update(
+            {
+                "status": "failed",
+                "reason": "capability_policy_unavailable",
+            }
+        )
+    return _capability_registry_prompt_messages(trace), trace
 
 
 async def _resolve_capability_registry_context(
@@ -4691,6 +4913,7 @@ async def _resolve_world_state(
         "expired_count": trace.get("expired_count", 0),
         "conflicted_count": trace.get("conflicted_count", 0),
         "confirmation_required": bool(trace.get("confirmation_required", False)),
+        "jellyfin_claim_refs": _jellyfin_claim_refs(included_claims),
     }
     if not isinstance(prompt_content, str) or not prompt_content:
         return None, {
@@ -4716,6 +4939,38 @@ async def _resolve_world_state(
         "status": "included",
         "included": True,
     }
+
+
+def _jellyfin_claim_refs(claims: Any) -> list[dict[str, str]]:
+    if not isinstance(claims, list):
+        return []
+    refs: list[dict[str, str]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        if (
+            claim.get("domain") != "active_external_system"
+            or claim.get("entity_id") != JELLYFIN_TARGET
+            or claim.get("attribute") != "restart_safe"
+            or claim.get("sensitivity") in {"high", "restricted"}
+            or claim.get("superseded_by_claim_id") is not None
+            or bool(claim.get("conflict_claim_ids"))
+        ):
+            continue
+        claim_id = _sanitize_trace_string(
+            claim.get("world_state_claim_id"),
+            max_length=120,
+        )
+        value_digest = _sanitize_trace_string(
+            claim.get("value_digest"),
+            max_length=120,
+        )
+        if claim_id is None or value_digest is None:
+            continue
+        refs.append({"claim_id": claim_id, "value_digest": value_digest})
+        if len(refs) >= 16:
+            break
+    return refs
 
 
 async def _resolve_relationship_context(
@@ -5669,15 +5924,36 @@ async def orchestrate_chat(
     prompt_output_token_reserve: int = 2048,
     prompt_context_safety_margin: int = 256,
     capability_revalidators: dict[str, Any] | None = None,
+    jellyfin_operations: JellyfinOperations | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     surface = payload.get("surface", "unknown")
+    pending_continuation, pending_error = parse_pending_action_confirmation(
+        payload.get("capability_confirmation")
+    )
 
     resolved = await memory_store.resolve_conversation(
         owner_id=payload["owner_id"],
         client_id=payload.get("client_id"),
     )
     conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
+
+    if pending_error is not None:
+        profile = await memory_store.resolve_profile(
+            owner_id=payload["owner_id"],
+            surface=surface,
+            requested_profile=payload.get("requested_profile"),
+            client_id=payload.get("client_id"),
+        )
+        return {
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "profile_name": profile["profile_name"],
+            "selected_model": "not_called",
+            "answer": "I could not use that capability confirmation safely. No action was taken.",
+            "status": "failed",
+            "sources": [],
+        }
 
     last_user_text = _extract_last_user_text(payload["messages"])
     recent_messages = _bounded_recent_messages(payload["messages"])
@@ -6221,6 +6497,7 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
+        jellyfin_claim_refs = world_state_trace.pop("jellyfin_claim_refs", [])
         if persona_containment_enabled:
             relationship_context = mandatory_policy.relationship_context
             relationship_context_trace = mandatory_policy.relationship_trace
@@ -6234,8 +6511,25 @@ async def orchestrate_chat(
                 runtime_session_id=runtime_session_trace.get("runtime_session_id"),
                 active_persona_id=runtime_identity_trace.get("active_persona_id"),
             )
-        capability_registry_messages, capability_registry_trace = (
-            await _resolve_capability_registry_context(
+        if pending_continuation is not None:
+            capability_registry_messages, capability_registry_trace = (
+                await _resolve_jellyfin_continuation_policy(
+                    runtime=runtime,
+                    enabled=capability_registry_enabled,
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                    runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                    active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                    continuation=pending_continuation,
+                    interaction_governance_trace=interaction_governance_trace,
+                )
+            )
+        else:
+            capability_registry_messages, capability_registry_trace = await (
+                _resolve_capability_registry_context(
                 runtime=runtime,
                 enabled=capability_registry_enabled,
                 request_id=request_id,
@@ -6248,7 +6542,7 @@ async def orchestrate_chat(
                 current_user_text=last_user_text,
                 interaction_governance_trace=interaction_governance_trace,
             )
-        )
+            )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -6397,7 +6691,7 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
-        if capability_registry_enabled and not _registry_allows_exact_capability_execution(
+        if capability_registry_enabled and not _registry_allows_exact_capability(
             capability_registry_trace
         ):
             capability_descriptors = []
@@ -6412,9 +6706,17 @@ async def orchestrate_chat(
                 "blocked_reasons": {},
             }
         else:
+            matched_capability_id = (
+                capability_registry_trace.get("match", {}).get(
+                    "matched_capability_id"
+                )
+                if isinstance(capability_registry_trace.get("match"), dict)
+                else None
+            )
             allowed_capability_ids = (
-                ["runtime.world_state.read"]
-                if _registry_allows_exact_capability_execution(capability_registry_trace)
+                [matched_capability_id]
+                if _registry_allows_exact_capability(capability_registry_trace)
+                and isinstance(matched_capability_id, str)
                 else None
             )
             (
@@ -6432,6 +6734,8 @@ async def orchestrate_chat(
                 selected_relationship_ids=_selected_relationship_ids_from_trace(
                     relationship_context_trace
                 ),
+                selected_world_state_claims=jellyfin_claim_refs,
+                jellyfin_operations=jellyfin_operations,
                 allowed_capability_ids=allowed_capability_ids,
             )
 
@@ -6609,6 +6913,7 @@ async def orchestrate_chat(
             ),
             "dispatch_completed": False,
             "executor_call_count": 0,
+            "provider_call_count": 0,
         }
 
         await _advance_runtime_turn(
@@ -6619,33 +6924,36 @@ async def orchestrate_chat(
         )
         model_started = perf_counter()
         try:
-            completion = await litellm.chat(
-                request_id=request_id,
-                model=selected_model,
-                messages=messages,
-                tools=capability_descriptors,
-            )
-            model_calls.append(
-                {
-                    **_model_attempt(
-                        provider=selected_provider,
-                        model=selected_model,
-                        status="ok",
-                        latency_ms=int((perf_counter() - model_started) * 1000),
-                    ),
-                    **_provider_attempt_evidence(
-                        ordinal=1,
-                        prompt_fingerprint=prompt_fingerprint,
-                        prompt_trace=prompt.trace,
-                    ),
-                    "capability_descriptor_fingerprint": capability_exposure_trace.get(
-                        "descriptor_fingerprint"
-                    ),
-                    "capability_descriptor_count": capability_exposure_trace.get(
-                        "descriptor_count"
-                    ),
-                }
-            )
+            if pending_continuation is not None:
+                completion = {"choices": [{"message": {"content": ""}}]}
+            else:
+                completion = await litellm.chat(
+                    request_id=request_id,
+                    model=selected_model,
+                    messages=messages,
+                    tools=capability_descriptors,
+                )
+                model_calls.append(
+                    {
+                        **_model_attempt(
+                            provider=selected_provider,
+                            model=selected_model,
+                            status="ok",
+                            latency_ms=int((perf_counter() - model_started) * 1000),
+                        ),
+                        **_provider_attempt_evidence(
+                            ordinal=1,
+                            prompt_fingerprint=prompt_fingerprint,
+                            prompt_trace=prompt.trace,
+                        ),
+                        "capability_descriptor_fingerprint": capability_exposure_trace.get(
+                            "descriptor_fingerprint"
+                        ),
+                        "capability_descriptor_count": capability_exposure_trace.get(
+                            "descriptor_count"
+                        ),
+                    }
+                )
         except Exception as e:
             model_calls.append(
                 {
@@ -6806,21 +7114,32 @@ async def orchestrate_chat(
                 )
                 raise
 
+        prompt.trace["capabilities"]["provider_call_count"] = len(model_calls)
         raw_answer = _apply_capability_registry_response_boundary(
             provider_text(completion),
             capability_registry_trace,
         )
         capability_request = None
+        pending_action: dict[str, Any] | None = None
         try:
-            capability_request = parse_provider_capability_request(completion)
+            capability_request = (
+                ParsedCapabilityRequest(
+                    capability_id=JELLYFIN_CAPABILITY_ID,
+                    provider_tool_name=JELLYFIN_PROVIDER_TOOL_NAME,
+                    arguments={"target": JELLYFIN_TARGET},
+                )
+                if pending_continuation is not None
+                else parse_provider_capability_request(completion)
+            )
             if capability_request is not None:
-                registry_execution_allowed = (
-                    _registry_allows_exact_capability_execution(capability_registry_trace)
-                    and capability_request.capability_id == "runtime.world_state.read"
+                registry_capability_allowed = (
+                    _registry_allows_exact_capability(capability_registry_trace)
+                    and capability_request.capability_id
+                    in {"runtime.world_state.read", JELLYFIN_CAPABILITY_ID}
                 )
                 if (
                     capability_registry_trace.get("context_included") is True
-                    and not registry_execution_allowed
+                    and not registry_capability_allowed
                 ):
                     prompt.trace["capabilities"]["validation"] = {
                         "validation_status": "not_requested",
@@ -6861,11 +7180,17 @@ async def orchestrate_chat(
                         selected_relationship_ids=_selected_relationship_ids_from_trace(
                             relationship_context_trace
                         ),
+                        selected_world_state_claims=jellyfin_claim_refs,
                         revalidators=capability_revalidators,
+                        jellyfin_operations=jellyfin_operations,
                         capability_confirmation=payload.get("capability_confirmation"),
-                        post_execution_verification_required=registry_execution_allowed,
+                        post_execution_verification_required=registry_capability_allowed,
                     )
                     prompt.trace["capabilities"]["execution"] = execution_result.trace
+                    pending_action = _pending_action_envelope(
+                        execution=execution_result.trace,
+                        registry_trace=capability_registry_trace,
+                    )
                     executor_call_count = execution_result.trace.get("executor_call_count")
                     if isinstance(executor_call_count, int):
                         prompt.trace["capabilities"]["executor_call_count"] = executor_call_count
@@ -6925,8 +7250,15 @@ async def orchestrate_chat(
             capability_execution_trace=prompt.trace["capabilities"].get("execution"),
         )
         prompt.trace["capabilities"]["action_summary"] = action_summary_trace
+        prompt.trace["capabilities"]["action_summary_call_count"] = (
+            1 if action_summary_trace.get("attempted") is True else 0
+        )
         if action_summary_answer is not None:
             raw_answer = action_summary_answer
+        if pending_action is not None:
+            raw_answer = (
+                "Restarting service:jellyfin requires confirmation. No action was taken."
+            )
         response_review = review_response(
             ResponseReviewInput(
                 candidate_text=raw_answer,
@@ -7120,7 +7452,16 @@ async def orchestrate_chat(
             "prompt_assembly": persisted_prompt_trace,
         }
         effective_model_call = {
-            **persisted_model_calls[-1],
+            **(
+                persisted_model_calls[-1]
+                if persisted_model_calls
+                else {
+                    "provider": "none",
+                    "model": selected_model,
+                    "status": "not_called",
+                    "latency_ms": 0,
+                }
+            ),
             "brief": {
                 key: value
                 for key, value in brief_metadata.items()
@@ -7197,7 +7538,7 @@ async def orchestrate_chat(
             },
         )
 
-        return {
+        result = {
             "request_id": request_id,
             "conversation_id": conversation_id,
             "profile_name": profile["profile_name"],
@@ -7206,6 +7547,9 @@ async def orchestrate_chat(
             "status": status,
             "sources": answer_sources,
         }
+        if pending_action is not None:
+            result["pending_action"] = pending_action
+        return result
     except Exception:
         if turn_state_trace.get("runtime_turn_id") and not turn_state_trace.get("completed"):
             await _complete_runtime_turn(

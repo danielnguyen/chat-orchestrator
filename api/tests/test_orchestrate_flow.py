@@ -4,7 +4,12 @@ import httpx
 import pytest
 import services.capabilities as capability_service
 from clients.runtime import RuntimeClient
-from services.capabilities import RevalidationOutput, Revalidator, RevalidatorEntry
+from services.capabilities import (
+    JellyfinOperations,
+    RevalidationOutput,
+    Revalidator,
+    RevalidatorEntry,
+)
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,
@@ -12932,6 +12937,396 @@ async def test_orchestrate_dsa_disabled_skips_external_context_call(tmp_path):
     }
     assert trace["retrieval"]["prompt_assembly"]["dsa"] == trace["dsa"]
     assert "External source context:" not in str(litellm.calls[0]["messages"])
+
+
+class ComposedJellyfinOperations:
+    def __init__(self):
+        self.status_inputs = []
+        self.restart_inputs = []
+
+    async def status(self, value):
+        self.status_inputs.append(value)
+        state = "safe" if value["purpose"] == "revalidation" else "healthy"
+        return {
+            "status": state,
+            "reason_code": f"simulated_{state}",
+            "observed_at": "2026-07-12T00:00:00+00:00",
+            "verified_at": "2026-07-12T00:00:01+00:00",
+            "claims": value["claims"],
+        }
+
+    async def restart(self, value):
+        self.restart_inputs.append(value)
+        return {"status": "completed", "reason_code": "simulated_completed"}
+
+    def binding(self):
+        return JellyfinOperations(
+            effect_mode="simulated",
+            status=self.status,
+            restart=self.restart,
+        )
+
+
+class ComposedJellyfinRuntime(CapabilityRuntime):
+    def __init__(self):
+        super().__init__()
+        self.confirmation_calls = []
+        self.selection_count = 0
+        self.dispatch_count = 0
+        self.turn_count = 0
+        self.consumed = False
+        self.world_state_response = {
+            "included_claims": [
+                {
+                    "world_state_claim_id": "claim_jellyfin_safe",
+                    "domain": "active_external_system",
+                    "entity_id": "service:jellyfin",
+                    "attribute": "restart_safe",
+                    "value_digest": "wsvalue_safe",
+                    "sensitivity": "medium",
+                }
+            ],
+            "excluded_claim_summaries": [],
+            "prompt_content": "A bounded service safety claim is available.",
+            "trace": {
+                "active_persona_id": "technical_architect",
+                "allowed_domains": ["active_external_system"],
+                "included_claim_count": 1,
+                "excluded_claim_count": 0,
+                "stale_count": 0,
+                "aging_count": 0,
+                "expired_count": 0,
+                "conflicted_count": 0,
+                "confirmation_required": False,
+            },
+        }
+        self.capability_match_response = {
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["registered_capability"],
+                "capability": {
+                    "capability_id": "jellyfin_restart",
+                    "display_name": "Restart Jellyfin",
+                    "domain": "media_operations",
+                    "operation_kind": "restart",
+                    "risk_level": "medium_service_interruption",
+                    "requires_confirmation": True,
+                    "reversible": False,
+                    "dry_run_supported": True,
+                    "verification_supported": True,
+                },
+            }
+        }
+
+    async def start_turn(self, **kwargs):
+        self.turn_count += 1
+        turn_id = f"rtturn_jellyfin_{self.turn_count}"
+        self.turn_start_calls.append(kwargs)
+        return {
+            "runtime_session": {
+                "runtime_session_id": "rtsession_1",
+                "status": "active",
+                "surface": "dev",
+            },
+            "runtime_turn": {"runtime_turn_id": turn_id, "turn_status": "received"},
+        }
+
+    async def action_authority(self, **kwargs):
+        self.capability_authority_calls.append(kwargs)
+        return {
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "risk_level": "medium_requires_confirmation",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": True,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        }
+
+    async def action_flow(self, **kwargs):
+        self.capability_flow_calls.append(kwargs)
+        return {
+            "result": {
+                "capability_id": "jellyfin_restart",
+                "dry_run_required": False,
+                "dry_run_supported": True,
+                "dry_run_effects": [],
+                "confirmation_required": True,
+                "confirmation_text": "Confirm restart of service:jellyfin.",
+                "execution_allowed": True,
+                "verification_required": True,
+                "verification_supported": True,
+                "verification_method": "capability_verification",
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        }
+
+    async def authorize_capability(self, **kwargs):
+        self.capability_authorization_calls.append(kwargs)
+        stage = kwargs.get("authorization_" + "pha" + "se")
+        if stage == "exposure":
+            return {
+                "result": {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                }
+            }
+        if stage == "dispatch":
+            self.dispatch_count += 1
+            allowed = not self.consumed
+            self.consumed = self.consumed or allowed
+            return {
+                "result": {
+                    "allowed": allowed,
+                    "decision_code": "allowed" if allowed else "challenge_consumed",
+                    "reason_codes": ["allowed" if allowed else "challenge_consumed"],
+                    "challenge_ref": kwargs.get("confirmation_challenge_ref"),
+                    "world_state_claim_ids_used": ["claim_jellyfin_safe"],
+                }
+            }
+        self.selection_count += 1
+        incoming = kwargs.get("confirmation_challenge_ref")
+        if self.consumed:
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "challenge_consumed",
+                    "reason_codes": ["challenge_consumed"],
+                }
+            }
+        if self.selection_count % 2 == 1:
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "revalidation_required",
+                    "reason_codes": ["revalidation_required"],
+                    "challenge_ref": incoming,
+                    "revalidation_selector": {
+                        "revalidator_id": "jellyfin_status",
+                        "world_state_claim_ids": ["claim_jellyfin_safe"],
+                    },
+                    "world_state_claim_ids_used": ["claim_jellyfin_safe"],
+                }
+            }
+        return {
+            "result": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-jellyfin-1",
+                "challenge_expires_at": "2026-07-12T01:00:00+00:00",
+                "world_state_claim_ids_used": ["claim_jellyfin_safe"],
+            }
+        }
+
+    async def world_state_claim_verify(self, **kwargs):
+        self.world_state_verification_calls.append(kwargs)
+        return {
+            "claim": {
+                "world_state_claim_id": kwargs["world_state_claim_id"],
+                "verification_verifier_id": kwargs["verifier_id"],
+                "verification_source_type": kwargs["verification_source_type"],
+                "verification_source_ref": kwargs["verification_source_ref"],
+                "last_verified_runtime_session_id": kwargs["runtime_session_id"],
+                "last_verified_runtime_turn_id": kwargs["runtime_turn_id"],
+            }
+        }
+
+    async def confirm_capability(self, **kwargs):
+        self.confirmation_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs["runtime_turn_id"],
+            "confirmation_challenge_ref": kwargs["confirmation_challenge_ref"],
+            "confirmation_state": "accepted" if kwargs["confirmed"] else "rejected",
+        }
+
+
+def _jellyfin_chat_payload(text, **overrides):
+    payload = _first_party_chat_payload(
+        text,
+        surface="dev",
+        surface_context={
+            "surface_type": "dev",
+            "interaction_mode": "text",
+            "spoken_output": False,
+            "active_task_mode": True,
+            "output_format": "markdown",
+        },
+    )
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_jellyfin_two_turn_continuation_skips_model_rediscovery(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = ComposedJellyfinRuntime()
+    operations = ComposedJellyfinOperations()
+    litellm = SequenceLiteLLM(
+        [_tool_completion("jellyfin_safe_restart", {"target": "service:jellyfin"})]
+    )
+
+    first = await orchestrate_chat(
+        payload=_jellyfin_chat_payload("Restart Jellyfin."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-jellyfin-first",
+        capability_registry_enabled=True,
+        jellyfin_operations=operations.binding(),
+    )
+
+    assert len(litellm.calls) == 1
+    assert [tool["function"]["name"] for tool in litellm.calls[0]["tools"]] == [
+        "jellyfin_safe_restart"
+    ]
+    assert first["answer"] == (
+        "Restarting service:jellyfin requires confirmation. No action was taken."
+    )
+    assert first["pending_action"] == {
+        "schema_version": "co.pending-action.v1",
+        "status": "pending_confirmation",
+        "capability_id": "jellyfin_restart",
+        "target": "service:jellyfin",
+        "argument_digest": first["pending_action"]["argument_digest"],
+        "challenge_ref": "challenge-jellyfin-1",
+        "challenge_expires_at": "2026-07-12T01:00:00+00:00",
+        "confirmation_text": "Confirm restart of service:jellyfin.",
+    }
+    assert operations.restart_inputs == []
+    assert len(runtime.confirmation_calls) == 0
+    assert runtime.dispatch_count == 0
+    assert len(runtime.action_summary_calls) == 1
+    assert runtime.action_summary_calls[0]["confirmation_status"] == "required_pending"
+    assert runtime.action_summary_calls[0]["execution_status"] == "not_attempted"
+    assert runtime.action_summary_calls[0]["verification_status"] == "not_required"
+
+    second = await orchestrate_chat(
+        payload=_jellyfin_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-jellyfin-second",
+        capability_registry_enabled=True,
+        jellyfin_operations=operations.binding(),
+    )
+
+    assert len(litellm.calls) == 1
+    assert "pending_action" not in second
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.confirmation_calls[0]["confirmed"] is True
+    assert runtime.confirmation_calls[0]["confirmation_challenge_ref"] == "challenge-jellyfin-1"
+    assert runtime.dispatch_count == 1
+    assert len(operations.restart_inputs) == 1
+    revalidation_calls = [
+        item for item in operations.status_inputs if item["purpose"] == "revalidation"
+    ]
+    post_restart_calls = [
+        item for item in operations.status_inputs if item["purpose"] == "post_restart"
+    ]
+    assert len(revalidation_calls) == 2
+    assert len(post_restart_calls) == 1
+    assert len(runtime.action_summary_calls) == 2
+    assert runtime.action_summary_calls[1]["confirmation_status"] == "accepted"
+    assert runtime.action_summary_calls[1]["execution_status"] == "executed"
+    assert runtime.action_summary_calls[1]["verification_status"] == "passed"
+    assert "verification passed" in second["answer"]
+    second_trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
+    evidence = second_trace["capabilities"]
+    assert evidence["provider_call_count"] == 0
+    assert evidence["execution"]["restart_call_count"] == 1
+    assert evidence["execution"]["post_restart_verification_call_count"] == 1
+    assert evidence["execution"]["effect_mode"] == "simulated"
+    assert evidence["action_summary_call_count"] == 1
+    protected = json.dumps(
+        {
+            "provider": litellm.calls,
+            "adapter": operations.status_inputs + operations.restart_inputs,
+            "summary": runtime.action_summary_calls,
+            "trace": second_trace,
+            "pending": first["pending_action"],
+            "answer": second["answer"],
+        },
+        sort_keys=True,
+    )
+    for sentinel in (
+        "PRIVATE-SIGNATURE-SENTINEL",
+        "PRIVATE-OBJECT-URI-SENTINEL",
+        "minioadmin",
+    ):
+        assert sentinel not in protected
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_jellyfin_false_continuation_records_rejection_once(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = ComposedJellyfinRuntime()
+    operations = ComposedJellyfinOperations()
+    litellm = SequenceLiteLLM(
+        [_tool_completion("jellyfin_safe_restart", {"target": "service:jellyfin"})]
+    )
+    first = await orchestrate_chat(
+        payload=_jellyfin_chat_payload("Restart Jellyfin."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-jellyfin-reject-first",
+        capability_registry_enabled=True,
+        jellyfin_operations=operations.binding(),
+    )
+    rejected = await orchestrate_chat(
+        payload=_jellyfin_chat_payload(
+            "no",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": False,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-jellyfin-reject-second",
+        capability_registry_enabled=True,
+        jellyfin_operations=operations.binding(),
+    )
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.confirmation_calls[0]["confirmed"] is False
+    assert runtime.dispatch_count == 0
+    assert operations.restart_inputs == []
+    assert len(runtime.action_summary_calls) == 2
+    assert runtime.action_summary_calls[1]["confirmation_status"] == "rejected"
+    assert runtime.action_summary_calls[1]["execution_status"] == "not_attempted"
+    assert "No action was taken" in rejected["answer"]
 
 
 @pytest.mark.asyncio

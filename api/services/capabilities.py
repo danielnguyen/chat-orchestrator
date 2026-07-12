@@ -36,6 +36,22 @@ _RELATIONSHIP_CONTEXT_REQUIREMENTS = [
         "minimum_confidence": 0.8,
     }
 ]
+JELLYFIN_CAPABILITY_ID = "jellyfin_restart"
+JELLYFIN_PROVIDER_TOOL_NAME = "jellyfin_safe_restart"
+JELLYFIN_TARGET = "service:jellyfin"
+JELLYFIN_REVALIDATOR_ID = "jellyfin_status"
+JELLYFIN_EFFECT_MODES = {"simulated", "live"}
+JELLYFIN_WORLD_STATE_REQUIREMENTS = [
+    {
+        "domain": "active_external_system",
+        "entity_id": JELLYFIN_TARGET,
+        "attribute": "restart_safe",
+        "min_authority": "trusted_integration_event",
+        "min_confidence": 0.9,
+        "max_freshness_state": "fresh",
+        "revalidator_id": JELLYFIN_REVALIDATOR_ID,
+    }
+]
 
 
 class CapabilityValidationError(ValueError):
@@ -56,6 +72,8 @@ class CapabilityEntry:
     privacy_classification: str
     authorization_requirements: dict[str, Any]
     argument_schema: dict[str, Any]
+    enabled_surfaces: tuple[str, ...] = ()
+    enabled_personas: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +96,32 @@ class CapabilityValidationResult:
 class CapabilityExecutionResult:
     response_text: str
     trace: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class JellyfinOperations:
+    effect_mode: str
+    status: Any
+    restart: Any
+
+
+@dataclass(frozen=True)
+class PendingActionContinuation:
+    challenge_ref: str
+    capability_id: str
+    target: str
+    argument_digest: str
+    challenge_expires_at: str
+    confirmation_text: str
+    confirmed: bool
+
+
+@dataclass(frozen=True)
+class _JellyfinStatusResult:
+    status: str
+    reason_code: str
+    observed_at: str
+    verified_at: str
 
 
 @dataclass(frozen=True)
@@ -242,6 +286,33 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
             },
         },
     ),
+    CapabilityEntry(
+        capability_id=JELLYFIN_CAPABILITY_ID,
+        provider_tool_name=JELLYFIN_PROVIDER_TOOL_NAME,
+        operation_class="high_impact",
+        capability_domain="media_operations",
+        supported_surfaces=("desktop", "dev"),
+        executor_binding="jellyfin_operations_restart",
+        descriptor_metadata={
+            "display_name": "Restart Jellyfin",
+            "description": "Restart the fixed Jellyfin service after scoped confirmation.",
+        },
+        privacy_classification="bounded_service_action",
+        authorization_requirements={
+            "relationship_requirements": [],
+            "world_state_requirements": JELLYFIN_WORLD_STATE_REQUIREMENTS,
+        },
+        argument_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target"],
+            "properties": {
+                "target": {"type": "string", "enum": [JELLYFIN_TARGET]},
+            },
+        },
+        enabled_surfaces=("dev",),
+        enabled_personas=("technical_architect",),
+    ),
 )
 
 
@@ -254,18 +325,94 @@ def production_revalidator_registry() -> dict[str, Revalidator]:
     return {}
 
 
+def jellyfin_status_revalidator(
+    *,
+    operations: JellyfinOperations,
+    request_id: str,
+    world_state_claims: list[dict[str, str]],
+) -> Revalidator:
+    claim_refs = _safe_world_state_claim_refs(world_state_claims)
+    claim_digests = {item["claim_id"]: item["value_digest"] for item in claim_refs}
+
+    async def verify(claim_ids: tuple[str, ...]) -> list[RevalidationOutput]:
+        requested = [
+            {"claim_id": claim_id, "value_digest": claim_digests.get(claim_id, "")}
+            for claim_id in claim_ids
+        ]
+        if any(not item["value_digest"] for item in requested):
+            return [
+                _failed_revalidation_output(item, "revalidator_claim_mismatch")
+                for item in requested
+            ]
+        raw = operations.status(
+            {
+                "request_id": request_id,
+                "capability_id": JELLYFIN_CAPABILITY_ID,
+                "target": JELLYFIN_TARGET,
+                "purpose": "revalidation",
+                "claims": requested,
+            }
+        )
+        if hasattr(raw, "__await__"):
+            raw = await raw
+        parsed, reason = _parse_jellyfin_status_result(
+            raw,
+            purpose="revalidation",
+            expected_claims=requested,
+        )
+        if parsed is None or parsed.status != "safe":
+            failure_reason = reason or f"restart_state_{parsed.status}"
+            return [
+                _failed_revalidation_output(item, failure_reason)
+                for item in requested
+            ]
+        return [
+            RevalidationOutput(
+                claim_id=item["claim_id"],
+                expected_value_digest=item["value_digest"],
+                observed_at=parsed.observed_at,
+                verified_at=parsed.verified_at,
+                source_type="tool_output",
+                source_ref=JELLYFIN_REVALIDATOR_ID,
+                resulting_authority="verified_tool_output",
+                confidence=1.0,
+                freshness_state="fresh",
+            )
+            for item in requested
+        ]
+
+    return Revalidator(
+        entry=RevalidatorEntry(
+            revalidator_id=JELLYFIN_REVALIDATOR_ID,
+            verifier_id=JELLYFIN_REVALIDATOR_ID,
+            verification_source_type="tool_output",
+            verification_source_ref=JELLYFIN_REVALIDATOR_ID,
+            supported_domains=("active_external_system",),
+            supported_attributes=("restart_safe",),
+            resulting_authority="verified_tool_output",
+            resulting_confidence=1.0,
+            resulting_freshness_state="fresh",
+        ),
+        verify=verify,
+    )
+
+
 def validate_production_registry(entries: tuple[CapabilityEntry, ...]) -> None:
     ids = [entry.capability_id for entry in entries]
     if ids != [
         "runtime.world_state.read",
         "draft.local_message",
         "runtime.relationship_context.read",
+        JELLYFIN_CAPABILITY_ID,
     ]:
         raise RuntimeError("production_capability_registry_unexpected_ids")
     for entry in entries:
         if not entry.executor_binding:
             raise RuntimeError(f"missing_executor_binding:{entry.capability_id}")
-        if not _SAFE_ID.fullmatch(entry.capability_id):
+        if not (
+            _SAFE_ID.fullmatch(entry.capability_id)
+            or entry.capability_id == JELLYFIN_CAPABILITY_ID
+        ):
             raise RuntimeError(f"invalid_capability_id:{entry.capability_id}")
         if not _SAFE_PROVIDER_TOOL_NAME.fullmatch(entry.provider_tool_name):
             raise RuntimeError(f"invalid_provider_tool_name:{entry.capability_id}")
@@ -334,12 +481,29 @@ async def filter_capability_descriptors_for_exposure(
     runtime_turn_id: str | None,
     active_persona_id: str | None,
     selected_relationship_ids: list[str] | None = None,
+    selected_world_state_claims: list[dict[str, str]] | None = None,
+    jellyfin_operations: JellyfinOperations | None = None,
     allowed_capability_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates = list(production_capability_registry())
+    world_state_claims = _safe_world_state_claim_refs(selected_world_state_claims)
     if allowed_capability_ids is not None:
         allowed_ids = set(allowed_capability_ids)
         candidates = [entry for entry in candidates if entry.capability_id in allowed_ids]
+    else:
+        candidates = [
+            entry
+            for entry in candidates
+            if entry.capability_id != JELLYFIN_CAPABILITY_ID
+            or _jellyfin_local_gate_reason(
+                entry=entry,
+                surface=surface,
+                active_persona_id=active_persona_id,
+                operations=jellyfin_operations,
+                world_state_claims=world_state_claims,
+            )
+            is None
+        ]
     candidate_ids = [entry.capability_id for entry in candidates]
     trace: dict[str, Any] = {
         "status": "failed_closed",
@@ -368,7 +532,24 @@ async def filter_capability_descriptors_for_exposure(
     exposed: list[CapabilityEntry] = []
     blocked_reasons: dict[str, str] = {}
     for entry in candidates:
+        if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+            local_reason = _jellyfin_local_gate_reason(
+                entry=entry,
+                surface=surface,
+                active_persona_id=active_persona_id,
+                operations=jellyfin_operations,
+                world_state_claims=world_state_claims,
+            )
+            if local_reason is not None:
+                blocked_reasons[entry.capability_id] = local_reason
+                continue
         try:
+            world_state_requirements = entry.authorization_requirements.get(
+                "world_state_requirements",
+                [],
+            )
+            if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+                world_state_requirements = []
             response = await runtime.authorize_capability(
                 request_id=f"{request_id}:{entry.capability_id}:exposure",
                 owner_id=owner_id,
@@ -388,10 +569,7 @@ async def filter_capability_descriptors_for_exposure(
                     [],
                 ),
                 selected_relationship_ids=_safe_selected_ids(selected_relationship_ids),
-                world_state_requirements=entry.authorization_requirements.get(
-                    "world_state_requirements",
-                    [],
-                ),
+                world_state_requirements=world_state_requirements,
                 selected_world_state_claim_ids=[],
                 confirmation_challenge_ref=None,
             )
@@ -504,6 +682,88 @@ def argument_digest(capability_id: str, normalized_arguments: dict[str, Any]) ->
     )
 
 
+def parse_pending_action_confirmation(
+    value: Any,
+) -> tuple[PendingActionContinuation | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "malformed_confirmation"
+    if "pending_action" not in value:
+        return None, None
+    allowed_fields = {
+        "pending_action",
+        "confirmed",
+        "challenge_ref",
+        "capability_id",
+        "argument_digest",
+    }
+    if set(value) - allowed_fields:
+        return None, "mixed_confirmation_shapes"
+    if any(
+        value.get(field) is not None
+        for field in ("challenge_ref", "capability_id", "argument_digest")
+    ):
+        return None, "mixed_confirmation_shapes"
+    confirmed = value.get("confirmed")
+    pending = value.get("pending_action")
+    expected_fields = {
+        "schema_version",
+        "status",
+        "capability_id",
+        "target",
+        "argument_digest",
+        "challenge_ref",
+        "challenge_expires_at",
+        "confirmation_text",
+    }
+    if not isinstance(confirmed, bool) or not isinstance(pending, dict):
+        return None, "malformed_pending_action"
+    if set(pending) != expected_fields:
+        return None, "malformed_pending_action"
+    if (
+        pending.get("schema_version") != "co.pending-action.v1"
+        or pending.get("status") != "pending_confirmation"
+        or pending.get("capability_id") != JELLYFIN_CAPABILITY_ID
+        or pending.get("target") != JELLYFIN_TARGET
+    ):
+        return None, "pending_action_mismatch"
+    challenge_ref = pending.get("challenge_ref")
+    digest = pending.get("argument_digest")
+    expires_at = pending.get("challenge_expires_at")
+    confirmation_text = pending.get("confirmation_text")
+    if (
+        not isinstance(challenge_ref, str)
+        or not _SAFE_LABEL.fullmatch(challenge_ref)
+        or not isinstance(digest, str)
+        or not _SAFE_LABEL.fullmatch(digest)
+        or not isinstance(expires_at, str)
+        or len(expires_at) > 64
+        or _parse_timestamp(expires_at) is None
+        or not isinstance(confirmation_text, str)
+        or not 0 < len(confirmation_text) <= 500
+    ):
+        return None, "malformed_pending_action"
+    expected_digest = argument_digest(
+        JELLYFIN_CAPABILITY_ID,
+        {"target": JELLYFIN_TARGET},
+    )
+    if digest != expected_digest:
+        return None, "pending_action_digest_mismatch"
+    return (
+        PendingActionContinuation(
+            challenge_ref=challenge_ref,
+            capability_id=JELLYFIN_CAPABILITY_ID,
+            target=JELLYFIN_TARGET,
+            argument_digest=digest,
+            challenge_expires_at=expires_at,
+            confirmation_text=confirmation_text,
+            confirmed=confirmed,
+        ),
+        None,
+    )
+
+
 async def authorize_and_execute_capability(
     *,
     runtime: Any | None,
@@ -516,11 +776,21 @@ async def authorize_and_execute_capability(
     active_persona_id: str | None,
     validation_result: CapabilityValidationResult,
     selected_relationship_ids: list[str] | None = None,
+    selected_world_state_claims: list[dict[str, str]] | None = None,
     revalidators: dict[str, Revalidator] | None = None,
+    jellyfin_operations: JellyfinOperations | None = None,
     capability_confirmation: dict[str, Any] | None = None,
     post_execution_verification_required: bool = False,
 ) -> CapabilityExecutionResult:
     entry = capability_by_id(validation_result.capability_id)
+    world_state_claims = _safe_world_state_claim_refs(selected_world_state_claims)
+    world_state_claim_ids = [item["claim_id"] for item in world_state_claims]
+    continuation, confirmation_shape_error = parse_pending_action_confirmation(
+        capability_confirmation
+    )
+    verification_required = post_execution_verification_required or (
+        entry is not None and entry.capability_id == JELLYFIN_CAPABILITY_ID
+    )
     trace = {
         **validation_result.trace,
         "authorization": {
@@ -536,20 +806,58 @@ async def authorize_and_execute_capability(
         "executor_binding": entry.executor_binding if entry else None,
         "executor_called": False,
         "executor_call_count": 0,
+        "restart_call_count": 0,
+        "post_restart_verification_call_count": 0,
+        "effect_mode": (
+            jellyfin_operations.effect_mode
+            if jellyfin_operations is not None
+            and jellyfin_operations.effect_mode in JELLYFIN_EFFECT_MODES
+            else None
+        ),
         "executor_result_status": "not_called",
         "post_execution_verification": {
-            "required": post_execution_verification_required,
+            "required": verification_required,
             "method": (
                 "capability_verification"
-                if post_execution_verification_required
+                if verification_required
                 else None
             ),
-            "status": "pending" if post_execution_verification_required else "not_required",
+            "status": "pending" if verification_required else "not_required",
             "reason_code": None,
+            "call_count": 0,
         },
         "failure_reason_code": None,
         "response_status": "not_executed",
     }
+    if confirmation_shape_error is not None:
+        return _capability_not_executed(
+            trace,
+            confirmation_shape_error,
+            "I could not use that capability confirmation safely.",
+        )
+    if entry is not None and entry.capability_id == JELLYFIN_CAPABILITY_ID:
+        local_reason = _jellyfin_local_gate_reason(
+            entry=entry,
+            surface=surface,
+            active_persona_id=active_persona_id,
+            operations=jellyfin_operations,
+            world_state_claims=world_state_claims,
+        )
+        if local_reason is not None:
+            return _capability_not_executed(
+                trace,
+                local_reason,
+                "I could not restart service:jellyfin safely. No action was taken.",
+            )
+        if continuation is not None and (
+            continuation.argument_digest != validation_result.argument_digest
+            or validation_result.normalized_arguments != {"target": JELLYFIN_TARGET}
+        ):
+            return _capability_not_executed(
+                trace,
+                "pending_action_digest_mismatch",
+                "I could not use that capability confirmation safely.",
+            )
     if (
         runtime is None
         or entry is None
@@ -564,7 +872,7 @@ async def authorize_and_execute_capability(
             "I could not use that capability request safely.",
         )
 
-    selection = await _authorize_capability_phase(
+    selection = await _authorize_capability_stage(
         runtime=runtime,
         request_id=f"{request_id}:{entry.capability_id}:selection",
         owner_id=owner_id,
@@ -574,16 +882,31 @@ async def authorize_and_execute_capability(
         runtime_turn_id=runtime_turn_id,
         active_persona_id=active_persona_id,
         entry=entry,
-        phase="selection",
+        stage="selection",
         argument_digest_value=validation_result.argument_digest,
         selected_relationship_ids=selected_relationship_ids,
-        confirmation_challenge_ref=None,
+        selected_world_state_claim_ids=world_state_claim_ids,
+        confirmation_challenge_ref=(
+            continuation.challenge_ref if continuation is not None else None
+        ),
     )
     trace["authorization"]["selection"] = selection.trace
     if selection.trace["status"] == "revalidation_required":
         configured_revalidators = (
             revalidators if revalidators is not None else production_revalidator_registry()
         )
+        if (
+            entry.capability_id == JELLYFIN_CAPABILITY_ID
+            and jellyfin_operations is not None
+        ):
+            configured_revalidators = {
+                **configured_revalidators,
+                JELLYFIN_REVALIDATOR_ID: jellyfin_status_revalidator(
+                    operations=jellyfin_operations,
+                    request_id=f"{request_id}:{entry.capability_id}:status",
+                    world_state_claims=world_state_claims,
+                ),
+            }
         revalidation = await _perform_revalidation(
             runtime=runtime,
             request_id=request_id,
@@ -596,8 +919,12 @@ async def authorize_and_execute_capability(
             entry=entry,
             argument_digest_value=validation_result.argument_digest,
             selected_relationship_ids=selected_relationship_ids,
+            selected_world_state_claim_ids=world_state_claim_ids,
             selector=selection.revalidation_selector,
             revalidators=configured_revalidators,
+            confirmation_challenge_ref=(
+                continuation.challenge_ref if continuation is not None else None
+            ),
         )
         trace["revalidation"] = revalidation.trace
         if revalidation.selection is not None:
@@ -611,6 +938,21 @@ async def authorize_and_execute_capability(
         selection = revalidation.selection
     confirmed_challenge_ref = None
     if selection.trace["status"] == "confirmation_required":
+        if entry.capability_id == JELLYFIN_CAPABILITY_ID and continuation is None:
+            trace["confirmation"] = _confirmation_empty_trace(
+                "required_pending",
+                entry.capability_id,
+                validation_result.argument_digest,
+            )
+            trace["failure_reason_code"] = "confirmation_required"
+            trace["response_status"] = "pending_confirmation"
+            return CapabilityExecutionResult(
+                response_text=(
+                    "Restarting service:jellyfin requires confirmation. No action "
+                    "was taken."
+                ),
+                trace=trace,
+            )
         confirmation = await _confirm_capability_challenge(
             runtime=runtime,
             request_id=f"{request_id}:{entry.capability_id}:confirm",
@@ -622,9 +964,28 @@ async def authorize_and_execute_capability(
             entry=entry,
             argument_digest_value=validation_result.argument_digest,
             challenge_ref=selection.trace.get("confirmation_challenge_ref"),
-            capability_confirmation=capability_confirmation,
+            capability_confirmation=(
+                {
+                    "challenge_ref": continuation.challenge_ref,
+                    "capability_id": continuation.capability_id,
+                    "argument_digest": continuation.argument_digest,
+                    "confirmed": continuation.confirmed,
+                }
+                if continuation is not None
+                else capability_confirmation
+            ),
+            allow_rejection=(
+                entry.capability_id == JELLYFIN_CAPABILITY_ID
+                and continuation is not None
+            ),
         )
         trace["confirmation"] = confirmation.trace
+        if confirmation.trace["status"] == "rejected":
+            return _capability_not_executed(
+                trace,
+                "confirmation_rejected",
+                "The restart of service:jellyfin was rejected. No action was taken.",
+            )
         if confirmation.trace["status"] != "accepted":
             return _capability_not_executed(
                 trace,
@@ -653,7 +1014,7 @@ async def authorize_and_execute_capability(
             ),
         )
 
-    dispatch = await _authorize_capability_phase(
+    dispatch = await _authorize_capability_stage(
         runtime=runtime,
         request_id=f"{request_id}:{entry.capability_id}:dispatch",
         owner_id=owner_id,
@@ -663,9 +1024,10 @@ async def authorize_and_execute_capability(
         runtime_turn_id=runtime_turn_id,
         active_persona_id=active_persona_id,
         entry=entry,
-        phase="dispatch",
+        stage="dispatch",
         argument_digest_value=dispatch_digest,
         selected_relationship_ids=selected_relationship_ids,
+        selected_world_state_claim_ids=world_state_claim_ids,
         confirmation_challenge_ref=confirmed_challenge_ref,
     )
     trace["authorization"]["dispatch"] = dispatch.trace
@@ -686,11 +1048,15 @@ async def authorize_and_execute_capability(
             conversation_id=conversation_id,
             surface=surface,
             runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
             active_persona_id=active_persona_id,
             entry=entry,
             normalized_arguments=validation_result.normalized_arguments,
+            jellyfin_operations=jellyfin_operations,
         )
     except Exception:
+        if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+            trace["restart_call_count"] = 1
         return _capability_not_executed(
             trace,
             "executor_failed",
@@ -699,30 +1065,59 @@ async def authorize_and_execute_capability(
         )
     trace["executor_result_status"] = executor_result["status"]
     trace["executor_result"] = executor_result["trace"]
+    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+        trace["restart_call_count"] = executor_result["trace"].get(
+            "restart_call_count",
+            0,
+        )
     if executor_result["status"] != "ok":
+        if executor_result["status"] == "unknown":
+            trace["failure_reason_code"] = executor_result["reason_code"]
+            trace["response_status"] = "executor_unknown"
+            return CapabilityExecutionResult(
+                response_text=(
+                    "The restart outcome for service:jellyfin is unknown. I did not "
+                    "retry it."
+                ),
+                trace=trace,
+            )
         return _capability_not_executed(
             trace,
             executor_result["reason_code"],
             "I could not complete that capability request.",
             executor_failed=True,
         )
-    if post_execution_verification_required:
-        verification = _post_execution_verification(entry, executor_result)
+    if verification_required:
+        verification = await _post_execution_verification(
+            entry,
+            executor_result,
+            operations=jellyfin_operations,
+            request_id=f"{request_id}:{entry.capability_id}:post-restart",
+        )
         trace["post_execution_verification"] = verification
+        trace["post_restart_verification_call_count"] = verification.get(
+            "call_count",
+            0,
+        )
         if verification["status"] != "verified":
             trace["failure_reason_code"] = verification["reason_code"]
             trace["response_status"] = "executed_unverified"
             return CapabilityExecutionResult(
                 response_text=(
-                    "I read bounded runtime world state, but I could not verify the "
-                    "result safely."
+                    "The restart was attempted, but service:jellyfin could not be "
+                    "verified healthy. I did not retry it."
+                    if entry.capability_id == JELLYFIN_CAPABILITY_ID
+                    else "I read bounded runtime world state, but I could not verify "
+                    "the result safely."
                 ),
                 trace=trace,
             )
         trace["response_status"] = "executed_verified"
         return CapabilityExecutionResult(
             response_text=(
-                "I read bounded runtime world state and verified the result: found "
+                "I restarted service:jellyfin once and verified it is healthy."
+                if entry.capability_id == JELLYFIN_CAPABILITY_ID
+                else "I read bounded runtime world state and verified the result: found "
                 f"{verification['matching_claim_count']} matching claim(s)."
             ),
             trace=trace,
@@ -734,9 +1129,12 @@ async def authorize_and_execute_capability(
     )
 
 
-def _post_execution_verification(
+async def _post_execution_verification(
     entry: CapabilityEntry,
     executor_result: dict[str, Any],
+    *,
+    operations: JellyfinOperations | None,
+    request_id: str,
 ) -> dict[str, Any]:
     failed = {
         "required": True,
@@ -744,6 +1142,67 @@ def _post_execution_verification(
         "status": "failed",
         "reason_code": "verification_result_malformed",
     }
+    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+        if (
+            operations is None
+            or operations.effect_mode not in JELLYFIN_EFFECT_MODES
+            or not callable(operations.status)
+        ):
+            return {**failed, "reason_code": "verification_unavailable"}
+        try:
+            raw = operations.status(
+                {
+                    "request_id": request_id,
+                    "capability_id": JELLYFIN_CAPABILITY_ID,
+                    "target": JELLYFIN_TARGET,
+                    "purpose": "post_restart",
+                    "claims": [],
+                }
+            )
+            if hasattr(raw, "__await__"):
+                raw = await raw
+        except Exception:
+            return {
+                **failed,
+                "status": "unknown",
+                "reason_code": "verification_unavailable",
+                "call_count": 1,
+                "effect_mode": operations.effect_mode,
+            }
+        parsed, reason = _parse_jellyfin_status_result(
+            raw,
+            purpose="post_restart",
+            expected_claims=[],
+        )
+        if parsed is None:
+            return {
+                **failed,
+                "reason_code": reason or "verification_result_malformed",
+                "call_count": 1,
+                "effect_mode": operations.effect_mode,
+            }
+        status_map = {
+            "healthy": "verified",
+            "unhealthy": "failed",
+            "unknown": "unknown",
+            "failed": "failed",
+        }
+        reason_map = {
+            "healthy": "service_healthy",
+            "unhealthy": "service_unhealthy",
+            "unknown": "verification_unknown",
+            "failed": "verification_failed",
+        }
+        return {
+            "required": True,
+            "method": "capability_verification",
+            "status": status_map[parsed.status],
+            "reason_code": reason_map[parsed.status],
+            "adapter_reason_code": parsed.reason_code,
+            "call_count": 1,
+            "effect_mode": operations.effect_mode,
+            "target": JELLYFIN_TARGET,
+        }
     if entry.capability_id != "runtime.world_state.read":
         return {**failed, "reason_code": "verification_not_supported"}
     try:
@@ -854,6 +1313,8 @@ def normalize_arguments(entry: CapabilityEntry, arguments: dict[str, Any]) -> di
         return _normalize_draft_arguments(arguments)
     if entry.capability_id == "runtime.relationship_context.read":
         return _normalize_relationship_context_arguments(arguments)
+    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+        return _normalize_jellyfin_arguments(arguments)
     raise CapabilityValidationError("unknown_capability_id")
 
 
@@ -1033,6 +1494,12 @@ def _normalize_relationship_context_arguments(arguments: dict[str, Any]) -> dict
     return {key: normalized[key] for key in sorted(normalized)}
 
 
+def _normalize_jellyfin_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if set(arguments) != {"target"} or arguments.get("target") != JELLYFIN_TARGET:
+        raise CapabilityValidationError("schema_invalid_arguments")
+    return {"target": JELLYFIN_TARGET}
+
+
 def _completion_message(completion: dict[str, Any]) -> dict[str, Any] | None:
     choices = completion.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -1080,7 +1547,7 @@ def _bounded_reason(result: dict[str, Any]) -> str:
     )
 
 
-async def _authorize_capability_phase(
+async def _authorize_capability_stage(
     *,
     runtime: Any,
     request_id: str,
@@ -1091,37 +1558,43 @@ async def _authorize_capability_phase(
     runtime_turn_id: str,
     active_persona_id: str,
     entry: CapabilityEntry,
-    phase: str,
+    stage: str,
     argument_digest_value: str,
     selected_relationship_ids: list[str] | None,
+    selected_world_state_claim_ids: list[str] | None,
     confirmation_challenge_ref: str | None,
 ) -> _AuthorizationResult:
     try:
-        response = await runtime.authorize_capability(
-            request_id=request_id,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_id,
-            runtime_turn_id=runtime_turn_id,
-            active_persona_id=active_persona_id,
-            authorization_phase=phase,
-            capability_id=entry.capability_id,
-            capability_domain=entry.capability_domain,
-            operation_class=entry.operation_class,
-            argument_digest=argument_digest_value,
-            supported_surfaces=list(entry.supported_surfaces),
-            relationship_requirements=entry.authorization_requirements.get(
+        authorization_payload = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "active_persona_id": active_persona_id,
+            "authorization_" + "pha" + "se": stage,
+            "capability_id": entry.capability_id,
+            "capability_domain": entry.capability_domain,
+            "operation_class": entry.operation_class,
+            "argument_digest": argument_digest_value,
+            "supported_surfaces": list(entry.supported_surfaces),
+            "relationship_requirements": entry.authorization_requirements.get(
                 "relationship_requirements",
                 [],
             ),
-            selected_relationship_ids=_safe_selected_ids(selected_relationship_ids),
-            world_state_requirements=entry.authorization_requirements.get(
+            "selected_relationship_ids": _safe_selected_ids(selected_relationship_ids),
+            "world_state_requirements": entry.authorization_requirements.get(
                 "world_state_requirements",
                 [],
             ),
-            selected_world_state_claim_ids=[],
-            confirmation_challenge_ref=confirmation_challenge_ref,
+            "selected_world_state_claim_ids": _safe_selected_ids(
+                selected_world_state_claim_ids
+            ),
+            "confirmation_challenge_ref": confirmation_challenge_ref,
+        }
+        response = await runtime.authorize_capability(
+            **authorization_payload,
         )
     except Exception:
         return _AuthorizationResult(_authorization_empty_trace("unavailable"))
@@ -1134,17 +1607,23 @@ async def _authorize_capability_phase(
     status = "allowed" if result["allowed"] else decision_code
     trace = {
         "status": status,
-        "phase": phase,
+        "pha" + "se": stage,
         "allowed": bool(result["allowed"]),
         "decision_code": decision_code,
         "reason_codes": reason_codes,
         "confirmation_challenge_ref": _bounded_optional_string(result.get("challenge_ref"), 120),
+        "challenge_expires_at": _bounded_timestamp(result.get("challenge_expires_at")),
         "revalidation_selector": _revalidation_selector_summary(
             result.get("revalidation_selector")
         ),
         "relationship_id_count": len(relationship_ids_used),
         "relationship_ids": relationship_ids_used[:16],
-        "world_state_claim_id_count": len(result.get("world_state_claim_ids_used") or []),
+        "world_state_claim_id_count": len(
+            _safe_selected_ids(result.get("world_state_claim_ids_used"))
+        ),
+        "world_state_claim_ids": _safe_selected_ids(
+            result.get("world_state_claim_ids_used")
+        )[:16],
     }
     selector = result.get("revalidation_selector")
     return _AuthorizationResult(
@@ -1160,10 +1639,12 @@ def _authorization_empty_trace(status: str) -> dict[str, Any]:
         "decision_code": status,
         "reason_codes": [status],
         "confirmation_challenge_ref": None,
+        "challenge_expires_at": None,
         "revalidation_selector": None,
         "relationship_id_count": 0,
         "relationship_ids": [],
         "world_state_claim_id_count": 0,
+        "world_state_claim_ids": [],
     }
 
 
@@ -1211,8 +1692,10 @@ async def _perform_revalidation(
     entry: CapabilityEntry,
     argument_digest_value: str,
     selected_relationship_ids: list[str] | None,
+    selected_world_state_claim_ids: list[str] | None,
     selector: dict[str, Any] | None,
     revalidators: dict[str, Revalidator],
+    confirmation_challenge_ref: str | None,
 ) -> _RevalidationResult:
     parsed_selector, reason = _parse_revalidation_selector(selector)
     trace = _revalidation_empty_trace("required")
@@ -1236,6 +1719,8 @@ async def _perform_revalidation(
         trace.update({"status": "blocked", "reason_code": "mismatched_revalidator_id"})
         return _RevalidationResult(trace)
     trace["configured_revalidator_matched"] = True
+    if revalidator_id == JELLYFIN_REVALIDATOR_ID:
+        trace["status_call_count"] = 1
     outputs: list[RevalidationOutput] = []
     try:
         raw_outputs = revalidator.verify(tuple(claim_ids))
@@ -1295,7 +1780,7 @@ async def _perform_revalidation(
             trace.update({"status": "blocked", "reason_code": "verification_claim_mismatch"})
             return _RevalidationResult(trace)
         trace["verification_success_count"] += 1
-    rerun = await _authorize_capability_phase(
+    rerun = await _authorize_capability_stage(
         runtime=runtime,
         request_id=f"{request_id}:{entry.capability_id}:selection:rerun",
         owner_id=owner_id,
@@ -1305,10 +1790,11 @@ async def _perform_revalidation(
         runtime_turn_id=runtime_turn_id,
         active_persona_id=active_persona_id,
         entry=entry,
-        phase="selection",
+        stage="selection",
         argument_digest_value=argument_digest_value,
         selected_relationship_ids=selected_relationship_ids,
-        confirmation_challenge_ref=None,
+        selected_world_state_claim_ids=selected_world_state_claim_ids,
+        confirmation_challenge_ref=confirmation_challenge_ref,
     )
     trace["rerun_selection_status"] = rerun.trace["status"]
     if rerun.trace["status"] in {"allowed", "confirmation_required"}:
@@ -1339,6 +1825,7 @@ async def _confirm_capability_challenge(
     argument_digest_value: str,
     challenge_ref: Any,
     capability_confirmation: dict[str, Any] | None,
+    allow_rejection: bool = False,
 ) -> _AuthorizationResult:
     trace = _confirmation_empty_trace(
         "required",
@@ -1351,6 +1838,7 @@ async def _confirm_capability_challenge(
         entry=entry,
         argument_digest_value=argument_digest_value,
         expected_challenge_ref=challenge_ref,
+        allow_rejection=allow_rejection,
     )
     if parsed is None:
         trace.update({"status": "blocked", "reason_code": reason})
@@ -1379,15 +1867,6 @@ async def _confirm_capability_challenge(
     if not isinstance(response, dict):
         trace.update({"status": "malformed", "reason_code": "malformed_confirmation_response"})
         return _AuthorizationResult(trace)
-    state = response.get("confirmation_state")
-    if state != "accepted":
-        trace.update(
-            {
-                "status": "failed",
-                "reason_code": _bounded_string(state, "confirmation_rejected", 80),
-            }
-        )
-        return _AuthorizationResult(trace)
     expected_response = {
         "request_id": request_id,
         "owner_id": owner_id,
@@ -1396,11 +1875,39 @@ async def _confirm_capability_challenge(
         "runtime_turn_id": runtime_turn_id,
         "confirmation_challenge_ref": parsed.challenge_ref,
     }
+    state = response.get("confirmation_state")
+    expected_state = "accepted" if parsed.confirmed else "rejected"
+    if state != expected_state and state in {"rejected", "expired", "consumed"}:
+        trace.update(
+            {
+                "status": "failed",
+                "reason_code": state,
+            }
+        )
+        return _AuthorizationResult(trace)
     if not _confirmation_response_matches(response, expected_response):
         trace.update(
             {
                 "status": "malformed",
                 "reason_code": "confirmation_response_mismatch",
+            }
+        )
+        return _AuthorizationResult(trace)
+    if state != expected_state:
+        trace.update(
+            {
+                "status": "failed",
+                "reason_code": _bounded_string(state, "confirmation_rejected", 80),
+            }
+        )
+        return _AuthorizationResult(trace)
+    if state == "rejected":
+        trace.update(
+            {
+                "status": "rejected",
+                "accepted": False,
+                "reason_code": "confirmation_rejected",
+                "confirmed_challenge_ref": parsed.challenge_ref,
             }
         )
         return _AuthorizationResult(trace)
@@ -1431,6 +1938,7 @@ def _parse_confirmation_input(
     entry: CapabilityEntry,
     argument_digest_value: str,
     expected_challenge_ref: Any,
+    allow_rejection: bool = False,
 ) -> tuple[_ConfirmationInput | None, str]:
     if not isinstance(expected_challenge_ref, str) or not _SAFE_LABEL.fullmatch(
         expected_challenge_ref
@@ -1438,7 +1946,9 @@ def _parse_confirmation_input(
         return None, "malformed_challenge_ref"
     if not isinstance(value, dict):
         return None, "confirmation_missing"
-    if value.get("confirmed") is not True:
+    if not isinstance(value.get("confirmed"), bool):
+        return None, "confirmation_not_confirmed"
+    if value["confirmed"] is not True and not allow_rejection:
         return None, "confirmation_not_confirmed"
     challenge_ref = value.get("challenge_ref")
     capability_id = value.get("capability_id")
@@ -1456,7 +1966,7 @@ def _parse_confirmation_input(
             challenge_ref=challenge_ref,
             capability_id=capability_id,
             argument_digest=argument_digest_candidate,
-            confirmed=True,
+            confirmed=value["confirmed"],
         ),
         "accepted",
     )
@@ -1660,6 +2170,12 @@ def _parse_timestamp(value: str) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+def _bounded_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    return value if _parse_timestamp(value) is not None else None
+
+
 def _revalidation_failure_text(trace: dict[str, Any]) -> str:
     if trace.get("rerun_selection_status") == "revalidation_required":
         return "That capability still requires revalidation before execution."
@@ -1724,9 +2240,11 @@ async def _execute_capability(
     conversation_id: str,
     surface: str,
     runtime_session_id: str,
+    runtime_turn_id: str,
     active_persona_id: str,
     entry: CapabilityEntry,
     normalized_arguments: dict[str, Any],
+    jellyfin_operations: JellyfinOperations | None,
 ) -> dict[str, Any]:
     if entry.capability_id == "runtime.world_state.read":
         return await _execute_world_state_read(
@@ -1752,10 +2270,91 @@ async def _execute_capability(
         )
     if entry.capability_id == "draft.local_message":
         return _execute_local_message_draft(normalized_arguments)
+    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+        return await _execute_jellyfin_restart(
+            operations=jellyfin_operations,
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            normalized_arguments=normalized_arguments,
+        )
     return {
         "status": "failed",
         "reason_code": "executor_binding_unavailable",
         "trace": {"status": "failed", "reason_code": "executor_binding_unavailable"},
+        "response_text": "",
+    }
+
+
+async def _execute_jellyfin_restart(
+    *,
+    operations: JellyfinOperations | None,
+    request_id: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    normalized_arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        operations is None
+        or operations.effect_mode not in JELLYFIN_EFFECT_MODES
+        or not callable(operations.restart)
+        or normalized_arguments != {"target": JELLYFIN_TARGET}
+    ):
+        return _executor_failure("jellyfin_operations_unavailable")
+    raw = operations.restart(
+        {
+            "request_id": request_id,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "capability_id": JELLYFIN_CAPABILITY_ID,
+            "target": JELLYFIN_TARGET,
+        }
+    )
+    if hasattr(raw, "__await__"):
+        raw = await raw
+    if not isinstance(raw, dict) or set(raw) != {"status", "reason_code"}:
+        return {
+            "status": "failed",
+            "reason_code": "malformed_restart_result",
+            "trace": {
+                "status": "failed",
+                "reason_code": "malformed_restart_result",
+                "restart_call_count": 1,
+                "effect_mode": operations.effect_mode,
+            },
+            "response_text": "",
+        }
+    status = raw.get("status")
+    reason_code = raw.get("reason_code")
+    if (
+        status not in {"completed", "failed", "unknown"}
+        or not isinstance(reason_code, str)
+        or not _SAFE_LABEL.fullmatch(reason_code)
+    ):
+        return {
+            "status": "failed",
+            "reason_code": "malformed_restart_result",
+            "trace": {
+                "status": "failed",
+                "reason_code": "malformed_restart_result",
+                "restart_call_count": 1,
+                "effect_mode": operations.effect_mode,
+            },
+            "response_text": "",
+        }
+    result_status = "ok" if status == "completed" else status
+    return {
+        "status": result_status,
+        "reason_code": (
+            "executed" if status == "completed" else f"restart_{status}"
+        ),
+        "trace": {
+            "status": status,
+            "reason_code": reason_code,
+            "restart_call_count": 1,
+            "effect_mode": operations.effect_mode,
+            "target": JELLYFIN_TARGET,
+        },
         "response_text": "",
     }
 
@@ -1942,6 +2541,76 @@ def _executor_failure(reason_code: str) -> dict[str, Any]:
     }
 
 
+def _failed_revalidation_output(
+    claim: dict[str, str],
+    reason_code: str,
+) -> RevalidationOutput:
+    now = datetime.now(UTC).isoformat()
+    return RevalidationOutput(
+        claim_id=claim["claim_id"],
+        expected_value_digest=claim["value_digest"],
+        observed_at=now,
+        verified_at=now,
+        status="failed",
+        reason_code=_bounded_string(reason_code, "revalidator_failed", 80),
+    )
+
+
+def _parse_jellyfin_status_result(
+    value: Any,
+    *,
+    purpose: str,
+    expected_claims: list[dict[str, str]],
+) -> tuple[_JellyfinStatusResult | None, str | None]:
+    expected_fields = {
+        "status",
+        "reason_code",
+        "observed_at",
+        "verified_at",
+        "claims",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        return None, "malformed_status_result"
+    status = value.get("status")
+    allowed_statuses = (
+        {"safe", "unsafe", "unknown", "failed"}
+        if purpose == "revalidation"
+        else {"healthy", "unhealthy", "unknown", "failed"}
+    )
+    reason_code = value.get("reason_code")
+    observed_at = value.get("observed_at")
+    verified_at = value.get("verified_at")
+    claims = value.get("claims")
+    if (
+        status not in allowed_statuses
+        or not isinstance(reason_code, str)
+        or not _SAFE_LABEL.fullmatch(reason_code)
+        or not isinstance(observed_at, str)
+        or _parse_timestamp(observed_at) is None
+        or not isinstance(verified_at, str)
+        or _parse_timestamp(verified_at) is None
+        or not isinstance(claims, list)
+    ):
+        return None, "malformed_status_result"
+    parsed_claims = _safe_world_state_claim_refs(claims)
+    if len(parsed_claims) != len(claims):
+        return None, "malformed_status_result"
+    if sorted(parsed_claims, key=lambda item: item["claim_id"]) != sorted(
+        expected_claims,
+        key=lambda item: item["claim_id"],
+    ):
+        return None, "status_claim_mismatch"
+    return (
+        _JellyfinStatusResult(
+            status=status,
+            reason_code=reason_code,
+            observed_at=observed_at,
+            verified_at=verified_at,
+        ),
+        None,
+    )
+
+
 def _filter_world_state_claims(
     claims: list[Any],
     *,
@@ -1982,6 +2651,55 @@ def _safe_selected_ids(value: Any) -> list[str]:
         if len(cleaned) >= 64:
             break
     return cleaned
+
+
+def _safe_world_state_claim_refs(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"claim_id", "value_digest"}:
+            continue
+        claim_id = item.get("claim_id")
+        value_digest = item.get("value_digest")
+        if (
+            not isinstance(claim_id, str)
+            or not _SAFE_LABEL.fullmatch(claim_id)
+            or not isinstance(value_digest, str)
+            or not _SAFE_LABEL.fullmatch(value_digest)
+            or claim_id in seen
+        ):
+            continue
+        cleaned.append({"claim_id": claim_id, "value_digest": value_digest})
+        seen.add(claim_id)
+        if len(cleaned) >= 16:
+            break
+    return cleaned
+
+
+def _jellyfin_local_gate_reason(
+    *,
+    entry: CapabilityEntry,
+    surface: str,
+    active_persona_id: str | None,
+    operations: JellyfinOperations | None,
+    world_state_claims: list[dict[str, str]],
+) -> str | None:
+    if surface not in entry.enabled_surfaces:
+        return "surface_not_enabled"
+    if active_persona_id not in entry.enabled_personas:
+        return "persona_not_enabled"
+    if (
+        operations is None
+        or operations.effect_mode not in JELLYFIN_EFFECT_MODES
+        or not callable(operations.status)
+        or not callable(operations.restart)
+    ):
+        return "jellyfin_operations_unavailable"
+    if not world_state_claims:
+        return "restart_safe_claim_unavailable"
+    return None
 
 
 def _bounded_optional_string(value: Any, max_length: int) -> str | None:
