@@ -124,6 +124,71 @@ class _JellyfinStatusResult:
     verified_at: str
 
 
+class _JellyfinStatusVerifier:
+    def __init__(
+        self,
+        *,
+        operations: JellyfinOperations,
+        request_id: str,
+        claim_digests: dict[str, str],
+    ) -> None:
+        self.operations = operations
+        self.request_id = request_id
+        self.claim_digests = claim_digests
+        self.status_call_count = 0
+
+    async def __call__(self, claim_ids: tuple[str, ...]) -> list[RevalidationOutput]:
+        requested = [
+            {
+                "claim_id": claim_id,
+                "value_digest": self.claim_digests.get(claim_id, ""),
+            }
+            for claim_id in claim_ids
+        ]
+        if any(not item["value_digest"] for item in requested):
+            return [
+                _failed_revalidation_output(item, "revalidator_claim_mismatch")
+                for item in requested
+            ]
+        self.status_call_count += 1
+        raw = self.operations.status(
+            {
+                "request_id": self.request_id,
+                "capability_id": JELLYFIN_CAPABILITY_ID,
+                "target": JELLYFIN_TARGET,
+                "purpose": "revalidation",
+                "claims": requested,
+            }
+        )
+        if hasattr(raw, "__await__"):
+            raw = await raw
+        parsed, reason = _parse_jellyfin_status_result(
+            raw,
+            purpose="revalidation",
+            expected_claims=requested,
+        )
+        if parsed is None or parsed.status != "safe":
+            failure_reason = reason or f"restart_state_{parsed.status}"
+            return [
+                _failed_revalidation_output(item, failure_reason)
+                for item in requested
+            ]
+        return [
+            RevalidationOutput(
+                claim_id=item["claim_id"],
+                expected_value_digest=item["value_digest"],
+                observed_at=parsed.observed_at,
+                verified_at=parsed.verified_at,
+                source_type="tool_output",
+                source_ref=JELLYFIN_REVALIDATOR_ID,
+                resulting_authority="verified_tool_output",
+                confidence=1.0,
+                freshness_state="fresh",
+            )
+            for item in requested
+        ]
+
+
 @dataclass(frozen=True)
 class RevalidatorEntry:
     revalidator_id: str
@@ -333,53 +398,11 @@ def jellyfin_status_revalidator(
 ) -> Revalidator:
     claim_refs = _safe_world_state_claim_refs(world_state_claims)
     claim_digests = {item["claim_id"]: item["value_digest"] for item in claim_refs}
-
-    async def verify(claim_ids: tuple[str, ...]) -> list[RevalidationOutput]:
-        requested = [
-            {"claim_id": claim_id, "value_digest": claim_digests.get(claim_id, "")}
-            for claim_id in claim_ids
-        ]
-        if any(not item["value_digest"] for item in requested):
-            return [
-                _failed_revalidation_output(item, "revalidator_claim_mismatch")
-                for item in requested
-            ]
-        raw = operations.status(
-            {
-                "request_id": request_id,
-                "capability_id": JELLYFIN_CAPABILITY_ID,
-                "target": JELLYFIN_TARGET,
-                "purpose": "revalidation",
-                "claims": requested,
-            }
-        )
-        if hasattr(raw, "__await__"):
-            raw = await raw
-        parsed, reason = _parse_jellyfin_status_result(
-            raw,
-            purpose="revalidation",
-            expected_claims=requested,
-        )
-        if parsed is None or parsed.status != "safe":
-            failure_reason = reason or f"restart_state_{parsed.status}"
-            return [
-                _failed_revalidation_output(item, failure_reason)
-                for item in requested
-            ]
-        return [
-            RevalidationOutput(
-                claim_id=item["claim_id"],
-                expected_value_digest=item["value_digest"],
-                observed_at=parsed.observed_at,
-                verified_at=parsed.verified_at,
-                source_type="tool_output",
-                source_ref=JELLYFIN_REVALIDATOR_ID,
-                resulting_authority="verified_tool_output",
-                confidence=1.0,
-                freshness_state="fresh",
-            )
-            for item in requested
-        ]
+    verifier = _JellyfinStatusVerifier(
+        operations=operations,
+        request_id=request_id,
+        claim_digests=claim_digests,
+    )
 
     return Revalidator(
         entry=RevalidatorEntry(
@@ -393,7 +416,7 @@ def jellyfin_status_revalidator(
             resulting_confidence=1.0,
             resulting_freshness_state="fresh",
         ),
-        verify=verify,
+        verify=verifier,
     )
 
 
@@ -1711,6 +1734,8 @@ async def _perform_revalidation(
             "reason_code": "revalidation_required",
         }
     )
+    if revalidator_id == JELLYFIN_REVALIDATOR_ID:
+        trace["status_call_count"] = 0
     revalidator = revalidators.get(revalidator_id)
     if revalidator is None:
         trace.update({"status": "blocked", "reason_code": "unknown_revalidator_id"})
@@ -1719,8 +1744,11 @@ async def _perform_revalidation(
         trace.update({"status": "blocked", "reason_code": "mismatched_revalidator_id"})
         return _RevalidationResult(trace)
     trace["configured_revalidator_matched"] = True
+    status_count_before = 0
     if revalidator_id == JELLYFIN_REVALIDATOR_ID:
-        trace["status_call_count"] = 1
+        count = getattr(revalidator.verify, "status_call_count", 0)
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            status_count_before = count
     outputs: list[RevalidationOutput] = []
     try:
         raw_outputs = revalidator.verify(tuple(claim_ids))
@@ -1729,6 +1757,16 @@ async def _perform_revalidation(
     except Exception:
         trace.update({"status": "failed", "reason_code": "revalidator_unavailable"})
         return _RevalidationResult(trace)
+    finally:
+        if revalidator_id == JELLYFIN_REVALIDATOR_ID:
+            count = getattr(revalidator.verify, "status_call_count", 0)
+            trace["status_call_count"] = (
+                count - status_count_before
+                if isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= status_count_before
+                else 0
+            )
     if not isinstance(raw_outputs, list) or len(raw_outputs) != len(claim_ids):
         trace.update({"status": "malformed", "reason_code": "malformed_revalidator_output"})
         return _RevalidationResult(trace)

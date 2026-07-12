@@ -1991,13 +1991,14 @@ class JellyfinStateMachine:
 
 
 class JellyfinPolicyRuntime:
-    def __init__(self):
+    def __init__(self, *, selector_claim_id="claim_jellyfin_safe"):
         self.authorization_calls = []
         self.verification_calls = []
         self.confirmation_calls = []
         self.selection_count = 0
         self.dispatch_count = 0
         self.consumed = False
+        self.selector_claim_id = selector_claim_id
 
     async def authorize_capability(self, **kwargs):
         self.authorization_calls.append(kwargs)
@@ -2044,9 +2045,9 @@ class JellyfinPolicyRuntime:
                     "challenge_ref": incoming,
                     "revalidation_selector": {
                         "revalidator_id": "jellyfin_status",
-                        "world_state_claim_ids": ["claim_jellyfin_safe"],
+                        "world_state_claim_ids": [self.selector_claim_id],
                     },
-                    "world_state_claim_ids_used": ["claim_jellyfin_safe"],
+                    "world_state_claim_ids_used": [self.selector_claim_id],
                 }
             }
         return {
@@ -2233,21 +2234,29 @@ async def test_jellyfin_first_turn_and_accepted_continuation_keep_one_challenge(
     adapter = JellyfinStateMachine()
     first = await _jellyfin_execute(runtime, adapter)
     digest = _jellyfin_validation().argument_digest
+    first_status_calls = [
+        item for item in adapter.status_inputs if item["purpose"] == "revalidation"
+    ]
 
     assert first.trace["response_status"] == "pending_confirmation"
     first_selection = first.trace["authorization"]["selection"]
     assert first_selection["confirmation_challenge_ref"] == "challenge-jellyfin-1"
     assert first.trace["authorization"]["selection"]["challenge_expires_at"] == _PENDING_EXPIRES_AT
-    assert first.trace["revalidation"]["status_call_count"] == 1
+    assert first.trace["revalidation"]["status_call_count"] == len(first_status_calls) == 1
     assert first.trace["confirmation"]["call_count"] == 0
     assert runtime.dispatch_count == 0
     assert adapter.restart_inputs == []
 
+    before_second = len(first_status_calls)
     second = await _jellyfin_execute(
         runtime,
         adapter,
         {"pending_action": _pending_envelope(digest), "confirmed": True},
     )
+    after_second = len(
+        [item for item in adapter.status_inputs if item["purpose"] == "revalidation"]
+    )
+    second_status_calls = after_second - before_second
 
     assert second.trace["response_status"] == "executed_verified"
     second_selection = second.trace["authorization"]["selection"]
@@ -2255,6 +2264,7 @@ async def test_jellyfin_first_turn_and_accepted_continuation_keep_one_challenge(
     assert second.trace["authorization"]["selection"]["challenge_expires_at"] == _PENDING_EXPIRES_AT
     assert second.trace["confirmation"]["status"] == "accepted"
     assert second.trace["confirmation"]["call_count"] == 1
+    assert second.trace["revalidation"]["status_call_count"] == second_status_calls == 1
     second_dispatch = second.trace["authorization"]["dispatch"]
     assert second_dispatch["confirmation_challenge_ref"] == "challenge-jellyfin-1"
     assert runtime.dispatch_count == 1
@@ -2436,11 +2446,36 @@ async def test_jellyfin_revalidation_failures_never_issue_challenge_or_restart(s
     runtime = JellyfinPolicyRuntime()
     adapter = JellyfinStateMachine(safety_status=safety_status)
     result = await _jellyfin_execute(runtime, adapter)
+    actual_status_calls = len(
+        [item for item in adapter.status_inputs if item["purpose"] == "revalidation"]
+    )
     assert result.trace["response_status"] == "not_executed"
+    assert result.trace["revalidation"]["status_call_count"] == actual_status_calls == 1
     assert result.trace["authorization"]["selection"]["confirmation_challenge_ref"] is None
     assert runtime.confirmation_calls == []
     assert runtime.dispatch_count == 0
     assert adapter.restart_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_jellyfin_missing_selected_digest_records_zero_actual_status_calls():
+    runtime = JellyfinPolicyRuntime(selector_claim_id="claim_jellyfin_other")
+    adapter = JellyfinStateMachine()
+
+    result = await _jellyfin_execute(runtime, adapter)
+
+    assert adapter.status_inputs == []
+    assert result.trace["revalidation"]["status_call_count"] == 0
+    assert result.trace["revalidation"]["reason_code"] == "revalidator_claim_mismatch"
+    assert runtime.verification_calls == []
+    assert runtime.selection_count == 1
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
+    assert adapter.restart_inputs == []
+    assert (
+        result.trace["authorization"]["selection"]["confirmation_challenge_ref"]
+        is None
+    )
 
 
 @pytest.mark.asyncio
