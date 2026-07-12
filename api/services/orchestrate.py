@@ -1720,10 +1720,10 @@ def _action_summary_confirmation_status(
     evidence = {confirmation_state, confirmation_reason, execution_reason, *flow_reasons}
     if "accepted" in evidence or confirmation.get("accepted") is True:
         return "accepted"
-    if evidence & {"confirmation_cancelled", "cancelled"}:
-        return "cancelled"
     if evidence & {"confirmation_rejected", "rejected"}:
         return "rejected"
+    if evidence & {"confirmation_cancelled", "cancelled"}:
+        return "cancelled"
     if evidence & {"confirmation_expired", "challenge_expired", "expired"}:
         return "expired"
     if action_flow.get("confirmation_required") is False:
@@ -2194,6 +2194,46 @@ async def _compose_action_summary(
     return trace, replacement
 
 
+def _jellyfin_registry_allows_processing(action_flow: dict[str, Any]) -> bool:
+    if not all(
+        (
+            action_flow.get("confirmation_required") is True,
+            action_flow.get("verification_supported") is True,
+            action_flow.get("verification_method") == "capability_verification",
+        )
+    ):
+        return False
+    reasons = set(_sanitize_trace_string_list(action_flow.get("reason_summary"), limit=16))
+    if "confirmation_cancelled" in reasons:
+        return all(
+            (
+                "execution_not_allowed" in reasons,
+                "confirmation_received" not in reasons,
+                "execution_allowed_by_policy" not in reasons,
+                action_flow.get("execution_allowed") is False,
+                action_flow.get("verification_required") is False,
+            )
+        )
+    if "confirmation_received" in reasons:
+        return all(
+            (
+                "confirmation_cancelled" not in reasons,
+                "execution_not_allowed" not in reasons,
+                action_flow.get("execution_allowed") is True,
+                action_flow.get("verification_required") is True,
+            )
+        )
+    return all(
+        (
+            action_flow.get("execution_allowed") is False,
+            action_flow.get("verification_required") is True,
+            "confirmation_received" not in reasons,
+            "confirmation_cancelled" not in reasons,
+            "execution_allowed_by_policy" not in reasons,
+        )
+    )
+
+
 def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
     match = trace.get("match") if isinstance(trace.get("match"), dict) else {}
     capability = match.get("capability") if isinstance(match.get("capability"), dict) else {}
@@ -2233,10 +2273,8 @@ def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
                 authority.get("risk_level") == "medium_requires_confirmation",
                 authority.get("authority_level") == "execute_after_confirmation",
                 authority.get("requires_confirmation") is True,
-                action_flow.get("confirmation_required") is True,
-                action_flow.get("verification_required") is True,
-                action_flow.get("verification_supported") is True,
-                action_flow.get("verification_method") == "capability_verification",
+                authority.get("allowed") is False,
+                _jellyfin_registry_allows_processing(action_flow),
             )
         )
     return all(
