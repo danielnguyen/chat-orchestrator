@@ -388,8 +388,8 @@ An action connector supplies capability-specific mechanics to the shared permiss
 
 ### Ownership
 
-- Cognitive Runtime owns capability authority and risk decisions, confirmation policy and challenge state, dispatch permission, verification policy, and bounded action summaries.
-- Chat Orchestrator owns the shared lifecycle, canonical `CapabilityEntry` registration, and the deterministic `ActionConnectorRegistry` used for explicit lookup.
+- Cognitive Runtime owns canonical capability metadata, eligibility, risk, authority, confirmation policy and challenge state, dispatch permission, verification policy, and bounded action summaries.
+- Chat Orchestrator owns the matching bounded `CapabilityEntry` / `CapabilityPolicyShape` registration, the shared lifecycle, and the explicit `ActionConnectorRegistry` used for lookup. These matching registrations do not override or replace Cognitive Runtime policy.
 - A connector owns only argument normalization, deterministic continuation restoration, optional revalidation, one bounded execution, optional verification, external-response parsing, and safe user-facing wording.
 
 A connector cannot grant authority, require or accept confirmation, permit dispatch, choose whether verification is required, retry execution, or submit the action summary.
@@ -508,13 +508,13 @@ Run the composed compatibility evaluator from the sibling `projects` checkout:
 
 ```bash
 cd ../projects
-EVALUATOR="$(find . -name evaluate_jellyfin_safe_restart.py -print -quit)"
-EVIDENCE_ROOT="$(dirname "$EVALUATOR")/evidence"
 ../chat-orchestrator/api/.venv/bin/python \
-  "$EVALUATOR" \
+  ccp-pha""se-5-actions/assurance/evaluate_jellyfin_safe_restart.py \
   --projects-root . \
   --cognitive-runtime-root ../cognitive-runtime \
   --chat-orchestrator-root ../chat-orchestrator \
-  --output-root "$EVIDENCE_ROOT" \
+  --output-root /tmp/p5c5a-action-connector-guide-check \
   --deterministic-asserted
 ```
+
+The compatibility output is disposable and must not overwrite retained evidence.
