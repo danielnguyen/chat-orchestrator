@@ -29,9 +29,8 @@ from services.action_connectors import (
 from services.jellyfin_action_connector import (
     JELLYFIN_CAPABILITY_ID,
     JELLYFIN_PROVIDER_TOOL_NAME,
+    JELLYFIN_REVALIDATOR_ID,
     JELLYFIN_TARGET,
-    JELLYFIN_WORLD_STATE_RULES,
-    JellyfinActionConnector,
 )
 from services.jellyfin_action_connector import (
     JellyfinOperations as JellyfinOperations,
@@ -65,6 +64,19 @@ _RELATIONSHIP_CONTEXT_REQUIREMENTS = [
         "minimum_confidence": 0.8,
     }
 ]
+JELLYFIN_WORLD_STATE_REQUIREMENTS = [
+    {
+        "domain": "active_external_system",
+        "entity_id": JELLYFIN_TARGET,
+        "attribute": "restart_safe",
+        "min_authority": "trusted_integration_event",
+        "min_confidence": 0.9,
+        "max_freshness_state": "fresh",
+        "revalidator_id": JELLYFIN_REVALIDATOR_ID,
+    }
+]
+
+
 class CapabilityValidationError(ValueError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code)
@@ -158,6 +170,21 @@ class Revalidator:
     verify: Any
 
 
+_CONNECTOR_REVALIDATOR_ENTRIES = {
+    JELLYFIN_CAPABILITY_ID: RevalidatorEntry(
+        revalidator_id=JELLYFIN_REVALIDATOR_ID,
+        verifier_id=JELLYFIN_REVALIDATOR_ID,
+        verification_source_type="tool_output",
+        verification_source_ref=JELLYFIN_REVALIDATOR_ID,
+        supported_domains=("active_external_system",),
+        supported_attributes=("restart_safe",),
+        resulting_authority="verified_tool_output",
+        resulting_confidence=1.0,
+        resulting_freshness_state="fresh",
+    )
+}
+
+
 class _ConnectorVerifier:
     def __init__(
         self,
@@ -166,11 +193,13 @@ class _ConnectorVerifier:
         request_id: str,
         arguments: ConnectorArguments,
         selected_claims: tuple[ConnectorClaimRef, ...],
+        entry: RevalidatorEntry,
     ) -> None:
         self.connector = connector
         self.request_id = request_id
         self.arguments = arguments
         self.selected_claims = selected_claims
+        self.entry = entry
         self.external_call_count = 0
 
     async def __call__(self, claim_ids: tuple[str, ...]) -> list[RevalidationOutput]:
@@ -185,9 +214,6 @@ class _ConnectorVerifier:
         if not isinstance(result, ConnectorRevalidationResult):
             raise ValueError("malformed_connector_revalidation")
         self.external_call_count += result.external_call_count
-        spec = self.connector.revalidation_spec
-        if spec is None:
-            raise ValueError("connector_revalidation_unavailable")
         if result.status is not RevalidationStatus.SUCCESSFUL:
             digests = {item.claim_id: item.value_digest for item in self.selected_claims}
             return [
@@ -203,11 +229,11 @@ class _ConnectorVerifier:
                 expected_value_digest=item.expected_value_digest,
                 observed_at=item.observed_at,
                 verified_at=item.verified_at,
-                source_type=spec.source_type,
-                source_ref=spec.source_ref,
-                resulting_authority=spec.resulting_authority,
-                confidence=spec.resulting_confidence,
-                freshness_state=spec.resulting_freshness_state,
+                source_type=self.entry.verification_source_type,
+                source_ref=self.entry.verification_source_ref,
+                resulting_authority=self.entry.resulting_authority,
+                confidence=self.entry.resulting_confidence,
+                freshness_state=self.entry.resulting_freshness_state,
             )
             for item in result.observations
         ]
@@ -351,7 +377,7 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
         privacy_classification="bounded_service_action",
         authorization_requirements={
             "relationship_requirements": [],
-            "world_state_requirements": JELLYFIN_WORLD_STATE_RULES,
+            "world_state_requirements": JELLYFIN_WORLD_STATE_REQUIREMENTS,
         },
         argument_schema={
             "type": "object",
@@ -384,26 +410,30 @@ def _connector_revalidator(
     world_state_claims: list[dict[str, str]],
 ) -> Revalidator | None:
     spec = connector.revalidation_spec
-    if spec is None:
+    entry = _CONNECTOR_REVALIDATOR_ENTRIES.get(connector.capability_id)
+    if spec is None or entry is None:
+        return None
+    if (
+        spec.revalidator_id,
+        spec.verifier_id,
+        spec.source_type,
+        spec.source_ref,
+    ) != (
+        entry.revalidator_id,
+        entry.verifier_id,
+        entry.verification_source_type,
+        entry.verification_source_ref,
+    ):
         return None
     verifier = _ConnectorVerifier(
         connector=connector,
         request_id=request_id,
         arguments=ConnectorArguments(normalized_arguments),
         selected_claims=_connector_claim_refs(world_state_claims),
+        entry=entry,
     )
     return Revalidator(
-        entry=RevalidatorEntry(
-            revalidator_id=spec.revalidator_id,
-            verifier_id=spec.verifier_id,
-            verification_source_type=spec.source_type,
-            verification_source_ref=spec.source_ref,
-            supported_domains=spec.supported_domains,
-            supported_attributes=spec.supported_attributes,
-            resulting_authority=spec.resulting_authority,
-            resulting_confidence=spec.resulting_confidence,
-            resulting_freshness_state=spec.resulting_freshness_state,
-        ),
+        entry=entry,
         verify=verifier,
     )
 
@@ -806,9 +836,7 @@ async def authorize_and_execute_capability(
     continuation, confirmation_shape_error = parse_pending_action_confirmation(
         capability_confirmation
     )
-    verification_required = post_execution_verification_required or (
-        connector is not None
-    )
+    verification_required = post_execution_verification_required
     trace = {
         **validation_result.trace,
         "authorization": {
@@ -1314,10 +1342,11 @@ def normalize_arguments(
     if entry.capability_id == "runtime.relationship_context.read":
         return _normalize_relationship_context_arguments(arguments)
     if entry.executor_binding == "action_connector":
-        registry = connector_registry or ActionConnectorRegistry(
-            (JellyfinActionConnector(None),)
+        connector = (
+            connector_registry.get(entry.capability_id)
+            if connector_registry is not None
+            else None
         )
-        connector = registry.get(entry.capability_id)
         if connector is None:
             raise CapabilityValidationError("connector_unavailable")
         try:
@@ -2638,8 +2667,6 @@ def _connector_local_gate_reason(
     try:
         result = connector.check_availability(
             ConnectorAvailabilityRequest(
-                surface=surface,
-                active_persona_id=active_persona_id,
                 selected_claims=_connector_claim_refs(world_state_claims),
             )
         )

@@ -27,17 +27,6 @@ JELLYFIN_PROVIDER_TOOL_NAME = "jellyfin_safe_restart"
 JELLYFIN_TARGET = "service:jellyfin"
 JELLYFIN_REVALIDATOR_ID = "jellyfin_status"
 JELLYFIN_EFFECT_MODES = {"simulated", "live"}
-JELLYFIN_WORLD_STATE_RULES = [
-    {
-        "domain": "active_external_system",
-        "entity_id": JELLYFIN_TARGET,
-        "attribute": "restart_safe",
-        "min_authority": "trusted_integration_event",
-        "min_confidence": 0.9,
-        "max_freshness_state": "fresh",
-        "revalidator_id": JELLYFIN_REVALIDATOR_ID,
-    }
-]
 
 
 @dataclass(frozen=True)
@@ -62,11 +51,6 @@ class JellyfinActionConnector:
         verifier_id=JELLYFIN_REVALIDATOR_ID,
         source_type="tool_output",
         source_ref=JELLYFIN_REVALIDATOR_ID,
-        supported_domains=("active_external_system",),
-        supported_attributes=("restart_safe",),
-        resulting_authority="verified_tool_output",
-        resulting_confidence=1.0,
-        resulting_freshness_state="fresh",
     )
 
     def __init__(self, operations: JellyfinOperations | None) -> None:

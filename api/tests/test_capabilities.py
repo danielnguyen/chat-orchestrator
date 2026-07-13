@@ -6,7 +6,11 @@ import pytest
 import services.capabilities as capability_service
 from models import ChatRequest, ChatResponse
 from pydantic import ValidationError
-from services.action_connectors import ActionConnectorRegistry
+from services.action_connectors import (
+    ActionConnectorRegistry,
+    ConnectorVerificationResult,
+    VerificationStatus,
+)
 from services.capabilities import (
     CapabilityValidationError,
     RevalidationOutput,
@@ -2097,7 +2101,15 @@ def _jellyfin_validation():
     return _validated("jellyfin_safe_restart", {"target": "service:jellyfin"})
 
 
-async def _jellyfin_execute(runtime, adapter, confirmation=None):
+async def _jellyfin_execute(
+    runtime,
+    adapter,
+    confirmation=None,
+    *,
+    connector=None,
+    verification_required=True,
+):
+    connector = connector or JellyfinActionConnector(adapter.binding())
     return await authorize_and_execute_capability(
         runtime=runtime,
         request_id="rid-jellyfin",
@@ -2109,11 +2121,25 @@ async def _jellyfin_execute(runtime, adapter, confirmation=None):
         active_persona_id="technical_architect",
         validation_result=_jellyfin_validation(),
         selected_world_state_claims=_JELLYFIN_CLAIMS,
-        connector_registry=ActionConnectorRegistry(
-            (JellyfinActionConnector(adapter.binding()),)
-        ),
+        connector_registry=ActionConnectorRegistry((connector,)),
         capability_confirmation=confirmation,
+        post_execution_verification_required=verification_required,
     )
+
+
+class RecordingJellyfinConnector(JellyfinActionConnector):
+    def __init__(self, operations):
+        super().__init__(operations)
+        self.execute_calls = 0
+        self.verify_calls = 0
+
+    async def execute(self, request):
+        self.execute_calls += 1
+        return await super().execute(request)
+
+    async def verify(self, request):
+        self.verify_calls += 1
+        return await super().verify(request)
 
 
 def test_pending_action_models_retain_bounded_input_and_output():
@@ -2215,6 +2241,24 @@ def test_jellyfin_descriptor_and_fixed_target_are_exact():
     }
 
 
+def test_jellyfin_world_state_policy_is_owned_by_shared_capability_service():
+    expected = [
+        {
+            "domain": "active_external_system",
+            "entity_id": "service:jellyfin",
+            "attribute": "restart_safe",
+            "min_authority": "trusted_integration_event",
+            "min_confidence": 0.9,
+            "max_freshness_state": "fresh",
+            "revalidator_id": "jellyfin_status",
+        }
+    ]
+    assert capability_service.JELLYFIN_WORLD_STATE_REQUIREMENTS == expected
+    assert production_capability_registry()[-1].authorization_requirements[
+        "world_state_requirements"
+    ] is capability_service.JELLYFIN_WORLD_STATE_REQUIREMENTS
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -2262,6 +2306,72 @@ def test_connector_lookup_drives_jellyfin_normalization():
     assert result.normalized_arguments == {"target": "service:jellyfin"}
 
 
+@pytest.mark.parametrize(
+    "connector_registry",
+    [None, ActionConnectorRegistry(())],
+)
+def test_connector_backed_normalization_requires_explicit_known_registry(
+    connector_registry,
+):
+    request = parse_provider_capability_request(
+        _call("jellyfin_safe_restart", {"target": "service:jellyfin"})
+    )
+    with pytest.raises(CapabilityValidationError) as exc:
+        validate_and_digest_capability_request(
+            request=request,
+            exposed_capability_ids=["jellyfin_restart"],
+            connector_registry=connector_registry,
+        )
+    assert exc.value.reason_code == "connector_unavailable"
+    assert not hasattr(capability_service, "JellyfinActionConnector")
+
+
+@pytest.mark.asyncio
+async def test_shared_jellyfin_revalidator_mapping_cannot_be_overridden_by_connector():
+    class PolicyClaimingConnector(JellyfinActionConnector):
+        resulting_authority = "connector_declared"
+        resulting_confidence = 0.1
+        resulting_freshness_state = "stale"
+        supported_domains = ("connector_domain",)
+        supported_attributes = ("connector_attribute",)
+
+        async def revalidate(self, request):
+            result = await super().revalidate(request)
+            object.__setattr__(result, "resulting_authority", "result_declared")
+            object.__setattr__(result, "resulting_confidence", 0.2)
+            object.__setattr__(result, "resulting_freshness_state", "expired")
+            return result
+
+    adapter = JellyfinStateMachine()
+    connector = PolicyClaimingConnector(adapter.binding())
+    revalidator = capability_service._connector_revalidator(
+        connector=connector,
+        request_id="rid-jellyfin-policy",
+        normalized_arguments={"target": "service:jellyfin"},
+        world_state_claims=_JELLYFIN_CLAIMS,
+    )
+
+    assert revalidator is not None
+    assert revalidator.entry == RevalidatorEntry(
+        revalidator_id="jellyfin_status",
+        verifier_id="jellyfin_status",
+        verification_source_type="tool_output",
+        verification_source_ref="jellyfin_status",
+        supported_domains=("active_external_system",),
+        supported_attributes=("restart_safe",),
+        resulting_authority="verified_tool_output",
+        resulting_confidence=1.0,
+        resulting_freshness_state="fresh",
+    )
+    outputs = await revalidator.verify(("claim_jellyfin_safe",))
+    assert len(outputs) == 1
+    assert outputs[0].source_type == "tool_output"
+    assert outputs[0].source_ref == "jellyfin_status"
+    assert outputs[0].resulting_authority == "verified_tool_output"
+    assert outputs[0].confidence == 1.0
+    assert outputs[0].freshness_state == "fresh"
+
+
 @pytest.mark.asyncio
 async def test_unknown_connector_blocks_connector_backed_execution():
     runtime = JellyfinPolicyRuntime()
@@ -2283,6 +2393,89 @@ async def test_unknown_connector_blocks_connector_backed_execution():
     assert runtime.authorization_calls == []
     assert adapter.status_inputs == []
     assert adapter.restart_inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "persona", "reason"),
+    [
+        ("desktop", "technical_architect", "surface_not_enabled"),
+        ("dev", "general_assistant", "persona_not_enabled"),
+    ],
+)
+async def test_shared_surface_and_persona_gates_precede_connector_availability(
+    surface,
+    persona,
+    reason,
+):
+    class RecordingAvailabilityConnector(JellyfinActionConnector):
+        def __init__(self, operations):
+            super().__init__(operations)
+            self.availability_requests = []
+
+        def check_availability(self, request):
+            self.availability_requests.append(request)
+            return super().check_availability(request)
+
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    connector = RecordingAvailabilityConnector(adapter.binding())
+    descriptors, trace = await filter_capability_descriptors_for_exposure(
+        runtime=runtime,
+        request_id="rid-shared-policy-gate",
+        owner_id="owner",
+        conversation_id="conv",
+        surface=surface,
+        runtime_session_id="rtsession_jellyfin",
+        runtime_turn_id="rtturn_jellyfin",
+        active_persona_id=persona,
+        selected_world_state_claims=_JELLYFIN_CLAIMS,
+        connector_registry=ActionConnectorRegistry((connector,)),
+        allowed_capability_ids=["jellyfin_restart"],
+    )
+
+    assert descriptors == []
+    assert trace["blocked_reasons"] == {"jellyfin_restart": reason}
+    assert connector.availability_requests == []
+    assert runtime.authorization_calls == []
+
+
+@pytest.mark.asyncio
+async def test_connector_availability_receives_no_surface_or_persona_policy_input():
+    class RecordingAvailabilityConnector(JellyfinActionConnector):
+        def __init__(self, operations):
+            super().__init__(operations)
+            self.availability_requests = []
+
+        def check_availability(self, request):
+            self.availability_requests.append(request)
+            return super().check_availability(request)
+
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    connector = RecordingAvailabilityConnector(adapter.binding())
+    descriptors, _ = await filter_capability_descriptors_for_exposure(
+        runtime=runtime,
+        request_id="rid-connector-input",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_jellyfin",
+        runtime_turn_id="rtturn_jellyfin",
+        active_persona_id="technical_architect",
+        selected_world_state_claims=_JELLYFIN_CLAIMS,
+        connector_registry=ActionConnectorRegistry((connector,)),
+        allowed_capability_ids=["jellyfin_restart"],
+    )
+
+    assert [item["function"]["name"] for item in descriptors] == [
+        "jellyfin_safe_restart"
+    ]
+    assert len(connector.availability_requests) == 1
+    request = connector.availability_requests[0]
+    assert not hasattr(request, "surface")
+    assert not hasattr(request, "active_persona_id")
+    assert request.selected_claims
 
 
 def test_capability_service_has_no_direct_jellyfin_adapter_path():
@@ -2332,8 +2525,12 @@ async def test_jellyfin_first_turn_and_accepted_continuation_keep_one_challenge(
     assert second_dispatch["confirmation_challenge_ref"] == "challenge-jellyfin-1"
     assert runtime.dispatch_count == 1
     assert len(adapter.restart_inputs) == 1
-    assert len([item for item in adapter.status_inputs if item["purpose"] == "revalidation"]) == 2
-    assert len([item for item in adapter.status_inputs if item["purpose"] == "post_restart"]) == 1
+    assert len(
+        [item for item in adapter.status_inputs if item["purpose"] == "revalidation"]
+    ) == 2
+    assert len(
+        [item for item in adapter.status_inputs if item["purpose"] == "post_restart"]
+    ) == 1
     assert second.trace["effect_mode"] == "simulated"
     assert second.trace["restart_call_count"] == 1
     assert second.trace["post_restart_verification_call_count"] == 1
@@ -2346,6 +2543,103 @@ async def test_jellyfin_first_turn_and_accepted_continuation_keep_one_challenge(
     assert replay.trace["failure_reason_code"] == "challenge_consumed"
     assert len(adapter.restart_inputs) == 1
     assert runtime.dispatch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_connector_execution_without_policy_verification_stays_executed():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    connector = RecordingJellyfinConnector(adapter.binding())
+    await _jellyfin_execute(
+        runtime,
+        adapter,
+        connector=connector,
+        verification_required=False,
+    )
+    confirmation = {
+        "pending_action": _pending_envelope(_jellyfin_validation().argument_digest),
+        "confirmed": True,
+    }
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        confirmation,
+        connector=connector,
+        verification_required=False,
+    )
+
+    assert connector.execute_calls == len(adapter.restart_inputs) == 1
+    assert connector.verify_calls == 0
+    assert result.trace["response_status"] == "executed"
+    assert result.trace["post_execution_verification"] == {
+        "required": False,
+        "method": None,
+        "status": "not_required",
+        "reason_code": None,
+        "call_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_connector_execution_with_policy_verification_calls_verify_once():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    connector = RecordingJellyfinConnector(adapter.binding())
+    await _jellyfin_execute(runtime, adapter, connector=connector)
+    confirmation = {
+        "pending_action": _pending_envelope(_jellyfin_validation().argument_digest),
+        "confirmed": True,
+    }
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        confirmation,
+        connector=connector,
+    )
+
+    assert connector.execute_calls == len(adapter.restart_inputs) == 1
+    assert connector.verify_calls == 1
+    assert result.trace["response_status"] == "executed_verified"
+    assert result.trace["post_execution_verification"]["status"] == "verified"
+    assert result.trace["post_execution_verification"]["call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_required_but_unsupported_connector_verification_is_explicit():
+    class UnsupportedVerificationConnector(RecordingJellyfinConnector):
+        async def verify(self, request):
+            self.verify_calls += 1
+            return ConnectorVerificationResult(
+                VerificationStatus.NOT_SUPPORTED,
+                "verification_not_supported",
+                "verification_not_supported",
+                0,
+                effect_mode="simulated",
+                target_label="service:jellyfin",
+            )
+
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    connector = UnsupportedVerificationConnector(adapter.binding())
+    await _jellyfin_execute(runtime, adapter, connector=connector)
+    confirmation = {
+        "pending_action": _pending_envelope(_jellyfin_validation().argument_digest),
+        "confirmed": True,
+    }
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        confirmation,
+        connector=connector,
+    )
+
+    assert connector.execute_calls == len(adapter.restart_inputs) == 1
+    assert connector.verify_calls == 1
+    assert result.trace["response_status"] == "executed_unverified"
+    assert result.trace["post_execution_verification"]["status"] == "not_supported"
+    assert result.trace["post_execution_verification"]["reason_code"] == (
+        "verification_not_supported"
+    )
 
 
 @pytest.mark.asyncio

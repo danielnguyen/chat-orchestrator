@@ -94,14 +94,9 @@ class ConnectorClaimRef:
 
 @dataclass(frozen=True)
 class ConnectorAvailabilityRequest:
-    surface: str
-    active_persona_id: str | None
     selected_claims: tuple[ConnectorClaimRef, ...] = ()
 
     def __post_init__(self) -> None:
-        _validate_label(self.surface, "surface")
-        if self.active_persona_id is not None:
-            _validate_label(self.active_persona_id, "active_persona_id")
         if not isinstance(self.selected_claims, tuple) or any(
             not isinstance(item, ConnectorClaimRef) for item in self.selected_claims
         ):
@@ -125,11 +120,6 @@ class ConnectorRevalidationSpec:
     verifier_id: str
     source_type: str
     source_ref: str
-    supported_domains: tuple[str, ...]
-    supported_attributes: tuple[str, ...]
-    resulting_authority: str
-    resulting_confidence: float
-    resulting_freshness_state: str
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -137,18 +127,8 @@ class ConnectorRevalidationSpec:
             "verifier_id",
             "source_type",
             "source_ref",
-            "resulting_authority",
-            "resulting_freshness_state",
         ):
             _validate_label(getattr(self, field_name), field_name)
-        for value in self.supported_domains + self.supported_attributes:
-            _validate_label(value, "supported_value")
-        if (
-            not isinstance(self.resulting_confidence, int | float)
-            or isinstance(self.resulting_confidence, bool)
-            or not 0.0 <= self.resulting_confidence <= 1.0
-        ):
-            raise ValueError("invalid_resulting_confidence")
 
 
 @dataclass(frozen=True)

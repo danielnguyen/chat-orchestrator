@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import pytest
+import services.jellyfin_action_connector as jellyfin_connector
 from services.action_connectors import (
     ActionConnector,
     ActionConnectorRegistry,
@@ -16,6 +17,7 @@ from services.action_connectors import (
     ConnectorInputError,
     ConnectorRevalidationRequest,
     ConnectorRevalidationResult,
+    ConnectorRevalidationSpec,
     ConnectorVerificationRequest,
     ConnectorVerificationResult,
     ExecutionStatus,
@@ -142,11 +144,7 @@ class JellyfinFixtureOperations:
 
 
 def _availability(claims=_CLAIMS):
-    return ConnectorAvailabilityRequest(
-        surface="dev",
-        active_persona_id="technical_architect",
-        selected_claims=claims,
-    )
+    return ConnectorAvailabilityRequest(selected_claims=claims)
 
 
 def _revalidation_request(claims=_CLAIMS, claim_ids=("claim_jellyfin_safe",)):
@@ -230,6 +228,30 @@ def test_registry_lookup_and_normalization_do_not_execute_connector():
         hasattr(registry, field)
         for field in ("risk_level", "authority_level", "confirmation_state")
     )
+
+
+def test_connector_policy_inputs_are_excluded_from_bounded_contracts():
+    assert [field.name for field in fields(ConnectorAvailabilityRequest)] == [
+        "selected_claims"
+    ]
+    assert [field.name for field in fields(ConnectorRevalidationSpec)] == [
+        "revalidator_id",
+        "verifier_id",
+        "source_type",
+        "source_ref",
+    ]
+    with pytest.raises(TypeError):
+        ConnectorRevalidationSpec(
+            revalidator_id="fixture_revalidator",
+            verifier_id="fixture_verifier",
+            source_type="tool_output",
+            source_ref="fixture_status",
+            supported_domains=("active_external_system",),
+            supported_attributes=("restart_safe",),
+            resulting_authority="self_declared",
+            resulting_confidence=1.0,
+            resulting_freshness_state="fresh",
+        )
 
 
 @pytest.mark.asyncio
@@ -358,6 +380,12 @@ def test_jellyfin_connector_exact_target_normalizes_without_external_call():
     assert result.as_dict() == {"target": JELLYFIN_TARGET}
     assert operations.status_inputs == []
     assert operations.restart_inputs == []
+
+
+def test_jellyfin_connector_exposes_no_world_state_policy_requirements():
+    assert not hasattr(jellyfin_connector, "JELLYFIN_WORLD_STATE_REQUIREMENTS")
+    assert not hasattr(jellyfin_connector, "JELLYFIN_WORLD_STATE_RULES")
+    assert not hasattr(JellyfinActionConnector, "world_state_requirements")
 
 
 def test_jellyfin_connector_availability_is_bounded():
