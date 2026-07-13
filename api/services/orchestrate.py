@@ -16,14 +16,11 @@ from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from router.engine import evaluate_route
+from services.action_connectors import ActionConnectorRegistry
 from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.capabilities import (
-    JELLYFIN_CAPABILITY_ID,
-    JELLYFIN_PROVIDER_TOOL_NAME,
-    JELLYFIN_TARGET,
     CapabilityValidationError,
-    JellyfinOperations,
     ParsedCapabilityRequest,
     PendingActionContinuation,
     authorize_and_execute_capability,
@@ -38,6 +35,13 @@ from services.capabilities import (
 )
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
+from services.jellyfin_action_connector import (
+    JELLYFIN_CAPABILITY_ID,
+    JELLYFIN_PROVIDER_TOOL_NAME,
+    JELLYFIN_TARGET,
+    JellyfinActionConnector,
+    JellyfinOperations,
+)
 from services.memory_hygiene import apply_memory_hygiene, disabled_memory_hygiene_trace
 from services.memory_recall_composition import (
     build_recall_candidates,
@@ -5966,6 +5970,9 @@ async def orchestrate_chat(
 ) -> dict[str, Any]:
     started = perf_counter()
     surface = payload.get("surface", "unknown")
+    connector_registry = ActionConnectorRegistry(
+        (JellyfinActionConnector(jellyfin_operations),)
+    )
     pending_continuation, pending_error = parse_pending_action_confirmation(
         payload.get("capability_confirmation")
     )
@@ -6773,7 +6780,7 @@ async def orchestrate_chat(
                     relationship_context_trace
                 ),
                 selected_world_state_claims=jellyfin_claim_refs,
-                jellyfin_operations=jellyfin_operations,
+                connector_registry=connector_registry,
                 allowed_capability_ids=allowed_capability_ids,
             )
 
@@ -7203,6 +7210,7 @@ async def orchestrate_chat(
                             "exposed_capability_ids",
                             [],
                         ),
+                        connector_registry=connector_registry,
                     )
                     prompt.trace["capabilities"]["validation"] = validation_result.trace
                     execution_result = await authorize_and_execute_capability(
@@ -7220,7 +7228,7 @@ async def orchestrate_chat(
                         ),
                         selected_world_state_claims=jellyfin_claim_refs,
                         revalidators=capability_revalidators,
-                        jellyfin_operations=jellyfin_operations,
+                        connector_registry=connector_registry,
                         capability_confirmation=payload.get("capability_confirmation"),
                         post_execution_verification_required=registry_capability_allowed,
                     )

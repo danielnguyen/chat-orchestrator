@@ -5,11 +5,11 @@ import pytest
 import services.capabilities as capability_service
 from clients.runtime import RuntimeClient
 from services.capabilities import (
-    JellyfinOperations,
     RevalidationOutput,
     Revalidator,
     RevalidatorEntry,
 )
+from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,

@@ -7,11 +7,40 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from services.action_connectors import (
+    ActionConnector,
+    ActionConnectorRegistry,
+    ConnectorArguments,
+    ConnectorAvailabilityRequest,
+    ConnectorAvailabilityResult,
+    ConnectorClaimRef,
+    ConnectorExecutionRequest,
+    ConnectorExecutionResult,
+    ConnectorInputError,
+    ConnectorRevalidationRequest,
+    ConnectorRevalidationResult,
+    ConnectorVerificationRequest,
+    ConnectorVerificationResult,
+    ExecutionStatus,
+    RevalidationStatus,
+    VerificationStatus,
+    is_valid_capability_id,
+)
+from services.jellyfin_action_connector import (
+    JELLYFIN_CAPABILITY_ID,
+    JELLYFIN_PROVIDER_TOOL_NAME,
+    JELLYFIN_TARGET,
+    JELLYFIN_WORLD_STATE_RULES,
+    JellyfinActionConnector,
+)
+from services.jellyfin_action_connector import (
+    JellyfinOperations as JellyfinOperations,
+)
+
 CAPABILITY_DESCRIPTOR_VERSION = "co.capability-descriptor.v1"
 CAPABILITY_ARGUMENT_SCHEMA_VERSION = "co.capability-args.v1"
 MAX_ARGUMENT_BYTES = 4096
 
-_SAFE_ID = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _SAFE_PROVIDER_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9_.:@/-]{1,120}$")
 _WORLD_STATE_DOMAINS = {
@@ -36,24 +65,6 @@ _RELATIONSHIP_CONTEXT_REQUIREMENTS = [
         "minimum_confidence": 0.8,
     }
 ]
-JELLYFIN_CAPABILITY_ID = "jellyfin_restart"
-JELLYFIN_PROVIDER_TOOL_NAME = "jellyfin_safe_restart"
-JELLYFIN_TARGET = "service:jellyfin"
-JELLYFIN_REVALIDATOR_ID = "jellyfin_status"
-JELLYFIN_EFFECT_MODES = {"simulated", "live"}
-JELLYFIN_WORLD_STATE_REQUIREMENTS = [
-    {
-        "domain": "active_external_system",
-        "entity_id": JELLYFIN_TARGET,
-        "attribute": "restart_safe",
-        "min_authority": "trusted_integration_event",
-        "min_confidence": 0.9,
-        "max_freshness_state": "fresh",
-        "revalidator_id": JELLYFIN_REVALIDATOR_ID,
-    }
-]
-
-
 class CapabilityValidationError(ValueError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code)
@@ -99,13 +110,6 @@ class CapabilityExecutionResult:
 
 
 @dataclass(frozen=True)
-class JellyfinOperations:
-    effect_mode: str
-    status: Any
-    restart: Any
-
-
-@dataclass(frozen=True)
 class PendingActionContinuation:
     challenge_ref: str
     capability_id: str
@@ -114,79 +118,6 @@ class PendingActionContinuation:
     challenge_expires_at: str
     confirmation_text: str
     confirmed: bool
-
-
-@dataclass(frozen=True)
-class _JellyfinStatusResult:
-    status: str
-    reason_code: str
-    observed_at: str
-    verified_at: str
-
-
-class _JellyfinStatusVerifier:
-    def __init__(
-        self,
-        *,
-        operations: JellyfinOperations,
-        request_id: str,
-        claim_digests: dict[str, str],
-    ) -> None:
-        self.operations = operations
-        self.request_id = request_id
-        self.claim_digests = claim_digests
-        self.status_call_count = 0
-
-    async def __call__(self, claim_ids: tuple[str, ...]) -> list[RevalidationOutput]:
-        requested = [
-            {
-                "claim_id": claim_id,
-                "value_digest": self.claim_digests.get(claim_id, ""),
-            }
-            for claim_id in claim_ids
-        ]
-        if any(not item["value_digest"] for item in requested):
-            return [
-                _failed_revalidation_output(item, "revalidator_claim_mismatch")
-                for item in requested
-            ]
-        self.status_call_count += 1
-        raw = self.operations.status(
-            {
-                "request_id": self.request_id,
-                "capability_id": JELLYFIN_CAPABILITY_ID,
-                "target": JELLYFIN_TARGET,
-                "purpose": "revalidation",
-                "claims": requested,
-            }
-        )
-        if hasattr(raw, "__await__"):
-            raw = await raw
-        parsed, reason = _parse_jellyfin_status_result(
-            raw,
-            purpose="revalidation",
-            expected_claims=requested,
-        )
-        if parsed is None or parsed.status != "safe":
-            failure_reason = reason or f"restart_state_{parsed.status}"
-            return [
-                _failed_revalidation_output(item, failure_reason)
-                for item in requested
-            ]
-        return [
-            RevalidationOutput(
-                claim_id=item["claim_id"],
-                expected_value_digest=item["value_digest"],
-                observed_at=parsed.observed_at,
-                verified_at=parsed.verified_at,
-                source_type="tool_output",
-                source_ref=JELLYFIN_REVALIDATOR_ID,
-                resulting_authority="verified_tool_output",
-                confidence=1.0,
-                freshness_state="fresh",
-            )
-            for item in requested
-        ]
 
 
 @dataclass(frozen=True)
@@ -225,6 +156,61 @@ class RevalidationOutput:
 class Revalidator:
     entry: RevalidatorEntry
     verify: Any
+
+
+class _ConnectorVerifier:
+    def __init__(
+        self,
+        *,
+        connector: ActionConnector,
+        request_id: str,
+        arguments: ConnectorArguments,
+        selected_claims: tuple[ConnectorClaimRef, ...],
+    ) -> None:
+        self.connector = connector
+        self.request_id = request_id
+        self.arguments = arguments
+        self.selected_claims = selected_claims
+        self.external_call_count = 0
+
+    async def __call__(self, claim_ids: tuple[str, ...]) -> list[RevalidationOutput]:
+        result = await self.connector.revalidate(
+            ConnectorRevalidationRequest(
+                request_id=self.request_id,
+                arguments=self.arguments,
+                selected_claims=self.selected_claims,
+                requested_claim_ids=claim_ids,
+            )
+        )
+        if not isinstance(result, ConnectorRevalidationResult):
+            raise ValueError("malformed_connector_revalidation")
+        self.external_call_count += result.external_call_count
+        spec = self.connector.revalidation_spec
+        if spec is None:
+            raise ValueError("connector_revalidation_unavailable")
+        if result.status is not RevalidationStatus.SUCCESSFUL:
+            digests = {item.claim_id: item.value_digest for item in self.selected_claims}
+            return [
+                _failed_revalidation_output(
+                    {"claim_id": claim_id, "value_digest": digests.get(claim_id, "")},
+                    result.reason_code,
+                )
+                for claim_id in claim_ids
+            ]
+        return [
+            RevalidationOutput(
+                claim_id=item.claim_id,
+                expected_value_digest=item.expected_value_digest,
+                observed_at=item.observed_at,
+                verified_at=item.verified_at,
+                source_type=spec.source_type,
+                source_ref=spec.source_ref,
+                resulting_authority=spec.resulting_authority,
+                confidence=spec.resulting_confidence,
+                freshness_state=spec.resulting_freshness_state,
+            )
+            for item in result.observations
+        ]
 
 
 @dataclass(frozen=True)
@@ -357,7 +343,7 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
         operation_class="high_impact",
         capability_domain="media_operations",
         supported_surfaces=("desktop", "dev"),
-        executor_binding="jellyfin_operations_restart",
+        executor_binding="action_connector",
         descriptor_metadata={
             "display_name": "Restart Jellyfin",
             "description": "Restart the fixed Jellyfin service after scoped confirmation.",
@@ -365,7 +351,7 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
         privacy_classification="bounded_service_action",
         authorization_requirements={
             "relationship_requirements": [],
-            "world_state_requirements": JELLYFIN_WORLD_STATE_REQUIREMENTS,
+            "world_state_requirements": JELLYFIN_WORLD_STATE_RULES,
         },
         argument_schema={
             "type": "object",
@@ -390,31 +376,33 @@ def production_revalidator_registry() -> dict[str, Revalidator]:
     return {}
 
 
-def jellyfin_status_revalidator(
+def _connector_revalidator(
     *,
-    operations: JellyfinOperations,
+    connector: ActionConnector,
     request_id: str,
+    normalized_arguments: dict[str, Any],
     world_state_claims: list[dict[str, str]],
-) -> Revalidator:
-    claim_refs = _safe_world_state_claim_refs(world_state_claims)
-    claim_digests = {item["claim_id"]: item["value_digest"] for item in claim_refs}
-    verifier = _JellyfinStatusVerifier(
-        operations=operations,
+) -> Revalidator | None:
+    spec = connector.revalidation_spec
+    if spec is None:
+        return None
+    verifier = _ConnectorVerifier(
+        connector=connector,
         request_id=request_id,
-        claim_digests=claim_digests,
+        arguments=ConnectorArguments(normalized_arguments),
+        selected_claims=_connector_claim_refs(world_state_claims),
     )
-
     return Revalidator(
         entry=RevalidatorEntry(
-            revalidator_id=JELLYFIN_REVALIDATOR_ID,
-            verifier_id=JELLYFIN_REVALIDATOR_ID,
-            verification_source_type="tool_output",
-            verification_source_ref=JELLYFIN_REVALIDATOR_ID,
-            supported_domains=("active_external_system",),
-            supported_attributes=("restart_safe",),
-            resulting_authority="verified_tool_output",
-            resulting_confidence=1.0,
-            resulting_freshness_state="fresh",
+            revalidator_id=spec.revalidator_id,
+            verifier_id=spec.verifier_id,
+            verification_source_type=spec.source_type,
+            verification_source_ref=spec.source_ref,
+            supported_domains=spec.supported_domains,
+            supported_attributes=spec.supported_attributes,
+            resulting_authority=spec.resulting_authority,
+            resulting_confidence=spec.resulting_confidence,
+            resulting_freshness_state=spec.resulting_freshness_state,
         ),
         verify=verifier,
     )
@@ -432,10 +420,7 @@ def validate_production_registry(entries: tuple[CapabilityEntry, ...]) -> None:
     for entry in entries:
         if not entry.executor_binding:
             raise RuntimeError(f"missing_executor_binding:{entry.capability_id}")
-        if not (
-            _SAFE_ID.fullmatch(entry.capability_id)
-            or entry.capability_id == JELLYFIN_CAPABILITY_ID
-        ):
+        if not is_valid_capability_id(entry.capability_id):
             raise RuntimeError(f"invalid_capability_id:{entry.capability_id}")
         if not _SAFE_PROVIDER_TOOL_NAME.fullmatch(entry.provider_tool_name):
             raise RuntimeError(f"invalid_provider_tool_name:{entry.capability_id}")
@@ -505,7 +490,7 @@ async def filter_capability_descriptors_for_exposure(
     active_persona_id: str | None,
     selected_relationship_ids: list[str] | None = None,
     selected_world_state_claims: list[dict[str, str]] | None = None,
-    jellyfin_operations: JellyfinOperations | None = None,
+    connector_registry: ActionConnectorRegistry | None = None,
     allowed_capability_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates = list(production_capability_registry())
@@ -517,12 +502,12 @@ async def filter_capability_descriptors_for_exposure(
         candidates = [
             entry
             for entry in candidates
-            if entry.capability_id != JELLYFIN_CAPABILITY_ID
-            or _jellyfin_local_gate_reason(
+            if entry.executor_binding != "action_connector"
+            or _connector_local_gate_reason(
                 entry=entry,
                 surface=surface,
                 active_persona_id=active_persona_id,
-                operations=jellyfin_operations,
+                connector_registry=connector_registry,
                 world_state_claims=world_state_claims,
             )
             is None
@@ -555,12 +540,12 @@ async def filter_capability_descriptors_for_exposure(
     exposed: list[CapabilityEntry] = []
     blocked_reasons: dict[str, str] = {}
     for entry in candidates:
-        if entry.capability_id == JELLYFIN_CAPABILITY_ID:
-            local_reason = _jellyfin_local_gate_reason(
+        if entry.executor_binding == "action_connector":
+            local_reason = _connector_local_gate_reason(
                 entry=entry,
                 surface=surface,
                 active_persona_id=active_persona_id,
-                operations=jellyfin_operations,
+                connector_registry=connector_registry,
                 world_state_claims=world_state_claims,
             )
             if local_reason is not None:
@@ -668,6 +653,7 @@ def validate_and_digest_capability_request(
     *,
     request: ParsedCapabilityRequest,
     exposed_capability_ids: list[str],
+    connector_registry: ActionConnectorRegistry | None = None,
 ) -> CapabilityValidationResult:
     if request.capability_id not in exposed_capability_ids:
         if capability_by_id(request.capability_id) is None:
@@ -676,7 +662,11 @@ def validate_and_digest_capability_request(
     entry = capability_by_id(request.capability_id)
     if entry is None:
         raise CapabilityValidationError("unknown_capability_id")
-    normalized = normalize_arguments(entry, request.arguments)
+    normalized = normalize_arguments(
+        entry,
+        request.arguments,
+        connector_registry=connector_registry,
+    )
     digest = argument_digest(entry.capability_id, normalized)
     return CapabilityValidationResult(
         capability_id=entry.capability_id,
@@ -801,18 +791,23 @@ async def authorize_and_execute_capability(
     selected_relationship_ids: list[str] | None = None,
     selected_world_state_claims: list[dict[str, str]] | None = None,
     revalidators: dict[str, Revalidator] | None = None,
-    jellyfin_operations: JellyfinOperations | None = None,
+    connector_registry: ActionConnectorRegistry | None = None,
     capability_confirmation: dict[str, Any] | None = None,
     post_execution_verification_required: bool = False,
 ) -> CapabilityExecutionResult:
     entry = capability_by_id(validation_result.capability_id)
+    connector = (
+        connector_registry.get(validation_result.capability_id)
+        if connector_registry is not None
+        else None
+    )
     world_state_claims = _safe_world_state_claim_refs(selected_world_state_claims)
     world_state_claim_ids = [item["claim_id"] for item in world_state_claims]
     continuation, confirmation_shape_error = parse_pending_action_confirmation(
         capability_confirmation
     )
     verification_required = post_execution_verification_required or (
-        entry is not None and entry.capability_id == JELLYFIN_CAPABILITY_ID
+        connector is not None
     )
     trace = {
         **validation_result.trace,
@@ -832,10 +827,7 @@ async def authorize_and_execute_capability(
         "restart_call_count": 0,
         "post_restart_verification_call_count": 0,
         "effect_mode": (
-            jellyfin_operations.effect_mode
-            if jellyfin_operations is not None
-            and jellyfin_operations.effect_mode in JELLYFIN_EFFECT_MODES
-            else None
+            connector.effect_mode if connector is not None else None
         ),
         "executor_result_status": "not_called",
         "post_execution_verification": {
@@ -858,12 +850,12 @@ async def authorize_and_execute_capability(
             confirmation_shape_error,
             "I could not use that capability confirmation safely.",
         )
-    if entry is not None and entry.capability_id == JELLYFIN_CAPABILITY_ID:
-        local_reason = _jellyfin_local_gate_reason(
+    if entry is not None and entry.executor_binding == "action_connector":
+        local_reason = _connector_local_gate_reason(
             entry=entry,
             surface=surface,
             active_persona_id=active_persona_id,
-            operations=jellyfin_operations,
+            connector_registry=connector_registry,
             world_state_claims=world_state_claims,
         )
         if local_reason is not None:
@@ -918,17 +910,20 @@ async def authorize_and_execute_capability(
         configured_revalidators = (
             revalidators if revalidators is not None else production_revalidator_registry()
         )
-        if (
-            entry.capability_id == JELLYFIN_CAPABILITY_ID
-            and jellyfin_operations is not None
-        ):
+        connector_revalidator = (
+            _connector_revalidator(
+                connector=connector,
+                request_id=f"{request_id}:{entry.capability_id}:status",
+                normalized_arguments=validation_result.normalized_arguments,
+                world_state_claims=world_state_claims,
+            )
+            if connector is not None
+            else None
+        )
+        if connector_revalidator is not None:
             configured_revalidators = {
                 **configured_revalidators,
-                JELLYFIN_REVALIDATOR_ID: jellyfin_status_revalidator(
-                    operations=jellyfin_operations,
-                    request_id=f"{request_id}:{entry.capability_id}:status",
-                    world_state_claims=world_state_claims,
-                ),
+                connector_revalidator.entry.revalidator_id: connector_revalidator,
             }
         revalidation = await _perform_revalidation(
             runtime=runtime,
@@ -1075,11 +1070,9 @@ async def authorize_and_execute_capability(
             active_persona_id=active_persona_id,
             entry=entry,
             normalized_arguments=validation_result.normalized_arguments,
-            jellyfin_operations=jellyfin_operations,
+            connector=connector,
         )
     except Exception:
-        if entry.capability_id == JELLYFIN_CAPABILITY_ID:
-            trace["restart_call_count"] = 1
         return _capability_not_executed(
             trace,
             "executor_failed",
@@ -1088,9 +1081,9 @@ async def authorize_and_execute_capability(
         )
     trace["executor_result_status"] = executor_result["status"]
     trace["executor_result"] = executor_result["trace"]
-    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+    if connector is not None:
         trace["restart_call_count"] = executor_result["trace"].get(
-            "restart_call_count",
+            "connector_call_count",
             0,
         )
     if executor_result["status"] != "ok":
@@ -1114,7 +1107,7 @@ async def authorize_and_execute_capability(
         verification = await _post_execution_verification(
             entry,
             executor_result,
-            operations=jellyfin_operations,
+            connector=connector,
             request_id=f"{request_id}:{entry.capability_id}:post-restart",
         )
         trace["post_execution_verification"] = verification
@@ -1156,7 +1149,7 @@ async def _post_execution_verification(
     entry: CapabilityEntry,
     executor_result: dict[str, Any],
     *,
-    operations: JellyfinOperations | None,
+    connector: ActionConnector | None,
     request_id: str,
 ) -> dict[str, Any]:
     failed = {
@@ -1165,66 +1158,45 @@ async def _post_execution_verification(
         "status": "failed",
         "reason_code": "verification_result_malformed",
     }
-    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
-        if (
-            operations is None
-            or operations.effect_mode not in JELLYFIN_EFFECT_MODES
-            or not callable(operations.status)
-        ):
-            return {**failed, "reason_code": "verification_unavailable"}
+    if connector is not None:
+        connector_result = executor_result.get("connector_result")
+        if not isinstance(connector_result, ConnectorExecutionResult):
+            return {**failed, "reason_code": "verification_result_malformed"}
         try:
-            raw = operations.status(
-                {
-                    "request_id": request_id,
-                    "capability_id": JELLYFIN_CAPABILITY_ID,
-                    "target": JELLYFIN_TARGET,
-                    "purpose": "post_restart",
-                    "claims": [],
-                }
+            result = await connector.verify(
+                ConnectorVerificationRequest(
+                    request_id=request_id,
+                    arguments=ConnectorArguments(
+                        executor_result.get("normalized_arguments", {})
+                    ),
+                    execution=connector_result,
+                )
             )
-            if hasattr(raw, "__await__"):
-                raw = await raw
         except Exception:
             return {
                 **failed,
                 "status": "unknown",
                 "reason_code": "verification_unavailable",
-                "call_count": 1,
-                "effect_mode": operations.effect_mode,
+                "call_count": 0,
+                "effect_mode": connector.effect_mode,
             }
-        parsed, reason = _parse_jellyfin_status_result(
-            raw,
-            purpose="post_restart",
-            expected_claims=[],
-        )
-        if parsed is None:
-            return {
-                **failed,
-                "reason_code": reason or "verification_result_malformed",
-                "call_count": 1,
-                "effect_mode": operations.effect_mode,
-            }
+        if not isinstance(result, ConnectorVerificationResult):
+            return {**failed, "reason_code": "verification_result_malformed"}
         status_map = {
-            "healthy": "verified",
-            "unhealthy": "failed",
-            "unknown": "unknown",
-            "failed": "failed",
-        }
-        reason_map = {
-            "healthy": "service_healthy",
-            "unhealthy": "service_unhealthy",
-            "unknown": "verification_unknown",
-            "failed": "verification_failed",
+            VerificationStatus.PASSED: "verified",
+            VerificationStatus.FAILED: "failed",
+            VerificationStatus.UNKNOWN: "unknown",
+            VerificationStatus.NOT_SUPPORTED: "not_supported",
         }
         return {
             "required": True,
             "method": "capability_verification",
-            "status": status_map[parsed.status],
-            "reason_code": reason_map[parsed.status],
-            "adapter_reason_code": parsed.reason_code,
-            "call_count": 1,
-            "effect_mode": operations.effect_mode,
-            "target": JELLYFIN_TARGET,
+            "status": status_map[result.status],
+            "reason_code": result.reason_code,
+            "adapter_reason_code": result.external_reason_code,
+            "call_count": result.external_call_count,
+            "effect_mode": result.effect_mode,
+            "target": result.target_label,
         }
     if entry.capability_id != "runtime.world_state.read":
         return {**failed, "reason_code": "verification_not_supported"}
@@ -1319,7 +1291,12 @@ def capability_validation_failure_trace(
     return trace
 
 
-def normalize_arguments(entry: CapabilityEntry, arguments: dict[str, Any]) -> dict[str, Any]:
+def normalize_arguments(
+    entry: CapabilityEntry,
+    arguments: dict[str, Any],
+    *,
+    connector_registry: ActionConnectorRegistry | None = None,
+) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise CapabilityValidationError("malformed_arguments")
     try:
@@ -1336,8 +1313,19 @@ def normalize_arguments(entry: CapabilityEntry, arguments: dict[str, Any]) -> di
         return _normalize_draft_arguments(arguments)
     if entry.capability_id == "runtime.relationship_context.read":
         return _normalize_relationship_context_arguments(arguments)
-    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
-        return _normalize_jellyfin_arguments(arguments)
+    if entry.executor_binding == "action_connector":
+        registry = connector_registry or ActionConnectorRegistry(
+            (JellyfinActionConnector(None),)
+        )
+        connector = registry.get(entry.capability_id)
+        if connector is None:
+            raise CapabilityValidationError("connector_unavailable")
+        try:
+            return connector.normalize_arguments(arguments).as_dict()
+        except ConnectorInputError as exc:
+            raise CapabilityValidationError(exc.reason_code) from exc
+        except (TypeError, ValueError) as exc:
+            raise CapabilityValidationError("schema_invalid_arguments") from exc
     raise CapabilityValidationError("unknown_capability_id")
 
 
@@ -1515,12 +1503,6 @@ def _normalize_relationship_context_arguments(arguments: dict[str, Any]) -> dict
             raise CapabilityValidationError("schema_invalid_arguments")
         normalized["output_mode"] = value
     return {key: normalized[key] for key in sorted(normalized)}
-
-
-def _normalize_jellyfin_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if set(arguments) != {"target"} or arguments.get("target") != JELLYFIN_TARGET:
-        raise CapabilityValidationError("schema_invalid_arguments")
-    return {"target": JELLYFIN_TARGET}
 
 
 def _completion_message(completion: dict[str, Any]) -> dict[str, Any] | None:
@@ -1734,8 +1716,6 @@ async def _perform_revalidation(
             "reason_code": "revalidation_required",
         }
     )
-    if revalidator_id == JELLYFIN_REVALIDATOR_ID:
-        trace["status_call_count"] = 0
     revalidator = revalidators.get(revalidator_id)
     if revalidator is None:
         trace.update({"status": "blocked", "reason_code": "unknown_revalidator_id"})
@@ -1744,11 +1724,14 @@ async def _perform_revalidation(
         trace.update({"status": "blocked", "reason_code": "mismatched_revalidator_id"})
         return _RevalidationResult(trace)
     trace["configured_revalidator_matched"] = True
-    status_count_before = 0
-    if revalidator_id == JELLYFIN_REVALIDATOR_ID:
-        count = getattr(revalidator.verify, "status_call_count", 0)
-        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-            status_count_before = count
+    connector_count_before = getattr(revalidator.verify, "external_call_count", None)
+    if isinstance(connector_count_before, int) and not isinstance(
+        connector_count_before,
+        bool,
+    ):
+        trace["status_call_count"] = 0
+    else:
+        connector_count_before = None
     outputs: list[RevalidationOutput] = []
     try:
         raw_outputs = revalidator.verify(tuple(claim_ids))
@@ -1758,13 +1741,13 @@ async def _perform_revalidation(
         trace.update({"status": "failed", "reason_code": "revalidator_unavailable"})
         return _RevalidationResult(trace)
     finally:
-        if revalidator_id == JELLYFIN_REVALIDATOR_ID:
-            count = getattr(revalidator.verify, "status_call_count", 0)
+        if connector_count_before is not None:
+            count = getattr(revalidator.verify, "external_call_count", 0)
             trace["status_call_count"] = (
-                count - status_count_before
+                count - connector_count_before
                 if isinstance(count, int)
                 and not isinstance(count, bool)
-                and count >= status_count_before
+                and count >= connector_count_before
                 else 0
             )
     if not isinstance(raw_outputs, list) or len(raw_outputs) != len(claim_ids):
@@ -2282,7 +2265,7 @@ async def _execute_capability(
     active_persona_id: str,
     entry: CapabilityEntry,
     normalized_arguments: dict[str, Any],
-    jellyfin_operations: JellyfinOperations | None,
+    connector: ActionConnector | None,
 ) -> dict[str, Any]:
     if entry.capability_id == "runtime.world_state.read":
         return await _execute_world_state_read(
@@ -2308,9 +2291,9 @@ async def _execute_capability(
         )
     if entry.capability_id == "draft.local_message":
         return _execute_local_message_draft(normalized_arguments)
-    if entry.capability_id == JELLYFIN_CAPABILITY_ID:
-        return await _execute_jellyfin_restart(
-            operations=jellyfin_operations,
+    if entry.executor_binding == "action_connector":
+        return await _execute_action_connector(
+            connector=connector,
             request_id=request_id,
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
@@ -2324,76 +2307,40 @@ async def _execute_capability(
     }
 
 
-async def _execute_jellyfin_restart(
+async def _execute_action_connector(
     *,
-    operations: JellyfinOperations | None,
+    connector: ActionConnector | None,
     request_id: str,
     runtime_session_id: str,
     runtime_turn_id: str,
     normalized_arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    if (
-        operations is None
-        or operations.effect_mode not in JELLYFIN_EFFECT_MODES
-        or not callable(operations.restart)
-        or normalized_arguments != {"target": JELLYFIN_TARGET}
-    ):
-        return _executor_failure("jellyfin_operations_unavailable")
-    raw = operations.restart(
-        {
-            "request_id": request_id,
-            "runtime_session_id": runtime_session_id,
-            "runtime_turn_id": runtime_turn_id,
-            "capability_id": JELLYFIN_CAPABILITY_ID,
-            "target": JELLYFIN_TARGET,
-        }
+    if connector is None:
+        return _executor_failure("connector_unavailable")
+    result = await connector.execute(
+        ConnectorExecutionRequest(
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            arguments=ConnectorArguments(normalized_arguments),
+        )
     )
-    if hasattr(raw, "__await__"):
-        raw = await raw
-    if not isinstance(raw, dict) or set(raw) != {"status", "reason_code"}:
-        return {
-            "status": "failed",
-            "reason_code": "malformed_restart_result",
-            "trace": {
-                "status": "failed",
-                "reason_code": "malformed_restart_result",
-                "restart_call_count": 1,
-                "effect_mode": operations.effect_mode,
-            },
-            "response_text": "",
-        }
-    status = raw.get("status")
-    reason_code = raw.get("reason_code")
-    if (
-        status not in {"completed", "failed", "unknown"}
-        or not isinstance(reason_code, str)
-        or not _SAFE_LABEL.fullmatch(reason_code)
-    ):
-        return {
-            "status": "failed",
-            "reason_code": "malformed_restart_result",
-            "trace": {
-                "status": "failed",
-                "reason_code": "malformed_restart_result",
-                "restart_call_count": 1,
-                "effect_mode": operations.effect_mode,
-            },
-            "response_text": "",
-        }
-    result_status = "ok" if status == "completed" else status
+    if not isinstance(result, ConnectorExecutionResult):
+        return _executor_failure("malformed_connector_result")
+    result_status = "ok" if result.status is ExecutionStatus.COMPLETED else result.status.value
     return {
         "status": result_status,
-        "reason_code": (
-            "executed" if status == "completed" else f"restart_{status}"
-        ),
+        "reason_code": result.reason_code,
         "trace": {
-            "status": status,
-            "reason_code": reason_code,
-            "restart_call_count": 1,
-            "effect_mode": operations.effect_mode,
-            "target": JELLYFIN_TARGET,
+            "status": result.status.value,
+            "reason_code": result.external_reason_code,
+            "connector_call_count": result.external_call_count,
+            "effect_mode": result.effect_mode,
+            "target": result.target_label,
         },
         "response_text": "",
+        "connector_result": result,
+        "normalized_arguments": normalized_arguments,
     }
 
 
@@ -2594,61 +2541,6 @@ def _failed_revalidation_output(
     )
 
 
-def _parse_jellyfin_status_result(
-    value: Any,
-    *,
-    purpose: str,
-    expected_claims: list[dict[str, str]],
-) -> tuple[_JellyfinStatusResult | None, str | None]:
-    expected_fields = {
-        "status",
-        "reason_code",
-        "observed_at",
-        "verified_at",
-        "claims",
-    }
-    if not isinstance(value, dict) or set(value) != expected_fields:
-        return None, "malformed_status_result"
-    status = value.get("status")
-    allowed_statuses = (
-        {"safe", "unsafe", "unknown", "failed"}
-        if purpose == "revalidation"
-        else {"healthy", "unhealthy", "unknown", "failed"}
-    )
-    reason_code = value.get("reason_code")
-    observed_at = value.get("observed_at")
-    verified_at = value.get("verified_at")
-    claims = value.get("claims")
-    if (
-        status not in allowed_statuses
-        or not isinstance(reason_code, str)
-        or not _SAFE_LABEL.fullmatch(reason_code)
-        or not isinstance(observed_at, str)
-        or _parse_timestamp(observed_at) is None
-        or not isinstance(verified_at, str)
-        or _parse_timestamp(verified_at) is None
-        or not isinstance(claims, list)
-    ):
-        return None, "malformed_status_result"
-    parsed_claims = _safe_world_state_claim_refs(claims)
-    if len(parsed_claims) != len(claims):
-        return None, "malformed_status_result"
-    if sorted(parsed_claims, key=lambda item: item["claim_id"]) != sorted(
-        expected_claims,
-        key=lambda item: item["claim_id"],
-    ):
-        return None, "status_claim_mismatch"
-    return (
-        _JellyfinStatusResult(
-            status=status,
-            reason_code=reason_code,
-            observed_at=observed_at,
-            verified_at=verified_at,
-        ),
-        None,
-    )
-
-
 def _filter_world_state_claims(
     claims: list[Any],
     *,
@@ -2716,28 +2608,46 @@ def _safe_world_state_claim_refs(value: Any) -> list[dict[str, str]]:
     return cleaned
 
 
-def _jellyfin_local_gate_reason(
+def _connector_claim_refs(
+    value: list[dict[str, str]],
+) -> tuple[ConnectorClaimRef, ...]:
+    return tuple(
+        ConnectorClaimRef(
+            claim_id=item["claim_id"],
+            value_digest=item["value_digest"],
+        )
+        for item in value
+    )
+
+
+def _connector_local_gate_reason(
     *,
     entry: CapabilityEntry,
     surface: str,
     active_persona_id: str | None,
-    operations: JellyfinOperations | None,
+    connector_registry: ActionConnectorRegistry | None,
     world_state_claims: list[dict[str, str]],
 ) -> str | None:
     if surface not in entry.enabled_surfaces:
         return "surface_not_enabled"
     if active_persona_id not in entry.enabled_personas:
         return "persona_not_enabled"
-    if (
-        operations is None
-        or operations.effect_mode not in JELLYFIN_EFFECT_MODES
-        or not callable(operations.status)
-        or not callable(operations.restart)
-    ):
-        return "jellyfin_operations_unavailable"
-    if not world_state_claims:
-        return "restart_safe_claim_unavailable"
-    return None
+    connector = connector_registry.get(entry.capability_id) if connector_registry else None
+    if connector is None:
+        return "connector_unavailable"
+    try:
+        result = connector.check_availability(
+            ConnectorAvailabilityRequest(
+                surface=surface,
+                active_persona_id=active_persona_id,
+                selected_claims=_connector_claim_refs(world_state_claims),
+            )
+        )
+    except Exception:
+        return "connector_unavailable"
+    if not isinstance(result, ConnectorAvailabilityResult):
+        return "connector_unavailable"
+    return None if result.available else result.reason_code
 
 
 def _bounded_optional_string(value: Any, max_length: int) -> str | None:

@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 
 import pytest
+import services.capabilities as capability_service
 from models import ChatRequest, ChatResponse
 from pydantic import ValidationError
+from services.action_connectors import ActionConnectorRegistry
 from services.capabilities import (
     CapabilityValidationError,
-    JellyfinOperations,
     RevalidationOutput,
     Revalidator,
     RevalidatorEntry,
@@ -20,6 +21,10 @@ from services.capabilities import (
     production_capability_registry,
     provider_descriptors,
     validate_and_digest_capability_request,
+)
+from services.jellyfin_action_connector import (
+    JellyfinActionConnector,
+    JellyfinOperations,
 )
 
 
@@ -234,6 +239,7 @@ def _validated(provider_tool_name: str, arguments: dict[str, object]):
             "runtime.relationship_context.read",
             "jellyfin_restart",
         ],
+        connector_registry=ActionConnectorRegistry((JellyfinActionConnector(None),)),
     )
 
 
@@ -2103,7 +2109,9 @@ async def _jellyfin_execute(runtime, adapter, confirmation=None):
         active_persona_id="technical_architect",
         validation_result=_jellyfin_validation(),
         selected_world_state_claims=_JELLYFIN_CLAIMS,
-        jellyfin_operations=adapter.binding(),
+        connector_registry=ActionConnectorRegistry(
+            (JellyfinActionConnector(adapter.binding()),)
+        ),
         capability_confirmation=confirmation,
     )
 
@@ -2224,8 +2232,63 @@ def test_jellyfin_rejects_every_non_exact_argument_shape(arguments):
         validate_and_digest_capability_request(
             request=request,
             exposed_capability_ids=["jellyfin_restart"],
+            connector_registry=ActionConnectorRegistry(
+                (JellyfinActionConnector(None),)
+            ),
         )
     assert exc.value.reason_code == "schema_invalid_arguments"
+
+
+def test_connector_lookup_drives_jellyfin_normalization():
+    class RecordingConnector(JellyfinActionConnector):
+        def __init__(self):
+            super().__init__(None)
+            self.normalization_calls = []
+
+        def normalize_arguments(self, arguments):
+            self.normalization_calls.append(arguments)
+            return super().normalize_arguments(arguments)
+
+    connector = RecordingConnector()
+    request = parse_provider_capability_request(
+        _call("jellyfin_safe_restart", {"target": "service:jellyfin"})
+    )
+    result = validate_and_digest_capability_request(
+        request=request,
+        exposed_capability_ids=["jellyfin_restart"],
+        connector_registry=ActionConnectorRegistry((connector,)),
+    )
+    assert connector.normalization_calls == [{"target": "service:jellyfin"}]
+    assert result.normalized_arguments == {"target": "service:jellyfin"}
+
+
+@pytest.mark.asyncio
+async def test_unknown_connector_blocks_connector_backed_execution():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    result = await authorize_and_execute_capability(
+        runtime=runtime,
+        request_id="rid-jellyfin-missing-connector",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_jellyfin",
+        runtime_turn_id="rtturn_jellyfin",
+        active_persona_id="technical_architect",
+        validation_result=_jellyfin_validation(),
+        selected_world_state_claims=_JELLYFIN_CLAIMS,
+        connector_registry=ActionConnectorRegistry(()),
+    )
+    assert result.trace["failure_reason_code"] == "connector_unavailable"
+    assert runtime.authorization_calls == []
+    assert adapter.status_inputs == []
+    assert adapter.restart_inputs == []
+
+
+def test_capability_service_has_no_direct_jellyfin_adapter_path():
+    assert not hasattr(capability_service, "_parse_jellyfin_status_result")
+    assert not hasattr(capability_service, "_execute_jellyfin_restart")
+    assert not hasattr(capability_service, "_JellyfinStatusVerifier")
 
 
 @pytest.mark.asyncio
@@ -2354,7 +2417,13 @@ async def test_jellyfin_exposure_fails_closed_when_local_inputs_are_missing(
         runtime_turn_id="rtturn_jellyfin",
         active_persona_id=persona,
         selected_world_state_claims=_JELLYFIN_CLAIMS if with_claim else [],
-        jellyfin_operations=adapter.binding() if with_adapter else None,
+        connector_registry=ActionConnectorRegistry(
+            (
+                JellyfinActionConnector(
+                    adapter.binding() if with_adapter else None
+                ),
+            )
+        ),
         allowed_capability_ids=["jellyfin_restart"],
     )
     assert descriptors == []
@@ -2376,7 +2445,9 @@ async def test_jellyfin_exposure_sends_exact_registered_metadata_without_full_wo
         runtime_turn_id="rtturn_jellyfin",
         active_persona_id="technical_architect",
         selected_world_state_claims=_JELLYFIN_CLAIMS,
-        jellyfin_operations=adapter.binding(),
+        connector_registry=ActionConnectorRegistry(
+            (JellyfinActionConnector(adapter.binding()),)
+        ),
         allowed_capability_ids=["jellyfin_restart"],
     )
     assert [item["function"]["name"] for item in descriptors] == ["jellyfin_safe_restart"]
