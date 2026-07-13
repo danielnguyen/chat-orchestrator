@@ -2573,7 +2573,7 @@ def _pending_action_envelope(
     confirmation_text = _safe_confirmation_text(
         continuation.get("confirmation_text"), required=True
     )
-    policy_confirmation_text = _safe_confirmation_text(
+    cr_confirmation_text = _safe_confirmation_text(
         action_flow.get("confirmation_text"), required=True
     )
     capability_id = _sanitize_trace_string(
@@ -2588,9 +2588,10 @@ def _pending_action_envelope(
             capability_id,
             target,
             confirmation_text,
-            policy_confirmation_text,
+            cr_confirmation_text,
         }
-        or confirmation_text != policy_confirmation_text
+        or action_flow.get("confirmation_required") is not True
+        or action_flow.get("execution_allowed") is not False
     ):
         return None
     return {
@@ -2852,7 +2853,7 @@ async def _resolve_capability_continuation_policy(
                 else "confirmation_cancelled"
             ),
             affects_multiple_systems=False,
-            target_label=None,
+            target_label=continuation.target,
         )
         flow_result = flow_response.get("result") if isinstance(flow_response, dict) else None
         action_flow = _safe_action_flow_decision(flow_result)
@@ -7318,16 +7319,6 @@ async def orchestrate_chat(
                                 "verification_required"
                             )
                             is True
-                        ),
-                        policy_confirmation_text=(
-                            capability_registry_trace.get("action_flow", {}).get(
-                                "confirmation_text"
-                            )
-                            if capability_registry_trace.get("action_flow", {}).get(
-                                "confirmation_required"
-                            )
-                            is True
-                            else None
                         ),
                     )
                     prompt.trace["capabilities"]["execution"] = execution_result.trace

@@ -896,7 +896,6 @@ async def authorize_and_execute_capability(
     connector_registry: ActionConnectorRegistry | None = None,
     capability_confirmation: dict[str, Any] | None = None,
     post_execution_verification_required: bool = False,
-    policy_confirmation_text: str | None = None,
 ) -> CapabilityExecutionResult:
     entry = capability_by_id(validation_result.capability_id)
     connector = (
@@ -997,15 +996,6 @@ async def authorize_and_execute_capability(
             "target": continuation_description.target,
             "confirmation_text": continuation_description.confirmation_text,
         }
-        if (
-            policy_confirmation_text is not None
-            and policy_confirmation_text != continuation_description.confirmation_text
-        ):
-            return _capability_not_executed(
-                trace,
-                "policy_confirmation_text_mismatch",
-                "I could not use that capability request safely.",
-            )
         if continuation is not None:
             mismatch_reason = None
             if continuation.capability_id != validation_result.capability_id:

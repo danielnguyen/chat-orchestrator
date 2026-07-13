@@ -13178,7 +13178,7 @@ class DisplaySettingRuntime(CapabilityRuntime):
                 "dry_run_supported": True,
                 "dry_run_effects": [],
                 "confirmation_required": True,
-                "confirmation_text": "Confirm display level 7 for fixture:display.",
+                "confirmation_text": "Confirm the display setting change.",
                 "execution_allowed": confirmed,
                 "verification_required": False,
                 "verification_supported": False,
@@ -13532,9 +13532,11 @@ def test_shared_action_helpers_have_no_product_identity_branches():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("level", [3, 7])
 async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay(
     tmp_path,
     monkeypatch,
+    level,
 ):
     _install_display_capability(monkeypatch)
     rules, models = _write_router_files(tmp_path)
@@ -13547,20 +13549,20 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
         [
             _tool_completion(
                 "fixture_display_setting_apply",
-                {"target": "fixture:display", "level": 7},
+                {"target": "fixture:display", "level": level},
             )
         ]
     )
 
     first = await orchestrate_chat(
-        payload=_display_chat_payload("Apply display level seven."),
+        payload=_display_chat_payload(f"Apply display level {level}."),
         memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-display-first",
+        request_id=f"rid-display-{level}-first",
         capability_registry_enabled=True,
         action_connector_registry=connectors,
     )
@@ -13570,6 +13572,11 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
     assert connector.verify_inputs == []
     assert runtime.confirmation_calls == []
     assert runtime.dispatch_count == 0
+    first_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]
+    assert first_trace["capabilities"]["provider_call_count"] == 1
+    assert first_trace["capabilities"]["action_summary_call_count"] == 1
     assert first["pending_action"] == {
         "schema_version": "co.pending-action.v1",
         "status": "pending_confirmation",
@@ -13578,8 +13585,28 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
         "argument_digest": first["pending_action"]["argument_digest"],
         "challenge_ref": "challenge-display-1",
         "challenge_expires_at": "2026-07-14T01:00:00+00:00",
-        "confirmation_text": "Confirm display level 7 for fixture:display.",
+        "confirmation_text": f"Confirm display level {level} for fixture:display.",
     }
+    restored = capability_service.restore_pending_action_request(
+        continuation=capability_service.parse_pending_action_confirmation(
+            {
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            }
+        )[0],
+        connector_registry=connectors,
+    )
+    assert restored.arguments == {"level": level, "target": "fixture:display"}
+    assert operations.apply_inputs == []
+    assert connector.verify_inputs == []
+    assert first["pending_action"]["argument_digest"] == (
+        capability_service.argument_digest(
+            DISPLAY_CAPABILITY.capability_id,
+            restored.arguments,
+        )
+    )
+    assert runtime.capability_flow_calls[0]["target_label"] is None
+    assert runtime.capability_flow_calls[0].get("confirmation_text") is None
 
     accepted = await orchestrate_chat(
         payload=_display_chat_payload(
@@ -13595,7 +13622,7 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-display-accepted",
+        request_id=f"rid-display-{level}-accepted",
         capability_registry_enabled=True,
         action_connector_registry=connectors,
     )
@@ -13607,13 +13634,28 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
     )
     assert runtime.dispatch_count == 1
     assert len(operations.apply_inputs) == 1
-    assert operations.apply_inputs[0]["level"] == 7
+    assert operations.apply_inputs[0]["level"] == level
     assert connector.verify_inputs == []
     assert "Verification is not supported" in accepted["answer"]
-    accepted_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
+    accepted_prompt_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
         "prompt_assembly"
-    ]["capabilities"]
+    ]
+    accepted_trace = accepted_prompt_trace["capabilities"]
     assert accepted_trace["provider_call_count"] == 0
+    assert runtime.capability_flow_calls[1]["target_label"] == "fixture:display"
+    assert runtime.capability_flow_calls[1].get("confirmation_text") is None
+    assert (
+        accepted_prompt_trace["capability_registry"]["action_flow"][
+            "confirmation_text"
+        ]
+        == "Confirm the display setting change."
+    )
+    assert (
+        first["pending_action"]["confirmation_text"]
+        != accepted_prompt_trace["capability_registry"]["action_flow"][
+            "confirmation_text"
+        ]
+    )
     assert accepted_trace["execution"]["connector_execution_call_count"] == 1
     assert accepted_trace["execution"]["connector_verification_call_count"] == 0
     assert accepted_trace["action_summary_call_count"] == 1
@@ -13632,7 +13674,7 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-display-replay",
+        request_id=f"rid-display-{level}-replay",
         capability_registry_enabled=True,
         action_connector_registry=connectors,
     )
@@ -13794,6 +13836,83 @@ async def test_orchestrate_display_setting_expiry_and_mismatch_do_not_replace_ch
     assert mismatch["status"] == "failed"
     assert len(memory_store.trace_calls) == trace_count
     assert len(litellm.calls) == 1
+    assert operations.apply_inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target", "fixture:other"),
+        ("confirmation_text", "Confirm display level 3 for fixture:display."),
+        ("argument_digest", "capargs_00000000000000000000000000000000"),
+    ],
+)
+async def test_orchestrate_display_setting_mismatch_fails_before_dependencies(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connectors = ActionConnectorRegistry((DisplaySettingConnector(operations),))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-mismatch-{field}-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    trace_count = len(memory_store.trace_calls)
+    authority_count = len(runtime.capability_authority_calls)
+    flow_count = len(runtime.capability_flow_calls)
+    authorization_count = len(runtime.capability_authorization_calls)
+    mismatched_pending = {**first["pending_action"], field: value}
+
+    mismatch = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": mismatched_pending,
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-mismatch-{field}-second",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert mismatch["status"] == "failed"
+    assert len(memory_store.trace_calls) == trace_count
+    assert len(runtime.capability_authority_calls) == authority_count
+    assert len(runtime.capability_flow_calls) == flow_count
+    assert len(runtime.capability_authorization_calls) == authorization_count
+    assert len(litellm.calls) == 1
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
     assert operations.apply_inputs == []
 
 
