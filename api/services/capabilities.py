@@ -14,9 +14,11 @@ from services.action_connectors import (
     ConnectorAvailabilityRequest,
     ConnectorAvailabilityResult,
     ConnectorClaimRef,
+    ConnectorContinuationDescription,
     ConnectorExecutionRequest,
     ConnectorExecutionResult,
     ConnectorInputError,
+    ConnectorOutcome,
     ConnectorRevalidationRequest,
     ConnectorRevalidationResult,
     ConnectorVerificationRequest,
@@ -84,6 +86,17 @@ class CapabilityValidationError(ValueError):
 
 
 @dataclass(frozen=True)
+class CapabilityPolicyShape:
+    registry_domain: str
+    operation_kind: str
+    risk_level: str
+    requires_confirmation: bool
+    reversible: bool
+    dry_run_supported: bool
+    verification_supported: bool
+
+
+@dataclass(frozen=True)
 class CapabilityEntry:
     capability_id: str
     provider_tool_name: str
@@ -97,6 +110,7 @@ class CapabilityEntry:
     argument_schema: dict[str, Any]
     enabled_surfaces: tuple[str, ...] = ()
     enabled_personas: tuple[str, ...] = ()
+    policy_shape: CapabilityPolicyShape | None = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +308,15 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
                 },
             },
         },
+        policy_shape=CapabilityPolicyShape(
+            registry_domain="runtime_context",
+            operation_kind="read_only",
+            risk_level="low_read_only",
+            requires_confirmation=False,
+            reversible=True,
+            dry_run_supported=True,
+            verification_supported=True,
+        ),
     ),
     CapabilityEntry(
         capability_id="draft.local_message",
@@ -389,6 +412,15 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
         },
         enabled_surfaces=("dev",),
         enabled_personas=("technical_architect",),
+        policy_shape=CapabilityPolicyShape(
+            registry_domain="media_operations",
+            operation_kind="restart",
+            risk_level="medium_service_interruption",
+            requires_confirmation=True,
+            reversible=False,
+            dry_run_supported=True,
+            verification_supported=True,
+        ),
     ),
 )
 
@@ -586,7 +618,7 @@ async def filter_capability_descriptors_for_exposure(
                 "world_state_requirements",
                 [],
             )
-            if entry.capability_id == JELLYFIN_CAPABILITY_ID:
+            if entry.executor_binding == "action_connector":
                 world_state_requirements = []
             response = await runtime.authorize_capability(
                 request_id=f"{request_id}:{entry.capability_id}:exposure",
@@ -732,7 +764,7 @@ def parse_pending_action_confirmation(
         return None, None
     if not isinstance(value, dict):
         return None, "malformed_confirmation"
-    if "pending_action" not in value:
+    if "pending_action" not in value or value.get("pending_action") is None:
         return None, None
     allowed_fields = {
         "pending_action",
@@ -767,10 +799,10 @@ def parse_pending_action_confirmation(
     if (
         pending.get("schema_version") != "co.pending-action.v1"
         or pending.get("status") != "pending_confirmation"
-        or pending.get("capability_id") != JELLYFIN_CAPABILITY_ID
-        or pending.get("target") != JELLYFIN_TARGET
     ):
         return None, "pending_action_mismatch"
+    capability_id = pending.get("capability_id")
+    target = pending.get("target")
     challenge_ref = pending.get("challenge_ref")
     digest = pending.get("argument_digest")
     expires_at = pending.get("challenge_expires_at")
@@ -778,6 +810,9 @@ def parse_pending_action_confirmation(
     if (
         not isinstance(challenge_ref, str)
         or not _SAFE_LABEL.fullmatch(challenge_ref)
+        or not is_valid_capability_id(capability_id)
+        or not isinstance(target, str)
+        or not _SAFE_LABEL.fullmatch(target)
         or not isinstance(digest, str)
         or not _SAFE_LABEL.fullmatch(digest)
         or not isinstance(expires_at, str)
@@ -785,25 +820,62 @@ def parse_pending_action_confirmation(
         or _parse_timestamp(expires_at) is None
         or not isinstance(confirmation_text, str)
         or not 0 < len(confirmation_text) <= 500
+        or confirmation_text != confirmation_text.strip()
+        or any(
+            ord(character) < 32 and character not in "\n\t"
+            for character in confirmation_text
+        )
     ):
         return None, "malformed_pending_action"
-    expected_digest = argument_digest(
-        JELLYFIN_CAPABILITY_ID,
-        {"target": JELLYFIN_TARGET},
-    )
-    if digest != expected_digest:
-        return None, "pending_action_digest_mismatch"
     return (
         PendingActionContinuation(
             challenge_ref=challenge_ref,
-            capability_id=JELLYFIN_CAPABILITY_ID,
-            target=JELLYFIN_TARGET,
+            capability_id=capability_id,
+            target=target,
             argument_digest=digest,
             challenge_expires_at=expires_at,
             confirmation_text=confirmation_text,
             confirmed=confirmed,
         ),
         None,
+    )
+
+
+def restore_pending_action_request(
+    *,
+    continuation: PendingActionContinuation,
+    connector_registry: ActionConnectorRegistry | None,
+) -> ParsedCapabilityRequest:
+    entry = capability_by_id(continuation.capability_id)
+    if entry is None:
+        raise CapabilityValidationError("unknown_capability_id")
+    if entry.executor_binding != "action_connector" or connector_registry is None:
+        raise CapabilityValidationError("connector_unavailable")
+    connector = connector_registry.get(entry.capability_id)
+    if connector is None or connector.capability_id != entry.capability_id:
+        raise CapabilityValidationError("connector_unavailable")
+    description = ConnectorContinuationDescription(
+        target=continuation.target,
+        confirmation_text=continuation.confirmation_text,
+    )
+    try:
+        restored = connector.restore_continuation(description)
+        normalized = connector.normalize_arguments(restored.as_dict())
+        expected_description = connector.describe_continuation(normalized)
+    except ConnectorInputError as exc:
+        raise CapabilityValidationError(exc.reason_code) from exc
+    except (TypeError, ValueError) as exc:
+        raise CapabilityValidationError("malformed_pending_action") from exc
+    if expected_description.target != continuation.target:
+        raise CapabilityValidationError("pending_action_target_mismatch")
+    if expected_description.confirmation_text != continuation.confirmation_text:
+        raise CapabilityValidationError("pending_action_confirmation_text_mismatch")
+    if argument_digest(entry.capability_id, normalized.as_dict()) != continuation.argument_digest:
+        raise CapabilityValidationError("pending_action_digest_mismatch")
+    return ParsedCapabilityRequest(
+        capability_id=entry.capability_id,
+        provider_tool_name=entry.provider_tool_name,
+        arguments=normalized.as_dict(),
     )
 
 
@@ -836,7 +908,21 @@ async def authorize_and_execute_capability(
     continuation, confirmation_shape_error = parse_pending_action_confirmation(
         capability_confirmation
     )
+    legacy_confirmation_supplied = (
+        isinstance(capability_confirmation, dict)
+        and capability_confirmation.get("pending_action") is None
+        and all(
+            capability_confirmation.get(field) is not None
+            for field in (
+                "challenge_ref",
+                "capability_id",
+                "argument_digest",
+                "confirmed",
+            )
+        )
+    )
     verification_required = post_execution_verification_required
+    continuation_description: ConnectorContinuationDescription | None = None
     trace = {
         **validation_result.trace,
         "authorization": {
@@ -852,6 +938,8 @@ async def authorize_and_execute_capability(
         "executor_binding": entry.executor_binding if entry else None,
         "executor_called": False,
         "executor_call_count": 0,
+        "connector_execution_call_count": 0,
+        "connector_verification_call_count": 0,
         "restart_call_count": 0,
         "post_restart_verification_call_count": 0,
         "effect_mode": (
@@ -890,17 +978,43 @@ async def authorize_and_execute_capability(
             return _capability_not_executed(
                 trace,
                 local_reason,
-                "I could not restart service:jellyfin safely. No action was taken.",
+                connector.presentation.text_for(ConnectorOutcome.EXECUTION_FAILED)
+                if connector is not None
+                else "I could not use that capability request safely.",
             )
-        if continuation is not None and (
-            continuation.argument_digest != validation_result.argument_digest
-            or validation_result.normalized_arguments != {"target": JELLYFIN_TARGET}
-        ):
+        try:
+            continuation_description = connector.describe_continuation(
+                ConnectorArguments(validation_result.normalized_arguments)
+            )
+        except (ConnectorInputError, TypeError, ValueError):
             return _capability_not_executed(
                 trace,
-                "pending_action_digest_mismatch",
-                "I could not use that capability confirmation safely.",
+                "continuation_description_invalid",
+                "I could not use that capability request safely.",
             )
+        trace["continuation"] = {
+            "target": continuation_description.target,
+            "confirmation_text": continuation_description.confirmation_text,
+        }
+        if continuation is not None:
+            mismatch_reason = None
+            if continuation.capability_id != validation_result.capability_id:
+                mismatch_reason = "pending_action_mismatch"
+            elif continuation.target != continuation_description.target:
+                mismatch_reason = "pending_action_target_mismatch"
+            elif (
+                continuation.confirmation_text
+                != continuation_description.confirmation_text
+            ):
+                mismatch_reason = "pending_action_confirmation_text_mismatch"
+            elif continuation.argument_digest != validation_result.argument_digest:
+                mismatch_reason = "pending_action_digest_mismatch"
+            if mismatch_reason is not None:
+                return _capability_not_executed(
+                    trace,
+                    mismatch_reason,
+                    "I could not use that capability confirmation safely.",
+                )
     if (
         runtime is None
         or entry is None
@@ -984,7 +1098,11 @@ async def authorize_and_execute_capability(
         selection = revalidation.selection
     confirmed_challenge_ref = None
     if selection.trace["status"] == "confirmation_required":
-        if entry.capability_id == JELLYFIN_CAPABILITY_ID and continuation is None:
+        if (
+            connector is not None
+            and continuation is None
+            and not legacy_confirmation_supplied
+        ):
             trace["confirmation"] = _confirmation_empty_trace(
                 "required_pending",
                 entry.capability_id,
@@ -993,9 +1111,8 @@ async def authorize_and_execute_capability(
             trace["failure_reason_code"] = "confirmation_required"
             trace["response_status"] = "pending_confirmation"
             return CapabilityExecutionResult(
-                response_text=(
-                    "Restarting service:jellyfin requires confirmation. No action "
-                    "was taken."
+                response_text=connector.presentation.text_for(
+                    ConnectorOutcome.PENDING_CONFIRMATION
                 ),
                 trace=trace,
             )
@@ -1020,17 +1137,18 @@ async def authorize_and_execute_capability(
                 if continuation is not None
                 else capability_confirmation
             ),
-            allow_rejection=(
-                entry.capability_id == JELLYFIN_CAPABILITY_ID
-                and continuation is not None
-            ),
+            allow_rejection=continuation is not None,
         )
         trace["confirmation"] = confirmation.trace
         if confirmation.trace["status"] == "rejected":
             return _capability_not_executed(
                 trace,
                 "confirmation_rejected",
-                "The restart of service:jellyfin was rejected. No action was taken.",
+                connector.presentation.text_for(
+                    ConnectorOutcome.CONFIRMATION_REJECTED
+                )
+                if connector is not None
+                else "That action was rejected. No action was taken.",
             )
         if confirmation.trace["status"] != "accepted":
             return _capability_not_executed(
@@ -1104,31 +1222,37 @@ async def authorize_and_execute_capability(
         return _capability_not_executed(
             trace,
             "executor_failed",
-            "I could not complete that capability request.",
+            connector.presentation.text_for(ConnectorOutcome.EXECUTION_FAILED)
+            if connector is not None
+            else "I could not complete that capability request.",
             executor_failed=True,
         )
     trace["executor_result_status"] = executor_result["status"]
     trace["executor_result"] = executor_result["trace"]
     if connector is not None:
-        trace["restart_call_count"] = executor_result["trace"].get(
+        trace["connector_execution_call_count"] = executor_result["trace"].get(
             "connector_call_count",
             0,
         )
+        trace["restart_call_count"] = trace["connector_execution_call_count"]
     if executor_result["status"] != "ok":
         if executor_result["status"] == "unknown":
             trace["failure_reason_code"] = executor_result["reason_code"]
             trace["response_status"] = "executor_unknown"
             return CapabilityExecutionResult(
-                response_text=(
-                    "The restart outcome for service:jellyfin is unknown. I did not "
-                    "retry it."
-                ),
+                response_text=connector.presentation.text_for(
+                    ConnectorOutcome.EXECUTION_UNKNOWN
+                )
+                if connector is not None
+                else "The capability outcome is unknown. I did not retry it.",
                 trace=trace,
             )
         return _capability_not_executed(
             trace,
             executor_result["reason_code"],
-            "I could not complete that capability request.",
+            connector.presentation.text_for(ConnectorOutcome.EXECUTION_FAILED)
+            if connector is not None
+            else "I could not complete that capability request.",
             executor_failed=True,
         )
     if verification_required:
@@ -1136,39 +1260,43 @@ async def authorize_and_execute_capability(
             entry,
             executor_result,
             connector=connector,
-            request_id=f"{request_id}:{entry.capability_id}:post-restart",
+            request_id=f"{request_id}:{entry.capability_id}:post-execution",
         )
         trace["post_execution_verification"] = verification
-        trace["post_restart_verification_call_count"] = verification.get(
+        trace["connector_verification_call_count"] = verification.get(
             "call_count",
             0,
         )
+        trace["post_restart_verification_call_count"] = trace[
+            "connector_verification_call_count"
+        ]
         if verification["status"] != "verified":
             trace["failure_reason_code"] = verification["reason_code"]
             trace["response_status"] = "executed_unverified"
             return CapabilityExecutionResult(
-                response_text=(
-                    "The restart was attempted, but service:jellyfin could not be "
-                    "verified healthy. I did not retry it."
-                    if entry.capability_id == JELLYFIN_CAPABILITY_ID
-                    else "I read bounded runtime world state, but I could not verify "
-                    "the result safely."
-                ),
+                response_text=connector.presentation.text_for(
+                    ConnectorOutcome.EXECUTED_UNVERIFIED
+                )
+                if connector is not None
+                else "I read bounded runtime world state, but I could not verify "
+                "the result safely.",
                 trace=trace,
             )
         trace["response_status"] = "executed_verified"
         return CapabilityExecutionResult(
-            response_text=(
-                "I restarted service:jellyfin once and verified it is healthy."
-                if entry.capability_id == JELLYFIN_CAPABILITY_ID
-                else "I read bounded runtime world state and verified the result: found "
-                f"{verification['matching_claim_count']} matching claim(s)."
-            ),
+            response_text=connector.presentation.text_for(
+                ConnectorOutcome.EXECUTED_VERIFIED
+            )
+            if connector is not None
+            else "I read bounded runtime world state and verified the result: found "
+            f"{verification['matching_claim_count']} matching claim(s).",
             trace=trace,
         )
     trace["response_status"] = "executed"
     return CapabilityExecutionResult(
-        response_text=executor_result["response_text"],
+        response_text=connector.presentation.text_for(ConnectorOutcome.EXECUTED)
+        if connector is not None
+        else executor_result["response_text"],
         trace=trace,
     )
 

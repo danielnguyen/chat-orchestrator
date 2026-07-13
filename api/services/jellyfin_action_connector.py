@@ -9,9 +9,11 @@ from services.action_connectors import (
     ConnectorAvailabilityRequest,
     ConnectorAvailabilityResult,
     ConnectorClaimObservation,
+    ConnectorContinuationDescription,
     ConnectorExecutionRequest,
     ConnectorExecutionResult,
     ConnectorInputError,
+    ConnectorPresentation,
     ConnectorRevalidationRequest,
     ConnectorRevalidationResult,
     ConnectorRevalidationSpec,
@@ -52,6 +54,28 @@ class JellyfinActionConnector:
         source_type="tool_output",
         source_ref=JELLYFIN_REVALIDATOR_ID,
     )
+    presentation = ConnectorPresentation(
+        pending_confirmation=(
+            "Restarting service:jellyfin requires confirmation. No action was taken."
+        ),
+        confirmation_rejected=(
+            "The restart of service:jellyfin was rejected. No action was taken."
+        ),
+        execution_failed=(
+            "I could not restart service:jellyfin safely. No action was taken."
+        ),
+        execution_unknown=(
+            "The restart outcome for service:jellyfin is unknown. I did not retry it."
+        ),
+        executed="I restarted service:jellyfin once.",
+        executed_verified=(
+            "I restarted service:jellyfin once and verified it is healthy."
+        ),
+        executed_unverified=(
+            "The restart was attempted, but service:jellyfin could not be verified "
+            "healthy. I did not retry it."
+        ),
+    )
 
     def __init__(self, operations: JellyfinOperations | None) -> None:
         self._operations = operations
@@ -66,6 +90,28 @@ class JellyfinActionConnector:
     def normalize_arguments(self, arguments: Mapping[str, Any]) -> ConnectorArguments:
         if set(arguments) != {"target"} or arguments.get("target") != JELLYFIN_TARGET:
             raise ConnectorInputError("schema_invalid_arguments")
+        return ConnectorArguments({"target": JELLYFIN_TARGET})
+
+    def describe_continuation(
+        self,
+        arguments: ConnectorArguments,
+    ) -> ConnectorContinuationDescription:
+        if arguments.as_dict() != {"target": JELLYFIN_TARGET}:
+            raise ConnectorInputError("schema_invalid_arguments")
+        return ConnectorContinuationDescription(
+            target=JELLYFIN_TARGET,
+            confirmation_text=(
+                "Confirm Restart Jellyfin. This may be difficult to reverse."
+            ),
+        )
+
+    def restore_continuation(
+        self,
+        description: ConnectorContinuationDescription,
+    ) -> ConnectorArguments:
+        expected = self.describe_continuation(ConnectorArguments({"target": JELLYFIN_TARGET}))
+        if description != expected:
+            raise ConnectorInputError("continuation_mismatch")
         return ConnectorArguments({"target": JELLYFIN_TARGET})
 
     def check_availability(

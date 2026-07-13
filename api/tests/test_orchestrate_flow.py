@@ -1,10 +1,27 @@
+import inspect
 import json
 
 import httpx
 import pytest
 import services.capabilities as capability_service
 from clients.runtime import RuntimeClient
+from services.action_connectors import (
+    ActionConnectorRegistry,
+    ConnectorArguments,
+    ConnectorAvailabilityResult,
+    ConnectorContinuationDescription,
+    ConnectorExecutionResult,
+    ConnectorInputError,
+    ConnectorPresentation,
+    ConnectorRevalidationResult,
+    ConnectorVerificationResult,
+    ExecutionStatus,
+    RevalidationStatus,
+    VerificationStatus,
+)
 from services.capabilities import (
+    CapabilityEntry,
+    CapabilityPolicyShape,
     RevalidationOutput,
     Revalidator,
     RevalidatorEntry,
@@ -13,7 +30,10 @@ from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,
+    _registry_allows_exact_capability,
     _relationship_projection_allows,
+    _resolve_capability_continuation_policy,
+    _select_capability_claim_refs,
     orchestrate_chat,
 )
 
@@ -12939,6 +12959,299 @@ async def test_orchestrate_dsa_disabled_skips_external_context_call(tmp_path):
     assert "External source context:" not in str(litellm.calls[0]["messages"])
 
 
+class DisplaySettingOperations:
+    def __init__(self, result_state="completed"):
+        self.result_state = result_state
+        self.apply_inputs = []
+
+    async def apply_setting(self, value):
+        self.apply_inputs.append(value)
+        if isinstance(self.result_state, BaseException):
+            raise self.result_state
+        return self.result_state
+
+
+class DisplaySettingConnector:
+    capability_id = "fixture.display_setting_apply"
+    effect_mode = "simulated"
+    revalidation_spec = None
+    presentation = ConnectorPresentation(
+        pending_confirmation=(
+            "Applying the display setting requires confirmation. No action was taken."
+        ),
+        confirmation_rejected=(
+            "The display setting was rejected. No action was taken."
+        ),
+        execution_failed="I could not apply the display setting. No action was taken.",
+        execution_unknown=(
+            "The display setting outcome is unknown. I did not retry it."
+        ),
+        executed="I applied the display setting once without verification.",
+        executed_verified="I applied and verified the display setting.",
+        executed_unverified=(
+            "The display setting was applied, but verification did not pass. "
+            "I did not retry it."
+        ),
+    )
+
+    def __init__(self, operations):
+        self.operations = operations
+        self.verify_inputs = []
+
+    def normalize_arguments(self, arguments):
+        if set(arguments) != {"target", "level"}:
+            raise ConnectorInputError("schema_invalid_arguments")
+        target = arguments.get("target")
+        level = arguments.get("level")
+        if (
+            target != "fixture:display"
+            or not isinstance(level, int)
+            or isinstance(level, bool)
+            or not 0 <= level <= 10
+        ):
+            raise ConnectorInputError("schema_invalid_arguments")
+        return ConnectorArguments({"target": target, "level": level})
+
+    def describe_continuation(self, arguments):
+        normalized = self.normalize_arguments(arguments.as_dict())
+        return ConnectorContinuationDescription(
+            target=normalized.values["target"],
+            confirmation_text=(
+                f"Confirm display level {normalized.values['level']} for "
+                f"{normalized.values['target']}."
+            ),
+        )
+
+    def restore_continuation(self, description):
+        prefix = "Confirm display level "
+        suffix = " for fixture:display."
+        text = description.confirmation_text
+        if (
+            description.target != "fixture:display"
+            or not text.startswith(prefix)
+            or not text.endswith(suffix)
+        ):
+            raise ConnectorInputError("continuation_mismatch")
+        level_text = text[len(prefix) : -len(suffix)]
+        if not level_text.isdigit():
+            raise ConnectorInputError("continuation_mismatch")
+        return self.normalize_arguments(
+            {"target": description.target, "level": int(level_text)}
+        )
+
+    def check_availability(self, request):
+        return ConnectorAvailabilityResult(True, "available")
+
+    async def revalidate(self, request):
+        return ConnectorRevalidationResult(
+            RevalidationStatus.UNAVAILABLE,
+            "revalidation_unavailable",
+        )
+
+    async def execute(self, request):
+        state = await self.operations.apply_setting(
+            {
+                "request_id": request.request_id,
+                "target": request.arguments.values["target"],
+                "level": request.arguments.values["level"],
+            }
+        )
+        status = ExecutionStatus(state)
+        return ConnectorExecutionResult(
+            status=status,
+            reason_code=(
+                "executed" if status is ExecutionStatus.COMPLETED else f"setting_{state}"
+            ),
+            external_reason_code=f"fixture_{state}",
+            external_call_count=1,
+            effect_mode="simulated",
+            target_label="fixture:display",
+        )
+
+    async def verify(self, request):
+        self.verify_inputs.append(request)
+        return ConnectorVerificationResult(
+            VerificationStatus.NOT_SUPPORTED,
+            "verification_not_supported",
+            "verification_not_supported",
+            0,
+            effect_mode="simulated",
+            target_label="fixture:display",
+        )
+
+
+DISPLAY_CAPABILITY = CapabilityEntry(
+    capability_id="fixture.display_setting_apply",
+    provider_tool_name="fixture_display_setting_apply",
+    operation_class="state_change",
+    capability_domain="display_preferences",
+    supported_surfaces=("dev",),
+    executor_binding="action_connector",
+    descriptor_metadata={
+        "display_name": "Apply display setting",
+        "description": "Apply a bounded level to a fixed test display.",
+    },
+    privacy_classification="bounded_setting_action",
+    authorization_requirements={
+        "relationship_requirements": [],
+        "world_state_requirements": [],
+    },
+    argument_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["target", "level"],
+        "properties": {
+            "target": {"type": "string", "enum": ["fixture:display"]},
+            "level": {"type": "integer", "minimum": 0, "maximum": 10},
+        },
+    },
+    enabled_surfaces=("dev",),
+    enabled_personas=("technical_architect",),
+    policy_shape=CapabilityPolicyShape(
+        registry_domain="display_preferences",
+        operation_kind="state_change",
+        risk_level="low_display_change",
+        requires_confirmation=True,
+        reversible=True,
+        dry_run_supported=True,
+        verification_supported=False,
+    ),
+)
+
+
+class DisplaySettingRuntime(CapabilityRuntime):
+    def __init__(self, *, expired=False, action_summary_error=None):
+        super().__init__(action_summary_error=action_summary_error)
+        self.confirmation_calls = []
+        self.dispatch_count = 0
+        self.consumed = False
+        self.expired = expired
+        self.capability_match_response = {
+            "result": {
+                "capability_matched": True,
+                "action_taken": False,
+                "reason_codes": ["registered_capability"],
+                "capability": {
+                    "capability_id": DISPLAY_CAPABILITY.capability_id,
+                    "display_name": "Apply display setting",
+                    "domain": "display_preferences",
+                    "operation_kind": "state_change",
+                    "risk_level": "low_display_change",
+                    "requires_confirmation": True,
+                    "reversible": True,
+                    "dry_run_supported": True,
+                    "verification_supported": False,
+                },
+            }
+        }
+
+    async def action_authority(self, **kwargs):
+        self.capability_authority_calls.append(kwargs)
+        return {
+            "result": {
+                "capability_id": DISPLAY_CAPABILITY.capability_id,
+                "risk_level": "low_reversible",
+                "authority_level": "execute_after_confirmation",
+                "requires_confirmation": True,
+                "allowed": False,
+                "reason_summary": ["registered_capability", "confirmation_required"],
+                "action_taken": False,
+            }
+        }
+
+    async def action_flow(self, **kwargs):
+        self.capability_flow_calls.append(kwargs)
+        intent = kwargs.get("flow_intent")
+        cancelled = intent == "confirmation_cancelled"
+        confirmed = intent == "confirmation_received"
+        reasons = ["registered_capability", "confirmation_required"]
+        if cancelled:
+            reasons.extend(["confirmation_cancelled", "execution_not_allowed"])
+        elif confirmed:
+            reasons.extend(["confirmation_received", "execution_allowed_by_policy"])
+        else:
+            reasons.append("execution_not_allowed")
+        return {
+            "result": {
+                "capability_id": DISPLAY_CAPABILITY.capability_id,
+                "dry_run_required": False,
+                "dry_run_supported": True,
+                "dry_run_effects": [],
+                "confirmation_required": True,
+                "confirmation_text": "Confirm the display setting change.",
+                "execution_allowed": confirmed,
+                "verification_required": False,
+                "verification_supported": False,
+                "verification_method": None,
+                "reason_summary": reasons,
+                "action_taken": False,
+            }
+        }
+
+    async def authorize_capability(self, **kwargs):
+        self.capability_authorization_calls.append(kwargs)
+        stage = kwargs.get("authorization_" + "pha" + "se")
+        if stage == "exposure":
+            return {
+                "result": {
+                    "allowed": True,
+                    "decision_code": "allowed",
+                    "reason_codes": ["allowed"],
+                }
+            }
+        if stage == "dispatch":
+            self.dispatch_count += 1
+            allowed = not self.consumed
+            self.consumed = self.consumed or allowed
+            return {
+                "result": {
+                    "allowed": allowed,
+                    "decision_code": "allowed" if allowed else "challenge_consumed",
+                    "reason_codes": ["allowed" if allowed else "challenge_consumed"],
+                    "challenge_ref": kwargs.get("confirmation_challenge_ref"),
+                    "world_state_claim_ids_used": [],
+                }
+            }
+        if self.consumed:
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "challenge_consumed",
+                    "reason_codes": ["challenge_consumed"],
+                }
+            }
+        if self.expired and kwargs.get("confirmation_challenge_ref"):
+            return {
+                "result": {
+                    "allowed": False,
+                    "decision_code": "challenge_expired",
+                    "reason_codes": ["challenge_expired"],
+                }
+            }
+        return {
+            "result": {
+                "allowed": False,
+                "decision_code": "confirmation_required",
+                "reason_codes": ["confirmation_required"],
+                "challenge_ref": "challenge-display-1",
+                "challenge_expires_at": "2026-07-14T01:00:00+00:00",
+                "world_state_claim_ids_used": [],
+            }
+        }
+
+    async def confirm_capability(self, **kwargs):
+        self.confirmation_calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs["runtime_turn_id"],
+            "confirmation_challenge_ref": kwargs["confirmation_challenge_ref"],
+            "confirmation_state": "accepted" if kwargs["confirmed"] else "rejected",
+        }
+
+
 class ComposedJellyfinOperations:
     def __init__(self):
         self.status_inputs = []
@@ -13065,7 +13378,9 @@ class ComposedJellyfinRuntime(CapabilityRuntime):
                 "dry_run_supported": True,
                 "dry_run_effects": [],
                 "confirmation_required": True,
-                "confirmation_text": "Confirm restart of service:jellyfin.",
+                "confirmation_text": (
+                    "Confirm Restart Jellyfin. This may be difficult to reverse."
+                ),
                 "execution_allowed": confirmed,
                 "verification_required": not cancelled,
                 "verification_supported": True,
@@ -13176,6 +13491,554 @@ def _jellyfin_chat_payload(text, **overrides):
     return payload
 
 
+def _display_chat_payload(text, **overrides):
+    return _jellyfin_chat_payload(text, **overrides)
+
+
+def _install_display_capability(monkeypatch):
+    production = capability_service.production_capability_registry()
+    monkeypatch.setattr(
+        capability_service,
+        "production_capability_registry",
+        lambda: (*production, DISPLAY_CAPABILITY),
+    )
+
+
+def test_shared_action_helpers_have_no_product_identity_branches():
+    shared_source = "\n".join(
+        inspect.getsource(value)
+        for value in (
+            _resolve_capability_continuation_policy,
+            _registry_allows_exact_capability,
+            _select_capability_claim_refs,
+            capability_service.authorize_and_execute_capability,
+        )
+    )
+    for product_identity in (
+        "JELLYFIN_CAPABILITY_ID",
+        "JELLYFIN_TARGET",
+        "service:jellyfin",
+        "JellyfinActionConnector",
+    ):
+        assert product_identity not in shared_source
+    assert all(
+        base.__name__ != "JellyfinActionConnector"
+        for base in DisplaySettingConnector.__mro__
+    )
+    assert DISPLAY_CAPABILITY.capability_id not in {
+        entry.capability_id
+        for entry in capability_service.PRODUCTION_CAPABILITIES
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", [3, 7])
+async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay(
+    tmp_path,
+    monkeypatch,
+    level,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connector = DisplaySettingConnector(operations)
+    connectors = ActionConnectorRegistry((connector,))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": level},
+            )
+        ]
+    )
+
+    first = await orchestrate_chat(
+        payload=_display_chat_payload(f"Apply display level {level}."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-{level}-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert operations.apply_inputs == []
+    assert connector.verify_inputs == []
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
+    first_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]
+    assert first_trace["capabilities"]["provider_call_count"] == 1
+    assert first_trace["capabilities"]["action_summary_call_count"] == 1
+    assert first["pending_action"] == {
+        "schema_version": "co.pending-action.v1",
+        "status": "pending_confirmation",
+        "capability_id": DISPLAY_CAPABILITY.capability_id,
+        "target": "fixture:display",
+        "argument_digest": first["pending_action"]["argument_digest"],
+        "challenge_ref": "challenge-display-1",
+        "challenge_expires_at": "2026-07-14T01:00:00+00:00",
+        "confirmation_text": f"Confirm display level {level} for fixture:display.",
+    }
+    restored = capability_service.restore_pending_action_request(
+        continuation=capability_service.parse_pending_action_confirmation(
+            {
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            }
+        )[0],
+        connector_registry=connectors,
+    )
+    assert restored.arguments == {"level": level, "target": "fixture:display"}
+    assert operations.apply_inputs == []
+    assert connector.verify_inputs == []
+    assert first["pending_action"]["argument_digest"] == (
+        capability_service.argument_digest(
+            DISPLAY_CAPABILITY.capability_id,
+            restored.arguments,
+        )
+    )
+    assert runtime.capability_flow_calls[0]["target_label"] is None
+    assert runtime.capability_flow_calls[0].get("confirmation_text") is None
+
+    accepted = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-{level}-accepted",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.confirmation_calls[0]["confirmation_challenge_ref"] == (
+        "challenge-display-1"
+    )
+    assert runtime.dispatch_count == 1
+    assert len(operations.apply_inputs) == 1
+    assert operations.apply_inputs[0]["level"] == level
+    assert connector.verify_inputs == []
+    assert "Verification is not supported" in accepted["answer"]
+    accepted_prompt_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]
+    accepted_trace = accepted_prompt_trace["capabilities"]
+    assert accepted_trace["provider_call_count"] == 0
+    assert runtime.capability_flow_calls[1]["target_label"] == "fixture:display"
+    assert runtime.capability_flow_calls[1].get("confirmation_text") is None
+    assert (
+        accepted_prompt_trace["capability_registry"]["action_flow"][
+            "confirmation_text"
+        ]
+        == "Confirm the display setting change."
+    )
+    assert (
+        first["pending_action"]["confirmation_text"]
+        != accepted_prompt_trace["capability_registry"]["action_flow"][
+            "confirmation_text"
+        ]
+    )
+    assert accepted_trace["execution"]["connector_execution_call_count"] == 1
+    assert accepted_trace["execution"]["connector_verification_call_count"] == 0
+    assert accepted_trace["action_summary_call_count"] == 1
+
+    replay = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes again",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-{level}-replay",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.dispatch_count == 1
+    assert len(operations.apply_inputs) == 1
+    assert "pending_action" not in replay
+    replay_trace = memory_store.trace_calls[2]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["capabilities"]
+    assert replay_trace["provider_call_count"] == 0
+    assert replay_trace["execution"]["failure_reason_code"] == "challenge_consumed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_display_setting_rejects_without_dispatch(
+    tmp_path,
+    monkeypatch,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connectors = ActionConnectorRegistry((DisplaySettingConnector(operations),))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-reject-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    rejected = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "no",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": False,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-rejected",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.confirmation_calls[0]["confirmed"] is False
+    assert runtime.dispatch_count == 0
+    assert operations.apply_inputs == []
+    assert "rejected" in rejected["answer"].casefold()
+    trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["provider_call_count"] == 0
+    assert trace["capabilities"]["action_summary_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_display_setting_expiry_and_mismatch_do_not_replace_challenge(
+    tmp_path,
+    monkeypatch,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connectors = ActionConnectorRegistry((DisplaySettingConnector(operations),))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-expiry-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    runtime.expired = True
+    expired = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-expired",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    assert len(litellm.calls) == 1
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
+    assert operations.apply_inputs == []
+    assert "pending_action" not in expired
+    expired_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["capabilities"]
+    assert expired_trace["provider_call_count"] == 0
+    assert expired_trace["execution"]["failure_reason_code"] == "challenge_expired"
+
+    trace_count = len(memory_store.trace_calls)
+    mismatched_pending = {**first["pending_action"], "target": "fixture:other"}
+    mismatch = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": mismatched_pending,
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-mismatch",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    assert mismatch["status"] == "failed"
+    assert len(memory_store.trace_calls) == trace_count
+    assert len(litellm.calls) == 1
+    assert operations.apply_inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target", "fixture:other"),
+        ("confirmation_text", "Confirm display level 3 for fixture:display."),
+        ("argument_digest", "capargs_00000000000000000000000000000000"),
+    ],
+)
+async def test_orchestrate_display_setting_mismatch_fails_before_dependencies(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connectors = ActionConnectorRegistry((DisplaySettingConnector(operations),))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-mismatch-{field}-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    trace_count = len(memory_store.trace_calls)
+    authority_count = len(runtime.capability_authority_calls)
+    flow_count = len(runtime.capability_flow_calls)
+    authorization_count = len(runtime.capability_authorization_calls)
+    mismatched_pending = {**first["pending_action"], field: value}
+
+    mismatch = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": mismatched_pending,
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-mismatch-{field}-second",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert mismatch["status"] == "failed"
+    assert len(memory_store.trace_calls) == trace_count
+    assert len(runtime.capability_authority_calls) == authority_count
+    assert len(runtime.capability_flow_calls) == flow_count
+    assert len(runtime.capability_authorization_calls) == authorization_count
+    assert len(litellm.calls) == 1
+    assert runtime.confirmation_calls == []
+    assert runtime.dispatch_count == 0
+    assert operations.apply_inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result_state", "expected_status"),
+    [("failed", "executor_failed"), ("unknown", "executor_unknown")],
+)
+async def test_orchestrate_display_setting_failure_and_unknown_do_not_retry(
+    tmp_path,
+    monkeypatch,
+    result_state,
+    expected_status,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations(result_state)
+    connector = DisplaySettingConnector(operations)
+    connectors = ActionConnectorRegistry((connector,))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-{result_state}-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-{result_state}-second",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
+    assert len(litellm.calls) == 1
+    assert len(operations.apply_inputs) == 1
+    assert connector.verify_inputs == []
+    assert trace["capabilities"]["execution"]["response_status"] == expected_status
+    assert trace["capabilities"]["execution"]["connector_execution_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_display_setting_summary_failure_does_not_reexecute(
+    tmp_path,
+    monkeypatch,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime(action_summary_error=RuntimeError("offline"))
+    operations = DisplaySettingOperations()
+    connectors = ActionConnectorRegistry((DisplaySettingConnector(operations),))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-summary-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    second = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-summary-second",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    assert len(litellm.calls) == 1
+    assert len(operations.apply_inputs) == 1
+    assert second["answer"] == (
+        "I applied the display setting once without verification."
+    )
+    trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["action_summary"]["status"] == "unavailable"
+    assert trace["capabilities"]["execution"]["connector_execution_call_count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_jellyfin_two_turn_continuation_skips_model_rediscovery(tmp_path):
     rules, models = _write_router_files(tmp_path)
@@ -13214,7 +14077,9 @@ async def test_orchestrate_jellyfin_two_turn_continuation_skips_model_rediscover
         "argument_digest": first["pending_action"]["argument_digest"],
         "challenge_ref": "challenge-jellyfin-1",
         "challenge_expires_at": "2026-07-12T01:00:00+00:00",
-        "confirmation_text": "Confirm restart of service:jellyfin.",
+        "confirmation_text": (
+            "Confirm Restart Jellyfin. This may be difficult to reverse."
+        ),
     }
     assert operations.restart_inputs == []
     assert len(runtime.confirmation_calls) == 0
