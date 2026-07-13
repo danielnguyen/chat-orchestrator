@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, fields
 
 import pytest
@@ -12,9 +13,12 @@ from services.action_connectors import (
     ConnectorAvailabilityResult,
     ConnectorClaimObservation,
     ConnectorClaimRef,
+    ConnectorContinuationDescription,
     ConnectorExecutionRequest,
     ConnectorExecutionResult,
     ConnectorInputError,
+    ConnectorOutcome,
+    ConnectorPresentation,
     ConnectorRevalidationRequest,
     ConnectorRevalidationResult,
     ConnectorRevalidationSpec,
@@ -25,6 +29,7 @@ from services.action_connectors import (
     VerificationStatus,
     is_valid_capability_id,
 )
+from services.capabilities import argument_digest
 from services.jellyfin_action_connector import (
     JELLYFIN_CAPABILITY_ID,
     JELLYFIN_TARGET,
@@ -51,6 +56,24 @@ class DisplaySettingConnector:
     capability_id = "fixture.display_setting_apply"
     effect_mode = "simulated"
     revalidation_spec = None
+    presentation = ConnectorPresentation(
+        pending_confirmation=(
+            "Applying the display setting requires confirmation. No action was taken."
+        ),
+        confirmation_rejected=(
+            "The display setting was rejected. No action was taken."
+        ),
+        execution_failed="I could not apply the display setting. No action was taken.",
+        execution_unknown=(
+            "The display setting outcome is unknown. I did not retry it."
+        ),
+        executed="I applied the display setting once without verification.",
+        executed_verified="I applied and verified the display setting.",
+        executed_unverified=(
+            "The display setting was applied, but verification did not pass. "
+            "I did not retry it."
+        ),
+    )
 
     def __init__(self, operations: DisplaySettingOperations) -> None:
         self.operations = operations
@@ -64,6 +87,27 @@ class DisplaySettingConnector:
         if not isinstance(level, int) or isinstance(level, bool) or not 0 <= level <= 10:
             raise ConnectorInputError("schema_invalid_arguments")
         return ConnectorArguments({"target": "fixture:display", "level": level})
+
+    def describe_continuation(self, arguments):
+        normalized = self.normalize_arguments(arguments.as_dict())
+        return ConnectorContinuationDescription(
+            target=normalized.values["target"],
+            confirmation_text=(
+                f"Confirm display level {normalized.values['level']} for "
+                f"{normalized.values['target']}."
+            ),
+        )
+
+    def restore_continuation(self, description):
+        match = re.fullmatch(
+            r"Confirm display level ([0-9]|10) for (fixture:display)\.",
+            description.confirmation_text,
+        )
+        if match is None or description.target != match.group(2):
+            raise ConnectorInputError("continuation_mismatch")
+        return self.normalize_arguments(
+            {"target": match.group(2), "level": int(match.group(1))}
+        )
 
     def check_availability(self, request):
         return ConnectorAvailabilityResult(True, "available")
@@ -228,6 +272,88 @@ def test_registry_lookup_and_normalization_do_not_execute_connector():
         hasattr(registry, field)
         for field in ("risk_level", "authority_level", "confirmation_state")
     )
+
+
+def test_continuation_description_restores_display_arguments_without_calls():
+    operations = DisplaySettingOperations()
+    connector = DisplaySettingConnector(operations)
+    arguments = connector.normalize_arguments(
+        {"target": "fixture:display", "level": 7}
+    )
+
+    description = connector.describe_continuation(arguments)
+    restored = connector.restore_continuation(description)
+
+    assert description == ConnectorContinuationDescription(
+        target="fixture:display",
+        confirmation_text="Confirm display level 7 for fixture:display.",
+    )
+    assert restored == arguments
+    assert argument_digest(connector.capability_id, restored.as_dict()) == argument_digest(
+        connector.capability_id,
+        arguments.as_dict(),
+    )
+    assert operations.apply_inputs == []
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        ConnectorContinuationDescription(
+            "fixture:display",
+            "Confirm display level 11 for fixture:display.",
+        ),
+        ConnectorContinuationDescription(
+            "fixture:other",
+            "Confirm display level 7 for fixture:display.",
+        ),
+    ],
+)
+def test_display_continuation_rejects_malformed_or_mismatched_values(description):
+    connector = DisplaySettingConnector(DisplaySettingOperations())
+    with pytest.raises(ConnectorInputError, match="continuation_mismatch"):
+        connector.restore_continuation(description)
+
+
+def test_jellyfin_continuation_remains_exact_and_side_effect_free():
+    operations = JellyfinFixtureOperations()
+    connector = JellyfinActionConnector(operations.binding())
+    arguments = connector.normalize_arguments({"target": JELLYFIN_TARGET})
+
+    description = connector.describe_continuation(arguments)
+    restored = connector.restore_continuation(description)
+
+    assert description == ConnectorContinuationDescription(
+        target=JELLYFIN_TARGET,
+        confirmation_text=(
+            "Confirm Restart Jellyfin. This may be difficult to reverse."
+        ),
+    )
+    assert restored.as_dict() == {"target": JELLYFIN_TARGET}
+    assert operations.status_inputs == []
+    assert operations.restart_inputs == []
+
+
+def test_connector_presentation_is_bounded_and_outcome_is_selected_by_caller():
+    presentation = DisplaySettingConnector(DisplaySettingOperations()).presentation
+    assert [field.name for field in fields(ConnectorPresentation)] == [
+        outcome.value for outcome in ConnectorOutcome
+    ]
+    assert presentation.text_for(ConnectorOutcome.EXECUTED) == (
+        "I applied the display setting once without verification."
+    )
+    with pytest.raises(ValueError, match="invalid_connector_outcome"):
+        presentation.text_for("executed")
+    with pytest.raises(ValueError, match="invalid_execution_failed"):
+        ConnectorPresentation(
+            pending_confirmation="Pending.",
+            confirmation_rejected="Rejected.",
+            execution_failed="x" * 501,
+            execution_unknown="Unknown.",
+            executed="Executed.",
+            executed_verified="Verified.",
+            executed_unverified="Unverified.",
+        )
 
 
 def test_connector_policy_inputs_are_excluded_from_bounded_contracts():

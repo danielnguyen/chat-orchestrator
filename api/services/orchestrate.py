@@ -20,10 +20,12 @@ from services.action_connectors import ActionConnectorRegistry
 from services.assistant_handoff import build_assistant_handoff
 from services.briefing import generate_brief
 from services.capabilities import (
+    CapabilityEntry,
     CapabilityValidationError,
     ParsedCapabilityRequest,
     PendingActionContinuation,
     authorize_and_execute_capability,
+    capability_by_id,
     capability_follow_up_summary,
     capability_validation_failure_trace,
     ensure_draft_local_unsent_truth,
@@ -31,14 +33,12 @@ from services.capabilities import (
     parse_pending_action_confirmation,
     parse_provider_capability_request,
     provider_text,
+    restore_pending_action_request,
     validate_and_digest_capability_request,
 )
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
 from services.jellyfin_action_connector import (
-    JELLYFIN_CAPABILITY_ID,
-    JELLYFIN_PROVIDER_TOOL_NAME,
-    JELLYFIN_TARGET,
     JellyfinActionConnector,
     JellyfinOperations,
 )
@@ -2198,11 +2198,27 @@ async def _compose_action_summary(
     return trace, replacement
 
 
-def _jellyfin_registry_allows_processing(action_flow: dict[str, Any]) -> bool:
+def _action_flow_allows_processing(
+    entry: CapabilityEntry,
+    authority: dict[str, Any],
+    action_flow: dict[str, Any],
+) -> bool:
+    shape = entry.policy_shape
+    if shape is None:
+        return False
     if not all(
         (
-            action_flow.get("confirmation_required") is True,
-            action_flow.get("verification_supported") is True,
+            authority.get("requires_confirmation") is shape.requires_confirmation,
+            action_flow.get("confirmation_required") is shape.requires_confirmation,
+            action_flow.get("verification_supported") is shape.verification_supported,
+            isinstance(action_flow.get("execution_allowed"), bool),
+            isinstance(action_flow.get("verification_required"), bool),
+        )
+    ):
+        return False
+    if action_flow.get("verification_required") is True and not all(
+        (
+            shape.verification_supported,
             action_flow.get("verification_method") == "capability_verification",
         )
     ):
@@ -2221,21 +2237,22 @@ def _jellyfin_registry_allows_processing(action_flow: dict[str, Any]) -> bool:
     if "confirmation_received" in reasons:
         return all(
             (
+                shape.requires_confirmation,
                 "confirmation_cancelled" not in reasons,
                 "execution_not_allowed" not in reasons,
                 action_flow.get("execution_allowed") is True,
-                action_flow.get("verification_required") is True,
             )
         )
-    return all(
-        (
-            action_flow.get("execution_allowed") is False,
-            action_flow.get("verification_required") is True,
-            "confirmation_received" not in reasons,
-            "confirmation_cancelled" not in reasons,
-            "execution_allowed_by_policy" not in reasons,
+    if shape.requires_confirmation:
+        return all(
+            (
+                action_flow.get("execution_allowed") is False,
+                "confirmation_received" not in reasons,
+                "confirmation_cancelled" not in reasons,
+                "execution_allowed_by_policy" not in reasons,
+            )
         )
-    )
+    return action_flow.get("execution_allowed") is True
 
 
 def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
@@ -2246,6 +2263,8 @@ def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
         trace.get("action_flow") if isinstance(trace.get("action_flow"), dict) else {}
     )
     capability_id = match.get("matched_capability_id")
+    entry = capability_by_id(capability_id) if isinstance(capability_id, str) else None
+    shape = entry.policy_shape if entry is not None else None
     common = all(
         (
             trace.get("enabled") is True,
@@ -2254,8 +2273,22 @@ def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
             trace.get("action_taken") is False,
             match.get("status") == "included",
             match.get("matched") is True,
-            capability_id in {"runtime.world_state.read", JELLYFIN_CAPABILITY_ID},
+            entry is not None,
+            shape is not None,
             capability.get("capability_id") == capability_id,
+            capability.get("domain") == shape.registry_domain if shape else False,
+            capability.get("operation_kind") == shape.operation_kind if shape else False,
+            capability.get("risk_level") == shape.risk_level if shape else False,
+            capability.get("requires_confirmation") is shape.requires_confirmation
+            if shape
+            else False,
+            capability.get("reversible") is shape.reversible if shape else False,
+            capability.get("dry_run_supported") is shape.dry_run_supported
+            if shape
+            else False,
+            capability.get("verification_supported") is shape.verification_supported
+            if shape
+            else False,
             authority.get("capability_id") == capability_id,
             action_flow.get("capability_id") == capability_id,
             authority.get("status") == "included",
@@ -2266,38 +2299,11 @@ def _registry_allows_exact_capability(trace: dict[str, Any]) -> bool:
     )
     if not common:
         return False
-    if capability_id == JELLYFIN_CAPABILITY_ID:
-        return all(
-            (
-                capability.get("domain") == "media_operations",
-                capability.get("operation_kind") == "restart",
-                capability.get("risk_level") == "medium_service_interruption",
-                capability.get("requires_confirmation") is True,
-                capability.get("verification_supported") is True,
-                authority.get("risk_level") == "medium_requires_confirmation",
-                authority.get("authority_level") == "execute_after_confirmation",
-                authority.get("requires_confirmation") is True,
-                authority.get("allowed") is False,
-                _jellyfin_registry_allows_processing(action_flow),
-            )
-        )
-    return all(
-        (
-            capability.get("operation_kind") == "read_only",
-            capability.get("risk_level") == "low_read_only",
-            capability.get("requires_confirmation") is False,
-            capability.get("verification_supported") is True,
-            authority.get("risk_level") == "read_only",
-            authority.get("authority_level") == "answer_only",
-            authority.get("requires_confirmation") is False,
-            authority.get("allowed") is True,
-            action_flow.get("confirmation_required") is False,
-            action_flow.get("execution_allowed") is True,
-            action_flow.get("verification_required") is True,
-            action_flow.get("verification_supported") is True,
-            action_flow.get("verification_method") == "capability_verification",
-        )
-    )
+    if shape.requires_confirmation and authority.get("allowed") is not False:
+        return False
+    if not shape.requires_confirmation and authority.get("allowed") is not True:
+        return False
+    return _action_flow_allows_processing(entry, authority, action_flow)
 
 
 def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str, str]]:
@@ -2345,18 +2351,21 @@ def _capability_registry_prompt_messages(trace: dict[str, Any]) -> list[dict[str
             f"- The runtime matched a registered capability: {label}.",
         ]
         if _registry_allows_exact_capability(trace):
-            if capability.get("capability_id") == JELLYFIN_CAPABILITY_ID:
+            entry = capability_by_id(capability.get("capability_id"))
+            if entry is not None:
                 lines.extend(
                     [
-                        "- You may request only jellyfin_safe_restart for service:jellyfin.",
-                        "- Confirmation and execution are controlled outside provider prose.",
+                        "- You may request only "
+                        f"{entry.provider_tool_name} through its exposed tool.",
+                        "- Policy, confirmation, execution, and verification are "
+                        "controlled outside provider prose.",
                     ]
                 )
             else:
                 lines.extend(
                     [
-                        "- You may request only runtime.world_state.read through its exposed tool.",
-                        "- Do not claim execution or verification from provider prose.",
+                        "- Treat this as registry context only; do not execute the action.",
+                        "- Do not say that the action was completed.",
                     ]
                 )
         else:
@@ -2529,10 +2538,7 @@ def _pending_action_envelope(
     execution: dict[str, Any],
     registry_trace: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if (
-        execution.get("capability_id") != JELLYFIN_CAPABILITY_ID
-        or execution.get("response_status") != "pending_confirmation"
-    ):
+    if execution.get("response_status") != "pending_confirmation":
         return None
     authorization = (
         execution.get("authorization")
@@ -2558,17 +2564,40 @@ def _pending_action_envelope(
         max_length=64,
     )
     digest = _sanitize_trace_string(execution.get("argument_digest"), max_length=120)
-    confirmation_text = _safe_confirmation_text(
-        action_flow.get("confirmation_text"),
-        required=True,
+    continuation = (
+        execution.get("continuation")
+        if isinstance(execution.get("continuation"), dict)
+        else {}
     )
-    if None in {challenge_ref, expires_at, digest, confirmation_text}:
+    target = _sanitize_trace_string(continuation.get("target"), max_length=120)
+    confirmation_text = _safe_confirmation_text(
+        continuation.get("confirmation_text"), required=True
+    )
+    policy_confirmation_text = _safe_confirmation_text(
+        action_flow.get("confirmation_text"), required=True
+    )
+    capability_id = _sanitize_trace_string(
+        execution.get("capability_id"), max_length=120
+    )
+    if (
+        None
+        in {
+            challenge_ref,
+            expires_at,
+            digest,
+            capability_id,
+            target,
+            confirmation_text,
+            policy_confirmation_text,
+        }
+        or confirmation_text != policy_confirmation_text
+    ):
         return None
     return {
         "schema_version": "co.pending-action.v1",
         "status": "pending_confirmation",
-        "capability_id": JELLYFIN_CAPABILITY_ID,
-        "target": JELLYFIN_TARGET,
+        "capability_id": capability_id,
+        "target": target,
         "argument_digest": digest,
         "challenge_ref": challenge_ref,
         "challenge_expires_at": expires_at,
@@ -2720,7 +2749,7 @@ def _action_flow_context_inputs(
     }
 
 
-async def _resolve_jellyfin_continuation_policy(
+async def _resolve_capability_continuation_policy(
     *,
     runtime: Any | None,
     enabled: bool,
@@ -2737,6 +2766,11 @@ async def _resolve_jellyfin_continuation_policy(
     trace = _capability_registry_base_trace(enabled=enabled)
     if not enabled:
         return [], trace
+    entry = capability_by_id(continuation.capability_id)
+    shape = entry.policy_shape if entry is not None else None
+    if entry is None or shape is None or entry.executor_binding != "action_connector":
+        trace.update({"status": "failed", "reason": "unknown_capability_id"})
+        return [], trace
     if runtime is None or not active_persona_id:
         trace.update(
             {
@@ -2746,22 +2780,22 @@ async def _resolve_jellyfin_continuation_policy(
         )
         return [], trace
     capability = {
-        "capability_id": JELLYFIN_CAPABILITY_ID,
-        "display_name": "Restart Jellyfin",
-        "domain": "media_operations",
-        "operation_kind": "restart",
-        "risk_level": "medium_service_interruption",
-        "requires_confirmation": True,
-        "reversible": False,
-        "dry_run_supported": True,
-        "verification_supported": True,
+        "capability_id": entry.capability_id,
+        "display_name": entry.descriptor_metadata["display_name"],
+        "domain": shape.registry_domain,
+        "operation_kind": shape.operation_kind,
+        "risk_level": shape.risk_level,
+        "requires_confirmation": shape.requires_confirmation,
+        "reversible": shape.reversible,
+        "dry_run_supported": shape.dry_run_supported,
+        "verification_supported": shape.verification_supported,
     }
     trace.update({"status": "included", "context_included": True})
     trace["match"] = {
         "attempted": False,
         "status": "included",
         "matched": True,
-        "matched_capability_id": JELLYFIN_CAPABILITY_ID,
+        "matched_capability_id": entry.capability_id,
         "capability": capability,
         "reason_codes": ["bounded_continuation"],
     }
@@ -2778,7 +2812,7 @@ async def _resolve_jellyfin_continuation_policy(
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
             active_persona_id=active_persona_id,
-            capability_id=JELLYFIN_CAPABILITY_ID,
+            capability_id=entry.capability_id,
             **_authority_context_inputs(interaction_governance_trace),
         )
         authority_result = (
@@ -2810,7 +2844,7 @@ async def _resolve_jellyfin_continuation_policy(
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
             active_persona_id=active_persona_id,
-            capability_id=JELLYFIN_CAPABILITY_ID,
+            capability_id=entry.capability_id,
             **_authority_context_inputs(interaction_governance_trace),
             flow_intent=(
                 "confirmation_received"
@@ -2818,7 +2852,7 @@ async def _resolve_jellyfin_continuation_policy(
                 else "confirmation_cancelled"
             ),
             affects_multiple_systems=False,
-            target_label=JELLYFIN_TARGET,
+            target_label=None,
         )
         flow_result = flow_response.get("result") if isinstance(flow_response, dict) else None
         action_flow = _safe_action_flow_decision(flow_result)
@@ -4955,7 +4989,7 @@ async def _resolve_world_state(
         "expired_count": trace.get("expired_count", 0),
         "conflicted_count": trace.get("conflicted_count", 0),
         "confirmation_required": bool(trace.get("confirmation_required", False)),
-        "jellyfin_claim_refs": _jellyfin_claim_refs(included_claims),
+        "world_state_claim_refs": _bounded_world_state_claims(included_claims),
     }
     if not isinstance(prompt_content, str) or not prompt_content:
         return None, {
@@ -4983,7 +5017,7 @@ async def _resolve_world_state(
     }
 
 
-def _jellyfin_claim_refs(claims: Any) -> list[dict[str, str]]:
+def _bounded_world_state_claims(claims: Any) -> list[dict[str, str]]:
     if not isinstance(claims, list):
         return []
     refs: list[dict[str, str]] = []
@@ -4991,14 +5025,14 @@ def _jellyfin_claim_refs(claims: Any) -> list[dict[str, str]]:
         if not isinstance(claim, dict):
             continue
         if (
-            claim.get("domain") != "active_external_system"
-            or claim.get("entity_id") != JELLYFIN_TARGET
-            or claim.get("attribute") != "restart_safe"
-            or claim.get("sensitivity") in {"high", "restricted"}
+            claim.get("sensitivity") in {"high", "restricted"}
             or claim.get("superseded_by_claim_id") is not None
             or bool(claim.get("conflict_claim_ids"))
         ):
             continue
+        domain = _sanitize_trace_string(claim.get("domain"), max_length=120)
+        entity_id = _sanitize_trace_string(claim.get("entity_id"), max_length=120)
+        attribute = _sanitize_trace_string(claim.get("attribute"), max_length=120)
         claim_id = _sanitize_trace_string(
             claim.get("world_state_claim_id"),
             max_length=120,
@@ -5007,12 +5041,49 @@ def _jellyfin_claim_refs(claims: Any) -> list[dict[str, str]]:
             claim.get("value_digest"),
             max_length=120,
         )
-        if claim_id is None or value_digest is None:
+        if None in {domain, entity_id, attribute, claim_id, value_digest}:
             continue
-        refs.append({"claim_id": claim_id, "value_digest": value_digest})
-        if len(refs) >= 16:
-            break
-    return refs
+        refs.append(
+            {
+                "domain": domain,
+                "entity_id": entity_id,
+                "attribute": attribute,
+                "claim_id": claim_id,
+                "value_digest": value_digest,
+            }
+        )
+    unique = {item["claim_id"]: item for item in refs}
+    return [unique[claim_id] for claim_id in sorted(unique)[:16]]
+
+
+def _select_capability_claim_refs(
+    entry: CapabilityEntry | None,
+    claims: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    if entry is None:
+        return []
+    requirements = entry.authorization_requirements.get("world_state_requirements")
+    if not isinstance(requirements, list) or not requirements:
+        return []
+    required_keys = {
+        (
+            requirement.get("domain"),
+            requirement.get("entity_id"),
+            requirement.get("attribute"),
+        )
+        for requirement in requirements
+        if isinstance(requirement, dict)
+    }
+    selected = {
+        item["claim_id"]: {
+            "claim_id": item["claim_id"],
+            "value_digest": item["value_digest"],
+        }
+        for item in claims
+        if (item.get("domain"), item.get("entity_id"), item.get("attribute"))
+        in required_keys
+    }
+    return [selected[claim_id] for claim_id in sorted(selected)[:16]]
 
 
 async def _resolve_relationship_context(
@@ -5967,38 +6038,44 @@ async def orchestrate_chat(
     prompt_context_safety_margin: int = 256,
     capability_revalidators: dict[str, Any] | None = None,
     jellyfin_operations: JellyfinOperations | None = None,
+    action_connector_registry: ActionConnectorRegistry | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     surface = payload.get("surface", "unknown")
-    connector_registry = ActionConnectorRegistry(
-        (JellyfinActionConnector(jellyfin_operations),)
+    connector_registry = (
+        action_connector_registry
+        if action_connector_registry is not None
+        else ActionConnectorRegistry((JellyfinActionConnector(jellyfin_operations),))
     )
     pending_continuation, pending_error = parse_pending_action_confirmation(
         payload.get("capability_confirmation")
     )
+    pending_capability_request: ParsedCapabilityRequest | None = None
+    if pending_continuation is not None:
+        try:
+            pending_capability_request = restore_pending_action_request(
+                continuation=pending_continuation,
+                connector_registry=connector_registry,
+            )
+        except CapabilityValidationError as exc:
+            pending_error = exc.reason_code
+
+    if pending_error is not None:
+        return {
+            "request_id": request_id,
+            "conversation_id": payload.get("conversation_id") or "unresolved",
+            "profile_name": "unresolved",
+            "selected_model": "not_called",
+            "answer": "I could not use that capability confirmation safely. No action was taken.",
+            "status": "failed",
+            "sources": [],
+        }
 
     resolved = await memory_store.resolve_conversation(
         owner_id=payload["owner_id"],
         client_id=payload.get("client_id"),
     )
     conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
-
-    if pending_error is not None:
-        profile = await memory_store.resolve_profile(
-            owner_id=payload["owner_id"],
-            surface=surface,
-            requested_profile=payload.get("requested_profile"),
-            client_id=payload.get("client_id"),
-        )
-        return {
-            "request_id": request_id,
-            "conversation_id": conversation_id,
-            "profile_name": profile["profile_name"],
-            "selected_model": "not_called",
-            "answer": "I could not use that capability confirmation safely. No action was taken.",
-            "status": "failed",
-            "sources": [],
-        }
 
     last_user_text = _extract_last_user_text(payload["messages"])
     recent_messages = _bounded_recent_messages(payload["messages"])
@@ -6542,7 +6619,7 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
-        jellyfin_claim_refs = world_state_trace.pop("jellyfin_claim_refs", [])
+        world_state_claim_refs = world_state_trace.pop("world_state_claim_refs", [])
         if persona_containment_enabled:
             relationship_context = mandatory_policy.relationship_context
             relationship_context_trace = mandatory_policy.relationship_trace
@@ -6558,7 +6635,7 @@ async def orchestrate_chat(
             )
         if pending_continuation is not None:
             capability_registry_messages, capability_registry_trace = (
-                await _resolve_jellyfin_continuation_policy(
+                await _resolve_capability_continuation_policy(
                     runtime=runtime,
                     enabled=capability_registry_enabled,
                     request_id=request_id,
@@ -6588,6 +6665,17 @@ async def orchestrate_chat(
                 interaction_governance_trace=interaction_governance_trace,
             )
             )
+        matched_capability_id = (
+            capability_registry_trace.get("match", {}).get("matched_capability_id")
+            if isinstance(capability_registry_trace.get("match"), dict)
+            else None
+        )
+        selected_action_claim_refs = _select_capability_claim_refs(
+            capability_by_id(matched_capability_id)
+            if isinstance(matched_capability_id, str)
+            else None,
+            world_state_claim_refs,
+        )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -6779,7 +6867,7 @@ async def orchestrate_chat(
                 selected_relationship_ids=_selected_relationship_ids_from_trace(
                     relationship_context_trace
                 ),
-                selected_world_state_claims=jellyfin_claim_refs,
+                selected_world_state_claims=selected_action_claim_refs,
                 connector_registry=connector_registry,
                 allowed_capability_ids=allowed_capability_ids,
             )
@@ -7168,19 +7256,14 @@ async def orchestrate_chat(
         pending_action: dict[str, Any] | None = None
         try:
             capability_request = (
-                ParsedCapabilityRequest(
-                    capability_id=JELLYFIN_CAPABILITY_ID,
-                    provider_tool_name=JELLYFIN_PROVIDER_TOOL_NAME,
-                    arguments={"target": JELLYFIN_TARGET},
-                )
+                pending_capability_request
                 if pending_continuation is not None
                 else parse_provider_capability_request(completion)
             )
             if capability_request is not None:
                 registry_capability_allowed = (
                     _registry_allows_exact_capability(capability_registry_trace)
-                    and capability_request.capability_id
-                    in {"runtime.world_state.read", JELLYFIN_CAPABILITY_ID}
+                    and capability_request.capability_id == matched_capability_id
                 )
                 if (
                     capability_registry_trace.get("context_included") is True
@@ -7226,11 +7309,26 @@ async def orchestrate_chat(
                         selected_relationship_ids=_selected_relationship_ids_from_trace(
                             relationship_context_trace
                         ),
-                        selected_world_state_claims=jellyfin_claim_refs,
+                        selected_world_state_claims=selected_action_claim_refs,
                         revalidators=capability_revalidators,
                         connector_registry=connector_registry,
                         capability_confirmation=payload.get("capability_confirmation"),
-                        post_execution_verification_required=registry_capability_allowed,
+                        post_execution_verification_required=(
+                            capability_registry_trace.get("action_flow", {}).get(
+                                "verification_required"
+                            )
+                            is True
+                        ),
+                        policy_confirmation_text=(
+                            capability_registry_trace.get("action_flow", {}).get(
+                                "confirmation_text"
+                            )
+                            if capability_registry_trace.get("action_flow", {}).get(
+                                "confirmation_required"
+                            )
+                            is True
+                            else None
+                        ),
                     )
                     prompt.trace["capabilities"]["execution"] = execution_result.trace
                     pending_action = _pending_action_envelope(
@@ -7247,7 +7345,11 @@ async def orchestrate_chat(
                     prompt.trace["capabilities"]["dispatch_completed"] = dispatch_completed
                     if dispatch_completed:
                         prompt.trace["capabilities"]["fallback"]["blocked_after_dispatch"] = True
-                    if execution_result.trace.get("response_status") == "executed":
+                    if (
+                        execution_result.trace.get("response_status") == "executed"
+                        and execution_result.trace.get("executor_binding")
+                        != "action_connector"
+                    ):
                         raw_answer, follow_up_trace = await _attempt_capability_follow_up(
                             litellm=litellm,
                             request_id=request_id,
@@ -7302,9 +7404,7 @@ async def orchestrate_chat(
         if action_summary_answer is not None:
             raw_answer = action_summary_answer
         if pending_action is not None:
-            raw_answer = (
-                "Restarting service:jellyfin requires confirmation. No action was taken."
-            )
+            raw_answer = execution_result.response_text
         response_review = review_response(
             ResponseReviewInput(
                 candidate_text=raw_answer,

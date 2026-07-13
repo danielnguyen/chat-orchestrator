@@ -12,6 +12,8 @@ from services.action_connectors import (
     VerificationStatus,
 )
 from services.capabilities import (
+    CapabilityEntry,
+    CapabilityPolicyShape,
     CapabilityValidationError,
     RevalidationOutput,
     Revalidator,
@@ -24,12 +26,15 @@ from services.capabilities import (
     parse_provider_capability_request,
     production_capability_registry,
     provider_descriptors,
+    restore_pending_action_request,
     validate_and_digest_capability_request,
 )
 from services.jellyfin_action_connector import (
     JellyfinActionConnector,
     JellyfinOperations,
 )
+from services.orchestrate import _select_capability_claim_refs
+from test_action_connectors import DisplaySettingConnector, DisplaySettingOperations
 
 
 class FakeRuntime:
@@ -1944,7 +1949,9 @@ def _pending_envelope(digest: str) -> dict[str, object]:
         "argument_digest": digest,
         "challenge_ref": "challenge-jellyfin-1",
         "challenge_expires_at": _PENDING_EXPIRES_AT,
-        "confirmation_text": "Confirm restart of service:jellyfin.",
+        "confirmation_text": (
+            "Confirm Restart Jellyfin. This may be difficult to reverse."
+        ),
     }
 
 
@@ -2174,6 +2181,149 @@ def test_pending_action_models_retain_bounded_input_and_output():
         pending_action=pending,
     )
     assert response.model_dump()["pending_action"] == pending
+
+
+def _display_entry():
+    return CapabilityEntry(
+        capability_id="fixture.display_setting_apply",
+        provider_tool_name="fixture_display_setting_apply",
+        operation_class="state_change",
+        capability_domain="display_preferences",
+        supported_surfaces=("dev",),
+        executor_binding="action_connector",
+        descriptor_metadata={"display_name": "Apply display setting", "description": "Test."},
+        privacy_classification="bounded_setting_action",
+        authorization_requirements={
+            "relationship_requirements": [],
+            "world_state_requirements": [
+                {
+                    "domain": "active_external_system",
+                    "entity_id": "fixture:display",
+                    "attribute": "setting_available",
+                }
+            ],
+        },
+        argument_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "level"],
+            "properties": {"target": {"type": "string"}, "level": {"type": "integer"}},
+        },
+        policy_shape=CapabilityPolicyShape(
+            registry_domain="display_preferences",
+            operation_kind="state_change",
+            risk_level="low_display_change",
+            requires_confirmation=True,
+            reversible=True,
+            dry_run_supported=True,
+            verification_supported=False,
+        ),
+    )
+
+
+def test_generic_pending_parser_and_connector_restoration_bind_digest(monkeypatch):
+    entry = _display_entry()
+    operations = DisplaySettingOperations()
+    connector = DisplaySettingConnector(operations)
+    arguments = connector.normalize_arguments({"target": "fixture:display", "level": 7})
+    description = connector.describe_continuation(arguments)
+    digest = argument_digest(entry.capability_id, arguments.as_dict())
+    pending = {
+        "schema_version": "co.pending-action.v1",
+        "status": "pending_confirmation",
+        "capability_id": entry.capability_id,
+        "target": description.target,
+        "argument_digest": digest,
+        "challenge_ref": "challenge-display-1",
+        "challenge_expires_at": "2026-07-14T01:00:00+00:00",
+        "confirmation_text": description.confirmation_text,
+    }
+    continuation, reason = parse_pending_action_confirmation(
+        {"pending_action": pending, "confirmed": True}
+    )
+    monkeypatch.setattr(capability_service, "capability_by_id", lambda value: entry)
+
+    restored = restore_pending_action_request(
+        continuation=continuation,
+        connector_registry=ActionConnectorRegistry((connector,)),
+    )
+
+    assert reason is None
+    assert restored.arguments == {"level": 7, "target": "fixture:display"}
+    assert argument_digest(restored.capability_id, restored.arguments) == digest
+    assert operations.apply_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("target", "not a safe target", "malformed_pending_action"),
+        ("confirmation_text", "", "malformed_pending_action"),
+        ("capability_id", "plain", "malformed_pending_action"),
+    ],
+)
+def test_generic_pending_parser_rejects_malformed_bounded_values(field, value, reason):
+    pending = {
+        "schema_version": "co.pending-action.v1",
+        "status": "pending_confirmation",
+        "capability_id": "fixture.display_setting_apply",
+        "target": "fixture:display",
+        "argument_digest": "capargs_fixture",
+        "challenge_ref": "challenge-display-1",
+        "challenge_expires_at": "2026-07-14T01:00:00+00:00",
+        "confirmation_text": "Confirm display level 7 for fixture:display.",
+    }
+    pending[field] = value
+    continuation, parse_reason = parse_pending_action_confirmation(
+        {"pending_action": pending, "confirmed": True}
+    )
+    assert continuation is None
+    assert parse_reason == reason
+
+
+def test_generic_claim_selection_matches_registered_facts_and_is_bounded():
+    selected = _select_capability_claim_refs(
+        _display_entry(),
+        [
+            {
+                "domain": "active_external_system",
+                "entity_id": "fixture:display",
+                "attribute": "setting_available",
+                "claim_id": "claim_b",
+                "value_digest": "digest_b",
+            },
+            {
+                "domain": "active_external_system",
+                "entity_id": "fixture:display",
+                "attribute": "setting_available",
+                "claim_id": "claim_a",
+                "value_digest": "digest_a",
+            },
+            {
+                "domain": "active_external_system",
+                "entity_id": "fixture:other",
+                "attribute": "setting_available",
+                "claim_id": "claim_other",
+                "value_digest": "digest_other",
+            },
+        ],
+    )
+    assert selected == [
+        {"claim_id": "claim_a", "value_digest": "digest_a"},
+        {"claim_id": "claim_b", "value_digest": "digest_b"},
+    ]
+    assert _select_capability_claim_refs(
+        CapabilityEntry(
+            **{
+                **_display_entry().__dict__,
+                "authorization_requirements": {
+                    "relationship_requirements": [],
+                    "world_state_requirements": [],
+                },
+            }
+        ),
+        [],
+    ) == []
 
 
 @pytest.mark.parametrize(
@@ -2546,6 +2696,28 @@ async def test_jellyfin_first_turn_and_accepted_continuation_keep_one_challenge(
 
 
 @pytest.mark.asyncio
+async def test_jellyfin_legacy_flat_confirmation_remains_accepted():
+    runtime = JellyfinPolicyRuntime()
+    adapter = JellyfinStateMachine()
+    first = await _jellyfin_execute(runtime, adapter)
+    selection = first.trace["authorization"]["selection"]
+    result = await _jellyfin_execute(
+        runtime,
+        adapter,
+        {
+            "challenge_ref": selection["confirmation_challenge_ref"],
+            "capability_id": "jellyfin_restart",
+            "argument_digest": _jellyfin_validation().argument_digest,
+            "confirmed": True,
+        },
+    )
+    assert result.trace["confirmation"]["status"] == "accepted"
+    assert result.trace["response_status"] == "executed_verified"
+    assert runtime.dispatch_count == 1
+    assert len(adapter.restart_inputs) == 1
+
+
+@pytest.mark.asyncio
 async def test_connector_execution_without_policy_verification_stays_executed():
     runtime = JellyfinPolicyRuntime()
     adapter = JellyfinStateMachine()
@@ -2759,7 +2931,7 @@ async def test_jellyfin_exposure_sends_exact_registered_metadata_without_full_wo
     ("field", "value", "reason"),
     [
         ("capability_id", "draft.local_message", "pending_action_mismatch"),
-        ("target", "service:other", "pending_action_mismatch"),
+        ("target", "service:other", "pending_action_target_mismatch"),
         ("argument_digest", "capargs_wrong", "pending_action_digest_mismatch"),
     ],
 )

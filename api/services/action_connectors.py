@@ -10,6 +10,7 @@ _CAPABILITY_ID = re.compile(r"^[a-z][a-z0-9]*(?:[._][a-z][a-z0-9_]*)+$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9_.:@/-]{1,120}$")
 _EFFECT_MODES = {"simulated", "live"}
+_MAX_PRESENTATION_LENGTH = 500
 
 
 class ConnectorInputError(ValueError):
@@ -37,6 +38,16 @@ class RevalidationStatus(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class ConnectorOutcome(str, Enum):
+    PENDING_CONFIRMATION = "pending_confirmation"
+    CONFIRMATION_REJECTED = "confirmation_rejected"
+    EXECUTION_FAILED = "execution_failed"
+    EXECUTION_UNKNOWN = "execution_unknown"
+    EXECUTED = "executed"
+    EXECUTED_VERIFIED = "executed_verified"
+    EXECUTED_UNVERIFIED = "executed_unverified"
+
+
 def is_valid_capability_id(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -60,6 +71,17 @@ def _validate_count(value: Any, field_name: str) -> None:
         raise ValueError(f"invalid_{field_name}")
 
 
+def _validate_presentation_text(value: Any, field_name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value) > _MAX_PRESENTATION_LENGTH
+        or any(ord(character) < 32 and character not in "\n\t" for character in value)
+    ):
+        raise ValueError(f"invalid_{field_name}")
+
+
 @dataclass(frozen=True)
 class ConnectorArguments:
     values: Mapping[str, Any]
@@ -80,6 +102,44 @@ class ConnectorArguments:
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.values)
+
+
+@dataclass(frozen=True)
+class ConnectorContinuationDescription:
+    target: str
+    confirmation_text: str
+
+    def __post_init__(self) -> None:
+        _validate_label(self.target, "continuation_target")
+        _validate_presentation_text(self.confirmation_text, "confirmation_text")
+
+
+@dataclass(frozen=True)
+class ConnectorPresentation:
+    pending_confirmation: str
+    confirmation_rejected: str
+    execution_failed: str
+    execution_unknown: str
+    executed: str
+    executed_verified: str
+    executed_unverified: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "pending_confirmation",
+            "confirmation_rejected",
+            "execution_failed",
+            "execution_unknown",
+            "executed",
+            "executed_verified",
+            "executed_unverified",
+        ):
+            _validate_presentation_text(getattr(self, field_name), field_name)
+
+    def text_for(self, outcome: ConnectorOutcome) -> str:
+        if not isinstance(outcome, ConnectorOutcome):
+            raise ValueError("invalid_connector_outcome")
+        return getattr(self, outcome.value)
 
 
 @dataclass(frozen=True)
@@ -274,7 +334,20 @@ class ActionConnector(Protocol):
     @property
     def revalidation_spec(self) -> ConnectorRevalidationSpec | None: ...
 
+    @property
+    def presentation(self) -> ConnectorPresentation: ...
+
     def normalize_arguments(self, arguments: Mapping[str, Any]) -> ConnectorArguments: ...
+
+    def describe_continuation(
+        self,
+        arguments: ConnectorArguments,
+    ) -> ConnectorContinuationDescription: ...
+
+    def restore_continuation(
+        self,
+        description: ConnectorContinuationDescription,
+    ) -> ConnectorArguments: ...
 
     def check_availability(
         self,
