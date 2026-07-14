@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 import pytest
 import services.jellyfin_action_connector as jellyfin_connector
@@ -66,6 +66,9 @@ class DisplaySettingConnector:
         execution_failed="I could not apply the display setting. No action was taken.",
         execution_unknown=(
             "The display setting outcome is unknown. I did not retry it."
+        ),
+        partially_executed=(
+            "The display setting was only partially applied. I did not retry it."
         ),
         executed="I applied the display setting once without verification.",
         executed_verified="I applied and verified the display setting.",
@@ -350,6 +353,7 @@ def test_connector_presentation_is_bounded_and_outcome_is_selected_by_caller():
             confirmation_rejected="Rejected.",
             execution_failed="x" * 501,
             execution_unknown="Unknown.",
+            partially_executed="Partially applied.",
             executed="Executed.",
             executed_verified="Verified.",
             executed_unverified="Unverified.",
@@ -412,6 +416,25 @@ async def test_neutral_connector_uses_different_operation_and_no_verification():
 def test_execution_result_accepts_bounded_statuses(status):
     result = ConnectorExecutionResult(status, "executed", "fixture_result", 1)
     assert result.status is status
+
+
+def test_partial_execution_result_and_presentation_are_bounded():
+    result = ConnectorExecutionResult(
+        ExecutionStatus.PARTIALLY_EXECUTED,
+        "partial_execution",
+        "fixture_partial",
+        1,
+        effect_mode="simulated",
+        target_label="fixture:display",
+    )
+    presentation = DisplaySettingConnector(DisplaySettingOperations()).presentation
+
+    assert result.status is ExecutionStatus.PARTIALLY_EXECUTED
+    assert presentation.text_for(ConnectorOutcome.PARTIALLY_EXECUTED) == (
+        "The display setting was only partially applied. I did not retry it."
+    )
+    with pytest.raises(ValueError, match="invalid_partially_executed"):
+        replace(presentation, partially_executed="")
 
 
 @pytest.mark.parametrize("status", list(VerificationStatus))
@@ -573,6 +596,11 @@ async def test_jellyfin_revalidation_missing_digest_calls_nothing():
         ("completed", ExecutionStatus.COMPLETED, "executed"),
         ("failed", ExecutionStatus.FAILED, "restart_failed"),
         ("unknown", ExecutionStatus.UNKNOWN, "restart_unknown"),
+        (
+            "partially_executed",
+            ExecutionStatus.FAILED,
+            "malformed_restart_result",
+        ),
         (RuntimeError("private"), ExecutionStatus.FAILED, "executor_failed"),
         ("malformed", ExecutionStatus.FAILED, "malformed_restart_result"),
     ],

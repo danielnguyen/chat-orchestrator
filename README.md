@@ -403,7 +403,7 @@ The frozen types in `api/services/action_connectors.py` bound the connector inte
 - `ConnectorContinuationDescription` carries the safe target and confirmation text used to restore arguments on a later request.
 - `ConnectorPresentation` provides bounded wording for shared outcome classes. The lifecycle, not the connector, selects the outcome.
 - Optional `ConnectorRevalidationSpec`, `ConnectorRevalidationRequest`, and `ConnectorRevalidationResult` types identify the implementation and bound claim observations, status, reason, and call count.
-- `ConnectorExecutionRequest` supplies request/session/turn identity and arguments; `ConnectorExecutionResult` uses `ExecutionStatus` and bounded result fields.
+- `ConnectorExecutionRequest` supplies request/session/turn identity and arguments; `ConnectorExecutionResult` uses `ExecutionStatus` and bounded result fields, including an explicit `partially_executed` state.
 - `ConnectorVerificationRequest` binds the arguments and execution result; `ConnectorVerificationResult` uses `VerificationStatus` and bounded result fields.
 - `ActionConnector` is the protocol containing these properties and methods.
 - `ActionConnectorRegistry` indexes connectors by capability ID, rejects duplicates, and returns `None` for malformed or unknown lookups.
@@ -428,7 +428,7 @@ Do not add dynamic loading, environment-owned capability identities, implicit fa
 
 ### Optional hooks
 
-Revalidation is optional: return no `ConnectorRevalidationSpec` when it is unnecessary. When used, authority, confidence, freshness, domain, and attribute policy mappings remain in shared registered policy, not in the connector. Post-execution verification runs only when Cognitive Runtime requires it; connector presence never makes verification mandatory. A failed or unknown consequential execution is reported truthfully and is never retried.
+Revalidation is optional: return no `ConnectorRevalidationSpec` when it is unnecessary. When used, authority, confidence, freshness, domain, and attribute policy mappings remain in shared registered policy, not in the connector. Post-execution verification runs only when Cognitive Runtime requires it; connector presence never makes verification mandatory. A partial execution remains explicitly degraded, may receive one policy-required verification call, and is never retried. Failed and unknown consequential executions are also reported truthfully and never retried.
 
 ### Illustrative neutral connector
 
@@ -485,7 +485,7 @@ A connector must cover:
 - first-turn pending behavior and accepted/rejected provider-free continuation;
 - expired and consumed-replay behavior without provider fallback or a replacement challenge;
 - exact confirmation, dispatch, execution, verification, and summary call counts;
-- failed and unknown execution with no retry;
+- partial, failed, and unknown execution with no retry, including partial results with and without policy-required verification;
 - verification-required and verification-not-required paths; and
 - exclusion of raw external results, credentials, endpoints, prompts, and exception text from traces, summaries, and user-visible output.
 

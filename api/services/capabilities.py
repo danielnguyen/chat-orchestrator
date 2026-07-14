@@ -1235,7 +1235,13 @@ async def authorize_and_execute_capability(
             0,
         )
         trace["restart_call_count"] = trace["connector_execution_call_count"]
-    if executor_result["status"] != "ok":
+    partial_execution = executor_result["status"] == "partially_executed"
+    partial_reason = (
+        executor_result["reason_code"]
+        if partial_execution and executor_result.get("reason_code")
+        else "partial_execution"
+    )
+    if executor_result["status"] != "ok" and not partial_execution:
         if executor_result["status"] == "unknown":
             trace["failure_reason_code"] = executor_result["reason_code"]
             trace["response_status"] = "executor_unknown"
@@ -1270,6 +1276,15 @@ async def authorize_and_execute_capability(
         trace["post_restart_verification_call_count"] = trace[
             "connector_verification_call_count"
         ]
+        if partial_execution:
+            trace["failure_reason_code"] = partial_reason
+            trace["response_status"] = "partially_executed"
+            return CapabilityExecutionResult(
+                response_text=connector.presentation.text_for(
+                    ConnectorOutcome.PARTIALLY_EXECUTED
+                ),
+                trace=trace,
+            )
         if verification["status"] != "verified":
             trace["failure_reason_code"] = verification["reason_code"]
             trace["response_status"] = "executed_unverified"
@@ -1290,6 +1305,15 @@ async def authorize_and_execute_capability(
             if connector is not None
             else "I read bounded runtime world state and verified the result: found "
             f"{verification['matching_claim_count']} matching claim(s).",
+            trace=trace,
+        )
+    if partial_execution:
+        trace["failure_reason_code"] = partial_reason
+        trace["response_status"] = "partially_executed"
+        return CapabilityExecutionResult(
+            response_text=connector.presentation.text_for(
+                ConnectorOutcome.PARTIALLY_EXECUTED
+            ),
             trace=trace,
         )
     trace["response_status"] = "executed"
