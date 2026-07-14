@@ -18,7 +18,7 @@ The default endpoints and keys can be overridden for a development environment:
 | --- | --- |
 | `ORCH_BASE` | Chat Orchestrator base URL; defaults to `http://127.0.0.1:4361`. |
 | `ORCH_API_KEY` | Value sent as the Chat Orchestrator `X-API-Key`. |
-| `MS_BASE` | Basic Memory Store base URL; defaults to `http://127.0.0.1:4321`. |
+| `MEMORY_STORE_BASE_URL` | Basic Memory Store base URL; defaults to `http://127.0.0.1:4321`. |
 | `MEMORY_STORE_API_KEY` | Value sent as the Basic Memory Store `X-API-Key`. |
 | `CHAT_PAYLOAD_JSON` | Complete JSON body for the smoke chat request. |
 
