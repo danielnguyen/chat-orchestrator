@@ -21,6 +21,7 @@ class ConnectorInputError(ValueError):
 
 class ExecutionStatus(str, Enum):
     COMPLETED = "completed"
+    PARTIALLY_EXECUTED = "partially_executed"
     FAILED = "failed"
     UNKNOWN = "unknown"
 
@@ -43,6 +44,7 @@ class ConnectorOutcome(str, Enum):
     CONFIRMATION_REJECTED = "confirmation_rejected"
     EXECUTION_FAILED = "execution_failed"
     EXECUTION_UNKNOWN = "execution_unknown"
+    PARTIALLY_EXECUTED = "partially_executed"
     EXECUTED = "executed"
     EXECUTED_VERIFIED = "executed_verified"
     EXECUTED_UNVERIFIED = "executed_unverified"
@@ -120,6 +122,7 @@ class ConnectorPresentation:
     confirmation_rejected: str
     execution_failed: str
     execution_unknown: str
+    partially_executed: str
     executed: str
     executed_verified: str
     executed_unverified: str
@@ -130,6 +133,7 @@ class ConnectorPresentation:
             "confirmation_rejected",
             "execution_failed",
             "execution_unknown",
+            "partially_executed",
             "executed",
             "executed_verified",
             "executed_unverified",

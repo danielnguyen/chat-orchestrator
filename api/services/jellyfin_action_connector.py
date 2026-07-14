@@ -67,6 +67,10 @@ class JellyfinActionConnector:
         execution_unknown=(
             "The restart outcome for service:jellyfin is unknown. I did not retry it."
         ),
+        partially_executed=(
+            "The restart of service:jellyfin was only partially completed. "
+            "I did not retry it."
+        ),
         executed="I restarted service:jellyfin once.",
         executed_verified=(
             "I restarted service:jellyfin once and verified it is healthy."
@@ -247,9 +251,12 @@ class JellyfinActionConnector:
             return _malformed_execution_result(operations.effect_mode)
         status = raw.get("status")
         external_reason = raw.get("reason_code")
-        if status not in {item.value for item in ExecutionStatus} or not _safe_label(
-            external_reason
-        ):
+        allowed_statuses = {
+            ExecutionStatus.COMPLETED.value,
+            ExecutionStatus.FAILED.value,
+            ExecutionStatus.UNKNOWN.value,
+        }
+        if status not in allowed_statuses or not _safe_label(external_reason):
             return _malformed_execution_result(operations.effect_mode)
         parsed_status = ExecutionStatus(status)
         reason_code = {

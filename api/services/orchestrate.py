@@ -1803,6 +1803,33 @@ def _action_summary_outcome(
                 "degradation_reason": None,
             }
         )
+    elif response_status == "partially_executed":
+        degradation = failure_reason or "partial_execution"
+        if verification_state == "verified":
+            verification_status = "passed"
+        elif verification_state in {"failed", "unknown", "not_supported"}:
+            verification_status = verification_state
+        else:
+            verification_status = (
+                "not_supported"
+                if action_flow.get("verification_supported") is False
+                else "not_required"
+            )
+        outcome.update(
+            {
+                "execution_status": "partially_executed",
+                "verification_status": verification_status,
+                "execution_reason_code": degradation,
+                "verification_reason_code": (
+                    verification_reason
+                    if verification_status
+                    in {"passed", "failed", "unknown", "not_supported"}
+                    and verification_state != "not_required"
+                    else None
+                ),
+                "degradation_reason": degradation,
+            }
+        )
     elif response_status == "executed_unverified":
         failed_verification = verification_state == "failed"
         degradation = verification_reason or "verification_unknown"
@@ -2188,7 +2215,12 @@ async def _compose_action_summary(
         "user_visible_summary_present": True,
     }
     replacement = None
-    if summary["execution_status"] in {"executed", "failed", "unknown"}:
+    if summary["execution_status"] in {
+        "executed",
+        "partially_executed",
+        "failed",
+        "unknown",
+    }:
         replacement = summary["user_visible_summary"]
     elif (
         summary["execution_status"] == "blocked_by_policy"

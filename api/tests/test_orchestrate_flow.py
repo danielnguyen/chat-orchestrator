@@ -1,5 +1,6 @@
 import inspect
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -928,6 +929,11 @@ class FakeRuntime:
             summary = (
                 f"The execution state for action {capability_id} could not be confirmed. "
                 "No success is claimed."
+            )
+        elif execution_status == "partially_executed":
+            summary = (
+                f"Action {capability_id} was only partially completed and remains "
+                "degraded. It was not retried."
             )
         elif verification_status == "passed":
             summary = f"Action {capability_id} was executed and verification passed."
@@ -12986,6 +12992,9 @@ class DisplaySettingConnector:
         execution_unknown=(
             "The display setting outcome is unknown. I did not retry it."
         ),
+        partially_executed=(
+            "The display setting was only partially applied. I did not retry it."
+        ),
         executed="I applied the display setting once without verification.",
         executed_verified="I applied and verified the display setting.",
         executed_unverified=(
@@ -12994,8 +13003,14 @@ class DisplaySettingConnector:
         ),
     )
 
-    def __init__(self, operations):
+    def __init__(
+        self,
+        operations,
+        *,
+        verification_status=VerificationStatus.NOT_SUPPORTED,
+    ):
         self.operations = operations
+        self.verification_status = verification_status
         self.verify_inputs = []
 
     def normalize_arguments(self, arguments):
@@ -13071,10 +13086,12 @@ class DisplaySettingConnector:
     async def verify(self, request):
         self.verify_inputs.append(request)
         return ConnectorVerificationResult(
-            VerificationStatus.NOT_SUPPORTED,
-            "verification_not_supported",
-            "verification_not_supported",
-            0,
+            self.verification_status,
+            f"verification_{self.verification_status.value}",
+            f"fixture_{self.verification_status.value}",
+            0
+            if self.verification_status is VerificationStatus.NOT_SUPPORTED
+            else 1,
             effect_mode="simulated",
             target_label="fixture:display",
         )
@@ -13120,12 +13137,23 @@ DISPLAY_CAPABILITY = CapabilityEntry(
 
 
 class DisplaySettingRuntime(CapabilityRuntime):
-    def __init__(self, *, expired=False, action_summary_error=None):
-        super().__init__(action_summary_error=action_summary_error)
+    def __init__(
+        self,
+        *,
+        expired=False,
+        action_summary_error=None,
+        action_summary_response=None,
+        verification_required=False,
+    ):
+        super().__init__(
+            action_summary_error=action_summary_error,
+            action_summary_response=action_summary_response,
+        )
         self.confirmation_calls = []
         self.dispatch_count = 0
         self.consumed = False
         self.expired = expired
+        self.verification_required = verification_required
         self.capability_match_response = {
             "result": {
                 "capability_matched": True,
@@ -13140,7 +13168,7 @@ class DisplaySettingRuntime(CapabilityRuntime):
                     "requires_confirmation": True,
                     "reversible": True,
                     "dry_run_supported": True,
-                    "verification_supported": False,
+                    "verification_supported": verification_required,
                 },
             }
         }
@@ -13180,9 +13208,13 @@ class DisplaySettingRuntime(CapabilityRuntime):
                 "confirmation_required": True,
                 "confirmation_text": "Confirm the display setting change.",
                 "execution_allowed": confirmed,
-                "verification_required": False,
-                "verification_supported": False,
-                "verification_method": None,
+                "verification_required": self.verification_required,
+                "verification_supported": self.verification_required,
+                "verification_method": (
+                    "capability_verification"
+                    if self.verification_required
+                    else None
+                ),
                 "reason_summary": reasons,
                 "action_taken": False,
             }
@@ -13495,12 +13527,21 @@ def _display_chat_payload(text, **overrides):
     return _jellyfin_chat_payload(text, **overrides)
 
 
-def _install_display_capability(monkeypatch):
+def _install_display_capability(monkeypatch, *, verification_supported=False):
     production = capability_service.production_capability_registry()
+    entry = DISPLAY_CAPABILITY
+    if verification_supported:
+        entry = replace(
+            DISPLAY_CAPABILITY,
+            policy_shape=replace(
+                DISPLAY_CAPABILITY.policy_shape,
+                verification_supported=True,
+            ),
+        )
     monkeypatch.setattr(
         capability_service,
         "production_capability_registry",
-        lambda: (*production, DISPLAY_CAPABILITY),
+        lambda: (*production, entry),
     )
 
 
@@ -13978,6 +14019,286 @@ async def test_orchestrate_display_setting_failure_and_unknown_do_not_retry(
     assert connector.verify_inputs == []
     assert trace["capabilities"]["execution"]["response_status"] == expected_status
     assert trace["capabilities"]["execution"]["connector_execution_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_display_setting_partial_execution_is_degraded_and_not_retried(
+    tmp_path,
+    monkeypatch,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations("partially_executed")
+    connector = DisplaySettingConnector(operations)
+    connectors = ActionConnectorRegistry((connector,))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-partial-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    assert operations.apply_inputs == []
+
+    accepted = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-partial-accepted",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.dispatch_count == 1
+    assert len(operations.apply_inputs) == 1
+    assert operations.apply_inputs[0]["level"] == 7
+    assert connector.verify_inputs == []
+    assert len(runtime.action_summary_calls) == 2
+    summary_call = runtime.action_summary_calls[-1]
+    assert summary_call["execution_status"] == "partially_executed"
+    assert summary_call["execution_reason_code"] == "setting_partially_executed"
+    assert summary_call["degradation_reason"] == "setting_partially_executed"
+    assert summary_call["verification_status"] == "not_supported"
+    assert "partially completed" in accepted["answer"].casefold()
+    assert "degraded" in accepted["answer"].casefold()
+    for false_outcome in (
+        "no action was taken",
+        "complete success",
+        "complete failure",
+        "outcome is unknown",
+    ):
+        assert false_outcome not in accepted["answer"].casefold()
+    accepted_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["capabilities"]
+    assert accepted_trace["provider_call_count"] == 0
+    assert accepted_trace["action_summary_call_count"] == 1
+    assert accepted_trace["execution"]["response_status"] == "partially_executed"
+    assert accepted_trace["execution"]["connector_execution_call_count"] == 1
+    assert accepted_trace["execution"]["connector_verification_call_count"] == 0
+    assert accepted_trace["action_summary"]["execution_status"] == (
+        "partially_executed"
+    )
+    assert "fixture_partial" not in str(summary_call)
+    assert "fixture_partial" not in accepted["answer"]
+
+    replay = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes again",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-partial-replay",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert "pending_action" not in replay
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.dispatch_count == 1
+    assert len(operations.apply_inputs) == 1
+    replay_trace = memory_store.trace_calls[2]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["capabilities"]
+    assert replay_trace["provider_call_count"] == 0
+    assert replay_trace["execution"]["failure_reason_code"] == "challenge_consumed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_partial_with_passed_verification_remains_partial(
+    tmp_path,
+    monkeypatch,
+):
+    _install_display_capability(monkeypatch, verification_supported=True)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime(verification_required=True)
+    operations = DisplaySettingOperations("partially_executed")
+    connector = DisplaySettingConnector(
+        operations,
+        verification_status=VerificationStatus.PASSED,
+    )
+    connectors = ActionConnectorRegistry((connector,))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-partial-verified-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    accepted = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-display-partial-verified-accepted",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert runtime.dispatch_count == 1
+    assert len(operations.apply_inputs) == 1
+    assert len(connector.verify_inputs) == 1
+    assert len(runtime.action_summary_calls) == 2
+    summary_call = runtime.action_summary_calls[-1]
+    assert summary_call["execution_status"] == "partially_executed"
+    assert summary_call["verification_status"] == "passed"
+    assert summary_call["execution_reason_code"] == "setting_partially_executed"
+    assert summary_call["degradation_reason"] == "setting_partially_executed"
+    assert "partially completed" in accepted["answer"].casefold()
+    assert "degraded" in accepted["answer"].casefold()
+    trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["execution"]["response_status"] == (
+        "partially_executed"
+    )
+    assert trace["capabilities"]["execution"]["connector_execution_call_count"] == 1
+    assert trace["capabilities"]["execution"]["connector_verification_call_count"] == 1
+    assert trace["capabilities"]["action_summary"]["execution_status"] == (
+        "partially_executed"
+    )
+    assert trace["capabilities"]["action_summary"]["verification_status"] == "passed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary_mode", ["unavailable", "malformed"])
+async def test_orchestrate_partial_summary_degradation_does_not_reexecute(
+    tmp_path,
+    monkeypatch,
+    summary_mode,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime(
+        action_summary_error=(
+            RuntimeError("PRIVATE-SUMMARY-ERROR")
+            if summary_mode == "unavailable"
+            else None
+        ),
+        action_summary_response=(
+            {"result": "PRIVATE-MALFORMED-SUMMARY"}
+            if summary_mode == "malformed"
+            else None
+        ),
+    )
+    operations = DisplaySettingOperations("partially_executed")
+    connector = DisplaySettingConnector(operations)
+    connectors = ActionConnectorRegistry((connector,))
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 7},
+            )
+        ]
+    )
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level seven."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-partial-{summary_mode}-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+    accepted = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-display-partial-{summary_mode}-accepted",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(litellm.calls) == 1
+    assert len(runtime.confirmation_calls) == 1
+    assert runtime.dispatch_count == 1
+    assert len(operations.apply_inputs) == 1
+    assert connector.verify_inputs == []
+    assert len(runtime.action_summary_calls) == 2
+    assert accepted["answer"] == (
+        "The display setting was only partially applied. I did not retry it."
+    )
+    trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["capabilities"]["action_summary"]["status"] == summary_mode
+    assert trace["capabilities"]["execution"]["response_status"] == (
+        "partially_executed"
+    )
+    assert "PRIVATE" not in str(trace["capabilities"])
+    assert "PRIVATE" not in accepted["answer"]
 
 
 @pytest.mark.asyncio

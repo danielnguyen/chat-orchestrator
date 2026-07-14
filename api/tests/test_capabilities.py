@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from services.action_connectors import (
     ActionConnectorRegistry,
     ConnectorVerificationResult,
+    ExecutionStatus,
     VerificationStatus,
 )
 from services.capabilities import (
@@ -2209,6 +2210,8 @@ def _display_entry():
             "required": ["target", "level"],
             "properties": {"target": {"type": "string"}, "level": {"type": "integer"}},
         },
+        enabled_surfaces=("dev",),
+        enabled_personas=("technical_architect",),
         policy_shape=CapabilityPolicyShape(
             registry_domain="display_preferences",
             operation_kind="state_change",
@@ -2219,6 +2222,169 @@ def _display_entry():
             verification_supported=False,
         ),
     )
+
+
+class PartialDisplayConnector(DisplaySettingConnector):
+    def __init__(
+        self,
+        operations,
+        *,
+        verification_status=VerificationStatus.NOT_SUPPORTED,
+        verification_error=None,
+        verification_result=None,
+    ):
+        super().__init__(operations)
+        self.verification_status = verification_status
+        self.verification_error = verification_error
+        self.verification_result = verification_result
+        self.execute_calls = 0
+        self.verify_calls = 0
+
+    async def execute(self, request):
+        self.execute_calls += 1
+        return await super().execute(request)
+
+    async def verify(self, request):
+        self.verify_calls += 1
+        assert request.execution.status is ExecutionStatus.PARTIALLY_EXECUTED
+        if self.verification_error is not None:
+            raise self.verification_error
+        if self.verification_result is not None:
+            return self.verification_result
+        return ConnectorVerificationResult(
+            self.verification_status,
+            f"verification_{self.verification_status.value}",
+            f"fixture_{self.verification_status.value}",
+            0 if self.verification_status is VerificationStatus.NOT_SUPPORTED else 1,
+            effect_mode="simulated",
+            target_label="fixture:display",
+        )
+
+
+def _display_validation(monkeypatch, connector):
+    entry = _display_entry()
+    monkeypatch.setattr(
+        capability_service,
+        "capability_by_id",
+        lambda capability_id: entry if capability_id == entry.capability_id else None,
+    )
+    monkeypatch.setattr(
+        capability_service,
+        "capability_by_provider_tool_name",
+        lambda tool_name: entry if tool_name == entry.provider_tool_name else None,
+    )
+    request = parse_provider_capability_request(
+        _call(
+            entry.provider_tool_name,
+            {"target": "fixture:display", "level": 7},
+        )
+    )
+    assert request is not None
+    return validate_and_digest_capability_request(
+        request=request,
+        exposed_capability_ids=[entry.capability_id],
+        connector_registry=ActionConnectorRegistry((connector,)),
+    )
+
+
+async def _execute_partial_display(
+    monkeypatch,
+    connector,
+    *,
+    verification_required,
+):
+    validation = _display_validation(monkeypatch, connector)
+    runtime = FakeRuntime()
+    result = await authorize_and_execute_capability(
+        runtime=runtime,
+        request_id="rid-display-partial",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_display",
+        runtime_turn_id="rtturn_display",
+        active_persona_id="technical_architect",
+        validation_result=validation,
+        connector_registry=ActionConnectorRegistry((connector,)),
+        post_execution_verification_required=verification_required,
+    )
+    return result, runtime
+
+
+@pytest.mark.asyncio
+async def test_partial_connector_execution_without_verification_stays_degraded(
+    monkeypatch,
+):
+    operations = DisplaySettingOperations("partially_executed")
+    connector = PartialDisplayConnector(operations)
+
+    result, runtime = await _execute_partial_display(
+        monkeypatch,
+        connector,
+        verification_required=False,
+    )
+
+    assert connector.execute_calls == len(operations.apply_inputs) == 1
+    assert connector.verify_calls == 0
+    assert len(runtime.calls) == 2
+    assert result.trace["executor_result_status"] == "partially_executed"
+    assert result.trace["response_status"] == "partially_executed"
+    assert result.trace["failure_reason_code"] == "setting_partially_executed"
+    assert result.trace["post_execution_verification"]["status"] == "not_required"
+    assert "partially" in result.response_text.casefold()
+    assert "no action was taken" not in result.response_text.casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "verification_status",
+        "verification_error",
+        "verification_result",
+        "expected_status",
+    ),
+    [
+        (VerificationStatus.PASSED, None, None, "verified"),
+        (VerificationStatus.FAILED, None, None, "failed"),
+        (VerificationStatus.UNKNOWN, None, None, "unknown"),
+        (VerificationStatus.NOT_SUPPORTED, None, None, "not_supported"),
+        (
+            VerificationStatus.UNKNOWN,
+            RuntimeError("private"),
+            None,
+            "unknown",
+        ),
+        (VerificationStatus.UNKNOWN, None, {"status": "passed"}, "failed"),
+    ],
+)
+async def test_partial_connector_execution_preserves_partial_after_one_verification(
+    monkeypatch,
+    verification_status,
+    verification_error,
+    verification_result,
+    expected_status,
+):
+    operations = DisplaySettingOperations("partially_executed")
+    connector = PartialDisplayConnector(
+        operations,
+        verification_status=verification_status,
+        verification_error=verification_error,
+        verification_result=verification_result,
+    )
+
+    result, _runtime = await _execute_partial_display(
+        monkeypatch,
+        connector,
+        verification_required=True,
+    )
+
+    assert connector.execute_calls == len(operations.apply_inputs) == 1
+    assert connector.verify_calls == 1
+    assert result.trace["response_status"] == "partially_executed"
+    assert result.trace["failure_reason_code"] == "setting_partially_executed"
+    assert result.trace["post_execution_verification"]["status"] == expected_status
+    assert "partially" in result.response_text.casefold()
+    assert "no action was taken" not in result.response_text.casefold()
 
 
 def test_generic_pending_parser_and_connector_restoration_bind_digest(monkeypatch):
