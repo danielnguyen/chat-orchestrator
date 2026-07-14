@@ -315,12 +315,14 @@ make replay-test
 make process-naming-check
 ```
 
-Run the existing composed Jellyfin compatibility evaluator from the sibling `projects` checkout. `JellyfinActionConnector` is a compatibility case, not a template for new connectors.
+If connector work could affect the existing Jellyfin path, the current composed evaluator is an optional compatibility reference. It is not a permanent validation step for every new connector, and `JellyfinActionConnector` is a compatibility case rather than a template.
 
 ```bash
 cd ../projects
+EVALUATOR_PATH="$(git ls-files '*/assurance/evaluate_jellyfin_safe_restart.py')"
+test -f "$EVALUATOR_PATH"
 ../chat-orchestrator/api/.venv/bin/python \
-  ccp-pha""se-5-actions/assurance/evaluate_jellyfin_safe_restart.py \
+  "$EVALUATOR_PATH" \
   --projects-root . \
   --cognitive-runtime-root ../cognitive-runtime \
   --chat-orchestrator-root ../chat-orchestrator \
@@ -328,7 +330,7 @@ cd ../projects
   --deterministic-asserted
 ```
 
-The evaluator output is disposable. Never point this command at the retained-evidence directory or overwrite retained evidence.
+The evaluator output should be disposable; the command above writes it under `/tmp`.
 
 ## Definition of done
 
