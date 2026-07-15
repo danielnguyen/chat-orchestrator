@@ -44,6 +44,7 @@ from services.claim_capture import (
     mark_trace_status_update_failed,
     prepare_claim_capture,
 )
+from services.claim_explanation import resolve_claim_explanation
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
 from services.jellyfin_action_connector import (
@@ -6413,6 +6414,120 @@ async def orchestrate_chat(
     privacy_context_trace = _privacy_context_disabled_trace()
 
     try:
+        claim_explanation = await resolve_claim_explanation(
+            enabled=claim_record_capture_enabled,
+            messages=payload.get("messages"),
+            memory_store=memory_store,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+        )
+        if claim_explanation.handled:
+            answer = claim_explanation.answer or ""
+            status = claim_explanation.status or "degraded"
+            await _advance_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="responding",
+            )
+            await memory_store.add_message(
+                conversation_id=conversation_id,
+                owner_id=payload["owner_id"],
+                role="assistant",
+                content=answer,
+                client_id=payload.get("client_id"),
+                metadata={
+                    "request_id": request_id,
+                    "selected_model": "not_called",
+                    "response_kind": "claim_explanation",
+                },
+                policy_metadata=turn_policy_metadata,
+            )
+            await _complete_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="completed",
+            )
+            trace_payload = {
+                "request_id": request_id,
+                "conversation_id": conversation_id,
+                "owner_id": payload["owner_id"],
+                "client_id": payload.get("client_id"),
+                "surface": surface,
+                "profile": {
+                    "name": profile["profile_name"],
+                    "version": profile["profile_version"],
+                    "effective_profile_ref": profile["effective_profile_ref"],
+                },
+                "retrieval": {
+                    "status": "not_requested",
+                    "query_present": False,
+                    "bundle": {
+                        "status": "not_requested",
+                        "recent_count": 0,
+                        "semantic_count": 0,
+                        "artifact_ref_count": 0,
+                    },
+                    "prompt_assembly": {
+                        "status": "not_requested",
+                        "claim_explanation": claim_explanation.trace,
+                    },
+                },
+                "prompt": {
+                    "status": "not_requested",
+                    "claim_explanation": claim_explanation.trace,
+                    "runtime_session": runtime_session_trace,
+                    "turn_state": turn_state_trace,
+                },
+                "router_decision": {
+                    "rule_id": None,
+                    "selected_model": "not_called",
+                    "provider": "none",
+                    "rationale": "claim_explanation",
+                    "fallbacks": [],
+                },
+                "manual_override": {
+                    "requested_model": None,
+                    "applied": False,
+                    "rejection_reason": None,
+                },
+                "model_call": {
+                    "provider": "none",
+                    "model": "not_called",
+                    "status": "not_called",
+                    "latency_ms": 0,
+                },
+                "model_calls": [],
+                "fallback": {"triggered": False, "reason": None},
+                "dsa": {"enabled": False, "called": False, "status": "not_requested"},
+                "artifacts": {
+                    "status": "not_requested",
+                    "artifact_count": 0,
+                    "included_ids": [],
+                    "source_reference_count": 0,
+                },
+                "references": [],
+                "cost": {},
+                "latency_ms": int((perf_counter() - started) * 1000),
+                "status": status,
+                "error": None,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            await memory_store.create_trace(
+                request_id=request_id,
+                payload=trace_payload,
+            )
+            return {
+                "request_id": request_id,
+                "conversation_id": conversation_id,
+                "profile_name": profile["profile_name"],
+                "selected_model": "not_called",
+                "answer": answer,
+                "status": status,
+                "sources": [],
+            }
+
         await _advance_runtime_turn(
             runtime=runtime,
             turn_state_trace=turn_state_trace,

@@ -26,10 +26,19 @@ class MemoryStoreClient:
             resp.raise_for_status()
             return resp.json()
 
-    async def _get(self, path: str) -> dict[str, Any]:
+    async def _get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         headers = {"X-API-Key": self.api_key}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(f"{self.base_url}{path}", headers=headers)
+            resp = await client.get(
+                f"{self.base_url}{path}",
+                headers=headers,
+                params=params,
+            )
             resp.raise_for_status()
             return resp.json()
 
@@ -183,6 +192,24 @@ class MemoryStoreClient:
             "/v1/internal/claim-records",
             request_id=request_id,
             json=payload,
+        )
+
+    async def list_claim_records(
+        self,
+        *,
+        owner_id: str,
+        conversation_id: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        if not 1 <= limit <= 20:
+            raise ValueError("claim_record_limit_out_of_range")
+        return await self._get(
+            "/v1/internal/claim-records",
+            params={
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "limit": limit,
+            },
         )
 
     async def get_trace(self, request_id: str) -> dict[str, Any]:

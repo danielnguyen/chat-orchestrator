@@ -148,8 +148,25 @@ are also skipped rather than attributed by guesswork.
 Capture does not add another provider call or expose calibration metadata in the
 chat response. Calibration or storage failure leaves the completed answer intact,
 records only a bounded structural outcome in the request trace, and never
-fabricates a durable record. Claim-record retrieval and follow-up explanation are
-not currently implemented by Chat Orchestrator.
+fabricates a durable record.
+
+The same flag also enables a bounded follow-up explanation path for these exact
+messages: `How are you sure?`, `What supports that?`, `What supported that?`,
+`What evidence supports that?`, and `What was that based on?` Matching is
+case-insensitive, permits whitespace variation and one terminal question mark or
+period, and does not intercept messages with additional instructions or a named
+older claim.
+
+The follow-up must immediately follow a bounded assistant answer. Chat Orchestrator
+loads the newest conversation-scoped claim-record group, requires exactly one claim
+in that group, and requires its normalized claim anchor to equal the immediately
+preceding answer. It never scans older groups for a convenient match. A valid
+record is rendered without retrieval or a model call, using only its source type,
+claim class, confidence, evidence strength, freshness, and material limitations.
+Opaque source identifiers and private record content are not shown. Missing,
+ambiguous, incomplete, or unavailable records produce an honest deterministic
+fallback, and no explanation performs fresh verification. Quoted or specifically
+targeted older claims remain on the ordinary chat path.
 
 ## Integration boundaries
 
