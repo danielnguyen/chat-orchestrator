@@ -614,9 +614,13 @@ run_claim_traceability_scenario() {
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_g2" >/dev/null
   trace_g2="$(fetch_trace "$request_g2")"
-  jq -e '
+  jq -e \
+    --arg claim_id "$claim_id" \
+    --arg claim_digest "$claim_digest" '
     .prompt.claim_explanation.reason_code == "latest_claim_record_resolved"
     and .prompt.claim_explanation.target_mode == "immediate_previous"
+    and .prompt.claim_explanation.claim_id == $claim_id
+    and .prompt.claim_explanation.claim_anchor_digest == $claim_digest
     and .prompt.claim_explanation.storage_call_count == 1
     and .prompt.claim_explanation.provider_call_count == 0
     and .retrieval.status == "not_requested"
@@ -626,7 +630,7 @@ run_claim_traceability_scenario() {
   ' <<<"$trace_g2" >/dev/null
   private_output="$(jq -c . <<<"$trace_g2")"
   case "$private_output" in
-    *"$malicious_summary"*|*"$expected_answer"*|*"$claim_id"*|*"$assistant_message_id"*|*"$derived_id"*)
+    *"$malicious_summary"*|*"$expected_answer"*|*"$assistant_message_id"*|*"$derived_id"*)
       echo "claim explanation trace exposed private or opaque stored content" >&2
       exit 1
       ;;
@@ -752,7 +756,7 @@ run_claim_traceability_scenario() {
   esac
   private_output="$(jq -c . <<<"$trace_g2")$(jq -c . <<<"$trace_g3")$(jq -c . <<<"$trace_g4")"
   case "$private_output" in
-    *"$expected_answer"*|*"$derived_id"*|*"$claim_id"*|*"$assistant_message_id"*)
+    *"$expected_answer"*|*"$derived_id"*|*"$assistant_message_id"*)
       echo "claim explanation smoke trace exposed target or opaque identifiers" >&2
       exit 1
       ;;
