@@ -115,6 +115,7 @@ services:
       COGNITIVE_RUNTIME_TIMEOUT_MS: "5000"
       ENABLE_RUNTIME_OVERLAYS: "true"
       COGNITIVE_RUNTIME_MEMORY_HYGIENE_ENABLED: "true"
+      CLAIM_RECORD_CAPTURE_ENABLED: "true"
       LITELLM_BASE_URL: http://provider:8000
       ROUTER_RULES_PATH: /app/router/rules.yaml
       MODEL_REGISTRY_PATH: /app/router/model_registry.yaml

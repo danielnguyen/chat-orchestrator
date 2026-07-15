@@ -53,15 +53,28 @@ async def chat_completions(
         for message in messages
         if isinstance(message, dict)
     ]
+    latest_user_text = next(
+        (
+            message["content"]
+            for message in reversed(normalized_messages)
+            if message["role"] == "user"
+        ),
+        "",
+    )
     prompt_fingerprint = hashlib.sha256(
         json.dumps(normalized_messages, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )
     ).hexdigest()
-    current_block = prompt_text.split("Historical or unverified memory context:")[0]
-    has_current = "Current memory evidence:" in prompt_text
+    current_memory_messages = [
+        message["content"]
+        for message in normalized_messages
+        if message["role"] == "system"
+        and "Current memory evidence:" in message["content"]
+    ]
+    has_current = bool(current_memory_messages)
     has_historical = "Historical or unverified memory context:" in prompt_text
-    beta_in_current = "Current memory evidence:" in current_block and "Beta" in current_block
+    beta_in_current = any("Beta" in content for content in current_memory_messages)
     beta_anywhere = "Beta" in prompt_text
     wave2e_private_sentinel = "PRIVATE-WAVE2E-DIAGNOSTIC-SENTINEL" in prompt_text
     raw_diagnostics_marker = (
@@ -100,7 +113,9 @@ async def chat_completions(
             }
         )
         raise HTTPException(status_code=503, detail="primary failure fixture")
-    if has_current and "Current plan is Alpha." in prompt_text:
+    if latest_user_text.strip() == "What does the retained file report about the setting?":
+        answer = "The retained file reports that the setting is active."
+    elif has_current and "Current plan is Alpha." in prompt_text:
         answer = "Current plan is Alpha."
     elif has_historical:
         answer = "I only have historical or unverified memory context."
