@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -22,6 +23,13 @@ _SUPPORTED_INTENTS = frozenset(
         "what was that based on",
     }
 )
+_QUOTED_INTENT_RE = re.compile(
+    r'(?:what\s+supports\s+the\s+statement|'
+    r'what\s+supported\s+the\s+statement|'
+    r'how\s+are\s+you\s+sure\s+about\s+the\s+statement)'
+    r'\s+"(?P<anchor>[^"\r\n]*)"\s*[?.]?\s*',
+    re.IGNORECASE,
+)
 
 _TARGET_UNAVAILABLE = (
     "I can’t safely identify which earlier statement you mean from the supplied "
@@ -34,6 +42,14 @@ _NO_RECORD = (
 _AMBIGUOUS = (
     "I found more than one retained claim for the immediately previous answer, so I "
     "can’t safely choose one. I did not perform a new verification."
+)
+_QUOTED_NO_RECORD = (
+    "I don’t have a retained evidence record matching that quoted earlier statement, "
+    "so I can’t honestly say what supported it. I did not perform a new verification."
+)
+_QUOTED_AMBIGUOUS = (
+    "I found more than one retained claim matching that quoted earlier statement, so "
+    "I can’t safely choose one. I did not perform a new verification."
 )
 _DEPENDENCY_UNAVAILABLE = (
     "I couldn’t access the retained evidence record for that earlier answer. I can’t "
@@ -164,6 +180,12 @@ class ClaimRecordListResponse(BaseModel):
 
 
 @dataclass(frozen=True)
+class ClaimExplanationIntent:
+    mode: Literal["latest", "quoted_anchor"]
+    target_anchor: str | None = None
+
+
+@dataclass(frozen=True)
 class ClaimExplanationOutcome:
     handled: bool
     answer: str | None
@@ -175,19 +197,41 @@ def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def is_claim_explanation_intent(value: Any) -> bool:
+def parse_claim_explanation_intent(value: Any) -> ClaimExplanationIntent | None:
     if not isinstance(value, str):
-        return False
+        return None
     normalized = normalize_text(value).casefold()
     if normalized.endswith(("?", ".")):
         normalized = normalized[:-1].rstrip()
-    return normalized in _SUPPORTED_INTENTS
+    if normalized in _SUPPORTED_INTENTS:
+        return ClaimExplanationIntent(mode="latest")
+
+    match = _QUOTED_INTENT_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    target_anchor = normalize_text(match.group("anchor"))
+    if not target_anchor or len(target_anchor) > 500:
+        target_anchor = None
+    return ClaimExplanationIntent(
+        mode="quoted_anchor",
+        target_anchor=target_anchor,
+    )
 
 
-def _trace(*, reason_code: str, **updates: Any) -> dict[str, Any]:
+def is_claim_explanation_intent(value: Any) -> bool:
+    return parse_claim_explanation_intent(value) is not None
+
+
+def _trace(
+    *,
+    reason_code: str,
+    target_mode: Literal["immediate_previous", "quoted_anchor"] = "immediate_previous",
+    **updates: Any,
+) -> dict[str, Any]:
     trace = {
         "enabled": True,
         "intent_status": "matched",
+        "target_mode": target_mode,
         "target_status": "not_resolved",
         "lookup_status": "not_requested",
         "resolution_status": "not_resolved",
@@ -214,7 +258,10 @@ def _fallback(answer: str, reason_code: str, **trace_updates: Any) -> ClaimExpla
     )
 
 
-def _prior_assistant(messages: Any) -> str | None:
+def _prior_assistant(
+    messages: Any,
+    intent: ClaimExplanationIntent,
+) -> str | None:
     if not isinstance(messages, list) or len(messages) < 2:
         return None
     final = messages[-1]
@@ -222,7 +269,7 @@ def _prior_assistant(messages: Any) -> str | None:
     if (
         not isinstance(final, dict)
         or final.get("role") != "user"
-        or not is_claim_explanation_intent(final.get("content"))
+        or intent.mode != "latest"
         or not isinstance(prior, dict)
         or prior.get("role") != "assistant"
         or not isinstance(prior.get("content"), str)
@@ -357,12 +404,29 @@ async def resolve_claim_explanation(
     conversation_id: str,
 ) -> ClaimExplanationOutcome:
     final_content = messages[-1].get("content") if isinstance(messages, list) and messages else None
-    if not enabled or not is_claim_explanation_intent(final_content):
+    intent = parse_claim_explanation_intent(final_content)
+    if not enabled or intent is None:
         return ClaimExplanationOutcome(False, None, None, {})
 
-    prior_answer = _prior_assistant(messages)
-    if prior_answer is None:
-        return _fallback(_TARGET_UNAVAILABLE, "prior_assistant_unavailable")
+    target_mode: Literal["immediate_previous", "quoted_anchor"] = (
+        "immediate_previous" if intent.mode == "latest" else "quoted_anchor"
+    )
+    prior_answer = None
+    if intent.mode == "latest":
+        prior_answer = _prior_assistant(messages, intent)
+        if prior_answer is None:
+            return _fallback(
+                _TARGET_UNAVAILABLE,
+                "prior_assistant_unavailable",
+                target_mode=target_mode,
+            )
+    elif intent.target_anchor is None:
+        return _fallback(
+            _TARGET_UNAVAILABLE,
+            "quoted_target_invalid",
+            target_mode=target_mode,
+            target_status="invalid",
+        )
 
     try:
         payload = await memory_store.list_claim_records(
@@ -374,6 +438,7 @@ async def resolve_claim_explanation(
         return _fallback(
             _DEPENDENCY_UNAVAILABLE,
             "claim_records_unavailable",
+            target_mode=target_mode,
             target_status="resolved",
             lookup_status="failed",
             storage_call_count=1,
@@ -385,6 +450,7 @@ async def resolve_claim_explanation(
         return _fallback(
             _INVALID_RECORD,
             "claim_record_response_invalid",
+            target_mode=target_mode,
             target_status="resolved",
             lookup_status="completed",
             storage_call_count=1,
@@ -392,9 +458,20 @@ async def resolve_claim_explanation(
 
     records = response.records
     if not records:
+        if intent.mode == "quoted_anchor":
+            return _fallback(
+                _QUOTED_NO_RECORD,
+                "quoted_claim_record_not_found",
+                target_mode=target_mode,
+                target_status="resolved",
+                lookup_status="completed",
+                resolution_status="no_record",
+                storage_call_count=1,
+            )
         return _fallback(
             _NO_RECORD,
             "no_claim_records",
+            target_mode=target_mode,
             target_status="resolved",
             lookup_status="completed",
             resolution_status="no_record",
@@ -412,6 +489,7 @@ async def resolve_claim_explanation(
         return _fallback(
             _INVALID_RECORD,
             "record_invalid",
+            target_mode=target_mode,
             target_status="resolved",
             lookup_status="completed",
             resolution_status="invalid",
@@ -419,35 +497,58 @@ async def resolve_claim_explanation(
             record_count=len(records),
         )
 
-    newest_message_id = records[0].assistant_message_id
-    newest_group: list[ClaimRecord] = []
-    for record in records:
-        if record.assistant_message_id != newest_message_id:
-            break
-        newest_group.append(record)
     counts = {
+        "target_mode": target_mode,
         "target_status": "resolved",
         "lookup_status": "completed",
         "storage_call_count": 1,
         "record_count": len(records),
-        "newest_group_count": len(newest_group),
     }
-    if len(newest_group) > 1:
-        return _fallback(
-            _AMBIGUOUS,
-            "ambiguous_latest_response",
-            resolution_status="ambiguous",
-            **counts,
-        )
+    if intent.mode == "quoted_anchor":
+        matching_records = [
+            record for record in records if record.claim_anchor == intent.target_anchor
+        ]
+        if not matching_records:
+            return _fallback(
+                _QUOTED_NO_RECORD,
+                "quoted_claim_record_not_found",
+                resolution_status="no_record",
+                matched_record_count=0,
+                **counts,
+            )
+        if len(matching_records) > 1:
+            return _fallback(
+                _QUOTED_AMBIGUOUS,
+                "ambiguous_quoted_claim",
+                resolution_status="ambiguous",
+                matched_record_count=len(matching_records),
+                **counts,
+            )
+        record = matching_records[0]
+    else:
+        newest_message_id = records[0].assistant_message_id
+        newest_group: list[ClaimRecord] = []
+        for record in records:
+            if record.assistant_message_id != newest_message_id:
+                break
+            newest_group.append(record)
+        counts["newest_group_count"] = len(newest_group)
+        if len(newest_group) > 1:
+            return _fallback(
+                _AMBIGUOUS,
+                "ambiguous_latest_response",
+                resolution_status="ambiguous",
+                **counts,
+            )
 
-    record = newest_group[0]
-    if record.claim_anchor != prior_answer:
-        return _fallback(
-            _NO_RECORD,
-            "no_record_for_latest_response",
-            resolution_status="no_record",
-            **counts,
-        )
+        record = newest_group[0]
+        if record.claim_anchor != prior_answer:
+            return _fallback(
+                _NO_RECORD,
+                "no_record_for_latest_response",
+                resolution_status="no_record",
+                **counts,
+            )
 
     support_status = _record_support_status(
         record,
@@ -473,16 +574,16 @@ async def resolve_claim_explanation(
         answer=_render(record),
         status="ok",
         trace=_trace(
-            reason_code="latest_claim_record_resolved",
-            target_status="resolved",
-            lookup_status="completed",
+            reason_code=(
+                "latest_claim_record_resolved"
+                if intent.mode == "latest"
+                else "quoted_claim_record_resolved"
+            ),
             resolution_status="resolved",
             render_status="completed",
-            storage_call_count=1,
-            record_count=len(records),
-            newest_group_count=1,
             matched_record_count=1,
             claim_id=record.claim_id,
             claim_anchor_digest=record.claim_anchor_digest,
+            **counts,
         ),
     )
