@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import inspect
 import json
 from dataclasses import replace
@@ -86,6 +88,7 @@ class FakeMemoryStore:
         self.added_messages = []
         self.retrieve_calls = []
         self.trace_calls = []
+        self.claim_record_calls = []
 
     async def resolve_conversation(self, **kwargs):
         return {"conversation_id": "conv-1", "reused": False}
@@ -217,6 +220,18 @@ class FakeMemoryStore:
         self.trace_calls.append(kwargs)
         return {"trace_id": "t-1", "request_id": kwargs["request_id"]}
 
+    async def create_claim_record(self, **kwargs):
+        self.claim_record_calls.append(kwargs)
+        payload = kwargs["payload"]
+        return {
+            "created": True,
+            "record": {
+                **{key: value for key, value in payload.items() if key != "calibration_result"},
+                **payload["calibration_result"],
+                "created_at": "2026-07-15T00:00:00+00:00",
+            },
+        }
+
 
 class RetrievalDiagnosticsMemoryStore(FakeMemoryStore):
     def __init__(self, *, diagnostics: object | None = None, malformed_bundle: bool = False):
@@ -347,6 +362,7 @@ class FakeRuntime:
         capability_authority_response=None,
         capability_flow_response=None,
         action_summary_response=None,
+        claim_calibration_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
@@ -359,6 +375,7 @@ class FakeRuntime:
         capability_authority_error: Exception | None = None,
         capability_flow_error: Exception | None = None,
         action_summary_error: Exception | None = None,
+        claim_calibration_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -381,6 +398,7 @@ class FakeRuntime:
         self.capability_authority_calls = []
         self.capability_flow_calls = []
         self.action_summary_calls = []
+        self.claim_calibration_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -705,6 +723,7 @@ class FakeRuntime:
             },
         }
         self.action_summary_response = action_summary_response
+        self.claim_calibration_response = claim_calibration_response
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
@@ -717,6 +736,7 @@ class FakeRuntime:
         self.capability_authority_error = capability_authority_error
         self.capability_flow_error = capability_flow_error
         self.action_summary_error = action_summary_error
+        self.claim_calibration_error = claim_calibration_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -969,6 +989,39 @@ class FakeRuntime:
                 "execution_reason_code": kwargs.get("execution_reason_code"),
                 "verification_reason_code": kwargs.get("verification_reason_code"),
                 "user_visible_summary": summary,
+            },
+        }
+
+    async def evaluate_claim_calibration(self, **kwargs):
+        self.claim_calibration_calls.append(kwargs)
+        self.call_order.append("claim_calibration")
+        if self.claim_calibration_error is not None:
+            raise self.claim_calibration_error
+        if self.claim_calibration_response is not None:
+            return self.claim_calibration_response
+        anchor = kwargs["claim_anchor"]
+        digest = hashlib.sha256(anchor.encode("utf-8")).hexdigest()
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "surface": kwargs["surface"],
+            "runtime_session_id": kwargs["runtime_session_id"],
+            "runtime_turn_id": kwargs["runtime_turn_id"],
+            "result": {
+                "claim_id": "claim-capture-1",
+                "claim_anchor": anchor,
+                "claim_anchor_digest": f"sha256:{digest}",
+                "claim_class": "source_backed_fact",
+                "calibration_status": "limited",
+                "evidence_strength": "weak",
+                "confidence": "low",
+                "strongest_authority": "user_report",
+                "freshness_summary": "current",
+                "uncertainty_disclosure_required": True,
+                "validated_evidence_references": kwargs["evidence_references"],
+                "limitation_codes": ["low_authority_evidence", "single_source"],
+                "user_safe_summary": "This claim has limited recorded support.",
             },
         }
 
@@ -11050,6 +11103,298 @@ def _route_files_with_fallback(tmp_path):
 
 def _text_completion(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"content": content}}]}
+
+
+class ClaimCaptureMemoryStore(FakeMemoryStore):
+    def __init__(
+        self,
+        *,
+        malformed_assistant_ack: bool = False,
+        claim_record_error: Exception | None = None,
+        final_trace_error: Exception | None = None,
+    ):
+        super().__init__()
+        self.events = []
+        self.malformed_assistant_ack = malformed_assistant_ack
+        self.claim_record_error = claim_record_error
+        self.final_trace_error = final_trace_error
+
+    async def add_message(self, **kwargs):
+        self.added_messages.append(kwargs)
+        self.events.append(f"message:{kwargs['role']}")
+        if kwargs["role"] == "assistant":
+            if self.malformed_assistant_ack:
+                return {}
+            return {"message_id": "00000000-0000-4000-8000-000000000002"}
+        return {"message_id": "00000000-0000-4000-8000-000000000001"}
+
+    async def create_trace(self, **kwargs):
+        self.trace_calls.append(copy.deepcopy(kwargs))
+        self.events.append(f"trace:{len(self.trace_calls)}")
+        if len(self.trace_calls) == 2 and self.final_trace_error is not None:
+            raise self.final_trace_error
+        return {"trace_id": "trace-claim-capture", "request_id": kwargs["request_id"]}
+
+    async def create_claim_record(self, **kwargs):
+        self.claim_record_calls.append(copy.deepcopy(kwargs))
+        self.events.append("claim_record")
+        if self.claim_record_error is not None:
+            raise self.claim_record_error
+        payload = kwargs["payload"]
+        return {
+            "created": True,
+            "record": {
+                **{key: value for key, value in payload.items() if key != "calibration_result"},
+                **payload["calibration_result"],
+                "created_at": "2026-07-15T00:00:00+00:00",
+            },
+        }
+
+
+async def _run_claim_capture_chat(
+    tmp_path,
+    *,
+    memory_store=None,
+    runtime=None,
+    litellm=None,
+    enabled: bool = True,
+    request_id: str = "request-claim-capture",
+):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = memory_store or ClaimCaptureMemoryStore()
+    runtime = runtime or FakeRuntime()
+    litellm = litellm or FakeLiteLLM(
+        content="The retained file reports that the setting is active."
+    )
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=enabled,
+        request_id=request_id,
+    )
+    return result, memory_store, runtime, litellm
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(tmp_path):
+    result, memory_store, runtime, litellm = await _run_claim_capture_chat(tmp_path)
+
+    assert result["answer"] == "The retained file reports that the setting is active."
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_calibration_calls) == 1
+    assert len([item for item in memory_store.added_messages if item["role"] == "assistant"]) == 1
+    assert len(memory_store.trace_calls) == 2
+    assert len(memory_store.claim_record_calls) == 1
+    assert memory_store.events[-4:] == ["message:assistant", "trace:1", "claim_record", "trace:2"]
+
+    calibration_call = runtime.claim_calibration_calls[0]
+    assert calibration_call["request_id"] == result["request_id"]
+    assert calibration_call["owner_id"] == "owner"
+    assert calibration_call["conversation_id"] == "conv-1"
+    assert calibration_call["surface"] == "vscode"
+    assert calibration_call["runtime_session_id"] == "rtsession_1"
+    assert calibration_call["runtime_turn_id"] == "rtturn_1"
+    assert calibration_call["claim_anchor"] == result["answer"]
+    assert calibration_call["evidence_references"] == [
+        {
+            "ref_type": "derived_text",
+            "ref_id": "derived-text-1",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "support_kind": "direct",
+            "authority": "user_report",
+            "freshness_state": "active",
+        }
+    ]
+    serialized_call = json.dumps(calibration_call)
+    assert "PRIVATE-SIGNATURE-SENTINEL" not in serialized_call
+    assert "PRIVATE-OBJECT-URI-SENTINEL" not in serialized_call
+    assert "def entrypoint" not in serialized_call
+
+    initial_trace = memory_store.trace_calls[0]["payload"]
+    final_trace = memory_store.trace_calls[1]["payload"]
+    assert initial_trace["prompt"]["claim_capture"]["persistence_status"] == "pending"
+    assert final_trace["prompt"]["claim_capture"] == {
+        "enabled": True,
+        "eligibility_status": "eligible",
+        "calibration_status": "completed",
+        "persistence_status": "persisted",
+        "reason_code": "single_claim_single_file_source",
+        "runtime_call_count": 1,
+        "storage_call_count": 1,
+        "evidence_count": 1,
+        "claim_id": "claim-capture-1",
+        "claim_anchor_digest": runtime.claim_calibration_calls[0]
+        and memory_store.claim_record_calls[0]["payload"]["calibration_result"][
+            "claim_anchor_digest"
+        ],
+    }
+    assert {("derived_text", "derived-text-1")} <= {
+        (item["ref_type"], item["ref_id"]) for item in initial_trace["references"]
+    }
+    record_payload = memory_store.claim_record_calls[0]["payload"]
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert record_payload["assistant_message_id"] == "00000000-0000-4000-8000-000000000002"
+    assert record_payload["request_id"] == assistant_write["metadata"]["request_id"]
+    assert record_payload["calibration_result"]["claim_id"] == "claim-capture-1"
+    assert record_payload["calibration_result"]["claim_anchor"] == result["answer"]
+    assert record_payload["calibration_result"]["validated_evidence_references"] == (
+        calibration_call["evidence_references"]
+    )
+    assert "claim_capture" not in result
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_disabled_capture_preserves_single_trace_and_no_extra_calls(tmp_path):
+    result, memory_store, runtime, litellm = await _run_claim_capture_chat(
+        tmp_path,
+        enabled=False,
+    )
+    assert result["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert len(memory_store.trace_calls) == 1
+    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
+        "reason_code"
+    ] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_ambiguous_answer_skips_runtime_and_storage_calls(tmp_path):
+    litellm = FakeLiteLLM(content="The first fact is recorded. The second fact is recorded.")
+    result, memory_store, runtime, litellm = await _run_claim_capture_chat(
+        tmp_path,
+        litellm=litellm,
+    )
+    assert result["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert len(memory_store.trace_calls) == 1
+    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
+        "reason_code"
+    ] == "multi_sentence_answer"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_subjective_sentence_with_file_source_skips_capture(tmp_path):
+    litellm = FakeLiteLLM(content="The blue logo looks better.")
+    result, memory_store, runtime, litellm = await _run_claim_capture_chat(
+        tmp_path,
+        litellm=litellm,
+    )
+    assert result["answer"] == "The blue logo looks better."
+    assert len(litellm.calls) == 1
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert len(
+        [message for message in memory_store.added_messages if message["role"] == "assistant"]
+    ) == 1
+    assert len(memory_store.trace_calls) == 1
+    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
+        "reason_code"
+    ] == "factual_source_attribution_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_calibration_failure_is_nonfatal_and_skips_claim_storage(tmp_path):
+    runtime = FakeRuntime(claim_calibration_error=RuntimeError("PRIVATE-RUNTIME-ERROR"))
+    result, memory_store, runtime, _ = await _run_claim_capture_chat(
+        tmp_path,
+        runtime=runtime,
+    )
+    assert result["status"] == "ok"
+    assert len(runtime.claim_calibration_calls) == 1
+    assert memory_store.claim_record_calls == []
+    assert len(memory_store.trace_calls) == 1
+    capture = memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]
+    assert capture["reason_code"] == "calibration_unavailable"
+    assert "PRIVATE-RUNTIME-ERROR" not in json.dumps(capture)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_malformed_message_ack_skips_claim_storage(tmp_path):
+    memory_store = ClaimCaptureMemoryStore(malformed_assistant_ack=True)
+    result, memory_store, _, _ = await _run_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+    )
+    assert result["status"] == "ok"
+    assert memory_store.claim_record_calls == []
+    assert len(memory_store.trace_calls) == 1
+    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
+        "reason_code"
+    ] == "assistant_message_ack_invalid"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_claim_storage_failure_is_nonfatal_and_traced_once(tmp_path):
+    memory_store = ClaimCaptureMemoryStore(
+        claim_record_error=RuntimeError("PRIVATE-STORAGE-ERROR")
+    )
+    result, memory_store, _, litellm = await _run_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+    )
+    assert result["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert len(memory_store.claim_record_calls) == 1
+    assert len(memory_store.trace_calls) == 2
+    capture = memory_store.trace_calls[-1]["payload"]["prompt"]["claim_capture"]
+    assert capture["persistence_status"] == "failed"
+    assert capture["reason_code"] == "claim_record_persistence_failed"
+    assert "PRIVATE-STORAGE-ERROR" not in json.dumps(capture)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_final_trace_update_failure_does_not_repeat_capture(tmp_path):
+    memory_store = ClaimCaptureMemoryStore(
+        final_trace_error=RuntimeError("PRIVATE-TRACE-ERROR")
+    )
+    result, memory_store, runtime, litellm = await _run_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+    )
+    assert result["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_calibration_calls) == 1
+    assert len(memory_store.claim_record_calls) == 1
+    assert len(memory_store.trace_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_provider_fallback_still_calibrates_and_persists_once(tmp_path):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory_store = ClaimCaptureMemoryStore()
+    runtime = FakeRuntime()
+    litellm = FakeLiteLLM(
+        fail_first=True,
+        content="The retained file reports that the setting is active.",
+    )
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-claim-fallback",
+    )
+    assert result["status"] == "degraded"
+    assert len(litellm.calls) == 2
+    assert len(runtime.claim_calibration_calls) == 1
+    assert len(memory_store.claim_record_calls) == 1
+    assert len(memory_store.trace_calls) == 2
 
 
 @pytest.mark.asyncio

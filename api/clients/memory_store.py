@@ -173,5 +173,17 @@ class MemoryStoreClient:
     async def create_trace(self, *, request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post("/v1/traces", request_id=request_id, json=payload)
 
+    async def create_claim_record(
+        self,
+        *,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/internal/claim-records",
+            request_id=request_id,
+            json=payload,
+        )
+
     async def get_trace(self, request_id: str) -> dict[str, Any]:
         return await self._get(f"/v1/traces/{request_id}")

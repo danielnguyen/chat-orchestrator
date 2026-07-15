@@ -36,6 +36,14 @@ from services.capabilities import (
     restore_pending_action_request,
     validate_and_digest_capability_request,
 )
+from services.claim_capture import (
+    bind_assistant_message,
+    calibrate_claim_capture,
+    claim_record_payload,
+    finish_claim_record_persistence,
+    mark_trace_status_update_failed,
+    prepare_claim_capture,
+)
 from services.companion_presentation import build_companion_presentation
 from services.fallback import resolve_provider_attempt_plan
 from services.jellyfin_action_connector import (
@@ -3986,6 +3994,7 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
             "budget_enforcement": ("enforced" if prompt_budget else "not_enforced"),
         },
         "prompt_budget": prompt_budget,
+        "claim_capture": trace.get("claim_capture", {}),
     }
 
 
@@ -6063,6 +6072,7 @@ async def orchestrate_chat(
     memory_hygiene_enabled: bool = False,
     privacy_context_enabled: bool = False,
     capability_registry_enabled: bool = False,
+    claim_record_capture_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -7532,7 +7542,53 @@ async def orchestrate_chat(
             "brief_text_suppressed": privacy_boundary.brief_text_suppressed,
         }
 
-        await memory_store.add_message(
+        references = _trace_references(retrieval_bundle)
+        claim_capture = prepare_claim_capture(
+            enabled=claim_record_capture_enabled,
+            runtime_available=runtime is not None,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            answer=answer,
+            is_brief=brief_metadata.get("enabled") is True,
+            pending_action_present=pending_action is not None,
+            capability_requested=(
+                capability_request is not None
+                or isinstance(
+                    prompt.trace.get("capabilities", {}).get("execution"),
+                    dict,
+                )
+            ),
+            capability_executed=(
+                prompt.trace.get("capabilities", {}).get("execution", {}).get(
+                    "executor_called"
+                )
+                is True
+            ),
+            callback_applied=(
+                prompt.trace.get("memory_episode_recall_composition", {}).get(
+                    "final_callback_applied"
+                )
+                is True
+            ),
+            privacy_suppressed=privacy_boundary.enforced,
+            retained_artifacts=artifact_refs_for_sources,
+            public_sources=answer_sources,
+            trace_references=references,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+        )
+        claim_capture = await calibrate_claim_capture(
+            runtime=runtime,
+            state=claim_capture,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
+        )
+
+        assistant_message_ack = await memory_store.add_message(
             conversation_id=conversation_id,
             owner_id=payload["owner_id"],
             role="assistant",
@@ -7541,6 +7597,8 @@ async def orchestrate_chat(
             metadata={"request_id": request_id, "selected_model": selected_model},
             policy_metadata=turn_policy_metadata,
         )
+        claim_capture = bind_assistant_message(claim_capture, assistant_message_ack)
+        prompt.trace["claim_capture"] = claim_capture.trace
         prompt.trace["answer_persistence"] = {
             "assistant_message_persisted": True,
             "persistence_acknowledged": True,
@@ -7637,75 +7695,114 @@ async def orchestrate_chat(
                 if key not in {"raw_model_answer", "shaped_answer"}
             },
         }
-        references = _trace_references(retrieval_bundle)
-
+        trace_payload = {
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "owner_id": payload["owner_id"],
+            "client_id": payload.get("client_id"),
+            "surface": surface,
+            "profile": {
+                "name": profile["profile_name"],
+                "version": profile["profile_version"],
+                "effective_profile_ref": profile["effective_profile_ref"],
+            },
+            "retrieval": persisted_retrieval,
+            "prompt": _trace_prompt(persisted_prompt_trace),
+            "router_decision": {
+                "rule_id": route.get("rule_id"),
+                "selected_model": selected_model,
+                "provider": selected_provider,
+                "rationale": route.get("rationale"),
+                "fallbacks": route.get("fallbacks", []),
+                "routing_contract": routing_trace_metadata(
+                    sensitivity=effective_payload.get("sensitivity", "private"),
+                    request_local_only=sensitivity_local_only,
+                    profile_local_only=profile_local_only,
+                    effective_local_only=local_only,
+                    manual_override_requested=override_requested,
+                    manual_override_applied=bool(override),
+                    manual_override_rejection_reason=override_reason,
+                    selected_model=selected_model,
+                    selected_provider=selected_provider,
+                    fallback_used=fallback_used,
+                ),
+            },
+            "manual_override": {
+                "requested_model": override_requested,
+                "applied": bool(override),
+                "rejection_reason": override_reason,
+            },
+            "model_call": effective_model_call,
+            "model_calls": persisted_model_calls,
+            "fallback": {
+                "triggered": fallback_used,
+                "reason": "provider_error" if fallback_used else None,
+            },
+            "dsa": persisted_dsa_trace,
+            "artifacts": (
+                {
+                    "status": "omitted",
+                    "artifact_count": len(
+                        retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
+                    ),
+                    "included_ids": [],
+                    "source_reference_count": 0,
+                    "reason": "privacy_suppressed",
+                }
+                if privacy_boundary.enforced
+                else _trace_artifacts(retrieval_bundle)
+            ),
+            "references": [] if privacy_boundary.enforced else references,
+            "cost": {},
+            "latency_ms": int((perf_counter() - started) * 1000),
+            "status": status,
+            "error": model_error,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
         await memory_store.create_trace(
             request_id=request_id,
-            payload={
-                "request_id": request_id,
-                "conversation_id": conversation_id,
-                "owner_id": payload["owner_id"],
-                "client_id": payload.get("client_id"),
-                "surface": surface,
-                "profile": {
-                    "name": profile["profile_name"],
-                    "version": profile["profile_version"],
-                    "effective_profile_ref": profile["effective_profile_ref"],
-                },
-                "retrieval": persisted_retrieval,
-                "prompt": _trace_prompt(persisted_prompt_trace),
-                "router_decision": {
-                    "rule_id": route.get("rule_id"),
-                    "selected_model": selected_model,
-                    "provider": selected_provider,
-                    "rationale": route.get("rationale"),
-                    "fallbacks": route.get("fallbacks", []),
-                    "routing_contract": routing_trace_metadata(
-                        sensitivity=effective_payload.get("sensitivity", "private"),
-                        request_local_only=sensitivity_local_only,
-                        profile_local_only=profile_local_only,
-                        effective_local_only=local_only,
-                        manual_override_requested=override_requested,
-                        manual_override_applied=bool(override),
-                        manual_override_rejection_reason=override_reason,
-                        selected_model=selected_model,
-                        selected_provider=selected_provider,
-                        fallback_used=fallback_used,
-                    ),
-                },
-                "manual_override": {
-                    "requested_model": override_requested,
-                    "applied": bool(override),
-                    "rejection_reason": override_reason,
-                },
-                "model_call": effective_model_call,
-                "model_calls": persisted_model_calls,
-                "fallback": {
-                    "triggered": fallback_used,
-                    "reason": "provider_error" if fallback_used else None,
-                },
-                "dsa": persisted_dsa_trace,
-                "artifacts": (
-                    {
-                        "status": "omitted",
-                        "artifact_count": len(
-                            retrieval_bundle.get("bundle", {}).get("artifact_refs", [])
-                        ),
-                        "included_ids": [],
-                        "source_reference_count": 0,
-                        "reason": "privacy_suppressed",
-                    }
-                    if privacy_boundary.enforced
-                    else _trace_artifacts(retrieval_bundle)
-                ),
-                "references": [] if privacy_boundary.enforced else references,
-                "cost": {},
-                "latency_ms": int((perf_counter() - started) * 1000),
-                "status": status,
-                "error": model_error,
-                "created_at": datetime.now(UTC).isoformat(),
-            },
+            payload=trace_payload,
         )
+
+        record_payload = claim_record_payload(
+            state=claim_capture,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
+        )
+        if record_payload is not None:
+            try:
+                record_response = await memory_store.create_claim_record(
+                    request_id=request_id,
+                    payload=record_payload,
+                )
+                claim_capture = finish_claim_record_persistence(
+                    state=claim_capture,
+                    expected_payload=record_payload,
+                    response=record_response,
+                )
+            except Exception:
+                claim_capture = finish_claim_record_persistence(
+                    state=claim_capture,
+                    expected_payload=record_payload,
+                    failed=True,
+                )
+            prompt.trace["claim_capture"] = claim_capture.trace
+            if isinstance(persisted_prompt_trace, dict):
+                persisted_prompt_trace["claim_capture"] = claim_capture.trace
+            persisted_retrieval["prompt_assembly"] = persisted_prompt_trace
+            trace_payload["retrieval"] = persisted_retrieval
+            trace_payload["prompt"] = _trace_prompt(persisted_prompt_trace)
+            try:
+                await memory_store.create_trace(
+                    request_id=request_id,
+                    payload=trace_payload,
+                )
+            except Exception:
+                claim_capture = mark_trace_status_update_failed(claim_capture)
 
         result = {
             "request_id": request_id,
