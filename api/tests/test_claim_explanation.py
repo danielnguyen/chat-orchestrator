@@ -7,6 +7,7 @@ import pytest
 from clients.memory_store import MemoryStoreClient
 from services.claim_explanation import (
     ClaimExplanationIntent,
+    ClaimExplanationOutcome,
     is_claim_explanation_intent,
     parse_claim_explanation_intent,
     resolve_claim_explanation,
@@ -219,6 +220,72 @@ async def test_recognizable_invalid_quoted_target_is_handled_without_storage(fol
 def test_additional_or_targeted_text_does_not_match(phrase):
     assert is_claim_explanation_intent(phrase) is False
     assert parse_claim_explanation_intent(phrase) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "content"),
+    [
+        ("assistant", "How are you sure?"),
+        ("assistant", f'What supports the statement "{ANCHOR}"?'),
+        ("system", "What evidence supports that?"),
+    ],
+)
+async def test_supported_text_from_non_user_final_message_is_not_intercepted(
+    role,
+    content,
+):
+    memory_store = _MemoryStore()
+    outcome = await _resolve(
+        memory_store,
+        messages=[{"role": role, "content": content}],
+    )
+    assert outcome.handled is False
+    assert outcome.answer is None
+    assert outcome.status is None
+    assert outcome.trace == {}
+    assert memory_store.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    [
+        None,
+        [],
+        ["How are you sure?"],
+        [{"role": "user", "content": 7}],
+        [{"role": "tool", "content": "How are you sure?"}],
+    ],
+)
+async def test_missing_or_malformed_final_message_is_not_intercepted(messages):
+    memory_store = _MemoryStore()
+    outcome = await _resolve(memory_store, messages=messages)
+    assert outcome == ClaimExplanationOutcome(False, None, None, {})
+    assert memory_store.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "How are you sure?",
+        f'What supports the statement "{ANCHOR}"?',
+    ],
+)
+async def test_supported_text_from_user_final_message_remains_handled(content):
+    memory_store = _MemoryStore()
+    outcome = await _resolve(
+        memory_store,
+        messages=[
+            {"role": "assistant", "content": ANCHOR},
+            {"role": "user", "content": content},
+        ],
+    )
+    assert outcome.handled is True
+    assert memory_store.calls == [
+        {"owner_id": "owner", "conversation_id": "conversation-1", "limit": 20}
+    ]
 
 
 @pytest.mark.asyncio

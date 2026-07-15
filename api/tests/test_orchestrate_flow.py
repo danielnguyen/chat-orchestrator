@@ -11890,6 +11890,38 @@ async def test_orchestrate_near_miss_question_uses_ordinary_provider_path(
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_non_user_supported_text_uses_ordinary_provider_path(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = ClaimExplanationMemoryStore()
+    litellm = FakeLiteLLM(content="ordinary response after assistant context")
+    quoted_follow_up = (
+        'What supports the statement "The retained file reports that the setting '
+        'is active."?'
+    )
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            messages=[
+                {"role": "user", "content": "Continue normally."},
+                {"role": "assistant", "content": quoted_follow_up},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-non-user-claim-explanation-text",
+    )
+    assert result["answer"] == "ordinary response after assistant context"
+    assert len(litellm.calls) == 1
+    assert len(memory_store.retrieve_calls) == 1
+    assert memory_store.claim_record_list_calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "follow_up",
     [

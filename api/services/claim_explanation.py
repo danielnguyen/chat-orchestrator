@@ -403,9 +403,19 @@ async def resolve_claim_explanation(
     owner_id: str,
     conversation_id: str,
 ) -> ClaimExplanationOutcome:
-    final_content = messages[-1].get("content") if isinstance(messages, list) and messages else None
-    intent = parse_claim_explanation_intent(final_content)
-    if not enabled or intent is None:
+    if not enabled:
+        return ClaimExplanationOutcome(False, None, None, {})
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not isinstance(messages[-1], dict)
+        or messages[-1].get("role") != "user"
+        or not isinstance(messages[-1].get("content"), str)
+    ):
+        return ClaimExplanationOutcome(False, None, None, {})
+
+    intent = parse_claim_explanation_intent(messages[-1]["content"])
+    if intent is None:
         return ClaimExplanationOutcome(False, None, None, {})
 
     target_mode: Literal["immediate_previous", "quoted_anchor"] = (
