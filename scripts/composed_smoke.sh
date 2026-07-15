@@ -941,5 +941,5 @@ jq -e '
 run_wave2e_retrieval_scenario
 run_claim_traceability_scenario
 
-echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-wave2e-diagnostics-compat, G-claim-capture-and-explanation"
+echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation"
 echo "Topology: CO HTTP -> deterministic provider HTTP; BMS HTTP -> PostgreSQL 16 + Qdrant; CR HTTP -> disposable SQLite."
