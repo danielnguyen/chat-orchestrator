@@ -11205,6 +11205,43 @@ async def _run_claim_capture_chat(
     return result, memory_store, runtime, litellm
 
 
+async def _capture_two_explanation_claims(tmp_path):
+    memory_store = ClaimExplanationMemoryStore()
+    runtime = FakeRuntime()
+    first_litellm = FakeLiteLLM(
+        content="The retained file reports that the setting is active."
+    )
+    first, _, _, _ = await _run_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        litellm=first_litellm,
+        request_id="request-first-quoted-claim",
+    )
+    memory_store.listed_records[0]["claim_id"] = "claim-setting-active"
+    memory_store.listed_records[0]["freshness_summary"] = "stale"
+    memory_store.listed_records[0]["validated_evidence_references"][0][
+        "freshness_state"
+    ] = "stale"
+    memory_store.listed_records[0]["limitation_codes"].append("stale_evidence")
+
+    second_litellm = FakeLiteLLM(
+        content="The retained file reports that the service is healthy."
+    )
+    second, _, _, _ = await _run_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        litellm=second_litellm,
+        request_id="request-second-quoted-claim",
+    )
+    memory_store.listed_records[0]["claim_id"] = "claim-service-healthy"
+    memory_store.listed_records[0]["assistant_message_id"] = (
+        "00000000-0000-4000-8000-000000000003"
+    )
+    return first, second, memory_store, runtime
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(tmp_path):
     result, memory_store, runtime, litellm = await _run_claim_capture_chat(tmp_path)
@@ -11496,11 +11533,178 @@ async def test_orchestrate_two_turn_claim_explanation_is_record_backed_and_provi
     assert follow_up_trace["prompt"]["claim_explanation"]["reason_code"] == (
         "latest_claim_record_resolved"
     )
+    assert follow_up_trace["prompt"]["claim_explanation"]["target_mode"] == (
+        "immediate_previous"
+    )
     assert follow_up_trace["retrieval"]["status"] == "not_requested"
     assert follow_up_trace["model_call"]["status"] == "not_called"
     assert follow_up_trace["model_calls"] == []
     assert follow_up_trace["references"] == []
     assert "derived-text-1" not in json.dumps(follow_up_trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_path):
+    first, second, memory_store, runtime = await _capture_two_explanation_claims(
+        tmp_path
+    )
+    assert memory_store.listed_records[0]["claim_anchor"] == second["answer"]
+    assert memory_store.listed_records[1]["claim_anchor"] == first["answer"]
+
+    prior_counts = {
+        "retrieve": len(memory_store.retrieve_calls),
+        "calibration": len(runtime.claim_calibration_calls),
+        "claim_create": len(memory_store.claim_record_calls),
+        "assistant": len(
+            [
+                item
+                for item in memory_store.added_messages
+                if item["role"] == "assistant"
+            ]
+        ),
+        "trace": len(memory_store.trace_calls),
+    }
+    rules, models = _write_router_files(tmp_path)
+    provider = FailingLiteLLM()
+    dsa = FakeDSA()
+    follow_up = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What about the service?"},
+                {"role": "assistant", "content": second["answer"]},
+                {
+                    "role": "user",
+                    "content": f'What supports the statement "{first["answer"]}"?',
+                },
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        dsa=dsa,
+        dsa_enabled=True,
+        request_id="request-quoted-older-claim",
+    )
+
+    assert follow_up["status"] == "ok"
+    assert follow_up["selected_model"] == "not_called"
+    assert "a source-backed fact" in follow_up["answer"]
+    assert "The evidence was marked stale." in follow_up["answer"]
+    assert "The retained evidence was marked stale." in follow_up["answer"]
+    assert first["answer"] not in follow_up["answer"]
+    assert provider.calls == []
+    assert dsa.calls == []
+    assert len(memory_store.retrieve_calls) == prior_counts["retrieve"]
+    assert len(runtime.claim_calibration_calls) == prior_counts["calibration"]
+    assert len(memory_store.claim_record_calls) == prior_counts["claim_create"]
+    assert len(memory_store.claim_record_list_calls) == 1
+    assert len(
+        [item for item in memory_store.added_messages if item["role"] == "assistant"]
+    ) == prior_counts["assistant"] + 1
+    assert len(memory_store.trace_calls) == prior_counts["trace"] + 1
+    trace = memory_store.trace_calls[-1]["payload"]
+    explanation = trace["prompt"]["claim_explanation"]
+    assert explanation["target_mode"] == "quoted_anchor"
+    assert explanation["reason_code"] == "quoted_claim_record_resolved"
+    assert explanation["storage_call_count"] == 1
+    assert explanation["provider_call_count"] == 0
+    assert explanation["record_count"] == 2
+    assert explanation["matched_record_count"] == 1
+    assert trace["retrieval"]["status"] == "not_requested"
+    assert trace["model_call"]["status"] == "not_called"
+    assert first["answer"] not in json.dumps(trace)
+    assert "derived-text-1" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_generic_follow_up_still_resolves_only_latest_claim(tmp_path):
+    first, second, memory_store, runtime = await _capture_two_explanation_claims(
+        tmp_path
+    )
+    rules, models = _write_router_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What about the service?"},
+                {"role": "assistant", "content": second["answer"]},
+                {"role": "user", "content": "How are you sure?"},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=FailingLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-latest-after-two-claims",
+    )
+    assert result["status"] == "ok"
+    assert "a source-backed fact" in result["answer"]
+    assert "low confidence and weak support" in result["answer"]
+    explanation = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "claim_explanation"
+    ]
+    assert explanation["target_mode"] == "immediate_previous"
+    assert explanation["claim_id"] == "claim-service-healthy"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_orchestrate_quoted_missing_or_ambiguous_claim_is_provider_free(
+    tmp_path,
+    ambiguous,
+):
+    first, second, memory_store, runtime = await _capture_two_explanation_claims(
+        tmp_path
+    )
+    target = "The retained file reports that an older value is enabled."
+    expected_reason = "quoted_claim_record_not_found"
+    if ambiguous:
+        target = first["answer"]
+        duplicate = copy.deepcopy(memory_store.listed_records[1])
+        duplicate["claim_id"] = "claim-setting-active-duplicate"
+        duplicate["assistant_message_id"] = "assistant-setting-active-duplicate"
+        memory_store.listed_records.append(duplicate)
+        expected_reason = "ambiguous_quoted_claim"
+
+    rules, models = _write_router_files(tmp_path)
+    provider = FailingLiteLLM()
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": second["answer"]},
+                {
+                    "role": "user",
+                    "content": f'What supports the statement "{target}"?',
+                },
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=f"request-quoted-fallback-{ambiguous}",
+    )
+    assert result["status"] == "degraded"
+    assert result["selected_model"] == "not_called"
+    assert provider.calls == []
+    assert len(memory_store.claim_record_list_calls) == 1
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["prompt"]["claim_explanation"]["reason_code"] == expected_reason
+    assert target not in json.dumps(trace)
 
 
 @pytest.mark.asyncio
@@ -11529,6 +11733,14 @@ async def test_orchestrate_two_turn_claim_explanation_is_record_backed_and_provi
                 {"role": "user", "content": "How are you sure?"},
             ],
             "claim_records_unavailable",
+        ),
+        (
+            ClaimExplanationMemoryStore(),
+            [
+                {"role": "assistant", "content": "A prior answer."},
+                {"role": "user", "content": 'What supports the statement "   "?'},
+            ],
+            "quoted_target_invalid",
         ),
     ],
 )
@@ -11559,7 +11771,11 @@ async def test_orchestrate_claim_explanation_fallbacks_are_provider_free(
     trace = memory_store.trace_calls[0]["payload"]
     assert trace["prompt"]["claim_explanation"]["reason_code"] == reason
     assert "PRIVATE-LOOKUP-EXCEPTION" not in json.dumps((result, trace))
-    expected_list_calls = 0 if reason == "prior_assistant_unavailable" else 1
+    expected_list_calls = (
+        0
+        if reason in {"prior_assistant_unavailable", "quoted_target_invalid"}
+        else 1
+    )
     assert len(memory_store.claim_record_list_calls) == expected_list_calls
 
 
@@ -11636,7 +11852,17 @@ async def test_orchestrate_ambiguous_claim_records_never_invoke_provider(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_near_miss_question_uses_ordinary_provider_path(tmp_path):
+@pytest.mark.parametrize(
+    "follow_up",
+    [
+        "How are you sure this is safe?",
+        "What supports the claim about Toronto?",
+    ],
+)
+async def test_orchestrate_near_miss_question_uses_ordinary_provider_path(
+    tmp_path,
+    follow_up,
+):
     rules, models = _write_router_files(tmp_path)
     memory_store = ClaimExplanationMemoryStore()
     litellm = FakeLiteLLM(content="ordinary response")
@@ -11645,7 +11871,7 @@ async def test_orchestrate_near_miss_question_uses_ordinary_provider_path(tmp_pa
             conversation_id="conv-1",
             messages=[
                 {"role": "assistant", "content": "A prior answer."},
-                {"role": "user", "content": "How are you sure this is safe?"},
+                {"role": "user", "content": follow_up},
             ],
         ),
         memory_store=memory_store,
@@ -11664,7 +11890,49 @@ async def test_orchestrate_near_miss_question_uses_ordinary_provider_path(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_disabled_exact_follow_up_uses_ordinary_provider_path(tmp_path):
+async def test_orchestrate_non_user_supported_text_uses_ordinary_provider_path(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = ClaimExplanationMemoryStore()
+    litellm = FakeLiteLLM(content="ordinary response after assistant context")
+    quoted_follow_up = (
+        'What supports the statement "The retained file reports that the setting '
+        'is active."?'
+    )
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            messages=[
+                {"role": "user", "content": "Continue normally."},
+                {"role": "assistant", "content": quoted_follow_up},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-non-user-claim-explanation-text",
+    )
+    assert result["answer"] == "ordinary response after assistant context"
+    assert len(litellm.calls) == 1
+    assert len(memory_store.retrieve_calls) == 1
+    assert memory_store.claim_record_list_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "follow_up",
+    [
+        "How are you sure?",
+        'What supports the statement "A prior answer."?',
+    ],
+)
+async def test_orchestrate_disabled_exact_follow_up_uses_ordinary_provider_path(
+    tmp_path,
+    follow_up,
+):
     rules, models = _write_router_files(tmp_path)
     memory_store = ClaimExplanationMemoryStore()
     litellm = FakeLiteLLM(content="ordinary disabled response")
@@ -11673,7 +11941,7 @@ async def test_orchestrate_disabled_exact_follow_up_uses_ordinary_provider_path(
             conversation_id="conv-1",
             messages=[
                 {"role": "assistant", "content": "A prior answer."},
-                {"role": "user", "content": "How are you sure?"},
+                {"role": "user", "content": follow_up},
             ],
         ),
         memory_store=memory_store,

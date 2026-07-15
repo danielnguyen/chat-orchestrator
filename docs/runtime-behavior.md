@@ -150,23 +150,34 @@ chat response. Calibration or storage failure leaves the completed answer intact
 records only a bounded structural outcome in the request trace, and never
 fabricates a durable record.
 
-The same flag also enables a bounded follow-up explanation path for these exact
-messages: `How are you sure?`, `What supports that?`, `What supported that?`,
-`What evidence supports that?`, and `What was that based on?` Matching is
-case-insensitive, permits whitespace variation and one terminal question mark or
-period, and does not intercept messages with additional instructions or a named
-older claim.
+The same flag also enables a bounded follow-up explanation path. The generic
+messages `How are you sure?`, `What supports that?`, `What supported that?`,
+`What evidence supports that?`, and `What was that based on?` still target only
+the immediately preceding bounded assistant answer. Chat Orchestrator loads only
+the newest conversation-scoped claim-record group, requires exactly one claim in
+that group, and requires its normalized anchor to equal that preceding answer.
 
-The follow-up must immediately follow a bounded assistant answer. Chat Orchestrator
-loads the newest conversation-scoped claim-record group, requires exactly one claim
-in that group, and requires its normalized claim anchor to equal the immediately
-preceding answer. It never scans older groups for a convenient match. A valid
-record is rendered without retrieval or a model call, using only its source type,
-claim class, confidence, evidence strength, freshness, and material limitations.
-Opaque source identifiers and private record content are not shown. Missing,
-ambiguous, incomplete, or unavailable records produce an honest deterministic
-fallback, and no explanation performs fresh verification. Quoted or specifically
-targeted older claims remain on the ordinary chat path.
+An older retained claim can be targeted with one of these exact forms:
+
+```text
+What supports the statement "<exact retained claim anchor>"?
+What supported the statement "<exact retained claim anchor>"?
+How are you sure about the statement "<exact retained claim anchor>"?
+```
+
+The framing is case-insensitive and tolerates whitespace variation and one terminal
+question mark or period. The quoted anchor uses straight double quotes and is
+matched in full after whitespace normalization; its case and punctuation must
+match. One lookup considers at most 20 scoped claim records. No fuzzy matching,
+pagination, repeated lookup, or provider interpretation occurs, and duplicate
+exact anchors are treated as ambiguous.
+
+A supported record is rendered without retrieval or a model call, using only its
+source type, claim class, confidence, evidence strength, freshness, and material
+limitations. Opaque record and source identifiers, target text, and private record
+content are not copied into traces or explanations. Malformed targets and missing,
+ambiguous, incomplete, unsupported, or unavailable records produce an honest
+deterministic fallback. No explanation performs fresh verification.
 
 ## Integration boundaries
 
