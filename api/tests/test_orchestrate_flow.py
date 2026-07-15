@@ -11285,6 +11285,26 @@ async def test_orchestrate_ambiguous_answer_skips_runtime_and_storage_calls(tmp_
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_subjective_sentence_with_file_source_skips_capture(tmp_path):
+    litellm = FakeLiteLLM(content="The blue logo looks better.")
+    result, memory_store, runtime, litellm = await _run_claim_capture_chat(
+        tmp_path,
+        litellm=litellm,
+    )
+    assert result["answer"] == "The blue logo looks better."
+    assert len(litellm.calls) == 1
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert len(
+        [message for message in memory_store.added_messages if message["role"] == "assistant"]
+    ) == 1
+    assert len(memory_store.trace_calls) == 1
+    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
+        "reason_code"
+    ] == "factual_source_attribution_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_calibration_failure_is_nonfatal_and_skips_claim_storage(tmp_path):
     runtime = FakeRuntime(claim_calibration_error=RuntimeError("PRIVATE-RUNTIME-ERROR"))
     result, memory_store, runtime, _ = await _run_claim_capture_chat(

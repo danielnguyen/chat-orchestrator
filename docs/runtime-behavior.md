@@ -137,11 +137,13 @@ Cognitive Runtime client for calibration and Basic Memory Store for immutable
 association with the persisted assistant message and request trace.
 
 The initial supported path is deliberately narrow: a normal response must contain
-one bounded factual sentence and exactly one retained, user-visible file-backed
-source. The source identity must be present in the normal trace reference set.
-Multi-sentence or structured answers, multiple or missing sources, briefs, action
-responses, memory callbacks, and privacy-suppressed answers are skipped rather than
-attributed by guesswork.
+one bounded, explicitly file-source-attributed factual sentence and exactly one
+retained, user-visible file-backed source. The source identity must be present in
+the normal trace reference set. A source being present is not sufficient by
+itself; subjective, creative, humorous, or otherwise unattributed sentences are
+skipped conservatively. Multi-sentence or structured answers, multiple or missing
+sources, briefs, action responses, memory callbacks, and privacy-suppressed answers
+are also skipped rather than attributed by guesswork.
 
 Capture does not add another provider call or expose calibration metadata in the
 chat response. Calibration or storage failure leaves the completed answer intact,

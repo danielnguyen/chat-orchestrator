@@ -28,6 +28,19 @@ _FRESHNESS_STATES = {
     "unknown_freshness",
     "not_applicable",
 }
+_FILE_SOURCE_NOUN = r"(?:file|document|report|record|notice|entry|table|log|source)"
+_EVIDENTIAL_VERB = r"(?:states|reports|lists|shows|indicates|records|documents|confirms)"
+_SOURCE_MODIFIER = r"[A-Za-z][A-Za-z0-9-]{0,31}"
+_SOURCE_SUBJECT_ATTRIBUTION = re.compile(
+    rf"^(?:the|this)\s+(?:{_SOURCE_MODIFIER}\s+){{0,3}}"
+    rf"{_FILE_SOURCE_NOUN}\s+{_EVIDENTIAL_VERB}\s+.+\.$",
+    re.IGNORECASE,
+)
+_ACCORDING_TO_ATTRIBUTION = re.compile(
+    rf"^according\s+to\s+(?:the|this)\s+(?:{_SOURCE_MODIFIER}\s+){{0,3}}"
+    rf"{_FILE_SOURCE_NOUN},\s+.+\.$",
+    re.IGNORECASE,
+)
 
 
 class _EvidenceReference(BaseModel):
@@ -237,6 +250,11 @@ def _normalized_claim_anchor(answer: Any) -> tuple[str | None, str | None]:
     sentence_marks = re.findall(r"[.!?](?=\s|$)", normalized)
     if len(sentence_marks) != 1 or normalized[-1:] not in {".", "!"}:
         return None, "multi_sentence_answer"
+    if not (
+        _SOURCE_SUBJECT_ATTRIBUTION.fullmatch(normalized)
+        or _ACCORDING_TO_ATTRIBUTION.fullmatch(normalized)
+    ):
+        return None, "factual_source_attribution_unavailable"
     return normalized, None
 
 

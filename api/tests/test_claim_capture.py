@@ -63,7 +63,7 @@ def _prepare(**overrides):
         "runtime_available": True,
         "runtime_session_id": "runtime-session-1",
         "runtime_turn_id": "runtime-turn-1",
-        "answer": "The retained setting is active.",
+        "answer": "The retained file reports that the setting is active.",
         "is_brief": False,
         "pending_action_present": False,
         "capability_requested": False,
@@ -143,7 +143,7 @@ async def _calibrate(state, runtime):
 
 
 def test_single_sentence_and_one_retained_file_source_are_eligible():
-    state = _prepare(answer="  The retained setting is active.  ")
+    state = _prepare(answer="  The retained file reports that the setting is active.  ")
 
     assert state.trace == {
         "enabled": True,
@@ -157,7 +157,7 @@ def test_single_sentence_and_one_retained_file_source_are_eligible():
         "claim_id": None,
         "claim_anchor_digest": None,
     }
-    assert state.candidate.claim_anchor == "The retained setting is active."
+    assert state.candidate.claim_anchor == "The retained file reports that the setting is active."
     assert state.candidate.evidence_reference == {
         "ref_type": "derived_text",
         "ref_id": "derived-text-1",
@@ -229,6 +229,43 @@ def test_ambiguous_or_structured_answers_skip_capture(answer):
     assert state.trace["eligibility_status"] == "ineligible"
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The file states that the setting is active.",
+        "The retained file reports that the setting is active.",
+        "According to this document, the setting is active.",
+        "the maintenance record lists the service as healthy.",
+    ],
+)
+def test_explicit_file_source_attribution_is_eligible(answer):
+    state = _prepare(answer=answer)
+    assert state.candidate is not None
+    assert state.candidate.claim_anchor == answer
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The blue logo looks better.",
+        "This poem feels melancholy.",
+        "I think the setting is active.",
+        "The setting is probably active.",
+        "Thanks.",
+        "Wow!",
+        "That was hilarious.",
+        "The file is beautiful.",
+        "The file might be correct.",
+        "The file reports that the setting is active!",
+        "The very recently retained maintenance file reports that the setting is active.",
+    ],
+)
+def test_unattributed_or_nonfactual_sentence_is_ineligible(answer):
+    state = _prepare(answer=answer)
+    assert state.candidate is None
+    assert state.trace["reason_code"] == "factual_source_attribution_unavailable"
+
+
 def test_source_must_match_public_source_and_normal_trace_reference():
     assert _prepare(public_sources=[_public_source(ref_id="other")]).candidate is None
     assert _prepare(trace_references=[]).candidate is None
@@ -260,7 +297,7 @@ async def test_calibration_forwards_only_bounded_scope_anchor_and_evidence():
         "surface": "vscode",
         "runtime_session_id": "runtime-session-1",
         "runtime_turn_id": "runtime-turn-1",
-        "claim_anchor": "The retained setting is active.",
+        "claim_anchor": "The retained file reports that the setting is active.",
         "evidence_references": [state.candidate.evidence_reference],
     }
     assert calibrated.trace["calibration_status"] == "completed"
