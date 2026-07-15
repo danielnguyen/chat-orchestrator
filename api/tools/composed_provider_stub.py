@@ -53,6 +53,14 @@ async def chat_completions(
         for message in messages
         if isinstance(message, dict)
     ]
+    latest_user_text = next(
+        (
+            message["content"]
+            for message in reversed(normalized_messages)
+            if message["role"] == "user"
+        ),
+        "",
+    )
     prompt_fingerprint = hashlib.sha256(
         json.dumps(normalized_messages, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
@@ -105,7 +113,7 @@ async def chat_completions(
             }
         )
         raise HTTPException(status_code=503, detail="primary failure fixture")
-    if user_text.strip() == "What does the retained file report about the setting?":
+    if latest_user_text.strip() == "What does the retained file report about the setting?":
         answer = "The retained file reports that the setting is active."
     elif has_current and "Current plan is Alpha." in prompt_text:
         answer = "Current plan is Alpha."
