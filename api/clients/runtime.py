@@ -44,6 +44,40 @@ class RuntimeClient:
             },
         )
 
+    async def evaluate_claim_calibration(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        claim_anchor: str,
+        evidence_references: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+        response = await self._post(
+            "/v1/runtime/claim-calibration/evaluate",
+            json={
+                **scope,
+                "claim_anchor": claim_anchor,
+                "evidence_references": evidence_references,
+            },
+        )
+        if not isinstance(response, dict) or any(
+            response.get(field) != value for field, value in scope.items()
+        ):
+            raise RuntimeError("claim_calibration_response_invalid")
+        return response
+
     async def resolve_session(
         self,
         *,

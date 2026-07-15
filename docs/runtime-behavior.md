@@ -129,6 +129,26 @@ Routing considers the effective local-only constraint, a permitted manual model 
 
 Provider failure may produce a policy-compatible fallback or a degraded response. It must not cause a permissioned action to execute again.
 
+## Claim-record capture
+
+Durable claim-record capture is disabled by default through
+`CLAIM_RECORD_CAPTURE_ENABLED=false`. When enabled, it uses the configured
+Cognitive Runtime client for calibration and Basic Memory Store for immutable
+association with the persisted assistant message and request trace.
+
+The initial supported path is deliberately narrow: a normal response must contain
+one bounded factual sentence and exactly one retained, user-visible file-backed
+source. The source identity must be present in the normal trace reference set.
+Multi-sentence or structured answers, multiple or missing sources, briefs, action
+responses, memory callbacks, and privacy-suppressed answers are skipped rather than
+attributed by guesswork.
+
+Capture does not add another provider call or expose calibration metadata in the
+chat response. Calibration or storage failure leaves the completed answer intact,
+records only a bounded structural outcome in the request trace, and never
+fabricates a durable record. Claim-record retrieval and follow-up explanation are
+not currently implemented by Chat Orchestrator.
+
 ## Integration boundaries
 
 ### Basic Memory Store
