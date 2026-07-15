@@ -672,7 +672,12 @@ run_claim_traceability_scenario() {
     and (.answer | contains("did not perform a new verification"))
   ' <<<"$response_g3" >/dev/null
   trace_g3="$(fetch_trace "$request_g3")"
-  jq -e '
+  jq -e \
+    --arg owner_id "$isolated_owner" \
+    --arg conversation_id "$isolated_conversation" '
+    .owner_id == $owner_id
+    and .conversation_id == $conversation_id
+    and
     .prompt.claim_explanation.reason_code == "quoted_claim_record_not_found"
     and .prompt.claim_explanation.target_mode == "quoted_anchor"
     and .prompt.claim_explanation.storage_call_count == 1
@@ -690,7 +695,7 @@ run_claim_traceability_scenario() {
   assert_request_persistence_counts "$isolated_conversation" "$request_g3" 0
   private_output="$(jq -c . <<<"$response_g3")$(jq -c . <<<"$trace_g3")"
   case "$private_output" in
-    *"$owner"*|*"$derived_id"*|*"$claim_id"*|*"$malicious_summary"*)
+    *"$derived_id"*|*"$claim_id"*|*"$malicious_summary"*)
       echo "owner-isolated claim fallback exposed another owner's content" >&2
       exit 1
       ;;
