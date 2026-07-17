@@ -31,6 +31,18 @@ class DataSourceAggregatorClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def _get(self, path: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}{path}",
+                headers=self._build_headers(),
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def list_sources(self) -> dict[str, Any]:
+        return await self._get("/v1/sources")
+
     async def context_pack(
         self,
         *,

@@ -6,6 +6,44 @@ from clients.data_source_aggregator import DataSourceAggregatorClient
 
 
 @pytest.mark.asyncio
+async def test_list_sources_gets_inventory():
+    client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
+    calls = []
+
+    async def fake_get(path):
+        calls.append(path)
+        return {"sources": []}
+
+    client._get = fake_get  # type: ignore[method-assign]
+
+    assert await client.list_sources() == {"sources": []}
+    assert calls == ["/v1/sources"]
+
+
+@pytest.mark.asyncio
+async def test_list_sources_preserves_api_key_header(monkeypatch):
+    client = DataSourceAggregatorClient(
+        "http://dsa.local",
+        timeout_ms=1500,
+        api_key="dsa-secret",
+    )
+    captured = {}
+
+    async def fake_get(self, url, *, headers=None, **kwargs):
+        captured["url"] = url
+        captured["headers"] = headers
+        return httpx.Response(200, json={"sources": []}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    assert await client.list_sources() == {"sources": []}
+    assert captured == {
+        "url": "http://dsa.local/v1/sources",
+        "headers": {"X-API-Key": "dsa-secret"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_context_pack_posts_expected_payload():
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
     calls: list[tuple[str, dict[str, object]]] = []

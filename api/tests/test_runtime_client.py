@@ -16,6 +16,218 @@ def _status_error(path: str, status_code: int) -> httpx.HTTPStatusError:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "path", "specific"),
+    [
+        (
+            "derive_evidence_shape",
+            "/v1/runtime/evidence-shapes/derive",
+            {
+                "task_text": "Verify the record.",
+                "interaction_kind": "question",
+                "task_context": {
+                    "evidence_input_kinds": [],
+                    "external_verification_required": False,
+                    "freshness_sensitive": False,
+                    "high_stakes_accuracy_required": False,
+                    "continuation_of_prior_evidence_task": False,
+                    "prior_task_shape": None,
+                },
+            },
+        ),
+        (
+            "compile_evidence_plan",
+            "/v1/runtime/evidence-plans/compile",
+            {
+                "question_anchor": "Verify the record.",
+                "task_shape": "targeted_lookup",
+                "declared_scope": {
+                    "source_ids": [],
+                    "source_categories": [],
+                    "inventory_status": "complete_for_declared_scope",
+                },
+                "source_inventory": [],
+            },
+        ),
+        (
+            "evaluate_evidence_sufficiency",
+            "/v1/runtime/evidence-sufficiency/evaluate",
+            {
+                "evidence_plan_id": "evidence_plan_1",
+                "acquisition_manifest_id": "evidence_manifest_1",
+                "task_shape": "targeted_lookup",
+                "declared_requirements": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "requirement_kind": "targeted_evidence",
+                        "criticality": "material",
+                    }
+                ],
+                "acquisition_facts": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "outcome": "satisfied",
+                    }
+                ],
+            },
+        ),
+    ],
+)
+async def test_evidence_runtime_methods_send_exact_scope_and_endpoint(
+    method_name,
+    path,
+    specific,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+    scope = {
+        "request_id": "rid",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+    }
+
+    async def fake_post(called_path, *, json):
+        calls.append((called_path, json))
+        response = {**scope, "result": {}}
+        if method_name == "evaluate_evidence_sufficiency":
+            response.update(
+                {
+                    "evidence_plan_id": specific["evidence_plan_id"],
+                    "acquisition_manifest_id": specific["acquisition_manifest_id"],
+                }
+            )
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await getattr(client, method_name)(**scope, **specific)
+
+    assert response["request_id"] == "rid"
+    assert calls == [(path, {**scope, **specific})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_error"),
+    [
+        ([], "evidence_shape_response_invalid"),
+        (
+            {
+                "request_id": "rid",
+                "owner_id": "other-owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+            },
+            "evidence_shape_response_invalid",
+        ),
+    ],
+)
+async def test_derive_evidence_shape_rejects_malformed_or_mismatched_scope(
+    response,
+    expected_error,
+):
+    client = RuntimeClient("http://runtime.local", None)
+
+    async def fake_post(path, *, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=expected_error):
+        await client.derive_evidence_shape(
+            request_id="rid",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+            runtime_session_id="rtsession_1",
+            runtime_turn_id="rtturn_1",
+            task_text="Verify the record.",
+            interaction_kind="question",
+            task_context={
+                "evidence_input_kinds": [],
+                "external_verification_required": False,
+                "freshness_sensitive": False,
+                "high_stakes_accuracy_required": False,
+                "continuation_of_prior_evidence_task": False,
+                "prior_task_shape": None,
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "specific", "expected_error"),
+    [
+        (
+            "compile_evidence_plan",
+            {
+                "question_anchor": "Verify the record.",
+                "task_shape": "targeted_lookup",
+                "declared_scope": {
+                    "source_ids": [],
+                    "source_categories": [],
+                    "inventory_status": "complete_for_declared_scope",
+                },
+                "source_inventory": [],
+            },
+            "evidence_plan_response_invalid",
+        ),
+        (
+            "evaluate_evidence_sufficiency",
+            {
+                "evidence_plan_id": "evidence_plan_1",
+                "acquisition_manifest_id": "evidence_manifest_1",
+                "task_shape": "targeted_lookup",
+                "declared_requirements": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "requirement_kind": "targeted_evidence",
+                        "criticality": "material",
+                    }
+                ],
+                "acquisition_facts": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "outcome": "satisfied",
+                    }
+                ],
+            },
+            "evidence_sufficiency_response_invalid",
+        ),
+    ],
+)
+async def test_evidence_runtime_methods_reject_scope_mismatch(
+    method_name,
+    specific,
+    expected_error,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    scope = {
+        "request_id": "rid",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+    }
+
+    async def fake_post(path, *, json):
+        response = {**scope, "owner_id": "other-owner", "result": {}}
+        response["evidence_plan_id"] = specific.get("evidence_plan_id")
+        response["acquisition_manifest_id"] = specific.get(
+            "acquisition_manifest_id"
+        )
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=expected_error):
+        await getattr(client, method_name)(**scope, **specific)
+
+
+@pytest.mark.asyncio
 async def test_compile_companion_policy_prefers_profile_endpoint_then_falls_back_on_404():
     client = RuntimeClient("http://runtime.local", None)
     calls: list[str] = []

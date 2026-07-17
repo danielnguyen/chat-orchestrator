@@ -46,6 +46,18 @@ from services.claim_capture import (
 )
 from services.claim_explanation import resolve_claim_explanation
 from services.companion_presentation import build_companion_presentation
+from services.evidence_acquisition import (
+    EvidenceAcquisitionState,
+    begin_evidence_acquisition,
+    bind_manifest_response,
+    build_manifest_trace,
+    disabled_evidence_trace,
+    enforce_final_answer,
+    evaluate_acquisition_sufficiency,
+    provider_allowed,
+    suppress_manifest_identifiers,
+    validate_context_pack_response,
+)
 from services.fallback import resolve_provider_attempt_plan
 from services.jellyfin_action_connector import (
     JellyfinActionConnector,
@@ -67,7 +79,7 @@ from services.privacy_context import (
     validate_privacy_runtime_response,
 )
 from services.profile_apply import apply_profile_to_request
-from services.prompt_assembly import assemble_prompt
+from services.prompt_assembly import PromptAssembly, assemble_prompt
 from services.prompt_budget import PromptBudgetContract, PromptBudgetError
 from services.response_action import ResponseActionInput, apply_response_action
 from services.response_review import ResponseReviewInput, review_response
@@ -3963,7 +3975,7 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
     )
     prompt_budget = trace.get("prompt_budget")
     prompt_budget = prompt_budget if isinstance(prompt_budget, dict) else {}
-    return {
+    summary = {
         "layers": structural_layers,
         "ordered_layer_names": [layer["name"] for layer in structural_layers if layer.get("name")],
         "included_layers": [
@@ -3997,6 +4009,9 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         "prompt_budget": prompt_budget,
         "claim_capture": trace.get("claim_capture", {}),
     }
+    if isinstance(trace.get("evidence_acquisition"), dict):
+        summary["evidence_acquisition"] = trace["evidence_acquisition"]
+    return summary
 
 
 def _prompt_fingerprint(messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -4362,6 +4377,7 @@ def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
     )
 
     return {
+        "query_id": _sanitize_trace_string(response.get("query_id"), max_length=120),
         "query": _sanitize_trace_string(response.get("query"), max_length=500),
         "sources_used": _sanitize_trace_string_list(
             response.get("sources_used"),
@@ -4373,6 +4389,7 @@ def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
         "budget": budget_out,
         "diagnostics": diagnostics_out,
         "diagnostics_status": diagnostics_status,
+        "raw_item_count": len(response.get("items") or []),
     }
 
 
@@ -4384,6 +4401,7 @@ async def _resolve_external_context(
     external_context: dict[str, Any] | None,
     external_calls_allowed: bool,
     query: str,
+    response_validator: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     external_context_config = _normalize_external_context_config(external_context)
     allowed_sensitivity = external_context_config.get("allowed_sensitivity", "medium")
@@ -4436,6 +4454,8 @@ async def _resolve_external_context(
                 "reason": "malformed_response",
                 "error_code": "malformed_response",
             }
+        if response_validator is not None:
+            response = response_validator(response)
         context_pack = _sanitize_context_pack(response)
         diagnostics = context_pack.get("diagnostics")
         errors = context_pack.get("errors", [])
@@ -4468,6 +4488,8 @@ async def _resolve_external_context(
             "context_injected": item_count > 0,
             "diagnostics_status": context_pack.get("diagnostics_status"),
         }
+        if response_validator is not None:
+            dsa_trace["raw_item_count"] = context_pack.get("raw_item_count", item_count)
         if diagnostics:
             dsa_trace["selection_mode"] = diagnostics.get("selection_mode")
             dsa_trace["selected_source_ids"] = diagnostics.get("selected_source_ids", [])
@@ -4483,6 +4505,14 @@ async def _resolve_external_context(
                 dsa_trace["source_diagnostics"] = diagnostics["source_diagnostics"]
         return context_pack, {
             **dsa_trace,
+        }
+    except (ValueError, TypeError):
+        return None, {
+            **dsa_trace_base,
+            "called": True,
+            "status": "error",
+            "reason": "malformed_response",
+            "error_code": "malformed_response",
         }
     except httpx.TimeoutException:
         return None, {
@@ -6074,6 +6104,7 @@ async def orchestrate_chat(
     privacy_context_enabled: bool = False,
     capability_registry_enabled: bool = False,
     claim_record_capture_enabled: bool = False,
+    evidence_acquisition_enabled: bool = False,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -6412,6 +6443,9 @@ async def orchestrate_chat(
     memory_hygiene_result = None
     privacy_context = None
     privacy_context_trace = _privacy_context_disabled_trace()
+    evidence_acquisition: EvidenceAcquisitionState | None = None
+    evidence_manifest: dict[str, Any] | None = None
+    evidence_path_deferred = False
 
     try:
         claim_explanation = await resolve_claim_explanation(
@@ -6673,16 +6707,63 @@ async def orchestrate_chat(
             retrieval_bundle=retrieval_bundle,
         )
         retrieval_bundle = memory_hygiene_result.retrieval_bundle
-        external_context_pack, dsa_trace = await _resolve_external_context(
-            dsa=dsa,
-            dsa_enabled=dsa_enabled,
-            external_context_enabled=external_context_enabled,
-            external_context=(
-                external_context_request if isinstance(external_context_request, dict) else None
-            ),
-            external_calls_allowed=not local_only,
-            query=last_user_text,
+        runtime_session_id = runtime_session_trace.get("runtime_session_id")
+        runtime_turn_id = turn_state_trace.get("runtime_turn_id")
+        interaction_kind = (
+            interaction_governance.get("interaction_kind")
+            if isinstance(interaction_governance, dict)
+            else None
         )
+        evidence_path_deferred = bool(
+            evidence_acquisition_enabled
+            and dsa_enabled
+            and external_context_enabled
+            and not local_only
+            and effective_payload.get("response_mode", "normal") == "normal"
+            and pending_continuation is None
+            and runtime is not None
+            and dsa is not None
+            and isinstance(runtime_session_id, str)
+            and runtime_session_id
+            and isinstance(runtime_turn_id, str)
+            and runtime_turn_id
+            and isinstance(interaction_kind, str)
+            and interaction_governance_trace.get("included") is True
+        )
+        if evidence_path_deferred:
+            normalized_external_config = _normalize_external_context_config(
+                external_context_request
+                if isinstance(external_context_request, dict)
+                else None
+            )
+            external_context_pack = None
+            dsa_trace = {
+                **_build_dsa_trace_base(
+                    capability_enabled=dsa_enabled,
+                    request_enabled=external_context_enabled,
+                    external_context_config=normalized_external_config,
+                    allowed_sensitivity=normalized_external_config.get(
+                        "allowed_sensitivity",
+                        "medium",
+                    ),
+                    max_results=normalized_external_config.get("max_results"),
+                ),
+                "status": "deferred_for_evidence_governance",
+                "reason": "evidence_policy_pending",
+            }
+        else:
+            external_context_pack, dsa_trace = await _resolve_external_context(
+                dsa=dsa,
+                dsa_enabled=dsa_enabled,
+                external_context_enabled=external_context_enabled,
+                external_context=(
+                    external_context_request
+                    if isinstance(external_context_request, dict)
+                    else None
+                ),
+                external_calls_allowed=not local_only,
+                query=last_user_text,
+            )
         companion_overlays, companion_trace = await _resolve_companion_policy(
             runtime=runtime,
             enabled=companion_policy_enabled,
@@ -6834,6 +6915,76 @@ async def orchestrate_chat(
             else None,
             world_state_claim_refs,
         )
+        if evidence_path_deferred:
+            external_config = (
+                external_context_request
+                if isinstance(external_context_request, dict)
+                else None
+            )
+            if isinstance(matched_capability_id, str):
+                external_context_pack, dsa_trace = await _resolve_external_context(
+                    dsa=dsa,
+                    dsa_enabled=dsa_enabled,
+                    external_context_enabled=external_context_enabled,
+                    external_context=external_config,
+                    external_calls_allowed=not local_only,
+                    query=last_user_text,
+                )
+            else:
+                evidence_acquisition = await begin_evidence_acquisition(
+                    runtime=runtime,
+                    dsa=dsa,
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_trace["runtime_session_id"],
+                    runtime_turn_id=turn_state_trace["runtime_turn_id"],
+                    task_text=last_user_text,
+                    interaction_kind=interaction_governance["interaction_kind"],
+                    external_context=external_config,
+                )
+                if (
+                    evidence_acquisition.follow_existing_path
+                    or evidence_acquisition.supported_targeted_path
+                ):
+                    governed_plan = (
+                        evidence_acquisition.plan
+                        if evidence_acquisition.supported_targeted_path
+                        else None
+                    )
+                    acquisition_query = (
+                        governed_plan.question_anchor
+                        if governed_plan is not None
+                        else last_user_text
+                    )
+                    external_context_pack, dsa_trace = await _resolve_external_context(
+                        dsa=dsa,
+                        dsa_enabled=dsa_enabled,
+                        external_context_enabled=external_context_enabled,
+                        external_context=external_config,
+                        external_calls_allowed=not local_only,
+                        query=acquisition_query,
+                        response_validator=(
+                            (
+                                lambda response: validate_context_pack_response(
+                                    response,
+                                    expected_query=acquisition_query,
+                                    eligible_source_ids=governed_plan.eligible_source_ids,
+                                )
+                            )
+                            if governed_plan is not None
+                            else None
+                        ),
+                    )
+                else:
+                    external_context_pack = None
+                    dsa_trace = {
+                        **dsa_trace,
+                        "called": False,
+                        "status": "not_called",
+                        "reason": evidence_acquisition.status,
+                    }
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -7146,37 +7297,43 @@ async def orchestrate_chat(
                 "memory_episode_recall_composition": provider_memory_recall_trace,
                 "message_count": 0,
             }
-            await _create_error_trace(
-                memory_store=memory_store,
-                request_id=request_id,
-                conversation_id=conversation_id,
-                payload=effective_payload,
-                profile=profile,
-                retrieval_bundle=retrieval_bundle,
-                last_user_text=last_user_text,
-                route=route,
-                selected_model=selected_model,
-                selected_provider=selected_provider,
-                sensitivity_local_only=sensitivity_local_only,
-                profile_local_only=profile_local_only,
-                effective_local_only=local_only,
-                override_requested=override_requested,
-                override_applied=bool(override),
-                override_reason=override_reason,
-                failure_reason=budget_error.reason,
-                started=started,
-                prompt_trace=budget_prompt_trace,
-                surface_presence_trace=surface_presence_trace,
-                dsa_trace=dsa_trace,
-                privacy_policy=privacy_context,
-            )
-            await _complete_runtime_turn(
-                runtime=runtime,
-                turn_state_trace=turn_state_trace,
-                request_id=request_id,
-                turn_status="abandoned",
-            )
-            raise RuntimeError(budget_error.reason) from budget_error
+            if (
+                evidence_acquisition is not None
+                and evidence_acquisition.supported_targeted_path
+            ):
+                prompt = PromptAssembly(messages=[], trace=budget_prompt_trace)
+            else:
+                await _create_error_trace(
+                    memory_store=memory_store,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    payload=effective_payload,
+                    profile=profile,
+                    retrieval_bundle=retrieval_bundle,
+                    last_user_text=last_user_text,
+                    route=route,
+                    selected_model=selected_model,
+                    selected_provider=selected_provider,
+                    sensitivity_local_only=sensitivity_local_only,
+                    profile_local_only=profile_local_only,
+                    effective_local_only=local_only,
+                    override_requested=override_requested,
+                    override_applied=bool(override),
+                    override_reason=override_reason,
+                    failure_reason=budget_error.reason,
+                    started=started,
+                    prompt_trace=budget_prompt_trace,
+                    surface_presence_trace=surface_presence_trace,
+                    dsa_trace=dsa_trace,
+                    privacy_policy=privacy_context,
+                )
+                await _complete_runtime_turn(
+                    runtime=runtime,
+                    turn_state_trace=turn_state_trace,
+                    request_id=request_id,
+                    turn_status="abandoned",
+                )
+                raise RuntimeError(budget_error.reason) from budget_error
         messages = prompt.messages
         prompt.trace["capability_registry"] = capability_registry_trace
         prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
@@ -7206,6 +7363,33 @@ async def orchestrate_chat(
             "executor_call_count": 0,
             "provider_call_count": 0,
         }
+        if evidence_acquisition is not None:
+            retained_external_refs = _retained_external_source_refs(prompt.trace)
+            await evaluate_acquisition_sufficiency(
+                state=evidence_acquisition,
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace["runtime_session_id"],
+                runtime_turn_id=turn_state_trace["runtime_turn_id"],
+                context_pack=external_context_pack,
+                dsa_trace=dsa_trace,
+                retained_source_refs=retained_external_refs,
+            )
+            evidence_manifest = build_manifest_trace(
+                state=evidence_acquisition,
+                context_pack=external_context_pack,
+                dsa_trace=dsa_trace,
+                retained_source_refs=retained_external_refs,
+            )
+            prompt.trace["evidence_acquisition"] = evidence_manifest
+        elif evidence_acquisition_enabled:
+            prompt.trace["evidence_acquisition"] = disabled_evidence_trace(
+                enabled=True,
+                reason="ineligible",
+            )
 
         await _advance_runtime_turn(
             runtime=runtime,
@@ -7214,9 +7398,15 @@ async def orchestrate_chat(
             turn_status="responding",
         )
         model_started = perf_counter()
+        evidence_provider_allowed = provider_allowed(evidence_acquisition)
         try:
             if pending_continuation is not None:
                 completion = {"choices": [{"message": {"content": ""}}]}
+            elif not evidence_provider_allowed:
+                completion = {"choices": [{"message": {"content": ""}}]}
+                selected_model = "not_called"
+                selected_provider = "none"
+                status = "degraded"
             else:
                 completion = await litellm.chat(
                     request_id=request_id,
@@ -7406,9 +7596,14 @@ async def orchestrate_chat(
                 raise
 
         prompt.trace["capabilities"]["provider_call_count"] = len(model_calls)
-        raw_answer = _apply_capability_registry_response_boundary(
-            provider_text(completion),
-            capability_registry_trace,
+        raw_answer = (
+            evidence_acquisition.forced_answer
+            if evidence_acquisition is not None
+            and evidence_acquisition.forced_answer is not None
+            else _apply_capability_registry_response_boundary(
+                provider_text(completion),
+                capability_registry_trace,
+            )
         )
         capability_request = None
         pending_action: dict[str, Any] | None = None
@@ -7553,6 +7748,11 @@ async def orchestrate_chat(
             raw_answer = action_summary_answer
         if pending_action is not None:
             raw_answer = execution_result.response_text
+        if (
+            evidence_acquisition is not None
+            and evidence_acquisition.forced_answer is not None
+        ):
+            raw_answer = evidence_acquisition.forced_answer
         response_review = review_response(
             ResponseReviewInput(
                 candidate_text=raw_answer,
@@ -7642,6 +7842,7 @@ async def orchestrate_chat(
                 sources=answer_sources,
             )
         answer = privacy_boundary.final_answer
+        answer = enforce_final_answer(answer, evidence_acquisition)
         if privacy_boundary.enforced:
             answer_sources = []
             if brief_metadata.get("enabled") is True:
@@ -7659,7 +7860,7 @@ async def orchestrate_chat(
 
         references = _trace_references(retrieval_bundle)
         claim_capture = prepare_claim_capture(
-            enabled=claim_record_capture_enabled,
+            enabled=claim_record_capture_enabled and evidence_provider_allowed,
             runtime_available=runtime is not None,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
@@ -7712,6 +7913,13 @@ async def orchestrate_chat(
             metadata={"request_id": request_id, "selected_model": selected_model},
             policy_metadata=turn_policy_metadata,
         )
+        if evidence_manifest is not None:
+            bind_manifest_response(
+                evidence_manifest,
+                assistant_message_ack=assistant_message_ack,
+                answer=answer,
+            )
+            prompt.trace["evidence_acquisition"] = evidence_manifest
         claim_capture = bind_assistant_message(claim_capture, assistant_message_ack)
         prompt.trace["claim_capture"] = claim_capture.trace
         prompt.trace["answer_persistence"] = {
@@ -7761,6 +7969,10 @@ async def orchestrate_chat(
             else prompt.trace
         )
         if privacy_boundary.enforced and isinstance(persisted_prompt_trace, dict):
+            if evidence_manifest is not None:
+                persisted_prompt_trace["evidence_acquisition"] = (
+                    suppress_manifest_identifiers(evidence_manifest)
+                )
             persisted_prompt_trace.pop("retained_source_ids", None)
             persisted_prompt_trace["memory_episode_recall_composition"] = (
                 _privacy_safe_memory_recall_trace(

@@ -78,6 +78,125 @@ class RuntimeClient:
             raise RuntimeError("claim_calibration_response_invalid")
         return response
 
+    async def derive_evidence_shape(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        task_text: str,
+        interaction_kind: str,
+        task_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+        response = await self._post(
+            "/v1/runtime/evidence-shapes/derive",
+            json={
+                **scope,
+                "task_text": task_text,
+                "interaction_kind": interaction_kind,
+                "task_context": task_context,
+            },
+        )
+        if not isinstance(response, dict) or any(
+            response.get(field) != value for field, value in scope.items()
+        ):
+            raise RuntimeError("evidence_shape_response_invalid")
+        return response
+
+    async def compile_evidence_plan(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        question_anchor: str,
+        task_shape: str,
+        declared_scope: dict[str, Any],
+        source_inventory: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+        response = await self._post(
+            "/v1/runtime/evidence-plans/compile",
+            json={
+                **scope,
+                "question_anchor": question_anchor,
+                "task_shape": task_shape,
+                "declared_scope": declared_scope,
+                "source_inventory": source_inventory,
+            },
+        )
+        if not isinstance(response, dict) or any(
+            response.get(field) != value for field, value in scope.items()
+        ):
+            raise RuntimeError("evidence_plan_response_invalid")
+        return response
+
+    async def evaluate_evidence_sufficiency(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        evidence_plan_id: str,
+        acquisition_manifest_id: str,
+        task_shape: str,
+        declared_requirements: list[dict[str, Any]],
+        acquisition_facts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+        response = await self._post(
+            "/v1/runtime/evidence-sufficiency/evaluate",
+            json={
+                **scope,
+                "evidence_plan_id": evidence_plan_id,
+                "acquisition_manifest_id": acquisition_manifest_id,
+                "task_shape": task_shape,
+                "declared_requirements": declared_requirements,
+                "acquisition_facts": acquisition_facts,
+            },
+        )
+        expected = {
+            **scope,
+            "evidence_plan_id": evidence_plan_id,
+            "acquisition_manifest_id": acquisition_manifest_id,
+        }
+        if not isinstance(response, dict) or any(
+            response.get(field) != value for field, value in expected.items()
+        ):
+            raise RuntimeError("evidence_sufficiency_response_invalid")
+        return response
+
     async def resolve_session(
         self,
         *,

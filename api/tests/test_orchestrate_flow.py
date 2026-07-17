@@ -7,6 +7,7 @@ from dataclasses import replace
 import httpx
 import pytest
 import services.capabilities as capability_service
+import services.orchestrate as orchestrate_service
 from clients.runtime import RuntimeClient
 from services.action_connectors import (
     ActionConnectorRegistry,
@@ -363,6 +364,9 @@ class FakeRuntime:
         capability_flow_response=None,
         action_summary_response=None,
         claim_calibration_response=None,
+        evidence_shape_response=None,
+        evidence_plan_response=None,
+        evidence_sufficiency_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
@@ -376,6 +380,9 @@ class FakeRuntime:
         capability_flow_error: Exception | None = None,
         action_summary_error: Exception | None = None,
         claim_calibration_error: Exception | None = None,
+        evidence_shape_error: Exception | None = None,
+        evidence_plan_error: Exception | None = None,
+        evidence_sufficiency_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -399,6 +406,9 @@ class FakeRuntime:
         self.capability_flow_calls = []
         self.action_summary_calls = []
         self.claim_calibration_calls = []
+        self.evidence_shape_calls = []
+        self.evidence_plan_calls = []
+        self.evidence_sufficiency_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -724,6 +734,9 @@ class FakeRuntime:
         }
         self.action_summary_response = action_summary_response
         self.claim_calibration_response = claim_calibration_response
+        self.evidence_shape_response = evidence_shape_response
+        self.evidence_plan_response = evidence_plan_response
+        self.evidence_sufficiency_response = evidence_sufficiency_response
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
@@ -737,6 +750,9 @@ class FakeRuntime:
         self.capability_flow_error = capability_flow_error
         self.action_summary_error = action_summary_error
         self.claim_calibration_error = claim_calibration_error
+        self.evidence_shape_error = evidence_shape_error
+        self.evidence_plan_error = evidence_plan_error
+        self.evidence_sufficiency_error = evidence_sufficiency_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -839,6 +855,188 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.interaction_governance_response
+
+    async def derive_evidence_shape(self, **kwargs):
+        self.evidence_shape_calls.append(kwargs)
+        self.call_order.append("evidence_shape")
+        if self.evidence_shape_error is not None:
+            raise self.evidence_shape_error
+        if self.evidence_shape_response is not None:
+            return self.evidence_shape_response
+        question = " ".join(kwargs["task_text"].split())
+        digest = f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                )
+            },
+            "result": {
+                "derivation_id": "evidence_shape_1",
+                "question_anchor": question,
+                "question_anchor_digest": digest,
+                "derivation_status": "derived",
+                "task_shape": "targeted_lookup",
+                "candidate_task_shapes": ["targeted_lookup"],
+                "evidence_scope_material": True,
+                "clarification_required": False,
+                "reason_codes": [
+                    "explicit_evidence_language",
+                    "targeted_lookup_derived",
+                ],
+                "user_safe_summary": "A bounded acquisition mode was identified.",
+            },
+        }
+
+    async def compile_evidence_plan(self, **kwargs):
+        self.evidence_plan_calls.append(kwargs)
+        self.call_order.append("evidence_plan")
+        if self.evidence_plan_error is not None:
+            raise self.evidence_plan_error
+        if self.evidence_plan_response is not None:
+            return self.evidence_plan_response
+        digest = f"sha256:{hashlib.sha256(kwargs['question_anchor'].encode()).hexdigest()}"
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                )
+            },
+            "result": {
+                "plan_id": "evidence_plan_1",
+                "question_anchor": kwargs["question_anchor"],
+                "question_anchor_digest": digest,
+                "task_shape": kwargs["task_shape"],
+                "plan_status": "ready",
+                "completeness_expectation": "targeted_scope",
+                "contradiction_search_required": False,
+                "eligible_source_ids": ["vehicle_log_primary"],
+                "authoritative_source_ids": [],
+                "selected_strategies": ["targeted_retrieval"],
+                "declared_requirements": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "requirement_kind": "targeted_evidence",
+                        "criticality": "material",
+                    },
+                    {
+                        "requirement_id": "context-delivery",
+                        "requirement_kind": "context_delivery",
+                        "criticality": "material",
+                    },
+                ],
+                "limitation_codes": [],
+                "user_safe_summary": "A strategy is available.",
+            },
+        }
+
+    async def evaluate_evidence_sufficiency(self, **kwargs):
+        self.evidence_sufficiency_calls.append(kwargs)
+        self.call_order.append("evidence_sufficiency")
+        if self.evidence_sufficiency_error is not None:
+            raise self.evidence_sufficiency_error
+        if self.evidence_sufficiency_response is not None:
+            return self.evidence_sufficiency_response
+        evaluations = [
+            {
+                **requirement,
+                "effective_outcome": next(
+                    fact["outcome"]
+                    for fact in kwargs["acquisition_facts"]
+                    if fact["requirement_id"] == requirement["requirement_id"]
+                ),
+            }
+            for requirement in kwargs["declared_requirements"]
+        ]
+        concrete_failure = any(
+            item["criticality"] == "material"
+            and item["effective_outcome"] not in {"satisfied", "unknown"}
+            for item in evaluations
+        )
+        unknown = any(
+            item["criticality"] == "material"
+            and item["effective_outcome"] == "unknown"
+            for item in evaluations
+        )
+        optional = any(
+            item["criticality"] == "optional"
+            and item["effective_outcome"] != "satisfied"
+            for item in evaluations
+        )
+        status = (
+            "insufficient"
+            if concrete_failure
+            else "unknown"
+            if unknown
+            else "sufficient_with_limitations"
+            if optional
+            else "sufficient_for_declared_scope"
+        )
+        constraints = (
+            []
+            if status == "sufficient_for_declared_scope"
+            else [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+            ]
+            if status == "sufficient_with_limitations"
+            else [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ]
+        )
+        reasons = (
+            ["all_declared_requirements_satisfied"]
+            if status == "sufficient_for_declared_scope"
+            else ["optional_requirement_incomplete"]
+            if status == "sufficient_with_limitations"
+            else ["material_requirement_not_satisfied"]
+            if status == "insufficient"
+            else ["material_requirement_unknown"]
+        )
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "evidence_plan_id",
+                    "acquisition_manifest_id",
+                )
+            },
+            "result": {
+                "evaluation_id": "evidence_eval_1",
+                "task_shape": kwargs["task_shape"],
+                "sufficiency_status": status,
+                "evaluated_requirements": evaluations,
+                "reason_codes": reasons,
+                "answer_constraints": constraints,
+                "qualification_required": status != "sufficient_for_declared_scope",
+                "additional_acquisition_required": status
+                in {"insufficient", "unknown"},
+                "user_safe_summary": "Bounded sufficiency.",
+            },
+        }
 
     async def evaluate_persona_containment(self, **kwargs):
         self.persona_containment_calls.append(kwargs)
@@ -1200,10 +1398,42 @@ class TruthAwareLiteLLM(FakeLiteLLM):
 
 
 class FakeDSA:
-    def __init__(self, *, response=None, error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        response=None,
+        error: Exception | None = None,
+        source_response=None,
+        source_error: Exception | None = None,
+    ):
         self.calls = []
+        self.list_calls = []
         self.response = response or {"sources_used": [], "items": []}
         self.error = error
+        self.source_response = source_response or {
+            "sources": [
+                {
+                    "source_id": "vehicle_log_primary",
+                    "display_name": "Vehicle Log",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["vehicle", "maintenance"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+            ]
+        }
+        self.source_error = source_error
+
+    async def list_sources(self):
+        self.list_calls.append({})
+        if self.source_error is not None:
+            raise self.source_error
+        return self.source_response
 
     async def context_pack(self, **kwargs):
         self.calls.append(kwargs)
@@ -11070,6 +11300,1162 @@ def _first_party_chat_payload(
     }
     payload.update(overrides)
     return payload
+
+
+def _governed_context_pack(query: str) -> dict[str, object]:
+    return {
+        "query_id": "query_1",
+        "query": query,
+        "sources_used": ["vehicle_log_primary"],
+        "items": [
+            {
+                "result_id": "result_1",
+                "source_type": "record",
+                "source_id": "vehicle_log_primary",
+                "source_name": "PRIVATE SOURCE NAME",
+                "source_ref": "vehicle_log_primary:record_1",
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "title": "PRIVATE SOURCE TITLE",
+                "content_type": "text",
+                "text": "The maintenance record lists 2025-07-12.",
+                "confidence": "high",
+                "warnings": [],
+            }
+        ],
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": 5,
+            "returned_results": 1,
+            "estimated_bytes": 120,
+            "truncated": False,
+        },
+        "diagnostics": {
+            "selection_mode": "query_relevance",
+            "considered_source_ids": ["vehicle_log_primary"],
+            "selected_source_ids": ["vehicle_log_primary"],
+            "source_diagnostics": [],
+            "ranking_mode": "single_source",
+            "candidate_counts_by_source": {"vehicle_log_primary": 1},
+            "budget_truncated_candidates": False,
+        },
+    }
+
+
+def _targeted_plan_response(
+    *,
+    request_id: str,
+    question: str,
+    status: str = "ready",
+    strategy: str = "targeted_retrieval",
+    optional: bool = False,
+    task_shape: str = "targeted_lookup",
+    eligible_source_ids: list[str] | None = None,
+) -> dict[str, object]:
+    requirements = [
+        {
+            "requirement_id": "targeted-evidence",
+            "requirement_kind": "targeted_evidence",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "context-delivery",
+            "requirement_kind": "context_delivery",
+            "criticality": "material",
+        },
+    ]
+    if optional:
+        requirements.append(
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+            }
+        )
+    return {
+        "request_id": request_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "node_red",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "plan_id": "evidence_plan_1",
+            "question_anchor": question,
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
+            "task_shape": task_shape,
+            "plan_status": status,
+            "completeness_expectation": (
+                "complete_for_declared_scope"
+                if task_shape
+                in {"bounded_exhaustive_review", "absence_or_coverage_check"}
+                else "targeted_scope"
+            ),
+            "contradiction_search_required": task_shape == "bounded_exhaustive_review",
+            "eligible_source_ids": eligible_source_ids or ["vehicle_log_primary"],
+            "authoritative_source_ids": [],
+            "selected_strategies": [strategy] if strategy else [],
+            "declared_requirements": requirements,
+            "limitation_codes": (
+                ["optional_source_unavailable"] if optional else []
+            ),
+            "user_safe_summary": "A bounded strategy result.",
+        },
+    }
+
+
+def _derived_shape_response(
+    *,
+    request_id: str,
+    question: str,
+    task_shape: str,
+) -> dict[str, object]:
+    reason_code = {
+        "targeted_lookup": "targeted_lookup_derived",
+        "bounded_exhaustive_review": "exhaustive_scope_requested",
+        "absence_or_coverage_check": "absence_scope_requested",
+    }[task_shape]
+    return {
+        "request_id": request_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "node_red",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "derivation_id": "evidence_shape_1",
+            "question_anchor": question,
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
+            "derivation_status": "derived",
+            "task_shape": task_shape,
+            "candidate_task_shapes": [task_shape],
+            "evidence_scope_material": True,
+            "clarification_required": False,
+            "reason_codes": ["explicit_evidence_language", reason_code],
+            "user_safe_summary": "A bounded acquisition mode was identified.",
+        },
+    }
+
+
+async def _run_governed_context_case(
+    *,
+    tmp_path,
+    response: dict[str, object],
+    request_id: str,
+    eligible_source_ids: list[str] | None = None,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime(
+        evidence_plan_response=(
+            _targeted_plan_response(
+                request_id=request_id,
+                question=question,
+                eligible_source_ids=eligible_source_ids,
+            )
+            if eligible_source_ids is not None
+            else None
+        )
+    )
+    dsa = FakeDSA(response=response)
+    if eligible_source_ids and "vehicle_log_secondary" in eligible_source_ids:
+        dsa.source_response["sources"].append(
+            {
+                "source_id": "vehicle_log_secondary",
+                "display_name": "Secondary Vehicle Log",
+                "connector": "neutral_connector",
+                "domain_tags": ["vehicle", "maintenance"],
+                "sensitivity": "medium",
+                "access_mode": "read_only",
+                "capabilities": ["profile", "search"],
+                "enabled": True,
+                "status": "ready",
+                "last_checked_at": "2026-07-17T00:00:00Z",
+                "last_error": None,
+            }
+        )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return out, runtime, dsa, litellm, memory_store
+
+
+def _assert_governed_context_rejected(
+    *,
+    out,
+    runtime,
+    dsa,
+    litellm,
+    memory_store,
+    prohibited_text: str | None = None,
+):
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.calls) == 1
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "filtered"},
+    ]
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["acquisition"]["dsa_outcome"] == "error"
+    assert manifest["acquisition"]["dsa_error_codes"] == ["malformed_response"]
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_references_returned",
+        "source_references_retained",
+    ):
+        assert manifest["acquisition"][field] == []
+    if prohibited_text is not None:
+        assert prohibited_text not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_manifest(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    user_text = "Verify   the maintenance record."
+
+    class OrderedDsa(FakeDSA):
+        async def list_sources(self):
+            runtime.call_order.append("dsa_inventory")
+            return await super().list_sources()
+
+        async def context_pack(self, **kwargs):
+            runtime.call_order.append("dsa_context_pack")
+            return await super().context_pack(**kwargs)
+
+    dsa = OrderedDsa(response=_governed_context_pack("Verify the maintenance record."))
+    memory_store = FakeMemoryStore()
+
+    class OrderedLiteLlm(FakeLiteLLM):
+        async def chat(self, **kwargs):
+            runtime.call_order.append("provider")
+            return await super().chat(**kwargs)
+
+    litellm = OrderedLiteLlm(content="The record lists 2025-07-12.")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            user_text,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-targeted",
+    )
+
+    assert out["answer"] == "The record lists 2025-07-12."
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["query"] == "Verify the maintenance record."
+    assert len(litellm.calls) == 1
+    assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
+        "evidence_shape"
+    )
+    assert runtime.call_order.index("evidence_shape") < runtime.call_order.index(
+        "dsa_inventory"
+    )
+    assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index(
+        "evidence_plan"
+    )
+    assert runtime.call_order.index("evidence_plan") < runtime.call_order.index(
+        "dsa_context_pack"
+    )
+    assert runtime.call_order.index("dsa_context_pack") < runtime.call_order.index(
+        "evidence_sufficiency"
+    )
+    assert runtime.call_order.index("evidence_sufficiency") < runtime.call_order.index(
+        "provider"
+    )
+    submitted_facts = runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    assert {fact["requirement_id"]: fact["outcome"] for fact in submitted_facts} == {
+        "context-delivery": "satisfied",
+        "targeted-evidence": "satisfied",
+    }
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    retained_manifest = trace["retrieval"]["prompt_assembly"]["evidence_acquisition"]
+    assert manifest == retained_manifest
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert manifest["assistant_message_id"] == "m-1"
+    assert manifest["response_digest"] == (
+        f"sha256:{hashlib.sha256(out['answer'].encode()).hexdigest()}"
+    )
+    assert manifest["acquisition"]["source_references_returned"] == [
+        "vehicle_log_primary:record_1"
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == [
+        "vehicle_log_primary:record_1"
+    ]
+    eligible_sources = {"vehicle_log_primary"}
+    assert set(manifest["acquisition"]["sources_considered"]).issubset(
+        eligible_sources
+    )
+    assert manifest["acquisition"]["sources_selected"] == manifest["acquisition"][
+        "sources_used"
+    ]
+    assert set(manifest["acquisition"]["source_references_retained"]).issubset(
+        manifest["acquisition"]["source_references_returned"]
+    )
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "The maintenance record lists" not in serialized
+    assert "PRIVATE SOURCE" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_no_result_withholds_without_provider(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    empty = _governed_context_pack("Verify the maintenance record.")
+    empty["items"] = []
+    empty["sources_used"] = []
+    empty["budget"]["returned_results"] = 0
+    empty["budget"]["estimated_bytes"] = 0
+    empty["diagnostics"]["selected_source_ids"] = []
+    empty["diagnostics"]["candidate_counts_by_source"] = {}
+    dsa = FakeDSA(response=empty)
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-no-result",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert out["selected_model"] == "not_called"
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "unknown"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_ambiguous_shape_is_provider_and_dsa_free(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "rid-evidence-ambiguous"
+    runtime = FakeRuntime()
+    runtime.evidence_shape_response = {
+        "request_id": request_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "node_red",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "derivation_id": "evidence_shape_ambiguous",
+            "question_anchor": "Compare everything and reconstruct the history.",
+            "question_anchor_digest": (
+                "sha256:"
+                + hashlib.sha256(
+                    "Compare everything and reconstruct the history.".encode()
+                ).hexdigest()
+            ),
+            "derivation_status": "ambiguous",
+            "task_shape": None,
+            "candidate_task_shapes": [
+                "bounded_exhaustive_review",
+                "historical_reconstruction",
+            ],
+            "evidence_scope_material": True,
+            "clarification_required": True,
+            "reason_codes": ["multiple_incompatible_shapes"],
+            "user_safe_summary": "The task must be narrowed.",
+        },
+    }
+    dsa = FakeDSA()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Compare everything and reconstruct the history.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I need a narrower evidence request before I can determine what should be checked."
+    )
+    assert out["selected_model"] == "not_called"
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "All maintenance records use this date.",
+        "None of the maintenance records use another date.",
+        "There is no record of any other date.",
+    ],
+)
+async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_disclosure(
+    tmp_path,
+    provider_answer,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    litellm = FakeLiteLLM(content=provider_answer)
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-overclaim",
+    )
+
+    assert out["answer"].endswith(
+        "This reflects only the targeted sources checked, not a complete search "
+        "of every possible source."
+    )
+    assert out["answer"].count("This reflects only the targeted sources checked") == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_provider_cannot_rewrite_policy_history(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    malicious = (
+        "PROVIDER_POLICY_SENTINEL plan_id=evil_plan "
+        "sufficiency_status=insufficient answer_constraints=[]"
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content=malicious),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-provider-policy",
+    )
+
+    assert out["answer"] == malicious
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["plan"]["plan_id"] == "evidence_plan_1"
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
+    assert manifest["sufficiency"]["answer_constraints"] == []
+    assert "PROVIDER_POLICY_SENTINEL" not in json.dumps(manifest)
+    assert "evil_plan" not in json.dumps(manifest)
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_suffix(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    request_id = "rid-evidence-limited"
+    runtime = FakeRuntime(
+        evidence_plan_response=_targeted_plan_response(
+            request_id=request_id,
+            question=question,
+            status="ready_with_limitations",
+            optional=True,
+        )
+    )
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM(content="The record lists 2025-07-12.")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert len(litellm.calls) == 1
+    assert out["answer"].endswith(
+        "Some optional source scope was unavailable, so this answer is limited "
+        "to the material evidence that was successfully checked."
+    )
+    assert out["answer"].count("Some optional source scope was unavailable") == 1
+    trace = runtime.evidence_sufficiency_calls[0]
+    assert trace["acquisition_facts"][-1] == {
+        "requirement_id": "targeted-evidence",
+        "outcome": "satisfied",
+    }
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in trace["acquisition_facts"]
+    }["optional-selected-source-coverage"] == "unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["exact_fetch", "bounded_full_context", "hybrid"])
+async def test_evidence_acquisition_non_targeted_strategy_is_provider_and_acquisition_free(
+    tmp_path,
+    strategy,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    request_id = f"rid-evidence-{strategy}"
+    runtime = FakeRuntime(
+        evidence_plan_response=_targeted_plan_response(
+            request_id=request_id,
+            question=question,
+            strategy=strategy,
+        )
+    )
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert len(dsa.list_calls) == 1
+    assert dsa.calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_shape", "question"),
+    [
+        (
+            "bounded_exhaustive_review",
+            "Check every requirement in the declared checklist.",
+        ),
+        (
+            "absence_or_coverage_check",
+            "Confirm there is no record in the declared logs.",
+        ),
+    ],
+)
+async def test_evidence_acquisition_unsupported_shape_is_provider_and_acquisition_free(
+    tmp_path,
+    task_shape,
+    question,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = f"rid-evidence-{task_shape}"
+    runtime = FakeRuntime(
+        evidence_shape_response=_derived_shape_response(
+            request_id=request_id,
+            question=question,
+            task_shape=task_shape,
+        ),
+        evidence_plan_response=_targeted_plan_response(
+            request_id=request_id,
+            question=question,
+            status="unsupported",
+            strategy="",
+            task_shape=task_shape,
+        ),
+    )
+    dsa = FakeDSA()
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert len(runtime.evidence_plan_calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert dsa.calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dsa_failure",
+    [
+        httpx.ReadTimeout("timed out"),
+        _http_status_error(503),
+        RuntimeError("PRIVATE DEPENDENCY ERROR"),
+    ],
+)
+async def test_evidence_acquisition_dependency_failure_is_withheld_without_provider(
+    tmp_path,
+    dsa_failure,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(error=dsa_failure)
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-dsa-failure",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "failed"},
+    ]
+    serialized = json.dumps(runtime.evidence_sufficiency_calls[0])
+    assert "PRIVATE DEPENDENCY ERROR" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_malformed_context_is_filtered_and_withheld(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    malformed = _governed_context_pack("Verify the maintenance record.")
+    malformed["items"][0]["raw_metadata"] = {
+        "private": "PRIVATE RAW METADATA"
+    }
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=malformed)
+    litellm = FakeLiteLLM()
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-malformed-context",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "filtered"},
+    ]
+    serialized = json.dumps(memory_store.trace_calls[0]["payload"])
+    assert "PRIVATE RAW METADATA" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_rejects_unrelated_context_query(tmp_path):
+    unrelated_query = "UNRELATED QUERY SENTINEL"
+    response = _governed_context_pack(unrelated_query)
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=response,
+        request_id="rid-evidence-query-mismatch",
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+        prohibited_text=unrelated_query,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "association_case",
+    [
+        "source-used-outside-plan",
+        "item-source-not-used",
+        "item-source-outside-plan",
+    ],
+)
+async def test_evidence_acquisition_rejects_source_association_mismatch(
+    tmp_path,
+    association_case,
+):
+    response = _governed_context_pack("Verify the maintenance record.")
+    eligible_source_ids = None
+    if association_case == "source-used-outside-plan":
+        response["items"] = []
+        response["sources_used"] = ["vehicle_log_outside"]
+        response["diagnostics"] = None
+    elif association_case == "item-source-not-used":
+        response["items"][0]["source_id"] = "vehicle_log_secondary"
+        eligible_source_ids = [
+            "vehicle_log_primary",
+            "vehicle_log_secondary",
+        ]
+    else:
+        response["items"][0]["source_id"] = "vehicle_log_outside"
+        response["sources_used"] = ["vehicle_log_outside"]
+        response["diagnostics"] = None
+
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=response,
+        request_id=f"rid-evidence-{association_case}",
+        eligible_source_ids=eligible_source_ids,
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "diagnostic_case",
+    [
+        "considered-outside-plan",
+        "selected-not-considered",
+        "selected-differs-from-used",
+        "source-diagnostic-not-considered",
+        "candidate-count-not-selected",
+    ],
+)
+async def test_evidence_acquisition_rejects_diagnostic_association_mismatch(
+    tmp_path,
+    diagnostic_case,
+):
+    response = _governed_context_pack("Verify the maintenance record.")
+    diagnostics = response["diagnostics"]
+    eligible_source_ids = ["vehicle_log_primary", "vehicle_log_secondary"]
+    if diagnostic_case == "considered-outside-plan":
+        diagnostics["considered_source_ids"] = ["vehicle_log_outside"]
+        eligible_source_ids = None
+    elif diagnostic_case == "selected-not-considered":
+        diagnostics["considered_source_ids"] = []
+    elif diagnostic_case == "selected-differs-from-used":
+        diagnostics["selected_source_ids"] = ["vehicle_log_secondary"]
+        diagnostics["considered_source_ids"] = [
+            "vehicle_log_primary",
+            "vehicle_log_secondary",
+        ]
+    elif diagnostic_case == "source-diagnostic-not-considered":
+        diagnostics["source_diagnostics"] = [
+            {
+                "source_id": "vehicle_log_secondary",
+                "score": 1,
+                "score_band": "eligible",
+                "reasons": ["bounded_match"],
+            }
+        ]
+    else:
+        diagnostics["candidate_counts_by_source"] = {
+            "vehicle_log_secondary": 1
+        }
+
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=response,
+        request_id=f"rid-evidence-{diagnostic_case}",
+        eligible_source_ids=eligible_source_ids,
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+    )
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_prompt_filtered_context_cannot_satisfy_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        response=_governed_context_pack("Verify the maintenance record.")
+    )
+    litellm = FakeLiteLLM()
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-prompt-filtered",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "filtered"},
+        {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        response=_governed_context_pack("Verify the maintenance record.")
+    )
+    litellm = FakeLiteLLM()
+    memory_store = FakeMemoryStore()
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def mismatched_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["metadata"]["source_refs"] = [
+                    "vehicle_log_primary:not_returned"
+                ]
+        return replace(prompt, trace=trace)
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        mismatched_assemble_prompt,
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-prompt-reference-mismatch",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
+    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["source_references_returned"] == [
+        "vehicle_log_primary:record_1"
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == []
+    assert manifest["acquisition"]["context_delivery_status"] == "unknown"
+    assert "not_returned" not in json.dumps(manifest, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_provider_path(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "rid-evidence-not-applicable"
+    runtime = FakeRuntime()
+    runtime.evidence_shape_response = {
+        "request_id": request_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "node_red",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "derivation_id": "evidence_shape_na",
+            "question_anchor": "Tell me a joke.",
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256('Tell me a joke.'.encode()).hexdigest()}"
+            ),
+            "derivation_status": "not_applicable",
+            "task_shape": None,
+            "candidate_task_shapes": [],
+            "evidence_scope_material": False,
+            "clarification_required": False,
+            "reason_codes": ["non_evidence_interaction"],
+            "user_safe_summary": "Evidence planning does not apply.",
+        },
+    }
+    dsa = FakeDSA(response=_governed_context_pack("Tell me a joke."))
+    litellm = FakeLiteLLM(content="A bounded joke.")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Tell me a joke.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == "A bounded joke."
+    assert dsa.list_calls == []
+    assert len(dsa.calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert len(litellm.calls) == 1
+    provider_prompt = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "External source context:" in provider_prompt
+    assert "The maintenance record lists 2025-07-12." in provider_prompt
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["status"] == "not_applicable"
+    assert manifest["shape"] == {
+        "derivation_status": "not_applicable",
+        "task_shape": None,
+        "candidate_count": 0,
+        "clarification_required": False,
+        "reason_codes": ["non_evidence_interaction"],
+    }
+    assert manifest["plan"]["plan_status"] == "not_compiled"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["acquisition"]["dsa_outcome"] == "success"
+    assert manifest["acquisition"]["source_references_retained"] == [
+        "vehicle_log_primary:record_1"
+    ]
+    assert "The maintenance record lists" not in json.dumps(
+        manifest,
+        sort_keys=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_request_without_external_opt_in_is_ineligible(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA()
+    litellm = FakeLiteLLM(content="Ordinary answer.")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Explain the maintenance schedule."),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-not-opted-in",
+    )
+
+    assert out["answer"] == "Ordinary answer."
+    assert runtime.evidence_shape_calls == []
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert len(litellm.calls) == 1
 
 
 def _route_files_with_fallback(tmp_path):
