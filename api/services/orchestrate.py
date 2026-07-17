@@ -37,6 +37,7 @@ from services.capabilities import (
     validate_and_digest_capability_request,
 )
 from services.claim_capture import (
+    bind_acquisition_manifest,
     bind_assistant_message,
     calibrate_claim_capture,
     claim_record_payload,
@@ -8033,6 +8034,10 @@ async def orchestrate_chat(
             )
             prompt.trace["evidence_acquisition"] = evidence_manifest
         claim_capture = bind_assistant_message(claim_capture, assistant_message_ack)
+        claim_capture = bind_acquisition_manifest(
+            claim_capture,
+            evidence_manifest,
+        )
         prompt.trace["claim_capture"] = claim_capture.trace
         prompt.trace["answer_persistence"] = {
             "assistant_message_persisted": True,
