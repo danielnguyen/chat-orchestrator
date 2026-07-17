@@ -12371,20 +12371,16 @@ async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_pr
             "user_safe_summary": "Evidence planning does not apply.",
         },
     }
-    dsa = FakeDSA(
-        response={
-            "sources_used": [],
-            "items": [],
-        }
-    )
+    dsa = FakeDSA(response=_governed_context_pack("Tell me a joke."))
     litellm = FakeLiteLLM(content="A bounded joke.")
+    memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Tell me a joke.",
             external_context_enabled=True,
         ),
-        memory_store=FakeMemoryStore(),
+        memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
         dsa=dsa,
@@ -12403,6 +12399,30 @@ async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_pr
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert len(litellm.calls) == 1
+    provider_prompt = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "External source context:" in provider_prompt
+    assert "The maintenance record lists 2025-07-12." in provider_prompt
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["status"] == "not_applicable"
+    assert manifest["shape"] == {
+        "derivation_status": "not_applicable",
+        "task_shape": None,
+        "candidate_count": 0,
+        "clarification_required": False,
+        "reason_codes": ["non_evidence_interaction"],
+    }
+    assert manifest["plan"]["plan_status"] == "not_compiled"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["acquisition"]["dsa_outcome"] == "success"
+    assert manifest["acquisition"]["source_references_retained"] == [
+        "vehicle_log_primary:record_1"
+    ]
+    assert "The maintenance record lists" not in json.dumps(
+        manifest,
+        sort_keys=True,
+    )
 
 
 @pytest.mark.asyncio

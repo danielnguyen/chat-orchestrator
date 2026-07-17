@@ -6966,10 +6966,12 @@ async def orchestrate_chat(
                         external_calls_allowed=not local_only,
                         query=acquisition_query,
                         response_validator=(
-                            lambda response: validate_context_pack_response(
-                                response,
-                                expected_query=acquisition_query,
-                                eligible_source_ids=governed_plan.eligible_source_ids,
+                            (
+                                lambda response: validate_context_pack_response(
+                                    response,
+                                    expected_query=acquisition_query,
+                                    eligible_source_ids=governed_plan.eligible_source_ids,
+                                )
                             )
                             if governed_plan is not None
                             else None
