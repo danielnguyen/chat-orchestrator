@@ -390,25 +390,67 @@ def _context_pack():
     }
 
 
+def _validated_context_pack(
+    response=None,
+    *,
+    eligible_source_ids=("source_a",),
+):
+    return validate_context_pack_response(
+        response or _context_pack(),
+        expected_query=QUESTION,
+        eligible_source_ids=eligible_source_ids,
+    )
+
+
 def test_context_pack_contract_rejects_raw_metadata_and_malformed_items():
-    validated = validate_context_pack_response(_context_pack())
+    validated = _validated_context_pack()
     assert validated["query_id"] == "query_1"
     with pytest.raises(ValidationError):
-        validate_context_pack_response(
+        _validated_context_pack(
             {
                 **_context_pack(),
                 "items": [{**_context_pack()["items"][0], "raw": {"secret": "value"}}],
             }
         )
+    for diagnostics in (
+        {
+            **_context_pack()["diagnostics"],
+            "considered_source_ids": ["source_a", "source_a"],
+        },
+        {
+            **_context_pack()["diagnostics"],
+            "source_diagnostics": [
+                {
+                    "source_id": "source_a",
+                    "score": 1,
+                    "score_band": "eligible",
+                    "reasons": ["bounded_match"],
+                },
+                {
+                    "source_id": "source_a",
+                    "score": 1,
+                    "score_band": "eligible",
+                    "reasons": ["bounded_match"],
+                },
+            ],
+        },
+    ):
+        with pytest.raises(ValidationError):
+            _validated_context_pack(
+                {
+                    **_context_pack(),
+                    "diagnostics": diagnostics,
+                }
+            )
     with pytest.raises(ValidationError):
-        validate_context_pack_response(
+        _validated_context_pack(
             {
                 **_context_pack(),
                 "items": [{**_context_pack()["items"][0], "text": ""}],
             }
         )
     with pytest.raises(ValidationError):
-        validate_context_pack_response(
+        _validated_context_pack(
             {
                 **_context_pack(),
                 "items": [
@@ -418,6 +460,100 @@ def test_context_pack_contract_rejects_raw_metadata_and_malformed_items():
                     }
                 ],
             }
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "eligible_source_ids", "expected_error"),
+    [
+        (
+            lambda response: response.update(query="Unrelated bounded question."),
+            ("source_a",),
+            "context_pack_query_mismatch",
+        ),
+        (
+            lambda response: response.update(sources_used=["source_a", "source_b"]),
+            ("source_a",),
+            "context_source_not_eligible",
+        ),
+        (
+            lambda response: response["items"][0].update(source_id="source_b"),
+            ("source_a", "source_b"),
+            "context_item_source_not_used",
+        ),
+        (
+            lambda response: (
+                response["items"][0].update(source_id="source_b"),
+                response.update(sources_used=["source_a", "source_b"]),
+            ),
+            ("source_a",),
+            "context_item_source_not_eligible",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                considered_source_ids=["source_a", "source_b"]
+            ),
+            ("source_a",),
+            "diagnostic_considered_source_not_eligible",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                considered_source_ids=[],
+                selected_source_ids=["source_a"],
+            ),
+            ("source_a",),
+            "diagnostic_selected_source_not_considered",
+        ),
+        (
+            lambda response: response["diagnostics"].update(selected_source_ids=[]),
+            ("source_a",),
+            "diagnostic_selected_source_mismatch",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                source_diagnostics=[
+                    {
+                        "source_id": "source_b",
+                        "score": 1,
+                        "score_band": "eligible",
+                        "reasons": ["bounded_match"],
+                    }
+                ]
+            ),
+            ("source_a", "source_b"),
+            "source_diagnostic_not_considered",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                candidate_counts_by_source={"source_b": 1}
+            ),
+            ("source_a", "source_b"),
+            "candidate_count_source_not_selected",
+        ),
+    ],
+    ids=[
+        "query-mismatch",
+        "source-used-outside-plan",
+        "item-source-not-used",
+        "item-source-outside-plan",
+        "considered-source-outside-plan",
+        "selected-source-not-considered",
+        "selected-source-differs-from-used",
+        "source-diagnostic-not-considered",
+        "candidate-count-source-not-selected",
+    ],
+)
+def test_context_pack_contract_rejects_plan_association_mismatch(
+    mutation,
+    eligible_source_ids,
+    expected_error,
+):
+    response = _context_pack()
+    mutation(response)
+    with pytest.raises(ValueError, match=expected_error):
+        _validated_context_pack(
+            response,
+            eligible_source_ids=eligible_source_ids,
         )
 
 
@@ -444,7 +580,7 @@ async def test_actual_prompt_delivery_controls_sufficiency(
         external_context=None,
         **SCOPE,
     )
-    context = validate_context_pack_response(_context_pack())
+    context = _validated_context_pack()
 
     await evaluate_acquisition_sufficiency(
         state=state,
@@ -465,6 +601,47 @@ async def test_actual_prompt_delivery_controls_sufficiency(
     assert provider_allowed(state) is provider_is_allowed
     if not provider_is_allowed:
         assert state.forced_answer == WITHHELD_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_non_returned_prompt_reference_is_unknown_and_not_retained():
+    runtime = FakeRuntime(sufficiency_status="unknown")
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+    context = _validated_context_pack()
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=context,
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs={"source_a:not_returned"},
+        **SCOPE,
+    )
+
+    facts = runtime.calls[-1][1]["acquisition_facts"]
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in facts
+    }["context-delivery"] == "unknown"
+    assert provider_allowed(state) is False
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=context,
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs={"source_a:not_returned"},
+    )
+    assert manifest["acquisition"]["source_references_returned"] == [
+        "source_a:record_1"
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == []
+    assert manifest["acquisition"]["context_delivery_status"] == "unknown"
+    assert "not_returned" not in json.dumps(manifest, sort_keys=True)
 
 
 @pytest.mark.asyncio
@@ -496,7 +673,7 @@ async def test_optional_limitation_allows_provider_and_is_disclosed_once():
     await evaluate_acquisition_sufficiency(
         state=state,
         runtime=runtime,
-        context_pack=validate_context_pack_response(_context_pack()),
+        context_pack=_validated_context_pack(),
         dsa_trace={"status": "success", "called": True},
         retained_source_refs={"source_a:record_1"},
         **SCOPE,
@@ -522,7 +699,7 @@ async def test_targeted_scope_overclaim_disclosure_is_bounded_and_idempotent():
     await evaluate_acquisition_sufficiency(
         state=state,
         runtime=runtime,
-        context_pack=validate_context_pack_response(_context_pack()),
+        context_pack=_validated_context_pack(),
         dsa_trace={"status": "success", "called": True},
         retained_source_refs={"source_a:record_1"},
         **SCOPE,
@@ -546,7 +723,7 @@ async def test_manifest_association_and_privacy_exclude_raw_content():
         external_context=None,
         **SCOPE,
     )
-    context = validate_context_pack_response(_context_pack())
+    context = _validated_context_pack()
     await evaluate_acquisition_sufficiency(
         state=state,
         runtime=runtime,

@@ -397,6 +397,12 @@ class DsaSourceDiagnostic(StrictModel):
     score_band: Identifier
     reasons: list[Identifier] = Field(max_length=8)
 
+    @model_validator(mode="after")
+    def validate_reasons(self) -> DsaSourceDiagnostic:
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("duplicate_source_diagnostic_reason")
+        return self
+
 
 class DsaDiagnostics(StrictModel):
     selection_mode: Identifier
@@ -406,6 +412,17 @@ class DsaDiagnostics(StrictModel):
     ranking_mode: Identifier
     candidate_counts_by_source: dict[Identifier, Annotated[int, Field(ge=0, le=10000)]]
     budget_truncated_candidates: bool
+
+    @model_validator(mode="after")
+    def validate_collections(self) -> DsaDiagnostics:
+        if len(set(self.considered_source_ids)) != len(self.considered_source_ids):
+            raise ValueError("duplicate_considered_source")
+        if len(set(self.selected_source_ids)) != len(self.selected_source_ids):
+            raise ValueError("duplicate_selected_source")
+        diagnostic_ids = [item.source_id for item in self.source_diagnostics]
+        if len(set(diagnostic_ids)) != len(diagnostic_ids):
+            raise ValueError("duplicate_source_diagnostic")
+        return self
 
 
 class DsaError(StrictModel):
@@ -719,9 +736,72 @@ async def begin_evidence_acquisition(
     return state
 
 
-def validate_context_pack_response(response: dict[str, Any]) -> dict[str, Any]:
+def validate_context_pack_response(
+    response: dict[str, Any],
+    *,
+    expected_query: str,
+    eligible_source_ids: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
     validated = DsaContextPackResponse.model_validate(response)
+    if validated.query != expected_query:
+        raise ValueError("context_pack_query_mismatch")
+    eligible_sources = set(eligible_source_ids)
+    sources_used = set(validated.sources_used)
+    for item in validated.items:
+        if item.source_id not in eligible_sources:
+            raise ValueError("context_item_source_not_eligible")
+        if item.source_id not in sources_used:
+            raise ValueError("context_item_source_not_used")
+    if not sources_used.issubset(eligible_sources):
+        raise ValueError("context_source_not_eligible")
+    if validated.diagnostics is not None:
+        considered_sources = set(validated.diagnostics.considered_source_ids)
+        selected_sources = set(validated.diagnostics.selected_source_ids)
+        if not considered_sources.issubset(eligible_sources):
+            raise ValueError("diagnostic_considered_source_not_eligible")
+        if not selected_sources.issubset(eligible_sources):
+            raise ValueError("diagnostic_selected_source_not_eligible")
+        if not selected_sources.issubset(considered_sources):
+            raise ValueError("diagnostic_selected_source_not_considered")
+        if selected_sources != sources_used:
+            raise ValueError("diagnostic_selected_source_mismatch")
+        if any(
+            item.source_id not in considered_sources
+            for item in validated.diagnostics.source_diagnostics
+        ):
+            raise ValueError("source_diagnostic_not_considered")
+        if not set(validated.diagnostics.candidate_counts_by_source).issubset(
+            selected_sources
+        ):
+            raise ValueError("candidate_count_source_not_selected")
     return validated.model_dump(mode="json")
+
+
+def _delivery_reference_state(
+    *,
+    context_pack: dict[str, Any] | None,
+    retained_source_refs: set[str] | None,
+) -> tuple[str, set[str], set[str]]:
+    items = (
+        context_pack.get("items")
+        if isinstance(context_pack, dict) and isinstance(context_pack.get("items"), list)
+        else []
+    )
+    returned_refs = {
+        item["source_ref"]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("source_ref"), str)
+    }
+    if retained_source_refs is None:
+        return "unknown", returned_refs, set()
+    retained_refs = returned_refs.intersection(retained_source_refs)
+    if retained_source_refs - returned_refs:
+        return "unknown", returned_refs, retained_refs
+    if retained_refs:
+        return "satisfied", returned_refs, retained_refs
+    if items and not retained_source_refs:
+        return "filtered", returned_refs, set()
+    return "unknown", returned_refs, set()
 
 
 def _build_acquisition_facts(
@@ -734,6 +814,10 @@ def _build_acquisition_facts(
     status = dsa_trace.get("status")
     error_code = dsa_trace.get("error_code")
     usable_count = len(context_pack.get("items", [])) if isinstance(context_pack, dict) else 0
+    delivery_outcome, _, _ = _delivery_reference_state(
+        context_pack=context_pack,
+        retained_source_refs=retained_source_refs,
+    )
     facts: list[dict[str, str]] = []
     for requirement in sorted(
         plan.declared_requirements,
@@ -747,12 +831,7 @@ def _build_acquisition_facts(
             else:
                 outcome = "unknown"
         elif requirement.requirement_kind == "context_delivery":
-            if usable_count and retained_source_refs:
-                outcome = "satisfied"
-            elif usable_count and retained_source_refs == set():
-                outcome = "filtered"
-            else:
-                outcome = "unknown"
+            outcome = delivery_outcome
         elif (
             requirement.requirement_kind == "selected_source_coverage"
             and requirement.criticality == "optional"
@@ -1026,15 +1105,13 @@ def build_manifest_trace(
         if isinstance(context_pack, dict) and isinstance(context_pack.get("items"), list)
         else []
     )
-    returned_refs = sorted(
-        {
-            item["source_ref"]
-            for item in items
-            if isinstance(item, dict) and isinstance(item.get("source_ref"), str)
-        }
+    delivery_outcome, returned_ref_set, retained_ref_set = _delivery_reference_state(
+        context_pack=context_pack,
+        retained_source_refs=retained_source_refs,
     )
-    retained_refs = sorted(retained_source_refs or [])
-    omitted_refs = sorted(set(returned_refs) - set(retained_refs))
+    returned_refs = sorted(returned_ref_set)
+    retained_refs = sorted(retained_ref_set)
+    omitted_refs = sorted(returned_ref_set - retained_ref_set)
     sources_used = sorted(
         context_pack.get("sources_used", [])
         if isinstance(context_pack, dict)
@@ -1123,9 +1200,9 @@ def build_manifest_trace(
             "candidate_truncation": bool(trace.get("candidate_truncated")),
             "context_delivery_status": (
                 "retained"
-                if retained_refs
+                if delivery_outcome == "satisfied"
                 else "filtered"
-                if items and retained_source_refs == set()
+                if delivery_outcome == "filtered"
                 else "unknown"
             ),
             "requirement_facts": sorted(

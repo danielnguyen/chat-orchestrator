@@ -6948,16 +6948,30 @@ async def orchestrate_chat(
                     evidence_acquisition.follow_existing_path
                     or evidence_acquisition.supported_targeted_path
                 ):
+                    governed_plan = (
+                        evidence_acquisition.plan
+                        if evidence_acquisition.supported_targeted_path
+                        else None
+                    )
+                    acquisition_query = (
+                        governed_plan.question_anchor
+                        if governed_plan is not None
+                        else last_user_text
+                    )
                     external_context_pack, dsa_trace = await _resolve_external_context(
                         dsa=dsa,
                         dsa_enabled=dsa_enabled,
                         external_context_enabled=external_context_enabled,
                         external_context=external_config,
                         external_calls_allowed=not local_only,
-                        query=last_user_text,
+                        query=acquisition_query,
                         response_validator=(
-                            validate_context_pack_response
-                            if evidence_acquisition.supported_targeted_path
+                            lambda response: validate_context_pack_response(
+                                response,
+                                expected_query=acquisition_query,
+                                eligible_source_ids=governed_plan.eligible_source_ids,
+                            )
+                            if governed_plan is not None
                             else None
                         ),
                     )

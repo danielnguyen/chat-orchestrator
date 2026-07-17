@@ -11351,6 +11351,7 @@ def _targeted_plan_response(
     strategy: str = "targeted_retrieval",
     optional: bool = False,
     task_shape: str = "targeted_lookup",
+    eligible_source_ids: list[str] | None = None,
 ) -> dict[str, object]:
     requirements = [
         {
@@ -11394,7 +11395,7 @@ def _targeted_plan_response(
                 else "targeted_scope"
             ),
             "contradiction_search_required": task_shape == "bounded_exhaustive_review",
-            "eligible_source_ids": ["vehicle_log_primary"],
+            "eligible_source_ids": eligible_source_ids or ["vehicle_log_primary"],
             "authoritative_source_ids": [],
             "selected_strategies": [strategy] if strategy else [],
             "declared_requirements": requirements,
@@ -11441,12 +11442,104 @@ def _derived_shape_response(
     }
 
 
+async def _run_governed_context_case(
+    *,
+    tmp_path,
+    response: dict[str, object],
+    request_id: str,
+    eligible_source_ids: list[str] | None = None,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime(
+        evidence_plan_response=(
+            _targeted_plan_response(
+                request_id=request_id,
+                question=question,
+                eligible_source_ids=eligible_source_ids,
+            )
+            if eligible_source_ids is not None
+            else None
+        )
+    )
+    dsa = FakeDSA(response=response)
+    if eligible_source_ids and "vehicle_log_secondary" in eligible_source_ids:
+        dsa.source_response["sources"].append(
+            {
+                "source_id": "vehicle_log_secondary",
+                "display_name": "Secondary Vehicle Log",
+                "connector": "neutral_connector",
+                "domain_tags": ["vehicle", "maintenance"],
+                "sensitivity": "medium",
+                "access_mode": "read_only",
+                "capabilities": ["profile", "search"],
+                "enabled": True,
+                "status": "ready",
+                "last_checked_at": "2026-07-17T00:00:00Z",
+                "last_error": None,
+            }
+        )
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return out, runtime, dsa, litellm, memory_store
+
+
+def _assert_governed_context_rejected(
+    *,
+    out,
+    runtime,
+    dsa,
+    litellm,
+    memory_store,
+    prohibited_text: str | None = None,
+):
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.calls) == 1
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "filtered"},
+    ]
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["acquisition"]["dsa_outcome"] == "error"
+    assert manifest["acquisition"]["dsa_error_codes"] == ["malformed_response"]
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_references_returned",
+        "source_references_retained",
+    ):
+        assert manifest["acquisition"][field] == []
+    if prohibited_text is not None:
+        assert prohibited_text not in json.dumps(trace, sort_keys=True)
+
+
 @pytest.mark.asyncio
 async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_manifest(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
+    user_text = "Verify   the maintenance record."
 
     class OrderedDsa(FakeDSA):
         async def list_sources(self):
@@ -11469,7 +11562,7 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
-            "Verify the maintenance record.",
+            user_text,
             external_context_enabled=True,
         ),
         memory_store=memory_store,
@@ -11491,6 +11584,7 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert len(runtime.evidence_sufficiency_calls) == 1
     assert len(dsa.list_calls) == 1
     assert len(dsa.calls) == 1
+    assert dsa.calls[0]["query"] == "Verify the maintenance record."
     assert len(litellm.calls) == 1
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
         "evidence_shape"
@@ -11530,6 +11624,16 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert manifest["acquisition"]["source_references_retained"] == [
         "vehicle_log_primary:record_1"
     ]
+    eligible_sources = {"vehicle_log_primary"}
+    assert set(manifest["acquisition"]["sources_considered"]).issubset(
+        eligible_sources
+    )
+    assert manifest["acquisition"]["sources_selected"] == manifest["acquisition"][
+        "sources_used"
+    ]
+    assert set(manifest["acquisition"]["source_references_retained"]).issubset(
+        manifest["acquisition"]["source_references_returned"]
+    )
     serialized = json.dumps(manifest, sort_keys=True)
     assert "The maintenance record lists" not in serialized
     assert "PRIVATE SOURCE" not in serialized
@@ -11544,6 +11648,8 @@ async def test_evidence_acquisition_no_result_withholds_without_provider(tmp_pat
     empty["sources_used"] = []
     empty["budget"]["returned_results"] = 0
     empty["budget"]["estimated_bytes"] = 0
+    empty["diagnostics"]["selected_source_ids"] = []
+    empty["diagnostics"]["candidate_counts_by_source"] = {}
     dsa = FakeDSA(response=empty)
     litellm = FakeLiteLLM()
 
@@ -11978,6 +12084,131 @@ async def test_evidence_acquisition_malformed_context_is_filtered_and_withheld(
 
 
 @pytest.mark.asyncio
+async def test_evidence_acquisition_rejects_unrelated_context_query(tmp_path):
+    unrelated_query = "UNRELATED QUERY SENTINEL"
+    response = _governed_context_pack(unrelated_query)
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=response,
+        request_id="rid-evidence-query-mismatch",
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+        prohibited_text=unrelated_query,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "association_case",
+    [
+        "source-used-outside-plan",
+        "item-source-not-used",
+        "item-source-outside-plan",
+    ],
+)
+async def test_evidence_acquisition_rejects_source_association_mismatch(
+    tmp_path,
+    association_case,
+):
+    response = _governed_context_pack("Verify the maintenance record.")
+    eligible_source_ids = None
+    if association_case == "source-used-outside-plan":
+        response["items"] = []
+        response["sources_used"] = ["vehicle_log_outside"]
+        response["diagnostics"] = None
+    elif association_case == "item-source-not-used":
+        response["items"][0]["source_id"] = "vehicle_log_secondary"
+        eligible_source_ids = [
+            "vehicle_log_primary",
+            "vehicle_log_secondary",
+        ]
+    else:
+        response["items"][0]["source_id"] = "vehicle_log_outside"
+        response["sources_used"] = ["vehicle_log_outside"]
+        response["diagnostics"] = None
+
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=response,
+        request_id=f"rid-evidence-{association_case}",
+        eligible_source_ids=eligible_source_ids,
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "diagnostic_case",
+    [
+        "considered-outside-plan",
+        "selected-not-considered",
+        "selected-differs-from-used",
+        "source-diagnostic-not-considered",
+        "candidate-count-not-selected",
+    ],
+)
+async def test_evidence_acquisition_rejects_diagnostic_association_mismatch(
+    tmp_path,
+    diagnostic_case,
+):
+    response = _governed_context_pack("Verify the maintenance record.")
+    diagnostics = response["diagnostics"]
+    eligible_source_ids = ["vehicle_log_primary", "vehicle_log_secondary"]
+    if diagnostic_case == "considered-outside-plan":
+        diagnostics["considered_source_ids"] = ["vehicle_log_outside"]
+        eligible_source_ids = None
+    elif diagnostic_case == "selected-not-considered":
+        diagnostics["considered_source_ids"] = []
+    elif diagnostic_case == "selected-differs-from-used":
+        diagnostics["selected_source_ids"] = ["vehicle_log_secondary"]
+        diagnostics["considered_source_ids"] = [
+            "vehicle_log_primary",
+            "vehicle_log_secondary",
+        ]
+    elif diagnostic_case == "source-diagnostic-not-considered":
+        diagnostics["source_diagnostics"] = [
+            {
+                "source_id": "vehicle_log_secondary",
+                "score": 1,
+                "score_band": "eligible",
+                "reasons": ["bounded_match"],
+            }
+        ]
+    else:
+        diagnostics["candidate_counts_by_source"] = {
+            "vehicle_log_secondary": 1
+        }
+
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=response,
+        request_id=f"rid-evidence-{diagnostic_case}",
+        eligible_source_ids=eligible_source_ids,
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+    )
+
+
+@pytest.mark.asyncio
 async def test_evidence_acquisition_prompt_filtered_context_cannot_satisfy_delivery(
     tmp_path,
     monkeypatch,
@@ -12041,6 +12272,74 @@ async def test_evidence_acquisition_prompt_filtered_context_cannot_satisfy_deliv
         {"requirement_id": "context-delivery", "outcome": "filtered"},
         {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        response=_governed_context_pack("Verify the maintenance record.")
+    )
+    litellm = FakeLiteLLM()
+    memory_store = FakeMemoryStore()
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def mismatched_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["metadata"]["source_refs"] = [
+                    "vehicle_log_primary:not_returned"
+                ]
+        return replace(prompt, trace=trace)
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        mismatched_assemble_prompt,
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-prompt-reference-mismatch",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert litellm.calls == []
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "unknown"},
+        {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
+    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["source_references_returned"] == [
+        "vehicle_log_primary:record_1"
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == []
+    assert manifest["acquisition"]["context_delivery_status"] == "unknown"
+    assert "not_returned" not in json.dumps(manifest, sort_keys=True)
 
 
 @pytest.mark.asyncio
