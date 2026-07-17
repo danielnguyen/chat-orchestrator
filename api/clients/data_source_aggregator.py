@@ -71,3 +71,24 @@ class DataSourceAggregatorClient:
                 },
             },
         )
+
+    async def fetch_source(
+        self,
+        *,
+        source_ref: str,
+        include_raw: bool = False,
+        budget: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/sources/fetch",
+            json={
+                "source_ref": source_ref,
+                "include_raw": include_raw,
+                "budget": budget
+                or {
+                    "max_results": 1,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+            },
+        )

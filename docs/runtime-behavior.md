@@ -124,11 +124,25 @@ shape, reads the governed DSA source inventory, adapts the neutral source
 capabilities, and asks Cognitive Runtime to compile an evidence plan. The initial
 execution boundary proceeds only for a derived `targeted_lookup` whose plan is
 ready (possibly with optional limitations) and whose only selected strategy is
-`targeted_retrieval`.
+either `targeted_retrieval` or `exact_fetch`.
 
-That supported path calls the existing DSA context-pack operation once. After
-prompt assembly, Chat Orchestrator reports requirement outcomes based on what was
-actually acquired and what external context survived into provider reasoning.
+Source IDs narrow semantic retrieval to governed source registries. They do not
+identify exact items and continue to use one DSA context-pack call. The optional
+structured `external_context.exact_source_refs` collection instead identifies
+individual opaque records, each associated with a source ID. Exact references
+require explicit external-context opt-in. A supported exact plan makes one
+bounded DSA fetch call per normalized reference, requests no raw connector data,
+attempts every declared reference without retry, and never falls back to
+semantic search. Every response must match the declared source ID and exact
+reference.
+
+After prompt assembly, Chat Orchestrator reports requirement outcomes based on
+what was actually acquired and what external context survived into provider
+reasoning.
+For exact fetch, every declared reference must return a valid untruncated result,
+and every returned reference must survive in the final provider prompt. Partial,
+missing, malformed, failed, truncated, or prompt-filtered exact coverage cannot
+authorize a provider conclusion.
 Cognitive Runtime evaluates those facts. An insufficient or unknown result
 withholds an unsupported conclusion without calling the provider. A sufficient
 result permits the existing single provider path; an optional limitation adds a
@@ -140,20 +154,24 @@ status, or answer constraints.
 The final request trace retains a bounded `prompt.evidence_acquisition` manifest.
 It records structural shape, inventory, plan, acquisition, delivery, sufficiency,
 and limitation outcomes; the exact persisted assistant-message identifier; and a
-digest of the final user-visible answer. It does not retain the question text,
+digest of the final user-visible answer. Exact manifests distinguish attempted,
+returned, retained, omitted, and unsuccessful references and retain only bounded
+attempt counts and outcomes. They do not copy fetch response bodies. The manifest
+does not retain the question text,
 source text, source titles or descriptions, provider output, credentials, raw
 dependency errors, confidence values, prompts, or hidden reasoning. Existing
-privacy suppression removes source identifiers while retaining counts and
-statuses.
+privacy suppression removes source and exact-reference identifiers while
+retaining counts and statuses.
 
 Ambiguous evidence tasks and unsupported plans or strategies return bounded,
 provider-free responses. A `not_applicable` result continues through the existing
 chat and optional DSA behavior. Briefs, capability and action flows, pending-action
-continuations, and claim-explanation follow-ups remain outside this initial path.
-Exact fetch, bounded full context, structured queries, hybrid acquisition, and
-execution of exhaustive, absence-sensitive, contradiction, historical,
-comparison, or recommendation plans are not implemented here. The public chat
-request and response fields are unchanged.
+continuations, and claim-explanation follow-ups remain outside governed execution;
+an exact-reference request at one of those boundaries fails closed instead of
+entering a legacy path. Bounded full context, structured queries, hybrid
+acquisition, and execution of exhaustive, absence-sensitive, contradiction,
+historical, comparison, or recommendation plans are not implemented here.
+The public chat response fields are unchanged.
 
 ## Prompt assembly and routing
 
