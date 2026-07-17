@@ -184,7 +184,7 @@ retain only bounded association status and whether a link was established; they
 do not duplicate the manifest identifier or body. Ordinary non-evidence claims
 continue to use the legacy unlinked payload. This association does not expand the
 current single-sentence, single-file claim-capture boundary, infer which external
-item a provider used, or add acquisition-history explanation.
+item a provider used, or treat every acquired item as claim support.
 
 Ambiguous evidence tasks and unsupported plans or strategies return bounded,
 provider-free responses. A `not_applicable` result continues through the existing
@@ -264,6 +264,46 @@ limitations. Opaque record and source identifiers, target text, and private reco
 content are not copied into traces or explanations. Malformed targets and missing,
 ambiguous, incomplete, unsupported, or unavailable records produce an honest
 deterministic fallback. No explanation performs fresh verification.
+
+Linked claim records also support a separate, provider-free acquisition-history
+explanation. The exact immediate-prior forms are `What did you check?`, `What did
+you examine?`, `Did you look at everything relevant?`, `What might you have
+missed?`, and `What did you not check?`. An older retained claim can be targeted
+with the exact straight-double-quoted forms `What did you check for the statement
+"<exact retained claim anchor>"?`, `What did you examine for the statement
+"<exact retained claim anchor>"?`, `Did you look at everything relevant for the
+statement "<exact retained claim anchor>"?`, and `What might you have missed for
+the statement "<exact retained claim anchor>"?`. The same bounded whitespace,
+punctuation, target-length, and exact-match rules apply. Additional instructions,
+topical additions, malformed quoting, and combined re-verification requests are
+not intercepted.
+
+After deterministic claim selection, Chat Orchestrator performs exactly one
+lookup of the linked request trace. It requires matching request, owner,
+conversation, surface, manifest, assistant-message, and answer-digest
+associations; attempted acquisition; a ready plan; and matching sufficient
+top-level and nested outcomes. Support explanations such as `How are you sure?`
+remain support-focused and do not load the acquisition trace merely because a
+claim has a manifest link.
+
+Successful acquisition explanations render only the retained bounded method,
+aggregate considered, selected, returned, delivered, omitted, unsuccessful, and
+truncation counts, declared-scope sufficiency, and non-universal coverage
+boundary. Targeted lookup is described as targeted rather than exhaustive.
+Exact fetch is limited to the supplied exact-reference scope. Coverage questions
+begin with a direct non-universal answer, and gap questions describe only
+recorded structural limitations plus the fact that unknown evidence outside the
+declared scope cannot be identified. Privacy-suppressed manifests use retained
+aggregate counts without reconstructing identifiers.
+
+This historical path performs no provider call, memory retrieval, DSA inventory
+or acquisition, Cognitive Runtime evidence planning, or new verification. It
+never exposes source IDs or references, source names or titles, content, URLs,
+prompts, credentials, model-call data, dependency exceptions, or hidden
+reasoning. Missing links, unavailable traces, mismatched records, malformed
+manifests, and ambiguous or missing targets return bounded degraded explanations
+instead of reconstructing history from model memory. It does not implement a
+combined explanation-and-recheck flow and never claims universal completeness.
 
 ## Integration boundaries
 

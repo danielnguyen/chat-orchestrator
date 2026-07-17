@@ -6485,6 +6485,7 @@ async def orchestrate_chat(
             memory_store=memory_store,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
+            surface=surface,
         )
         if claim_explanation.handled and not exact_reference_request:
             answer = claim_explanation.answer or ""
