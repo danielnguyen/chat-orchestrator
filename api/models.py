@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+import re
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 Role = Literal["user", "assistant", "system", "tool"]
 BriefType = Literal[
@@ -86,14 +94,61 @@ class SurfaceContext(BaseModel):
     style_envelope: StyleEnvelopeOverride = Field(default_factory=StyleEnvelopeOverride)
 
 
+EvidenceIdentifier = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
+
+
+class ExactSourceReferenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: EvidenceIdentifier
+    source_ref: str = Field(min_length=1, max_length=240)
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_opaque_source_ref(cls, value: str) -> str:
+        if re.search(r"\s|://|\?", value):
+            raise ValueError("unsafe_source_reference")
+        return value
+
+
 class ExternalContextRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: Optional[bool] = None
     source_ids: Optional[List[str]] = None
+    exact_source_refs: Optional[List[ExactSourceReferenceRequest]] = Field(
+        default=None,
+        max_length=16,
+    )
     domain_tags: Optional[List[str]] = None
     allowed_sensitivity: Optional[str] = None
     max_results: Optional[int] = Field(default=None, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def validate_exact_source_refs(self) -> "ExternalContextRequest":
+        references = self.exact_source_refs or []
+        source_refs = [item.source_ref for item in references]
+        if len(set(source_refs)) != len(source_refs):
+            raise ValueError("duplicate_exact_source_reference")
+        if self.source_ids:
+            declared_source_ids = set(self.source_ids)
+            if any(item.source_id not in declared_source_ids for item in references):
+                raise ValueError("exact_source_reference_source_mismatch")
+        return self
+
+    @model_serializer(mode="wrap")
+    def omit_absent_exact_source_refs(self, handler):
+        serialized = handler(self)
+        if self.exact_source_refs is None:
+            serialized.pop("exact_source_refs", None)
+        return serialized
 
 
 class PendingActionEnvelope(BaseModel):
@@ -138,6 +193,16 @@ class ChatRequest(BaseModel):
     brief_type: BriefType = "general"
     interrupt_policy_mode: InterruptPolicyMode = "off"
     capability_confirmation: Optional[CapabilityConfirmationInput] = None
+
+    @model_validator(mode="after")
+    def validate_exact_reference_opt_in(self) -> "ChatRequest":
+        if self.external_context and self.external_context.exact_source_refs:
+            if (
+                not self.external_context_enabled
+                or self.external_context.enabled is False
+            ):
+                raise ValueError("exact_source_reference_requires_external_context")
+        return self
 
 
 class ChatResponse(BaseModel):

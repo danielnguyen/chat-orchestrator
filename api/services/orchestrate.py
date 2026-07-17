@@ -54,6 +54,8 @@ from services.evidence_acquisition import (
     disabled_evidence_trace,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
+    execute_exact_fetches,
+    ineligible_exact_evidence_state,
     provider_allowed,
     suppress_manifest_identifiers,
     validate_context_pack_response,
@@ -4299,6 +4301,26 @@ def _normalize_external_context_config(
         if cleaned_source_ids:
             normalized["source_ids"] = cleaned_source_ids
 
+    exact_source_refs = external_context.get("exact_source_refs")
+    if isinstance(exact_source_refs, list):
+        cleaned_exact_source_refs = sorted(
+            [
+                {
+                    "source_id": item["source_id"],
+                    "source_ref": item["source_ref"],
+                }
+                for item in exact_source_refs
+                if isinstance(item, dict)
+                and isinstance(item.get("source_id"), str)
+                and item.get("source_id")
+                and isinstance(item.get("source_ref"), str)
+                and item.get("source_ref")
+            ],
+            key=lambda item: (item["source_id"], item["source_ref"]),
+        )
+        if cleaned_exact_source_refs:
+            normalized["exact_source_refs"] = cleaned_exact_source_refs
+
     domain_tags = external_context.get("domain_tags")
     if isinstance(domain_tags, list):
         cleaned_domain_tags = [item for item in domain_tags if isinstance(item, str) and item]
@@ -6440,6 +6462,14 @@ async def orchestrate_chat(
         isinstance(external_context_request, dict)
         and external_context_request.get("enabled") is True
     )
+    normalized_external_config = _normalize_external_context_config(
+        external_context_request
+        if isinstance(external_context_request, dict)
+        else None
+    )
+    exact_reference_request = bool(
+        normalized_external_config.get("exact_source_refs")
+    )
     memory_hygiene_result = None
     privacy_context = None
     privacy_context_trace = _privacy_context_disabled_trace()
@@ -6455,7 +6485,7 @@ async def orchestrate_chat(
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
         )
-        if claim_explanation.handled:
+        if claim_explanation.handled and not exact_reference_request:
             answer = claim_explanation.answer or ""
             status = claim_explanation.status or "degraded"
             await _advance_runtime_turn(
@@ -6714,7 +6744,7 @@ async def orchestrate_chat(
             if isinstance(interaction_governance, dict)
             else None
         )
-        evidence_path_deferred = bool(
+        governed_evidence_eligible = bool(
             evidence_acquisition_enabled
             and dsa_enabled
             and external_context_enabled
@@ -6730,12 +6760,8 @@ async def orchestrate_chat(
             and isinstance(interaction_kind, str)
             and interaction_governance_trace.get("included") is True
         )
+        evidence_path_deferred = exact_reference_request or governed_evidence_eligible
         if evidence_path_deferred:
-            normalized_external_config = _normalize_external_context_config(
-                external_context_request
-                if isinstance(external_context_request, dict)
-                else None
-            )
             external_context_pack = None
             dsa_trace = {
                 **_build_dsa_trace_base(
@@ -6921,7 +6947,33 @@ async def orchestrate_chat(
                 if isinstance(external_context_request, dict)
                 else None
             )
-            if isinstance(matched_capability_id, str):
+            if exact_reference_request and (
+                not governed_evidence_eligible
+                or isinstance(matched_capability_id, str)
+            ):
+                evidence_acquisition = ineligible_exact_evidence_state(
+                    enabled=evidence_acquisition_enabled,
+                    reason=(
+                        "capability_path_ineligible"
+                        if isinstance(matched_capability_id, str)
+                        else "ineligible_exact_request"
+                    ),
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_id,
+                    runtime_turn_id=runtime_turn_id,
+                    external_context=external_config,
+                )
+                external_context_pack = None
+                dsa_trace = {
+                    **dsa_trace,
+                    "called": False,
+                    "status": "not_called",
+                    "reason": evidence_acquisition.status,
+                }
+            elif isinstance(matched_capability_id, str):
                 external_context_pack, dsa_trace = await _resolve_external_context(
                     dsa=dsa,
                     dsa_enabled=dsa_enabled,
@@ -6946,37 +6998,45 @@ async def orchestrate_chat(
                 )
                 if (
                     evidence_acquisition.follow_existing_path
-                    or evidence_acquisition.supported_targeted_path
+                    or evidence_acquisition.supported_governed_path
                 ):
-                    governed_plan = (
-                        evidence_acquisition.plan
-                        if evidence_acquisition.supported_targeted_path
-                        else None
-                    )
-                    acquisition_query = (
-                        governed_plan.question_anchor
-                        if governed_plan is not None
-                        else last_user_text
-                    )
-                    external_context_pack, dsa_trace = await _resolve_external_context(
-                        dsa=dsa,
-                        dsa_enabled=dsa_enabled,
-                        external_context_enabled=external_context_enabled,
-                        external_context=external_config,
-                        external_calls_allowed=not local_only,
-                        query=acquisition_query,
-                        response_validator=(
-                            (
-                                lambda response: validate_context_pack_response(
-                                    response,
-                                    expected_query=acquisition_query,
-                                    eligible_source_ids=governed_plan.eligible_source_ids,
-                                )
-                            )
-                            if governed_plan is not None
+                    if evidence_acquisition.supported_exact_path:
+                        external_context_pack, dsa_trace = await execute_exact_fetches(
+                            state=evidence_acquisition,
+                            dsa=dsa,
+                        )
+                    else:
+                        governed_plan = (
+                            evidence_acquisition.plan
+                            if evidence_acquisition.supported_targeted_path
                             else None
-                        ),
-                    )
+                        )
+                        acquisition_query = (
+                            governed_plan.question_anchor
+                            if governed_plan is not None
+                            else last_user_text
+                        )
+                        external_context_pack, dsa_trace = await _resolve_external_context(
+                            dsa=dsa,
+                            dsa_enabled=dsa_enabled,
+                            external_context_enabled=external_context_enabled,
+                            external_context=external_config,
+                            external_calls_allowed=not local_only,
+                            query=acquisition_query,
+                            response_validator=(
+                                (
+                                    lambda response: validate_context_pack_response(
+                                        response,
+                                        expected_query=acquisition_query,
+                                        eligible_source_ids=(
+                                            governed_plan.eligible_source_ids
+                                        ),
+                                    )
+                                )
+                                if governed_plan is not None
+                                else None
+                            )
+                        )
                 else:
                     external_context_pack = None
                     dsa_trace = {
@@ -7052,7 +7112,15 @@ async def orchestrate_chat(
         selected_model = route["selected_model"]
         selected_provider = _model_provider(selected_model, registry, route.get("provider"))
 
-        if local_only and selected_provider != "local":
+        if (
+            local_only
+            and selected_provider != "local"
+            and not (
+                exact_reference_request
+                and evidence_acquisition is not None
+                and evidence_acquisition.forced_answer is not None
+            )
+        ):
             local_candidate = _policy_pick_model(
                 registry,
                 provider="local",
@@ -7299,7 +7367,7 @@ async def orchestrate_chat(
             }
             if (
                 evidence_acquisition is not None
-                and evidence_acquisition.supported_targeted_path
+                and evidence_acquisition.supported_governed_path
             ):
                 prompt = PromptAssembly(messages=[], trace=budget_prompt_trace)
             else:

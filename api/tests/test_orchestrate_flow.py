@@ -1405,9 +1405,11 @@ class FakeDSA:
         error: Exception | None = None,
         source_response=None,
         source_error: Exception | None = None,
+        fetch_responses=None,
     ):
         self.calls = []
         self.list_calls = []
+        self.fetch_calls = []
         self.response = response or {"sources_used": [], "items": []}
         self.error = error
         self.source_response = source_response or {
@@ -1428,6 +1430,7 @@ class FakeDSA:
             ]
         }
         self.source_error = source_error
+        self.fetch_responses = list(fetch_responses or [])
 
     async def list_sources(self):
         self.list_calls.append({})
@@ -1440,6 +1443,13 @@ class FakeDSA:
         if self.error is not None:
             raise self.error
         return self.response
+
+    async def fetch_source(self, **kwargs):
+        self.fetch_calls.append(kwargs)
+        response = self.fetch_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _http_status_error(
@@ -11343,6 +11353,54 @@ def _governed_context_pack(query: str) -> dict[str, object]:
     }
 
 
+def _exact_fetch_response(
+    *,
+    source_id: str = "vehicle_log_primary",
+    source_ref: str = "neutral_connector:vehicle_log_primary:record_1",
+    result: bool = True,
+    truncated: bool = False,
+) -> dict[str, object]:
+    results = (
+        [
+            {
+                "result_id": f"exact-result-{source_id}",
+                "source_type": "neutral_connector",
+                "source_id": source_id,
+                "source_name": "PRIVATE EXACT SOURCE",
+                "source_ref": source_ref,
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": "PRIVATE EXACT TITLE",
+                "content_type": "text",
+                "text": "The exact maintenance item lists 2025-07-12.",
+                "url": "https://private.invalid/exact",
+                "confidence": "high",
+                "raw": None,
+                "available_context": [],
+                "warnings": [],
+            }
+        ]
+        if result
+        else []
+    )
+    return {
+        "query_id": f"query-{source_id}",
+        "answerable": bool(results),
+        "confidence": "low" if results else "none",
+        "retrieval_mode": "fetch",
+        "results": results,
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": 1,
+            "returned_results": len(results),
+            "estimated_bytes": 80 if results else 0,
+            "truncated": truncated,
+        },
+    }
+
+
 def _targeted_plan_response(
     *,
     request_id: str,
@@ -11404,6 +11462,48 @@ def _targeted_plan_response(
             ),
             "user_safe_summary": "A bounded strategy result.",
         },
+    }
+
+
+def _exact_plan_response(
+    *,
+    request_id: str,
+    question: str,
+    eligible_source_ids: list[str] | None = None,
+    authoritative_source_ids: list[str] | None = None,
+    strategy: str = "exact_fetch",
+) -> dict[str, object]:
+    response = _targeted_plan_response(
+        request_id=request_id,
+        question=question,
+        strategy=strategy,
+        eligible_source_ids=eligible_source_ids,
+    )
+    authoritative_source_ids = authoritative_source_ids or []
+    response["result"]["authoritative_source_ids"] = authoritative_source_ids
+    if authoritative_source_ids:
+        response["result"]["declared_requirements"].append(
+            {
+                "requirement_id": "exact-authoritative-fetch",
+                "requirement_kind": "exact_authoritative_fetch",
+                "criticality": "material",
+            }
+        )
+    return response
+
+
+def _exact_external_context(
+    references=None,
+) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "exact_source_refs": references
+        or [
+            {
+                "source_id": "vehicle_log_primary",
+                "source_ref": "neutral_connector:vehicle_log_primary:record_1",
+            }
+        ],
     }
 
 
@@ -12423,6 +12523,467 @@ async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_pr
         manifest,
         sort_keys=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_manifest(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "rid-exact-evidence-success"
+    question = "Verify this exact maintenance record."
+    runtime = FakeRuntime(
+        evidence_plan_response=_exact_plan_response(
+            request_id=request_id,
+            question=question,
+        )
+    )
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"] = ["profile", "search", "fetch"]
+    litellm = FakeLiteLLM(content="The exact record gives the date.")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context=_exact_external_context(),
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == "The exact record gives the date."
+    assert dsa.calls == []
+    assert len(dsa.fetch_calls) == 1
+    assert dsa.fetch_calls[0] == {
+        "source_ref": "neutral_connector:vehicle_log_primary:record_1",
+        "include_raw": False,
+        "budget": {
+            "max_results": 1,
+            "max_bytes": 50000,
+            "max_text_chars": 12000,
+        },
+    }
+    assert len(litellm.calls) == 1
+    assert "The exact maintenance item lists 2025-07-12." in json.dumps(
+        litellm.calls[0]["messages"],
+        sort_keys=True,
+    )
+    assert runtime.evidence_shape_calls[0]["task_context"][
+        "evidence_input_kinds"
+    ] == ["external_source"]
+    assert runtime.evidence_shape_calls[0]["task_context"][
+        "external_verification_required"
+    ] is True
+    assert runtime.evidence_plan_calls[0]["declared_scope"][
+        "exact_source_refs"
+    ] == [
+        {
+            "source_id": "vehicle_log_primary",
+            "source_ref": "neutral_connector:vehicle_log_primary:record_1",
+        }
+    ]
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "context-delivery", "outcome": "satisfied"},
+        {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
+    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["strategy_attempted"] == "exact_fetch"
+    assert manifest["acquisition"]["exact_reference_attempt_count"] == 1
+    assert manifest["acquisition"]["exact_reference_successful_count"] == 1
+    assert manifest["acquisition"]["source_references_attempted"] == [
+        "neutral_connector:vehicle_log_primary:record_1"
+    ]
+    assert manifest["acquisition"]["exact_reference_attempts"] == [
+        {
+            "source_id": "vehicle_log_primary",
+            "source_ref": "neutral_connector:vehicle_log_primary:record_1",
+            "outcome": "satisfied",
+        }
+    ]
+    assert manifest["acquisition"]["source_references_returned"] == (
+        manifest["acquisition"]["source_references_retained"]
+    )
+    assert manifest["assistant_message_id"] == "m-1"
+    assert manifest["response_digest"] == (
+        f"sha256:{hashlib.sha256(out['answer'].encode()).hexdigest()}"
+    )
+    serialized = json.dumps(manifest, sort_keys=True)
+    for prohibited in (
+        "PRIVATE EXACT SOURCE",
+        "PRIVATE EXACT TITLE",
+        "The exact maintenance item",
+        "https://private.invalid",
+        '"confidence"',
+    ):
+        assert prohibited not in serialized
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_source_id_scope_still_uses_targeted_retrieval(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM(content="The targeted record gives the date.")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context={
+                "enabled": True,
+                "source_ids": ["vehicle_log_primary"],
+            },
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-targeted-source-id-regression",
+    )
+
+    assert out["answer"] == "The targeted record gives the date."
+    assert dsa.fetch_calls == []
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["source_ids"] == ["vehicle_log_primary"]
+    assert len(litellm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_exact_fetch_provider_cannot_rewrite_history(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "rid-exact-provider-overclaim"
+    question = "Verify this exact maintenance record."
+    runtime = FakeRuntime(
+        evidence_plan_response=_exact_plan_response(
+            request_id=request_id,
+            question=question,
+        )
+    )
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"] = ["fetch"]
+    memory_store = FakeMemoryStore()
+    provider_claim = (
+        "I checked all sources, including malicious:source:item, and nothing was found."
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context=_exact_external_context(),
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content=provider_claim),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"].count(
+        "This reflects only the targeted sources checked, not a complete search "
+        "of every possible source."
+    ) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["source_references_attempted"] == [
+        "neutral_connector:vehicle_log_primary:record_1"
+    ]
+    assert "malicious:source:item" not in json.dumps(manifest, sort_keys=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_mutation", "expected_outcome"),
+    [
+        ("wrong-source", "filtered"),
+        ("wrong-reference", "filtered"),
+        ("raw-data", "filtered"),
+        ("answerability", "filtered"),
+        ("result-count", "filtered"),
+        ("wrong-mode", "filtered"),
+        ("unknown-field", "filtered"),
+        ("no-result", "unknown"),
+        ("truncated", "truncated"),
+        ("timeout", "failed"),
+    ],
+)
+async def test_evidence_acquisition_exact_fetch_failures_withhold_without_fallback(
+    tmp_path,
+    response_mutation,
+    expected_outcome,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = f"rid-exact-{response_mutation}"
+    question = "Verify this exact maintenance record."
+    response = _exact_fetch_response()
+    if response_mutation == "wrong-source":
+        response["results"][0]["source_id"] = "vehicle_log_secondary"
+    elif response_mutation == "wrong-reference":
+        response["results"][0]["source_ref"] = (
+            "neutral_connector:vehicle_log_primary:record-other"
+        )
+    elif response_mutation == "raw-data":
+        response["results"][0]["raw"] = {"private": "PRIVATE RAW"}
+    elif response_mutation == "answerability":
+        response["answerable"] = False
+    elif response_mutation == "result-count":
+        response["budget"]["returned_results"] = 0
+    elif response_mutation == "wrong-mode":
+        response["retrieval_mode"] = "search"
+    elif response_mutation == "unknown-field":
+        response["metadata"] = {"private": "PRIVATE METADATA"}
+    elif response_mutation == "no-result":
+        response = _exact_fetch_response(result=False)
+    elif response_mutation == "truncated":
+        response = _exact_fetch_response(truncated=True)
+    else:
+        response = httpx.ReadTimeout("PRIVATE TIMEOUT")
+    runtime = FakeRuntime(
+        evidence_plan_response=_exact_plan_response(
+            request_id=request_id,
+            question=question,
+        )
+    )
+    dsa = FakeDSA(fetch_responses=[response])
+    dsa.source_response["sources"][0]["capabilities"] = ["fetch"]
+    litellm = FakeLiteLLM()
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context=_exact_external_context(),
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.fetch_calls) == 1
+    assert dsa.calls == []
+    assert litellm.calls == []
+    facts = {
+        item["requirement_id"]: item["outcome"]
+        for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["targeted-evidence"] == expected_outcome
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["source_references_returned"] == []
+    assert manifest["acquisition"]["source_references_retained"] == []
+    assert "PRIVATE" not in json.dumps(manifest, sort_keys=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "feature-disabled",
+        "governance-disabled",
+        "local-only",
+        "brief",
+        "not-applicable",
+        "ambiguous",
+        "targeted-plan",
+        "unrelated-plan-source",
+    ],
+)
+async def test_evidence_acquisition_exact_fetch_ineligible_paths_fail_closed(
+    tmp_path,
+    case,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = f"rid-exact-ineligible-{case}"
+    question = "Verify this exact maintenance record."
+    plan = _exact_plan_response(request_id=request_id, question=question)
+    shape = None
+    evidence_enabled = True
+    governance_enabled = True
+    sensitivity = "private"
+    response_mode = "normal"
+    if case == "feature-disabled":
+        evidence_enabled = False
+    elif case == "governance-disabled":
+        governance_enabled = False
+    elif case == "local-only":
+        sensitivity = "local_only"
+    elif case == "brief":
+        response_mode = "brief"
+    elif case == "not-applicable":
+        shape = {
+            **_derived_shape_response(
+                request_id=request_id,
+                question=question,
+                task_shape="targeted_lookup",
+            ),
+        }
+        shape["result"].update(
+            {
+                "derivation_status": "not_applicable",
+                "task_shape": None,
+                "candidate_task_shapes": [],
+                "evidence_scope_material": False,
+                "reason_codes": ["ordinary_chat_without_material_evidence_scope"],
+            }
+        )
+    elif case == "ambiguous":
+        shape = {
+            **_derived_shape_response(
+                request_id=request_id,
+                question=question,
+                task_shape="targeted_lookup",
+            ),
+        }
+        shape["result"].update(
+            {
+                "derivation_status": "ambiguous",
+                "task_shape": None,
+                "candidate_task_shapes": [
+                    "targeted_lookup",
+                    "historical_reconstruction",
+                ],
+                "evidence_scope_material": True,
+                "clarification_required": True,
+                "reason_codes": ["multiple_incompatible_shapes"],
+            }
+        )
+    elif case == "targeted-plan":
+        plan = _targeted_plan_response(
+            request_id=request_id,
+            question=question,
+        )
+    elif case == "unrelated-plan-source":
+        plan = _exact_plan_response(
+            request_id=request_id,
+            question=question,
+            eligible_source_ids=["vehicle_log_secondary"],
+        )
+    runtime = FakeRuntime(
+        evidence_shape_response=shape,
+        evidence_plan_response=plan,
+    )
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"] = ["fetch"]
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context=_exact_external_context(),
+            sensitivity=sensitivity,
+            response_mode=response_mode,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=evidence_enabled,
+        interaction_governance_enabled=governance_enabled,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I need a narrower evidence request before I can determine what should "
+        "be checked."
+        if case == "ambiguous"
+        else "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_exact_fetch_plan_without_references_fails_closed(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "rid-exact-plan-without-references"
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime(
+        evidence_plan_response=_exact_plan_response(
+            request_id=request_id,
+            question=question,
+        )
+    )
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
 
 
 @pytest.mark.asyncio

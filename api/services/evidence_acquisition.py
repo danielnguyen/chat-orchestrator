@@ -200,6 +200,18 @@ class Requirement(StrictModel):
     criticality: Literal["material", "optional"]
 
 
+class ExactSourceReference(StrictModel):
+    source_id: Identifier
+    source_ref: Annotated[str, Field(min_length=1, max_length=240)]
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_opaque_source_ref(cls, value: str) -> str:
+        if re.search(r"\s|://|\?", value):
+            raise ValueError("unsafe_source_reference")
+        return value
+
+
 class PlanResult(StrictModel):
     plan_id: Identifier
     question_anchor: Annotated[str, Field(min_length=1, max_length=500)]
@@ -449,6 +461,65 @@ class DsaContextPackResponse(StrictModel):
         return self
 
 
+class DsaAvailableContext(StrictModel):
+    context_mode: Identifier
+    description: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class DsaFetchItem(StrictModel):
+    result_id: Identifier
+    source_type: Identifier
+    source_id: Identifier
+    source_name: Annotated[str, Field(min_length=1, max_length=240)]
+    source_ref: Annotated[str, Field(min_length=1, max_length=240)]
+    retrieved_at: datetime
+    source_modified_at: datetime | None = None
+    cache_status: Literal["live", "cached", "stale", "unknown"]
+    title: Annotated[str, Field(min_length=1, max_length=500)]
+    content_type: Identifier
+    text: Annotated[str, Field(min_length=1, max_length=12000)]
+    url: Annotated[str, Field(max_length=2048)] | None = None
+    confidence: Literal["none", "low", "medium", "high"]
+    raw: dict[str, Any] | None = None
+    available_context: list[DsaAvailableContext] = Field(max_length=16)
+    warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_opaque_source_ref(cls, value: str) -> str:
+        if re.search(r"\s|://|\?", value):
+            raise ValueError("unsafe_source_reference")
+        return value
+
+    @model_validator(mode="after")
+    def reject_raw_data(self) -> DsaFetchItem:
+        if self.raw is not None:
+            raise ValueError("raw_fetch_data_not_allowed")
+        return self
+
+
+class DsaFetchResponse(StrictModel):
+    query_id: Identifier
+    answerable: bool
+    confidence: Literal["none", "low", "medium", "high"]
+    retrieval_mode: Literal["fetch"]
+    results: list[DsaFetchItem] = Field(max_length=1)
+    warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
+    errors: list[DsaError] = Field(max_length=12)
+    budget: DsaBudget
+
+    @model_validator(mode="after")
+    def validate_result_accounting(self) -> DsaFetchResponse:
+        if self.answerable != bool(self.results):
+            raise ValueError("fetch_answerability_mismatch")
+        if self.budget.returned_results != len(self.results):
+            raise ValueError("fetch_result_count_mismatch")
+        result_ids = [item.result_id for item in self.results]
+        if len(set(result_ids)) != len(result_ids):
+            raise ValueError("duplicate_fetch_result")
+        return self
+
+
 @dataclass
 class EvidenceAcquisitionState:
     enabled: bool
@@ -463,6 +534,8 @@ class EvidenceAcquisitionState:
     forced_answer: str | None = None
     follow_existing_path: bool = False
     acquisition_facts: list[dict[str, str]] | None = None
+    exact_source_refs: list[dict[str, str]] | None = None
+    exact_attempts: list[dict[str, Any]] | None = None
 
     @property
     def supported_targeted_path(self) -> bool:
@@ -471,7 +544,42 @@ class EvidenceAcquisitionState:
             and self.plan.task_shape == "targeted_lookup"
             and self.plan.plan_status in {"ready", "ready_with_limitations"}
             and self.plan.selected_strategies == ["targeted_retrieval"]
+            and not self.exact_source_refs
         )
+
+    @property
+    def supported_exact_path(self) -> bool:
+        if not (
+            self.plan
+            and self.plan.task_shape == "targeted_lookup"
+            and self.plan.plan_status in {"ready", "ready_with_limitations"}
+            and self.plan.selected_strategies == ["exact_fetch"]
+            and self.exact_source_refs
+        ):
+            return False
+        referenced_sources = {
+            item["source_id"] for item in self.exact_source_refs
+        }
+        eligible_sources = set(self.plan.eligible_source_ids)
+        authoritative_sources = set(self.plan.authoritative_source_ids)
+        requirement_kinds = {
+            item.requirement_kind for item in self.plan.declared_requirements
+        }
+        return bool(
+            referenced_sources == eligible_sources
+            and authoritative_sources.issubset(eligible_sources)
+            and {"targeted_evidence", "context_delivery"}.issubset(
+                requirement_kinds
+            )
+            and (
+                ("exact_authoritative_fetch" in requirement_kinds)
+                == bool(referenced_sources & authoritative_sources)
+            )
+        )
+
+    @property
+    def supported_governed_path(self) -> bool:
+        return self.supported_targeted_path or self.supported_exact_path
 
 
 def disabled_evidence_trace(*, enabled: bool, reason: str) -> dict[str, Any]:
@@ -509,6 +617,101 @@ def _scope(
     }
 
 
+def _normalize_exact_source_refs(
+    external_context: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    config = external_context if isinstance(external_context, dict) else {}
+    raw_references = config.get("exact_source_refs")
+    if raw_references is None:
+        return []
+    if not isinstance(raw_references, list) or len(raw_references) > 16:
+        raise ValueError("invalid_exact_source_references")
+    references = [
+        ExactSourceReference.model_validate(item).model_dump(mode="json")
+        for item in raw_references
+    ]
+    source_refs = [item["source_ref"] for item in references]
+    if len(set(source_refs)) != len(source_refs):
+        raise ValueError("duplicate_exact_source_reference")
+    source_ids = config.get("source_ids")
+    if isinstance(source_ids, list) and source_ids:
+        declared_source_ids = set(source_ids)
+        if any(item["source_id"] not in declared_source_ids for item in references):
+            raise ValueError("exact_source_reference_source_mismatch")
+    return sorted(
+        references,
+        key=lambda item: (item["source_id"], item["source_ref"]),
+    )
+
+
+def ineligible_exact_evidence_state(
+    *,
+    enabled: bool,
+    reason: str,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    external_context: dict[str, Any] | None,
+) -> EvidenceAcquisitionState:
+    references = _normalize_exact_source_refs(external_context)
+    scope = _scope(
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id or "runtime_session_unavailable",
+        runtime_turn_id=runtime_turn_id or "runtime_turn_unavailable",
+    )
+    declared_scope = {
+        "source_ids": sorted(
+            {
+                item
+                for item in (
+                    external_context.get("source_ids", [])
+                    if isinstance(external_context, dict)
+                    else []
+                )
+                if isinstance(item, str) and item
+            }
+        ),
+        "source_categories": sorted(
+            {
+                item
+                for item in (
+                    external_context.get("domain_tags", [])
+                    if isinstance(external_context, dict)
+                    else []
+                )
+                if isinstance(item, str) and item
+            }
+        ),
+        "exact_source_refs": references,
+        "inventory_status": "unknown",
+        "time_scope_ref": None,
+        "version_scope_ref": None,
+        "domain_scope_ref": None,
+        "project_scope_ref": None,
+    }
+    state = EvidenceAcquisitionState(
+        enabled=enabled,
+        attempted=False,
+        status=reason,
+        declared_scope=declared_scope,
+        exact_source_refs=references,
+        forced_answer=UNSUPPORTED_ANSWER,
+    )
+    state.manifest_id = _manifest_id(
+        scope=scope,
+        plan_id=None,
+        selected_strategies=[],
+        declared_scope=declared_scope,
+    )
+    return state
+
+
 def _manifest_id(
     *,
     scope: dict[str, str],
@@ -518,7 +721,23 @@ def _manifest_id(
     query_id: str | None = None,
     considered_source_ids: list[str] | None = None,
     selected_source_ids: list[str] | None = None,
+    exact_attempts: list[dict[str, Any]] | None = None,
 ) -> str:
+    normalized_attempts = sorted(
+        [
+            {
+                "source_id": item.get("source_id"),
+                "source_ref": item.get("source_ref"),
+                "outcome": item.get("outcome"),
+                "query_id": item.get("query_id"),
+            }
+            for item in (exact_attempts or [])
+        ],
+        key=lambda item: (
+            str(item.get("source_id") or ""),
+            str(item.get("source_ref") or ""),
+        ),
+    )
     material = {
         **scope,
         "plan_id": plan_id,
@@ -527,6 +746,7 @@ def _manifest_id(
         "query_id": query_id,
         "considered_source_ids": sorted(considered_source_ids or []),
         "selected_source_ids": sorted(selected_source_ids or []),
+        "exact_attempts": normalized_attempts,
     }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"evidence_manifest_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
@@ -574,6 +794,42 @@ def _validate_scope_echo(
         raise ValueError("dependency_scope_mismatch")
 
 
+def _validate_supported_plan(state: EvidenceAcquisitionState) -> bool:
+    plan = state.plan
+    if plan is None or plan.task_shape != "targeted_lookup":
+        return False
+    if plan.plan_status not in {"ready", "ready_with_limitations"}:
+        return False
+    requirement_kinds = {
+        requirement.requirement_kind for requirement in plan.declared_requirements
+    }
+    if not {"targeted_evidence", "context_delivery"}.issubset(requirement_kinds):
+        return False
+    exact_references = state.exact_source_refs or []
+    if exact_references:
+        if plan.selected_strategies != ["exact_fetch"]:
+            return False
+        referenced_sources = {item["source_id"] for item in exact_references}
+        eligible_sources = set(plan.eligible_source_ids)
+        authoritative_sources = set(plan.authoritative_source_ids)
+        if referenced_sources != eligible_sources:
+            return False
+        if not authoritative_sources.issubset(eligible_sources):
+            return False
+        exact_authoritative_declared = (
+            "exact_authoritative_fetch" in requirement_kinds
+        )
+        if exact_authoritative_declared != bool(
+            referenced_sources & authoritative_sources
+        ):
+            return False
+        return True
+    return (
+        plan.selected_strategies == ["targeted_retrieval"]
+        and "exact_authoritative_fetch" not in requirement_kinds
+    )
+
+
 async def begin_evidence_acquisition(
     *,
     runtime: Any,
@@ -588,10 +844,25 @@ async def begin_evidence_acquisition(
     interaction_kind: str,
     external_context: dict[str, Any] | None,
 ) -> EvidenceAcquisitionState:
+    try:
+        exact_source_refs = _normalize_exact_source_refs(external_context)
+    except Exception:
+        return ineligible_exact_evidence_state(
+            enabled=True,
+            reason="invalid_exact_source_references",
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            external_context=None,
+        )
     state = EvidenceAcquisitionState(
         enabled=True,
         attempted=True,
         status="shape_requested",
+        exact_source_refs=exact_source_refs,
     )
     scope = _scope(
         request_id=request_id,
@@ -607,8 +878,10 @@ async def begin_evidence_acquisition(
             task_text=task_text,
             interaction_kind=interaction_kind,
             task_context={
-                "evidence_input_kinds": [],
-                "external_verification_required": False,
+                "evidence_input_kinds": (
+                    ["external_source"] if exact_source_refs else []
+                ),
+                "external_verification_required": bool(exact_source_refs),
                 "freshness_sensitive": False,
                 "high_stakes_accuracy_required": False,
                 "continuation_of_prior_evidence_task": False,
@@ -635,8 +908,13 @@ async def begin_evidence_acquisition(
         return state
 
     if state.shape.derivation_status == "not_applicable":
-        state.status = "not_applicable"
-        state.follow_existing_path = True
+        state.status = (
+            "not_applicable_exact_request"
+            if exact_source_refs
+            else "not_applicable"
+        )
+        state.follow_existing_path = not exact_source_refs
+        state.forced_answer = UNSUPPORTED_ANSWER if exact_source_refs else None
         state.manifest_id = _manifest_id(
             scope=scope,
             plan_id=None,
@@ -687,6 +965,7 @@ async def begin_evidence_acquisition(
     state.declared_scope = {
         "source_ids": source_ids,
         "source_categories": source_categories,
+        "exact_source_refs": exact_source_refs,
         "inventory_status": "complete_for_declared_scope",
         "time_scope_ref": None,
         "version_scope_ref": None,
@@ -728,7 +1007,7 @@ async def begin_evidence_acquisition(
         selected_strategies=state.plan.selected_strategies,
         declared_scope=state.declared_scope,
     )
-    if not state.supported_targeted_path:
+    if not _validate_supported_plan(state):
         state.status = "unsupported_plan"
         state.forced_answer = UNSUPPORTED_ANSWER
         return state
@@ -777,6 +1056,191 @@ def validate_context_pack_response(
     return validated.model_dump(mode="json")
 
 
+def validate_fetch_response(
+    response: dict[str, Any],
+    *,
+    expected_source_id: str,
+    expected_source_ref: str,
+) -> DsaFetchResponse:
+    validated = DsaFetchResponse.model_validate(response)
+    for item in validated.results:
+        if item.source_id != expected_source_id:
+            raise ValueError("fetch_source_id_mismatch")
+        if item.source_ref != expected_source_ref:
+            raise ValueError("fetch_source_reference_mismatch")
+    return validated
+
+
+def _exact_bundle_id(
+    *,
+    plan_id: str,
+    question_anchor_digest: str,
+    attempts: list[dict[str, Any]],
+) -> str:
+    material = {
+        "plan_id": plan_id,
+        "question_anchor_digest": question_anchor_digest,
+        "attempts": sorted(
+            [
+                {
+                    "source_id": item["source_id"],
+                    "source_ref": item["source_ref"],
+                    "outcome": item["outcome"],
+                    "query_id": item.get("query_id"),
+                }
+                for item in attempts
+            ],
+            key=lambda item: (item["source_id"], item["source_ref"]),
+        ),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return f"evidence_exact_bundle_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
+
+
+async def execute_exact_fetches(
+    *,
+    state: EvidenceAcquisitionState,
+    dsa: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not state.supported_exact_path or state.plan is None or state.shape is None:
+        return None, {
+            "enabled": True,
+            "called": False,
+            "status": "not_called",
+            "reason": "unsupported_exact_plan",
+        }
+    attempts: list[dict[str, Any]] = []
+    safe_items: list[dict[str, Any]] = []
+    aggregate_errors: set[str] = set()
+    for reference in state.exact_source_refs or []:
+        attempt: dict[str, Any] = {
+            "source_id": reference["source_id"],
+            "source_ref": reference["source_ref"],
+            "outcome": "failed",
+            "query_id": None,
+        }
+        try:
+            response_raw = await dsa.fetch_source(
+                source_ref=reference["source_ref"],
+                include_raw=False,
+                budget={
+                    "max_results": 1,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+            )
+            if not isinstance(response_raw, dict):
+                raise ValueError("malformed_fetch_response")
+            response = validate_fetch_response(
+                response_raw,
+                expected_source_id=reference["source_id"],
+                expected_source_ref=reference["source_ref"],
+            )
+            attempt["query_id"] = response.query_id
+            if response.errors:
+                attempt["outcome"] = "failed"
+                aggregate_errors.update(item.code for item in response.errors)
+            elif response.budget.truncated:
+                attempt["outcome"] = "truncated"
+                aggregate_errors.add("budget_truncated")
+            elif not response.results:
+                attempt["outcome"] = "unknown"
+            else:
+                attempt["outcome"] = "satisfied"
+                for item in response.results:
+                    safe_items.append(
+                        {
+                            "source_ref": item.source_ref,
+                            "source_name": item.source_name,
+                            "title": item.title,
+                            "text": item.text,
+                            "retrieved_at": item.retrieved_at.isoformat(),
+                            "warnings": list(item.warnings),
+                        }
+                    )
+        except ValueError:
+            attempt["outcome"] = "filtered"
+            aggregate_errors.add("malformed_response")
+        except Exception:
+            attempt["outcome"] = "failed"
+            aggregate_errors.add("dependency_failure")
+        attempts.append(attempt)
+
+    state.exact_attempts = attempts
+    successful_sources = sorted(
+        {item["source_id"] for item in attempts if item["outcome"] == "satisfied"}
+    )
+    considered_sources = sorted({item["source_id"] for item in attempts})
+    successful_counts = {
+        source_id: sum(
+            item["source_id"] == source_id and item["outcome"] == "satisfied"
+            for item in attempts
+        )
+        for source_id in successful_sources
+    }
+    bundle = {
+        "bundle_id": _exact_bundle_id(
+            plan_id=state.plan.plan_id,
+            question_anchor_digest=state.plan.question_anchor_digest,
+            attempts=attempts,
+        ),
+        "query": state.plan.question_anchor,
+        "sources_used": successful_sources,
+        "items": safe_items,
+        "errors": [{"code": code} for code in sorted(aggregate_errors)],
+        "budget": {
+            "max_results": len(attempts),
+            "returned_results": len(safe_items),
+            "estimated_bytes": sum(
+                len(item["text"].encode("utf-8")) for item in safe_items
+            ),
+            "truncated": any(item["outcome"] == "truncated" for item in attempts),
+        },
+        "diagnostics": {
+            "selection_mode": "exact_source_references",
+            "considered_source_ids": considered_sources,
+            "selected_source_ids": considered_sources,
+            "source_diagnostics": [],
+            "ranking_mode": "declared_exact_reference_order",
+            "candidate_counts_by_source": successful_counts,
+            "budget_truncated_candidates": any(
+                item["outcome"] == "truncated" for item in attempts
+            ),
+        },
+        "raw_item_count": len(safe_items),
+    }
+    outcome_counts = {
+        outcome: sum(item["outcome"] == outcome for item in attempts)
+        for outcome in ("satisfied", "unknown", "failed", "filtered", "truncated")
+    }
+    status = (
+        "included"
+        if outcome_counts["satisfied"] == len(attempts)
+        else "error"
+        if outcome_counts["failed"] or outcome_counts["filtered"]
+        else "empty"
+    )
+    return bundle, {
+        "enabled": True,
+        "called": bool(attempts),
+        "call_count": len(attempts),
+        "status": status,
+        "reason": "exact_fetch_completed",
+        "error_code": (
+            "malformed_response"
+            if outcome_counts["filtered"]
+            else "dependency_failure"
+            if outcome_counts["failed"]
+            else None
+        ),
+        "error_codes": sorted(aggregate_errors),
+        "raw_item_count": len(safe_items),
+        "budget_truncated": bool(outcome_counts["truncated"]),
+        "candidate_truncated": False,
+        "exact_attempt_counts": outcome_counts,
+    }
+
+
 def _delivery_reference_state(
     *,
     context_pack: dict[str, Any] | None,
@@ -804,27 +1268,71 @@ def _delivery_reference_state(
     return "unknown", returned_refs, set()
 
 
+def _aggregate_exact_outcome(attempts: list[dict[str, Any]]) -> str:
+    outcomes = {str(item.get("outcome")) for item in attempts}
+    for outcome in ("truncated", "filtered", "failed", "unknown"):
+        if outcome in outcomes:
+            return outcome
+    return "satisfied" if attempts and outcomes == {"satisfied"} else "unknown"
+
+
+def _exact_delivery_reference_state(
+    *,
+    exact_source_refs: list[dict[str, str]],
+    exact_attempts: list[dict[str, Any]],
+    context_pack: dict[str, Any] | None,
+    retained_source_refs: set[str] | None,
+) -> tuple[str, set[str], set[str]]:
+    _, returned_refs, retained_refs = _delivery_reference_state(
+        context_pack=context_pack,
+        retained_source_refs=retained_source_refs,
+    )
+    if retained_source_refs is None or retained_source_refs - returned_refs:
+        return "unknown", returned_refs, retained_refs
+    declared_refs = {item["source_ref"] for item in exact_source_refs}
+    if _aggregate_exact_outcome(exact_attempts) != "satisfied":
+        return "unknown", returned_refs, retained_refs
+    if returned_refs == declared_refs and retained_refs == declared_refs:
+        return "satisfied", returned_refs, retained_refs
+    if returned_refs and declared_refs - retained_refs:
+        return "filtered", returned_refs, retained_refs
+    return "unknown", returned_refs, retained_refs
+
+
 def _build_acquisition_facts(
     *,
     plan: PlanResult,
     context_pack: dict[str, Any] | None,
     dsa_trace: dict[str, Any],
     retained_source_refs: set[str] | None,
+    exact_source_refs: list[dict[str, str]] | None = None,
+    exact_attempts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     status = dsa_trace.get("status")
     error_code = dsa_trace.get("error_code")
     usable_count = len(context_pack.get("items", [])) if isinstance(context_pack, dict) else 0
-    delivery_outcome, _, _ = _delivery_reference_state(
-        context_pack=context_pack,
-        retained_source_refs=retained_source_refs,
-    )
+    exact_path = plan.selected_strategies == ["exact_fetch"]
+    if exact_path:
+        delivery_outcome, _, _ = _exact_delivery_reference_state(
+            exact_source_refs=exact_source_refs or [],
+            exact_attempts=exact_attempts or [],
+            context_pack=context_pack,
+            retained_source_refs=retained_source_refs,
+        )
+    else:
+        delivery_outcome, _, _ = _delivery_reference_state(
+            context_pack=context_pack,
+            retained_source_refs=retained_source_refs,
+        )
     facts: list[dict[str, str]] = []
     for requirement in sorted(
         plan.declared_requirements,
         key=lambda item: item.requirement_id,
     ):
         if requirement.requirement_kind == "targeted_evidence":
-            if status == "error":
+            if exact_path:
+                outcome = _aggregate_exact_outcome(exact_attempts or [])
+            elif status == "error":
                 outcome = "filtered" if error_code == "malformed_response" else "failed"
             elif usable_count:
                 outcome = "satisfied"
@@ -832,6 +1340,14 @@ def _build_acquisition_facts(
                 outcome = "unknown"
         elif requirement.requirement_kind == "context_delivery":
             outcome = delivery_outcome
+        elif requirement.requirement_kind == "exact_authoritative_fetch":
+            authoritative_sources = set(plan.authoritative_source_ids)
+            authoritative_attempts = [
+                item
+                for item in (exact_attempts or [])
+                if item.get("source_id") in authoritative_sources
+            ]
+            outcome = _aggregate_exact_outcome(authoritative_attempts)
         elif (
             requirement.requirement_kind == "selected_source_coverage"
             and requirement.criticality == "optional"
@@ -872,7 +1388,7 @@ async def evaluate_acquisition_sufficiency(
     dsa_trace: dict[str, Any],
     retained_source_refs: set[str] | None,
 ) -> None:
-    if not state.supported_targeted_path or state.plan is None or state.manifest_id is None:
+    if not state.supported_governed_path or state.plan is None or state.manifest_id is None:
         return
     diagnostics = (
         context_pack.get("diagnostics")
@@ -901,12 +1417,15 @@ async def evaluate_acquisition_sufficiency(
         ),
         considered_source_ids=diagnostics.get("considered_source_ids", []),
         selected_source_ids=diagnostics.get("selected_source_ids", []),
+        exact_attempts=state.exact_attempts,
     )
     facts = _build_acquisition_facts(
         plan=state.plan,
         context_pack=context_pack,
         dsa_trace=dsa_trace,
         retained_source_refs=retained_source_refs,
+        exact_source_refs=state.exact_source_refs,
+        exact_attempts=state.exact_attempts,
     )
     state.acquisition_facts = facts
     try:
@@ -1105,10 +1624,23 @@ def build_manifest_trace(
         if isinstance(context_pack, dict) and isinstance(context_pack.get("items"), list)
         else []
     )
-    delivery_outcome, returned_ref_set, retained_ref_set = _delivery_reference_state(
-        context_pack=context_pack,
-        retained_source_refs=retained_source_refs,
-    )
+    exact_path = state.supported_exact_path
+    if exact_path:
+        delivery_outcome, returned_ref_set, retained_ref_set = (
+            _exact_delivery_reference_state(
+                exact_source_refs=state.exact_source_refs or [],
+                exact_attempts=state.exact_attempts or [],
+                context_pack=context_pack,
+                retained_source_refs=retained_source_refs,
+            )
+        )
+    else:
+        delivery_outcome, returned_ref_set, retained_ref_set = (
+            _delivery_reference_state(
+                context_pack=context_pack,
+                retained_source_refs=retained_source_refs,
+            )
+        )
     returned_refs = sorted(returned_ref_set)
     retained_refs = sorted(retained_ref_set)
     omitted_refs = sorted(returned_ref_set - retained_ref_set)
@@ -1125,6 +1657,26 @@ def build_manifest_trace(
     )
     plan = state.plan
     shape = state.shape
+    exact_attempts = state.exact_attempts or []
+    attempted_exact_refs = sorted(
+        {
+            item["source_ref"]
+            for item in (state.exact_source_refs or [])
+            if isinstance(item.get("source_ref"), str)
+        }
+    )
+    unsuccessful_exact_refs = sorted(
+        {
+            str(item["source_ref"])
+            for item in exact_attempts
+            if item.get("outcome") != "satisfied"
+            and isinstance(item.get("source_ref"), str)
+        }
+    )
+    exact_outcome_counts = {
+        outcome: sum(item.get("outcome") == outcome for item in exact_attempts)
+        for outcome in ("satisfied", "unknown", "failed", "filtered", "truncated")
+    }
     return {
         "enabled": state.enabled,
         "attempted": state.attempted,
@@ -1164,8 +1716,10 @@ def build_manifest_trace(
         },
         "acquisition": {
             "strategy_attempted": (
-                "targeted_retrieval"
-                if state.supported_targeted_path and trace.get("called") is True
+                plan.selected_strategies[0]
+                if state.supported_governed_path
+                and plan
+                and trace.get("called") is True
                 else None
             ),
             "sources_considered": considered_sources,
@@ -1174,13 +1728,39 @@ def build_manifest_trace(
             "source_references_returned": returned_refs,
             "source_references_retained": retained_refs,
             "source_references_filtered_or_omitted": omitted_refs,
+            "source_references_attempted": attempted_exact_refs,
+            "source_references_unsuccessful": unsuccessful_exact_refs,
+            "exact_reference_attempts": sorted(
+                [
+                    {
+                        "source_id": str(item["source_id"]),
+                        "source_ref": str(item["source_ref"]),
+                        "outcome": str(item["outcome"]),
+                    }
+                    for item in exact_attempts
+                ],
+                key=lambda item: (item["source_id"], item["source_ref"]),
+            ),
+            "exact_reference_attempt_count": len(exact_attempts),
+            "exact_reference_successful_count": exact_outcome_counts["satisfied"],
+            "exact_reference_unknown_count": exact_outcome_counts["unknown"],
+            "exact_reference_failed_count": exact_outcome_counts["failed"],
+            "exact_reference_filtered_count": exact_outcome_counts["filtered"],
+            "exact_reference_truncated_count": exact_outcome_counts["truncated"],
             "unavailable_source_ids": sorted(
                 source.source_id
                 for source in (state.inventory.sources if state.inventory else [])
                 if not source.enabled
                 or source.status in {"unavailable", "disabled", "unknown"}
             ),
-            "failed_source_ids": [],
+            "failed_source_ids": sorted(
+                {
+                    str(item["source_id"])
+                    for item in exact_attempts
+                    if item.get("outcome") == "failed"
+                    and isinstance(item.get("source_id"), str)
+                }
+            ),
             "expansion_attempts": [],
             "item_count": int(trace.get("raw_item_count") or len(items)),
             "usable_item_count": len(items),
@@ -1261,6 +1841,9 @@ def suppress_manifest_identifiers(manifest: dict[str, Any]) -> dict[str, Any]:
         "source_references_returned",
         "source_references_retained",
         "source_references_filtered_or_omitted",
+        "source_references_attempted",
+        "source_references_unsuccessful",
+        "exact_reference_attempts",
         "unavailable_source_ids",
         "failed_source_ids",
     )
