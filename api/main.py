@@ -129,6 +129,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
             privacy_context_enabled=settings.cognitive_runtime_privacy_context_enabled,
             capability_registry_enabled=settings.cognitive_runtime_capability_registry_enabled,
             claim_record_capture_enabled=settings.claim_record_capture_enabled,
+            evidence_acquisition_enabled=settings.evidence_acquisition_enabled,
             response_action_mode=settings.response_action_mode,
             interrupt_policy_mode=body.interrupt_policy_mode,
             dsa=dsa,

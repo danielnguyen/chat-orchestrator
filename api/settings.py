@@ -54,6 +54,10 @@ class Settings(BaseSettings):
         default=False,
         alias="CLAIM_RECORD_CAPTURE_ENABLED",
     )
+    evidence_acquisition_enabled: bool = Field(
+        default=False,
+        alias="EVIDENCE_ACQUISITION_ENABLED",
+    )
     dsa_base_url: str = Field(default="http://localhost:5174", alias="DSA_BASE_URL")
     dsa_timeout_ms: int = Field(default=5000, alias="DSA_TIMEOUT_MS", ge=100, le=30000)
     dsa_enabled: bool = Field(default=False, alias="DSA_ENABLED")
@@ -100,6 +104,13 @@ class Settings(BaseSettings):
     def validate_claim_capture_runtime(self) -> Settings:
         if self.claim_record_capture_enabled and not self.cognitive_runtime_base_url:
             raise ValueError("claim record capture requires Cognitive Runtime")
+        if self.evidence_acquisition_enabled:
+            if not self.cognitive_runtime_base_url:
+                raise ValueError("evidence acquisition requires Cognitive Runtime")
+            if not self.cognitive_runtime_interaction_governance_enabled:
+                raise ValueError("evidence acquisition requires interaction governance")
+            if not self.dsa_enabled:
+                raise ValueError("evidence acquisition requires Data Source Aggregator")
         return self
 
 

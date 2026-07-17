@@ -110,6 +110,51 @@ DSA failures are non-fatal to normal chat execution. Memory writes remain separa
 
 For a manual integration check, start DSA at the configured base URL, enable it in `api/.env`, restart Chat Orchestrator, and send the targeted request above. Then stop DSA and repeat the request to confirm that chat continues with a bounded DSA error status.
 
+## Governed targeted evidence acquisition
+
+The first governed evidence-acquisition path is disabled by default with
+`EVIDENCE_ACQUISITION_ENABLED=false`. Enabling it also requires a configured
+Cognitive Runtime, enabled interaction governance, and `DSA_ENABLED=true`. It
+does not opt requests into external context: the request-level flag or structured
+object is still required, and an effective `local_only` policy always wins.
+
+For an eligible normal chat request, Chat Orchestrator uses the existing
+interaction-governance result, asks Cognitive Runtime to derive a broad evidence
+shape, reads the governed DSA source inventory, adapts the neutral source
+capabilities, and asks Cognitive Runtime to compile an evidence plan. The initial
+execution boundary proceeds only for a derived `targeted_lookup` whose plan is
+ready (possibly with optional limitations) and whose only selected strategy is
+`targeted_retrieval`.
+
+That supported path calls the existing DSA context-pack operation once. After
+prompt assembly, Chat Orchestrator reports requirement outcomes based on what was
+actually acquired and what external context survived into provider reasoning.
+Cognitive Runtime evaluates those facts. An insufficient or unknown result
+withholds an unsupported conclusion without calling the provider. A sufficient
+result permits the existing single provider path; an optional limitation adds a
+bounded disclosure. Targeted answers that claim exhaustive or absence-sensitive
+coverage receive a disclosure that only the targeted sources were checked.
+Provider prose cannot select or upgrade the plan, acquisition facts, sufficiency
+status, or answer constraints.
+
+The final request trace retains a bounded `prompt.evidence_acquisition` manifest.
+It records structural shape, inventory, plan, acquisition, delivery, sufficiency,
+and limitation outcomes; the exact persisted assistant-message identifier; and a
+digest of the final user-visible answer. It does not retain the question text,
+source text, source titles or descriptions, provider output, credentials, raw
+dependency errors, confidence values, prompts, or hidden reasoning. Existing
+privacy suppression removes source identifiers while retaining counts and
+statuses.
+
+Ambiguous evidence tasks and unsupported plans or strategies return bounded,
+provider-free responses. A `not_applicable` result continues through the existing
+chat and optional DSA behavior. Briefs, capability and action flows, pending-action
+continuations, and claim-explanation follow-ups remain outside this initial path.
+Exact fetch, bounded full context, structured queries, hybrid acquisition, and
+execution of exhaustive, absence-sensitive, contradiction, historical,
+comparison, or recommendation plans are not implemented here. The public chat
+request and response fields are unchanged.
+
 ## Prompt assembly and routing
 
 Prompt assembly is explicit and budgeted. Depending on configuration and request context, the assembled messages can include:
