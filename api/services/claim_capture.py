@@ -171,6 +171,12 @@ class _StoredClaimRecord(_CalibrationResult):
     surface: str = Field(min_length=1, max_length=64)
     runtime_session_id: str = Field(min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
     runtime_turn_id: str = Field(min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    acquisition_manifest_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        pattern=_IDENTIFIER_PATTERN,
+    )
     created_at: str = Field(min_length=1, max_length=80)
 
 
@@ -193,6 +199,8 @@ class ClaimCaptureState:
     candidate: ClaimCaptureCandidate | None = None
     calibration_result: dict[str, Any] | None = None
     assistant_message_id: str | None = None
+    acquisition_manifest_id: str | None = None
+    acquisition_manifest_required: bool = False
 
 
 def _trace(
@@ -213,6 +221,8 @@ def _trace(
         "evidence_count": evidence_count,
         "claim_id": None,
         "claim_anchor_digest": None,
+        "acquisition_manifest_status": "not_applicable",
+        "acquisition_manifest_linked": False,
     }
 
 
@@ -473,6 +483,86 @@ def bind_assistant_message(
     )
 
 
+def bind_acquisition_manifest(
+    state: ClaimCaptureState,
+    manifest: Any,
+) -> ClaimCaptureState:
+    if manifest is None or state.candidate is None:
+        return replace(
+            state,
+            acquisition_manifest_id=None,
+            acquisition_manifest_required=False,
+            trace={
+                **state.trace,
+                "acquisition_manifest_status": "not_applicable",
+                "acquisition_manifest_linked": False,
+            },
+        )
+
+    invalid_trace = {
+        **state.trace,
+        "persistence_status": "not_attempted",
+        "reason_code": "acquisition_manifest_association_invalid",
+        "acquisition_manifest_status": "invalid",
+        "acquisition_manifest_linked": False,
+    }
+    if (
+        state.calibration_result is None
+        or state.assistant_message_id is None
+        or not isinstance(manifest, dict)
+    ):
+        return replace(
+            state,
+            acquisition_manifest_id=None,
+            acquisition_manifest_required=True,
+            trace=invalid_trace,
+        )
+
+    manifest_id = manifest.get("manifest_id")
+    plan = manifest.get("plan")
+    sufficiency = manifest.get("sufficiency")
+    top_level_status = manifest.get("status")
+    nested_status = (
+        sufficiency.get("status")
+        if isinstance(sufficiency, dict)
+        else None
+    )
+    accepted_statuses = {
+        "sufficient_for_declared_scope",
+        "sufficient_with_limitations",
+    }
+    valid = (
+        _valid_identifier(manifest_id)
+        and manifest.get("attempted") is True
+        and isinstance(plan, dict)
+        and plan.get("plan_status") in {"ready", "ready_with_limitations"}
+        and top_level_status in accepted_statuses
+        and nested_status in accepted_statuses
+        and top_level_status == nested_status
+        and manifest.get("assistant_message_id") == state.assistant_message_id
+        and manifest.get("response_digest")
+        == state.calibration_result.get("claim_anchor_digest")
+    )
+    if not valid:
+        return replace(
+            state,
+            acquisition_manifest_id=None,
+            acquisition_manifest_required=True,
+            trace=invalid_trace,
+        )
+
+    return replace(
+        state,
+        acquisition_manifest_id=manifest_id,
+        acquisition_manifest_required=True,
+        trace={
+            **state.trace,
+            "acquisition_manifest_status": "bound",
+            "acquisition_manifest_linked": True,
+        },
+    )
+
+
 def claim_record_payload(
     *,
     state: ClaimCaptureState,
@@ -485,7 +575,9 @@ def claim_record_payload(
 ) -> dict[str, Any] | None:
     if state.calibration_result is None or state.assistant_message_id is None:
         return None
-    return {
+    if state.acquisition_manifest_required and state.acquisition_manifest_id is None:
+        return None
+    payload = {
         "schema_version": "claim-record.v1",
         "request_id": request_id,
         "owner_id": owner_id,
@@ -496,6 +588,9 @@ def claim_record_payload(
         "runtime_turn_id": runtime_turn_id,
         "calibration_result": state.calibration_result,
     }
+    if state.acquisition_manifest_id is not None:
+        payload["acquisition_manifest_id"] = state.acquisition_manifest_id
+    return payload
 
 
 def finish_claim_record_persistence(
@@ -530,6 +625,7 @@ def finish_claim_record_persistence(
         "surface": expected_payload.get("surface"),
         "runtime_session_id": expected_payload.get("runtime_session_id"),
         "runtime_turn_id": expected_payload.get("runtime_turn_id"),
+        "acquisition_manifest_id": expected_payload.get("acquisition_manifest_id"),
         **{
             key: value
             for key, value in expected_payload.get("calibration_result", {}).items()

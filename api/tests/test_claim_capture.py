@@ -6,6 +6,7 @@ import pytest
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import RuntimeClient
 from services.claim_capture import (
+    bind_acquisition_manifest,
     bind_assistant_message,
     calibrate_claim_capture,
     claim_record_payload,
@@ -86,6 +87,27 @@ def _digest(anchor: str) -> str:
     return f"sha256:{hashlib.sha256(anchor.encode()).hexdigest()}"
 
 
+def _manifest(state, **overrides):
+    manifest = {
+        "enabled": True,
+        "attempted": True,
+        "status": "sufficient_for_declared_scope",
+        "manifest_id": "evidence_manifest_0123456789abcdef0123456789abcdef",
+        "assistant_message_id": state.assistant_message_id,
+        "response_digest": state.calibration_result["claim_anchor_digest"],
+        "shape": {},
+        "inventory": {},
+        "plan": {"plan_status": "ready"},
+        "acquisition": {
+            "sources_considered": ["source-a", "source-b"],
+            "source_references_returned": ["external-ref-a", "external-ref-b"],
+        },
+        "sufficiency": {"status": "sufficient_for_declared_scope"},
+    }
+    manifest.update(overrides)
+    return manifest
+
+
 def _calibration_response(candidate, **overrides):
     result = {
         "claim_id": "claim-1",
@@ -156,6 +178,8 @@ def test_single_sentence_and_one_retained_file_source_are_eligible():
         "evidence_count": 1,
         "claim_id": None,
         "claim_anchor_digest": None,
+        "acquisition_manifest_status": "not_applicable",
+        "acquisition_manifest_linked": False,
     }
     assert state.candidate.claim_anchor == "The retained file reports that the setting is active."
     assert state.candidate.evidence_reference == {
@@ -359,6 +383,127 @@ async def test_message_binding_and_claim_record_forward_the_exact_runtime_result
     assert payload["schema_version"] == "claim-record.v1"
     assert payload["assistant_message_id"] == "assistant-message-1"
     assert payload["calibration_result"] is state.calibration_result
+    assert "acquisition_manifest_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_valid_acquisition_manifest_binding_retains_only_the_identifier():
+    initial = _prepare()
+    state = await _calibrate(initial, _Runtime(_calibration_response(initial.candidate)))
+    state = bind_assistant_message(state, {"message_id": "assistant-message-1"})
+    manifest = _manifest(state)
+
+    bound = bind_acquisition_manifest(state, manifest)
+    payload = claim_record_payload(
+        state=bound,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        runtime_session_id="runtime-session-1",
+        runtime_turn_id="runtime-turn-1",
+    )
+
+    assert bound.acquisition_manifest_required is True
+    assert bound.acquisition_manifest_id == manifest["manifest_id"]
+    assert bound.trace["acquisition_manifest_status"] == "bound"
+    assert bound.trace["acquisition_manifest_linked"] is True
+    assert payload["acquisition_manifest_id"] == manifest["manifest_id"]
+    assert payload["calibration_result"] == state.calibration_result
+    serialized = repr(bound)
+    assert "source-a" not in serialized
+    assert "external-ref-a" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manifest_change",
+    [
+        "not-a-dictionary",
+        {"manifest_id": None},
+        {"manifest_id": "bad id"},
+        {"manifest_id": "m" * 121},
+        {"attempted": False},
+        {"plan": None},
+        {"plan": {"plan_status": "unsupported"}},
+        {"status": "insufficient"},
+        {"sufficiency": {"status": "unknown"}},
+        {"status": "sufficient_with_limitations"},
+        {"sufficiency": None},
+        {"assistant_message_id": "assistant-message-other"},
+        {"response_digest": "sha256:" + "0" * 64},
+    ],
+)
+async def test_invalid_acquisition_manifest_fails_closed_without_raw_trace(
+    manifest_change,
+):
+    state = ClaimCaptureStateForTest.persistable()
+    manifest = (
+        manifest_change
+        if not isinstance(manifest_change, dict)
+        else _manifest(state, **manifest_change)
+    )
+
+    bound = bind_acquisition_manifest(state, manifest)
+
+    assert bound.acquisition_manifest_required is True
+    assert bound.acquisition_manifest_id is None
+    assert bound.trace["acquisition_manifest_status"] == "invalid"
+    assert bound.trace["acquisition_manifest_linked"] is False
+    assert bound.trace["reason_code"] == "acquisition_manifest_association_invalid"
+    assert bound.trace["storage_call_count"] == 0
+    assert claim_record_payload(
+        state=bound,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        runtime_session_id="runtime-session-1",
+        runtime_turn_id="runtime-turn-1",
+    ) is None
+    assert "source-a" not in repr(bound.trace)
+    assert "external-ref-a" not in repr(bound.trace)
+
+
+@pytest.mark.asyncio
+async def test_manifest_before_message_or_calibration_binding_fails_closed():
+    initial = _prepare()
+    calibrated = await _calibrate(
+        initial,
+        _Runtime(_calibration_response(initial.candidate)),
+    )
+    manifest = {
+        "manifest_id": "evidence_manifest_0123456789abcdef0123456789abcdef",
+    }
+
+    before_message = bind_acquisition_manifest(calibrated, manifest)
+    before_calibration = bind_acquisition_manifest(initial, manifest)
+
+    for state in (before_message, before_calibration):
+        assert state.acquisition_manifest_required is True
+        assert state.acquisition_manifest_id is None
+        assert state.trace["acquisition_manifest_status"] == "invalid"
+        assert state.trace["reason_code"] == "acquisition_manifest_association_invalid"
+
+
+def test_absent_manifest_preserves_legacy_claim_capture_state_and_payload():
+    state = ClaimCaptureStateForTest.persistable()
+    bound = bind_acquisition_manifest(state, None)
+    payload = claim_record_payload(
+        state=bound,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        runtime_session_id="runtime-session-1",
+        runtime_turn_id="runtime-turn-1",
+    )
+
+    assert bound.acquisition_manifest_required is False
+    assert bound.acquisition_manifest_id is None
+    assert bound.trace["acquisition_manifest_status"] == "not_applicable"
+    assert bound.trace["acquisition_manifest_linked"] is False
+    assert "acquisition_manifest_id" not in payload
 
 
 @pytest.mark.asyncio
@@ -405,6 +550,108 @@ def test_claim_record_response_is_validated_without_copying_record_content_to_tr
     )
     assert rejected.trace["persistence_status"] == "failed"
     assert "PRIVATE-RECORD-CONTENT" not in repr(rejected.trace)
+
+
+def test_linked_and_legacy_claim_record_responses_require_exact_manifest_agreement():
+    legacy_state = ClaimCaptureStateForTest.persistable()
+    legacy_payload = claim_record_payload(
+        state=legacy_state,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        runtime_session_id="runtime-session-1",
+        runtime_turn_id="runtime-turn-1",
+    )
+    legacy_response = {
+        "created": True,
+        "record": {
+            **{
+                key: value
+                for key, value in legacy_payload.items()
+                if key != "calibration_result"
+            },
+            **legacy_payload["calibration_result"],
+            "created_at": "2026-07-15T00:00:00+00:00",
+        },
+    }
+    assert finish_claim_record_persistence(
+        state=legacy_state,
+        expected_payload=legacy_payload,
+        response=legacy_response,
+    ).trace["persistence_status"] == "persisted"
+
+    manifest = _manifest(legacy_state)
+    linked_state = bind_acquisition_manifest(legacy_state, manifest)
+    linked_payload = claim_record_payload(
+        state=linked_state,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        runtime_session_id="runtime-session-1",
+        runtime_turn_id="runtime-turn-1",
+    )
+    linked_response = {
+        "created": True,
+        "record": {
+            **{
+                key: value
+                for key, value in linked_payload.items()
+                if key != "calibration_result"
+            },
+            **linked_payload["calibration_result"],
+            "created_at": "2026-07-15T00:00:00+00:00",
+        },
+    }
+    assert finish_claim_record_persistence(
+        state=linked_state,
+        expected_payload=linked_payload,
+        response=linked_response,
+    ).trace["persistence_status"] == "persisted"
+
+    for changed_response in (
+        {
+            **linked_response,
+            "record": {
+                key: value
+                for key, value in linked_response["record"].items()
+                if key != "acquisition_manifest_id"
+            },
+        },
+        {
+            **linked_response,
+            "record": {
+                **linked_response["record"],
+                "acquisition_manifest_id": "evidence_manifest_other",
+            },
+        },
+        {
+            **linked_response,
+            "record": {
+                **linked_response["record"],
+                "acquisition_manifest_id": "bad id",
+            },
+        },
+    ):
+        assert finish_claim_record_persistence(
+            state=linked_state,
+            expected_payload=linked_payload,
+            response=changed_response,
+        ).trace["persistence_status"] == "failed"
+
+    unexpected_legacy = {
+        **legacy_response,
+        "record": {
+            **legacy_response["record"],
+            "acquisition_manifest_id": manifest["manifest_id"],
+        },
+    }
+    assert finish_claim_record_persistence(
+        state=legacy_state,
+        expected_payload=legacy_payload,
+        response=unexpected_legacy,
+    ).trace["persistence_status"] == "failed"
 
 
 class ClaimCaptureStateForTest:

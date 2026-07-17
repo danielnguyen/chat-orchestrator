@@ -163,6 +163,29 @@ dependency errors, confidence values, prompts, or hidden reasoning. Existing
 privacy suppression removes source and exact-reference identifiers while
 retaining counts and statuses.
 
+When the existing claim-capture boundary accepts a single-sentence claim backed
+by one retained file source, Chat Orchestrator may link that claim record to the
+same turn's acquisition manifest. The assistant message is persisted first, the
+manifest is bound to that message and the exact final-answer digest, and the
+request trace containing the bound manifest is persisted before the claim record
+is created. Only the validated manifest identifier is added at the top level of
+the claim-record request. The calibrated evidence reference remains the one file
+reference actually used to support the claim; source inventories, acquisition
+attempts, returned or retained external references, and sufficiency details are
+not copied into claim support or calibration.
+
+Manifest association is validated independently of provider text. It requires an
+attempted acquisition, a ready plan, matching sufficient top-level and nested
+outcomes, and exact agreement with the bound assistant-message identifier and
+final-answer digest. A malformed, unsupported, insufficient, or mismatched
+association skips claim-record persistence without retry or an unlinked fallback,
+while preserving the assistant response and request trace. Claim diagnostics
+retain only bounded association status and whether a link was established; they
+do not duplicate the manifest identifier or body. Ordinary non-evidence claims
+continue to use the legacy unlinked payload. This association does not expand the
+current single-sentence, single-file claim-capture boundary, infer which external
+item a provider used, or add acquisition-history explanation.
+
 Ambiguous evidence tasks and unsupported plans or strategies return bounded,
 provider-free responses. A `not_applicable` result continues through the existing
 chat and optional DSA behavior. Briefs, capability and action flows, pending-action

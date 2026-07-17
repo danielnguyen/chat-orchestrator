@@ -11353,6 +11353,47 @@ def _governed_context_pack(query: str) -> dict[str, object]:
     }
 
 
+def _multi_source_governed_context_pack(query: str) -> dict[str, object]:
+    response = _governed_context_pack(query)
+    response["sources_used"] = [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    response["items"].append(
+        {
+            "result_id": "result_2",
+            "source_type": "record",
+            "source_id": "vehicle_log_secondary",
+            "source_name": "SECOND PRIVATE SOURCE NAME",
+            "source_ref": "vehicle_log_secondary:record_2",
+            "retrieved_at": "2026-07-17T00:00:00Z",
+            "source_modified_at": None,
+            "title": "SECOND PRIVATE SOURCE TITLE",
+            "content_type": "text",
+            "text": "The secondary maintenance record confirms 2025-07-12.",
+            "confidence": "high",
+            "warnings": [],
+        }
+    )
+    response["budget"]["returned_results"] = 2
+    response["budget"]["estimated_bytes"] = 240
+    diagnostics = response["diagnostics"]
+    diagnostics["considered_source_ids"] = [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    diagnostics["selected_source_ids"] = [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    diagnostics["ranking_mode"] = "cross_source"
+    diagnostics["candidate_counts_by_source"] = {
+        "vehicle_log_primary": 1,
+        "vehicle_log_secondary": 1,
+    }
+    return response
+
+
 def _exact_fetch_response(
     *,
     source_id: str = "vehicle_log_primary",
@@ -13352,6 +13393,74 @@ async def _run_claim_capture_chat(
     return result, memory_store, runtime, litellm
 
 
+async def _run_evidence_claim_capture_chat(
+    tmp_path,
+    *,
+    memory_store=None,
+    runtime=None,
+    litellm=None,
+    optional: bool = False,
+    request_id: str = "request-evidence-claim-capture",
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    eligible_source_ids = [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    runtime = runtime or FakeRuntime(
+        evidence_plan_response=_targeted_plan_response(
+            request_id=request_id,
+            question=question,
+            optional=optional,
+            eligible_source_ids=eligible_source_ids,
+        )
+    )
+    source_response = copy.deepcopy(FakeDSA().source_response)
+    source_response["sources"].append(
+        {
+            "source_id": "vehicle_log_secondary",
+            "display_name": "Secondary Vehicle Log",
+            "connector": "neutral_connector",
+            "domain_tags": ["vehicle", "maintenance"],
+            "sensitivity": "medium",
+            "access_mode": "read_only",
+            "capabilities": ["profile", "search"],
+            "enabled": True,
+            "status": "ready",
+            "last_checked_at": "2026-07-17T00:00:00Z",
+            "last_error": None,
+        }
+    )
+    dsa = FakeDSA(
+        response=_multi_source_governed_context_pack(question),
+        source_response=source_response,
+    )
+    memory_store = memory_store or ClaimCaptureMemoryStore()
+    litellm = litellm or FakeLiteLLM(
+        content="The retained file reports that the setting is active."
+    )
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+    return result, memory_store, runtime, litellm, dsa
+
+
 async def _capture_two_explanation_claims(tmp_path):
     memory_store = ClaimExplanationMemoryStore()
     runtime = FakeRuntime()
@@ -13442,6 +13551,8 @@ async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(t
         and memory_store.claim_record_calls[0]["payload"]["calibration_result"][
             "claim_anchor_digest"
         ],
+        "acquisition_manifest_status": "not_applicable",
+        "acquisition_manifest_linked": False,
     }
     assert {("derived_text", "derived-text-1")} <= {
         (item["ref_type"], item["ref_id"]) for item in initial_trace["references"]
@@ -13458,6 +13569,211 @@ async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(t
         calibration_call["evidence_references"]
     )
     assert "claim_capture" not in result
+
+
+@pytest.mark.asyncio
+async def test_governed_evidence_claim_links_bound_manifest_without_copying_acquisition(
+    tmp_path,
+):
+    result, memory_store, runtime, litellm, dsa = (
+        await _run_evidence_claim_capture_chat(tmp_path)
+    )
+
+    assert result["answer"] == "The retained file reports that the setting is active."
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_calibration_calls) == 1
+    assert len(memory_store.claim_record_calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert len(dsa.calls) == 1
+    assert memory_store.events[-4:] == [
+        "message:assistant",
+        "trace:1",
+        "claim_record",
+        "trace:2",
+    ]
+
+    initial_trace = memory_store.trace_calls[0]["payload"]
+    final_trace = memory_store.trace_calls[1]["payload"]
+    manifest = initial_trace["prompt"]["evidence_acquisition"]
+    claim_payload = memory_store.claim_record_calls[0]["payload"]
+    claim_support = claim_payload["calibration_result"][
+        "validated_evidence_references"
+    ]
+    expected_message_id = "00000000-0000-4000-8000-000000000002"
+    expected_digest = f"sha256:{hashlib.sha256(result['answer'].encode()).hexdigest()}"
+
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert manifest["assistant_message_id"] == expected_message_id
+    assert manifest["response_digest"] == expected_digest
+    assert manifest["acquisition"]["sources_considered"] == [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    assert manifest["acquisition"]["sources_selected"] == [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    assert manifest["acquisition"]["source_references_returned"] == [
+        "vehicle_log_primary:record_1",
+        "vehicle_log_secondary:record_2",
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == [
+        "vehicle_log_primary:record_1",
+        "vehicle_log_secondary:record_2",
+    ]
+
+    assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
+    assert claim_payload["assistant_message_id"] == expected_message_id
+    assert claim_payload["calibration_result"]["claim_anchor_digest"] == expected_digest
+    assert claim_support == [
+        {
+            "ref_type": "derived_text",
+            "ref_id": "derived-text-1",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "support_kind": "direct",
+            "authority": "user_report",
+            "freshness_state": "active",
+        }
+    ]
+    serialized_payload = json.dumps(claim_payload, sort_keys=True)
+    for prohibited in (
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+        "record_1",
+        "record_2",
+        "sources_considered",
+        "sources_selected",
+        "source_references_returned",
+        "source_references_retained",
+        "exact_reference_attempts",
+        "evidence_acquisition",
+    ):
+        assert prohibited not in serialized_payload
+    assert "acquisition_manifest_id" not in json.dumps(
+        claim_payload["calibration_result"],
+        sort_keys=True,
+    )
+    assert initial_trace["prompt"]["claim_capture"][
+        "acquisition_manifest_status"
+    ] == "bound"
+    assert initial_trace["prompt"]["claim_capture"][
+        "acquisition_manifest_linked"
+    ] is True
+    assert final_trace["prompt"]["claim_capture"]["persistence_status"] == "persisted"
+    assert final_trace["prompt"]["evidence_acquisition"] == manifest
+
+
+@pytest.mark.asyncio
+async def test_invalid_bound_manifest_skips_claim_storage_without_exposing_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    original = orchestrate_service.bind_manifest_response
+
+    def bind_invalid_digest(manifest, *, assistant_message_ack, answer):
+        original(
+            manifest,
+            assistant_message_ack=assistant_message_ack,
+            answer=answer,
+        )
+        manifest["response_digest"] = "sha256:" + ("0" * 64)
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "bind_manifest_response",
+        bind_invalid_digest,
+    )
+    result, memory_store, runtime, litellm, _ = (
+        await _run_evidence_claim_capture_chat(tmp_path)
+    )
+
+    assert result["answer"] == "The retained file reports that the setting is active."
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_calibration_calls) == 1
+    assert memory_store.claim_record_calls == []
+    assert len(memory_store.trace_calls) == 1
+    capture = memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]
+    assert capture["persistence_status"] == "not_attempted"
+    assert capture["reason_code"] == "acquisition_manifest_association_invalid"
+    assert capture["acquisition_manifest_status"] == "invalid"
+    assert capture["acquisition_manifest_linked"] is False
+    assert "sha256:" + ("0" * 64) not in json.dumps(capture, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_governed_manifest_claim_storage_rejection_is_nonfatal_and_not_retried(
+    tmp_path,
+):
+    memory_store = ClaimCaptureMemoryStore(
+        claim_record_error=RuntimeError("PRIVATE-MANIFEST-ASSOCIATION-ERROR")
+    )
+    result, memory_store, _, litellm, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+    )
+
+    assert result["answer"] == "The retained file reports that the setting is active."
+    assert len(litellm.calls) == 1
+    assert len(memory_store.claim_record_calls) == 1
+    assert len(memory_store.trace_calls) == 2
+    capture = memory_store.trace_calls[-1]["payload"]["prompt"]["claim_capture"]
+    assert capture["persistence_status"] == "failed"
+    assert capture["reason_code"] == "claim_record_persistence_failed"
+    assert capture["acquisition_manifest_status"] == "bound"
+    assert capture["acquisition_manifest_linked"] is True
+    assert "PRIVATE-MANIFEST-ASSOCIATION-ERROR" not in json.dumps(
+        capture,
+        sort_keys=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_text_cannot_select_the_claim_acquisition_manifest_id(tmp_path):
+    fake_manifest_id = "evidence_manifest_provider_selected"
+    litellm = FakeLiteLLM(
+        content=(
+            "The retained file reports that "
+            f"{fake_manifest_id} is the active setting."
+        )
+    )
+    result, memory_store, _, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        litellm=litellm,
+    )
+
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    claim_payload = memory_store.claim_record_calls[0]["payload"]
+    assert fake_manifest_id in result["answer"]
+    assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
+    assert claim_payload["acquisition_manifest_id"] != fake_manifest_id
+
+
+@pytest.mark.asyncio
+async def test_limited_multi_sentence_evidence_answer_keeps_manifest_without_claim(
+    tmp_path,
+):
+    result, memory_store, runtime, litellm, _ = (
+        await _run_evidence_claim_capture_chat(tmp_path, optional=True)
+    )
+
+    assert len(litellm.calls) == 1
+    assert "Some optional source scope was unavailable" in result["answer"]
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert len(memory_store.trace_calls) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    capture = trace["prompt"]["claim_capture"]
+    assert manifest["status"] == "sufficient_with_limitations"
+    assert manifest["assistant_message_id"] == (
+        "00000000-0000-4000-8000-000000000002"
+    )
+    assert capture["reason_code"] == "structured_answer"
+    assert capture["acquisition_manifest_status"] == "not_applicable"
+    assert capture["acquisition_manifest_linked"] is False
 
 
 @pytest.mark.asyncio
