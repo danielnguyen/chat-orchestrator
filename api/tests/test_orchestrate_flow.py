@@ -12944,6 +12944,206 @@ async def test_evidence_acquisition_exact_fetch_ineligible_paths_fail_closed(
 
 
 @pytest.mark.asyncio
+async def test_evidence_acquisition_exact_fetch_pending_continuation_blocks_dispatch(
+    tmp_path,
+    monkeypatch,
+):
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connector = DisplaySettingConnector(operations)
+    connectors = ActionConnectorRegistry((connector,))
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    litellm = SequenceLiteLLM(
+        [
+            _tool_completion(
+                "fixture_display_setting_apply",
+                {"target": "fixture:display", "level": 6},
+            )
+        ]
+    )
+    validation_calls = []
+    revalidation_calls = []
+    original_validate = orchestrate_service.validate_and_digest_capability_request
+    original_revalidate = connector.revalidate
+
+    def track_validation(*args, **kwargs):
+        validation_calls.append((args, kwargs))
+        return original_validate(*args, **kwargs)
+
+    async def track_revalidation(request):
+        revalidation_calls.append(request)
+        return await original_revalidate(request)
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "validate_and_digest_capability_request",
+        track_validation,
+    )
+    monkeypatch.setattr(connector, "revalidate", track_revalidation)
+
+    first = await orchestrate_chat(
+        payload=_display_chat_payload("Apply display level 6."),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-exact-pending-first",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    continuation, continuation_error = capability_service.parse_pending_action_confirmation(
+        {
+            "pending_action": first["pending_action"],
+            "confirmed": True,
+        }
+    )
+    assert continuation_error is None
+    assert continuation is not None
+    restored = capability_service.restore_pending_action_request(
+        continuation=continuation,
+        connector_registry=connectors,
+    )
+    assert restored.arguments == {"level": 6, "target": "fixture:display"}
+
+    provider_calls_before = len(litellm.calls)
+    validation_calls_before = len(validation_calls)
+    authorization_calls_before = len(runtime.capability_authorization_calls)
+    confirmation_calls_before = len(runtime.confirmation_calls)
+    verification_calls_before = len(runtime.world_state_verification_calls)
+    revalidation_calls_before = len(revalidation_calls)
+    action_summary_calls_before = len(runtime.action_summary_calls)
+    assistant_message_calls_before = sum(
+        message.get("role") == "assistant"
+        for message in memory_store.added_messages
+    )
+    trace_calls_before = len(memory_store.trace_calls)
+
+    blocked = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "Verify this exact maintenance record.",
+            external_context_enabled=True,
+            external_context=_exact_external_context(),
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-exact-pending-blocked",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert blocked["answer"] == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert blocked["status"] == "degraded"
+    assert "pending_action" not in blocked
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert len(litellm.calls) == provider_calls_before
+    assert len(validation_calls) == validation_calls_before
+    assert len(runtime.capability_authorization_calls) == authorization_calls_before
+    assert len(runtime.confirmation_calls) == confirmation_calls_before
+    assert len(runtime.world_state_verification_calls) == verification_calls_before
+    assert len(revalidation_calls) == revalidation_calls_before
+    assert operations.apply_inputs == []
+    assert connector.verify_inputs == []
+    assert len(runtime.action_summary_calls) == action_summary_calls_before
+    assert sum(
+        message.get("role") == "assistant"
+        for message in memory_store.added_messages
+    ) == assistant_message_calls_before + 1
+    assert len(memory_store.trace_calls) == trace_calls_before + 1
+
+    blocked_trace = memory_store.trace_calls[-1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]
+    capability_trace = blocked_trace["capabilities"]
+    assert capability_trace["validation"] == {
+        "validation_status": "not_requested",
+        "reason_code": "evidence_request_ineligible",
+    }
+    assert capability_trace["execution"] == {
+        "executor_called": False,
+        "executor_call_count": 0,
+        "executor_result_status": "not_called",
+        "failure_reason_code": "evidence_request_ineligible",
+        "response_status": "not_executed",
+    }
+    assert capability_trace["dispatch_completed"] is False
+    assert capability_trace["executor_call_count"] == 0
+    assert capability_trace["follow_up"]["status"] == "not_attempted"
+    assert capability_trace["action_summary_call_count"] == 0
+    assert capability_trace["fallback"]["blocked_after_dispatch"] is False
+    manifest = blocked_trace["evidence_acquisition"]
+    assert manifest["status"] == "capability_path_ineligible"
+    assert manifest["attempted"] is False
+    assert manifest["acquisition"]["strategy_attempted"] is None
+    assert manifest["acquisition"]["exact_reference_attempts"] == []
+    assert manifest["acquisition"]["exact_reference_attempt_count"] == 0
+    assert manifest["acquisition"]["source_references_returned"] == []
+    assert manifest["acquisition"]["source_references_retained"] == []
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["assistant_message_id"] == "m-1"
+    assert manifest["response_digest"] == (
+        f"sha256:{hashlib.sha256(blocked['answer'].encode()).hexdigest()}"
+    )
+
+    accepted = await orchestrate_chat(
+        payload=_display_chat_payload(
+            "yes",
+            capability_confirmation={
+                "pending_action": first["pending_action"],
+                "confirmed": True,
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-exact-pending-control",
+        capability_registry_enabled=True,
+        action_connector_registry=connectors,
+    )
+
+    assert len(operations.apply_inputs) == 1
+    assert operations.apply_inputs[0] == {
+        "request_id": (
+            "rid-exact-pending-control:"
+            "fixture.display_setting_apply:execute"
+        ),
+        "target": "fixture:display",
+        "level": 6,
+    }
+    assert runtime.dispatch_count == 1
+    assert len(validation_calls) == validation_calls_before + 1
+    assert len(runtime.confirmation_calls) == confirmation_calls_before + 1
+    assert len(runtime.action_summary_calls) == action_summary_calls_before + 1
+    assert "Verification is not supported" in accepted["answer"]
+    assert "pending_action" not in accepted
+
+
+@pytest.mark.asyncio
 async def test_evidence_acquisition_exact_fetch_plan_without_references_fails_closed(
     tmp_path,
 ):

@@ -7201,7 +7201,19 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
-        if capability_registry_enabled and not _registry_allows_exact_capability(
+        if exact_reference_request:
+            capability_descriptors = []
+            capability_exposure_trace = {
+                "schema_version": "capability-exposure.v1",
+                "status": "not_requested",
+                "reason": "evidence_request_only",
+                "descriptor_count": 0,
+                "descriptor_fingerprint": None,
+                "exposed_capability_ids": [],
+                "blocked_capability_ids": [],
+                "blocked_reasons": {},
+            }
+        elif capability_registry_enabled and not _registry_allows_exact_capability(
             capability_registry_trace
         ):
             capability_descriptors = []
@@ -7467,14 +7479,19 @@ async def orchestrate_chat(
         )
         model_started = perf_counter()
         evidence_provider_allowed = provider_allowed(evidence_acquisition)
+        capability_dispatch_blocked_by_evidence = bool(
+            exact_reference_request
+            and evidence_acquisition is not None
+            and not evidence_provider_allowed
+        )
         try:
-            if pending_continuation is not None:
-                completion = {"choices": [{"message": {"content": ""}}]}
-            elif not evidence_provider_allowed:
+            if not evidence_provider_allowed:
                 completion = {"choices": [{"message": {"content": ""}}]}
                 selected_model = "not_called"
                 selected_provider = "none"
                 status = "degraded"
+            elif pending_continuation is not None:
+                completion = {"choices": [{"message": {"content": ""}}]}
             else:
                 completion = await litellm.chat(
                     request_id=request_id,
@@ -7677,11 +7694,32 @@ async def orchestrate_chat(
         pending_action: dict[str, Any] | None = None
         try:
             capability_request = (
-                pending_capability_request
-                if pending_continuation is not None
-                else parse_provider_capability_request(completion)
+                None
+                if capability_dispatch_blocked_by_evidence
+                else (
+                    pending_capability_request
+                    if pending_continuation is not None
+                    else parse_provider_capability_request(completion)
+                )
             )
-            if capability_request is not None:
+            if capability_dispatch_blocked_by_evidence:
+                prompt.trace["capabilities"]["validation"] = {
+                    "validation_status": "not_requested",
+                    "reason_code": "evidence_request_ineligible",
+                }
+                prompt.trace["capabilities"]["execution"] = {
+                    "executor_called": False,
+                    "executor_call_count": 0,
+                    "executor_result_status": "not_called",
+                    "failure_reason_code": "evidence_request_ineligible",
+                    "response_status": "not_executed",
+                }
+                prompt.trace["capabilities"]["follow_up"] = (
+                    _capability_follow_up_empty_trace()
+                )
+                prompt.trace["capabilities"]["dispatch_completed"] = False
+                prompt.trace["capabilities"]["executor_call_count"] = 0
+            elif capability_request is not None:
                 registry_capability_allowed = (
                     _registry_allows_exact_capability(capability_registry_trace)
                     and capability_request.capability_id == matched_capability_id
@@ -7796,18 +7834,24 @@ async def orchestrate_chat(
             prompt.trace["capabilities"]["dispatch_completed"] = False
             prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
-        action_summary_trace, action_summary_answer = await _compose_action_summary(
-            runtime=runtime,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            active_persona_id=runtime_identity_trace.get("active_persona_id"),
-            capability_registry_trace=capability_registry_trace,
-            capability_execution_trace=prompt.trace["capabilities"].get("execution"),
-        )
+        if capability_dispatch_blocked_by_evidence:
+            action_summary_trace, action_summary_answer = (
+                _action_summary_empty_trace(),
+                None,
+            )
+        else:
+            action_summary_trace, action_summary_answer = await _compose_action_summary(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                active_persona_id=runtime_identity_trace.get("active_persona_id"),
+                capability_registry_trace=capability_registry_trace,
+                capability_execution_trace=prompt.trace["capabilities"].get("execution"),
+            )
         prompt.trace["capabilities"]["action_summary"] = action_summary_trace
         prompt.trace["capabilities"]["action_summary_call_count"] = (
             1 if action_summary_trace.get("attempted") is True else 0
