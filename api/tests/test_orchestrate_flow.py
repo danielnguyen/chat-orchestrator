@@ -13345,12 +13345,23 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
         *,
         listed_records=None,
         list_error: Exception | None = None,
+        trace_error: Exception | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.listed_records = [] if listed_records is None else listed_records
         self.list_error = list_error
+        self.trace_error = trace_error
         self.claim_record_list_calls = []
+        self.trace_get_calls = []
+        self.traces_by_request_id = {}
+
+    async def create_trace(self, **kwargs):
+        response = await super().create_trace(**kwargs)
+        self.traces_by_request_id[kwargs["request_id"]] = copy.deepcopy(
+            kwargs["payload"]
+        )
+        return response
 
     async def create_claim_record(self, **kwargs):
         response = await super().create_claim_record(**kwargs)
@@ -13362,6 +13373,12 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
         if self.list_error is not None:
             raise self.list_error
         return {"records": copy.deepcopy(self.listed_records)}
+
+    async def get_trace(self, request_id):
+        self.trace_get_calls.append(request_id)
+        if self.trace_error is not None:
+            raise self.trace_error
+        return copy.deepcopy(self.traces_by_request_id[request_id])
 
 
 async def _run_claim_capture_chat(
@@ -13459,6 +13476,52 @@ async def _run_evidence_claim_capture_chat(
         request_id=request_id,
     )
     return result, memory_store, runtime, litellm, dsa
+
+
+async def _run_acquisition_explanation_follow_up(
+    tmp_path,
+    *,
+    follow_up: str,
+    prior_answer: str,
+    memory_store,
+    runtime,
+    messages=None,
+    request_id="request-acquisition-explanation",
+):
+    rules, models = _write_default_route_files(tmp_path)
+    dsa = FakeDSA()
+    provider = FailingLiteLLM()
+    prior_counts = {
+        "retrieve": len(memory_store.retrieve_calls),
+        "shape": len(runtime.evidence_shape_calls),
+        "plan": len(runtime.evidence_plan_calls),
+        "sufficiency": len(runtime.evidence_sufficiency_calls),
+        "provider": 0,
+    }
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            follow_up,
+            conversation_id="conv-1",
+            messages=messages
+            or [
+                {"role": "assistant", "content": prior_answer},
+                {"role": "user", "content": follow_up},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+    return result, provider, dsa, prior_counts
 
 
 async def _capture_two_explanation_claims(tmp_path):
@@ -13920,6 +13983,262 @@ async def test_orchestrate_provider_fallback_still_calibrates_and_persists_once(
     assert len(runtime.claim_calibration_calls) == 1
     assert len(memory_store.claim_record_calls) == 1
     assert len(memory_store.trace_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_path):
+    memory_store = ClaimExplanationMemoryStore()
+    runtime = None
+    first, _, runtime, first_provider, first_dsa = (
+        await _run_evidence_claim_capture_chat(
+            tmp_path,
+            memory_store=memory_store,
+            runtime=runtime,
+            request_id="request-acquisition-original",
+        )
+    )
+    assert len(first_provider.calls) == 1
+    assert len(memory_store.claim_record_calls) == 1
+    manifest = memory_store.traces_by_request_id["request-acquisition-original"][
+        "prompt"
+    ]["evidence_acquisition"]
+    assert memory_store.listed_records[0]["acquisition_manifest_id"] == manifest[
+        "manifest_id"
+    ]
+
+    follow_up, provider, dsa, prior_counts = (
+        await _run_acquisition_explanation_follow_up(
+            tmp_path,
+            follow_up="What did you check?",
+            prior_answer=first["answer"],
+            memory_store=memory_store,
+            runtime=runtime,
+        )
+    )
+
+    assert follow_up == {
+        "request_id": "request-acquisition-explanation",
+        "conversation_id": "conv-1",
+        "profile_name": "dev",
+        "selected_model": "not_called",
+        "answer": (
+            "For that earlier answer, the retained record shows a targeted lookup. It "
+            "considered 2 configured sources, selected 2, returned 2 items, and "
+            "delivered 2 to reasoning. The recorded evidence was sufficient for the "
+            "declared targeted scope. This was not an exhaustive review of every "
+            "potentially relevant source. I did not perform a new verification for "
+            "this explanation."
+        ),
+        "status": "ok",
+        "sources": [],
+    }
+    assert memory_store.claim_record_list_calls == [
+        {"owner_id": "owner", "conversation_id": "conv-1", "limit": 20}
+    ]
+    assert memory_store.trace_get_calls == ["request-acquisition-original"]
+    assert len(memory_store.retrieve_calls) == prior_counts["retrieve"]
+    assert len(runtime.evidence_shape_calls) == prior_counts["shape"]
+    assert len(runtime.evidence_plan_calls) == prior_counts["plan"]
+    assert len(runtime.evidence_sufficiency_calls) == prior_counts["sufficiency"]
+    assert provider.calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert len(first_dsa.calls) == 1
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    explanation = trace["prompt"]["claim_explanation"]
+    assert trace["retrieval"]["status"] == "not_requested"
+    assert trace["model_call"]["status"] == "not_called"
+    assert explanation["explanation_kind"] == "acquisition"
+    assert explanation["acquisition_question"] == "checked"
+    assert explanation["acquisition_trace_lookup_status"] == "completed"
+    assert explanation["manifest_resolution_status"] == "resolved"
+    assert explanation["provider_call_count"] == 0
+    assert explanation["storage_call_count"] == 2
+    serialized = json.dumps((follow_up, trace), sort_keys=True)
+    for prohibited in (
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+        "record_1",
+        "record_2",
+        "PRIVATE SOURCE",
+        "PRIVATE EXACT",
+        "The maintenance record lists",
+    ):
+        assert prohibited not in serialized
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_free(
+    tmp_path,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    runtime = None
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-acquisition-coverage-original",
+    )
+
+    coverage, provider, dsa, _ = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up="Did you look at everything relevant?",
+        prior_answer=first["answer"],
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-acquisition-coverage",
+    )
+    assert coverage["answer"].startswith("No—not universally.")
+    assert "not an exhaustive review" in coverage["answer"]
+    assert provider.calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+
+    quoted_text = (
+        f'What did you check for the statement "{first["answer"]}"?'
+    )
+    quoted, provider, dsa, _ = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up=quoted_text,
+        prior_answer="A newer answer.",
+        messages=[
+            {"role": "assistant", "content": first["answer"]},
+            {"role": "user", "content": "Continue."},
+            {"role": "assistant", "content": "A newer answer."},
+            {"role": "user", "content": quoted_text},
+        ],
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-acquisition-quoted",
+    )
+    assert quoted["status"] == "ok"
+    assert quoted["answer"].startswith(
+        "For that earlier answer, the retained record shows a targeted lookup."
+    )
+    assert provider.calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    explanation = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "claim_explanation"
+    ]
+    assert explanation["target_mode"] == "quoted_anchor"
+    assert explanation["reason_code"] == "quoted_acquisition_record_resolved"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_linked_claim_support_explanation_does_not_fetch_manifest(
+    tmp_path,
+):
+    memory_store = ClaimExplanationMemoryStore(
+        trace_error=AssertionError("support explanation must not fetch trace")
+    )
+    runtime = None
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-linked-support-original",
+    )
+
+    rules, models = _write_default_route_files(tmp_path)
+    provider = FailingLiteLLM()
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "How are you sure?",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "How are you sure?"},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-linked-support-explanation",
+    )
+
+    assert result["status"] == "ok"
+    assert result["answer"].startswith("I based that earlier statement on")
+    assert memory_store.trace_get_calls == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_acquisition_trace_failure_is_bounded_and_dsa_free(
+    tmp_path,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    runtime = None
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-acquisition-trace-failure-original",
+    )
+    memory_store.trace_error = RuntimeError("PRIVATE-TRACE-FAILURE")
+
+    follow_up, provider, dsa, _ = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up="What did you check?",
+        prior_answer=first["answer"],
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-acquisition-trace-failure",
+    )
+
+    assert follow_up["status"] == "degraded"
+    assert follow_up["answer"] == (
+        "I couldn’t access the retained acquisition record for that earlier answer. "
+        "I can’t honestly reconstruct what was checked from memory, and I did not "
+        "perform a new verification."
+    )
+    assert provider.calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["prompt"]["claim_explanation"][
+        "acquisition_trace_lookup_status"
+    ] == "failed"
+    assert "PRIVATE-TRACE-FAILURE" not in json.dumps((follow_up, trace))
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_compound_acquisition_recheck_uses_ordinary_provider_path(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = ClaimExplanationMemoryStore()
+    provider = FakeLiteLLM(content="ordinary response")
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What did you check? Check again.",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": "A prior answer."},
+                {"role": "user", "content": "What did you check? Check again."},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-compound-acquisition-recheck",
+    )
+    assert result["answer"] == "ordinary response"
+    assert len(provider.calls) == 1
+    assert len(memory_store.retrieve_calls) == 1
+    assert memory_store.claim_record_list_calls == []
+    assert memory_store.trace_get_calls == []
 
 
 @pytest.mark.asyncio
