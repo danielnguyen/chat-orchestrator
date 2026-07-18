@@ -1410,6 +1410,7 @@ class FakeDSA:
         self.calls = []
         self.list_calls = []
         self.fetch_calls = []
+        self.context_calls = []
         self.response = response or {"sources_used": [], "items": []}
         self.error = error
         self.source_response = source_response or {
@@ -1450,6 +1451,10 @@ class FakeDSA:
         if isinstance(response, Exception):
             raise response
         return response
+
+    async def context_source(self, **kwargs):
+        self.context_calls.append(kwargs)
+        raise AssertionError("context expansion is not supported by this test path")
 
 
 def _http_status_error(
@@ -11330,6 +11335,12 @@ def _governed_context_pack(query: str) -> dict[str, object]:
                 "content_type": "text",
                 "text": "The maintenance record lists 2025-07-12.",
                 "confidence": "high",
+                "available_context": [
+                    {
+                        "context_mode": "nearby_rows",
+                        "description": "PRIVATE EXPANSION DESCRIPTION SENTINEL",
+                    }
+                ],
                 "warnings": [],
             }
         ],
@@ -11725,6 +11736,8 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert len(runtime.evidence_sufficiency_calls) == 1
     assert len(dsa.list_calls) == 1
     assert len(dsa.calls) == 1
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
     assert dsa.calls[0]["query"] == "Verify the maintenance record."
     assert len(litellm.calls) == 1
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
@@ -11778,6 +11791,17 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     serialized = json.dumps(manifest, sort_keys=True)
     assert "The maintenance record lists" not in serialized
     assert "PRIVATE SOURCE" not in serialized
+    provider_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    prompt_trace = json.dumps(trace, sort_keys=True)
+    public_response = json.dumps(out, sort_keys=True)
+    for prohibited in (
+        "nearby_rows",
+        "PRIVATE EXPANSION DESCRIPTION SENTINEL",
+    ):
+        assert prohibited not in provider_messages
+        assert prohibited not in prompt_trace
+        assert prohibited not in serialized
+        assert prohibited not in public_response
 
 
 @pytest.mark.asyncio
@@ -12222,6 +12246,32 @@ async def test_evidence_acquisition_malformed_context_is_filtered_and_withheld(
     ]
     serialized = json.dumps(memory_store.trace_calls[0]["payload"])
     assert "PRIVATE RAW METADATA" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_evidence_acquisition_malformed_context_descriptor_is_filtered_and_withheld(
+    tmp_path,
+):
+    malformed = _governed_context_pack("Verify the maintenance record.")
+    malformed["items"][0]["available_context"][0]["credentials"] = (
+        "PRIVATE DESCRIPTOR CREDENTIAL"
+    )
+    out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
+        tmp_path=tmp_path,
+        response=malformed,
+        request_id="rid-evidence-malformed-context-descriptor",
+    )
+
+    _assert_governed_context_rejected(
+        out=out,
+        runtime=runtime,
+        dsa=dsa,
+        litellm=litellm,
+        memory_store=memory_store,
+        prohibited_text="PRIVATE DESCRIPTOR CREDENTIAL",
+    )
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
 
 
 @pytest.mark.asyncio

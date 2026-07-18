@@ -381,6 +381,11 @@ class DsaBudget(StrictModel):
     truncated: bool
 
 
+class DsaAvailableContext(StrictModel):
+    context_mode: Identifier
+    description: Annotated[str, Field(min_length=1, max_length=500)]
+
+
 class DsaItem(StrictModel):
     result_id: Identifier
     source_type: Identifier
@@ -393,7 +398,29 @@ class DsaItem(StrictModel):
     content_type: Identifier
     text: Annotated[str, Field(min_length=1, max_length=12000)]
     confidence: Literal["none", "low", "medium", "high"]
+    available_context: list[DsaAvailableContext] = Field(
+        default_factory=list,
+        max_length=16,
+    )
     warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
+
+    @field_validator("available_context", mode="before")
+    @classmethod
+    def validate_available_context_collection(cls, value: object) -> object:
+        if not isinstance(value, list):
+            raise ValueError("available_context_must_be_list")
+        return value
+
+    @field_validator("available_context")
+    @classmethod
+    def validate_unique_context_modes(
+        cls,
+        value: list[DsaAvailableContext],
+    ) -> list[DsaAvailableContext]:
+        context_modes = [descriptor.context_mode for descriptor in value]
+        if len(set(context_modes)) != len(context_modes):
+            raise ValueError("duplicate_available_context_mode")
+        return value
 
     @field_validator("source_ref")
     @classmethod
@@ -459,11 +486,6 @@ class DsaContextPackResponse(StrictModel):
         if len(set(refs)) != len(refs):
             raise ValueError("duplicate_source_reference")
         return self
-
-
-class DsaAvailableContext(StrictModel):
-    context_mode: Identifier
-    description: Annotated[str, Field(min_length=1, max_length=500)]
 
 
 class DsaFetchItem(StrictModel):
@@ -1053,7 +1075,10 @@ def validate_context_pack_response(
             selected_sources
         ):
             raise ValueError("candidate_count_source_not_selected")
-    return validated.model_dump(mode="json")
+    normalized = validated.model_dump(mode="json")
+    for item in normalized["items"]:
+        item.pop("available_context", None)
+    return normalized
 
 
 def validate_fetch_response(
