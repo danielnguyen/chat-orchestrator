@@ -11,6 +11,7 @@ from services.evidence_acquisition import (
     LIMITATION_SUFFIX,
     TARGETED_SCOPE_SUFFIX,
     WITHHELD_ANSWER,
+    DsaItem,
     DsaSourceListResponse,
     begin_evidence_acquisition,
     bind_manifest_response,
@@ -703,6 +704,147 @@ def _validated_context_pack(
     )
 
 
+def test_context_pack_contract_accepts_legacy_and_explicit_empty_descriptors():
+    legacy_item = DsaItem.model_validate(_context_pack()["items"][0])
+    legacy = _validated_context_pack()
+    explicit_empty_response = copy.deepcopy(_context_pack())
+    explicit_empty_response["items"][0]["available_context"] = []
+    explicit_empty_item = DsaItem.model_validate(
+        explicit_empty_response["items"][0]
+    )
+    explicit_empty = _validated_context_pack(explicit_empty_response)
+
+    assert legacy_item.available_context == []
+    assert explicit_empty_item.available_context == []
+    assert legacy == explicit_empty
+    assert "available_context" not in legacy["items"][0]
+    assert "available_context" not in explicit_empty["items"][0]
+
+
+def test_context_pack_contract_validates_descriptor_order_then_removes_descriptors():
+    response = copy.deepcopy(_context_pack())
+    response["items"][0]["available_context"] = [
+        {
+            "context_mode": "nearby_rows",
+            "description": "Fetch nearby rows.",
+        },
+        {
+            "context_mode": "following",
+            "description": "Fetch following context.",
+        },
+    ]
+
+    validated_item = DsaItem.model_validate(response["items"][0])
+    normalized = _validated_context_pack(response)
+
+    assert [
+        descriptor.context_mode
+        for descriptor in validated_item.available_context
+    ] == ["nearby_rows", "following"]
+    assert "available_context" not in normalized["items"][0]
+    assert normalized == _validated_context_pack()
+
+
+@pytest.mark.parametrize(
+    "available_context",
+    [
+        {"context_mode": "nearby_rows", "description": "Fetch nearby rows."},
+        (
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+            },
+        ),
+        ["nearby_rows"],
+        [
+            {
+                "context_mode": f"mode_{index}",
+                "description": "Fetch bounded context.",
+            }
+            for index in range(17)
+        ],
+        [{"description": "Fetch nearby rows."}],
+        [{"context_mode": "nearby_rows"}],
+        [{"context_mode": "", "description": "Fetch nearby rows."}],
+        [{"context_mode": "nearby rows", "description": "Fetch nearby rows."}],
+        [
+            {
+                "context_mode": "https://private.invalid/context",
+                "description": "Fetch nearby rows.",
+            }
+        ],
+        [
+            {
+                "context_mode": "nearby_rows?window=1",
+                "description": "Fetch nearby rows.",
+            }
+        ],
+        [{"context_mode": "x" * 121, "description": "Fetch nearby rows."}],
+        [{"context_mode": "nearby_rows", "description": "x" * 501}],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+            },
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows again.",
+            },
+        ],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+                "metadata": {"private": True},
+            }
+        ],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+                "arguments": {"window": 5},
+            }
+        ],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+                "credentials": "PRIVATE CREDENTIAL",
+            }
+        ],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+                "url": "https://private.invalid/context",
+            }
+        ],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+                "raw": {"private": "PRIVATE RAW CONTENT"},
+            }
+        ],
+        [
+            {
+                "context_mode": "nearby_rows",
+                "description": "Fetch nearby rows.",
+                "source_config": {"private": True},
+            }
+        ],
+    ],
+)
+def test_context_pack_contract_rejects_malformed_descriptors(
+    available_context,
+):
+    response = copy.deepcopy(_context_pack())
+    response["items"][0]["available_context"] = available_context
+
+    with pytest.raises(ValidationError):
+        _validated_context_pack(response)
+
+
 def test_context_pack_contract_rejects_raw_metadata_and_malformed_items():
     validated = _validated_context_pack()
     assert validated["query_id"] == "query_1"
@@ -711,6 +853,18 @@ def test_context_pack_contract_rejects_raw_metadata_and_malformed_items():
             {
                 **_context_pack(),
                 "items": [{**_context_pack()["items"][0], "raw": {"secret": "value"}}],
+            }
+        )
+    with pytest.raises(ValidationError):
+        _validated_context_pack(
+            {
+                **_context_pack(),
+                "items": [
+                    {
+                        **_context_pack()["items"][0],
+                        "unexpected_item_field": "not allowed",
+                    }
+                ],
             }
         )
     for diagnostics in (

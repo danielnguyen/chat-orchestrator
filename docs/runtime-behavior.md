@@ -136,6 +136,14 @@ attempts every declared reference without retry, and never falls back to
 semantic search. Every response must match the declared source ID and exact
 reference.
 
+Context-pack items may also declare bounded `available_context` descriptors for
+connector-owned expansion modes. The current targeted path strictly validates
+those descriptors, then removes them before prompt assembly, trace retention,
+manifest construction, and public response rendering. It does not select an
+expansion target or call the DSA context endpoint. Deploy this consumer
+compatibility before a DSA producer that always emits the additive field.
+Governed hybrid expansion remains outside the current execution boundary.
+
 After prompt assembly, Chat Orchestrator reports requirement outcomes based on
 what was actually acquired and what external context survived into provider
 reasoning.
