@@ -216,6 +216,109 @@ async def test_fetch_source_timeout_propagates_without_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_context_source_posts_exact_bounded_payload_and_override():
+    client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, object]):
+        calls.append((path, json))
+        return {"retrieval_mode": "context", "results": []}
+
+    client._post = fake_post  # type: ignore[method-assign]
+
+    response = await client.context_source(
+        source_ref="connector:source-a:item-1",
+        context_mode="nearby_rows",
+    )
+    await client.context_source(
+        source_ref="connector:source-b:item-2",
+        context_mode="following",
+        budget={
+            "max_rows": 3,
+            "max_bytes": 40000,
+            "max_text_chars": 9000,
+        },
+    )
+
+    assert response == {"retrieval_mode": "context", "results": []}
+    assert calls == [
+        (
+            "/v1/sources/context",
+            {
+                "source_ref": "connector:source-a:item-1",
+                "context_mode": "nearby_rows",
+                "budget": {
+                    "max_rows": 5,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+            },
+        ),
+        (
+            "/v1/sources/context",
+            {
+                "source_ref": "connector:source-b:item-2",
+                "context_mode": "following",
+                "budget": {
+                    "max_rows": 3,
+                    "max_bytes": 40000,
+                    "max_text_chars": 9000,
+                },
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_context_source_preserves_headers_timeout_and_http_boundary(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json, headers):
+            captured.update(url=url, json=json, headers=headers)
+            return httpx.Response(
+                503,
+                json={"detail": "PRIVATE ERROR"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = DataSourceAggregatorClient(
+        "http://dsa.local",
+        timeout_ms=1750,
+        api_key="dsa-secret",
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.context_source(
+            source_ref="connector:source-a:item-1",
+            context_mode="nearby_rows",
+        )
+
+    assert captured["timeout"] == 1.75
+    assert captured["url"] == "http://dsa.local/v1/sources/context"
+    assert captured["headers"] == {"X-API-Key": "dsa-secret"}
+    assert captured["json"] == {
+        "source_ref": "connector:source-a:item-1",
+        "context_mode": "nearby_rows",
+        "budget": {
+            "max_rows": 5,
+            "max_bytes": 50000,
+            "max_text_chars": 12000,
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_client_includes_api_key_header_when_configured(monkeypatch):
     client = DataSourceAggregatorClient(
         "http://dsa.local",

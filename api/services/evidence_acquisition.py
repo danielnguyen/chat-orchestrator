@@ -139,6 +139,10 @@ TARGETED_SCOPE_SUFFIX = (
     "This reflects only the targeted sources checked, not a complete search of every "
     "possible source."
 )
+COMPARISON_SCOPE_SUFFIX = (
+    "This comparison is limited to the selected sources and bounded context checked, "
+    "not every potentially relevant source."
+)
 
 
 class StrictModel(BaseModel):
@@ -257,6 +261,12 @@ class PlanResult(StrictModel):
         ids = [item.requirement_id for item in self.declared_requirements]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate_evidence_requirement")
+        requirement_shapes = [
+            (item.requirement_kind, item.criticality)
+            for item in self.declared_requirements
+        ]
+        if len(set(requirement_shapes)) != len(requirement_shapes):
+            raise ValueError("duplicate_evidence_requirement_shape")
         if self.plan_status == "ready_with_limitations" and not any(
             item.criticality == "optional" for item in self.declared_requirements
         ):
@@ -542,6 +552,74 @@ class DsaFetchResponse(StrictModel):
         return self
 
 
+class DsaContextItem(StrictModel):
+    result_id: Identifier
+    source_type: Identifier
+    source_id: Identifier
+    source_name: Annotated[str, Field(min_length=1, max_length=240)]
+    source_ref: Annotated[str, Field(min_length=1, max_length=240)]
+    retrieved_at: datetime
+    source_modified_at: datetime | None = None
+    cache_status: Literal["live", "cached", "stale", "unknown"]
+    title: Annotated[str, Field(min_length=1, max_length=500)]
+    content_type: Identifier
+    text: Annotated[str, Field(min_length=1, max_length=12000)]
+    url: Annotated[str, Field(max_length=2048)] | None = None
+    confidence: Literal["none", "low", "medium", "high"]
+    raw: dict[str, Any] | None = None
+    available_context: list[DsaAvailableContext] = Field(max_length=16)
+    warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_opaque_source_ref(cls, value: str) -> str:
+        if re.search(r"\s|://|\?", value):
+            raise ValueError("unsafe_source_reference")
+        return value
+
+    @field_validator("available_context")
+    @classmethod
+    def validate_unique_context_modes(
+        cls,
+        value: list[DsaAvailableContext],
+    ) -> list[DsaAvailableContext]:
+        modes = [descriptor.context_mode for descriptor in value]
+        if len(set(modes)) != len(modes):
+            raise ValueError("duplicate_available_context_mode")
+        return value
+
+    @model_validator(mode="after")
+    def reject_raw_data(self) -> DsaContextItem:
+        if self.raw is not None:
+            raise ValueError("raw_context_data_not_allowed")
+        return self
+
+
+class DsaContextResponse(StrictModel):
+    query_id: Identifier
+    answerable: bool
+    confidence: Literal["none", "low", "medium", "high"]
+    retrieval_mode: Literal["context"]
+    results: list[DsaContextItem] = Field(max_length=250)
+    warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
+    errors: list[DsaError] = Field(max_length=12)
+    budget: DsaBudget
+
+    @model_validator(mode="after")
+    def validate_result_accounting(self) -> DsaContextResponse:
+        if self.answerable != bool(self.results):
+            raise ValueError("context_answerability_mismatch")
+        if self.budget.returned_results != len(self.results):
+            raise ValueError("context_result_count_mismatch")
+        result_ids = [item.result_id for item in self.results]
+        if len(set(result_ids)) != len(result_ids):
+            raise ValueError("duplicate_context_result")
+        source_refs = [item.source_ref for item in self.results]
+        if len(set(source_refs)) != len(source_refs):
+            raise ValueError("duplicate_context_source_reference")
+        return self
+
+
 @dataclass
 class EvidenceAcquisitionState:
     enabled: bool
@@ -558,6 +636,7 @@ class EvidenceAcquisitionState:
     acquisition_facts: list[dict[str, str]] | None = None
     exact_source_refs: list[dict[str, str]] | None = None
     exact_attempts: list[dict[str, Any]] | None = None
+    expansion_attempts: list[dict[str, Any]] | None = None
 
     @property
     def supported_targeted_path(self) -> bool:
@@ -600,8 +679,65 @@ class EvidenceAcquisitionState:
         )
 
     @property
+    def supported_hybrid_comparison_path(self) -> bool:
+        plan = self.plan
+        if not (
+            plan
+            and plan.task_shape == "cross_source_comparison"
+            and plan.plan_status in {"ready", "ready_with_limitations"}
+            and plan.selected_strategies == ["hybrid"]
+            and not self.exact_source_refs
+            and plan.completeness_expectation == "complete_for_selected_sources"
+            and plan.contradiction_search_required is False
+            and 2 <= len(plan.eligible_source_ids) <= 8
+            and len(set(plan.eligible_source_ids)) == len(plan.eligible_source_ids)
+            and self.inventory is not None
+        ):
+            return False
+        required_material = {
+            "selected_source_coverage",
+            "cross_source_comparison",
+            "context_delivery",
+        }
+        material = {
+            item.requirement_kind
+            for item in plan.declared_requirements
+            if item.criticality == "material"
+        }
+        if material != required_material:
+            return False
+        optional = {
+            item.requirement_kind
+            for item in plan.declared_requirements
+            if item.criticality == "optional"
+        }
+        if optional - {"selected_source_coverage"}:
+            return False
+        eligible = set(plan.eligible_source_ids)
+        if not set(plan.authoritative_source_ids).issubset(eligible):
+            return False
+        inventory_by_id = {
+            source.source_id: source for source in self.inventory.sources
+        }
+        for source_id in eligible:
+            source = inventory_by_id.get(source_id)
+            if (
+                source is None
+                or not source.enabled
+                or source.status != "ready"
+                or "search" not in source.capabilities
+                or "context" not in source.capabilities
+            ):
+                return False
+        return True
+
+    @property
     def supported_governed_path(self) -> bool:
-        return self.supported_targeted_path or self.supported_exact_path
+        return (
+            self.supported_targeted_path
+            or self.supported_exact_path
+            or self.supported_hybrid_comparison_path
+        )
 
 
 def disabled_evidence_trace(*, enabled: bool, reason: str) -> dict[str, Any]:
@@ -744,6 +880,7 @@ def _manifest_id(
     considered_source_ids: list[str] | None = None,
     selected_source_ids: list[str] | None = None,
     exact_attempts: list[dict[str, Any]] | None = None,
+    expansion_attempts: list[dict[str, Any]] | None = None,
 ) -> str:
     normalized_attempts = sorted(
         [
@@ -769,6 +906,26 @@ def _manifest_id(
         "considered_source_ids": sorted(considered_source_ids or []),
         "selected_source_ids": sorted(selected_source_ids or []),
         "exact_attempts": normalized_attempts,
+        "expansion_attempts": sorted(
+            [
+                {
+                    "source_id": item.get("source_id"),
+                    "seed_source_ref": item.get("seed_source_ref"),
+                    "context_mode": item.get("context_mode"),
+                    "outcome": item.get("outcome"),
+                    "query_id": item.get("query_id"),
+                    "returned_reference_count": item.get(
+                        "returned_reference_count"
+                    ),
+                }
+                for item in (expansion_attempts or [])
+            ],
+            key=lambda item: (
+                str(item.get("source_id") or ""),
+                str(item.get("seed_source_ref") or ""),
+                str(item.get("context_mode") or ""),
+            ),
+        ),
     }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"evidence_manifest_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
@@ -818,6 +975,8 @@ def _validate_scope_echo(
 
 def _validate_supported_plan(state: EvidenceAcquisitionState) -> bool:
     plan = state.plan
+    if state.supported_hybrid_comparison_path:
+        return True
     if plan is None or plan.task_shape != "targeted_lookup":
         return False
     if plan.plan_status not in {"ready", "ready_with_limitations"}:
@@ -1042,6 +1201,8 @@ def validate_context_pack_response(
     *,
     expected_query: str,
     eligible_source_ids: list[str] | tuple[str, ...],
+    preserve_available_context: bool = False,
+    require_all_eligible_sources: bool = False,
 ) -> dict[str, Any]:
     validated = DsaContextPackResponse.model_validate(response)
     if validated.query != expected_query:
@@ -1055,6 +1216,8 @@ def validate_context_pack_response(
             raise ValueError("context_item_source_not_used")
     if not sources_used.issubset(eligible_sources):
         raise ValueError("context_source_not_eligible")
+    if require_all_eligible_sources and sources_used != eligible_sources:
+        raise ValueError("context_source_selection_incomplete")
     if validated.diagnostics is not None:
         considered_sources = set(validated.diagnostics.considered_source_ids)
         selected_sources = set(validated.diagnostics.selected_source_ids)
@@ -1076,8 +1239,9 @@ def validate_context_pack_response(
         ):
             raise ValueError("candidate_count_source_not_selected")
     normalized = validated.model_dump(mode="json")
-    for item in normalized["items"]:
-        item.pop("available_context", None)
+    if not preserve_available_context:
+        for item in normalized["items"]:
+            item.pop("available_context", None)
     return normalized
 
 
@@ -1093,6 +1257,20 @@ def validate_fetch_response(
             raise ValueError("fetch_source_id_mismatch")
         if item.source_ref != expected_source_ref:
             raise ValueError("fetch_source_reference_mismatch")
+    return validated
+
+
+def validate_context_response(
+    response: dict[str, Any],
+    *,
+    expected_source_id: str,
+) -> DsaContextResponse:
+    validated = DsaContextResponse.model_validate(response)
+    if any(
+        item.source_id != expected_source_id
+        for item in validated.results
+    ):
+        raise ValueError("context_source_id_mismatch")
     return validated
 
 
@@ -1120,6 +1298,325 @@ def _exact_bundle_id(
     }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return f"evidence_exact_bundle_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
+
+
+def _hybrid_bundle_id(
+    *,
+    plan_id: str,
+    question_anchor_digest: str,
+    query_id: str | None,
+    attempts: list[dict[str, Any]],
+) -> str:
+    material = {
+        "plan_id": plan_id,
+        "question_anchor_digest": question_anchor_digest,
+        "query_id": query_id,
+        "attempts": sorted(
+            [
+                {
+                    "source_id": item.get("source_id"),
+                    "seed_source_ref": item.get("seed_source_ref"),
+                    "context_mode": item.get("context_mode"),
+                    "outcome": item.get("outcome"),
+                    "query_id": item.get("query_id"),
+                    "returned_reference_count": item.get(
+                        "returned_reference_count"
+                    ),
+                }
+                for item in attempts
+            ],
+            key=lambda item: (
+                str(item.get("source_id") or ""),
+                str(item.get("seed_source_ref") or ""),
+                str(item.get("context_mode") or ""),
+            ),
+        ),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return f"evidence_hybrid_bundle_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
+
+
+def _prompt_safe_context_item(item: DsaContextItem) -> dict[str, Any]:
+    return {
+        "result_id": item.result_id,
+        "source_type": item.source_type,
+        "source_id": item.source_id,
+        "source_name": item.source_name,
+        "source_ref": item.source_ref,
+        "retrieved_at": item.retrieved_at.isoformat(),
+        "source_modified_at": (
+            item.source_modified_at.isoformat()
+            if item.source_modified_at is not None
+            else None
+        ),
+        "title": item.title,
+        "content_type": item.content_type,
+        "text": item.text,
+        "confidence": item.confidence,
+        "warnings": list(item.warnings),
+    }
+
+
+def _prompt_safe_targeted_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: item.get(key)
+        for key in (
+            "result_id",
+            "source_type",
+            "source_id",
+            "source_name",
+            "source_ref",
+            "retrieved_at",
+            "source_modified_at",
+            "title",
+            "content_type",
+            "text",
+            "confidence",
+            "warnings",
+        )
+    }
+
+
+async def execute_hybrid_comparison(
+    *,
+    state: EvidenceAcquisitionState,
+    dsa: Any,
+    targeted_context_pack: dict[str, Any],
+    dsa_trace: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if (
+        not state.supported_hybrid_comparison_path
+        or state.plan is None
+        or state.shape is None
+    ):
+        return None, {
+            **dsa_trace,
+            "status": "error",
+            "reason": "unsupported_hybrid_plan",
+            "error_code": "unsupported_hybrid_plan",
+        }
+
+    targeted_items = [
+        item
+        for item in targeted_context_pack.get("items", [])
+        if isinstance(item, dict)
+    ]
+    attempts: list[dict[str, Any]] = []
+    expanded_items_by_source: dict[str, list[dict[str, Any]]] = {}
+    aggregate_error_codes = {
+        code
+        for code in [
+            dsa_trace.get("error_code"),
+            *(dsa_trace.get("error_codes") or []),
+        ]
+        if isinstance(code, str)
+    }
+    raw_expanded_item_count = 0
+    expansion_truncated = False
+    context_call_count = 0
+    targeted_budget = targeted_context_pack.get("budget")
+    aggregate_max_results = (
+        int(targeted_budget.get("max_results") or 0)
+        if isinstance(targeted_budget, dict)
+        else 0
+    )
+    aggregate_estimated_bytes = (
+        int(targeted_budget.get("estimated_bytes") or 0)
+        if isinstance(targeted_budget, dict)
+        else 0
+    )
+
+    for source_id in sorted(state.plan.eligible_source_ids):
+        source_items = [
+            item for item in targeted_items if item.get("source_id") == source_id
+        ]
+        target = next(
+            (
+                item
+                for item in source_items
+                if isinstance(item.get("available_context"), list)
+                and item["available_context"]
+            ),
+            None,
+        )
+        descriptor = (
+            target["available_context"][0]
+            if isinstance(target, dict)
+            and isinstance(target.get("available_context"), list)
+            and target["available_context"]
+            else None
+        )
+        attempt: dict[str, Any] = {
+            "source_id": source_id,
+            "seed_source_ref": (
+                target.get("source_ref")
+                if isinstance(target, dict)
+                else source_items[0].get("source_ref")
+                if source_items
+                else None
+            ),
+            "context_mode": (
+                descriptor.get("context_mode")
+                if isinstance(descriptor, dict)
+                else None
+            ),
+            "outcome": "unsupported",
+            "query_id": None,
+            "returned_reference_count": 0,
+        }
+        if (
+            not isinstance(target, dict)
+            or not isinstance(attempt["seed_source_ref"], str)
+            or not isinstance(attempt["context_mode"], str)
+        ):
+            attempts.append(attempt)
+            continue
+
+        context_call_count += 1
+        try:
+            response_raw = await dsa.context_source(
+                source_ref=attempt["seed_source_ref"],
+                context_mode=attempt["context_mode"],
+                budget={
+                    "max_rows": 5,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+            )
+            if not isinstance(response_raw, dict):
+                raise ValueError("malformed_context_response")
+            response = validate_context_response(
+                response_raw,
+                expected_source_id=source_id,
+            )
+            attempt["query_id"] = response.query_id
+            attempt["returned_reference_count"] = len(response.results)
+            raw_expanded_item_count += len(response.results)
+            aggregate_max_results += response.budget.max_results or 0
+            aggregate_estimated_bytes += response.budget.estimated_bytes
+            if response.budget.truncated:
+                attempt["outcome"] = "truncated"
+                expansion_truncated = True
+                aggregate_error_codes.add("budget_truncated")
+            elif response.errors:
+                attempt["outcome"] = "failed"
+                aggregate_error_codes.update(item.code for item in response.errors)
+            elif not response.results:
+                attempt["outcome"] = "unknown"
+            else:
+                attempt["outcome"] = "satisfied"
+            if attempt["outcome"] in {"satisfied", "truncated"}:
+                expanded_items_by_source[source_id] = [
+                    _prompt_safe_context_item(item)
+                    for item in response.results
+                ]
+        except ValueError:
+            attempt["outcome"] = "filtered"
+            aggregate_error_codes.add("malformed_response")
+        except Exception:
+            attempt["outcome"] = "failed"
+            aggregate_error_codes.add("dependency_failure")
+        attempts.append(attempt)
+
+    state.expansion_attempts = attempts
+    combined_items: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for item in targeted_items:
+        source_ref = item.get("source_ref")
+        if not isinstance(source_ref, str) or source_ref in seen_refs:
+            continue
+        seen_refs.add(source_ref)
+        combined_items.append(_prompt_safe_targeted_item(item))
+    for source_id in sorted(state.plan.eligible_source_ids):
+        for item in expanded_items_by_source.get(source_id, []):
+            source_ref = item.get("source_ref")
+            if not isinstance(source_ref, str) or source_ref in seen_refs:
+                continue
+            seen_refs.add(source_ref)
+            combined_items.append(item)
+
+    raw_targeted_item_count = len(targeted_items)
+    raw_total_item_count = raw_targeted_item_count + raw_expanded_item_count
+    outcome_counts = {
+        outcome: sum(item["outcome"] == outcome for item in attempts)
+        for outcome in (
+            "satisfied",
+            "unknown",
+            "failed",
+            "filtered",
+            "truncated",
+            "unsupported",
+        )
+    }
+    if attempts and outcome_counts["satisfied"] == len(attempts):
+        status = "included"
+    elif combined_items:
+        status = "partial"
+    elif outcome_counts["failed"] or outcome_counts["filtered"]:
+        status = "error"
+    else:
+        status = "empty"
+    sources_used = sorted(
+        {
+            item["source_id"]
+            for item in combined_items
+            if isinstance(item.get("source_id"), str)
+        }
+    )
+    query_id = targeted_context_pack.get("query_id")
+    bundle = {
+        "bundle_id": _hybrid_bundle_id(
+            plan_id=state.plan.plan_id,
+            question_anchor_digest=state.plan.question_anchor_digest,
+            query_id=query_id if isinstance(query_id, str) else None,
+            attempts=attempts,
+        ),
+        "query_id": query_id,
+        "query": state.plan.question_anchor,
+        "sources_used": sources_used,
+        "items": combined_items,
+        "errors": [
+            {"code": code} for code in sorted(aggregate_error_codes)
+        ],
+        "budget": {
+            "max_results": aggregate_max_results,
+            "returned_results": raw_total_item_count,
+            "estimated_bytes": aggregate_estimated_bytes,
+            "truncated": bool(
+                dsa_trace.get("budget_truncated") or expansion_truncated
+            ),
+        },
+        "diagnostics": targeted_context_pack.get("diagnostics"),
+        "raw_item_count": raw_total_item_count,
+    }
+    return bundle, {
+        **dsa_trace,
+        "called": True,
+        "call_count": 1 + context_call_count,
+        "context_pack_call_count": 1,
+        "context_expansion_call_count": context_call_count,
+        "status": status,
+        "reason": "hybrid_acquisition_completed",
+        "error_code": (
+            "malformed_response"
+            if outcome_counts["filtered"]
+            else "dependency_failure"
+            if outcome_counts["failed"]
+            else None
+        ),
+        "error_codes": sorted(aggregate_error_codes),
+        "raw_targeted_item_count": raw_targeted_item_count,
+        "raw_expanded_item_count": raw_expanded_item_count,
+        "raw_item_count": raw_total_item_count,
+        "final_combined_item_count": len(combined_items),
+        "expansion_attempt_counts": outcome_counts,
+        "budget_truncated": bool(
+            dsa_trace.get("budget_truncated") or expansion_truncated
+        ),
+        "search_budget_truncated": bool(dsa_trace.get("budget_truncated")),
+        "expansion_budget_truncated": expansion_truncated,
+        "candidate_truncated": bool(dsa_trace.get("candidate_truncated")),
+    }
 
 
 async def execute_exact_fetches(
@@ -1324,6 +1821,128 @@ def _exact_delivery_reference_state(
     return "unknown", returned_refs, retained_refs
 
 
+def _hybrid_non_satisfied_outcome(
+    attempts: list[dict[str, Any]],
+    dsa_trace: dict[str, Any],
+) -> str:
+    if not attempts and dsa_trace.get("status") == "error":
+        return (
+            "filtered"
+            if dsa_trace.get("error_code") == "malformed_response"
+            else "failed"
+        )
+    outcomes = {str(item.get("outcome")) for item in attempts}
+    for outcome in (
+        "truncated",
+        "filtered",
+        "failed",
+        "unsupported",
+        "unknown",
+    ):
+        if outcome in outcomes:
+            return outcome
+    return "unknown"
+
+
+def _hybrid_fact_outcomes(
+    *,
+    plan: PlanResult,
+    attempts: list[dict[str, Any]],
+    context_pack: dict[str, Any] | None,
+    dsa_trace: dict[str, Any],
+    retained_source_refs: set[str] | None,
+) -> tuple[str, str, str]:
+    planned_sources = set(plan.eligible_source_ids)
+    items = (
+        context_pack.get("items")
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("items"), list)
+        else []
+    )
+    returned_refs: set[str] = set()
+    source_by_ref: dict[str, str] = {}
+    combined_sources: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_ref = item.get("source_ref")
+        source_id = item.get("source_id")
+        if not isinstance(source_ref, str) or not isinstance(source_id, str):
+            continue
+        returned_refs.add(source_ref)
+        source_by_ref[source_ref] = source_id
+        combined_sources.add(source_id)
+
+    attempts_by_source = {
+        str(item.get("source_id")): str(item.get("outcome"))
+        for item in attempts
+        if isinstance(item.get("source_id"), str)
+    }
+    all_expansions_satisfied = bool(planned_sources) and all(
+        attempts_by_source.get(source_id) == "satisfied"
+        for source_id in planned_sources
+    )
+    material_truncated = bool(
+        dsa_trace.get("budget_truncated")
+        or dsa_trace.get("candidate_truncated")
+    )
+    base_failure = _hybrid_non_satisfied_outcome(attempts, dsa_trace)
+    if retained_source_refs is None:
+        return (
+            base_failure if not all_expansions_satisfied else "unknown",
+            base_failure if len({
+                source_id
+                for source_id, outcome in attempts_by_source.items()
+                if outcome == "satisfied"
+            }) < 2 else "unknown",
+            "unknown",
+        )
+    if retained_source_refs - returned_refs:
+        return (
+            base_failure if not all_expansions_satisfied else "unknown",
+            "unknown",
+            "unknown",
+        )
+
+    retained_sources = {
+        source_by_ref[source_ref]
+        for source_ref in retained_source_refs
+        if source_ref in source_by_ref
+    }
+    if material_truncated:
+        coverage_outcome = "truncated"
+    elif not all_expansions_satisfied:
+        coverage_outcome = base_failure
+    elif not planned_sources.issubset(combined_sources):
+        coverage_outcome = "unknown"
+    elif not planned_sources.issubset(retained_sources):
+        coverage_outcome = "filtered"
+    else:
+        coverage_outcome = "satisfied"
+
+    successful_sources = {
+        source_id
+        for source_id, outcome in attempts_by_source.items()
+        if outcome == "satisfied"
+    }
+    if material_truncated:
+        comparison_outcome = "truncated"
+    elif len(successful_sources) < 2:
+        comparison_outcome = base_failure
+    elif len(successful_sources & retained_sources) < 2:
+        comparison_outcome = "filtered"
+    else:
+        comparison_outcome = "satisfied"
+
+    if planned_sources.issubset(retained_sources) and all_expansions_satisfied:
+        delivery_outcome = "satisfied"
+    elif items:
+        delivery_outcome = "filtered"
+    else:
+        delivery_outcome = "unknown"
+    return coverage_outcome, comparison_outcome, delivery_outcome
+
+
 def _build_acquisition_facts(
     *,
     plan: PlanResult,
@@ -1332,11 +1951,16 @@ def _build_acquisition_facts(
     retained_source_refs: set[str] | None,
     exact_source_refs: list[dict[str, str]] | None = None,
     exact_attempts: list[dict[str, Any]] | None = None,
+    expansion_attempts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     status = dsa_trace.get("status")
     error_code = dsa_trace.get("error_code")
     usable_count = len(context_pack.get("items", [])) if isinstance(context_pack, dict) else 0
     exact_path = plan.selected_strategies == ["exact_fetch"]
+    hybrid_path = (
+        plan.task_shape == "cross_source_comparison"
+        and plan.selected_strategies == ["hybrid"]
+    )
     if exact_path:
         delivery_outcome, _, _ = _exact_delivery_reference_state(
             exact_source_refs=exact_source_refs or [],
@@ -1349,12 +1973,33 @@ def _build_acquisition_facts(
             context_pack=context_pack,
             retained_source_refs=retained_source_refs,
         )
+    hybrid_outcomes = (
+        _hybrid_fact_outcomes(
+            plan=plan,
+            attempts=expansion_attempts or [],
+            context_pack=context_pack,
+            dsa_trace=dsa_trace,
+            retained_source_refs=retained_source_refs,
+        )
+        if hybrid_path
+        else None
+    )
     facts: list[dict[str, str]] = []
     for requirement in sorted(
         plan.declared_requirements,
         key=lambda item: item.requirement_id,
     ):
-        if requirement.requirement_kind == "targeted_evidence":
+        if (
+            hybrid_path
+            and requirement.requirement_kind == "selected_source_coverage"
+            and requirement.criticality == "material"
+        ):
+            outcome = hybrid_outcomes[0] if hybrid_outcomes else "unknown"
+        elif hybrid_path and requirement.requirement_kind == "cross_source_comparison":
+            outcome = hybrid_outcomes[1] if hybrid_outcomes else "unknown"
+        elif hybrid_path and requirement.requirement_kind == "context_delivery":
+            outcome = hybrid_outcomes[2] if hybrid_outcomes else "unknown"
+        elif requirement.requirement_kind == "targeted_evidence":
             if exact_path:
                 outcome = _aggregate_exact_outcome(exact_attempts or [])
             elif status == "error":
@@ -1387,7 +2032,7 @@ def _build_acquisition_facts(
                 else "satisfied"
             )
         else:
-            outcome = "unknown" if requirement.criticality == "material" else "satisfied"
+            outcome = "unknown"
         facts.append(
             {
                 "requirement_id": requirement.requirement_id,
@@ -1443,6 +2088,7 @@ async def evaluate_acquisition_sufficiency(
         considered_source_ids=diagnostics.get("considered_source_ids", []),
         selected_source_ids=diagnostics.get("selected_source_ids", []),
         exact_attempts=state.exact_attempts,
+        expansion_attempts=state.expansion_attempts,
     )
     facts = _build_acquisition_facts(
         plan=state.plan,
@@ -1451,6 +2097,7 @@ async def evaluate_acquisition_sufficiency(
         retained_source_refs=retained_source_refs,
         exact_source_refs=state.exact_source_refs,
         exact_attempts=state.exact_attempts,
+        expansion_attempts=state.expansion_attempts,
     )
     state.acquisition_facts = facts
     try:
@@ -1580,6 +2227,12 @@ def enforce_final_answer(
         final = _append_once(final, LIMITATION_SUFFIX)
     if state.plan and state.plan.task_shape == "targeted_lookup" and _overclaims_scope(final):
         final = _append_once(final, TARGETED_SCOPE_SUFFIX)
+    if (
+        state.plan
+        and state.plan.task_shape == "cross_source_comparison"
+        and _overclaims_scope(final)
+    ):
+        final = _append_once(final, COMPARISON_SCOPE_SUFFIX)
     return final
 
 
@@ -1650,6 +2303,7 @@ def build_manifest_trace(
         else []
     )
     exact_path = state.supported_exact_path
+    hybrid_path = state.supported_hybrid_comparison_path
     if exact_path:
         delivery_outcome, returned_ref_set, retained_ref_set = (
             _exact_delivery_reference_state(
@@ -1666,6 +2320,14 @@ def build_manifest_trace(
                 retained_source_refs=retained_source_refs,
             )
         )
+        if hybrid_path and state.plan is not None:
+            _, _, delivery_outcome = _hybrid_fact_outcomes(
+                plan=state.plan,
+                attempts=state.expansion_attempts or [],
+                context_pack=context_pack,
+                dsa_trace=trace,
+                retained_source_refs=retained_source_refs,
+            )
     returned_refs = sorted(returned_ref_set)
     retained_refs = sorted(retained_ref_set)
     omitted_refs = sorted(returned_ref_set - retained_ref_set)
@@ -1683,6 +2345,7 @@ def build_manifest_trace(
     plan = state.plan
     shape = state.shape
     exact_attempts = state.exact_attempts or []
+    expansion_attempts = state.expansion_attempts or []
     attempted_exact_refs = sorted(
         {
             item["source_ref"]
@@ -1701,6 +2364,28 @@ def build_manifest_trace(
     exact_outcome_counts = {
         outcome: sum(item.get("outcome") == outcome for item in exact_attempts)
         for outcome in ("satisfied", "unknown", "failed", "filtered", "truncated")
+    }
+    expansion_outcome_counts = {
+        outcome: sum(item.get("outcome") == outcome for item in expansion_attempts)
+        for outcome in (
+            "satisfied",
+            "unknown",
+            "failed",
+            "filtered",
+            "truncated",
+            "unsupported",
+        )
+    }
+    attempted_expansion_refs = {
+        str(item["seed_source_ref"])
+        for item in expansion_attempts
+        if isinstance(item.get("seed_source_ref"), str)
+    }
+    unsuccessful_expansion_refs = {
+        str(item["seed_source_ref"])
+        for item in expansion_attempts
+        if item.get("outcome") != "satisfied"
+        and isinstance(item.get("seed_source_ref"), str)
     }
     return {
         "enabled": state.enabled,
@@ -1753,8 +2438,12 @@ def build_manifest_trace(
             "source_references_returned": returned_refs,
             "source_references_retained": retained_refs,
             "source_references_filtered_or_omitted": omitted_refs,
-            "source_references_attempted": attempted_exact_refs,
-            "source_references_unsuccessful": unsuccessful_exact_refs,
+            "source_references_attempted": sorted(
+                set(attempted_exact_refs) | attempted_expansion_refs
+            ),
+            "source_references_unsuccessful": sorted(
+                set(unsuccessful_exact_refs) | unsuccessful_expansion_refs
+            ),
             "exact_reference_attempts": sorted(
                 [
                     {
@@ -1785,8 +2474,39 @@ def build_manifest_trace(
                     if item.get("outcome") == "failed"
                     and isinstance(item.get("source_id"), str)
                 }
+                | {
+                    str(item["source_id"])
+                    for item in expansion_attempts
+                    if item.get("outcome") == "failed"
+                    and isinstance(item.get("source_id"), str)
+                }
             ),
-            "expansion_attempts": [],
+            "expansion_attempts": sorted(
+                [
+                    {
+                        "source_id": str(item["source_id"]),
+                        "seed_source_ref": item.get("seed_source_ref"),
+                        "context_mode": item.get("context_mode"),
+                        "outcome": str(item["outcome"]),
+                        "returned_reference_count": int(
+                            item.get("returned_reference_count") or 0
+                        ),
+                    }
+                    for item in expansion_attempts
+                ],
+                key=lambda item: (
+                    item["source_id"],
+                    str(item.get("seed_source_ref") or ""),
+                    str(item.get("context_mode") or ""),
+                ),
+            ),
+            "expansion_attempt_count": len(expansion_attempts),
+            "expansion_successful_count": expansion_outcome_counts["satisfied"],
+            "expansion_unknown_count": expansion_outcome_counts["unknown"],
+            "expansion_failed_count": expansion_outcome_counts["failed"],
+            "expansion_filtered_count": expansion_outcome_counts["filtered"],
+            "expansion_truncated_count": expansion_outcome_counts["truncated"],
+            "expansion_unsupported_count": expansion_outcome_counts["unsupported"],
             "item_count": int(trace.get("raw_item_count") or len(items)),
             "usable_item_count": len(items),
             "prompt_retained_item_count": len(retained_refs),
@@ -1869,6 +2589,7 @@ def suppress_manifest_identifiers(manifest: dict[str, Any]) -> dict[str, Any]:
         "source_references_attempted",
         "source_references_unsuccessful",
         "exact_reference_attempts",
+        "expansion_attempts",
         "unavailable_source_ids",
         "failed_source_ids",
     )

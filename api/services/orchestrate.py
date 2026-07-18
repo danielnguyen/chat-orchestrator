@@ -56,6 +56,7 @@ from services.evidence_acquisition import (
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
     execute_exact_fetches,
+    execute_hybrid_comparison,
     ineligible_exact_evidence_state,
     provider_allowed,
     suppress_manifest_identifiers,
@@ -4365,7 +4366,11 @@ def _build_dsa_budget(max_results: int | None) -> dict[str, int]:
     return budget
 
 
-def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_context_pack(
+    response: dict[str, Any],
+    *,
+    preserve_available_context: bool = False,
+) -> dict[str, Any]:
     items_out = []
     for item in response.get("items") or []:
         if not isinstance(item, dict):
@@ -4373,25 +4378,36 @@ def _sanitize_context_pack(response: dict[str, Any]) -> dict[str, Any]:
         text = item.get("text")
         if not isinstance(text, str) or not text:
             continue
-        items_out.append(
-            {
-                "source_ref": item.get("source_ref"),
-                "source_name": item.get("source_name"),
-                "title": item.get("title"),
-                "text": text,
-                "retrieved_at": item.get("retrieved_at"),
-                "freshness_state": _sanitize_trace_string(
-                    item.get("freshness_state"),
-                    max_length=80,
-                ),
-                "warnings": item.get("warnings", []),
-                "sensitivity": item.get("sensitivity"),
-                "sensitivity_level": item.get("sensitivity_level"),
-                "sensitivity_domains": item.get("sensitivity_domains"),
-                "domain_tags": item.get("domain_tags"),
-                "policy_metadata": item.get("policy_metadata"),
-            }
-        )
+        item_out = {
+            "source_ref": item.get("source_ref"),
+            "source_name": item.get("source_name"),
+            "title": item.get("title"),
+            "text": text,
+            "retrieved_at": item.get("retrieved_at"),
+            "freshness_state": _sanitize_trace_string(
+                item.get("freshness_state"),
+                max_length=80,
+            ),
+            "warnings": item.get("warnings", []),
+            "sensitivity": item.get("sensitivity"),
+            "sensitivity_level": item.get("sensitivity_level"),
+            "sensitivity_domains": item.get("sensitivity_domains"),
+            "domain_tags": item.get("domain_tags"),
+            "policy_metadata": item.get("policy_metadata"),
+        }
+        if preserve_available_context:
+            item_out.update(
+                {
+                    "result_id": item.get("result_id"),
+                    "source_type": item.get("source_type"),
+                    "source_id": item.get("source_id"),
+                    "source_modified_at": item.get("source_modified_at"),
+                    "content_type": item.get("content_type"),
+                    "confidence": item.get("confidence"),
+                    "available_context": item.get("available_context", []),
+                }
+            )
+        items_out.append(item_out)
 
     errors_out = _sanitize_context_pack_errors(response.get("errors"))
     budget_out = _sanitize_context_pack_budget(response.get("budget"))
@@ -4425,6 +4441,7 @@ async def _resolve_external_context(
     external_calls_allowed: bool,
     query: str,
     response_validator: Any | None = None,
+    preserve_available_context: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     external_context_config = _normalize_external_context_config(external_context)
     allowed_sensitivity = external_context_config.get("allowed_sensitivity", "medium")
@@ -4479,7 +4496,10 @@ async def _resolve_external_context(
             }
         if response_validator is not None:
             response = response_validator(response)
-        context_pack = _sanitize_context_pack(response)
+        context_pack = _sanitize_context_pack(
+            response,
+            preserve_available_context=preserve_available_context,
+        )
         diagnostics = context_pack.get("diagnostics")
         errors = context_pack.get("errors", [])
         item_count = len(context_pack.get("items", []))
@@ -7007,6 +7027,50 @@ async def orchestrate_chat(
                             state=evidence_acquisition,
                             dsa=dsa,
                         )
+                    elif evidence_acquisition.supported_hybrid_comparison_path:
+                        governed_plan = evidence_acquisition.plan
+                        if governed_plan is None:
+                            raise RuntimeError("hybrid_plan_unavailable")
+                        hybrid_external_config = dict(external_config or {})
+                        hybrid_external_config["source_ids"] = list(
+                            governed_plan.eligible_source_ids
+                        )
+                        hybrid_external_config["max_results"] = len(
+                            governed_plan.eligible_source_ids
+                        )
+                        external_context_pack, dsa_trace = (
+                            await _resolve_external_context(
+                                dsa=dsa,
+                                dsa_enabled=dsa_enabled,
+                                external_context_enabled=external_context_enabled,
+                                external_context=hybrid_external_config,
+                                external_calls_allowed=not local_only,
+                                query=governed_plan.question_anchor,
+                                response_validator=(
+                                    lambda response: validate_context_pack_response(
+                                        response,
+                                        expected_query=governed_plan.question_anchor,
+                                        eligible_source_ids=(
+                                            governed_plan.eligible_source_ids
+                                        ),
+                                        preserve_available_context=True,
+                                        require_all_eligible_sources=True,
+                                    )
+                                ),
+                                preserve_available_context=True,
+                            )
+                        )
+                        if external_context_pack is not None:
+                            external_context_pack, dsa_trace = (
+                                await execute_hybrid_comparison(
+                                    state=evidence_acquisition,
+                                    dsa=dsa,
+                                    targeted_context_pack=external_context_pack,
+                                    dsa_trace=dsa_trace,
+                                )
+                            )
+                        else:
+                            evidence_acquisition.expansion_attempts = []
                     else:
                         governed_plan = (
                             evidence_acquisition.plan
