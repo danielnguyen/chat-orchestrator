@@ -121,10 +121,10 @@ object is still required, and an effective `local_only` policy always wins.
 For an eligible normal chat request, Chat Orchestrator uses the existing
 interaction-governance result, asks Cognitive Runtime to derive a broad evidence
 shape, reads the governed DSA source inventory, adapts the neutral source
-capabilities, and asks Cognitive Runtime to compile an evidence plan. The initial
-execution boundary proceeds only for a derived `targeted_lookup` whose plan is
-ready (possibly with optional limitations) and whose only selected strategy is
-either `targeted_retrieval` or `exact_fetch`.
+capabilities, and asks Cognitive Runtime to compile an evidence plan. Governed
+execution proceeds for a derived `targeted_lookup` whose ready plan selects only
+`targeted_retrieval` or `exact_fetch`, and for the bounded hybrid comparison
+described below.
 
 Source IDs narrow semantic retrieval to governed source registries. They do not
 identify exact items and continue to use one DSA context-pack call. The optional
@@ -137,12 +137,30 @@ semantic search. Every response must match the declared source ID and exact
 reference.
 
 Context-pack items may also declare bounded `available_context` descriptors for
-connector-owned expansion modes. The current targeted path strictly validates
-those descriptors, then removes them before prompt assembly, trace retention,
-manifest construction, and public response rendering. It does not select an
-expansion target or call the DSA context endpoint. Deploy this consumer
-compatibility before a DSA producer that always emits the additive field.
-Governed hybrid expansion remains outside the current execution boundary.
+connector-owned expansion modes. The targeted path strictly validates and then
+removes those descriptors without executing them.
+
+The first hybrid path is limited to a ready `cross_source_comparison` plan over
+two to eight selected sources, with `complete_for_selected_sources` completeness,
+no exact references, no contradiction search, and material selected-source
+coverage, cross-source comparison, and context-delivery requirements. Every
+selected source must be available and support both targeted retrieval and context
+expansion. Other hybrid task shapes remain unsupported.
+
+Hybrid execution makes one targeted context-pack request over the exact planned
+source IDs, requiring at least one result from each. In stable source order, it
+chooses the first result that declares an expansion option and that result's
+first connector-declared mode. It makes at most one sequential context call per
+source, with no retry, replacement search, connector-specific inference, or
+provider-selected target. Each call uses a bounded budget of five rows, 50,000
+serialized bytes, and 12,000 text characters. Missing descriptors, empty or
+malformed responses, dependency failure, and truncation remain explicit bounded
+attempt outcomes.
+
+Targeted items precede expanded items in the combined prompt evidence; expanded
+items are grouped by planned source order, and duplicate references are removed
+deterministically while preserving the targeted item. Descriptors, modes, URLs,
+raw connector data, and cache internals do not enter the provider prompt.
 
 After prompt assembly, Chat Orchestrator reports requirement outcomes based on
 what was actually acquired and what external context survived into provider
@@ -156,6 +174,11 @@ withholds an unsupported conclusion without calling the provider. A sufficient
 result permits the existing single provider path; an optional limitation adds a
 bounded disclosure. Targeted answers that claim exhaustive or absence-sensitive
 coverage receive a disclosure that only the targeted sources were checked.
+Hybrid comparison facts are satisfied only when every planned source contributed
+targeted evidence, one successful expansion, and prompt-retained evidence, with
+at least two expanded source scopes surviving prompt budgeting. There is no
+targeted-only fallback. Universal wording in an otherwise permitted comparison
+is bounded to the selected sources and context checked.
 Provider prose cannot select or upgrade the plan, acquisition facts, sufficiency
 status, or answer constraints.
 
@@ -170,6 +193,13 @@ source text, source titles or descriptions, provider output, credentials, raw
 dependency errors, confidence values, prompts, or hidden reasoning. Existing
 privacy suppression removes source and exact-reference identifiers while
 retaining counts and statuses.
+Hybrid manifests additionally retain one bounded expansion attempt per planned
+source and aggregate satisfied, unknown, failed, filtered, truncated, and
+unsupported counts. Manifest identity includes the bounded target, declared
+mode, and outcome history. Privacy suppression clears source IDs, seed
+references, context modes, and internal context query IDs while preserving
+aggregate attempt semantics. Expanded evidence is not automatically claim
+support, and the existing single-file claim boundary is unchanged.
 
 When the existing claim-capture boundary accepts a single-sentence claim backed
 by one retained file source, Chat Orchestrator may link that claim record to the
@@ -200,8 +230,12 @@ chat and optional DSA behavior. Briefs, capability and action flows, pending-act
 continuations, and claim-explanation follow-ups remain outside governed execution;
 an exact-reference request at one of those boundaries fails closed instead of
 entering a legacy path. Bounded full context, structured queries, hybrid
-acquisition, and execution of exhaustive, absence-sensitive, contradiction,
-historical, comparison, or recommendation plans are not implemented here.
+acquisition outside the bounded cross-source comparison path, and execution of
+exhaustive, absence-sensitive, contradiction, historical, or recommendation
+plans are not implemented here. Hybrid manifests are retained truthfully, but
+the historical `What did you check?` renderer continues to support linked
+targeted and exact manifests only; hybrid-specific historical explanation
+remains separate work and is never reconstructed by a provider.
 The public chat response fields are unchanged.
 
 ## Prompt assembly and routing

@@ -8,20 +8,29 @@ import pytest
 from models import ChatRequest
 from pydantic import ValidationError
 from services.evidence_acquisition import (
+    COMPARISON_SCOPE_SUFFIX,
     LIMITATION_SUFFIX,
     TARGETED_SCOPE_SUFFIX,
     WITHHELD_ANSWER,
     DsaItem,
     DsaSourceListResponse,
+    EvidenceAcquisitionState,
+    PlanResult,
+    ShapeResult,
+    SufficiencyResult,
+    _build_acquisition_facts,
+    _manifest_id,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_manifest_trace,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
     execute_exact_fetches,
+    execute_hybrid_comparison,
     provider_allowed,
     suppress_manifest_identifiers,
     validate_context_pack_response,
+    validate_context_response,
     validate_fetch_response,
 )
 from settings import Settings
@@ -167,6 +176,73 @@ def _exact_plan_response(
     return response
 
 
+def _hybrid_shape_response():
+    question = "Compare the maintenance history in these two vehicle logs."
+    response = _shape_response(shape="cross_source_comparison")
+    response["result"].update(
+        {
+            "question_anchor": question,
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
+            "reason_codes": [
+                "explicit_evidence_language",
+                "comparison_requested",
+            ],
+        }
+    )
+    return response
+
+
+def _hybrid_plan_response(
+    *,
+    eligible_source_ids=None,
+    requirements=None,
+    task_shape="cross_source_comparison",
+    strategy="hybrid",
+    completeness="complete_for_selected_sources",
+    contradiction_required=False,
+    status="ready",
+):
+    shape = _hybrid_shape_response()["result"]
+    return {
+        **SCOPE,
+        "result": {
+            "plan_id": "evidence_plan_hybrid",
+            "question_anchor": shape["question_anchor"],
+            "question_anchor_digest": shape["question_anchor_digest"],
+            "task_shape": task_shape,
+            "plan_status": status,
+            "completeness_expectation": completeness,
+            "contradiction_search_required": contradiction_required,
+            "eligible_source_ids": eligible_source_ids
+            or ["source_a", "source_b"],
+            "authoritative_source_ids": [],
+            "selected_strategies": [strategy] if strategy else [],
+            "declared_requirements": requirements
+            or [
+                {
+                    "requirement_id": "selected-source-coverage",
+                    "requirement_kind": "selected_source_coverage",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "cross-source-comparison",
+                    "requirement_kind": "cross_source_comparison",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "context-delivery",
+                    "requirement_kind": "context_delivery",
+                    "criticality": "material",
+                },
+            ],
+            "limitation_codes": [],
+            "user_safe_summary": "A bounded comparison strategy is available.",
+        },
+    }
+
+
 def _fetch_response(
     *,
     source_id="source_a",
@@ -220,11 +296,62 @@ def _fetch_response(
     }
 
 
+def _context_response(
+    *,
+    source_id="source_a",
+    source_ref=None,
+    result=True,
+    truncated=False,
+):
+    source_ref = source_ref or f"connector:{source_id}:expanded-1"
+    results = (
+        [
+            {
+                "result_id": f"context-{source_id}",
+                "source_type": "connector",
+                "source_id": source_id,
+                "source_name": f"Source {source_id}",
+                "source_ref": source_ref,
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": f"Expanded {source_id}",
+                "content_type": "text",
+                "text": f"Expanded evidence from {source_id}.",
+                "url": "https://private.invalid/context",
+                "confidence": "high",
+                "raw": None,
+                "available_context": [],
+                "warnings": [],
+            }
+        ]
+        if result
+        else []
+    )
+    return {
+        "query_id": f"context-query-{source_id}",
+        "answerable": bool(results),
+        "confidence": "low" if results else "none",
+        "retrieval_mode": "context",
+        "results": results,
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": None,
+            "returned_results": len(results),
+            "estimated_bytes": 80 if results else 0,
+            "truncated": truncated,
+        },
+    }
+
+
 def _sufficiency_response(
     manifest_id,
     *,
     status="sufficient_for_declared_scope",
     requirements=None,
+    task_shape="targeted_lookup",
+    evidence_plan_id="evidence_plan_1",
 ):
     requirements = requirements or _plan_response()["result"]["declared_requirements"]
     evaluations = [
@@ -265,11 +392,11 @@ def _sufficiency_response(
     )
     return {
         **SCOPE,
-        "evidence_plan_id": "evidence_plan_1",
+        "evidence_plan_id": evidence_plan_id,
         "acquisition_manifest_id": manifest_id,
         "result": {
             "evaluation_id": "evidence_eval_1",
-            "task_shape": "targeted_lookup",
+            "task_shape": task_shape,
             "sufficiency_status": status,
             "evaluated_requirements": evaluations,
             "reason_codes": reasons,
@@ -308,14 +435,23 @@ class FakeRuntime:
             kwargs["acquisition_manifest_id"],
             status=self.sufficiency_status,
             requirements=kwargs["declared_requirements"],
+            task_shape=kwargs["task_shape"],
+            evidence_plan_id=kwargs["evidence_plan_id"],
         )
 
 
 class FakeDsa:
-    def __init__(self, sources, *, fetch_responses=None):
+    def __init__(
+        self,
+        sources,
+        *,
+        fetch_responses=None,
+        context_responses=None,
+    ):
         self.sources = sources
         self.calls = []
         self.fetch_responses = list(fetch_responses or [])
+        self.context_responses = list(context_responses or [])
 
     async def list_sources(self):
         self.calls.append("list_sources")
@@ -324,6 +460,13 @@ class FakeDsa:
     async def fetch_source(self, **kwargs):
         self.calls.append(("fetch_source", kwargs))
         response = self.fetch_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def context_source(self, **kwargs):
+        self.calls.append(("context_source", kwargs))
+        response = self.context_responses.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
@@ -743,6 +886,602 @@ def test_context_pack_contract_validates_descriptor_order_then_removes_descripto
     ] == ["nearby_rows", "following"]
     assert "available_context" not in normalized["items"][0]
     assert normalized == _validated_context_pack()
+
+
+def test_context_pack_contract_preserves_descriptors_only_when_requested():
+    response = copy.deepcopy(_context_pack())
+    response["items"][0]["available_context"] = [
+        {
+            "context_mode": "nearby_rows",
+            "description": "Fetch nearby rows.",
+        },
+        {
+            "context_mode": "following",
+            "description": "Fetch following context.",
+        },
+    ]
+
+    normalized = validate_context_pack_response(
+        response,
+        expected_query=QUESTION,
+        eligible_source_ids=["source_a"],
+        preserve_available_context=True,
+        require_all_eligible_sources=True,
+    )
+
+    assert normalized["items"][0]["available_context"] == response["items"][0][
+        "available_context"
+    ]
+    assert _validated_context_pack(response)["items"][0].get(
+        "available_context"
+    ) is None
+
+
+def _hybrid_state(
+    *,
+    source_ids=None,
+    capabilities=None,
+    source_status="ready",
+    plan_overrides=None,
+    exact_source_refs=None,
+):
+    source_ids = source_ids or ["source_a", "source_b"]
+    inventory = DsaSourceListResponse.model_validate(
+        {
+            "sources": [
+                _source(
+                    source_id,
+                    capabilities=(
+                        capabilities.get(source_id)
+                        if isinstance(capabilities, dict)
+                        else ["profile", "search", "context"]
+                    ),
+                    status=source_status,
+                )
+                for source_id in source_ids
+            ]
+        }
+    )
+    plan_data = _hybrid_plan_response(
+        eligible_source_ids=source_ids,
+    )["result"]
+    plan_data.update(plan_overrides or {})
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        shape=ShapeResult.model_validate(_hybrid_shape_response()["result"]),
+        inventory=inventory,
+        declared_scope={
+            "source_ids": list(source_ids),
+            "source_categories": [],
+            "exact_source_refs": exact_source_refs or [],
+            "inventory_status": "complete_for_declared_scope",
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        plan=PlanResult.model_validate(plan_data),
+        manifest_id="evidence_manifest_0123456789abcdef0123456789abcdef",
+        exact_source_refs=exact_source_refs or [],
+    )
+
+
+def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
+    assert _hybrid_state().supported_hybrid_comparison_path is True
+    limited_requirements = [
+        *_hybrid_plan_response()["result"]["declared_requirements"],
+        {
+            "requirement_id": "optional-selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "optional",
+        },
+    ]
+    assert (
+        _hybrid_state(
+            plan_overrides={
+                "plan_status": "ready_with_limitations",
+                "declared_requirements": limited_requirements,
+                "limitation_codes": ["optional_source_unavailable"],
+            }
+        ).supported_hybrid_comparison_path
+        is True
+    )
+
+    variants = [
+        _hybrid_state(source_ids=["source_a"]),
+        _hybrid_state(source_ids=[f"source_{index}" for index in range(9)]),
+        _hybrid_state(
+            plan_overrides={
+                "declared_requirements": _hybrid_plan_response()["result"][
+                    "declared_requirements"
+                ][1:]
+            }
+        ),
+        _hybrid_state(
+            plan_overrides={
+                "declared_requirements": [
+                    *_hybrid_plan_response()["result"]["declared_requirements"],
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "requirement_kind": "targeted_evidence",
+                        "criticality": "material",
+                    },
+                ]
+            }
+        ),
+        _hybrid_state(
+            plan_overrides={
+                "task_shape": "bounded_exhaustive_review",
+                "completeness_expectation": "complete_for_declared_scope",
+                "contradiction_search_required": True,
+            }
+        ),
+        _hybrid_state(
+            plan_overrides={"completeness_expectation": "targeted_scope"}
+        ),
+        _hybrid_state(plan_overrides={"contradiction_search_required": True}),
+        _hybrid_state(
+            exact_source_refs=[
+                {
+                    "source_id": "source_a",
+                    "source_ref": "connector:source_a:item-1",
+                }
+            ]
+        ),
+        _hybrid_state(
+            capabilities={
+                "source_a": ["profile", "search", "context"],
+                "source_b": ["profile", "search"],
+            }
+        ),
+        _hybrid_state(
+            capabilities={
+                "source_a": ["profile", "search", "context"],
+                "source_b": ["profile", "context"],
+            }
+        ),
+        _hybrid_state(source_status="unavailable"),
+    ]
+    assert all(
+        state.supported_hybrid_comparison_path is False
+        for state in variants
+    )
+
+    duplicate_plan = _hybrid_plan_response()["result"]
+    duplicate_plan["eligible_source_ids"] = ["source_a", "source_a"]
+    with pytest.raises(ValidationError):
+        PlanResult.model_validate(duplicate_plan)
+
+
+def _targeted_hybrid_context_pack():
+    response = _context_pack()
+    response["query"] = _hybrid_shape_response()["result"]["question_anchor"]
+    response["sources_used"] = ["source_a", "source_b"]
+    response["items"] = [
+        {
+            **response["items"][0],
+            "result_id": "target-a",
+            "source_id": "source_a",
+            "source_ref": "connector:source_a:seed-a",
+            "text": "Targeted source A.",
+            "available_context": [
+                {
+                    "context_mode": "nearby_rows",
+                    "description": "PRIVATE MODE A DESCRIPTION",
+                },
+                {
+                    "context_mode": "second_mode",
+                    "description": "PRIVATE SECOND DESCRIPTION",
+                },
+            ],
+        },
+        {
+            **response["items"][0],
+            "result_id": "target-b",
+            "source_id": "source_b",
+            "source_ref": "connector:source_b:seed-b",
+            "text": "Targeted source B.",
+            "available_context": [
+                {
+                    "context_mode": "upcoming_events",
+                    "description": "PRIVATE MODE B DESCRIPTION",
+                }
+            ],
+        },
+    ]
+    response["budget"]["returned_results"] = 2
+    response["diagnostics"].update(
+        {
+            "considered_source_ids": ["source_a", "source_b"],
+            "selected_source_ids": ["source_a", "source_b"],
+            "candidate_counts_by_source": {"source_a": 1, "source_b": 1},
+        }
+    )
+    return validate_context_pack_response(
+        response,
+        expected_query=response["query"],
+        eligible_source_ids=["source_a", "source_b"],
+        preserve_available_context=True,
+        require_all_eligible_sources=True,
+    )
+
+
+def test_context_response_contract_is_strict_and_source_bound():
+    valid = validate_context_response(
+        _context_response(source_id="source_a"),
+        expected_source_id="source_a",
+    )
+    assert valid.results[0].source_id == "source_a"
+
+    malformed_responses = []
+    wrong_source = _context_response(source_id="source_b")
+    malformed_responses.append(wrong_source)
+    wrong_mode = _context_response()
+    wrong_mode["retrieval_mode"] = "fetch"
+    malformed_responses.append(wrong_mode)
+    wrong_answerability = _context_response()
+    wrong_answerability["answerable"] = False
+    malformed_responses.append(wrong_answerability)
+    wrong_count = _context_response()
+    wrong_count["budget"]["returned_results"] = 0
+    malformed_responses.append(wrong_count)
+    raw = _context_response()
+    raw["results"][0]["raw"] = {"private": True}
+    malformed_responses.append(raw)
+    duplicate = _context_response()
+    duplicate["results"].append(copy.deepcopy(duplicate["results"][0]))
+    duplicate["budget"]["returned_results"] = 2
+    malformed_responses.append(duplicate)
+    extra = _context_response()
+    extra["private_metadata"] = {"secret": True}
+    malformed_responses.append(extra)
+
+    for response in malformed_responses:
+        with pytest.raises((ValidationError, ValueError)):
+            validate_context_response(
+                response,
+                expected_source_id="source_a",
+            )
+
+
+@pytest.mark.asyncio
+async def test_hybrid_execution_is_stable_bounded_and_deduplicated():
+    state = _hybrid_state()
+    targeted = _targeted_hybrid_context_pack()
+    repeated_seed = _context_response(
+        source_id="source_a",
+        source_ref="connector:source_a:seed-a",
+    )
+    dsa = FakeDsa(
+        [],
+        context_responses=[
+            repeated_seed,
+            _context_response(source_id="source_b"),
+        ],
+    )
+
+    combined, trace = await execute_hybrid_comparison(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={
+            "called": True,
+            "status": "success",
+            "budget_truncated": False,
+            "candidate_truncated": False,
+        },
+    )
+
+    assert [call[1]["source_ref"] for call in dsa.calls] == [
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+    ]
+    assert [call[1]["context_mode"] for call in dsa.calls] == [
+        "nearby_rows",
+        "upcoming_events",
+    ]
+    assert all(
+        call[1]["budget"]
+        == {
+            "max_rows": 5,
+            "max_bytes": 50000,
+            "max_text_chars": 12000,
+        }
+        for call in dsa.calls
+    )
+    assert combined is not None
+    assert [item["source_ref"] for item in combined["items"]] == [
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+        "connector:source_b:expanded-1",
+    ]
+    assert "available_context" not in combined["items"][0]
+    assert "url" not in combined["items"][-1]
+    assert "raw" not in combined["items"][-1]
+    assert trace["context_pack_call_count"] == 1
+    assert trace["context_expansion_call_count"] == 2
+    assert trace["call_count"] == 3
+    assert trace["raw_targeted_item_count"] == 2
+    assert trace["raw_expanded_item_count"] == 2
+    assert trace["final_combined_item_count"] == 3
+    assert trace["expansion_attempt_counts"]["satisfied"] == 2
+    assert trace["search_budget_truncated"] is False
+    assert trace["expansion_budget_truncated"] is False
+    assert combined["budget"] == {
+        "max_results": 5,
+        "returned_results": 4,
+        "estimated_bytes": 240,
+        "truncated": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_hybrid_selects_first_descriptor_bearing_result_and_first_mode():
+    state = _hybrid_state()
+    targeted = _targeted_hybrid_context_pack()
+    no_descriptor = {
+        **copy.deepcopy(targeted["items"][0]),
+        "result_id": "target-a-without-context",
+        "source_ref": "connector:source_a:no-context",
+        "available_context": [],
+    }
+    targeted["items"].insert(0, no_descriptor)
+    targeted["budget"]["returned_results"] = 3
+    targeted["diagnostics"]["candidate_counts_by_source"]["source_a"] = 2
+    targeted = validate_context_pack_response(
+        targeted,
+        expected_query=targeted["query"],
+        eligible_source_ids=["source_a", "source_b"],
+        preserve_available_context=True,
+        require_all_eligible_sources=True,
+    )
+    dsa = FakeDsa(
+        [],
+        context_responses=[
+            _context_response(source_id="source_a"),
+            _context_response(source_id="source_b"),
+        ],
+    )
+
+    await execute_hybrid_comparison(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={"called": True, "status": "success"},
+    )
+
+    assert [call[1]["source_ref"] for call in dsa.calls] == [
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+    ]
+    assert [call[1]["context_mode"] for call in dsa.calls] == [
+        "nearby_rows",
+        "upcoming_events",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_outcome"),
+    [
+        (_context_response(result=False), "unknown"),
+        (RuntimeError("PRIVATE DEPENDENCY"), "failed"),
+        (
+            {
+                **_context_response(),
+                "retrieval_mode": "fetch",
+            },
+            "filtered",
+        ),
+        (_context_response(truncated=True), "truncated"),
+    ],
+)
+async def test_hybrid_execution_records_failures_without_retry(
+    response,
+    expected_outcome,
+):
+    state = _hybrid_state()
+    targeted = _targeted_hybrid_context_pack()
+    dsa = FakeDsa(
+        [],
+        context_responses=[
+            response,
+            _context_response(source_id="source_b"),
+        ],
+    )
+
+    combined, trace = await execute_hybrid_comparison(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={"called": True, "status": "success"},
+    )
+
+    assert combined is not None
+    assert len(dsa.calls) == 2
+    assert state.expansion_attempts[0]["outcome"] == expected_outcome
+    assert state.expansion_attempts[1]["outcome"] == "satisfied"
+    assert trace["expansion_attempt_counts"][expected_outcome] == 1
+    assert "PRIVATE DEPENDENCY" not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_missing_descriptor_records_unsupported_and_continues():
+    state = _hybrid_state()
+    targeted = _targeted_hybrid_context_pack()
+    targeted["items"][0]["available_context"] = []
+    dsa = FakeDsa(
+        [],
+        context_responses=[_context_response(source_id="source_b")],
+    )
+
+    _, trace = await execute_hybrid_comparison(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={"called": True, "status": "success"},
+    )
+
+    assert len(dsa.calls) == 1
+    assert state.expansion_attempts[0]["source_id"] == "source_a"
+    assert state.expansion_attempts[0]["outcome"] == "unsupported"
+    assert state.expansion_attempts[1]["outcome"] == "satisfied"
+    assert trace["expansion_attempt_counts"]["unsupported"] == 1
+
+
+def test_hybrid_facts_manifest_identity_and_privacy_are_prompt_aware():
+    state = _hybrid_state()
+    state.expansion_attempts = [
+        {
+            "source_id": "source_a",
+            "seed_source_ref": "connector:source_a:seed-a",
+            "context_mode": "nearby_rows",
+            "outcome": "satisfied",
+            "query_id": "query-a",
+            "returned_reference_count": 1,
+        },
+        {
+            "source_id": "source_b",
+            "seed_source_ref": "connector:source_b:seed-b",
+            "context_mode": "upcoming_events",
+            "outcome": "satisfied",
+            "query_id": "query-b",
+            "returned_reference_count": 1,
+        },
+    ]
+    context_pack = {
+        **_targeted_hybrid_context_pack(),
+        "items": [
+            {
+                **item,
+                "available_context": [],
+            }
+            for item in _targeted_hybrid_context_pack()["items"]
+        ],
+    }
+    retained = {
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+    }
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs=retained,
+        expansion_attempts=state.expansion_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in facts} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+
+    filtered = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs={"connector:source_a:seed-a"},
+        expansion_attempts=state.expansion_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in filtered} == {
+        "context-delivery": "filtered",
+        "cross-source-comparison": "filtered",
+        "selected-source-coverage": "filtered",
+    }
+    truncated = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={
+            "status": "included",
+            "budget_truncated": False,
+            "candidate_truncated": True,
+        },
+        retained_source_refs=retained,
+        expansion_attempts=state.expansion_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in truncated} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "truncated",
+        "selected-source-coverage": "truncated",
+    }
+
+    identity_one = _manifest_id(
+        scope=SCOPE,
+        plan_id=state.plan.plan_id,
+        selected_strategies=["hybrid"],
+        declared_scope=state.declared_scope,
+        expansion_attempts=state.expansion_attempts,
+    )
+    changed_attempts = copy.deepcopy(state.expansion_attempts)
+    changed_attempts[0]["context_mode"] = "different_mode"
+    identity_two = _manifest_id(
+        scope=SCOPE,
+        plan_id=state.plan.plan_id,
+        selected_strategies=["hybrid"],
+        declared_scope=state.declared_scope,
+        expansion_attempts=changed_attempts,
+    )
+    assert identity_one != identity_two
+
+    state.acquisition_facts = facts
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=context_pack,
+        dsa_trace={
+            "called": True,
+            "status": "included",
+            "raw_item_count": 4,
+            "expansion_attempt_counts": {
+                "satisfied": 2,
+                "unknown": 0,
+                "failed": 0,
+                "filtered": 0,
+                "truncated": 0,
+                "unsupported": 0,
+            },
+        },
+        retained_source_refs=retained,
+    )
+    assert manifest["acquisition"]["expansion_attempt_count"] == 2
+    assert manifest["acquisition"]["expansion_successful_count"] == 2
+    assert manifest["acquisition"]["expansion_attempts"][0] == {
+        "source_id": "source_a",
+        "seed_source_ref": "connector:source_a:seed-a",
+        "context_mode": "nearby_rows",
+        "outcome": "satisfied",
+        "returned_reference_count": 1,
+    }
+    assert "query-a" not in json.dumps(manifest, sort_keys=True)
+    suppressed = suppress_manifest_identifiers(manifest)
+    assert suppressed["acquisition"]["expansion_attempt_count"] == 2
+    assert suppressed["acquisition"]["expansion_successful_count"] == 2
+    assert suppressed["acquisition"]["expansion_attempts"] == []
+    serialized = json.dumps(suppressed, sort_keys=True)
+    for prohibited in (
+        "source_a",
+        "connector:source_a:seed-a",
+        "nearby_rows",
+        "query-a",
+    ):
+        assert prohibited not in serialized
+
+
+def test_comparison_scope_overclaim_boundary_is_bounded_and_idempotent():
+    state = _hybrid_state()
+    state.sufficiency = _sufficiency_response(
+        state.manifest_id,
+        task_shape="cross_source_comparison",
+        evidence_plan_id=state.plan.plan_id,
+    )["result"]
+    state.sufficiency = SufficiencyResult.model_validate(state.sufficiency)
+    answer = enforce_final_answer("All records match.", state)
+    assert answer.endswith(COMPARISON_SCOPE_SUFFIX)
+    assert enforce_final_answer(answer, state).count(COMPARISON_SCOPE_SUFFIX) == 1
+    assert enforce_final_answer("The selected records differ.", state) == (
+        "The selected records differ."
+    )
 
 
 @pytest.mark.parametrize(

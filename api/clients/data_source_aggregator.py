@@ -92,3 +92,24 @@ class DataSourceAggregatorClient:
                 },
             },
         )
+
+    async def context_source(
+        self,
+        *,
+        source_ref: str,
+        context_mode: str,
+        budget: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v1/sources/context",
+            json={
+                "source_ref": source_ref,
+                "context_mode": context_mode,
+                "budget": budget
+                or {
+                    "max_rows": 5,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+            },
+        )

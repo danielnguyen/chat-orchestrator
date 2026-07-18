@@ -1406,6 +1406,7 @@ class FakeDSA:
         source_response=None,
         source_error: Exception | None = None,
         fetch_responses=None,
+        context_responses=None,
     ):
         self.calls = []
         self.list_calls = []
@@ -1432,6 +1433,7 @@ class FakeDSA:
         }
         self.source_error = source_error
         self.fetch_responses = list(fetch_responses or [])
+        self.context_responses = list(context_responses or [])
 
     async def list_sources(self):
         self.list_calls.append({})
@@ -1454,7 +1456,12 @@ class FakeDSA:
 
     async def context_source(self, **kwargs):
         self.context_calls.append(kwargs)
-        raise AssertionError("context expansion is not supported by this test path")
+        if not self.context_responses:
+            raise AssertionError("context expansion is not supported by this test path")
+        response = self.context_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _http_status_error(
@@ -11383,6 +11390,12 @@ def _multi_source_governed_context_pack(query: str) -> dict[str, object]:
             "content_type": "text",
             "text": "The secondary maintenance record confirms 2025-07-12.",
             "confidence": "high",
+            "available_context": [
+                {
+                    "context_mode": "upcoming_events",
+                    "description": "SECOND PRIVATE EXPANSION DESCRIPTION",
+                }
+            ],
             "warnings": [],
         }
     )
@@ -11403,6 +11416,55 @@ def _multi_source_governed_context_pack(query: str) -> dict[str, object]:
         "vehicle_log_secondary": 1,
     }
     return response
+
+
+def _hybrid_context_response(
+    *,
+    source_id: str,
+    source_ref: str,
+    text: str,
+    result: bool = True,
+    truncated: bool = False,
+) -> dict[str, object]:
+    results = (
+        [
+            {
+                "result_id": f"context-result-{source_id}",
+                "source_type": "record",
+                "source_id": source_id,
+                "source_name": f"PRIVATE CONTEXT SOURCE {source_id}",
+                "source_ref": source_ref,
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": f"PRIVATE CONTEXT TITLE {source_id}",
+                "content_type": "text",
+                "text": text,
+                "url": "https://private.invalid/context",
+                "confidence": "high",
+                "raw": None,
+                "available_context": [],
+                "warnings": [],
+            }
+        ]
+        if result
+        else []
+    )
+    return {
+        "query_id": f"context-query-{source_id}",
+        "answerable": bool(results),
+        "confidence": "high" if results else "none",
+        "retrieval_mode": "context",
+        "results": results,
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": 5,
+            "returned_results": len(results),
+            "estimated_bytes": 120 if results else 0,
+            "truncated": truncated,
+        },
+    }
 
 
 def _exact_fetch_response(
@@ -11544,6 +11606,45 @@ def _exact_plan_response(
     return response
 
 
+def _hybrid_plan_response(
+    *,
+    request_id: str,
+    question: str,
+    task_shape: str = "cross_source_comparison",
+) -> dict[str, object]:
+    response = _targeted_plan_response(
+        request_id=request_id,
+        question=question,
+        strategy="hybrid",
+        task_shape=task_shape,
+        eligible_source_ids=[
+            "vehicle_log_primary",
+            "vehicle_log_secondary",
+        ],
+    )
+    result = response["result"]
+    result["completeness_expectation"] = "complete_for_selected_sources"
+    result["contradiction_search_required"] = False
+    result["declared_requirements"] = [
+        {
+            "requirement_id": "selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "cross-source-comparison",
+            "requirement_kind": "cross_source_comparison",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "context-delivery",
+            "requirement_kind": "context_delivery",
+            "criticality": "material",
+        },
+    ]
+    return response
+
+
 def _exact_external_context(
     references=None,
 ) -> dict[str, object]:
@@ -11569,6 +11670,10 @@ def _derived_shape_response(
         "targeted_lookup": "targeted_lookup_derived",
         "bounded_exhaustive_review": "exhaustive_scope_requested",
         "absence_or_coverage_check": "absence_scope_requested",
+        "cross_source_comparison": "comparison_requested",
+        "contradiction_review": "contradiction_requested",
+        "historical_reconstruction": "historical_reconstruction_requested",
+        "recommendation_or_decision_support": "decision_support_requested",
     }[task_shape]
     return {
         "request_id": request_id,
@@ -11642,6 +11747,97 @@ async def _run_governed_context_case(
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return out, runtime, dsa, litellm, memory_store
+
+
+async def _run_hybrid_comparison_case(
+    *,
+    tmp_path,
+    context_pack: dict[str, object] | None = None,
+    context_responses=None,
+    provider_answer: str = (
+        "The two selected logs show different maintenance patterns."
+    ),
+    memory_store=None,
+    privacy_context_response=None,
+    privacy_context_enabled: bool = False,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Compare the maintenance history in these two vehicle logs."
+    request_id = "rid-evidence-hybrid-comparison"
+    runtime = FakeRuntime(
+        evidence_shape_response=_derived_shape_response(
+            request_id=request_id,
+            question=question,
+            task_shape="cross_source_comparison",
+        ),
+        evidence_plan_response=_hybrid_plan_response(
+            request_id=request_id,
+            question=question,
+        ),
+        privacy_context_response=privacy_context_response,
+    )
+    source_response = {
+        "sources": [
+            {
+                "source_id": source_id,
+                "display_name": f"Vehicle Log {source_id}",
+                "connector": "neutral_connector",
+                "domain_tags": ["vehicle", "maintenance"],
+                "sensitivity": "medium",
+                "access_mode": "read_only",
+                "capabilities": ["profile", "search", "context"],
+                "enabled": True,
+                "status": "ready",
+                "last_checked_at": "2026-07-17T00:00:00Z",
+                "last_error": None,
+            }
+            for source_id in (
+                "vehicle_log_primary",
+                "vehicle_log_secondary",
+            )
+        ]
+    }
+    dsa = FakeDSA(
+        response=context_pack or _multi_source_governed_context_pack(question),
+        source_response=source_response,
+        context_responses=(
+            context_responses
+            if context_responses is not None
+            else [
+                _hybrid_context_response(
+                    source_id="vehicle_log_primary",
+                    source_ref="vehicle_log_primary:expanded_1",
+                    text="Primary expanded history includes an oil change.",
+                ),
+                _hybrid_context_response(
+                    source_id="vehicle_log_secondary",
+                    source_ref="vehicle_log_secondary:expanded_2",
+                    text="Secondary expanded history includes a tire rotation.",
+                ),
+            ]
+        ),
+    )
+    litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = memory_store or FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        privacy_context_enabled=privacy_context_enabled,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -11802,6 +11998,353 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         assert prohibited not in prompt_trace
         assert prohibited not in serialized
         assert prohibited not in public_response
+
+
+@pytest.mark.asyncio
+async def test_hybrid_comparison_executes_declared_expansion_per_source_and_persists_truth(
+    tmp_path,
+):
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path
+    )
+
+    assert out["answer"] == (
+        "The two selected logs show different maintenance patterns."
+    )
+    assert len(runtime.interaction_governance_calls) == 1
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["source_ids"] == [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    assert dsa.calls[0]["budget"]["max_results"] == 2
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == [
+        {
+            "source_ref": "vehicle_log_primary:record_1",
+            "context_mode": "nearby_rows",
+            "budget": {
+                "max_rows": 5,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        },
+        {
+            "source_ref": "vehicle_log_secondary:record_2",
+            "context_mode": "upcoming_events",
+            "budget": {
+                "max_rows": 5,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        },
+    ]
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(litellm.calls) == 1
+    provider_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    for text in (
+        "The maintenance record lists 2025-07-12.",
+        "The secondary maintenance record confirms 2025-07-12.",
+        "Primary expanded history includes an oil change.",
+        "Secondary expanded history includes a tire rotation.",
+    ):
+        assert text in provider_messages
+    for prohibited in (
+        "nearby_rows",
+        "upcoming_events",
+        "PRIVATE EXPANSION DESCRIPTION SENTINEL",
+        "SECOND PRIVATE EXPANSION DESCRIPTION",
+    ):
+        assert prohibited not in provider_messages
+
+    facts = {
+        item["requirement_id"]: item["outcome"]
+        for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert manifest["acquisition"]["strategy_attempted"] == "hybrid"
+    assert manifest["acquisition"]["expansion_attempt_count"] == 2
+    assert manifest["acquisition"]["expansion_successful_count"] == 2
+    assert manifest["acquisition"]["expansion_attempts"] == [
+        {
+            "source_id": "vehicle_log_primary",
+            "seed_source_ref": "vehicle_log_primary:record_1",
+            "context_mode": "nearby_rows",
+            "outcome": "satisfied",
+            "returned_reference_count": 1,
+        },
+        {
+            "source_id": "vehicle_log_secondary",
+            "seed_source_ref": "vehicle_log_secondary:record_2",
+            "context_mode": "upcoming_events",
+            "outcome": "satisfied",
+            "returned_reference_count": 1,
+        },
+    ]
+    expected_refs = {
+        "vehicle_log_primary:record_1",
+        "vehicle_log_secondary:record_2",
+        "vehicle_log_primary:expanded_1",
+        "vehicle_log_secondary:expanded_2",
+    }
+    assert set(
+        manifest["acquisition"]["source_references_returned"]
+    ) == expected_refs
+    assert set(
+        manifest["acquisition"]["source_references_retained"]
+    ) == expected_refs
+    assert manifest["acquisition"]["source_references_filtered_or_omitted"] == []
+    assert manifest["acquisition"]["prompt_retained_item_count"] == 4
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_hybrid_comparison_missing_descriptor_withholds_without_targeted_fallback(
+    tmp_path,
+):
+    context_pack = _multi_source_governed_context_pack(
+        "Compare the maintenance history in these two vehicle logs."
+    )
+    context_pack["items"][1]["available_context"] = []
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path,
+        context_pack=context_pack,
+        context_responses=[
+            _hybrid_context_response(
+                source_id="vehicle_log_primary",
+                source_ref="vehicle_log_primary:expanded_1",
+                text="Primary expanded history.",
+            )
+        ],
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.calls) == 1
+    assert len(dsa.context_calls) == 1
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+    facts = {
+        item["requirement_id"]: item["outcome"]
+        for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["selected-source-coverage"] == "unsupported"
+    assert facts["cross-source-comparison"] == "unsupported"
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["expansion_unsupported_count"] == 1
+    assert manifest["acquisition"]["expansion_successful_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_outcome", "count_field"),
+    [
+        (
+            httpx.ReadTimeout("PRIVATE CONTEXT TIMEOUT"),
+            "failed",
+            "expansion_failed_count",
+        ),
+        (
+            _hybrid_context_response(
+                source_id="vehicle_log_primary",
+                source_ref="vehicle_log_primary:expanded_1",
+                text="",
+                result=False,
+            ),
+            "unknown",
+            "expansion_unknown_count",
+        ),
+        (
+            _hybrid_context_response(
+                source_id="vehicle_log_outside",
+                source_ref="vehicle_log_outside:expanded_1",
+                text="PRIVATE MALFORMED CONTENT",
+            ),
+            "filtered",
+            "expansion_filtered_count",
+        ),
+        (
+            _hybrid_context_response(
+                source_id="vehicle_log_primary",
+                source_ref="vehicle_log_primary:expanded_1",
+                text="PRIVATE TRUNCATED CONTENT",
+                truncated=True,
+            ),
+            "truncated",
+            "expansion_truncated_count",
+        ),
+    ],
+)
+async def test_hybrid_comparison_context_failure_is_bounded_and_never_retried(
+    tmp_path,
+    response,
+    expected_outcome,
+    count_field,
+):
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path,
+        context_responses=[
+            response,
+            _hybrid_context_response(
+                source_id="vehicle_log_secondary",
+                source_ref="vehicle_log_secondary:expanded_2",
+                text="Secondary expanded history.",
+            ),
+        ],
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.context_calls) == 2
+    assert litellm.calls == []
+    facts = {
+        item["requirement_id"]: item["outcome"]
+        for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["selected-source-coverage"] == expected_outcome
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"][count_field] == 1
+    serialized = json.dumps(manifest, sort_keys=True)
+    for prohibited in (
+        "PRIVATE CONTEXT TIMEOUT",
+        "PRIVATE MALFORMED CONTENT",
+        "PRIVATE TRUNCATED CONTENT",
+    ):
+        assert prohibited not in serialized
+
+
+@pytest.mark.asyncio
+async def test_hybrid_comparison_prompt_budget_source_loss_blocks_provider(
+    tmp_path,
+    monkeypatch,
+):
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["metadata"]["source_refs"] = [
+                    ref
+                    for ref in layer["metadata"]["source_refs"]
+                    if ref.startswith("vehicle_log_primary:")
+                ]
+        return replace(prompt, trace=trace)
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.context_calls) == 2
+    assert litellm.calls == []
+    facts = {
+        item["requirement_id"]: item["outcome"]
+        for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "context-delivery": "filtered",
+        "cross-source-comparison": "filtered",
+        "selected-source-coverage": "filtered",
+    }
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert len(manifest["acquisition"]["source_references_returned"]) == 4
+    assert all(
+        ref.startswith("vehicle_log_primary:")
+        for ref in manifest["acquisition"]["source_references_retained"]
+    )
+    assert len(
+        manifest["acquisition"]["source_references_filtered_or_omitted"]
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_hybrid_comparison_provider_overclaim_gets_selected_scope_disclosure(
+    tmp_path,
+):
+    out, _, _, litellm, _ = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path,
+        provider_answer="All relevant maintenance history is fully covered.",
+    )
+
+    suffix = (
+        "This comparison is limited to the selected sources and bounded context "
+        "checked, not every potentially relevant source."
+    )
+    assert len(litellm.calls) == 1
+    assert out["answer"].endswith(suffix)
+    assert out["answer"].count(suffix) == 1
+
+
+@pytest.mark.asyncio
+async def test_hybrid_comparison_privacy_suppresses_expansion_identifiers_not_outcomes(
+    tmp_path,
+):
+    out, _, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path,
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        ),
+        privacy_context_enabled=True,
+    )
+
+    assert out["answer"] == "Details cannot safely be shown on this surface."
+    assert len(dsa.context_calls) == 2
+    assert len(litellm.calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    acquisition = manifest["acquisition"]
+    assert acquisition["source_identifiers_suppressed"] is True
+    assert acquisition["expansion_attempts"] == []
+    assert acquisition["expansion_attempts_count"] == 2
+    assert acquisition["expansion_attempt_count"] == 2
+    assert acquisition["expansion_successful_count"] == 2
+    serialized = json.dumps(manifest, sort_keys=True)
+    for prohibited in (
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+        "nearby_rows",
+        "upcoming_events",
+        "Primary expanded history",
+        "Secondary expanded history",
+    ):
+        assert prohibited not in serialized
 
 
 @pytest.mark.asyncio
@@ -12150,6 +12693,92 @@ async def test_evidence_acquisition_unsupported_shape_is_provider_and_acquisitio
     assert len(runtime.evidence_plan_calls) == 1
     assert len(dsa.list_calls) == 1
     assert dsa.calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_shape",
+    [
+        "bounded_exhaustive_review",
+        "contradiction_review",
+        "absence_or_coverage_check",
+        "historical_reconstruction",
+        "recommendation_or_decision_support",
+    ],
+)
+async def test_hybrid_non_comparison_shapes_remain_acquisition_and_provider_free(
+    tmp_path,
+    task_shape,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Perform the requested bounded evidence review."
+    request_id = f"rid-evidence-hybrid-unsupported-{task_shape}"
+    runtime = FakeRuntime(
+        evidence_shape_response=_derived_shape_response(
+            request_id=request_id,
+            question=question,
+            task_shape=task_shape,
+        ),
+        evidence_plan_response=_hybrid_plan_response(
+            request_id=request_id,
+            question=question,
+            task_shape=task_shape,
+        ),
+    )
+    dsa = FakeDSA(
+        source_response={
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "display_name": source_id,
+                    "connector": "neutral_connector",
+                    "domain_tags": ["vehicle"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+                for source_id in (
+                    "vehicle_log_primary",
+                    "vehicle_log_secondary",
+                )
+            ]
+        }
+    )
+    litellm = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert len(dsa.list_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    assert dsa.calls == []
+    assert dsa.context_calls == []
+    assert dsa.fetch_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert litellm.calls == []
 
