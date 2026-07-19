@@ -11645,6 +11645,160 @@ def _hybrid_plan_response(
     return response
 
 
+def _bounded_exhaustive_plan_response(
+    *,
+    request_id: str,
+    question: str,
+    status: str = "ready",
+) -> dict[str, object]:
+    response = _targeted_plan_response(
+        request_id=request_id,
+        question=question,
+        strategy="hybrid",
+        task_shape="bounded_exhaustive_review",
+    )
+    result = response["result"]
+    result["plan_status"] = status
+    result["completeness_expectation"] = "complete_for_declared_scope"
+    result["contradiction_search_required"] = True
+    result["eligible_source_ids"] = ["vehicle_log_primary"]
+    result["authoritative_source_ids"] = ["vehicle_log_primary"]
+    result["declared_requirements"] = [
+        {
+            "requirement_id": "authoritative-inventory",
+            "requirement_kind": "authoritative_inventory",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "complete-scope-coverage",
+            "requirement_kind": "complete_scope_coverage",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "contradiction-search",
+            "requirement_kind": "contradiction_search",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "context-delivery",
+            "requirement_kind": "context_delivery",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "no-material-truncation",
+            "requirement_kind": "no_material_truncation",
+            "criticality": "material",
+        },
+    ]
+    result["limitation_codes"] = (
+        [] if status == "ready" else ["required_capability_unavailable"]
+    )
+    return response
+
+
+def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
+    response = _governed_context_pack(query)
+    response["query_id"] = "configured-worksheet-seed-query"
+    response["sources_used"] = ["vehicle_log_primary"]
+    response["items"] = [
+        {
+            "result_id": "targeted-seed-result",
+            "source_type": "google_sheets",
+            "source_id": "vehicle_log_primary",
+            "source_name": "PRIVATE WORKSHEET NAME",
+            "source_ref": (
+                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
+            ),
+            "retrieved_at": "2026-07-17T00:00:00Z",
+            "source_modified_at": None,
+            "title": "PRIVATE TARGETED SEED TITLE",
+            "content_type": "spreadsheet_row",
+            "text": "PRIVATE TARGETED SEED ROW",
+            "confidence": "high",
+            "available_context": [
+                {
+                    "context_mode": "nearby_rows",
+                    "description": (
+                        "Fetch every record from the complete configured worksheet."
+                    ),
+                },
+                {
+                    "context_mode": "configured_worksheet",
+                    "description": "PRIVATE COMPLETE DESCRIPTOR SENTINEL",
+                },
+            ],
+            "warnings": [],
+        }
+    ]
+    response["budget"] = {
+        "max_results": 1,
+        "returned_results": 1,
+        "estimated_bytes": 190,
+        "truncated": True,
+    }
+    response["diagnostics"] = {
+        "selection_mode": "query_relevance",
+        "considered_source_ids": ["vehicle_log_primary"],
+        "selected_source_ids": ["vehicle_log_primary"],
+        "source_diagnostics": [],
+        "ranking_mode": "single_source",
+        "candidate_counts_by_source": {"vehicle_log_primary": 4},
+        "budget_truncated_candidates": True,
+    }
+    return response
+
+
+def _configured_worksheet_context_response(
+    *,
+    result: bool = True,
+    truncated: bool = False,
+    source_id: str = "vehicle_log_primary",
+) -> dict[str, object]:
+    results = (
+        [
+            {
+                "result_id": "configured-worksheet-range",
+                "source_type": "google_sheets",
+                "source_id": source_id,
+                "source_name": "PRIVATE WORKSHEET NAME",
+                "source_ref": (
+                    f"google_sheets:{source_id}:Maintenance%20Log!A2:E20"
+                ),
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": "PRIVATE COMPLETE RANGE TITLE",
+                "content_type": "spreadsheet_range",
+                "text": (
+                    "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records."
+                ),
+                "url": None,
+                "confidence": "high",
+                "raw": None,
+                "available_context": [],
+                "warnings": [],
+            }
+        ]
+        if result
+        else []
+    )
+    return {
+        "query_id": "configured-worksheet-context-query",
+        "answerable": bool(results),
+        "confidence": "high" if results else "none",
+        "retrieval_mode": "context",
+        "results": results,
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": 1,
+            "returned_results": len(results),
+            "estimated_bytes": 310 if results else 0,
+            "truncated": truncated,
+        },
+    }
+
+
 def _exact_external_context(
     references=None,
 ) -> dict[str, object]:
@@ -11844,6 +11998,411 @@ async def _run_hybrid_comparison_case(
         request_id=request_id,
     )
     return out, runtime, dsa, litellm, memory_store
+
+
+async def _run_bounded_exhaustive_case(
+    *,
+    tmp_path,
+    context_pack: dict[str, object] | None = None,
+    context_responses=None,
+    plan_status: str = "ready",
+    provider_answer: str = (
+        "Within the configured worksheet, all records in the declared scope "
+        "were reviewed."
+    ),
+    memory_store=None,
+    privacy_context_response=None,
+    privacy_context_enabled: bool = False,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Review every maintenance record in the configured worksheet."
+    request_id = "rid-evidence-bounded-exhaustive"
+    runtime = FakeRuntime(
+        evidence_shape_response=_derived_shape_response(
+            request_id=request_id,
+            question=question,
+            task_shape="bounded_exhaustive_review",
+        ),
+        evidence_plan_response=_bounded_exhaustive_plan_response(
+            request_id=request_id,
+            question=question,
+            status=plan_status,
+        ),
+        privacy_context_response=privacy_context_response,
+    )
+    dsa = FakeDSA(
+        response=context_pack or _bounded_exhaustive_context_pack(question),
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "vehicle_log_primary",
+                    "display_name": "PRIVATE WORKSHEET NAME",
+                    "connector": "google_sheets",
+                    "domain_tags": ["vehicle", "maintenance"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "authority_role": "authoritative",
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+            ],
+        },
+        context_responses=(
+            context_responses
+            if context_responses is not None
+            else [_configured_worksheet_context_response()]
+        ),
+    )
+    litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = memory_store or FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context={
+                "enabled": True,
+                "source_ids": ["vehicle_log_primary"],
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        privacy_context_enabled=privacy_context_enabled,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return out, runtime, dsa, litellm, memory_store
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_review_delivers_only_complete_configured_worksheet(
+    tmp_path,
+):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(tmp_path=tmp_path)
+    )
+
+    assert out["answer"] == (
+        "Within the configured worksheet, all records in the declared scope "
+        "were reviewed."
+    )
+    assert len(runtime.interaction_governance_calls) == 1
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["query"] == (
+        "Review every maintenance record in the configured worksheet."
+    )
+    assert dsa.calls[0]["source_ids"] == ["vehicle_log_primary"]
+    assert dsa.calls[0]["budget"]["max_results"] == 1
+    assert dsa.context_calls == [
+        {
+            "source_ref": (
+                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
+            ),
+            "context_mode": "configured_worksheet",
+            "budget": {
+                "max_rows": 20,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    assert dsa.fetch_calls == []
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(litellm.calls) == 1
+    provider_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "COMPLETE WORKSHEET RANGE" in provider_messages
+    for prohibited in (
+        "PRIVATE TARGETED SEED ROW",
+        "PRIVATE COMPLETE DESCRIPTOR SENTINEL",
+        "configured_worksheet",
+        "nearby_rows",
+        "cache_status",
+    ):
+        assert prohibited not in provider_messages
+
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "authoritative-inventory": "satisfied",
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    acquisition = manifest["acquisition"]
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert acquisition["strategy_attempted"] == "hybrid"
+    assert acquisition["sources_considered"] == ["vehicle_log_primary"]
+    assert acquisition["sources_selected"] == ["vehicle_log_primary"]
+    assert acquisition["sources_used"] == ["vehicle_log_primary"]
+    assert acquisition["item_count"] == 1
+    assert acquisition["usable_item_count"] == 1
+    assert acquisition["prompt_retained_item_count"] == 1
+    assert acquisition["source_references_returned"] == [
+        "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20"
+    ]
+    assert acquisition["source_references_retained"] == [
+        "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20"
+    ]
+    assert acquisition["source_references_filtered_or_omitted"] == []
+    assert acquisition["expansion_attempt_count"] == 1
+    assert acquisition["expansion_successful_count"] == 1
+    assert acquisition["expansion_attempts"] == [
+        {
+            "source_id": "vehicle_log_primary",
+            "seed_source_ref": (
+                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
+            ),
+            "context_mode": "configured_worksheet",
+            "outcome": "satisfied",
+            "returned_reference_count": 1,
+        }
+    ]
+    assert acquisition["dsa_budget_truncation"] is True
+    assert acquisition["candidate_truncation"] is True
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "COMPLETE WORKSHEET RANGE" not in serialized
+    assert "PRIVATE TARGETED SEED ROW" not in serialized
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
+    tmp_path,
+    monkeypatch,
+):
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["metadata"]["source_refs"] = []
+        return replace(prompt, trace=trace)
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(tmp_path=tmp_path)
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.context_calls) == 1
+    assert litellm.calls == []
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "authoritative-inventory": "satisfied",
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "filtered",
+        "contradiction-search": "filtered",
+        "no-material-truncation": "filtered",
+    }
+    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["acquisition"]
+    assert len(acquisition["source_references_returned"]) == 1
+    assert acquisition["source_references_retained"] == []
+    assert len(acquisition["source_references_filtered_or_omitted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_missing_exact_descriptor_never_falls_back(
+    tmp_path,
+):
+    context_pack = _bounded_exhaustive_context_pack(
+        "Review every maintenance record in the configured worksheet."
+    )
+    context_pack["items"][0]["available_context"] = [
+        {
+            "context_mode": "nearby_rows",
+            "description": "Fetch the complete configured worksheet.",
+        }
+    ]
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(
+            tmp_path=tmp_path,
+            context_pack=context_pack,
+            context_responses=[],
+        )
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.calls) == 1
+    assert dsa.context_calls == []
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["complete-scope-coverage"] == "unsupported"
+    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["acquisition"]
+    assert acquisition["expansion_attempt_count"] == 1
+    assert acquisition["expansion_unsupported_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_outcome", "count_field"),
+    [
+        (
+            _configured_worksheet_context_response(result=False),
+            "unknown",
+            "expansion_unknown_count",
+        ),
+        (
+            _configured_worksheet_context_response(truncated=True),
+            "truncated",
+            "expansion_truncated_count",
+        ),
+        (
+            _configured_worksheet_context_response(source_id="outside-source"),
+            "filtered",
+            "expansion_filtered_count",
+        ),
+        (
+            httpx.ReadTimeout("PRIVATE CONFIGURED WORKSHEET TIMEOUT"),
+            "failed",
+            "expansion_failed_count",
+        ),
+    ],
+)
+async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
+    tmp_path,
+    response,
+    expected_outcome,
+    count_field,
+):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(
+            tmp_path=tmp_path,
+            context_responses=[response],
+        )
+    )
+
+    assert out["answer"] == (
+        "I couldn’t verify that from the available source context, so I’m not "
+        "going to present an unsupported conclusion."
+    )
+    assert len(dsa.context_calls) == 1
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["complete-scope-coverage"] == expected_outcome
+    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["acquisition"]
+    assert acquisition["expansion_attempt_count"] == 1
+    assert acquisition[count_field] == 1
+    serialized = json.dumps(memory_store.trace_calls[0]["payload"], sort_keys=True)
+    assert "PRIVATE CONFIGURED WORKSHEET TIMEOUT" not in serialized
+    assert "COMPLETE WORKSHEET RANGE" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_current_unsupported_plan_never_acquires(
+    tmp_path,
+):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(
+            tmp_path=tmp_path,
+            plan_status="unsupported",
+            context_responses=[],
+        )
+    )
+
+    assert out["answer"] == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert len(runtime.evidence_plan_calls) == 1
+    assert dsa.calls == []
+    assert dsa.context_calls == []
+    assert dsa.fetch_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert litellm.calls == []
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["status"] == "unsupported_plan"
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_privacy_suppresses_expansion_identifiers(
+    tmp_path,
+):
+    out, _, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(
+            tmp_path=tmp_path,
+            privacy_context_response=_privacy_runtime_response(
+                surface_type="desktop_private",
+                sensitivity_level="sensitive",
+                sensitive_detail_allowed=False,
+                screen_detail_allowed=False,
+                redaction_required=True,
+                safe_summary_required=True,
+                reason_codes=["safe_summary_required"],
+            ),
+            privacy_context_enabled=True,
+        )
+    )
+
+    assert out["answer"] == "Details cannot safely be shown on this surface."
+    assert len(dsa.context_calls) == 1
+    assert len(litellm.calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    acquisition = manifest["acquisition"]
+    assert acquisition["source_identifiers_suppressed"] is True
+    assert acquisition["expansion_attempts"] == []
+    assert acquisition["expansion_attempts_count"] == 1
+    assert acquisition["expansion_attempt_count"] == 1
+    assert acquisition["expansion_successful_count"] == 1
+    serialized = json.dumps(manifest, sort_keys=True)
+    for prohibited in (
+        "vehicle_log_primary",
+        "configured_worksheet",
+        "Maintenance%20Log",
+        "configured-worksheet-context-query",
+        "COMPLETE WORKSHEET RANGE",
+    ):
+        assert prohibited not in serialized
 
 
 def _assert_governed_context_rejected(

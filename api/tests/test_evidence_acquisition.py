@@ -8,7 +8,9 @@ import pytest
 from models import ChatRequest
 from pydantic import ValidationError
 from services.evidence_acquisition import (
+    BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
     COMPARISON_SCOPE_SUFFIX,
+    CONFIGURED_WORKSHEET_CONTEXT_MODE,
     LIMITATION_SUFFIX,
     TARGETED_SCOPE_SUFFIX,
     WITHHELD_ANSWER,
@@ -25,10 +27,13 @@ from services.evidence_acquisition import (
     build_manifest_trace,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
+    execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
     provider_allowed,
     suppress_manifest_identifiers,
+    validate_bounded_exhaustive_context_pack_response,
+    validate_configured_worksheet_response,
     validate_context_pack_response,
     validate_context_response,
     validate_fetch_response,
@@ -250,6 +255,76 @@ def _hybrid_plan_response(
     }
 
 
+def _exhaustive_shape_response():
+    question = "Review every configured worksheet record."
+    response = _shape_response(shape="bounded_exhaustive_review")
+    response["result"].update(
+        {
+            "question_anchor": question,
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
+            "reason_codes": [
+                "explicit_evidence_language",
+                "exhaustive_scope_requested",
+            ],
+        }
+    )
+    return response
+
+
+def _exhaustive_requirements():
+    return [
+        {
+            "requirement_id": requirement_kind.replace("_", "-"),
+            "requirement_kind": requirement_kind,
+            "criticality": "material",
+        }
+        for requirement_kind in (
+            "authoritative_inventory",
+            "complete_scope_coverage",
+            "contradiction_search",
+            "context_delivery",
+            "no_material_truncation",
+        )
+    ]
+
+
+def _exhaustive_plan_response(
+    *,
+    eligible_source_ids=None,
+    authoritative_source_ids=None,
+    requirements=None,
+    **overrides,
+):
+    shape = _exhaustive_shape_response()["result"]
+    result = {
+        "plan_id": "evidence_plan_exhaustive",
+        "question_anchor": shape["question_anchor"],
+        "question_anchor_digest": shape["question_anchor_digest"],
+        "task_shape": "bounded_exhaustive_review",
+        "plan_status": "ready",
+        "completeness_expectation": "complete_for_declared_scope",
+        "contradiction_search_required": True,
+        "eligible_source_ids": eligible_source_ids
+        if eligible_source_ids is not None
+        else ["source_a"],
+        "authoritative_source_ids": (
+            authoritative_source_ids
+            if authoritative_source_ids is not None
+            else ["source_a"]
+        ),
+        "selected_strategies": ["hybrid"],
+        "declared_requirements": (
+            requirements if requirements is not None else _exhaustive_requirements()
+        ),
+        "limitation_codes": [],
+        "user_safe_summary": "A bounded exhaustive strategy is available.",
+    }
+    result.update(overrides)
+    return {**SCOPE, "result": result}
+
+
 def _fetch_response(
     *,
     source_id="source_a",
@@ -347,6 +422,56 @@ def _context_response(
             "max_results": None,
             "returned_results": len(results),
             "estimated_bytes": 80 if results else 0,
+            "truncated": truncated,
+        },
+    }
+
+
+def _configured_worksheet_response(
+    *,
+    source_id="source_a",
+    result=True,
+    truncated=False,
+    errors=None,
+):
+    results = (
+        [
+            {
+                "result_id": "configured-worksheet-result",
+                "source_type": "google_sheets",
+                "source_id": source_id,
+                "source_name": "PRIVATE CONFIGURED SOURCE",
+                "source_ref": (
+                    f"google_sheets:{source_id}:Maintenance!A2:E5"
+                ),
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": "PRIVATE CONFIGURED WORKSHEET TITLE",
+                "content_type": "spreadsheet_range",
+                "text": "PRIVATE COMPLETE CONFIGURED WORKSHEET CONTENT",
+                "url": None,
+                "confidence": "high",
+                "raw": None,
+                "available_context": [],
+                "warnings": [],
+            }
+        ]
+        if result
+        else []
+    )
+    return {
+        "query_id": "configured-worksheet-query",
+        "answerable": bool(results),
+        "confidence": "high" if results else "none",
+        "retrieval_mode": "context",
+        "results": results,
+        "warnings": [],
+        "errors": errors or [],
+        "budget": {
+            "max_results": 1,
+            "returned_results": len(results),
+            "estimated_bytes": 240 if results else 0,
             "truncated": truncated,
         },
     }
@@ -1344,6 +1469,820 @@ def test_context_pack_contract_preserves_descriptors_only_when_requested():
     assert _validated_context_pack(response)["items"][0].get(
         "available_context"
     ) is None
+
+
+def _exhaustive_state(
+    *,
+    sources=None,
+    plan_overrides=None,
+    requirements=None,
+    inventory_metadata=None,
+    declared_source_ids=None,
+    declared_categories=None,
+    exact_source_refs=None,
+):
+    configured_sources = sources or [
+        _source(
+            "source_a",
+            capabilities=["profile", "search", "context"],
+            authority_role="authoritative",
+            connector="google_sheets",
+        )
+    ]
+    inventory = DsaSourceListResponse.model_validate(
+        {
+            **(
+                inventory_metadata
+                if inventory_metadata is not None
+                else {
+                    "inventory_scope": "configured_sources",
+                    "inventory_status": "complete",
+                }
+            ),
+            "sources": configured_sources,
+        }
+    )
+    plan_data = _exhaustive_plan_response(
+        requirements=requirements,
+    )["result"]
+    plan_data.update(plan_overrides or {})
+    references = exact_source_refs or []
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        shape=ShapeResult.model_validate(_exhaustive_shape_response()["result"]),
+        inventory=inventory,
+        declared_scope={
+            "source_ids": (
+                list(declared_source_ids)
+                if declared_source_ids is not None
+                else ["source_a"]
+            ),
+            "source_categories": list(declared_categories or []),
+            "exact_source_refs": references,
+            "inventory_status": (
+                "complete_for_declared_scope"
+                if inventory.inventory_status == "complete"
+                else inventory.inventory_status or "unknown"
+            ),
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        plan=PlanResult.model_validate(plan_data),
+        manifest_id="evidence_manifest_0123456789abcdef0123456789abcdef",
+        exact_source_refs=references,
+    )
+
+
+def _exhaustive_targeted_context_pack():
+    response = _context_pack()
+    response["query"] = _exhaustive_shape_response()["result"]["question_anchor"]
+    response["items"][0].update(
+        {
+            "result_id": "targeted-seed",
+            "source_type": "google_sheets",
+            "source_id": "source_a",
+            "source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+            "content_type": "spreadsheet_row",
+            "text": "PRIVATE TARGETED SEED CONTENT",
+            "available_context": [
+                {
+                    "context_mode": "nearby_rows",
+                    "description": "Fetch the complete worksheet, supposedly.",
+                },
+                {
+                    "context_mode": "configured_worksheet",
+                    "description": "Misleading description is ignored.",
+                },
+            ],
+        }
+    )
+    return validate_bounded_exhaustive_context_pack_response(
+        response,
+        expected_query=response["query"],
+        expected_source_id="source_a",
+    )
+
+
+def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
+    assert _exhaustive_state().supported_bounded_exhaustive_path is True
+    assert _exhaustive_state().supported_governed_path is True
+
+    second_source = _source(
+        "source_b",
+        capabilities=["profile", "search", "context"],
+        authority_role="supplemental",
+        connector="google_sheets",
+        tags=["other"],
+    )
+    narrowed_by_id = _exhaustive_state(
+        sources=[
+            _source(
+                "source_a",
+                capabilities=["profile", "search", "context"],
+                authority_role="authoritative",
+                connector="google_sheets",
+            ),
+            second_source,
+        ],
+        declared_source_ids=["source_a"],
+    )
+    narrowed_by_category = _exhaustive_state(
+        sources=[
+            _source(
+                "source_a",
+                capabilities=["profile", "search", "context"],
+                authority_role="authoritative",
+                connector="google_sheets",
+                tags=["records"],
+            ),
+            second_source,
+        ],
+        declared_source_ids=[],
+        declared_categories=["records"],
+    )
+    assert narrowed_by_id.supported_bounded_exhaustive_path is True
+    assert narrowed_by_category.supported_bounded_exhaustive_path is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unsupported-status",
+        "ready-with-limitations",
+        "limitation-code",
+        "wrong-shape",
+        "wrong-strategy",
+        "wrong-completeness",
+        "no-contradiction",
+        "exact-reference",
+        "zero-eligible",
+        "two-eligible",
+        "missing-requirement",
+        "extra-requirement",
+        "optional-requirement",
+        "non-material-requirement",
+        "missing-authoritative",
+        "additional-authoritative",
+    ],
+)
+def test_bounded_exhaustive_rejects_plan_contract_variants(case):
+    requirements = _exhaustive_requirements()
+    overrides = {}
+    exact_source_refs = None
+    if case == "unsupported-status":
+        overrides["plan_status"] = "unsupported"
+    elif case == "ready-with-limitations":
+        overrides.update(
+            {
+                "plan_status": "ready_with_limitations",
+                "limitation_codes": ["optional_source_unavailable"],
+            }
+        )
+        requirements.append(
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+            }
+        )
+    elif case == "limitation-code":
+        overrides["limitation_codes"] = ["required_capability_unavailable"]
+    elif case == "wrong-shape":
+        overrides["task_shape"] = "contradiction_review"
+    elif case == "wrong-strategy":
+        overrides["selected_strategies"] = ["bounded_full_context"]
+    elif case == "wrong-completeness":
+        overrides["completeness_expectation"] = "complete_for_selected_sources"
+    elif case == "no-contradiction":
+        overrides["contradiction_search_required"] = False
+    elif case == "exact-reference":
+        exact_source_refs = [
+            {
+                "source_id": "source_a",
+                "source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+            }
+        ]
+    elif case == "zero-eligible":
+        overrides["eligible_source_ids"] = []
+        overrides["authoritative_source_ids"] = []
+    elif case == "two-eligible":
+        overrides["eligible_source_ids"] = ["source_a", "source_b"]
+        overrides["authoritative_source_ids"] = ["source_a", "source_b"]
+    elif case == "missing-requirement":
+        requirements.pop()
+    elif case == "extra-requirement":
+        requirements.append(
+            {
+                "requirement_id": "targeted-evidence",
+                "requirement_kind": "targeted_evidence",
+                "criticality": "material",
+            }
+        )
+    elif case == "optional-requirement":
+        requirements[-1]["criticality"] = "optional"
+    elif case == "non-material-requirement":
+        requirements[0]["criticality"] = "optional"
+    elif case == "missing-authoritative":
+        overrides["authoritative_source_ids"] = []
+    else:
+        overrides["authoritative_source_ids"] = ["source_a", "source_b"]
+
+    state = _exhaustive_state(
+        plan_overrides=overrides,
+        requirements=requirements,
+        exact_source_refs=exact_source_refs,
+    )
+    assert state.supported_bounded_exhaustive_path is False
+
+
+@pytest.mark.parametrize(
+    ("case", "source_overrides"),
+    [
+        ("disabled", {"enabled": False, "status": "disabled"}),
+        ("unavailable", {"status": "unavailable"}),
+        ("unknown-status", {"status": "unknown"}),
+        ("supplemental", {"authority_role": "supplemental"}),
+        ("unknown-authority", {"authority_role": "unknown"}),
+        ("wrong-connector", {"connector": "ics_calendar"}),
+        ("missing-search", {"capabilities": ["profile", "context"]}),
+        ("missing-context", {"capabilities": ["profile", "search"]}),
+    ],
+)
+def test_bounded_exhaustive_rejects_untrusted_or_incapable_source(
+    case,
+    source_overrides,
+):
+    source_config = {
+        "capabilities": ["profile", "search", "context"],
+        "enabled": True,
+        "status": "ready",
+        "authority_role": "authoritative",
+        "connector": "google_sheets",
+    }
+    source_config.update(source_overrides)
+    source = _source(
+        "source_a",
+        capabilities=source_config["capabilities"],
+        enabled=source_config["enabled"],
+        status=source_config["status"],
+        authority_role=source_config["authority_role"],
+        connector=source_config["connector"],
+        display_name="Authoritative complete official records",
+        tags=["official"],
+    )
+    assert (
+        _exhaustive_state(sources=[source]).supported_bounded_exhaustive_path
+        is False
+    ), case
+
+
+@pytest.mark.parametrize(
+    "inventory_metadata",
+    [
+        {},
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "partial",
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "unknown",
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "unavailable",
+        },
+    ],
+)
+def test_bounded_exhaustive_rejects_untrusted_inventory_states(
+    inventory_metadata,
+):
+    assert (
+        _exhaustive_state(
+            inventory_metadata=inventory_metadata
+        ).supported_bounded_exhaustive_path
+        is False
+    )
+
+
+def test_bounded_exhaustive_rejects_malformed_inventory_and_wider_universe():
+    for metadata in (
+        {"inventory_scope": "configured_sources"},
+        {"inventory_status": "complete"},
+        {
+            "inventory_scope": None,
+            "inventory_status": "complete",
+        },
+    ):
+        with pytest.raises(ValidationError):
+            DsaSourceListResponse.model_validate(
+                {
+                    **metadata,
+                    "sources": [],
+                }
+            )
+
+    second_source = _source(
+        "source_b",
+        capabilities=["profile", "search", "context"],
+        authority_role="authoritative",
+        connector="google_sheets",
+    )
+    assert (
+        _exhaustive_state(
+            sources=[
+                _source(
+                    "source_a",
+                    capabilities=["profile", "search", "context"],
+                    authority_role="authoritative",
+                    connector="google_sheets",
+                ),
+                second_source,
+            ],
+            declared_source_ids=[],
+        ).supported_bounded_exhaustive_path
+        is False
+    )
+    assert (
+        _exhaustive_state(
+            declared_source_ids=["source_a", "missing_authoritative_source"]
+        ).supported_bounded_exhaustive_path
+        is False
+    )
+
+
+def test_bounded_exhaustive_context_pack_requires_exact_seed_association():
+    valid = _exhaustive_targeted_context_pack()
+    assert valid["items"][0]["available_context"][0]["context_mode"] == (
+        "nearby_rows"
+    )
+    assert valid["items"][0]["available_context"][1]["context_mode"] == (
+        "configured_worksheet"
+    )
+
+    mutations = []
+    for mutation in (
+        "errors",
+        "missing-items",
+        "wrong-count",
+        "missing-diagnostics",
+        "wrong-considered",
+        "wrong-selected",
+        "wrong-candidate",
+        "wrong-source",
+    ):
+        response = copy.deepcopy(_context_pack())
+        response["query"] = _exhaustive_shape_response()["result"][
+            "question_anchor"
+        ]
+        response["items"][0].update(
+            {
+                "source_type": "google_sheets",
+                "source_id": "source_a",
+                "source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+                "content_type": "spreadsheet_row",
+                "available_context": [],
+            }
+        )
+        if mutation == "errors":
+            response["errors"] = [{"code": "bounded_error"}]
+        elif mutation == "missing-items":
+            response["items"] = []
+            response["sources_used"] = []
+            response["budget"]["returned_results"] = 0
+            response["diagnostics"]["selected_source_ids"] = []
+            response["diagnostics"]["candidate_counts_by_source"] = {}
+        elif mutation == "wrong-count":
+            response["budget"]["returned_results"] = 0
+        elif mutation == "missing-diagnostics":
+            response["diagnostics"] = None
+        elif mutation == "wrong-considered":
+            response["diagnostics"]["considered_source_ids"] = []
+        elif mutation == "wrong-selected":
+            response["diagnostics"]["selected_source_ids"] = []
+        elif mutation == "wrong-candidate":
+            response["diagnostics"]["candidate_counts_by_source"] = {}
+        else:
+            response["items"][0]["source_id"] = "source_b"
+        mutations.append(response)
+
+    for response in mutations:
+        with pytest.raises((ValidationError, ValueError)):
+            validate_bounded_exhaustive_context_pack_response(
+                response,
+                expected_query=response["query"],
+                expected_source_id="source_a",
+            )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_outcome"),
+    [
+        ("valid", "satisfied"),
+        ("empty", "unknown"),
+        ("truncated", "truncated"),
+        ("errors", "failed"),
+        ("multiple", "filtered"),
+        ("wrong-source", "filtered"),
+        ("wrong-type", "filtered"),
+        ("wrong-content", "filtered"),
+        ("url", "filtered"),
+        ("recursive-context", "filtered"),
+    ],
+)
+def test_configured_worksheet_response_has_a_dedicated_strict_contract(
+    mutation,
+    expected_outcome,
+):
+    response = _configured_worksheet_response()
+    if mutation == "empty":
+        response = _configured_worksheet_response(result=False)
+    elif mutation == "truncated":
+        response["budget"]["truncated"] = True
+    elif mutation == "errors":
+        response = _configured_worksheet_response(
+            result=False,
+            errors=[{"code": "bounded_dependency_error"}],
+        )
+    elif mutation == "multiple":
+        second = copy.deepcopy(response["results"][0])
+        second["result_id"] = "configured-worksheet-result-2"
+        second["source_ref"] = "google_sheets:source_a:Maintenance!A2:E6"
+        response["results"].append(second)
+        response["budget"]["returned_results"] = 2
+    elif mutation == "wrong-source":
+        response["results"][0]["source_id"] = "source_b"
+    elif mutation == "wrong-type":
+        response["results"][0]["source_type"] = "neutral_connector"
+    elif mutation == "wrong-content":
+        response["results"][0]["content_type"] = "spreadsheet_row"
+    elif mutation == "url":
+        response["results"][0]["url"] = "https://private.invalid/sheet"
+    elif mutation == "recursive-context":
+        response["results"][0]["available_context"] = [
+            {
+                "context_mode": "configured_worksheet",
+                "description": "Fetch again.",
+            }
+        ]
+
+    validated, outcome = validate_configured_worksheet_response(
+        response,
+        expected_source_id="source_a",
+    )
+    assert outcome == expected_outcome
+    assert validated.budget.returned_results == len(validated.results)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "raw",
+        "answerability",
+        "count",
+        "duplicate-id",
+        "duplicate-reference",
+        "unknown-field",
+    ],
+)
+def test_configured_worksheet_response_rejects_malformed_contract(mutation):
+    response = _configured_worksheet_response()
+    if mutation == "raw":
+        response["results"][0]["raw"] = {"private": True}
+    elif mutation == "answerability":
+        response["answerable"] = False
+    elif mutation == "count":
+        response["budget"]["returned_results"] = 0
+    elif mutation in {"duplicate-id", "duplicate-reference"}:
+        second = copy.deepcopy(response["results"][0])
+        if mutation == "duplicate-id":
+            second["source_ref"] = "google_sheets:source_a:Maintenance!A2:E6"
+        else:
+            second["result_id"] = "configured-worksheet-result-2"
+        response["results"].append(second)
+        response["budget"]["returned_results"] = 2
+    else:
+        response["private_metadata"] = {"secret": True}
+    with pytest.raises(ValidationError):
+        validate_configured_worksheet_response(
+            response,
+            expected_source_id="source_a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_selects_exact_descriptor_and_only_delivers_range():
+    state = _exhaustive_state()
+    targeted = _exhaustive_targeted_context_pack()
+    first_without_mode = copy.deepcopy(targeted["items"][0])
+    first_without_mode.update(
+        {
+            "result_id": "earlier-targeted-seed",
+            "source_ref": "google_sheets:source_a:Maintenance!A3:E3",
+            "available_context": [
+                {
+                    "context_mode": "nearby_rows",
+                    "description": "Complete worksheet configured_worksheet.",
+                }
+            ],
+        }
+    )
+    targeted["items"].insert(0, first_without_mode)
+    targeted["budget"]["returned_results"] = 2
+    targeted["diagnostics"]["candidate_counts_by_source"]["source_a"] = 2
+    dsa = FakeDsa(
+        [],
+        context_responses=[_configured_worksheet_response()],
+    )
+
+    bundle, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={
+            "called": True,
+            "status": "success",
+            "budget_truncated": True,
+            "candidate_truncated": True,
+        },
+    )
+
+    assert dsa.calls == [
+        (
+            "context_source",
+            {
+                "source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+                "context_mode": "configured_worksheet",
+                "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
+            },
+        )
+    ]
+    assert bundle["bundle_id"].startswith("evidence_exhaustive_bundle_")
+    assert bundle["sources_used"] == ["source_a"]
+    assert len(bundle["items"]) == 1
+    item = bundle["items"][0]
+    assert item["source_ref"] == "google_sheets:source_a:Maintenance!A2:E5"
+    assert item["content_type"] == "spreadsheet_range"
+    for prohibited_field in (
+        "raw",
+        "url",
+        "available_context",
+        "cache_status",
+    ):
+        assert prohibited_field not in item
+    serialized = json.dumps(bundle, sort_keys=True)
+    assert "PRIVATE TARGETED SEED CONTENT" not in serialized
+    assert "Misleading description is ignored." not in serialized
+    assert trace["call_count"] == 2
+    assert trace["context_pack_call_count"] == 1
+    assert trace["context_expansion_call_count"] == 1
+    assert trace["raw_targeted_item_count"] == 2
+    assert trace["raw_expanded_item_count"] == 1
+    assert trace["final_combined_item_count"] == 1
+    assert trace["search_budget_truncated"] is True
+    assert trace["candidate_truncated"] is True
+    assert state.expansion_attempts == [
+        {
+            "source_id": "source_a",
+            "seed_source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+            "context_mode": "configured_worksheet",
+            "outcome": "satisfied",
+            "query_id": "configured-worksheet-query",
+            "returned_reference_count": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_missing_exact_descriptor_is_unsupported_without_call():
+    state = _exhaustive_state()
+    targeted = _exhaustive_targeted_context_pack()
+    targeted["items"][0]["available_context"] = [
+        {
+            "context_mode": "nearby_rows",
+            "description": "Fetch every complete worksheet.",
+        }
+    ]
+    dsa = FakeDsa([], context_responses=[])
+
+    bundle, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={"called": True, "status": "success"},
+    )
+
+    assert dsa.calls == []
+    assert bundle["items"] == []
+    assert state.expansion_attempts[0]["outcome"] == "unsupported"
+    assert state.expansion_attempts[0]["context_mode"] == (
+        CONFIGURED_WORKSHEET_CONTEXT_MODE
+    )
+    assert trace["call_count"] == 1
+    assert trace["context_expansion_call_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_outcome"),
+    [
+        (_configured_worksheet_response(result=False), "unknown"),
+        (_configured_worksheet_response(truncated=True), "truncated"),
+        (RuntimeError("PRIVATE DEPENDENCY FAILURE"), "failed"),
+        (
+            {
+                **_configured_worksheet_response(),
+                "private_metadata": {"secret": True},
+            },
+            "filtered",
+        ),
+    ],
+)
+async def test_bounded_exhaustive_failures_are_single_attempt_and_provider_safe(
+    response,
+    expected_outcome,
+):
+    state = _exhaustive_state()
+    dsa = FakeDsa([], context_responses=[copy.deepcopy(response)])
+    bundle, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=_exhaustive_targeted_context_pack(),
+        dsa_trace={"called": True, "status": "success"},
+    )
+    assert len(dsa.calls) == 1
+    assert state.expansion_attempts[0]["outcome"] == expected_outcome
+    assert bundle["items"] == []
+    assert trace["expansion_attempt_counts"][expected_outcome] == 1
+    assert "PRIVATE DEPENDENCY FAILURE" not in json.dumps(
+        (bundle, trace),
+        sort_keys=True,
+    )
+
+
+def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware():
+    state = _exhaustive_state()
+    state.expansion_attempts = [
+        {
+            "source_id": "source_a",
+            "seed_source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+            "context_mode": "configured_worksheet",
+            "outcome": "satisfied",
+            "query_id": "configured-worksheet-query",
+            "returned_reference_count": 1,
+        }
+    ]
+    bundle = {
+        **_exhaustive_targeted_context_pack(),
+        "bundle_id": "evidence_exhaustive_bundle_fixture",
+        "sources_used": ["source_a"],
+        "items": [
+            {
+                "result_id": "configured-worksheet-result",
+                "source_type": "google_sheets",
+                "source_id": "source_a",
+                "source_name": "PRIVATE CONFIGURED SOURCE",
+                "source_ref": "google_sheets:source_a:Maintenance!A2:E5",
+                "retrieved_at": "2026-07-17T00:00:00+00:00",
+                "source_modified_at": None,
+                "title": "PRIVATE CONFIGURED WORKSHEET TITLE",
+                "content_type": "spreadsheet_range",
+                "text": "PRIVATE COMPLETE CONFIGURED WORKSHEET CONTENT",
+                "confidence": "high",
+                "warnings": [],
+            }
+        ],
+        "budget": {
+            "max_results": 1,
+            "returned_results": 1,
+            "estimated_bytes": 240,
+            "truncated": False,
+        },
+        "raw_item_count": 1,
+    }
+    complete_ref = "google_sheets:source_a:Maintenance!A2:E5"
+    satisfied = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=bundle,
+        dsa_trace={
+            "status": "included",
+            "search_budget_truncated": True,
+            "candidate_truncated": True,
+            "expansion_budget_truncated": False,
+        },
+        retained_source_refs={complete_ref},
+        expansion_attempts=state.expansion_attempts,
+        bounded_exhaustive_path=True,
+    )
+    assert {
+        item["requirement_id"]: item["outcome"]
+        for item in satisfied
+    } == {
+        "authoritative-inventory": "satisfied",
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+
+    filtered = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=bundle,
+        dsa_trace={"status": "included"},
+        retained_source_refs=set(),
+        expansion_attempts=state.expansion_attempts,
+        bounded_exhaustive_path=True,
+    )
+    filtered_by_id = {
+        item["requirement_id"]: item["outcome"]
+        for item in filtered
+    }
+    assert filtered_by_id["complete-scope-coverage"] == "satisfied"
+    for requirement_id in (
+        "context-delivery",
+        "contradiction-search",
+        "no-material-truncation",
+    ):
+        assert filtered_by_id[requirement_id] == "filtered"
+
+    unknown = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=bundle,
+        dsa_trace={"status": "included"},
+        retained_source_refs=None,
+        expansion_attempts=state.expansion_attempts,
+        bounded_exhaustive_path=True,
+    )
+    unknown_by_id = {
+        item["requirement_id"]: item["outcome"]
+        for item in unknown
+    }
+    assert unknown_by_id["complete-scope-coverage"] == "satisfied"
+    assert unknown_by_id["context-delivery"] == "unknown"
+
+    identity_retained = _manifest_id(
+        scope=SCOPE,
+        plan_id=state.plan.plan_id,
+        selected_strategies=["hybrid"],
+        declared_scope=state.declared_scope,
+        expansion_attempts=state.expansion_attempts,
+        delivery_identity={
+            "returned_source_refs": [complete_ref],
+            "retained_source_refs": [complete_ref],
+            "retention_status": "satisfied",
+        },
+    )
+    identity_omitted = _manifest_id(
+        scope=SCOPE,
+        plan_id=state.plan.plan_id,
+        selected_strategies=["hybrid"],
+        declared_scope=state.declared_scope,
+        expansion_attempts=state.expansion_attempts,
+        delivery_identity={
+            "returned_source_refs": [complete_ref],
+            "retained_source_refs": [],
+            "retention_status": "filtered",
+        },
+    )
+    assert identity_retained != identity_omitted
+
+    state.acquisition_facts = satisfied
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=bundle,
+        dsa_trace={
+            "called": True,
+            "status": "included",
+            "raw_item_count": 1,
+            "raw_targeted_item_count": 1,
+            "raw_expanded_item_count": 1,
+        },
+        retained_source_refs={complete_ref},
+    )
+    assert manifest["acquisition"]["source_references_returned"] == [
+        complete_ref
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == [
+        complete_ref
+    ]
+    assert manifest["acquisition"]["expansion_attempt_count"] == 1
+    assert "PRIVATE COMPLETE" not in json.dumps(manifest, sort_keys=True)
+    suppressed = suppress_manifest_identifiers(manifest)
+    assert suppressed["acquisition"]["expansion_attempts"] == []
+    assert suppressed["acquisition"]["expansion_attempts_count"] == 1
+    serialized = json.dumps(suppressed, sort_keys=True)
+    for prohibited in (
+        "source_a",
+        "Maintenance!A2:E2",
+        "Maintenance!A2:E5",
+        "configured_worksheet",
+        "configured-worksheet-query",
+    ):
+        assert prohibited not in serialized
 
 
 def _hybrid_state(
