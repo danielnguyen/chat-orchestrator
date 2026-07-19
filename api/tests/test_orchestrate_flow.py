@@ -14704,7 +14704,8 @@ async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_
             "For that earlier answer, the retained record shows a targeted lookup. It "
             "considered 2 configured sources, selected 2, returned 2 items, and "
             "delivered 2 to reasoning. The recorded evidence was sufficient for the "
-            "declared targeted scope. This was not an exhaustive review of every "
+            "declared targeted scope. The completeness of the retained source "
+            "inventory was unknown. This was not an exhaustive review of every "
             "potentially relevant source. I did not perform a new verification for "
             "this explanation."
         ),
