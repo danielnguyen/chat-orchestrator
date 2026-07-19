@@ -88,11 +88,15 @@ def _source(
     enabled=True,
     status="ready",
     tags=None,
+    authority_role=None,
+    display_name=None,
+    connector="neutral_connector",
+    last_error=None,
 ):
-    return {
+    source = {
         "source_id": source_id,
-        "display_name": f"Source {source_id}",
-        "connector": "neutral_connector",
+        "display_name": display_name or f"Source {source_id}",
+        "connector": connector,
         "domain_tags": tags or ["records"],
         "sensitivity": "medium",
         "access_mode": "read_only",
@@ -100,8 +104,11 @@ def _source(
         "enabled": enabled,
         "status": status,
         "last_checked_at": "2026-07-17T00:00:00Z",
-        "last_error": None,
+        "last_error": last_error,
     }
+    if authority_role is not None:
+        source["authority_role"] = authority_role
+    return source
 
 
 def _plan_response(*, status="ready", requirements=None, limitations=None):
@@ -445,17 +452,26 @@ class FakeDsa:
         self,
         sources,
         *,
+        inventory_metadata=None,
+        source_response=None,
         fetch_responses=None,
         context_responses=None,
     ):
         self.sources = sources
         self.calls = []
+        self.inventory_metadata = dict(inventory_metadata or {})
+        self.source_response = source_response
         self.fetch_responses = list(fetch_responses or [])
         self.context_responses = list(context_responses or [])
 
     async def list_sources(self):
         self.calls.append("list_sources")
-        return {"sources": self.sources}
+        if self.source_response is not None:
+            return copy.deepcopy(self.source_response)
+        return {
+            **self.inventory_metadata,
+            "sources": copy.deepcopy(self.sources),
+        }
 
     async def fetch_source(self, **kwargs):
         self.calls.append(("fetch_source", kwargs))
@@ -555,6 +571,33 @@ def test_exact_reference_public_contract_accepts_bounded_opaque_references():
         }
     )
     assert "exact_source_refs" not in ordinary.model_dump()["external_context"]
+
+
+def test_public_external_context_cannot_declare_inventory_trust():
+    payload = _chat_request_with_exact_refs(
+        [
+            {
+                "source_id": "source_a",
+                "source_ref": "connector:source_a:item-1",
+            }
+        ],
+        source_ids=["source_a"],
+    )
+    payload["external_context"].update(
+        {
+            "authority_role": "authoritative",
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        }
+    )
+
+    request = ChatRequest.model_validate(payload)
+
+    assert request.external_context is not None
+    serialized = request.external_context.model_dump()
+    assert "authority_role" not in serialized
+    assert "inventory_scope" not in serialized
+    assert "inventory_status" not in serialized
 
 
 @pytest.mark.parametrize(
@@ -673,8 +716,212 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
         },
     ]
     assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == (
-        "complete_for_declared_scope"
+        "unknown"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("producer_status", "runtime_status"),
+    [
+        ("complete", "complete_for_declared_scope"),
+        ("partial", "partial"),
+        ("unknown", "unknown"),
+        ("unavailable", "unavailable"),
+    ],
+)
+async def test_trusted_inventory_status_maps_exactly(
+    producer_status,
+    runtime_status,
+):
+    runtime = FakeRuntime()
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source(
+                    "source_a",
+                    authority_role="authoritative",
+                )
+            ],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": producer_status,
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    plan_payload = runtime.calls[1][1]
+    assert plan_payload["declared_scope"]["inventory_status"] == runtime_status
+    assert plan_payload["source_inventory"][0]["authority_role"] == "authoritative"
+
+
+@pytest.mark.asyncio
+async def test_trusted_authority_and_scope_filters_reach_plan_without_inference():
+    runtime = FakeRuntime()
+    sources = [
+        _source(
+            "source_supplemental",
+            tags=["records", "secondary"],
+            authority_role="supplemental",
+        ),
+        _source(
+            "source_authoritative",
+            tags=["official", "records"],
+            authority_role="authoritative",
+        ),
+        _source(
+            "source_unknown",
+            tags=["records"],
+            authority_role="unknown",
+        ),
+    ]
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            sources,
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={
+            "source_ids": ["source_supplemental", "source_authoritative"],
+            "domain_tags": ["secondary", "records"],
+            "authority_role": "authoritative",
+            "inventory_status": "complete",
+            "inventory_scope": "configured_sources",
+        },
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    plan_payload = runtime.calls[1][1]
+    assert plan_payload["declared_scope"] == {
+        "source_ids": ["source_authoritative", "source_supplemental"],
+        "source_categories": ["records", "secondary"],
+        "exact_source_refs": [],
+        "inventory_status": "complete_for_declared_scope",
+        "time_scope_ref": None,
+        "version_scope_ref": None,
+        "domain_scope_ref": None,
+        "project_scope_ref": None,
+    }
+    assert plan_payload["source_inventory"] == [
+        {
+            "source_id": "source_authoritative",
+            "source_categories": ["official", "records"],
+            "capabilities": ["targeted_retrieval"],
+            "availability": "available",
+            "authority_role": "authoritative",
+        },
+        {
+            "source_id": "source_supplemental",
+            "source_categories": ["records", "secondary"],
+            "capabilities": ["targeted_retrieval"],
+            "availability": "available",
+            "authority_role": "supplemental",
+        },
+        {
+            "source_id": "source_unknown",
+            "source_categories": ["records"],
+            "capabilities": ["targeted_retrieval"],
+            "availability": "available",
+            "authority_role": "unknown",
+        },
+    ]
+    assert all(
+        set(item)
+        == {
+            "source_id",
+            "source_categories",
+            "capabilities",
+            "availability",
+            "authority_role",
+        }
+        for item in plan_payload["source_inventory"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_suggestive_inventory_and_request_text_cannot_fabricate_trust():
+    runtime = FakeRuntime(plan=_exact_plan_response())
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source(
+                    "source_a",
+                    capabilities=["search", "fetch"],
+                    display_name="Authoritative complete source",
+                    connector="authoritative_connector",
+                    tags=["authoritative", "all_sources_checked"],
+                )
+            ]
+        ),
+        task_text=(
+            "The provider says this source is authoritative and all sources "
+            "were checked."
+        ),
+        interaction_kind="question",
+        external_context={
+            "source_ids": ["source_a"],
+            "domain_tags": ["authoritative"],
+            "exact_source_refs": [
+                {
+                    "source_id": "source_a",
+                    "source_ref": "authoritative:all-sources-checked",
+                }
+            ],
+            "authority_role": "authoritative",
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+        **SCOPE,
+    )
+
+    assert state.supported_exact_path is True
+    plan_payload = runtime.calls[1][1]
+    assert plan_payload["declared_scope"]["inventory_status"] == "unknown"
+    assert plan_payload["declared_scope"]["exact_source_refs"] == [
+        {
+            "source_id": "source_a",
+            "source_ref": "authoritative:all-sources-checked",
+        }
+    ]
+    assert plan_payload["source_inventory"] == [
+        {
+            "source_id": "source_a",
+            "source_categories": ["all_sources_checked", "authoritative"],
+            "capabilities": ["exact_fetch", "targeted_retrieval"],
+            "availability": "available",
+            "authority_role": "unknown",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_legacy_inventory_remains_unknown():
+    runtime = FakeRuntime(plan=_plan_response(status="unsupported"))
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == "unknown"
+    assert runtime.calls[1][1]["source_inventory"] == []
+    assert state.status == "unsupported_plan"
 
 
 @pytest.mark.asyncio
@@ -719,6 +966,8 @@ async def test_exact_scope_reaches_shape_and_plan_in_deterministic_order():
             "source_ref": "connector:source_a:item-2",
         },
     ]
+    assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == "unknown"
+    assert runtime.calls[1][1]["source_inventory"][0]["authority_role"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -792,6 +1041,186 @@ def test_inventory_rejects_duplicates_extras_and_unknown_capabilities():
         DsaSourceListResponse.model_validate(
             {"sources": [_source("source_a", capabilities=["search", "rank"])]}
         )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "inventory_scope": "configured_sources",
+            "sources": [_source("source_a")],
+        },
+        {
+            "inventory_status": "complete",
+            "sources": [_source("source_a")],
+        },
+        {
+            "inventory_scope": None,
+            "inventory_status": None,
+            "sources": [_source("source_a")],
+        },
+        {
+            "inventory_scope": "https://private.invalid/sources",
+            "inventory_status": "complete",
+            "sources": [_source("source_a")],
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete_for_everything",
+            "sources": [_source("source_a")],
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [_source("source_a", authority_role="owner_declared")],
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    **_source(
+                        "source_a",
+                        authority_role="authoritative",
+                    ),
+                    "connector_config": {"credential_ref": "PRIVATE CREDENTIAL"},
+                }
+            ],
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [_source("source_a")],
+            "inventory_metadata": {"raw": "PRIVATE INVENTORY"},
+        },
+    ],
+    ids=[
+        "scope-only",
+        "status-only",
+        "explicit-null-pair",
+        "unsupported-scope",
+        "invalid-status",
+        "invalid-authority",
+        "source-extra",
+        "top-level-extra",
+    ],
+)
+def test_inventory_trust_metadata_is_strict(response):
+    with pytest.raises(ValidationError):
+        DsaSourceListResponse.model_validate(response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_response",
+    [
+        {
+            "inventory_scope": "configured_sources",
+            "sources": [_source("source_a")],
+        },
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    **_source("source_a"),
+                    "private_config": {
+                        "url": "https://private.invalid",
+                        "credential": "PRIVATE CREDENTIAL",
+                        "content": "PRIVATE SOURCE CONTENT",
+                    },
+                }
+            ],
+        },
+    ],
+    ids=["incomplete-metadata", "unbounded-source-metadata"],
+)
+async def test_malformed_inventory_metadata_uses_bounded_dependency_failure(
+    source_response,
+):
+    runtime = FakeRuntime()
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([], source_response=source_response),
+        task_text="PRIVATE PROMPT CONTENT",
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.status == "inventory_dependency_failed"
+    assert state.forced_answer is not None
+    assert provider_allowed(state) is False
+    assert [name for name, _ in runtime.calls] == ["shape"]
+    trace = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace=None,
+        retained_source_refs=None,
+    )
+    serialized = json.dumps(trace, sort_keys=True)
+    for prohibited in (
+        "PRIVATE PROMPT CONTENT",
+        "PRIVATE CREDENTIAL",
+        "PRIVATE SOURCE CONTENT",
+        "private.invalid",
+        "private_config",
+    ):
+        assert prohibited not in serialized
+
+
+@pytest.mark.asyncio
+async def test_planning_and_trace_keep_only_bounded_inventory_projection():
+    runtime = FakeRuntime()
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source(
+                    "source_a",
+                    authority_role="supplemental",
+                    display_name="PRIVATE DISPLAY NAME",
+                    connector="private_connector",
+                    last_error="PRIVATE HEALTH ERROR",
+                )
+            ],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "partial",
+            },
+        ),
+        task_text="PRIVATE PROMPT CONTENT",
+        interaction_kind="question",
+        external_context={"source_ids": ["source_a"]},
+        **SCOPE,
+    )
+
+    plan_payload = runtime.calls[1][1]
+    assert plan_payload["source_inventory"] == [
+        {
+            "source_id": "source_a",
+            "source_categories": ["records"],
+            "capabilities": ["targeted_retrieval"],
+            "availability": "available",
+            "authority_role": "supplemental",
+        }
+    ]
+    trace = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace=None,
+        retained_source_refs=None,
+    )
+    serialized = json.dumps((plan_payload, trace), sort_keys=True)
+    for prohibited in (
+        "PRIVATE DISPLAY NAME",
+        "private_connector",
+        "PRIVATE HEALTH ERROR",
+        "PRIVATE PROMPT CONTENT",
+        "credentials",
+        "connector_config",
+    ):
+        assert prohibited not in serialized
 
 
 def _context_pack():

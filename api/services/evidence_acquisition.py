@@ -363,6 +363,7 @@ class DsaSourceEntry(StrictModel):
     status: Literal["ready", "unavailable", "disabled", "unknown"]
     last_checked_at: datetime | None
     last_error: Annotated[str, Field(max_length=240)] | None = None
+    authority_role: Literal["authoritative", "supplemental", "unknown"] = "unknown"
 
     @model_validator(mode="after")
     def validate_collections(self) -> DsaSourceEntry:
@@ -374,10 +375,22 @@ class DsaSourceEntry(StrictModel):
 
 
 class DsaSourceListResponse(StrictModel):
+    inventory_scope: Literal["configured_sources"] | None = None
+    inventory_status: Literal["complete", "partial", "unknown", "unavailable"] | None = (
+        None
+    )
     sources: list[DsaSourceEntry] = Field(max_length=32)
 
     @model_validator(mode="after")
-    def validate_source_ids(self) -> DsaSourceListResponse:
+    def validate_inventory(self) -> DsaSourceListResponse:
+        metadata_fields = {"inventory_scope", "inventory_status"}
+        supplied_metadata_fields = metadata_fields & self.model_fields_set
+        if supplied_metadata_fields and supplied_metadata_fields != metadata_fields:
+            raise ValueError("incomplete_inventory_metadata")
+        if supplied_metadata_fields and (
+            self.inventory_scope is None or self.inventory_status is None
+        ):
+            raise ValueError("invalid_inventory_metadata")
         ids = [source.source_id for source in self.sources]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate_source_id")
@@ -959,10 +972,24 @@ def _adapt_inventory(source_list: DsaSourceListResponse) -> list[dict[str, Any]]
                     }
                 ),
                 "availability": availability,
-                "authority_role": "unknown",
+                "authority_role": source.authority_role,
             }
         )
     return inventory
+
+
+def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
+    if (
+        source_list.inventory_scope is None
+        or source_list.inventory_status is None
+    ):
+        return "unknown"
+    return {
+        "complete": "complete_for_declared_scope",
+        "partial": "partial",
+        "unknown": "unknown",
+        "unavailable": "unavailable",
+    }[source_list.inventory_status]
 
 
 def _validate_scope_echo(
@@ -1147,7 +1174,7 @@ async def begin_evidence_acquisition(
         "source_ids": source_ids,
         "source_categories": source_categories,
         "exact_source_refs": exact_source_refs,
-        "inventory_status": "complete_for_declared_scope",
+        "inventory_status": _adapt_inventory_status(state.inventory),
         "time_scope_ref": None,
         "version_scope_ref": None,
         "domain_scope_ref": None,
