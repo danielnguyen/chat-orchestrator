@@ -55,11 +55,13 @@ from services.evidence_acquisition import (
     disabled_evidence_trace,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
+    execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
     ineligible_exact_evidence_state,
     provider_allowed,
     suppress_manifest_identifiers,
+    validate_bounded_exhaustive_context_pack_response,
     validate_context_pack_response,
 )
 from services.fallback import resolve_provider_attempt_plan
@@ -7026,6 +7028,50 @@ async def orchestrate_chat(
                         external_context_pack, dsa_trace = await execute_exact_fetches(
                             state=evidence_acquisition,
                             dsa=dsa,
+                        )
+                    elif evidence_acquisition.supported_bounded_exhaustive_path:
+                        governed_plan = evidence_acquisition.plan
+                        if governed_plan is None:
+                            raise RuntimeError(
+                                "bounded_exhaustive_plan_unavailable"
+                            )
+                        exhaustive_external_config = dict(external_config or {})
+                        exhaustive_external_config["source_ids"] = list(
+                            governed_plan.eligible_source_ids
+                        )
+                        exhaustive_external_config["domain_tags"] = []
+                        exhaustive_external_config["max_results"] = 1
+                        external_context_pack, dsa_trace = (
+                            await _resolve_external_context(
+                                dsa=dsa,
+                                dsa_enabled=dsa_enabled,
+                                external_context_enabled=external_context_enabled,
+                                external_context=exhaustive_external_config,
+                                external_calls_allowed=not local_only,
+                                query=governed_plan.question_anchor,
+                                response_validator=(
+                                    lambda response: (
+                                        validate_bounded_exhaustive_context_pack_response(
+                                            response,
+                                            expected_query=(
+                                                governed_plan.question_anchor
+                                            ),
+                                            expected_source_id=(
+                                                governed_plan.eligible_source_ids[0]
+                                            ),
+                                        )
+                                    )
+                                ),
+                                preserve_available_context=True,
+                            )
+                        )
+                        external_context_pack, dsa_trace = (
+                            await execute_bounded_exhaustive_review(
+                                state=evidence_acquisition,
+                                dsa=dsa,
+                                targeted_context_pack=external_context_pack,
+                                dsa_trace=dsa_trace,
+                            )
                         )
                     elif evidence_acquisition.supported_hybrid_comparison_path:
                         governed_plan = evidence_acquisition.plan

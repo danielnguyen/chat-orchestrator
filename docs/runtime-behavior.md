@@ -124,7 +124,7 @@ shape, reads the governed DSA source inventory, adapts the neutral source
 capabilities, and asks Cognitive Runtime to compile an evidence plan. Governed
 execution proceeds for a derived `targeted_lookup` whose ready plan selects only
 `targeted_retrieval` or `exact_fetch`, and for the bounded hybrid comparison
-described below.
+and bounded exhaustive-review contracts described below.
 
 Source IDs narrow semantic retrieval to governed source registries. They do not
 identify exact items and continue to use one DSA context-pack call. The optional
@@ -182,6 +182,54 @@ is bounded to the selected sources and context checked.
 Provider prose cannot select or upgrade the plan, acquisition facts, sufficiency
 status, or answer constraints.
 
+The bounded exhaustive executor accepts only a ready
+`bounded_exhaustive_review` plan with no limitations, no exact references, the
+sole `hybrid` strategy, complete declared-scope coverage, contradiction search,
+and exactly five material requirements: authoritative inventory, complete scope
+coverage, contradiction search, context delivery, and no material truncation.
+Trusted DSA metadata must establish a complete `configured_sources` inventory
+whose declared scope resolves to exactly one enabled, ready, authoritative
+Google Sheets source advertising both search and context operations. Legacy,
+partial, unknown, unavailable, multi-source, optional, supplemental, disabled,
+or unavailable scope remains unsupported. Source names, categories, question
+text, result content, and provider prose cannot confer authority or completeness.
+
+This executor uses one targeted context-pack request only to discover a seed.
+The response must associate that exact source across its items and diagnostics,
+contain no errors, and include a result with the exact connector-declared
+`configured_worksheet` mode. Descriptor descriptions are ignored; the existing
+comparison path still selects its first connector-declared descriptor. The
+exhaustive executor makes exactly one context call using the seed reference,
+the exact named mode, and fixed limits of 20 rows, 50,000 serialized bytes, and
+12,000 text characters. It does not retry, choose `nearby_rows`, try another
+seed, fetch another source, or fall back to targeted evidence.
+
+A positive context response must be untruncated and error-free and contain
+exactly one raw-free, URL-free Google Sheets `spreadsheet_range` result with no
+further expansion descriptors. Only that complete range enters prompt
+assembly—the targeted seed is excluded. Authoritative-inventory and complete
+scope facts come from trusted inventory and the successful expansion contract,
+while context delivery, contradiction-search availability, and no-material-
+truncation also require the complete range to survive prompt budgeting. Targeted
+seed-search or candidate truncation remains visible in bounded diagnostics but
+does not truncate the complete material evidence set after a successful full
+expansion. Empty, missing-descriptor, malformed, failed, truncated, or
+prompt-filtered outcomes remain explicit and block the provider through the
+existing sufficiency gate. An empty worksheet does not prove absence.
+
+The retained manifest records one bounded configured-worksheet attempt,
+returned-versus-retained reference state, aggregate outcomes, and prompt-aware
+requirement facts without storing worksheet text. Its identity changes with the
+seed, mode, outcome, context query, returned count, and delivery state. Existing
+identifier suppression clears sources, seed and returned references, context
+modes, query identifiers, and attempt details while retaining safe aggregate
+counts. Exhaustive acquisition does not broaden claim-support capture or the
+historical explanation renderer. It supports neither multi-source exhaustive
+review nor ready-with-limitations plans and adds no absence proof or stronger
+answer policy. The orchestrator accepts this exact plan contract, but normal
+runtime readiness remains unavailable until a compatible planning policy is
+deployed.
+
 The final request trace retains a bounded `prompt.evidence_acquisition` manifest.
 It records structural shape, inventory, plan, acquisition, delivery, sufficiency,
 and limitation outcomes; the exact persisted assistant-message identifier; and a
@@ -230,9 +278,10 @@ chat and optional DSA behavior. Briefs, capability and action flows, pending-act
 continuations, and claim-explanation follow-ups remain outside governed execution;
 an exact-reference request at one of those boundaries fails closed instead of
 entering a legacy path. Bounded full context, structured queries, hybrid
-acquisition outside the bounded cross-source comparison path, and execution of
-exhaustive, absence-sensitive, contradiction, historical, or recommendation
-plans are not implemented here. Hybrid manifests are retained truthfully, but
+acquisition outside the bounded cross-source comparison and exact one-source
+exhaustive paths, and execution of absence-sensitive, broader contradiction,
+historical, or recommendation plans are not implemented here. Hybrid manifests
+are retained truthfully, but
 the historical `What did you check?` renderer continues to support linked
 targeted and exact manifests only; hybrid-specific historical explanation
 remains separate work and is never reconstructed by a provider.
