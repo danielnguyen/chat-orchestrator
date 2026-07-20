@@ -16,21 +16,31 @@ from services.evidence_acquisition import (
     WITHHELD_ANSWER,
     DsaItem,
     DsaSourceListResponse,
+    EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
+    NextStepResult,
     PlanResult,
+    RequirementEvaluation,
     ShapeResult,
     SufficiencyResult,
+    _acquisition_premise_digest,
     _build_acquisition_facts,
     _manifest_id,
     begin_evidence_acquisition,
     bind_manifest_response,
+    build_current_acquisition_premise,
     build_manifest_trace,
+    compile_safe_exact_fetch_proposal,
+    deterministic_clarification_target,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
+    promote_exact_fetch_proposal,
     provider_allowed,
+    retain_initial_attempt_summary,
+    select_evidence_next_step,
     suppress_manifest_identifiers,
     validate_bounded_exhaustive_context_pack_response,
     validate_configured_worksheet_response,
@@ -4385,6 +4395,7 @@ async def test_manifest_association_and_privacy_exclude_raw_content():
         "inventory",
         "plan",
         "acquisition",
+        "next_steps",
         "sufficiency",
     }
     assert set(manifest["shape"]) == {
@@ -4430,3 +4441,525 @@ async def test_manifest_association_and_privacy_exclude_raw_content():
     private = suppress_manifest_identifiers(manifest)
     assert private["acquisition"]["source_references_retained"] == []
     assert private["acquisition"]["source_references_retained_count"] == 1
+
+
+def _next_step_test_state(
+    *,
+    sufficiency_status="insufficient",
+    outcomes=None,
+    capabilities=None,
+    availability="available",
+    declared_scope=None,
+):
+    plan = PlanResult.model_validate(_plan_response()["result"])
+    scope = declared_scope or {
+        "source_ids": ["source_a"],
+        "source_categories": [],
+        "exact_source_refs": [],
+        "inventory_status": "complete_for_declared_scope",
+        "time_scope_ref": None,
+        "version_scope_ref": None,
+        "domain_scope_ref": None,
+        "project_scope_ref": None,
+    }
+    requirements = plan.declared_requirements
+    outcome_by_kind = outcomes or {
+        "targeted_evidence": "partial",
+        "context_delivery": "satisfied",
+    }
+    sufficiency = SufficiencyResult.model_validate(
+        {
+            "evaluation_id": "evidence_eval_next",
+            "task_shape": "targeted_lookup",
+            "sufficiency_status": sufficiency_status,
+            "evaluated_requirements": [
+                {
+                    **requirement.model_dump(mode="json"),
+                    "effective_outcome": outcome_by_kind[
+                        requirement.requirement_kind
+                    ],
+                }
+                for requirement in requirements
+            ],
+            "reason_codes": ["material_requirement_not_satisfied"],
+            "answer_constraints": [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ],
+            "qualification_required": True,
+            "additional_acquisition_required": True,
+            "user_safe_summary": "More evidence is required.",
+        }
+    )
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status=sufficiency_status,
+        shape=ShapeResult.model_validate(_shape_response()["result"]),
+        inventory=DsaSourceListResponse.model_validate(
+            {
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+                "sources": [
+                    _source(
+                        "source_a",
+                        capabilities=capabilities or ["search", "fetch"],
+                        status=(
+                            "ready"
+                            if availability == "available"
+                            else "unavailable"
+                        ),
+                    )
+                ],
+            }
+        ),
+        declared_scope=scope,
+        plan=plan,
+        manifest_id="evidence_manifest_next",
+        sufficiency=sufficiency,
+        forced_answer=WITHHELD_ANSWER,
+    )
+
+
+def _next_step_result_payload(
+    state,
+    *,
+    selected_next_step,
+    conclusion_disposition,
+    provider_disposition,
+    reacquisition_guard="not_applicable",
+    proposed_premise_digest=None,
+    clarification_target=None,
+):
+    premise = build_current_acquisition_premise(state)
+    return {
+        "selection_id": "evidence_next_step_1",
+        "evaluation_id": state.sufficiency.evaluation_id,
+        "evidence_plan_id": state.plan.plan_id,
+        "acquisition_manifest_id": state.manifest_id,
+        "task_shape": state.plan.task_shape,
+        "sufficiency_status": state.sufficiency.sufficiency_status,
+        "selected_next_step": selected_next_step,
+        "conclusion_disposition": conclusion_disposition,
+        "provider_disposition": provider_disposition,
+        "current_premise_digest": _acquisition_premise_digest(premise),
+        "proposed_premise_digest": proposed_premise_digest,
+        "reacquisition_guard": reacquisition_guard,
+        "clarification_target": clarification_target,
+        "unresolved_material_requirement_ids": sorted(
+            evaluation.requirement_id
+            for evaluation in state.sufficiency.evaluated_requirements
+            if evaluation.criticality == "material"
+            and evaluation.effective_outcome != "satisfied"
+        ),
+        "reason_codes": ["unsupported_conclusion_withheld"],
+        "user_safe_summary": "A bounded next step was selected.",
+    }
+
+
+def test_current_acquisition_premise_uses_only_compiled_plan_inputs():
+    state = _next_step_test_state()
+    premise = build_current_acquisition_premise(state)
+    reordered = EvidenceAcquisitionPremise.model_validate(
+        {
+            **premise.model_dump(mode="json"),
+            "source_inventory": [
+                {
+                    **premise.source_inventory[0].model_dump(mode="json"),
+                    "source_categories": list(
+                        reversed(premise.source_inventory[0].source_categories)
+                    ),
+                    "capabilities": list(
+                        reversed(premise.source_inventory[0].capabilities)
+                    ),
+                }
+            ],
+        }
+    )
+
+    assert premise.question_anchor_digest == state.plan.question_anchor_digest
+    assert premise.task_shape == state.plan.task_shape
+    assert premise.declared_scope.model_dump(mode="json") == state.declared_scope
+    assert premise.selected_strategies == state.plan.selected_strategies
+    assert _acquisition_premise_digest(reordered) == _acquisition_premise_digest(
+        premise
+    )
+    serialized = json.dumps(premise.model_dump(mode="json"), sort_keys=True)
+    for prohibited in ("request_id", "manifest_id", "provider", "PRIVATE"):
+        assert prohibited not in serialized
+
+
+@pytest.mark.parametrize(
+    ("requirement_kind", "scope_updates", "expected"),
+    [
+        ("exact_authoritative_fetch", {}, "exact_reference"),
+        ("historical_scope", {}, "time_scope"),
+        (
+            "complete_scope_coverage",
+            {"source_ids": [], "source_categories": []},
+            "source_scope",
+        ),
+        (
+            "targeted_evidence",
+            {"source_ids": [], "source_categories": []},
+            None,
+        ),
+    ],
+)
+def test_clarification_target_is_derived_only_from_structural_uncertainty(
+    requirement_kind,
+    scope_updates,
+    expected,
+):
+    scope = {
+        "source_ids": ["source_a"],
+        "source_categories": [],
+        "exact_source_refs": [],
+        "inventory_status": "complete_for_declared_scope",
+        "time_scope_ref": None,
+        "version_scope_ref": None,
+        "domain_scope_ref": None,
+        "project_scope_ref": None,
+        **scope_updates,
+    }
+    state = _next_step_test_state(declared_scope=scope)
+    state.sufficiency.evaluated_requirements = [
+        RequirementEvaluation.model_validate(
+            {
+                "requirement_id": "uncertain-requirement",
+                "requirement_kind": requirement_kind,
+                "criticality": "material",
+                "effective_outcome": "unknown",
+            }
+        )
+    ]
+
+    assert deterministic_clarification_target(state) == expected
+
+
+@pytest.mark.asyncio
+async def test_safe_exact_fetch_proposal_preserves_scope_and_uses_compiled_plan():
+    state = _next_step_test_state()
+    context_pack = {
+        "items": [
+            {"source_id": "source_a", "source_ref": "source_a:record_2"},
+            {"source_id": "source_a", "source_ref": "source_a:record_1"},
+        ]
+    }
+
+    class ProposalRuntime:
+        def __init__(self):
+            self.calls = []
+
+        async def compile_evidence_plan(self, **kwargs):
+            self.calls.append(kwargs)
+            response = _exact_plan_response()
+            response["result"]["plan_id"] = "evidence_plan_exact"
+            return response
+
+    runtime = ProposalRuntime()
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=runtime,
+        context_pack=context_pack,
+        **SCOPE,
+    )
+
+    assert proposal is not None
+    assert proposal.exact_reference == {
+        "source_id": "source_a",
+        "source_ref": "source_a:record_1",
+    }
+    assert proposal.declared_scope == {
+        **state.declared_scope,
+        "exact_source_refs": [proposal.exact_reference],
+    }
+    assert runtime.calls[0]["question_anchor"] == state.plan.question_anchor
+    assert runtime.calls[0]["task_shape"] == state.plan.task_shape
+    assert proposal.plan.selected_strategies == ["exact_fetch"]
+    assert proposal.premise.selected_strategies == ["exact_fetch"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capabilities", "availability", "source_id", "source_ref"),
+    [
+        (["search"], "available", "source_a", "source_a:record_1"),
+        (
+            ["search", "fetch"],
+            "unavailable",
+            "source_a",
+            "source_a:record_1",
+        ),
+        (
+            ["search", "fetch"],
+            "available",
+            "other_source",
+            "other:record_1",
+        ),
+        (
+            ["search", "fetch"],
+            "available",
+            "source_a",
+            "https://private.example/record",
+        ),
+    ],
+)
+async def test_safe_exact_fetch_proposal_rejects_unsafe_or_ineligible_targets(
+    capabilities,
+    availability,
+    source_id,
+    source_ref,
+):
+    state = _next_step_test_state(
+        capabilities=capabilities,
+        availability=availability,
+    )
+
+    class Runtime:
+        async def compile_evidence_plan(self, **kwargs):
+            raise AssertionError("unsafe proposal must not compile")
+
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=Runtime(),
+        context_pack={
+            "items": [{"source_id": source_id, "source_ref": source_ref}]
+        },
+        **SCOPE,
+    )
+
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_next_step_selection_associates_result_and_blocks_provider():
+    state = _next_step_test_state()
+
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+
+        async def select_evidence_next_step(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                **SCOPE,
+                "result": _next_step_result_payload(
+                    state,
+                    selected_next_step="withhold_unsupported_conclusion",
+                    conclusion_disposition="requested_conclusion_withheld",
+                    provider_disposition="blocked",
+                ),
+            }
+
+    runtime = Runtime()
+    result = await select_evidence_next_step(
+        state=state,
+        runtime=runtime,
+        **SCOPE,
+    )
+
+    assert result is not None
+    assert result.selected_next_step == "withhold_unsupported_conclusion"
+    assert provider_allowed(state) is False
+    assert runtime.calls[0]["current_premise"] == (
+        build_current_acquisition_premise(state).model_dump(mode="json")
+    )
+    assert runtime.calls[0]["evaluated_requirements"] == [
+        evaluation.model_dump(mode="json")
+        for evaluation in state.sufficiency.evaluated_requirements
+    ]
+    assert len(state.next_step_history) == 1
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "selected_next_step": "perform_additional_acquisition",
+            "reacquisition_guard": "unchanged_premise_blocked",
+        },
+        {
+            "selected_next_step": "answer_within_declared_scope",
+            "conclusion_disposition": "requested_conclusion_withheld",
+            "provider_disposition": "blocked",
+        },
+        {
+            "reacquisition_guard": "premise_already_attempted",
+        },
+        {
+            "selected_next_step": "ask_narrow_clarification",
+            "clarification_target": None,
+        },
+        {
+            "selected_next_step": "disclose_unexamined_scope",
+            "provider_disposition": "allowed",
+        },
+        {
+            "unresolved_material_requirement_ids": [
+                "targeted-evidence",
+                "targeted-evidence",
+            ]
+        },
+        {"reason_codes": ["unsupported_conclusion_withheld"] * 2},
+    ],
+)
+def test_strict_next_step_model_rejects_contradictory_results(updates):
+    state = _next_step_test_state()
+    payload = _next_step_result_payload(
+        state,
+        selected_next_step="withhold_unsupported_conclusion",
+        conclusion_disposition="requested_conclusion_withheld",
+        provider_disposition="blocked",
+    )
+    payload.update(updates)
+
+    with pytest.raises(ValidationError):
+        NextStepResult.model_validate(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["provider_selected_target", "missing_local_proposal"])
+async def test_next_step_selection_rejects_untrusted_follow_up(case):
+    state = _next_step_test_state()
+    if case == "provider_selected_target":
+        state.sufficiency.evaluated_requirements = [
+            RequirementEvaluation.model_validate(
+                {
+                    "requirement_id": "targeted-evidence",
+                    "requirement_kind": "targeted_evidence",
+                    "criticality": "material",
+                    "effective_outcome": "unknown",
+                }
+            )
+        ]
+
+    class Runtime:
+        async def select_evidence_next_step(self, **kwargs):
+            if case == "provider_selected_target":
+                result = _next_step_result_payload(
+                    state,
+                    selected_next_step="ask_narrow_clarification",
+                    conclusion_disposition="requested_conclusion_withheld",
+                    provider_disposition="blocked",
+                    clarification_target="source_scope",
+                )
+            else:
+                result = _next_step_result_payload(
+                    state,
+                    selected_next_step="perform_additional_acquisition",
+                    conclusion_disposition="requested_conclusion_withheld",
+                    provider_disposition="blocked",
+                    reacquisition_guard="changed_premise_allowed",
+                    proposed_premise_digest="sha256:" + ("1" * 64),
+                )
+            return {**SCOPE, "result": result}
+
+    result = await select_evidence_next_step(
+        state=state,
+        runtime=Runtime(),
+        proposal=None,
+        clarification_target=(
+            "exact_reference" if case == "provider_selected_target" else None
+        ),
+        **SCOPE,
+    )
+
+    assert result is None
+    assert state.next_step is None
+    assert state.next_step_failure == "dependency_failure"
+    assert provider_allowed(state) is False
+
+
+@pytest.mark.asyncio
+async def test_safe_exact_fetch_proposal_rejects_non_exact_compiled_plan():
+    state = _next_step_test_state()
+
+    class Runtime:
+        async def compile_evidence_plan(self, **kwargs):
+            return _plan_response()
+
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=Runtime(),
+        context_pack={
+            "items": [
+                {
+                    "source_id": "source_a",
+                    "source_ref": "source_a:record_1",
+                }
+            ]
+        },
+        **SCOPE,
+    )
+
+    assert proposal is None
+
+
+@pytest.mark.asyncio
+async def test_changed_premise_authorization_promotes_exact_plan_once():
+    state = _next_step_test_state()
+
+    class Runtime:
+        async def compile_evidence_plan(self, **kwargs):
+            response = _exact_plan_response()
+            response["result"]["plan_id"] = "evidence_plan_exact"
+            return response
+
+        async def select_evidence_next_step(self, **kwargs):
+            proposed = EvidenceAcquisitionPremise.model_validate(
+                kwargs["proposed_acquisition_premise"]
+            )
+            return {
+                **SCOPE,
+                "result": {
+                    **_next_step_result_payload(
+                        state,
+                        selected_next_step="perform_additional_acquisition",
+                        conclusion_disposition="requested_conclusion_withheld",
+                        provider_disposition="blocked",
+                        reacquisition_guard="changed_premise_allowed",
+                        proposed_premise_digest=_acquisition_premise_digest(
+                            proposed
+                        ),
+                    ),
+                    "reason_codes": [
+                        "changed_acquisition_premise_available"
+                    ],
+                },
+            }
+
+    runtime = Runtime()
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=runtime,
+        context_pack={
+            "items": [
+                {"source_id": "source_a", "source_ref": "source_a:record_1"}
+            ]
+        },
+        **SCOPE,
+    )
+    assert proposal is not None
+    await select_evidence_next_step(
+        state=state,
+        runtime=runtime,
+        proposal=proposal,
+        **SCOPE,
+    )
+    retain_initial_attempt_summary(
+        state,
+        context_pack={"items": [{"source_ref": "source_a:record_1"}]},
+        retained_source_refs={"source_a:record_1"},
+    )
+    promote_exact_fetch_proposal(state, proposal)
+
+    assert state.plan.plan_id == "evidence_plan_exact"
+    assert state.exact_source_refs == [proposal.exact_reference]
+    assert state.additional_acquisition_count == 1
+    assert state.next_step_history[0]["additional_acquisition_executed"] is True
+    with pytest.raises(ValueError, match="additional_acquisition_limit_reached"):
+        promote_exact_fetch_proposal(state, proposal)

@@ -48,10 +48,13 @@ from services.claim_capture import (
 from services.claim_explanation import resolve_claim_explanation
 from services.companion_presentation import build_companion_presentation
 from services.evidence_acquisition import (
+    NEXT_STEP_DEPENDENCY_ANSWER,
     EvidenceAcquisitionState,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_manifest_trace,
+    compile_safe_exact_fetch_proposal,
+    deterministic_clarification_target,
     disabled_evidence_trace,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
@@ -59,7 +62,10 @@ from services.evidence_acquisition import (
     execute_exact_fetches,
     execute_hybrid_comparison,
     ineligible_exact_evidence_state,
+    promote_exact_fetch_proposal,
     provider_allowed,
+    retain_initial_attempt_summary,
+    select_evidence_next_step,
     suppress_manifest_identifiers,
     validate_bounded_exhaustive_context_pack_response,
     validate_context_pack_response,
@@ -4372,6 +4378,7 @@ def _sanitize_context_pack(
     response: dict[str, Any],
     *,
     preserve_available_context: bool = False,
+    preserve_source_association: bool = False,
 ) -> dict[str, Any]:
     items_out = []
     for item in response.get("items") or []:
@@ -4409,6 +4416,8 @@ def _sanitize_context_pack(
                     "available_context": item.get("available_context", []),
                 }
             )
+        elif preserve_source_association:
+            item_out["source_id"] = item.get("source_id")
         items_out.append(item_out)
 
     errors_out = _sanitize_context_pack_errors(response.get("errors"))
@@ -4444,6 +4453,7 @@ async def _resolve_external_context(
     query: str,
     response_validator: Any | None = None,
     preserve_available_context: bool = False,
+    preserve_source_association: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     external_context_config = _normalize_external_context_config(external_context)
     allowed_sensitivity = external_context_config.get("allowed_sensitivity", "medium")
@@ -4501,6 +4511,7 @@ async def _resolve_external_context(
         context_pack = _sanitize_context_pack(
             response,
             preserve_available_context=preserve_available_context,
+            preserve_source_association=preserve_source_association,
         )
         diagnostics = context_pack.get("diagnostics")
         errors = context_pack.get("errors", [])
@@ -7147,7 +7158,10 @@ async def orchestrate_chat(
                                 )
                                 if governed_plan is not None
                                 else None
-                            )
+                            ),
+                            preserve_source_association=(
+                                governed_plan is not None
+                            ),
                         )
                 else:
                     external_context_pack = None
@@ -7570,6 +7584,295 @@ async def orchestrate_chat(
                 dsa_trace=dsa_trace,
                 retained_source_refs=retained_external_refs,
             )
+            exact_fetch_proposal = None
+            next_step = None
+            if (
+                evidence_acquisition.supported_governed_path
+                and evidence_acquisition.sufficiency is not None
+            ):
+                clarification_target = deterministic_clarification_target(
+                    evidence_acquisition
+                )
+                if clarification_target is None:
+                    exact_fetch_proposal = await compile_safe_exact_fetch_proposal(
+                        state=evidence_acquisition,
+                        runtime=runtime,
+                        request_id=request_id,
+                        owner_id=payload["owner_id"],
+                        conversation_id=conversation_id,
+                        surface=surface,
+                        runtime_session_id=runtime_session_trace[
+                            "runtime_session_id"
+                        ],
+                        runtime_turn_id=turn_state_trace["runtime_turn_id"],
+                        context_pack=external_context_pack,
+                    )
+                next_step = await select_evidence_next_step(
+                    state=evidence_acquisition,
+                    runtime=runtime,
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_trace[
+                        "runtime_session_id"
+                    ],
+                    runtime_turn_id=turn_state_trace["runtime_turn_id"],
+                    proposal=exact_fetch_proposal,
+                    clarification_target=clarification_target,
+                )
+            if (
+                next_step is not None
+                and next_step.selected_next_step
+                == "perform_additional_acquisition"
+                and exact_fetch_proposal is not None
+            ):
+                retain_initial_attempt_summary(
+                    evidence_acquisition,
+                    context_pack=external_context_pack,
+                    retained_source_refs=retained_external_refs,
+                )
+                try:
+                    promote_exact_fetch_proposal(
+                        evidence_acquisition,
+                        exact_fetch_proposal,
+                    )
+                    external_context_pack, dsa_trace = (
+                        await execute_exact_fetches(
+                            state=evidence_acquisition,
+                            dsa=dsa,
+                        )
+                    )
+                except Exception:
+                    evidence_acquisition.next_step = None
+                    evidence_acquisition.next_step_selection_attempted = True
+                    evidence_acquisition.next_step_failure = (
+                        "dependency_failure"
+                    )
+                    evidence_acquisition.status = "next_step_dependency_failed"
+                    evidence_acquisition.forced_answer = (
+                        NEXT_STEP_DEPENDENCY_ANSWER
+                    )
+                else:
+                    privacy_context, privacy_context_trace = (
+                        await _resolve_privacy_context(
+                            runtime=runtime,
+                            enabled=privacy_context_enabled,
+                            request_id=request_id,
+                            owner_id=payload["owner_id"],
+                            conversation_id=conversation_id,
+                            surface=surface,
+                            runtime_session_id=runtime_session_trace.get(
+                                "runtime_session_id"
+                            ),
+                            runtime_turn_id=turn_state_trace.get(
+                                "runtime_turn_id"
+                            ),
+                            payload=effective_payload,
+                            retrieval_bundle=retrieval_bundle,
+                            external_context_pack=external_context_pack,
+                            runtime_identity=runtime_identity,
+                            runtime_overlay=runtime_overlay,
+                            world_state=world_state,
+                            relationship_context=relationship_context,
+                        )
+                    )
+                    privacy_prompt_suppressed = (
+                        privacy_context_enabled
+                        and privacy_policy_requires_suppression(
+                            privacy_context
+                        )
+                    )
+                    provider_retrieval_bundle = (
+                        _empty_retrieval_bundle(
+                            request_id=request_id,
+                            conversation_id=conversation_id,
+                            reason="privacy_prompt_suppression",
+                        )
+                        if privacy_prompt_suppressed
+                        else retrieval_bundle
+                    )
+                    provider_memory_recall_messages = (
+                        []
+                        if privacy_prompt_suppressed
+                        else memory_recall_composition.prompt_messages
+                    )
+                    provider_memory_recall_trace = (
+                        _privacy_safe_memory_recall_trace(memory_recall_trace)
+                        if privacy_prompt_suppressed
+                        else memory_recall_trace
+                    )
+                    try:
+                        prompt = assemble_prompt(
+                            profile=profile,
+                            retrieval_bundle=provider_retrieval_bundle,
+                            current_messages=[
+                                *capability_registry_messages,
+                                *effective_payload["messages"],
+                            ],
+                            handoff=handoff,
+                            presentation=presentation,
+                            style_guidance=style_guidance,
+                            style_trace=style_trace,
+                            response_shape_guidance=response_shape_guidance,
+                            response_shape_trace=response_shape_trace,
+                            surface_presence_trace=surface_presence_trace,
+                            companion_overlays=companion_overlays,
+                            companion_trace=companion_trace,
+                            interaction_governance=interaction_governance,
+                            interaction_governance_trace_data=(
+                                interaction_governance_trace
+                            ),
+                            persona_containment=persona_containment,
+                            persona_containment_trace_data=(
+                                persona_containment_trace
+                            ),
+                            restraint=restraint,
+                            restraint_trace_data=restraint_trace,
+                            memory_hygiene_trace_data=(
+                                memory_hygiene_result.trace
+                                if memory_hygiene_result is not None
+                                else disabled_memory_hygiene_trace(
+                                    retrieval_bundle
+                                )
+                            ),
+                            privacy_context=privacy_context,
+                            privacy_context_trace_data=privacy_context_trace,
+                            runtime_identity=runtime_identity,
+                            runtime_identity_trace=runtime_identity_trace,
+                            world_state=world_state,
+                            world_state_trace=world_state_trace,
+                            relationship_context=relationship_context,
+                            relationship_context_trace=(
+                                relationship_context_trace
+                            ),
+                            runtime_overlay=runtime_overlay,
+                            runtime_trace=runtime_trace,
+                            interrupt_trace=interrupt_trace,
+                            external_context_pack=external_context_pack,
+                            dsa_trace=dsa_trace,
+                            memory_recall_messages=(
+                                provider_memory_recall_messages
+                            ),
+                            memory_recall_trace=provider_memory_recall_trace,
+                            prompt_budget_contract=PromptBudgetContract(
+                                attempts=provider_attempt_plan,
+                                output_token_reserve=(
+                                    prompt_output_token_reserve
+                                ),
+                                context_safety_margin=(
+                                    prompt_context_safety_margin
+                                ),
+                                profile_prompt_budget=(
+                                    profile.get("prompt_budget")
+                                    if isinstance(profile, dict)
+                                    else None
+                                ),
+                            ),
+                        )
+                        _preserve_interaction_governance_trace_inputs(
+                            prompt.trace,
+                            interaction_governance_trace,
+                        )
+                    except PromptBudgetError as budget_error:
+                        prompt = PromptAssembly(
+                            messages=[],
+                            trace={
+                                "prompt_budget": budget_error.trace,
+                                "truncation": {
+                                    "applied": bool(
+                                        budget_error.trace.get(
+                                            "omission_or_truncation_occurred"
+                                        )
+                                    ),
+                                    "reason": budget_error.trace.get(
+                                        "failure_reason"
+                                    ),
+                                },
+                                "privacy_context": privacy_context_trace,
+                                "runtime": runtime_trace,
+                                "dsa": dsa_trace,
+                                "message_count": 0,
+                            },
+                        )
+                    messages = prompt.messages
+                    prompt.trace["capability_registry"] = (
+                        capability_registry_trace
+                    )
+                    prompt.trace["retrieval_dispatch"] = (
+                        retrieval_dispatch_trace
+                    )
+                    prompt.trace["result_boundary"] = result_boundary_trace
+                    _apply_post_budget_survivor_trace(
+                        result_boundary_trace=result_boundary_trace,
+                        retrieval_bundle=retrieval_bundle,
+                        prompt_trace=prompt.trace,
+                    )
+                    prompt_fingerprint = _prompt_fingerprint(messages)
+                    prompt.trace["provider_prompt"] = {
+                        **prompt_fingerprint,
+                        "rebuilt_between_attempts": True,
+                    }
+                    prompt.trace["capabilities"] = {
+                        "exposure": capability_exposure_trace,
+                        "validation": {
+                            "validation_status": "not_requested",
+                            "schema_version": capability_exposure_trace.get(
+                                "schema_version"
+                            ),
+                        },
+                        "action_summary": _action_summary_empty_trace(),
+                        "follow_up": _capability_follow_up_empty_trace(),
+                        "fallback": _capability_fallback_trace(
+                            descriptor_fingerprint_value=(
+                                capability_exposure_trace.get(
+                                    "descriptor_fingerprint"
+                                )
+                            )
+                        ),
+                        "dispatch_completed": False,
+                        "executor_call_count": 0,
+                        "provider_call_count": 0,
+                    }
+                    retained_external_refs = _retained_external_source_refs(
+                        prompt.trace
+                    )
+                    await evaluate_acquisition_sufficiency(
+                        state=evidence_acquisition,
+                        runtime=runtime,
+                        request_id=request_id,
+                        owner_id=payload["owner_id"],
+                        conversation_id=conversation_id,
+                        surface=surface,
+                        runtime_session_id=runtime_session_trace[
+                            "runtime_session_id"
+                        ],
+                        runtime_turn_id=turn_state_trace[
+                            "runtime_turn_id"
+                        ],
+                        context_pack=external_context_pack,
+                        dsa_trace=dsa_trace,
+                        retained_source_refs=retained_external_refs,
+                    )
+                    await select_evidence_next_step(
+                        state=evidence_acquisition,
+                        runtime=runtime,
+                        request_id=request_id,
+                        owner_id=payload["owner_id"],
+                        conversation_id=conversation_id,
+                        surface=surface,
+                        runtime_session_id=runtime_session_trace[
+                            "runtime_session_id"
+                        ],
+                        runtime_turn_id=turn_state_trace[
+                            "runtime_turn_id"
+                        ],
+                        clarification_target=(
+                            deterministic_clarification_target(
+                                evidence_acquisition
+                            )
+                        ),
+                    )
             evidence_manifest = build_manifest_trace(
                 state=evidence_acquisition,
                 context_pack=external_context_pack,

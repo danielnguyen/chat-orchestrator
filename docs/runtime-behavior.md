@@ -325,10 +325,63 @@ historical explanation remains separate work and is never reconstructed by a
 provider.
 The public chat response fields are unchanged.
 
-This response policy does not select another acquisition step, repeat
-acquisition, or establish that a premise changed. Deterministic next-step policy
-and protection against unchanged-premise reacquisition remain outside this
-runtime behavior.
+Cognitive Runtime owns deterministic evidence next-step selection. After each
+governed sufficiency evaluation, Chat Orchestrator submits the exact current
+premise reconstructed from the compiled plan: its question-anchor digest, task
+shape, declared scope, normalized trusted source inventory, and selected
+strategies. It does not derive the premise or the selected next step from
+provider text, evidence text, budgets, request identifiers, or result counts.
+The returned selection is strictly associated with the evaluation, plan,
+manifest, task shape, sufficiency status, current premise, unresolved material
+requirements, and any locally validated proposed premise. A missing, malformed,
+or mismatched selection fails closed before any provider call.
+
+One narrow changed-premise follow-up is supported for a targeted lookup. When
+initial evidence is insufficient or unknown, no deterministic clarification is
+indicated, and a validated targeted result identifies an available eligible
+source with exact-fetch capability, Chat Orchestrator deterministically selects
+one source/reference pair in source-ID and opaque-reference order. It preserves
+every declared scope field and user selector, adds only that discovered exact
+reference, and asks Cognitive Runtime to compile the proposed plan. The
+proposal is submitted only if that plan is an existing executable `exact_fetch`
+composition and its premise is built from the compiled result. It never broadens
+source IDs or categories, changes the question anchor or trusted inventory,
+invents another scope, or treats a budget, retry identifier, or result-count
+change as a new premise.
+
+Additional acquisition occurs only when Cognitive Runtime selects
+`perform_additional_acquisition` with the `changed_premise_allowed` guard and
+the returned proposed-premise digest matches the local compiled proposal. Chat
+Orchestrator then performs exactly one existing raw-free exact fetch, rebuilds
+the prompt from the original sanitized request inputs, reapplies prompt
+budgeting and reference-retention checks, reevaluates sufficiency, and requests
+one final next-step selection under the promoted premise. There is no loop,
+retry, alternate reference, larger budget, or second additional acquisition.
+An unchanged or previously attempted premise, a failed fetch, an invalid
+authorization, or another acquisition request after the one allowed attempt
+remains provider-free.
+
+The final selection controls response enforcement. A bounded sufficient answer
+and an existing sufficient-with-limitations answer retain their current
+provider, limitation, and task-boundary behavior. For insufficient or unknown
+evidence, a CR-permitted qualified partial result is rendered
+deterministically from substantive satisfied or partial requirements and actual
+unresolved gaps; unrestricted provider prose is not invoked and the requested
+conclusion remains withheld. Narrow clarification renders exactly one
+policy-owned question. Unexamined-scope disclosure and unsupported-conclusion
+withholding use the existing privacy-safe material-gap renderer. Provider and
+fallback calls remain zero for those deterministic responses.
+
+The final manifest remains bound to the final active plan, prompt-retained
+evidence, assistant message, and complete response digest. It also retains at
+most two bounded structural next-step selections and a bounded initial-attempt
+summary showing the initial strategy, sufficiency, result and retention counts,
+and whether a changed-premise exact fetch followed. Premise bodies, evidence
+text, provider text, URLs, credentials, and unrestricted dependency errors are
+not retained. Identifier suppression continues to remove source and reference
+details where required. The final exact-fetch evidence alone determines claim
+support; the initial targeted seed is not copied into a claim. Acquisition
+history rendering is unchanged and no new-verification flow is added.
 
 ## Prompt assembly and routing
 

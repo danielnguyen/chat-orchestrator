@@ -197,6 +197,64 @@ class RuntimeClient:
             raise RuntimeError("evidence_sufficiency_response_invalid")
         return response
 
+    async def select_evidence_next_step(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        evaluation_id: str,
+        evidence_plan_id: str,
+        acquisition_manifest_id: str,
+        evaluated_requirements: list[dict[str, Any]],
+        current_premise: dict[str, Any],
+        proposed_acquisition_premise: dict[str, Any] | None = None,
+        clarification_target: str | None = None,
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+        payload: dict[str, Any] = {
+            **scope,
+            "evaluation_id": evaluation_id,
+            "evidence_plan_id": evidence_plan_id,
+            "acquisition_manifest_id": acquisition_manifest_id,
+            "evaluated_requirements": evaluated_requirements,
+            "current_premise": current_premise,
+        }
+        if proposed_acquisition_premise is not None:
+            payload["proposed_acquisition_premise"] = proposed_acquisition_premise
+        if clarification_target is not None:
+            payload["clarification_target"] = clarification_target
+        response = await self._post(
+            "/v1/runtime/evidence-next-steps/select",
+            json=payload,
+        )
+        expected = {
+            **scope,
+            "evaluation_id": evaluation_id,
+            "evidence_plan_id": evidence_plan_id,
+            "acquisition_manifest_id": acquisition_manifest_id,
+        }
+        result = response.get("result") if isinstance(response, dict) else None
+        if (
+            not isinstance(response, dict)
+            or not isinstance(result, dict)
+            or any(response.get(field) != value for field, value in scope.items())
+            or any(result.get(field) != value for field, value in expected.items()
+                if field not in scope)
+        ):
+            raise RuntimeError("evidence_next_step_response_invalid")
+        return response
+
     async def resolve_session(
         self,
         *,

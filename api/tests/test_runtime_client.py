@@ -71,6 +71,39 @@ def _status_error(path: str, status_code: int) -> httpx.HTTPStatusError:
                 ],
             },
         ),
+        (
+            "select_evidence_next_step",
+            "/v1/runtime/evidence-next-steps/select",
+            {
+                "evaluation_id": "evidence_eval_1",
+                "evidence_plan_id": "evidence_plan_1",
+                "acquisition_manifest_id": "evidence_manifest_1",
+                "evaluated_requirements": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "requirement_kind": "targeted_evidence",
+                        "criticality": "material",
+                        "effective_outcome": "satisfied",
+                    }
+                ],
+                "current_premise": {
+                    "question_anchor_digest": f"sha256:{'a' * 64}",
+                    "task_shape": "targeted_lookup",
+                    "declared_scope": {
+                        "source_ids": ["source_a"],
+                        "source_categories": [],
+                        "exact_source_refs": [],
+                        "inventory_status": "complete_for_declared_scope",
+                        "time_scope_ref": None,
+                        "version_scope_ref": None,
+                        "domain_scope_ref": None,
+                        "project_scope_ref": None,
+                    },
+                    "source_inventory": [],
+                    "selected_strategies": ["targeted_retrieval"],
+                },
+            },
+        ),
     ],
 )
 async def test_evidence_runtime_methods_send_exact_scope_and_endpoint(
@@ -99,6 +132,14 @@ async def test_evidence_runtime_methods_send_exact_scope_and_endpoint(
                     "acquisition_manifest_id": specific["acquisition_manifest_id"],
                 }
             )
+        if method_name == "select_evidence_next_step":
+            response["result"] = {
+                "evaluation_id": specific["evaluation_id"],
+                "evidence_plan_id": specific["evidence_plan_id"],
+                "acquisition_manifest_id": specific[
+                    "acquisition_manifest_id"
+                ],
+            }
         return response
 
     client._post = fake_post  # type: ignore[method-assign]
@@ -197,6 +238,39 @@ async def test_derive_evidence_shape_rejects_malformed_or_mismatched_scope(
             },
             "evidence_sufficiency_response_invalid",
         ),
+        (
+            "select_evidence_next_step",
+            {
+                "evaluation_id": "evidence_eval_1",
+                "evidence_plan_id": "evidence_plan_1",
+                "acquisition_manifest_id": "evidence_manifest_1",
+                "evaluated_requirements": [
+                    {
+                        "requirement_id": "targeted-evidence",
+                        "requirement_kind": "targeted_evidence",
+                        "criticality": "material",
+                        "effective_outcome": "satisfied",
+                    }
+                ],
+                "current_premise": {
+                    "question_anchor_digest": f"sha256:{'a' * 64}",
+                    "task_shape": "targeted_lookup",
+                    "declared_scope": {
+                        "source_ids": [],
+                        "source_categories": [],
+                        "exact_source_refs": [],
+                        "inventory_status": "unknown",
+                        "time_scope_ref": None,
+                        "version_scope_ref": None,
+                        "domain_scope_ref": None,
+                        "project_scope_ref": None,
+                    },
+                    "source_inventory": [],
+                    "selected_strategies": ["targeted_retrieval"],
+                },
+            },
+            "evidence_next_step_response_invalid",
+        ),
     ],
 )
 async def test_evidence_runtime_methods_reject_scope_mismatch(
@@ -220,11 +294,87 @@ async def test_evidence_runtime_methods_reject_scope_mismatch(
         response["acquisition_manifest_id"] = specific.get(
             "acquisition_manifest_id"
         )
+        if method_name == "select_evidence_next_step":
+            response["result"] = {
+                "evaluation_id": specific["evaluation_id"],
+                "evidence_plan_id": specific["evidence_plan_id"],
+                "acquisition_manifest_id": specific[
+                    "acquisition_manifest_id"
+                ],
+            }
         return response
 
     client._post = fake_post  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match=expected_error):
         await getattr(client, method_name)(**scope, **specific)
+
+
+@pytest.mark.asyncio
+async def test_select_evidence_next_step_sends_one_bounded_follow_up_input():
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+    scope = {
+        "request_id": "rid",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+    }
+    premise = {
+        "question_anchor_digest": f"sha256:{'a' * 64}",
+        "task_shape": "targeted_lookup",
+        "declared_scope": {
+            "source_ids": ["source_a"],
+            "source_categories": [],
+            "exact_source_refs": [],
+            "inventory_status": "complete_for_declared_scope",
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        "source_inventory": [],
+        "selected_strategies": ["targeted_retrieval"],
+    }
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return {
+            **scope,
+            "result": {
+                "evaluation_id": "evidence_eval_1",
+                "evidence_plan_id": "evidence_plan_1",
+                "acquisition_manifest_id": "evidence_manifest_1",
+            },
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+    await client.select_evidence_next_step(
+        **scope,
+        evaluation_id="evidence_eval_1",
+        evidence_plan_id="evidence_plan_1",
+        acquisition_manifest_id="evidence_manifest_1",
+        evaluated_requirements=[],
+        current_premise=premise,
+        clarification_target="source_scope",
+    )
+
+    assert calls == [
+        (
+            "/v1/runtime/evidence-next-steps/select",
+            {
+                **scope,
+                "evaluation_id": "evidence_eval_1",
+                "evidence_plan_id": "evidence_plan_1",
+                "acquisition_manifest_id": "evidence_manifest_1",
+                "evaluated_requirements": [],
+                "current_premise": premise,
+                "clarification_target": "source_scope",
+            },
+        )
+    ]
+    assert "proposed_acquisition_premise" not in calls[0][1]
 
 
 @pytest.mark.asyncio
