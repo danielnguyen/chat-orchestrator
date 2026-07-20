@@ -87,14 +87,19 @@ def _digest(anchor: str) -> str:
     return f"sha256:{hashlib.sha256(anchor.encode()).hexdigest()}"
 
 
-def _manifest(state, **overrides):
+def _manifest(state, *, final_answer=None, **overrides):
+    final_answer = (
+        state.candidate.claim_anchor
+        if final_answer is None
+        else final_answer
+    )
     manifest = {
         "enabled": True,
         "attempted": True,
         "status": "sufficient_for_declared_scope",
         "manifest_id": "evidence_manifest_0123456789abcdef0123456789abcdef",
         "assistant_message_id": state.assistant_message_id,
-        "response_digest": state.calibration_result["claim_anchor_digest"],
+        "response_digest": _digest(final_answer),
         "shape": {},
         "inventory": {},
         "plan": {"plan_status": "ready"},
@@ -393,7 +398,11 @@ async def test_valid_acquisition_manifest_binding_retains_only_the_identifier():
     state = bind_assistant_message(state, {"message_id": "assistant-message-1"})
     manifest = _manifest(state)
 
-    bound = bind_acquisition_manifest(state, manifest)
+    bound = bind_acquisition_manifest(
+        state,
+        manifest,
+        final_answer=state.candidate.claim_anchor,
+    )
     payload = claim_record_payload(
         state=bound,
         request_id="request-1",
@@ -413,6 +422,119 @@ async def test_valid_acquisition_manifest_binding_retains_only_the_identifier():
     serialized = repr(bound)
     assert "source-a" not in serialized
     assert "external-ref-a" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_bounded_response_keeps_claim_and_full_response_associations_distinct():
+    initial = _prepare()
+    state = await _calibrate(initial, _Runtime(_calibration_response(initial.candidate)))
+    state = bind_assistant_message(state, {"message_id": "assistant-message-1"})
+    final_answer = (
+        f"{state.candidate.claim_anchor}\n\n"
+        "This reflects only the targeted sources checked, not a complete search "
+        "of every possible source."
+    )
+    manifest = _manifest(state, final_answer=final_answer)
+
+    bound = bind_acquisition_manifest(
+        state,
+        manifest,
+        final_answer=final_answer,
+    )
+
+    assert bound.acquisition_manifest_id == manifest["manifest_id"]
+    assert bound.trace["acquisition_manifest_status"] == "bound"
+    assert manifest["response_digest"] == _digest(final_answer)
+    assert manifest["response_digest"] != state.calibration_result[
+        "claim_anchor_digest"
+    ]
+    assert state.calibration_result["claim_anchor"] == state.candidate.claim_anchor
+    assert "This reflects only" not in repr(state.calibration_result)
+
+
+@pytest.mark.asyncio
+async def test_bounded_response_rejects_digest_of_claim_paragraph_only():
+    state = ClaimCaptureStateForTest.persistable()
+    final_answer = (
+        f"{state.candidate.claim_anchor}\n\n"
+        "This reflects only the targeted sources checked."
+    )
+    manifest = _manifest(
+        state,
+        final_answer=state.candidate.claim_anchor,
+    )
+
+    bound = bind_acquisition_manifest(
+        state,
+        manifest,
+        final_answer=final_answer,
+    )
+
+    assert bound.acquisition_manifest_id is None
+    assert bound.trace["reason_code"] == "acquisition_manifest_association_invalid"
+
+
+@pytest.mark.parametrize(
+    ("final_answer", "manifest_answer"),
+    [
+        (None, "The retained file reports that the setting is active."),
+        ({"content": "not-a-string"}, "not-a-string"),
+        ("", "not-empty"),
+        (
+            "The retained file reports  that the setting is active.\n\n"
+            "This reflects only the targeted sources checked.",
+            "The retained file reports that the setting is active.\n\n"
+            "This reflects only the targeted sources checked.",
+        ),
+        (
+            "This answer is limited.\n\n"
+            "The retained file reports that the setting is active.",
+            "This answer is limited.\n\n"
+            "The retained file reports that the setting is active.",
+        ),
+        (
+            "The retained file includes the claim that the setting is active.",
+            "The retained file includes the claim that the setting is active.",
+        ),
+        (
+            "The retained file indicates that the setting is active.",
+            "The retained file indicates that the setting is active.",
+        ),
+        (
+            "# Result\n\nThe retained file reports that the setting is active.",
+            "# Result\n\nThe retained file reports that the setting is active.",
+        ),
+        (
+            "- Summary\n\nThe retained file reports that the setting is active.",
+            "- Summary\n\nThe retained file reports that the setting is active.",
+        ),
+        (
+            "\n\nThe retained file reports that the setting is active.",
+            "\n\nThe retained file reports that the setting is active.",
+        ),
+    ],
+)
+def test_manifest_binding_rejects_malformed_or_mismatched_final_answer(
+    final_answer,
+    manifest_answer,
+):
+    state = ClaimCaptureStateForTest.persistable()
+    manifest = _manifest(
+        state,
+        response_digest=_digest(manifest_answer),
+    )
+
+    bound = bind_acquisition_manifest(
+        state,
+        manifest,
+        final_answer=final_answer,
+    )
+
+    assert bound.acquisition_manifest_id is None
+    assert bound.trace["reason_code"] == "acquisition_manifest_association_invalid"
+    serialized = repr(bound.trace)
+    assert "retained file" not in serialized
+    assert "This reflects only" not in serialized
 
 
 @pytest.mark.asyncio
@@ -444,7 +566,11 @@ async def test_invalid_acquisition_manifest_fails_closed_without_raw_trace(
         else _manifest(state, **manifest_change)
     )
 
-    bound = bind_acquisition_manifest(state, manifest)
+    bound = bind_acquisition_manifest(
+        state,
+        manifest,
+        final_answer=state.candidate.claim_anchor,
+    )
 
     assert bound.acquisition_manifest_required is True
     assert bound.acquisition_manifest_id is None
@@ -476,8 +602,16 @@ async def test_manifest_before_message_or_calibration_binding_fails_closed():
         "manifest_id": "evidence_manifest_0123456789abcdef0123456789abcdef",
     }
 
-    before_message = bind_acquisition_manifest(calibrated, manifest)
-    before_calibration = bind_acquisition_manifest(initial, manifest)
+    before_message = bind_acquisition_manifest(
+        calibrated,
+        manifest,
+        final_answer=calibrated.candidate.claim_anchor,
+    )
+    before_calibration = bind_acquisition_manifest(
+        initial,
+        manifest,
+        final_answer=initial.candidate.claim_anchor,
+    )
 
     for state in (before_message, before_calibration):
         assert state.acquisition_manifest_required is True
@@ -488,7 +622,11 @@ async def test_manifest_before_message_or_calibration_binding_fails_closed():
 
 def test_absent_manifest_preserves_legacy_claim_capture_state_and_payload():
     state = ClaimCaptureStateForTest.persistable()
-    bound = bind_acquisition_manifest(state, None)
+    bound = bind_acquisition_manifest(
+        state,
+        None,
+        final_answer=state.candidate.claim_anchor,
+    )
     payload = claim_record_payload(
         state=bound,
         request_id="request-1",
@@ -582,7 +720,11 @@ def test_linked_and_legacy_claim_record_responses_require_exact_manifest_agreeme
     ).trace["persistence_status"] == "persisted"
 
     manifest = _manifest(legacy_state)
-    linked_state = bind_acquisition_manifest(legacy_state, manifest)
+    linked_state = bind_acquisition_manifest(
+        legacy_state,
+        manifest,
+        final_answer=legacy_state.candidate.claim_anchor,
+    )
     linked_payload = claim_record_payload(
         state=linked_state,
         request_id="request-1",

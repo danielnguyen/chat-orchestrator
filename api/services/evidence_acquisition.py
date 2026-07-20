@@ -131,10 +131,6 @@ WITHHELD_ANSWER = (
     "I couldn’t verify that from the available source context, so I’m not going "
     "to present an unsupported conclusion."
 )
-LIMITATION_SUFFIX = (
-    "Some optional source scope was unavailable, so this answer is limited to the "
-    "material evidence that was successfully checked."
-)
 TARGETED_SCOPE_SUFFIX = (
     "This reflects only the targeted sources checked, not a complete search of every "
     "possible source."
@@ -143,12 +139,94 @@ COMPARISON_SCOPE_SUFFIX = (
     "This comparison is limited to the selected sources and bounded context checked, "
     "not every potentially relevant source."
 )
+EXHAUSTIVE_SCOPE_SUFFIX = (
+    "This conclusion is complete only for the declared source scope that was checked; "
+    "sources outside that scope were not examined."
+)
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
     "max_rows": 20,
     "max_bytes": 50000,
     "max_text_chars": 12000,
 }
+
+_SCOPE_BOUNDARIES = {
+    "targeted_lookup": TARGETED_SCOPE_SUFFIX,
+    "cross_source_comparison": COMPARISON_SCOPE_SUFFIX,
+    "bounded_exhaustive_review": EXHAUSTIVE_SCOPE_SUFFIX,
+}
+_REQUIREMENT_DESCRIPTIONS = {
+    "authoritative_inventory": "the authoritative source inventory",
+    "targeted_evidence": "the requested targeted evidence",
+    "exact_authoritative_fetch": "the exact authoritative item",
+    "complete_scope_coverage": "the complete declared source scope",
+    "selected_source_coverage": "coverage of every selected source",
+    "structured_absence_check": (
+        "an absence-supporting check of the declared source set"
+    ),
+    "contradiction_search": "the required contradiction search",
+    "counterevidence_coverage": "counterevidence coverage",
+    "historical_scope": "the required historical scope",
+    "historical_sequence_coverage": "the historical sequence",
+    "candidate_evidence_coverage": "candidate evidence coverage",
+    "cross_source_comparison": "the selected-source comparison",
+    "context_delivery": (
+        "delivery of the required acquired evidence to the reasoning context"
+    ),
+    "no_material_truncation": "full delivery of the material evidence",
+}
+_PLAN_LIMITATION_DESCRIPTIONS = {
+    "declared_source_missing_from_inventory": (
+        "a declared optional source was missing from the configured inventory"
+    ),
+    "declared_category_not_available": (
+        "a declared optional source category was unavailable"
+    ),
+    "source_inventory_partial": (
+        "the configured source inventory was partial, so optional source coverage "
+        "remains incomplete"
+    ),
+    "source_inventory_unknown": (
+        "the completeness of the configured source inventory was unknown, so "
+        "optional source coverage could not be established"
+    ),
+    "source_inventory_unavailable": (
+        "the configured source inventory was unavailable, so optional source "
+        "coverage could not be established"
+    ),
+    "authoritative_source_missing": (
+        "an optional authoritative source was not established"
+    ),
+    "required_capability_unavailable": (
+        "a capability required for optional evidence was unavailable"
+    ),
+    "targeted_only_not_exhaustive": (
+        "optional evidence was limited to targeted retrieval"
+    ),
+    "absence_scope_not_enumerable": (
+        "optional source scope could not support an absence check"
+    ),
+    "insufficient_comparison_scope": (
+        "optional source coverage was insufficient for comparison"
+    ),
+    "contradiction_search_not_supported": (
+        "optional contradiction-search coverage was unsupported"
+    ),
+    "historical_time_scope_missing": (
+        "the optional historical time scope was not established"
+    ),
+    "historical_sequence_not_supported": (
+        "optional historical-sequence coverage was unsupported"
+    ),
+    "decision_support_scope_insufficient": (
+        "optional decision-support evidence remained incomplete"
+    ),
+}
+_SOURCE_AVAILABILITY_LIMITATIONS = {
+    "authoritative_source_unavailable",
+    "optional_source_unavailable",
+}
+_MAX_RENDERED_EVIDENCE_CAUSES = 3
 
 
 class StrictModel(BaseModel):
@@ -2729,42 +2807,258 @@ def enforce_final_answer(
 ) -> str:
     if state is None or state.follow_existing_path:
         return answer
+    if (
+        state.sufficiency is not None
+        and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
+    ):
+        return _render_blocked_answer(state.sufficiency)
     if state.forced_answer is not None:
         return state.forced_answer
     if state.sufficiency is None:
         return WITHHELD_ANSWER
 
-    final = answer
+    policy_paragraphs: list[str] = []
     if state.sufficiency.sufficiency_status == "sufficient_with_limitations":
-        final = _append_once(final, LIMITATION_SUFFIX)
-    if state.plan and state.plan.task_shape == "targeted_lookup" and _overclaims_scope(final):
-        final = _append_once(final, TARGETED_SCOPE_SUFFIX)
-    if (
-        state.plan
-        and state.plan.task_shape == "cross_source_comparison"
-        and _overclaims_scope(final)
+        policy_paragraphs.append(_render_limitation_disclosure(state))
+    boundary = _SCOPE_BOUNDARIES.get(state.sufficiency.task_shape)
+    if boundary:
+        policy_paragraphs.append(boundary)
+    return _compose_policy_answer(answer, policy_paragraphs)
+
+
+def _compose_policy_answer(answer: str, policy_paragraphs: list[str]) -> str:
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", answer.strip())
+        if paragraph.strip()
+    ]
+    owned_policy_paragraphs = {
+        *_SCOPE_BOUNDARIES.values(),
+        *policy_paragraphs,
+    }
+    provider_paragraphs = [
+        paragraph
+        for paragraph in paragraphs
+        if paragraph not in owned_policy_paragraphs
+    ]
+    return "\n\n".join([*provider_paragraphs, *policy_paragraphs])
+
+
+def _render_requirement_outcome(
+    requirement_kind: RequirementKind,
+    outcome: str,
+    *,
+    optional: bool = False,
+) -> str | None:
+    if outcome == "satisfied":
+        return None
+    description = _REQUIREMENT_DESCRIPTIONS[requirement_kind]
+    if optional:
+        description = f"optional {description}"
+    outcome_descriptions = {
+        "partial": f"{description} was only partially established",
+        "not_attempted": (
+            f"{description} was not established because the required acquisition "
+            "was not attempted"
+        ),
+        "unavailable": (
+            f"{description} was not established because the required evidence "
+            "scope was unavailable"
+        ),
+        "unsupported": (
+            f"{description} was not established because the required acquisition "
+            "was unsupported"
+        ),
+        "failed": f"{description} was not established because acquisition failed",
+        "excluded": (
+            f"{description} was not established because required evidence was "
+            "excluded"
+        ),
+        "filtered": (
+            f"{description} was not established because required evidence was "
+            "filtered or omitted before reasoning"
+        ),
+        "truncated": (
+            f"{description} was not established because material evidence was "
+            "truncated"
+        ),
+        "unresolved_contradiction": (
+            f"{description} was not established because contradictory evidence "
+            "remained unresolved"
+        ),
+        "unknown": (
+            f"{description} could not be established from the available "
+            "acquisition facts"
+        ),
+        "missing": (
+            f"{description} could not be established because the required "
+            "acquisition fact was missing"
+        ),
+    }
+    return outcome_descriptions.get(
+        outcome,
+        f"{description} could not be established",
+    )
+
+
+def _scoped_inventory_sources(
+    state: EvidenceAcquisitionState,
+) -> list[DsaSourceEntry]:
+    if state.inventory is None:
+        return []
+    scope = state.declared_scope or {}
+    source_ids = set(scope.get("source_ids") or [])
+    categories = set(scope.get("source_categories") or [])
+    if source_ids:
+        return [
+            source
+            for source in state.inventory.sources
+            if source.source_id in source_ids
+        ]
+    if categories:
+        return [
+            source
+            for source in state.inventory.sources
+            if set(source.domain_tags) & categories
+        ]
+    return list(state.inventory.sources)
+
+
+def _unavailable_source_limitation(
+    state: EvidenceAcquisitionState,
+) -> str:
+    count = sum(
+        1
+        for source in _scoped_inventory_sources(state)
+        if not source.enabled or source.status != "ready"
+    )
+    if count == 1:
+        return "1 optional source was unavailable"
+    if count > 1:
+        return f"{count} optional sources were unavailable"
+    return "an optional selected source was not available"
+
+
+def _bounded_clauses(
+    clauses: list[str],
+) -> tuple[list[str], bool]:
+    normalized = sorted(set(clauses))
+    return (
+        normalized[:_MAX_RENDERED_EVIDENCE_CAUSES],
+        len(normalized) > _MAX_RENDERED_EVIDENCE_CAUSES,
+    )
+
+
+def _join_clauses(clauses: list[str]) -> str:
+    if len(clauses) == 1:
+        return clauses[0]
+    if len(clauses) == 2:
+        return f"{clauses[0]} and {clauses[1]}"
+    return f"{'; '.join(clauses[:-1])}; and {clauses[-1]}"
+
+
+def _render_limitation_disclosure(state: EvidenceAcquisitionState) -> str:
+    assert state.sufficiency is not None
+    plan_codes = set(state.plan.limitation_codes if state.plan else [])
+    clauses: list[str] = []
+    if plan_codes & _SOURCE_AVAILABILITY_LIMITATIONS:
+        clauses.append(_unavailable_source_limitation(state))
+    for code in sorted(plan_codes - _SOURCE_AVAILABILITY_LIMITATIONS):
+        description = _PLAN_LIMITATION_DESCRIPTIONS.get(code)
+        if description:
+            clauses.append(description)
+
+    source_availability_rendered = bool(
+        plan_codes & _SOURCE_AVAILABILITY_LIMITATIONS
+    )
+    inventory_limitation_rendered = bool(
+        plan_codes
+        & {
+            "source_inventory_partial",
+            "source_inventory_unknown",
+            "source_inventory_unavailable",
+        }
+    )
+    for evaluation in sorted(
+        state.sufficiency.evaluated_requirements,
+        key=lambda item: (
+            item.requirement_kind,
+            item.effective_outcome,
+            item.requirement_id,
+        ),
     ):
-        final = _append_once(final, COMPARISON_SCOPE_SUFFIX)
-    return final
+        if evaluation.criticality != "optional":
+            continue
+        if (
+            (source_availability_rendered or inventory_limitation_rendered)
+            and evaluation.requirement_kind == "selected_source_coverage"
+            and evaluation.effective_outcome
+            in {"partial", "unavailable", "unknown"}
+        ):
+            continue
+        rendered = _render_requirement_outcome(
+            evaluation.requirement_kind,
+            evaluation.effective_outcome,
+            optional=True,
+        )
+        if rendered:
+            clauses.append(rendered)
+
+    if not clauses:
+        clauses = ["optional evidence scope remained incomplete"]
+    bounded, omitted = _bounded_clauses(clauses)
+    disclosure = f"Limitation: {_join_clauses(bounded)}."
+    if omitted:
+        disclosure = (
+            f"{disclosure} Additional optional evidence limitations remained."
+        )
+    return disclosure
 
 
-def _append_once(answer: str, sentence: str) -> str:
-    stripped = answer.rstrip()
-    if sentence in stripped:
-        return stripped
-    return f"{stripped}\n\n{sentence}" if stripped else sentence
+def _withholding_sentence(task_shape: TaskShape) -> str:
+    if task_shape == "bounded_exhaustive_review":
+        return "I’m withholding a complete-scope conclusion."
+    if task_shape == "absence_or_coverage_check":
+        return "I’m withholding an absence conclusion."
+    if task_shape == "contradiction_review":
+        return "I’m withholding a contradiction-sensitive conclusion."
+    return "I’m withholding the requested conclusion."
 
 
-_OVERCLAIM_PATTERN = re.compile(
-    r"\b(?:all|every|complete|fully|none)\b|"
-    r"\bno\s+(?:evidence|record)\b|"
-    r"\bnothing\s+(?:exists|was\s+found)\b",
-    re.IGNORECASE,
-)
-
-
-def _overclaims_scope(answer: str) -> bool:
-    return bool(_OVERCLAIM_PATTERN.search(answer))
+def _render_blocked_answer(sufficiency: SufficiencyResult) -> str:
+    clauses = [
+        rendered
+        for evaluation in sorted(
+            sufficiency.evaluated_requirements,
+            key=lambda item: (
+                item.requirement_kind,
+                item.effective_outcome,
+                item.requirement_id,
+            ),
+        )
+        if evaluation.criticality == "material"
+        if (
+            rendered := _render_requirement_outcome(
+                evaluation.requirement_kind,
+                evaluation.effective_outcome,
+            )
+        )
+    ]
+    if not clauses:
+        clauses = ["the required material evidence was not established"]
+    bounded, omitted = _bounded_clauses(clauses)
+    lead = (
+        "I can’t support the requested conclusion because"
+        if sufficiency.sufficiency_status == "insufficient"
+        else "I couldn’t establish whether the requested conclusion is supported because"
+    )
+    response = f"{lead} {_join_clauses(bounded)}."
+    if omitted:
+        response = (
+            f"{response} Additional material evidence requirements were also "
+            "unresolved."
+        )
+    return f"{response} {_withholding_sentence(sufficiency.task_shape)}"
 
 
 def _inventory_summary(

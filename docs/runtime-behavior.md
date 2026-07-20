@@ -170,17 +170,32 @@ and every returned reference must survive in the final provider prompt. Partial,
 missing, malformed, failed, truncated, or prompt-filtered exact coverage cannot
 authorize a provider conclusion.
 Cognitive Runtime evaluates those facts. An insufficient or unknown result
-withholds an unsupported conclusion without calling the provider. A sufficient
-result permits the existing single provider path; an optional limitation adds a
-bounded disclosure. Targeted answers that claim exhaustive or absence-sensitive
-coverage receive a disclosure that only the targeted sources were checked.
+withholds an unsupported conclusion without calling the provider. The
+provider-free response names a bounded set of the actual material requirement
+gaps and distinguishes failed, filtered, truncated, unsupported, unavailable,
+unknown, missing, partial, excluded, not-attempted, and unresolved-contradiction
+outcomes. It also states which class of conclusion is being withheld. Provider
+text and provider fallback are not consulted for that rendering.
+
+A sufficient result permits the existing single provider path. A
+`sufficient_with_limitations` result adds a deterministic disclosure derived
+from optional requirement evaluations, plan limitations, and bounded trusted
+inventory counts when those counts are established. Distinct causes are
+deduplicated, sorted, and capped; private source identifiers and provider prose
+do not enter the disclosure.
+
+Every governed successful targeted answer receives a stable statement that only
+the targeted sources were checked. This applies to semantic retrieval and exact
+fetch whether or not the provider uses universal wording.
 Hybrid comparison facts are satisfied only when every planned source contributed
 targeted evidence, one successful expansion, and prompt-retained evidence, with
 at least two expanded source scopes surviving prompt budgeting. There is no
-targeted-only fallback. Universal wording in an otherwise permitted comparison
-is bounded to the selected sources and context checked.
+targeted-only fallback. Every governed successful comparison receives a stable
+selected-source and bounded-context statement.
 Provider prose cannot select or upgrade the plan, acquisition facts, sufficiency
-status, or answer constraints.
+status, limitation disclosure, answer constraints, or scope boundary. Reapplying
+the final-answer policy does not duplicate or cross-apply policy-owned
+paragraphs.
 
 The bounded exhaustive executor accepts only a ready
 `bounded_exhaustive_review` plan with no limitations, no exact references, the
@@ -225,10 +240,10 @@ identifier suppression clears sources, seed and returned references, context
 modes, query identifiers, and attempt details while retaining safe aggregate
 counts. Exhaustive acquisition does not broaden claim-support capture or the
 historical explanation renderer. It supports neither multi-source exhaustive
-review nor ready-with-limitations plans and adds no absence proof or stronger
-answer policy. The orchestrator accepts this exact plan contract, but normal
-runtime readiness remains unavailable until a compatible planning policy is
-deployed.
+review nor ready-with-limitations plans and adds no absence proof. Every
+successful bounded exhaustive answer receives a stable statement that
+completeness applies only to the declared source scope that was checked and not
+to sources outside it.
 
 The final request trace retains a bounded `prompt.evidence_acquisition` manifest.
 It records structural shape, inventory, plan, acquisition, delivery, sufficiency,
@@ -251,26 +266,42 @@ support, and the existing single-file claim boundary is unchanged.
 
 When the existing claim-capture boundary accepts a single-sentence claim backed
 by one retained file source, Chat Orchestrator may link that claim record to the
-same turn's acquisition manifest. The assistant message is persisted first, the
-manifest is bound to that message and the exact final-answer digest, and the
-request trace containing the bound manifest is persisted before the claim record
-is created. Only the validated manifest identifier is added at the top level of
-the claim-record request. The calibrated evidence reference remains the one file
-reference actually used to support the claim; source inventories, acquisition
-attempts, returned or retained external references, and sufficiency details are
-not copied into claim support or calibration.
+same turn's acquisition manifest. Claim eligibility and calibration use the
+post-privacy answer before evidence-policy limitation and scope paragraphs are
+added. The resulting single-sentence claim remains the first paragraph of the
+final answer. Policy-owned paragraphs are not calibrated and are not copied into
+the claim record.
+
+The complete governed final answer is then persisted as the assistant message.
+The manifest is bound to that message and to a SHA-256 digest of the exact
+complete UTF-8 response. The claim-anchor digest independently identifies only
+the normalized calibrated first paragraph, so the two digests truthfully differ
+when a limitation or scope paragraph is present. Before a linked claim is stored,
+Chat Orchestrator requires the manifest digest to match the exact final answer
+and the normalized first response paragraph to match the calibrated claim
+exactly. Later-only, substring, paraphrased, headed, bulleted, empty, or modified
+first paragraphs fail closed.
+
+The request trace containing the bound manifest is persisted before the claim
+record is created. Only the validated manifest identifier is added at the top
+level of the claim-record request. The calibrated evidence reference remains the
+one file reference actually used to support the claim; source inventories,
+acquisition attempts, returned or retained external references, policy
+paragraphs, and sufficiency details are not copied into claim support or
+calibration.
 
 Manifest association is validated independently of provider text. It requires an
 attempted acquisition, a ready plan, matching sufficient top-level and nested
-outcomes, and exact agreement with the bound assistant-message identifier and
-final-answer digest. A malformed, unsupported, insufficient, or mismatched
-association skips claim-record persistence without retry or an unlinked fallback,
-while preserving the assistant response and request trace. Claim diagnostics
-retain only bounded association status and whether a link was established; they
-do not duplicate the manifest identifier or body. Ordinary non-evidence claims
-continue to use the legacy unlinked payload. This association does not expand the
-current single-sentence, single-file claim-capture boundary, infer which external
-item a provider used, or treat every acquired item as claim support.
+outcomes, exact agreement with the bound assistant-message identifier and full
+response digest, and exact first-paragraph claim association. A malformed,
+unsupported, insufficient, or mismatched association skips claim-record
+persistence without retry or an unlinked fallback, while preserving the
+assistant response and request trace. Claim diagnostics retain only bounded
+association status and whether a link was established; they do not duplicate the
+manifest identifier, response, or body. Ordinary non-evidence claims continue to
+use the legacy unlinked payload. This association does not expand the current
+single-sentence, single-file claim-capture boundary, infer which external item a
+provider used, or treat every acquired item as claim support.
 
 Ambiguous evidence tasks and unsupported plans or strategies return bounded,
 provider-free responses. A `not_applicable` result continues through the existing
@@ -283,9 +314,21 @@ exhaustive paths, and execution of absence-sensitive, broader contradiction,
 historical, or recommendation plans are not implemented here. Hybrid manifests
 are retained truthfully, but
 the historical `What did you check?` renderer continues to support linked
-targeted and exact manifests only; hybrid-specific historical explanation
-remains separate work and is never reconstructed by a provider.
+targeted and exact manifests only. For the immediately previous response it
+checks the manifest digest against the exact supplied assistant message and
+associates the normalized first paragraph with the retained claim anchor. A
+quoted-anchor explanation continues to select the exact normalized retained
+claim and relies on the immutable claim/manifest association already validated
+by the memory service; it does not fetch historical message content. This is a
+compatibility check, not trace-first history resolution. Hybrid-specific
+historical explanation remains separate work and is never reconstructed by a
+provider.
 The public chat response fields are unchanged.
+
+This response policy does not select another acquisition step, repeat
+acquisition, or establish that a premise changed. Deterministic next-step policy
+and protection against unchanged-premise reacquisition remain outside this
+runtime behavior.
 
 ## Prompt assembly and routing
 

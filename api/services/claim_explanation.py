@@ -44,6 +44,8 @@ _QUOTED_ACQUISITION_INTENT_RE = re.compile(
     r'\s+for\s+the\s+statement\s+"(?P<anchor>[^"\r\n]*)"\s*[?.]?\s*',
     re.IGNORECASE,
 )
+_PARAGRAPH_SEPARATOR = re.compile(r"\r?\n[ \t]*\r?\n")
+_RESPONSE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _TARGET_UNAVAILABLE = (
     "I can’t safely identify which earlier statement you mean from the supplied "
@@ -355,12 +357,27 @@ def _prior_assistant(
         or not isinstance(prior.get("content"), str)
     ):
         return None
-    normalized = normalize_text(prior["content"])
-    return normalized if normalized and len(normalized) <= 500 else None
+    content = prior["content"]
+    first_paragraph = _normalized_first_response_paragraph(content)
+    if first_paragraph is None or len(first_paragraph) > 500:
+        return None
+    return content
 
 
 def _digest(anchor: str) -> str:
     return f"sha256:{hashlib.sha256(anchor.encode()).hexdigest()}"
+
+
+def _response_digest(content: str) -> str:
+    return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+
+
+def _normalized_first_response_paragraph(content: Any) -> str | None:
+    if not isinstance(content, str) or not content:
+        return None
+    first_paragraph = _PARAGRAPH_SEPARATOR.split(content, maxsplit=1)[0]
+    normalized = normalize_text(first_paragraph)
+    return normalized or None
 
 
 _CLAIM_CLASS_WORDING = {
@@ -662,6 +679,7 @@ def _project_acquisition_history(
     owner_id: str,
     conversation_id: str,
     surface: str | None,
+    prior_response: str | None,
 ) -> AcquisitionHistory | None:
     if (
         not isinstance(trace, dict)
@@ -691,10 +709,20 @@ def _project_acquisition_history(
     inventory = manifest.get("inventory")
     acquisition = manifest.get("acquisition")
     status = manifest.get("status")
+    response_digest = manifest.get("response_digest")
     if (
         manifest.get("manifest_id") != record.acquisition_manifest_id
         or manifest.get("assistant_message_id") != record.assistant_message_id
-        or manifest.get("response_digest") != record.claim_anchor_digest
+        or not isinstance(response_digest, str)
+        or _RESPONSE_DIGEST_RE.fullmatch(response_digest) is None
+        or (
+            prior_response is not None
+            and (
+                response_digest != _response_digest(prior_response)
+                or _normalized_first_response_paragraph(prior_response)
+                != record.claim_anchor
+            )
+        )
         or manifest.get("attempted") is not True
         or status not in accepted_statuses
         or not isinstance(plan, dict)
@@ -1261,7 +1289,10 @@ async def resolve_claim_explanation(
             )
 
         record = newest_group[0]
-        if record.claim_anchor != prior_answer:
+        if (
+            _normalized_first_response_paragraph(prior_answer)
+            != record.claim_anchor
+        ):
             return _fallback(
                 _ACQUISITION_NO_RECORD if acquisition_explanation else _NO_RECORD,
                 "no_record_for_latest_response",
@@ -1353,6 +1384,11 @@ async def resolve_claim_explanation(
             owner_id=owner_id,
             conversation_id=conversation_id,
             surface=surface,
+            prior_response=(
+                prior_answer
+                if intent.mode == "latest"
+                else None
+            ),
         )
         if history is None:
             return _fallback(

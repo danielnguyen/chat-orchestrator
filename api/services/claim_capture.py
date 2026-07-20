@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
 _IDENTIFIER_RE = re.compile(_IDENTIFIER_PATTERN)
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PARAGRAPH_SEPARATOR = re.compile(r"\r?\n[ \t]*\r?\n")
 _SUPPORTED_FILE_REFERENCE_TYPES = {"artifact", "derived_text"}
 _SUPPORTED_REFERENCE_TYPES = {
     "message",
@@ -376,6 +377,20 @@ def _anchor_digest(value: str) -> str:
     return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
+def _response_digest(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def _normalized_first_response_paragraph(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    first_paragraph = _PARAGRAPH_SEPARATOR.split(value, maxsplit=1)[0]
+    normalized = " ".join(first_paragraph.split())
+    return normalized or None
+
+
 async def calibrate_claim_capture(
     *,
     runtime: Any,
@@ -486,6 +501,8 @@ def bind_assistant_message(
 def bind_acquisition_manifest(
     state: ClaimCaptureState,
     manifest: Any,
+    *,
+    final_answer: Any,
 ) -> ClaimCaptureState:
     if manifest is None or state.candidate is None:
         return replace(
@@ -540,8 +557,9 @@ def bind_acquisition_manifest(
         and nested_status in accepted_statuses
         and top_level_status == nested_status
         and manifest.get("assistant_message_id") == state.assistant_message_id
-        and manifest.get("response_digest")
-        == state.calibration_result.get("claim_anchor_digest")
+        and manifest.get("response_digest") == _response_digest(final_answer)
+        and _normalized_first_response_paragraph(final_answer)
+        == state.calibration_result.get("claim_anchor")
     )
     if not valid:
         return replace(

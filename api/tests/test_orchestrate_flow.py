@@ -30,6 +30,11 @@ from services.capabilities import (
     Revalidator,
     RevalidatorEntry,
 )
+from services.evidence_acquisition import (
+    COMPARISON_SCOPE_SUFFIX,
+    EXHAUSTIVE_SCOPE_SUFFIX,
+    TARGETED_SCOPE_SUFFIX,
+)
 from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
@@ -68,6 +73,24 @@ BANNED_RUNTIME_KEY_TOKENS = [
     "milestone",
     "spec",
 ]
+
+
+def _assert_material_gap_answer(
+    answer,
+    *,
+    fragments,
+    withholding="I’m withholding the requested conclusion.",
+    unknown=False,
+):
+    lead = (
+        "I couldn’t establish whether the requested conclusion is supported because"
+        if unknown
+        else "I can’t support the requested conclusion because"
+    )
+    assert answer.startswith(lead)
+    for fragment in fragments:
+        assert fragment in answer
+    assert answer.endswith(withholding)
 
 
 def _collect_keys(value):
@@ -12094,7 +12117,7 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
 
     assert out["answer"] == (
         "Within the configured worksheet, all records in the declared scope "
-        "were reviewed."
+        f"were reviewed.\n\n{EXHAUSTIVE_SCOPE_SUFFIX}"
     )
     assert len(runtime.interaction_governance_calls) == 1
     assert len(runtime.evidence_shape_calls) == 1
@@ -12207,9 +12230,14 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         await _run_bounded_exhaustive_case(tmp_path=tmp_path)
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "reasoning context",
+            "filtered or omitted before reasoning",
+            "full delivery of the material evidence",
+        ],
+        withholding="I’m withholding a complete-scope conclusion.",
     )
     assert len(dsa.context_calls) == 1
     assert litellm.calls == []
@@ -12253,9 +12281,13 @@ async def test_bounded_exhaustive_missing_exact_descriptor_never_falls_back(
         )
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "complete declared source scope",
+            "required acquisition was unsupported",
+        ],
+        withholding="I’m withholding a complete-scope conclusion.",
     )
     assert len(dsa.calls) == 1
     assert dsa.context_calls == []
@@ -12312,9 +12344,17 @@ async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
         )
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    expected_fragment = {
+        "unknown": "could not be established from the available acquisition facts",
+        "truncated": "material evidence was truncated",
+        "filtered": "filtered or omitted before reasoning",
+        "failed": "acquisition failed",
+    }[expected_outcome]
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=["complete declared source scope", expected_fragment],
+        withholding="I’m withholding a complete-scope conclusion.",
+        unknown=expected_outcome == "unknown",
     )
     assert len(dsa.context_calls) == 1
     assert dsa.fetch_calls == []
@@ -12382,7 +12422,10 @@ async def test_bounded_exhaustive_privacy_suppresses_expansion_identifiers(
         )
     )
 
-    assert out["answer"] == "Details cannot safely be shown on this surface."
+    assert out["answer"] == (
+        "Details cannot safely be shown on this surface.\n\n"
+        f"{EXHAUSTIVE_SCOPE_SUFFIX}"
+    )
     assert len(dsa.context_calls) == 1
     assert len(litellm.calls) == 1
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
@@ -12414,9 +12457,14 @@ def _assert_governed_context_rejected(
     memory_store,
     prohibited_text: str | None = None,
 ):
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "reasoning context",
+            "could not be established from the available acquisition facts",
+            "requested targeted evidence",
+            "filtered or omitted before reasoning",
+        ],
     )
     assert len(dsa.calls) == 1
     assert litellm.calls == []
@@ -12485,7 +12533,9 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         request_id="rid-evidence-targeted",
     )
 
-    assert out["answer"] == "The record lists 2025-07-12."
+    assert out["answer"] == (
+        f"The record lists 2025-07-12.\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
     assert len(runtime.evidence_shape_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
     assert len(runtime.evidence_sufficiency_calls) == 1
@@ -12568,7 +12618,8 @@ async def test_hybrid_comparison_executes_declared_expansion_per_source_and_pers
     )
 
     assert out["answer"] == (
-        "The two selected logs show different maintenance patterns."
+        "The two selected logs show different maintenance patterns.\n\n"
+        f"{COMPARISON_SCOPE_SUFFIX}"
     )
     assert len(runtime.interaction_governance_calls) == 1
     assert len(runtime.evidence_shape_calls) == 1
@@ -12687,9 +12738,13 @@ async def test_hybrid_comparison_missing_descriptor_withholds_without_targeted_f
         ],
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "coverage of every selected source",
+            "required acquisition was unsupported",
+            "selected-source comparison",
+        ],
     )
     assert len(dsa.calls) == 1
     assert len(dsa.context_calls) == 1
@@ -12766,9 +12821,15 @@ async def test_hybrid_comparison_context_failure_is_bounded_and_never_retried(
         ],
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    expected_fragment = {
+        "failed": "acquisition failed",
+        "unknown": "could not be established from the available acquisition facts",
+        "filtered": "filtered or omitted before reasoning",
+        "truncated": "material evidence was truncated",
+    }[expected_outcome]
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=["coverage of every selected source", expected_fragment],
     )
     assert len(dsa.context_calls) == 2
     assert litellm.calls == []
@@ -12818,9 +12879,13 @@ async def test_hybrid_comparison_prompt_budget_source_loss_blocks_provider(
         tmp_path=tmp_path
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "selected-source comparison",
+            "coverage of every selected source",
+            "filtered or omitted before reasoning",
+        ],
     )
     assert len(dsa.context_calls) == 2
     assert litellm.calls == []
@@ -12855,13 +12920,9 @@ async def test_hybrid_comparison_provider_overclaim_gets_selected_scope_disclosu
         provider_answer="All relevant maintenance history is fully covered.",
     )
 
-    suffix = (
-        "This comparison is limited to the selected sources and bounded context "
-        "checked, not every potentially relevant source."
-    )
     assert len(litellm.calls) == 1
-    assert out["answer"].endswith(suffix)
-    assert out["answer"].count(suffix) == 1
+    assert out["answer"].endswith(COMPARISON_SCOPE_SUFFIX)
+    assert out["answer"].count(COMPARISON_SCOPE_SUFFIX) == 1
 
 
 @pytest.mark.asyncio
@@ -12882,7 +12943,10 @@ async def test_hybrid_comparison_privacy_suppresses_expansion_identifiers_not_ou
         privacy_context_enabled=True,
     )
 
-    assert out["answer"] == "Details cannot safely be shown on this surface."
+    assert out["answer"] == (
+        "Details cannot safely be shown on this surface.\n\n"
+        f"{COMPARISON_SCOPE_SUFFIX}"
+    )
     assert len(dsa.context_calls) == 2
     assert len(litellm.calls) == 1
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
@@ -12919,13 +12983,14 @@ async def test_evidence_acquisition_no_result_withholds_without_provider(tmp_pat
     empty["diagnostics"]["candidate_counts_by_source"] = {}
     dsa = FakeDSA(response=empty)
     litellm = FakeLiteLLM()
+    memory_store = ClaimCaptureMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Verify the maintenance record.",
             external_context_enabled=True,
         ),
-        memory_store=FakeMemoryStore(),
+        memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
         dsa=dsa,
@@ -12935,15 +13000,26 @@ async def test_evidence_acquisition_no_result_withholds_without_provider(tmp_pat
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
+        claim_record_capture_enabled=True,
         request_id="rid-evidence-no-result",
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "requested targeted evidence",
+            "reasoning context",
+            "could not be established from the available acquisition facts",
+        ],
+        unknown=True,
     )
     assert out["selected_model"] == "not_called"
     assert litellm.calls == []
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    capture = memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]
+    assert capture["eligibility_status"] == "ineligible"
+    assert capture["acquisition_manifest_linked"] is False
     assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
         {"requirement_id": "context-delivery", "outcome": "unknown"},
         {"requirement_id": "targeted-evidence", "outcome": "unknown"},
@@ -13087,7 +13163,7 @@ async def test_evidence_acquisition_provider_cannot_rewrite_policy_history(tmp_p
         request_id="rid-evidence-provider-policy",
     )
 
-    assert out["answer"] == malicious
+    assert out["answer"] == f"{malicious}\n\n{TARGETED_SCOPE_SUFFIX}"
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
     ]
@@ -13132,11 +13208,12 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
     )
 
     assert len(litellm.calls) == 1
-    assert out["answer"].endswith(
-        "Some optional source scope was unavailable, so this answer is limited "
-        "to the material evidence that was successfully checked."
+    limitation = "Limitation: an optional selected source was not available."
+    assert out["answer"] == (
+        f"The record lists 2025-07-12.\n\n{limitation}\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
     )
-    assert out["answer"].count("Some optional source scope was unavailable") == 1
+    assert out["answer"].count(limitation) == 1
     trace = runtime.evidence_sufficiency_calls[0]
     assert trace["acquisition_facts"][-1] == {
         "requirement_id": "targeted-evidence",
@@ -13378,9 +13455,13 @@ async def test_evidence_acquisition_dependency_failure_is_withheld_without_provi
         request_id="rid-evidence-dsa-failure",
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "requested targeted evidence",
+            "acquisition failed",
+            "reasoning context",
+        ],
     )
     assert litellm.calls == []
     assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
@@ -13423,9 +13504,13 @@ async def test_evidence_acquisition_malformed_context_is_filtered_and_withheld(
         request_id="rid-evidence-malformed-context",
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "requested targeted evidence",
+            "filtered or omitted before reasoning",
+            "reasoning context",
+        ],
     )
     assert litellm.calls == []
     assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
@@ -13642,9 +13727,12 @@ async def test_evidence_acquisition_prompt_filtered_context_cannot_satisfy_deliv
         request_id="rid-evidence-prompt-filtered",
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "reasoning context",
+            "filtered or omitted before reasoning",
+        ],
     )
     assert litellm.calls == []
     assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
@@ -13701,9 +13789,13 @@ async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_deli
         request_id="rid-evidence-prompt-reference-mismatch",
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=[
+            "reasoning context",
+            "could not be established from the available acquisition facts",
+        ],
+        unknown=True,
     )
     assert litellm.calls == []
     assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
@@ -13841,7 +13933,9 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
         request_id=request_id,
     )
 
-    assert out["answer"] == "The exact record gives the date."
+    assert out["answer"] == (
+        f"The exact record gives the date.\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
     assert dsa.calls == []
     assert len(dsa.fetch_calls) == 1
     assert dsa.fetch_calls[0] == {
@@ -13941,7 +14035,9 @@ async def test_evidence_acquisition_source_id_scope_still_uses_targeted_retrieva
         request_id="rid-targeted-source-id-regression",
     )
 
-    assert out["answer"] == "The targeted record gives the date."
+    assert out["answer"] == (
+        f"The targeted record gives the date.\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
     assert dsa.fetch_calls == []
     assert len(dsa.calls) == 1
     assert dsa.calls[0]["source_ids"] == ["vehicle_log_primary"]
@@ -14077,9 +14173,16 @@ async def test_evidence_acquisition_exact_fetch_failures_withhold_without_fallba
         request_id=request_id,
     )
 
-    assert out["answer"] == (
-        "I couldn’t verify that from the available source context, so I’m not "
-        "going to present an unsupported conclusion."
+    expected_fragment = {
+        "filtered": "filtered or omitted before reasoning",
+        "unknown": "could not be established from the available acquisition facts",
+        "truncated": "material evidence was truncated",
+        "failed": "acquisition failed",
+    }[expected_outcome]
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=["requested targeted evidence", expected_fragment],
+        unknown=expected_outcome == "unknown",
     )
     assert len(dsa.fetch_calls) == 1
     assert dsa.calls == []
@@ -14880,7 +14983,8 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
         await _run_evidence_claim_capture_chat(tmp_path)
     )
 
-    assert result["answer"] == "The retained file reports that the setting is active."
+    claim_anchor = "The retained file reports that the setting is active."
+    assert result["answer"] == f"{claim_anchor}\n\n{TARGETED_SCOPE_SUFFIX}"
     assert len(litellm.calls) == 1
     assert len(runtime.claim_calibration_calls) == 1
     assert len(memory_store.claim_record_calls) == 1
@@ -14925,7 +15029,17 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
 
     assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
     assert claim_payload["assistant_message_id"] == expected_message_id
-    assert claim_payload["calibration_result"]["claim_anchor_digest"] == expected_digest
+    claim_digest = (
+        f"sha256:{hashlib.sha256(claim_anchor.encode()).hexdigest()}"
+    )
+    assert claim_payload["calibration_result"]["claim_anchor"] == claim_anchor
+    assert claim_payload["calibration_result"]["claim_anchor_digest"] == claim_digest
+    assert claim_digest != expected_digest
+    assert runtime.claim_calibration_calls[0]["claim_anchor"] == claim_anchor
+    assert TARGETED_SCOPE_SUFFIX not in json.dumps(
+        runtime.claim_calibration_calls[0],
+        sort_keys=True,
+    )
     assert claim_support == [
         {
             "ref_type": "derived_text",
@@ -14949,6 +15063,7 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
         "source_references_retained",
         "exact_reference_attempts",
         "evidence_acquisition",
+        TARGETED_SCOPE_SUFFIX,
     ):
         assert prohibited not in serialized_payload
     assert "acquisition_manifest_id" not in json.dumps(
@@ -14963,6 +15078,79 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
     ] is True
     assert final_trace["prompt"]["claim_capture"]["persistence_status"] == "persisted"
     assert final_trace["prompt"]["evidence_acquisition"] == manifest
+    assistant_write = next(
+        item
+        for item in memory_store.added_messages
+        if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_governed_exact_claim_links_full_bounded_response_to_manifest(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "request-exact-claim-capture"
+    question = "Verify this exact maintenance record."
+    runtime = FakeRuntime(
+        evidence_plan_response=_exact_plan_response(
+            request_id=request_id,
+            question=question,
+        )
+    )
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"] = [
+        "profile",
+        "search",
+        "fetch",
+    ]
+    memory_store = ClaimCaptureMemoryStore()
+    claim_anchor = "The retained file reports that the setting is active."
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context=_exact_external_context(),
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content=claim_anchor),
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+
+    assert result["answer"] == f"{claim_anchor}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert len(dsa.fetch_calls) == 1
+    assert len(runtime.claim_calibration_calls) == 1
+    assert runtime.claim_calibration_calls[0]["claim_anchor"] == claim_anchor
+    assert len(memory_store.claim_record_calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    claim_payload = memory_store.claim_record_calls[0]["payload"]
+    assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
+    assert manifest["response_digest"] == (
+        f"sha256:{hashlib.sha256(result['answer'].encode()).hexdigest()}"
+    )
+    assert claim_payload["calibration_result"]["claim_anchor_digest"] == (
+        f"sha256:{hashlib.sha256(claim_anchor.encode()).hexdigest()}"
+    )
+    assert manifest["response_digest"] != claim_payload["calibration_result"][
+        "claim_anchor_digest"
+    ]
+    assert TARGETED_SCOPE_SUFFIX not in json.dumps(
+        claim_payload,
+        sort_keys=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -14989,7 +15177,10 @@ async def test_invalid_bound_manifest_skips_claim_storage_without_exposing_manif
         await _run_evidence_claim_capture_chat(tmp_path)
     )
 
-    assert result["answer"] == "The retained file reports that the setting is active."
+    assert result["answer"] == (
+        "The retained file reports that the setting is active.\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
+    )
     assert len(litellm.calls) == 1
     assert len(runtime.claim_calibration_calls) == 1
     assert memory_store.claim_record_calls == []
@@ -15014,7 +15205,10 @@ async def test_governed_manifest_claim_storage_rejection_is_nonfatal_and_not_ret
         memory_store=memory_store,
     )
 
-    assert result["answer"] == "The retained file reports that the setting is active."
+    assert result["answer"] == (
+        "The retained file reports that the setting is active.\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
+    )
     assert len(litellm.calls) == 1
     assert len(memory_store.claim_record_calls) == 1
     assert len(memory_store.trace_calls) == 2
@@ -15053,7 +15247,7 @@ async def test_provider_text_cannot_select_the_claim_acquisition_manifest_id(tmp
 
 
 @pytest.mark.asyncio
-async def test_limited_multi_sentence_evidence_answer_keeps_manifest_without_claim(
+async def test_limited_evidence_answer_captures_pre_boundary_claim_and_full_response(
     tmp_path,
 ):
     result, memory_store, runtime, litellm, _ = (
@@ -15061,10 +15255,15 @@ async def test_limited_multi_sentence_evidence_answer_keeps_manifest_without_cla
     )
 
     assert len(litellm.calls) == 1
-    assert "Some optional source scope was unavailable" in result["answer"]
-    assert runtime.claim_calibration_calls == []
-    assert memory_store.claim_record_calls == []
-    assert len(memory_store.trace_calls) == 1
+    limitation = "Limitation: an optional selected source was not available."
+    claim_anchor = "The retained file reports that the setting is active."
+    assert result["answer"] == (
+        f"{claim_anchor}\n\n{limitation}\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert len(runtime.claim_calibration_calls) == 1
+    assert runtime.claim_calibration_calls[0]["claim_anchor"] == claim_anchor
+    assert len(memory_store.claim_record_calls) == 1
+    assert len(memory_store.trace_calls) == 2
     trace = memory_store.trace_calls[0]["payload"]
     manifest = trace["prompt"]["evidence_acquisition"]
     capture = trace["prompt"]["claim_capture"]
@@ -15072,9 +15271,20 @@ async def test_limited_multi_sentence_evidence_answer_keeps_manifest_without_cla
     assert manifest["assistant_message_id"] == (
         "00000000-0000-4000-8000-000000000002"
     )
-    assert capture["reason_code"] == "structured_answer"
-    assert capture["acquisition_manifest_status"] == "not_applicable"
-    assert capture["acquisition_manifest_linked"] is False
+    assert manifest["response_digest"] == (
+        f"sha256:{hashlib.sha256(result['answer'].encode()).hexdigest()}"
+    )
+    claim_payload = memory_store.claim_record_calls[0]["payload"]
+    assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
+    assert claim_payload["calibration_result"]["claim_anchor"] == claim_anchor
+    assert claim_payload["calibration_result"]["claim_anchor_digest"] != (
+        manifest["response_digest"]
+    )
+    assert limitation not in json.dumps(claim_payload, sort_keys=True)
+    assert TARGETED_SCOPE_SUFFIX not in json.dumps(claim_payload, sort_keys=True)
+    assert capture["reason_code"] == "single_claim_single_file_source"
+    assert capture["acquisition_manifest_status"] == "bound"
+    assert capture["acquisition_manifest_linked"] is True
 
 
 @pytest.mark.asyncio
@@ -15335,9 +15545,8 @@ async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_f
     assert dsa.list_calls == []
     assert dsa.calls == []
 
-    quoted_text = (
-        f'What did you check for the statement "{first["answer"]}"?'
-    )
+    claim_anchor = memory_store.listed_records[0]["claim_anchor"]
+    quoted_text = f'What did you check for the statement "{claim_anchor}"?'
     quoted, provider, dsa, _ = await _run_acquisition_explanation_follow_up(
         tmp_path,
         follow_up=quoted_text,
