@@ -34,6 +34,8 @@ from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
     TARGETED_SCOPE_SUFFIX,
+    EvidenceAcquisitionPremise,
+    _acquisition_premise_digest,
 )
 from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
@@ -390,6 +392,7 @@ class FakeRuntime:
         evidence_shape_response=None,
         evidence_plan_response=None,
         evidence_sufficiency_response=None,
+        evidence_next_step_response=None,
         fail: bool = False,
         companion_error: Exception | None = None,
         interaction_governance_error: Exception | None = None,
@@ -406,6 +409,7 @@ class FakeRuntime:
         evidence_shape_error: Exception | None = None,
         evidence_plan_error: Exception | None = None,
         evidence_sufficiency_error: Exception | None = None,
+        evidence_next_step_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -432,6 +436,7 @@ class FakeRuntime:
         self.evidence_shape_calls = []
         self.evidence_plan_calls = []
         self.evidence_sufficiency_calls = []
+        self.evidence_next_step_calls = []
         self.reset_calls = []
         self.call_order = []
         self.last_companion_compile_endpoint = None
@@ -760,6 +765,7 @@ class FakeRuntime:
         self.evidence_shape_response = evidence_shape_response
         self.evidence_plan_response = evidence_plan_response
         self.evidence_sufficiency_response = evidence_sufficiency_response
+        self.evidence_next_step_response = evidence_next_step_response
         self.fail = fail
         self.companion_error = companion_error
         self.interaction_governance_error = interaction_governance_error
@@ -776,6 +782,7 @@ class FakeRuntime:
         self.evidence_shape_error = evidence_shape_error
         self.evidence_plan_error = evidence_plan_error
         self.evidence_sufficiency_error = evidence_sufficiency_error
+        self.evidence_next_step_error = evidence_next_step_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -923,8 +930,19 @@ class FakeRuntime:
         if self.evidence_plan_error is not None:
             raise self.evidence_plan_error
         if self.evidence_plan_response is not None:
+            if isinstance(self.evidence_plan_response, list):
+                return self.evidence_plan_response.pop(0)
             return self.evidence_plan_response
         digest = f"sha256:{hashlib.sha256(kwargs['question_anchor'].encode()).hexdigest()}"
+        exact_references = kwargs["declared_scope"].get("exact_source_refs") or []
+        eligible_source_ids = (
+            sorted({item["source_id"] for item in exact_references})
+            if exact_references
+            else ["vehicle_log_primary"]
+        )
+        selected_strategies = (
+            ["exact_fetch"] if exact_references else ["targeted_retrieval"]
+        )
         return {
             **{
                 key: kwargs[key]
@@ -945,9 +963,9 @@ class FakeRuntime:
                 "plan_status": "ready",
                 "completeness_expectation": "targeted_scope",
                 "contradiction_search_required": False,
-                "eligible_source_ids": ["vehicle_log_primary"],
+                "eligible_source_ids": eligible_source_ids,
                 "authoritative_source_ids": [],
-                "selected_strategies": ["targeted_retrieval"],
+                "selected_strategies": selected_strategies,
                 "declared_requirements": [
                     {
                         "requirement_id": "targeted-evidence",
@@ -971,7 +989,13 @@ class FakeRuntime:
         if self.evidence_sufficiency_error is not None:
             raise self.evidence_sufficiency_error
         if self.evidence_sufficiency_response is not None:
-            return self.evidence_sufficiency_response
+            response = (
+                self.evidence_sufficiency_response.pop(0)
+                if isinstance(self.evidence_sufficiency_response, list)
+                else self.evidence_sufficiency_response
+            )
+            self._last_evidence_sufficiency_result = response["result"]
+            return response
         evaluations = [
             {
                 **requirement,
@@ -1033,7 +1057,7 @@ class FakeRuntime:
             if status == "insufficient"
             else ["material_requirement_unknown"]
         )
-        return {
+        response = {
             **{
                 key: kwargs[key]
                 for key in (
@@ -1058,6 +1082,133 @@ class FakeRuntime:
                 "additional_acquisition_required": status
                 in {"insufficient", "unknown"},
                 "user_safe_summary": "Bounded sufficiency.",
+            },
+        }
+        self._last_evidence_sufficiency_result = response["result"]
+        return response
+
+    async def select_evidence_next_step(self, **kwargs):
+        self.evidence_next_step_calls.append(kwargs)
+        self.call_order.append("evidence_next_step")
+        if self.evidence_next_step_error is not None:
+            raise self.evidence_next_step_error
+        if self.evidence_next_step_response is not None:
+            response = (
+                self.evidence_next_step_response.pop(0)
+                if isinstance(self.evidence_next_step_response, list)
+                else self.evidence_next_step_response
+            )
+            return response(kwargs) if callable(response) else response
+        sufficiency = self._last_evidence_sufficiency_result
+        status = sufficiency["sufficiency_status"]
+        current = EvidenceAcquisitionPremise.model_validate(
+            kwargs["current_premise"]
+        )
+        proposed_raw = kwargs.get("proposed_acquisition_premise")
+        proposed = (
+            EvidenceAcquisitionPremise.model_validate(proposed_raw)
+            if proposed_raw is not None
+            else None
+        )
+        clarification_target = kwargs.get("clarification_target")
+        if status == "sufficient_for_declared_scope":
+            selection = (
+                "answer_within_declared_scope",
+                "bounded_conclusion_allowed",
+                "allowed",
+                "not_applicable",
+                ["declared_scope_sufficient"],
+            )
+            proposed = None
+            clarification_target = None
+        elif status == "sufficient_with_limitations":
+            selection = (
+                "provide_qualified_partial_answer",
+                "qualified_partial_only",
+                "allowed",
+                "not_applicable",
+                ["optional_limitations_remain"],
+            )
+            proposed = None
+            clarification_target = None
+        elif clarification_target is not None:
+            selection = (
+                "ask_narrow_clarification",
+                "requested_conclusion_withheld",
+                "blocked",
+                "not_applicable",
+                ["material_uncertainty_requires_clarification"],
+            )
+        elif proposed is not None:
+            selection = (
+                "perform_additional_acquisition",
+                "requested_conclusion_withheld",
+                "blocked",
+                "changed_premise_allowed",
+                ["changed_acquisition_premise_available"],
+            )
+        else:
+            selection = (
+                "disclose_unexamined_scope",
+                "requested_conclusion_withheld",
+                "blocked",
+                "not_applicable",
+                ["unexamined_material_scope"],
+            )
+        (
+            selected_next_step,
+            conclusion_disposition,
+            provider_disposition,
+            reacquisition_guard,
+            reason_codes,
+        ) = selection
+        unresolved = sorted(
+            evaluation["requirement_id"]
+            for evaluation in kwargs["evaluated_requirements"]
+            if evaluation["criticality"] == "material"
+            and evaluation["effective_outcome"] != "satisfied"
+        )
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                )
+            },
+            "result": {
+                "selection_id": (
+                    f"evidence_next_step_{len(self.evidence_next_step_calls)}"
+                ),
+                "evaluation_id": kwargs["evaluation_id"],
+                "evidence_plan_id": kwargs["evidence_plan_id"],
+                "acquisition_manifest_id": kwargs[
+                    "acquisition_manifest_id"
+                ],
+                "task_shape": current.task_shape,
+                "sufficiency_status": status,
+                "selected_next_step": selected_next_step,
+                "conclusion_disposition": conclusion_disposition,
+                "provider_disposition": provider_disposition,
+                "current_premise_digest": _acquisition_premise_digest(current),
+                "proposed_premise_digest": (
+                    _acquisition_premise_digest(proposed)
+                    if proposed is not None
+                    else None
+                ),
+                "reacquisition_guard": reacquisition_guard,
+                "clarification_target": (
+                    clarification_target
+                    if selected_next_step == "ask_narrow_clarification"
+                    else None
+                ),
+                "unresolved_material_requirement_ids": unresolved,
+                "reason_codes": reason_codes,
+                "user_safe_summary": "A bounded next step was selected.",
             },
         }
 
@@ -11538,6 +11689,67 @@ def _exact_fetch_response(
     }
 
 
+def _next_step_response_from_call(
+    call,
+    *,
+    status,
+    selected_next_step,
+    conclusion_disposition,
+    provider_disposition,
+    reacquisition_guard="not_applicable",
+    clarification_target=None,
+    reason_codes=None,
+    include_proposed_digest=True,
+):
+    current = EvidenceAcquisitionPremise.model_validate(call["current_premise"])
+    proposed_raw = call.get("proposed_acquisition_premise")
+    proposed = (
+        EvidenceAcquisitionPremise.model_validate(proposed_raw)
+        if proposed_raw is not None
+        else None
+    )
+    return {
+        **{
+            key: call[key]
+            for key in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "runtime_session_id",
+                "runtime_turn_id",
+            )
+        },
+        "result": {
+            "selection_id": "evidence_next_step_fixture",
+            "evaluation_id": call["evaluation_id"],
+            "evidence_plan_id": call["evidence_plan_id"],
+            "acquisition_manifest_id": call["acquisition_manifest_id"],
+            "task_shape": current.task_shape,
+            "sufficiency_status": status,
+            "selected_next_step": selected_next_step,
+            "conclusion_disposition": conclusion_disposition,
+            "provider_disposition": provider_disposition,
+            "current_premise_digest": _acquisition_premise_digest(current),
+            "proposed_premise_digest": (
+                _acquisition_premise_digest(proposed)
+                if proposed is not None and include_proposed_digest
+                else None
+            ),
+            "reacquisition_guard": reacquisition_guard,
+            "clarification_target": clarification_target,
+            "unresolved_material_requirement_ids": sorted(
+                evaluation["requirement_id"]
+                for evaluation in call["evaluated_requirements"]
+                if evaluation["criticality"] == "material"
+                and evaluation["effective_outcome"] != "satisfied"
+            ),
+            "reason_codes": reason_codes or ["unsupported_conclusion_withheld"],
+            "user_safe_summary": "A bounded next step was selected.",
+        },
+    }
+
+
 def _targeted_plan_response(
     *,
     request_id: str,
@@ -12539,6 +12751,7 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert len(runtime.evidence_shape_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
     assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
     assert len(dsa.list_calls) == 1
     assert len(dsa.calls) == 1
     assert dsa.fetch_calls == []
@@ -12561,6 +12774,9 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         "evidence_sufficiency"
     )
     assert runtime.call_order.index("evidence_sufficiency") < runtime.call_order.index(
+        "evidence_next_step"
+    )
+    assert runtime.call_order.index("evidence_next_step") < runtime.call_order.index(
         "provider"
     )
     submitted_facts = runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
@@ -12607,6 +12823,585 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         assert prohibited not in prompt_trace
         assert prohibited not in serialized
         assert prohibited not in public_response
+
+
+@pytest.mark.asyncio
+async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        fetch_responses=[
+            _exact_fetch_response(
+                source_ref="vehicle_log_primary:record_1",
+            )
+        ],
+    )
+    dsa.source_response["sources"][0]["capabilities"] = [
+        "profile",
+        "search",
+        "fetch",
+    ]
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="The exact record lists 2025-07-12.")
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+    assembly_count = 0
+
+    def filter_only_initial_targeted_context(**kwargs):
+        nonlocal assembly_count
+        assembly_count += 1
+        prompt = original_assemble_prompt(**kwargs)
+        if assembly_count != 1:
+            return prompt
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filter_only_initial_targeted_context,
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-next-step-exact",
+    )
+
+    assert out["answer"] == (
+        f"The exact record lists 2025-07-12.\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert assembly_count == 2
+    assert len(runtime.evidence_plan_calls) == 2
+    assert runtime.evidence_plan_calls[0]["declared_scope"][
+        "exact_source_refs"
+    ] == []
+    assert runtime.evidence_plan_calls[1]["declared_scope"][
+        "exact_source_refs"
+    ] == [
+        {
+            "source_id": "vehicle_log_primary",
+            "source_ref": "vehicle_log_primary:record_1",
+        }
+    ]
+    assert len(runtime.evidence_sufficiency_calls) == 2
+    assert [
+        call["current_premise"]["selected_strategies"]
+        for call in runtime.evidence_next_step_calls
+    ] == [["targeted_retrieval"], ["exact_fetch"]]
+    assert len(runtime.evidence_next_step_calls) == 2
+    assert (
+        runtime.evidence_next_step_calls[0][
+            "proposed_acquisition_premise"
+        ]["selected_strategies"]
+        == ["exact_fetch"]
+    )
+    assert (
+        runtime.evidence_next_step_calls[1][
+            "proposed_acquisition_premise"
+        ]
+        is None
+    )
+    assert dsa.fetch_calls == [
+        {
+            "source_ref": "vehicle_log_primary:record_1",
+            "include_raw": False,
+            "budget": {
+                "max_results": 1,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    assert len(litellm.calls) == 1
+    provider_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "The exact maintenance item lists 2025-07-12." in provider_messages
+    assert "The maintenance record lists 2025-07-12." not in provider_messages
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["acquisition"]["strategy_attempted"] == "exact_fetch"
+    assert manifest["next_steps"]["additional_acquisition_count"] == 1
+    assert manifest["next_steps"]["selection_count"] == 2
+    assert manifest["next_steps"]["initial_attempt"] == {
+        "strategy": "targeted_retrieval",
+        "sufficiency_status": "insufficient",
+        "result_count": 1,
+        "retained_reference_count": 0,
+        "changed_premise_exact_fetch_followed": True,
+    }
+    assert [
+        item["selected_next_step"]
+        for item in manifest["next_steps"]["selections"]
+    ] == [
+        "perform_additional_acquisition",
+        "answer_within_declared_scope",
+    ]
+    assert manifest["next_steps"]["selections"][0][
+        "additional_acquisition_executed"
+    ] is True
+    assert "The maintenance record lists" not in json.dumps(
+        manifest,
+        sort_keys=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+
+    def unchanged_guard(call):
+        return _next_step_response_from_call(
+            call,
+            status="insufficient",
+            selected_next_step="withhold_unsupported_conclusion",
+            conclusion_disposition="requested_conclusion_withheld",
+            provider_disposition="blocked",
+            reacquisition_guard="unchanged_premise_blocked",
+            reason_codes=["unchanged_acquisition_premise"],
+        )
+
+    runtime = FakeRuntime(evidence_next_step_response=unchanged_guard)
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        fetch_responses=[
+            _exact_fetch_response(
+                source_ref="vehicle_log_primary:record_1",
+            )
+        ],
+    )
+    dsa.source_response["sources"][0]["capabilities"] = [
+        "profile",
+        "search",
+        "fetch",
+    ]
+    litellm = FakeLiteLLM()
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-next-step-unchanged",
+    )
+
+    _assert_material_gap_answer(
+        out["answer"],
+        fragments=["reasoning context", "filtered or omitted before reasoning"],
+    )
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert runtime.evidence_next_step_calls[0][
+        "proposed_acquisition_premise"
+    ] is not None
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guard,reason_code",
+    [
+        ("unchanged_premise_blocked", "unchanged_acquisition_premise"),
+        (
+            "premise_already_attempted",
+            "acquisition_premise_already_selected",
+        ),
+    ],
+)
+async def test_evidence_next_step_guarded_partial_is_provider_and_fetch_free(
+    tmp_path,
+    monkeypatch,
+    guard,
+    reason_code,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+
+    def guarded_partial(call):
+        return _next_step_response_from_call(
+            call,
+            status="insufficient",
+            selected_next_step="provide_qualified_partial_answer",
+            conclusion_disposition="qualified_partial_only",
+            provider_disposition="allowed",
+            reacquisition_guard=guard,
+            reason_codes=[
+                reason_code,
+                "substantive_partial_evidence_available",
+            ],
+        )
+
+    runtime = FakeRuntime(evidence_next_step_response=guarded_partial)
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        fetch_responses=[
+            _exact_fetch_response(
+                source_ref="vehicle_log_primary:record_1",
+            )
+        ],
+    )
+    dsa.source_response["sources"][0]["capabilities"] = [
+        "profile",
+        "search",
+        "fetch",
+    ]
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER CONCLUSION")
+    memory_store = FakeMemoryStore()
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-evidence-next-step-partial-{guard}",
+    )
+
+    assert out["answer"].startswith(
+        "The available evidence establishes the requested targeted evidence."
+    )
+    assert "reasoning context" in out["answer"]
+    assert out["answer"].endswith(
+        "I’m withholding the requested conclusion."
+    )
+    assert "PRIVATE PROVIDER CONCLUSION" not in out["answer"]
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert runtime.evidence_next_step_calls[0][
+        "proposed_acquisition_premise"
+    ] is not None
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+    assert memory_store.claim_record_calls == []
+    next_steps = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["next_steps"]
+    assert next_steps["additional_acquisition_count"] == 0
+    assert next_steps["selections"][0]["selected_next_step"] == (
+        "provide_qualified_partial_answer"
+    )
+    assert next_steps["selections"][0]["reacquisition_guard"] == guard
+
+
+@pytest.mark.asyncio
+async def test_evidence_next_step_deterministic_partial_remains_provider_free(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+
+    def qualified_partial(call):
+        return _next_step_response_from_call(
+            call,
+            status="insufficient",
+            selected_next_step="provide_qualified_partial_answer",
+            conclusion_disposition="qualified_partial_only",
+            provider_disposition="allowed",
+            reason_codes=["substantive_partial_evidence_available"],
+        )
+
+    runtime = FakeRuntime(evidence_next_step_response=qualified_partial)
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER CONCLUSION")
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-next-step-partial",
+    )
+
+    assert out["answer"].startswith(
+        "The available evidence establishes the requested targeted evidence."
+    )
+    assert "reasoning context" in out["answer"]
+    assert out["answer"].endswith(
+        "I’m withholding the requested conclusion."
+    )
+    assert "PRIVATE PROVIDER CONCLUSION" not in out["answer"]
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_next_step_dependency_failure_is_provider_free(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime(
+        evidence_next_step_error=RuntimeError("PRIVATE SELECTOR ERROR")
+    )
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER CONCLUSION")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-next-step-dependency",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t determine a safe evidence next step, so I’m withholding "
+        "the requested conclusion."
+    )
+    assert litellm.calls == []
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["next_steps"]["dependency_status"] == "dependency_failure"
+    assert "PRIVATE SELECTOR ERROR" not in json.dumps(manifest, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_evidence_next_step_never_executes_a_second_acquisition(
+    tmp_path,
+    monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+
+    def authorize_acquisition(call):
+        return _next_step_response_from_call(
+            call,
+            status="insufficient",
+            selected_next_step="perform_additional_acquisition",
+            conclusion_disposition="requested_conclusion_withheld",
+            provider_disposition="blocked",
+            reacquisition_guard="changed_premise_allowed",
+            reason_codes=["changed_acquisition_premise_available"],
+        )
+
+    runtime = FakeRuntime(
+        evidence_next_step_response=[
+            authorize_acquisition,
+            authorize_acquisition,
+        ]
+    )
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        fetch_responses=[httpx.ReadTimeout("PRIVATE EXACT FETCH TIMEOUT")],
+    )
+    dsa.source_response["sources"][0]["capabilities"] = [
+        "profile",
+        "search",
+        "fetch",
+    ]
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER CONCLUSION")
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+    assembly_count = 0
+
+    def filter_only_initial_targeted_context(**kwargs):
+        nonlocal assembly_count
+        assembly_count += 1
+        prompt = original_assemble_prompt(**kwargs)
+        if assembly_count != 1:
+            return prompt
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filter_only_initial_targeted_context,
+    )
+    memory_store = FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-next-step-max-one",
+    )
+
+    assert out["answer"] == (
+        "I couldn’t determine a safe evidence next step, so I’m withholding "
+        "the requested conclusion."
+    )
+    assert len(runtime.evidence_next_step_calls) == 2
+    assert runtime.evidence_next_step_calls[1][
+        "proposed_acquisition_premise"
+    ] is None
+    assert len(dsa.fetch_calls) == 1
+    assert litellm.calls == []
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["next_steps"]["additional_acquisition_count"] == 1
+    assert manifest["next_steps"]["dependency_status"] == "dependency_failure"
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "PRIVATE EXACT FETCH TIMEOUT" not in serialized
+    assert "PRIVATE PROVIDER CONCLUSION" not in serialized
 
 
 @pytest.mark.asyncio
@@ -12821,16 +13616,20 @@ async def test_hybrid_comparison_context_failure_is_bounded_and_never_retried(
         ],
     )
 
-    expected_fragment = {
-        "failed": "acquisition failed",
-        "unknown": "could not be established from the available acquisition facts",
-        "filtered": "filtered or omitted before reasoning",
-        "truncated": "material evidence was truncated",
-    }[expected_outcome]
-    _assert_material_gap_answer(
-        out["answer"],
-        fragments=["coverage of every selected source", expected_fragment],
-    )
+    if expected_outcome == "unknown":
+        assert out["answer"] == (
+            "Which bounded source or source set should I examine?"
+        )
+    else:
+        expected_fragment = {
+            "failed": "acquisition failed",
+            "filtered": "filtered or omitted before reasoning",
+            "truncated": "material evidence was truncated",
+        }[expected_outcome]
+        _assert_material_gap_answer(
+            out["answer"],
+            fragments=["coverage of every selected source", expected_fragment],
+        )
     assert len(dsa.context_calls) == 2
     assert litellm.calls == []
     facts = {
@@ -13208,6 +14007,10 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
     )
 
     assert len(litellm.calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert runtime.evidence_next_step_calls[0][
+        "proposed_acquisition_premise"
+    ] is None
     limitation = "Limitation: an optional selected source was not available."
     assert out["answer"] == (
         f"The record lists 2025-07-12.\n\n{limitation}\n\n"

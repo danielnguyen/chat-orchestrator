@@ -119,6 +119,53 @@ AnswerConstraint = Literal[
     "withhold_absence_conclusion",
     "withhold_contradiction_sensitive_conclusion",
 ]
+AcquisitionStrategy = Literal[
+    "targeted_retrieval",
+    "exact_fetch",
+    "bounded_full_context",
+    "structured_query",
+    "hybrid",
+]
+NextStep = Literal[
+    "answer_within_declared_scope",
+    "provide_qualified_partial_answer",
+    "perform_additional_acquisition",
+    "ask_narrow_clarification",
+    "disclose_unexamined_scope",
+    "withhold_unsupported_conclusion",
+]
+ConclusionDisposition = Literal[
+    "bounded_conclusion_allowed",
+    "qualified_partial_only",
+    "requested_conclusion_withheld",
+]
+ProviderDisposition = Literal["allowed", "blocked"]
+ReacquisitionGuard = Literal[
+    "not_applicable",
+    "changed_premise_allowed",
+    "unchanged_premise_blocked",
+    "premise_already_attempted",
+]
+ClarificationTarget = Literal[
+    "question_scope",
+    "source_scope",
+    "exact_reference",
+    "time_scope",
+    "version_scope",
+    "domain_scope",
+    "project_scope",
+]
+NextStepReasonCode = Literal[
+    "declared_scope_sufficient",
+    "optional_limitations_remain",
+    "material_uncertainty_requires_clarification",
+    "changed_acquisition_premise_available",
+    "unchanged_acquisition_premise",
+    "acquisition_premise_already_selected",
+    "substantive_partial_evidence_available",
+    "unexamined_material_scope",
+    "unsupported_conclusion_withheld",
+]
 
 AMBIGUOUS_ANSWER = (
     "I need a narrower evidence request before I can determine what should be checked."
@@ -130,6 +177,10 @@ UNSUPPORTED_ANSWER = (
 WITHHELD_ANSWER = (
     "I couldn’t verify that from the available source context, so I’m not going "
     "to present an unsupported conclusion."
+)
+NEXT_STEP_DEPENDENCY_ANSWER = (
+    "I couldn’t determine a safe evidence next step, so I’m withholding the "
+    "requested conclusion."
 )
 TARGETED_SCOPE_SUFFIX = (
     "This reflects only the targeted sources checked, not a complete search of every "
@@ -227,6 +278,20 @@ _SOURCE_AVAILABILITY_LIMITATIONS = {
     "optional_source_unavailable",
 }
 _MAX_RENDERED_EVIDENCE_CAUSES = 3
+_ADMINISTRATIVE_REQUIREMENT_KINDS = {
+    "authoritative_inventory",
+    "context_delivery",
+    "no_material_truncation",
+}
+_CLARIFICATION_QUESTIONS = {
+    "question_scope": "What exact question or conclusion should I evaluate?",
+    "source_scope": "Which bounded source or source set should I examine?",
+    "exact_reference": "Which exact source reference should I retrieve?",
+    "time_scope": "What time period should I examine?",
+    "version_scope": "Which version should I use?",
+    "domain_scope": "Which domain should bound the review?",
+    "project_scope": "Which project should bound the review?",
+}
 
 
 class StrictModel(BaseModel):
@@ -431,6 +496,229 @@ class SufficiencyResponse(StrictModel):
     evidence_plan_id: Identifier
     acquisition_manifest_id: Identifier
     result: SufficiencyResult
+
+
+class EvidenceDeclaredScope(StrictModel):
+    source_ids: list[Identifier] = Field(default_factory=list, max_length=32)
+    source_categories: list[Identifier] = Field(default_factory=list, max_length=16)
+    exact_source_refs: list[ExactSourceReference] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    inventory_status: Literal[
+        "complete_for_declared_scope",
+        "partial",
+        "unknown",
+        "unavailable",
+    ]
+    time_scope_ref: Identifier | None = None
+    version_scope_ref: Identifier | None = None
+    domain_scope_ref: Identifier | None = None
+    project_scope_ref: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_unique_scope_values(self) -> EvidenceDeclaredScope:
+        if len(set(self.source_ids)) != len(self.source_ids):
+            raise ValueError("duplicate_declared_source_id")
+        if len(set(self.source_categories)) != len(self.source_categories):
+            raise ValueError("duplicate_declared_source_category")
+        source_refs = [reference.source_ref for reference in self.exact_source_refs]
+        if len(set(source_refs)) != len(source_refs):
+            raise ValueError("duplicate_exact_source_ref")
+        if self.source_ids and any(
+            reference.source_id not in self.source_ids
+            for reference in self.exact_source_refs
+        ):
+            raise ValueError("exact_source_ref_outside_declared_source_ids")
+        return self
+
+
+class EvidenceSourceDescriptor(StrictModel):
+    source_id: Identifier
+    source_categories: list[Identifier] = Field(max_length=8)
+    capabilities: list[
+        Literal[
+            "targeted_retrieval",
+            "exact_fetch",
+            "bounded_full_context",
+            "structured_query",
+            "context_expansion",
+        ]
+    ] = Field(max_length=5)
+    availability: Literal["available", "unavailable", "disabled", "unknown"]
+    authority_role: Literal["authoritative", "supplemental", "unknown"]
+
+    @model_validator(mode="after")
+    def validate_unique_source_values(self) -> EvidenceSourceDescriptor:
+        if len(set(self.source_categories)) != len(self.source_categories):
+            raise ValueError("duplicate_source_category")
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("duplicate_source_capability")
+        return self
+
+
+class EvidenceAcquisitionPremise(StrictModel):
+    question_anchor_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ]
+    task_shape: TaskShape
+    declared_scope: EvidenceDeclaredScope
+    source_inventory: list[EvidenceSourceDescriptor] = Field(max_length=32)
+    selected_strategies: list[AcquisitionStrategy] = Field(max_length=5)
+
+    @model_validator(mode="after")
+    def validate_unique_premise_values(self) -> EvidenceAcquisitionPremise:
+        source_ids = [source.source_id for source in self.source_inventory]
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("duplicate_source_descriptor")
+        if len(set(self.selected_strategies)) != len(self.selected_strategies):
+            raise ValueError("duplicate_acquisition_strategy")
+        return self
+
+
+class NextStepResult(StrictModel):
+    selection_id: Identifier
+    evaluation_id: Identifier
+    evidence_plan_id: Identifier
+    acquisition_manifest_id: Identifier
+    task_shape: TaskShape
+    sufficiency_status: Literal[
+        "sufficient_for_declared_scope",
+        "sufficient_with_limitations",
+        "insufficient",
+        "unknown",
+    ]
+    selected_next_step: NextStep
+    conclusion_disposition: ConclusionDisposition
+    provider_disposition: ProviderDisposition
+    current_premise_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ]
+    proposed_premise_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ] | None = None
+    reacquisition_guard: ReacquisitionGuard
+    clarification_target: ClarificationTarget | None = None
+    unresolved_material_requirement_ids: list[Identifier] = Field(max_length=32)
+    reason_codes: list[NextStepReasonCode] = Field(max_length=4)
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @model_validator(mode="after")
+    def validate_policy_combination(self) -> NextStepResult:
+        if self.unresolved_material_requirement_ids != sorted(
+            set(self.unresolved_material_requirement_ids)
+        ):
+            raise ValueError("unordered_unresolved_material_requirements")
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("duplicate_next_step_reason_code")
+
+        terminal = self.sufficiency_status in {
+            "sufficient_for_declared_scope",
+            "sufficient_with_limitations",
+        }
+        if self.sufficiency_status == "sufficient_for_declared_scope":
+            expected = (
+                "answer_within_declared_scope",
+                "bounded_conclusion_allowed",
+                "allowed",
+                "not_applicable",
+            )
+            actual = (
+                self.selected_next_step,
+                self.conclusion_disposition,
+                self.provider_disposition,
+                self.reacquisition_guard,
+            )
+            if actual != expected:
+                raise ValueError("invalid_sufficient_next_step")
+        elif self.sufficiency_status == "sufficient_with_limitations":
+            expected = (
+                "provide_qualified_partial_answer",
+                "qualified_partial_only",
+                "allowed",
+                "not_applicable",
+            )
+            actual = (
+                self.selected_next_step,
+                self.conclusion_disposition,
+                self.provider_disposition,
+                self.reacquisition_guard,
+            )
+            if actual != expected:
+                raise ValueError("invalid_limited_next_step")
+        elif self.conclusion_disposition == "bounded_conclusion_allowed":
+            raise ValueError("invalid_nonterminal_conclusion_disposition")
+        if (
+            self.selected_next_step == "answer_within_declared_scope"
+            and self.sufficiency_status != "sufficient_for_declared_scope"
+        ):
+            raise ValueError("invalid_bounded_answer_next_step")
+
+        if terminal and (
+            self.proposed_premise_digest is not None
+            or self.clarification_target is not None
+        ):
+            raise ValueError("terminal_next_step_has_follow_up")
+        if self.selected_next_step == "ask_narrow_clarification":
+            if (
+                self.clarification_target is None
+                or self.provider_disposition != "blocked"
+                or self.conclusion_disposition != "requested_conclusion_withheld"
+                or self.reacquisition_guard != "not_applicable"
+            ):
+                raise ValueError("invalid_clarification_next_step")
+        elif self.clarification_target is not None:
+            raise ValueError("unexpected_clarification_target")
+
+        if self.selected_next_step == "provide_qualified_partial_answer" and (
+            self.conclusion_disposition != "qualified_partial_only"
+            or self.provider_disposition != "allowed"
+        ):
+            raise ValueError("invalid_partial_answer_next_step")
+        if self.selected_next_step in {
+            "disclose_unexamined_scope",
+            "withhold_unsupported_conclusion",
+        } and (
+            self.conclusion_disposition != "requested_conclusion_withheld"
+            or self.provider_disposition != "blocked"
+        ):
+            raise ValueError("invalid_blocked_next_step")
+        if self.selected_next_step == "perform_additional_acquisition":
+            if (
+                self.sufficiency_status not in {"insufficient", "unknown"}
+                or self.reacquisition_guard != "changed_premise_allowed"
+                or self.proposed_premise_digest is None
+                or self.provider_disposition != "blocked"
+                or self.conclusion_disposition != "requested_conclusion_withheld"
+            ):
+                raise ValueError("invalid_additional_acquisition_next_step")
+        elif self.reacquisition_guard == "changed_premise_allowed":
+            raise ValueError("unexpected_changed_premise_guard")
+        if (
+            self.reacquisition_guard
+            in {"unchanged_premise_blocked", "premise_already_attempted"}
+        ):
+            if (
+                self.sufficiency_status not in {"insufficient", "unknown"}
+                or self.proposed_premise_digest is None
+                or self.selected_next_step
+                == "perform_additional_acquisition"
+            ):
+                raise ValueError("invalid_blocked_reacquisition")
+        return self
+
+
+class NextStepResponse(StrictModel):
+    request_id: Identifier
+    owner_id: Identifier
+    conversation_id: Identifier
+    surface: Surface
+    runtime_session_id: Identifier
+    runtime_turn_id: Identifier
+    result: NextStepResult
 
 
 class DsaSourceEntry(StrictModel):
@@ -734,6 +1022,12 @@ class EvidenceAcquisitionState:
     exact_source_refs: list[dict[str, str]] | None = None
     exact_attempts: list[dict[str, Any]] | None = None
     expansion_attempts: list[dict[str, Any]] | None = None
+    next_step: NextStepResult | None = None
+    next_step_selection_attempted: bool = False
+    next_step_failure: str | None = None
+    next_step_history: list[dict[str, Any]] | None = None
+    initial_attempt_summary: dict[str, Any] | None = None
+    additional_acquisition_count: int = 0
 
     @property
     def supported_targeted_path(self) -> bool:
@@ -913,6 +1207,14 @@ class EvidenceAcquisitionState:
         )
 
 
+@dataclass(frozen=True)
+class ExactFetchProposal:
+    plan: PlanResult
+    declared_scope: dict[str, Any]
+    exact_reference: dict[str, str]
+    premise: EvidenceAcquisitionPremise
+
+
 def disabled_evidence_trace(*, enabled: bool, reason: str) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -1055,6 +1357,8 @@ def _manifest_id(
     exact_attempts: list[dict[str, Any]] | None = None,
     expansion_attempts: list[dict[str, Any]] | None = None,
     delivery_identity: dict[str, Any] | None = None,
+    initial_attempt_summary: dict[str, Any] | None = None,
+    next_step_history: list[dict[str, Any]] | None = None,
 ) -> str:
     normalized_attempts = sorted(
         [
@@ -1100,6 +1404,25 @@ def _manifest_id(
                 str(item.get("context_mode") or ""),
             ),
         ),
+        "initial_attempt_summary": initial_attempt_summary,
+        "next_step_history": [
+            {
+                "selection_id": item.get("selection_id"),
+                "evaluation_id": item.get("evaluation_id"),
+                "evidence_plan_id": item.get("evidence_plan_id"),
+                "acquisition_manifest_id": item.get("acquisition_manifest_id"),
+                "selected_next_step": item.get("selected_next_step"),
+                "conclusion_disposition": item.get("conclusion_disposition"),
+                "provider_disposition": item.get("provider_disposition"),
+                "reacquisition_guard": item.get("reacquisition_guard"),
+                "clarification_target": item.get("clarification_target"),
+                "reason_codes": sorted(item.get("reason_codes") or []),
+                "additional_acquisition_executed": bool(
+                    item.get("additional_acquisition_executed")
+                ),
+            }
+            for item in (next_step_history or [])[:2]
+        ],
     }
     if delivery_identity is not None:
         material["delivery_identity"] = {
@@ -1163,8 +1486,411 @@ def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
     }[source_list.inventory_status]
 
 
+def _acquisition_premise_digest(premise: EvidenceAcquisitionPremise) -> str:
+    scope = premise.declared_scope.model_copy(
+        update={
+            "source_ids": sorted(premise.declared_scope.source_ids),
+            "source_categories": sorted(premise.declared_scope.source_categories),
+            "exact_source_refs": sorted(
+                premise.declared_scope.exact_source_refs,
+                key=lambda reference: (reference.source_ref, reference.source_id),
+            ),
+        }
+    )
+    inventory = sorted(
+        [
+            source.model_copy(
+                update={
+                    "source_categories": sorted(source.source_categories),
+                    "capabilities": sorted(source.capabilities),
+                }
+            )
+            for source in premise.source_inventory
+        ],
+        key=lambda source: source.source_id,
+    )
+    material = {
+        "question_anchor_digest": premise.question_anchor_digest,
+        "task_shape": premise.task_shape,
+        "declared_scope": scope.model_dump(mode="json"),
+        "source_inventory": [
+            source.model_dump(mode="json") for source in inventory
+        ],
+        "selected_strategies": sorted(premise.selected_strategies),
+    }
+    encoded = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return f"sha256:{hashlib.sha256(encoded.encode()).hexdigest()}"
+
+
+def build_current_acquisition_premise(
+    state: EvidenceAcquisitionState,
+) -> EvidenceAcquisitionPremise:
+    if (
+        state.plan is None
+        or state.inventory is None
+        or not isinstance(state.declared_scope, dict)
+    ):
+        raise ValueError("current_acquisition_premise_unavailable")
+    return EvidenceAcquisitionPremise.model_validate(
+        {
+            "question_anchor_digest": state.plan.question_anchor_digest,
+            "task_shape": state.plan.task_shape,
+            "declared_scope": state.declared_scope,
+            "source_inventory": _adapt_inventory(state.inventory),
+            "selected_strategies": state.plan.selected_strategies,
+        }
+    )
+
+
+def deterministic_clarification_target(
+    state: EvidenceAcquisitionState,
+) -> ClarificationTarget | None:
+    if state.sufficiency is None:
+        return None
+    uncertain_material = {
+        evaluation.requirement_kind
+        for evaluation in state.sufficiency.evaluated_requirements
+        if evaluation.criticality == "material"
+        and evaluation.effective_outcome in {"missing", "unknown"}
+    }
+    scope = state.declared_scope or {}
+    if (
+        "exact_authoritative_fetch" in uncertain_material
+        and not scope.get("exact_source_refs")
+    ):
+        return "exact_reference"
+    if (
+        "historical_scope" in uncertain_material
+        and scope.get("time_scope_ref") is None
+    ):
+        return "time_scope"
+    scope_kinds = {
+        "authoritative_inventory",
+        "complete_scope_coverage",
+        "selected_source_coverage",
+        "structured_absence_check",
+        "contradiction_search",
+        "counterevidence_coverage",
+        "historical_scope",
+        "historical_sequence_coverage",
+        "candidate_evidence_coverage",
+        "cross_source_comparison",
+    }
+    if uncertain_material & scope_kinds and not any(
+        scope.get(field)
+        for field in ("source_ids", "source_categories", "exact_source_refs")
+    ):
+        return "source_scope"
+    return None
+
+
+def _safe_exact_fetch_candidate(
+    state: EvidenceAcquisitionState,
+    context_pack: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if (
+        state.plan is None
+        or state.inventory is None
+        or state.sufficiency is None
+        or not state.supported_targeted_path
+        or state.plan.task_shape != "targeted_lookup"
+        or state.plan.selected_strategies != ["targeted_retrieval"]
+        or state.exact_source_refs
+        or state.sufficiency.sufficiency_status not in {"insufficient", "unknown"}
+        or not isinstance(context_pack, dict)
+    ):
+        return None
+    eligible = set(state.plan.eligible_source_ids)
+    inventory = {
+        source["source_id"]: source for source in _adapt_inventory(state.inventory)
+    }
+    candidates: list[dict[str, str]] = []
+    for item in context_pack.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        source_id = item.get("source_id")
+        source_ref = item.get("source_ref")
+        source = inventory.get(source_id) if isinstance(source_id, str) else None
+        if (
+            source_id not in eligible
+            or not isinstance(source_ref, str)
+            or source is None
+            or source["availability"] != "available"
+            or "exact_fetch" not in source["capabilities"]
+        ):
+            continue
+        try:
+            reference = ExactSourceReference.model_validate(
+                {"source_id": source_id, "source_ref": source_ref}
+            )
+        except Exception:
+            continue
+        candidates.append(reference.model_dump(mode="json"))
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda item: (item["source_id"], item["source_ref"]),
+    )[0]
+
+
+async def compile_safe_exact_fetch_proposal(
+    *,
+    state: EvidenceAcquisitionState,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    context_pack: dict[str, Any] | None,
+) -> ExactFetchProposal | None:
+    candidate = _safe_exact_fetch_candidate(state, context_pack)
+    if (
+        candidate is None
+        or state.plan is None
+        or state.shape is None
+        or state.inventory is None
+        or not isinstance(state.declared_scope, dict)
+    ):
+        return None
+    proposed_scope = json.loads(json.dumps(state.declared_scope))
+    proposed_scope["exact_source_refs"] = [candidate]
+    try:
+        scope = _scope(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+        )
+        response_raw = await runtime.compile_evidence_plan(
+            **scope,
+            question_anchor=state.plan.question_anchor,
+            task_shape=state.plan.task_shape,
+            declared_scope=proposed_scope,
+            source_inventory=_adapt_inventory(state.inventory),
+        )
+        response = PlanResponse.model_validate(response_raw)
+        _validate_scope_echo(response, scope)
+        plan = response.result
+        if (
+            plan.question_anchor != state.plan.question_anchor
+            or plan.question_anchor_digest != state.plan.question_anchor_digest
+            or plan.task_shape != state.plan.task_shape
+            or plan.plan_status not in {"ready", "ready_with_limitations"}
+            or plan.selected_strategies != ["exact_fetch"]
+            or candidate["source_id"] not in plan.eligible_source_ids
+        ):
+            return None
+        proposed_state = EvidenceAcquisitionState(
+            enabled=state.enabled,
+            attempted=True,
+            status="acquisition_ready",
+            shape=state.shape,
+            inventory=state.inventory,
+            declared_scope=proposed_scope,
+            plan=plan,
+            exact_source_refs=[candidate],
+        )
+        if not proposed_state.supported_exact_path:
+            return None
+        premise = build_current_acquisition_premise(proposed_state)
+        return ExactFetchProposal(
+            plan=plan,
+            declared_scope=proposed_scope,
+            exact_reference=candidate,
+            premise=premise,
+        )
+    except Exception:
+        return None
+
+
+async def select_evidence_next_step(
+    *,
+    state: EvidenceAcquisitionState,
+    runtime: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    proposal: ExactFetchProposal | None = None,
+    clarification_target: ClarificationTarget | None = None,
+) -> NextStepResult | None:
+    state.next_step_selection_attempted = True
+    state.next_step_failure = None
+    if (
+        state.plan is None
+        or state.sufficiency is None
+        or state.manifest_id is None
+        or len(state.next_step_history or []) >= 2
+    ):
+        state.next_step = None
+        state.next_step_failure = "dependency_failure"
+        state.status = "next_step_dependency_failed"
+        state.forced_answer = NEXT_STEP_DEPENDENCY_ANSWER
+        return None
+    try:
+        scope = _scope(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+        )
+        current_premise = build_current_acquisition_premise(state)
+        response_raw = await runtime.select_evidence_next_step(
+            **scope,
+            evaluation_id=state.sufficiency.evaluation_id,
+            evidence_plan_id=state.plan.plan_id,
+            acquisition_manifest_id=state.manifest_id,
+            evaluated_requirements=[
+                evaluation.model_dump(mode="json")
+                for evaluation in state.sufficiency.evaluated_requirements
+            ],
+            current_premise=current_premise.model_dump(mode="json"),
+            proposed_acquisition_premise=(
+                proposal.premise.model_dump(mode="json")
+                if proposal is not None
+                else None
+            ),
+            clarification_target=clarification_target,
+        )
+        response = NextStepResponse.model_validate(response_raw)
+        _validate_scope_echo(response, scope)
+        result = response.result
+        if (
+            result.evaluation_id != state.sufficiency.evaluation_id
+            or result.evidence_plan_id != state.plan.plan_id
+            or result.acquisition_manifest_id != state.manifest_id
+            or result.task_shape != state.plan.task_shape
+            or result.sufficiency_status != state.sufficiency.sufficiency_status
+            or result.current_premise_digest
+            != _acquisition_premise_digest(current_premise)
+        ):
+            raise ValueError("next_step_association_mismatch")
+        proposed_digest = (
+            _acquisition_premise_digest(proposal.premise)
+            if proposal is not None
+            else None
+        )
+        if result.proposed_premise_digest != proposed_digest:
+            raise ValueError("next_step_proposed_premise_mismatch")
+        if (
+            result.selected_next_step == "ask_narrow_clarification"
+            and result.clarification_target != clarification_target
+        ):
+            raise ValueError("next_step_clarification_mismatch")
+        expected_unresolved = sorted(
+            evaluation.requirement_id
+            for evaluation in state.sufficiency.evaluated_requirements
+            if evaluation.criticality == "material"
+            and evaluation.effective_outcome != "satisfied"
+        )
+        if result.unresolved_material_requirement_ids != expected_unresolved:
+            raise ValueError("next_step_requirement_mismatch")
+        if (
+            result.selected_next_step == "perform_additional_acquisition"
+            and proposal is None
+        ):
+            raise ValueError("next_step_proposal_missing")
+        state.next_step = result
+        state.next_step_history = [
+            *(state.next_step_history or []),
+            {
+                "selection_id": result.selection_id,
+                "evaluation_id": result.evaluation_id,
+                "evidence_plan_id": result.evidence_plan_id,
+                "acquisition_manifest_id": result.acquisition_manifest_id,
+                "selected_next_step": result.selected_next_step,
+                "conclusion_disposition": result.conclusion_disposition,
+                "provider_disposition": result.provider_disposition,
+                "reacquisition_guard": result.reacquisition_guard,
+                "clarification_target": result.clarification_target,
+                "reason_codes": list(result.reason_codes),
+                "additional_acquisition_executed": False,
+            },
+        ]
+        return result
+    except Exception:
+        state.next_step = None
+        state.next_step_failure = "dependency_failure"
+        state.status = "next_step_dependency_failed"
+        state.forced_answer = NEXT_STEP_DEPENDENCY_ANSWER
+        return None
+
+
+def retain_initial_attempt_summary(
+    state: EvidenceAcquisitionState,
+    *,
+    context_pack: dict[str, Any] | None,
+    retained_source_refs: set[str] | None,
+) -> None:
+    items = (
+        context_pack.get("items")
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("items"), list)
+        else []
+    )
+    state.initial_attempt_summary = {
+        "strategy": (
+            state.plan.selected_strategies[0]
+            if state.plan and state.plan.selected_strategies
+            else None
+        ),
+        "sufficiency_status": (
+            state.sufficiency.sufficiency_status if state.sufficiency else None
+        ),
+        "result_count": len(items),
+        "retained_reference_count": (
+            len(retained_source_refs) if retained_source_refs is not None else None
+        ),
+        "changed_premise_exact_fetch_followed": True,
+    }
+
+
+def promote_exact_fetch_proposal(
+    state: EvidenceAcquisitionState,
+    proposal: ExactFetchProposal,
+) -> None:
+    if state.additional_acquisition_count >= 1:
+        raise ValueError("additional_acquisition_limit_reached")
+    if state.next_step is None or (
+        state.next_step.selected_next_step != "perform_additional_acquisition"
+        or state.next_step.reacquisition_guard != "changed_premise_allowed"
+        or state.next_step.proposed_premise_digest
+        != _acquisition_premise_digest(proposal.premise)
+    ):
+        raise ValueError("additional_acquisition_not_authorized")
+    state.additional_acquisition_count = 1
+    if state.next_step_history:
+        state.next_step_history[-1]["additional_acquisition_executed"] = True
+    state.plan = proposal.plan
+    state.declared_scope = proposal.declared_scope
+    state.exact_source_refs = [proposal.exact_reference]
+    state.exact_attempts = None
+    state.expansion_attempts = None
+    state.acquisition_facts = None
+    state.sufficiency = None
+    state.next_step = None
+    state.next_step_selection_attempted = False
+    state.next_step_failure = None
+    state.forced_answer = None
+    state.status = "acquisition_ready"
+
+
 def _validate_scope_echo(
-    model: ShapeResponse | PlanResponse | SufficiencyResponse,
+    model: ShapeResponse | PlanResponse | SufficiencyResponse | NextStepResponse,
     scope: dict[str, str],
 ) -> None:
     if any(getattr(model, field) != value for field, value in scope.items()):
@@ -2678,6 +3404,8 @@ async def evaluate_acquisition_sufficiency(
         exact_attempts=state.exact_attempts,
         expansion_attempts=state.expansion_attempts,
         delivery_identity=delivery_identity,
+        initial_attempt_summary=state.initial_attempt_summary,
+        next_step_history=state.next_step_history,
     )
     facts = _build_acquisition_facts(
         plan=state.plan,
@@ -2794,6 +3522,26 @@ def provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
         return True
     if state.forced_answer is not None:
         return False
+    if state.next_step_selection_attempted:
+        if state.next_step is None or state.sufficiency is None:
+            return False
+        return bool(
+            state.next_step.provider_disposition == "allowed"
+            and (
+                (
+                    state.next_step.selected_next_step
+                    == "answer_within_declared_scope"
+                    and state.sufficiency.sufficiency_status
+                    == "sufficient_for_declared_scope"
+                )
+                or (
+                    state.next_step.selected_next_step
+                    == "provide_qualified_partial_answer"
+                    and state.sufficiency.sufficiency_status
+                    == "sufficient_with_limitations"
+                )
+            )
+        )
     return bool(
         state.sufficiency
         and state.sufficiency.sufficiency_status
@@ -2807,6 +3555,28 @@ def enforce_final_answer(
 ) -> str:
     if state is None or state.follow_existing_path:
         return answer
+    if state.next_step_selection_attempted:
+        next_step = state.next_step
+        if next_step is None:
+            return state.forced_answer or NEXT_STEP_DEPENDENCY_ANSWER
+        if next_step.selected_next_step == "ask_narrow_clarification":
+            if next_step.clarification_target is None:
+                return NEXT_STEP_DEPENDENCY_ANSWER
+            return _CLARIFICATION_QUESTIONS[next_step.clarification_target]
+        if next_step.selected_next_step == "provide_qualified_partial_answer" and (
+            state.sufficiency is not None
+            and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
+        ):
+            return _render_qualified_partial_answer(state.sufficiency)
+        if next_step.selected_next_step in {
+            "disclose_unexamined_scope",
+            "withhold_unsupported_conclusion",
+        }:
+            if state.sufficiency is None:
+                return NEXT_STEP_DEPENDENCY_ANSWER
+            return _render_blocked_answer(state.sufficiency)
+        if next_step.selected_next_step == "perform_additional_acquisition":
+            return NEXT_STEP_DEPENDENCY_ANSWER
     if (
         state.sufficiency is not None
         and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
@@ -3057,6 +3827,64 @@ def _render_blocked_answer(sufficiency: SufficiencyResult) -> str:
         response = (
             f"{response} Additional material evidence requirements were also "
             "unresolved."
+        )
+    return f"{response} {_withholding_sentence(sufficiency.task_shape)}"
+
+
+def _render_qualified_partial_answer(sufficiency: SufficiencyResult) -> str:
+    supported = sorted(
+        {
+            (
+                f"{_REQUIREMENT_DESCRIPTIONS[evaluation.requirement_kind]} "
+                "was partially established"
+                if evaluation.effective_outcome == "partial"
+                else _REQUIREMENT_DESCRIPTIONS[evaluation.requirement_kind]
+            )
+            for evaluation in sufficiency.evaluated_requirements
+            if evaluation.criticality == "material"
+            and evaluation.requirement_kind
+            not in _ADMINISTRATIVE_REQUIREMENT_KINDS
+            and evaluation.effective_outcome in {"satisfied", "partial"}
+        }
+    )
+    unresolved = [
+        rendered
+        for evaluation in sorted(
+            sufficiency.evaluated_requirements,
+            key=lambda item: (
+                item.requirement_kind,
+                item.effective_outcome,
+                item.requirement_id,
+            ),
+        )
+        if evaluation.criticality == "material"
+        if (
+            rendered := _render_requirement_outcome(
+                evaluation.requirement_kind,
+                evaluation.effective_outcome,
+            )
+        )
+    ]
+    supported_bounded, supported_omitted = _bounded_clauses(supported)
+    unresolved_bounded, unresolved_omitted = _bounded_clauses(unresolved)
+    supported_text = (
+        _join_clauses(supported_bounded)
+        if supported_bounded
+        else "some substantive evidence"
+    )
+    unresolved_text = (
+        _join_clauses(unresolved_bounded)
+        if unresolved_bounded
+        else "material evidence remains unresolved"
+    )
+    response = (
+        f"The available evidence establishes {supported_text}. However, "
+        f"{unresolved_text}."
+    )
+    if supported_omitted or unresolved_omitted:
+        response = (
+            f"{response} Additional evidence details remain outside this bounded "
+            "summary."
         )
     return f"{response} {_withholding_sentence(sufficiency.task_shape)}"
 
@@ -3339,6 +4167,38 @@ def build_manifest_trace(
             "requirement_facts": sorted(
                 state.acquisition_facts or [],
                 key=lambda item: item["requirement_id"],
+            ),
+        },
+        "next_steps": {
+            "selection_count": len(state.next_step_history or []),
+            "selections": [
+                {
+                    "selection_id": item.get("selection_id"),
+                    "evaluation_id": item.get("evaluation_id"),
+                    "evidence_plan_id": item.get("evidence_plan_id"),
+                    "acquisition_manifest_id": item.get(
+                        "acquisition_manifest_id"
+                    ),
+                    "selected_next_step": item.get("selected_next_step"),
+                    "conclusion_disposition": item.get(
+                        "conclusion_disposition"
+                    ),
+                    "provider_disposition": item.get("provider_disposition"),
+                    "reacquisition_guard": item.get("reacquisition_guard"),
+                    "clarification_target": item.get("clarification_target"),
+                    "reason_codes": sorted(item.get("reason_codes") or []),
+                    "additional_acquisition_executed": bool(
+                        item.get("additional_acquisition_executed")
+                    ),
+                }
+                for item in (state.next_step_history or [])[:2]
+            ],
+            "additional_acquisition_count": state.additional_acquisition_count,
+            "initial_attempt": state.initial_attempt_summary,
+            "dependency_status": (
+                state.next_step_failure
+                if state.next_step_selection_attempted
+                else None
             ),
         },
         "sufficiency": {
