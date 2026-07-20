@@ -3917,6 +3917,82 @@ def test_governed_success_boundaries_follow_task_shape_not_provider_text(
 
 
 @pytest.mark.parametrize(
+    ("task_shape", "boundary"),
+    [
+        ("targeted_lookup", TARGETED_SCOPE_SUFFIX),
+        ("cross_source_comparison", COMPARISON_SCOPE_SUFFIX),
+        ("bounded_exhaustive_review", EXHAUSTIVE_SCOPE_SUFFIX),
+    ],
+)
+def test_provider_authored_limitation_paragraph_is_preserved(
+    task_shape,
+    boundary,
+):
+    state = _rendering_state(task_shape=task_shape)
+    provider_answer = (
+        "The report supports the migration.\n\n"
+        "Limitation: the report applies only to version 2."
+    )
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{boundary}"
+    assert enforce_final_answer(answer, state) == answer
+
+
+@pytest.mark.parametrize(
+    "provider_paragraph",
+    [
+        "Limitation: the report applies only to version 2.",
+        "Limitation — the report applies only to version 2.",
+        "Limitations: the report applies only to version 2.",
+        "Limited to: version 2.",
+    ],
+)
+def test_provider_limitation_like_paragraphs_are_not_policy_owned(
+    provider_paragraph,
+):
+    state = _rendering_state()
+
+    answer = enforce_final_answer(provider_paragraph, state)
+
+    assert answer == f"{provider_paragraph}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert enforce_final_answer(answer, state) == answer
+
+
+def test_limited_answer_preserves_provider_limitation_before_policy_paragraphs():
+    state = _rendering_state(
+        status="sufficient_with_limitations",
+        evaluations=[
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+                "effective_outcome": "unavailable",
+            }
+        ],
+        limitation_codes=["optional_source_unavailable"],
+    )
+    provider_answer = (
+        "The report supports the migration.\n\n"
+        "Limitation: the report applies only to version 2."
+    )
+    policy_limitation = (
+        "Limitation: an optional selected source was not available."
+    )
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == (
+        f"{provider_answer}\n\n{policy_limitation}\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert enforce_final_answer(answer, state) == answer
+    assert answer.count(policy_limitation) == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
     "provider_answer",
     [
         "Nothing material was left unchecked.",
@@ -4076,7 +4152,7 @@ def test_multiple_optional_limitations_are_deduplicated_and_bounded():
     second = enforce_final_answer(first, state)
 
     assert first == second
-    assert "provider-chosen qualification" not in first
+    assert "Limitation: provider-chosen qualification." in first
     assert first.count("1 optional source was unavailable") == 1
     assert "Additional optional evidence limitations remained." in first
     assert first.endswith(TARGETED_SCOPE_SUFFIX)

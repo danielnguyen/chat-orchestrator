@@ -2827,17 +2827,19 @@ def enforce_final_answer(
 
 
 def _compose_policy_answer(answer: str, policy_paragraphs: list[str]) -> str:
-    owned_boundaries = set(_SCOPE_BOUNDARIES.values())
     paragraphs = [
         paragraph.strip()
         for paragraph in re.split(r"\n\s*\n", answer.strip())
         if paragraph.strip()
     ]
+    owned_policy_paragraphs = {
+        *_SCOPE_BOUNDARIES.values(),
+        *policy_paragraphs,
+    }
     provider_paragraphs = [
         paragraph
         for paragraph in paragraphs
-        if paragraph not in owned_boundaries
-        and not paragraph.startswith("Limitation:")
+        if paragraph not in owned_policy_paragraphs
     ]
     return "\n\n".join([*provider_paragraphs, *policy_paragraphs])
 
