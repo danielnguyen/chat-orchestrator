@@ -4023,6 +4023,8 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
     }
     if isinstance(trace.get("evidence_acquisition"), dict):
         summary["evidence_acquisition"] = trace["evidence_acquisition"]
+    if isinstance(trace.get("claim_explanation"), dict):
+        summary["claim_explanation"] = trace["claim_explanation"]
     return summary
 
 
@@ -6510,17 +6512,39 @@ async def orchestrate_chat(
     evidence_acquisition: EvidenceAcquisitionState | None = None
     evidence_manifest: dict[str, Any] | None = None
     evidence_path_deferred = False
+    compound_verification_requested = False
+    compound_history_answer = ""
+    compound_verification_target: str | None = None
+    evidence_task_text = last_user_text
 
     try:
         claim_explanation = await resolve_claim_explanation(
             enabled=claim_record_capture_enabled,
+            acquisition_history_enabled=evidence_acquisition_enabled,
             messages=payload.get("messages"),
             memory_store=memory_store,
+            request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
             surface=surface,
         )
-        if claim_explanation.handled and not exact_reference_request:
+        compound_verification_requested = bool(
+            claim_explanation.handled
+            and claim_explanation.new_verification_requested
+        )
+        if compound_verification_requested:
+            compound_history_answer = claim_explanation.answer or ""
+            compound_verification_target = claim_explanation.verification_target
+            if compound_verification_target is not None:
+                evidence_task_text = (
+                    "Verify this prior statement with a new evidence check: "
+                    f'"{compound_verification_target}"'
+                )
+        if (
+            claim_explanation.handled
+            and not compound_verification_requested
+            and not exact_reference_request
+        ):
             answer = claim_explanation.answer or ""
             status = claim_explanation.status or "degraded"
             await _advance_runtime_turn(
@@ -7027,7 +7051,7 @@ async def orchestrate_chat(
                     surface=surface,
                     runtime_session_id=runtime_session_trace["runtime_session_id"],
                     runtime_turn_id=turn_state_trace["runtime_turn_id"],
-                    task_text=last_user_text,
+                    task_text=evidence_task_text,
                     interaction_kind=interaction_governance["interaction_kind"],
                     external_context=external_config,
                 )
@@ -7885,6 +7909,8 @@ async def orchestrate_chat(
                 enabled=True,
                 reason="ineligible",
             )
+        if compound_verification_requested:
+            prompt.trace["claim_explanation"] = claim_explanation.trace
 
         await _advance_runtime_turn(
             runtime=runtime,
@@ -7893,7 +7919,18 @@ async def orchestrate_chat(
             turn_status="responding",
         )
         model_started = perf_counter()
-        evidence_provider_allowed = provider_allowed(evidence_acquisition)
+        compound_governed_acquisition_established = bool(
+            evidence_acquisition is not None
+            and evidence_acquisition.attempted
+            and evidence_acquisition.supported_governed_path
+        )
+        evidence_provider_allowed = bool(
+            provider_allowed(evidence_acquisition)
+            and (
+                not compound_verification_requested
+                or compound_governed_acquisition_established
+            )
+        )
         capability_dispatch_blocked_by_evidence = bool(
             exact_reference_request
             and evidence_acquisition is not None
@@ -8386,7 +8423,11 @@ async def orchestrate_chat(
 
         references = _trace_references(retrieval_bundle)
         claim_capture = prepare_claim_capture(
-            enabled=claim_record_capture_enabled and evidence_provider_allowed,
+            enabled=(
+                claim_record_capture_enabled
+                and evidence_provider_allowed
+                and not compound_verification_requested
+            ),
             runtime_available=runtime is not None,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
@@ -8433,6 +8474,39 @@ async def orchestrate_chat(
             claim_candidate_answer,
             evidence_acquisition,
         )
+        if compound_verification_requested:
+            sufficiency_status = (
+                evidence_acquisition.sufficiency.sufficiency_status
+                if evidence_acquisition is not None
+                and evidence_acquisition.sufficiency is not None
+                else None
+            )
+            if (
+                compound_governed_acquisition_established
+                and sufficiency_status
+                in {
+                    "sufficient_for_declared_scope",
+                    "sufficient_with_limitations",
+                }
+            ):
+                verification_label = "New verification"
+                verification_answer = answer
+            elif (
+                compound_governed_acquisition_established
+                and sufficiency_status in {"insufficient", "unknown"}
+            ):
+                verification_label = "New verification attempt"
+                verification_answer = answer
+            else:
+                verification_label = "New verification unavailable"
+                verification_answer = (
+                    "I couldn’t complete a governed new evidence check for that "
+                    "statement."
+                )
+            answer = (
+                f"Original acquisition:\n{compound_history_answer}\n\n"
+                f"{verification_label}:\n{verification_answer}"
+            )
 
         assistant_message_ack = await memory_store.add_message(
             conversation_id=conversation_id,

@@ -164,6 +164,13 @@ def _manifest(
             "unavailable_source_ids": [],
             "failed_source_ids": [],
             "expansion_attempts": [],
+            "expansion_attempt_count": 0,
+            "expansion_successful_count": 0,
+            "expansion_unknown_count": 0,
+            "expansion_failed_count": 0,
+            "expansion_filtered_count": 0,
+            "expansion_truncated_count": 0,
+            "expansion_unsupported_count": 0,
             "item_count": 2,
             "usable_item_count": 2,
             "prompt_retained_item_count": 2,
@@ -182,8 +189,126 @@ def _manifest(
             "qualification_required": status == "sufficient_with_limitations",
             "additional_acquisition_required": False,
         },
-        "private_prompt": "PRIVATE-PROMPT-CONTENT",
     }
+
+
+def _hybrid_manifest(
+    *,
+    task_shape="cross_source_comparison",
+    status="sufficient_for_declared_scope",
+    next_steps=True,
+):
+    manifest = _manifest(status=status)
+    exhaustive = task_shape == "bounded_exhaustive_review"
+    source_ids = ["source-a"] if exhaustive else ["source-a", "source-b"]
+    returned = ["range-a"] if exhaustive else ["range-a", "range-b"]
+    seeds = ["seed-a"] if exhaustive else ["seed-a", "seed-b"]
+    manifest["shape"]["task_shape"] = task_shape
+    manifest["plan"].update(
+        {
+            "completeness_expectation": (
+                "complete_for_declared_scope"
+                if exhaustive
+                else "complete_for_selected_sources"
+            ),
+            "contradiction_search_required": exhaustive,
+            "selected_strategies": ["hybrid"],
+            "material_requirement_count": 5 if exhaustive else 3,
+        }
+    )
+    if status == "sufficient_with_limitations":
+        manifest["plan"]["plan_status"] = "ready_with_limitations"
+    inventory = manifest["inventory"]
+    inventory.update(
+        {
+            "inventory_source_count": len(source_ids),
+            "declared_source_count": len(source_ids),
+            "available_source_count": len(source_ids),
+        }
+    )
+    acquisition = manifest["acquisition"]
+    acquisition.update(
+        {
+            "strategy_attempted": "hybrid",
+            "sources_considered": source_ids,
+            "sources_selected": source_ids,
+            "sources_used": source_ids,
+            "source_references_returned": returned,
+            "source_references_retained": returned,
+            "source_references_filtered_or_omitted": [],
+            "source_references_attempted": seeds,
+            "source_references_unsuccessful": [],
+            "exact_reference_attempts": [],
+            "exact_reference_attempt_count": 0,
+            "exact_reference_successful_count": 0,
+            "expansion_attempts": [
+                {
+                    "source_id": source_id,
+                    "seed_source_ref": seed,
+                    "context_mode": "configured_worksheet" if exhaustive else "nearby_rows",
+                    "outcome": "satisfied",
+                    "returned_reference_count": 1,
+                }
+                for source_id, seed in zip(source_ids, seeds, strict=True)
+            ],
+            "expansion_attempt_count": len(source_ids),
+            "expansion_successful_count": len(source_ids),
+            "item_count": len(returned),
+            "usable_item_count": len(returned),
+            "prompt_retained_item_count": len(returned),
+        }
+    )
+    manifest["sufficiency"].update(
+        {
+            "status": status,
+            "qualification_required": status == "sufficient_with_limitations",
+            "additional_acquisition_required": status in {"insufficient", "unknown"},
+        }
+    )
+    manifest["status"] = status
+    if next_steps:
+        manifest["next_steps"] = {
+            "selection_count": 1,
+            "selections": [
+                {
+                    "selection_id": "selection-1",
+                    "evaluation_id": "evaluation-1",
+                    "evidence_plan_id": "plan-1",
+                    "acquisition_manifest_id": "manifest-1",
+                    "selected_next_step": (
+                        "answer_within_declared_scope"
+                        if status == "sufficient_for_declared_scope"
+                        else "provide_qualified_partial_answer"
+                        if status == "sufficient_with_limitations"
+                        else "withhold_unsupported_conclusion"
+                    ),
+                    "conclusion_disposition": (
+                        "bounded_conclusion_allowed"
+                        if status == "sufficient_for_declared_scope"
+                        else "qualified_partial_only"
+                        if status == "sufficient_with_limitations"
+                        else "requested_conclusion_withheld"
+                    ),
+                    "provider_disposition": (
+                        "allowed"
+                        if status
+                        in {
+                            "sufficient_for_declared_scope",
+                            "sufficient_with_limitations",
+                        }
+                        else "blocked"
+                    ),
+                    "reacquisition_guard": "not_applicable",
+                    "clarification_target": None,
+                    "reason_codes": ["bounded_policy_result"],
+                    "additional_acquisition_executed": False,
+                }
+            ],
+            "additional_acquisition_count": 0,
+            "initial_attempt": None,
+            "dependency_status": None,
+        }
+    return manifest
 
 
 def _trace(*, manifest=None, **overrides):
@@ -230,6 +355,7 @@ def _suppressed_trace():
         "source_references_attempted",
         "source_references_unsuccessful",
         "exact_reference_attempts",
+        "expansion_attempts",
         "unavailable_source_ids",
         "failed_source_ids",
     ):
@@ -253,6 +379,7 @@ class _MemoryStore:
         self.trace = _trace() if trace is None else trace
         self.trace_error = trace_error
         self.trace_calls = []
+        self.resolution_calls = []
 
     async def list_claim_records(self, **kwargs):
         self.calls.append(kwargs)
@@ -266,6 +393,97 @@ class _MemoryStore:
             raise self.trace_error
         return copy.deepcopy(self.trace)
 
+    async def resolve_acquisition_history(self, **kwargs):
+        self.resolution_calls.append(copy.deepcopy(kwargs))
+        if self.trace_error is not None:
+            raise self.trace_error
+        manifest = copy.deepcopy(self.trace.get("prompt", {}).get("evidence_acquisition"))
+        target_mode = kwargs["target_mode"]
+        target = kwargs["normalized_first_paragraph"]
+        matching = [
+            record for record in self.records if record.get("claim_anchor") == target
+        ]
+        if target_mode == "quoted_first_paragraph" and len(matching) > 1:
+            return _resolution_response(
+                kwargs,
+                status="ambiguous",
+                match_count=len(matching),
+                reason="quoted_response_ambiguous",
+            )
+        if target_mode == "quoted_first_paragraph" and not matching:
+            return _resolution_response(
+                kwargs,
+                status="no_record",
+                match_count=0,
+                reason="quoted_response_not_found",
+            )
+        if not isinstance(manifest, dict):
+            return _resolution_response(
+                kwargs,
+                status="no_record",
+                match_count=0,
+                reason=(
+                    "immediate_response_manifest_absent"
+                    if target_mode == "immediate_previous"
+                    else "quoted_response_manifest_absent"
+                ),
+            )
+        supplied_digest = kwargs.get("response_digest")
+        if (
+            target_mode == "immediate_previous"
+            and manifest.get("response_digest") != supplied_digest
+        ):
+            return _resolution_response(
+                kwargs,
+                status="no_record",
+                match_count=0,
+                reason="immediate_response_mismatch",
+            )
+        return _resolution_response(
+            kwargs,
+            status="resolved",
+            match_count=1,
+            reason=(
+                "immediate_response_resolved"
+                if target_mode == "immediate_previous"
+                else "quoted_response_resolved"
+            ),
+            manifest=manifest,
+        )
+
+
+def _resolution_response(
+    request,
+    *,
+    status,
+    match_count,
+    reason,
+    manifest=None,
+):
+    response = {
+        "schema_version": "acquisition-history-resolution.v1",
+        "request_id": request["request_id"],
+        "owner_id": request["owner_id"],
+        "conversation_id": request["conversation_id"],
+        "surface": request["surface"],
+        "target_mode": request["target_mode"],
+        "resolution_status": status,
+        "match_count": match_count,
+        "reason_code": reason,
+        "record": None,
+    }
+    if status == "resolved":
+        response["record"] = {
+            "original_request_id": "request-1",
+            "assistant_message_id": manifest["assistant_message_id"],
+            "surface": request["surface"],
+            "trace_status": "ok",
+            "response_digest": manifest["response_digest"],
+            "normalized_first_paragraph": request["normalized_first_paragraph"],
+            "acquisition_manifest": manifest,
+        }
+    return response
+
 
 async def _resolve(memory_store=None, **overrides):
     values = {
@@ -275,6 +493,7 @@ async def _resolve(memory_store=None, **overrides):
         "owner_id": "owner",
         "conversation_id": "conversation-1",
         "surface": "vscode",
+        "request_id": "lookup-request-1",
     }
     values.update(overrides)
     return await resolve_claim_explanation(**values)
@@ -305,6 +524,117 @@ async def test_memory_store_claim_record_list_is_scoped_and_bounded(monkeypatch)
             owner_id="owner",
             conversation_id="conversation-1",
             limit=21,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_mode", "response_digest"),
+    [
+        ("immediate_previous", "sha256:" + "1" * 64),
+        ("quoted_first_paragraph", None),
+    ],
+)
+async def test_memory_store_acquisition_history_request_is_exact(
+    monkeypatch,
+    target_mode,
+    response_digest,
+):
+    client = MemoryStoreClient("http://memory", "key")
+    calls = []
+
+    async def fake_post(path, *, request_id=None, json):
+        calls.append((path, request_id, copy.deepcopy(json)))
+        return {
+            **json,
+            "resolution_status": "no_record",
+            "match_count": 0,
+            "reason_code": (
+                "immediate_response_mismatch"
+                if target_mode == "immediate_previous"
+                else "quoted_response_not_found"
+            ),
+            "record": None,
+        }
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    response = await client.resolve_acquisition_history(
+        request_id="lookup-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        target_mode=target_mode,
+        normalized_first_paragraph=ANCHOR,
+        response_digest=response_digest,
+    )
+    assert response["resolution_status"] == "no_record"
+    assert calls[0][0:2] == (
+        "/v1/internal/acquisition-history/resolve",
+        "lookup-1",
+    )
+    payload = calls[0][2]
+    assert payload["schema_version"] == "acquisition-history-resolution.v1"
+    assert ("response_digest" in payload) is (response_digest is not None)
+
+
+@pytest.mark.asyncio
+async def test_memory_store_acquisition_history_rejects_scope_mismatch(monkeypatch):
+    client = MemoryStoreClient("http://memory", "key")
+
+    async def fake_post(path, *, request_id=None, json):
+        return {
+            **json,
+            "owner_id": "other-owner",
+            "resolution_status": "no_record",
+            "match_count": 0,
+            "reason_code": "immediate_response_mismatch",
+            "record": None,
+        }
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    with pytest.raises(RuntimeError, match="acquisition_history_response_context_mismatch"):
+        await client.resolve_acquisition_history(
+            request_id="lookup-1",
+            owner_id="owner",
+            conversation_id="conversation-1",
+            surface="vscode",
+            target_mode="immediate_previous",
+            normalized_first_paragraph=ANCHOR,
+            response_digest="sha256:" + "1" * 64,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_mode", "response_digest", "error"),
+    [
+        (
+            "immediate_previous",
+            None,
+            "acquisition_history_response_digest_required",
+        ),
+        (
+            "quoted_first_paragraph",
+            "sha256:" + "1" * 64,
+            "acquisition_history_response_digest_not_allowed",
+        ),
+    ],
+)
+async def test_memory_store_acquisition_history_rejects_conflicting_targets(
+    target_mode,
+    response_digest,
+    error,
+):
+    client = MemoryStoreClient("http://memory", "key")
+    with pytest.raises(ValueError, match=error):
+        await client.resolve_acquisition_history(
+            request_id="lookup-1",
+            owner_id="owner",
+            conversation_id="conversation-1",
+            surface="vscode",
+            target_mode=target_mode,
+            normalized_first_paragraph=ANCHOR,
+            response_digest=response_digest,
         )
 
 
@@ -480,7 +810,6 @@ def test_additional_or_targeted_text_does_not_match(phrase):
 @pytest.mark.parametrize(
     "phrase",
     [
-        "What did you check? Check again.",
         "Can you tell me what you checked and then search more?",
         "Did you look at everything relevant about Toronto?",
         "Please explain what you might have missed.",
@@ -488,11 +817,32 @@ def test_additional_or_targeted_text_does_not_match(phrase):
         f"What did you check for the statement “{OLDER_ANCHOR}”?",
         f'What did you check for the statement "{OLDER_ANCHOR}" and "another"?',
         f'What did you check for the statement "{OLDER_ANCHOR}?',
-        f'What did you check for the statement "{OLDER_ANCHOR}"? Check again.',
+        "What did you check? Check again. Then summarize it.",
+        "What did you check? Check again!",
+        "Please check again.",
+        f'What did you check for the statement "{OLDER_ANCHOR}"? Check again. Now compare it.',
     ],
 )
 def test_acquisition_intent_rejects_additional_or_malformed_text(phrase):
     assert parse_claim_explanation_intent(phrase) is None
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "What did you check? Check again.",
+        "What did you examine? Verify again.",
+        "Did you look at everything relevant? Check again.",
+        "What might you have missed? Verify again.",
+        "What did you not check? Check again.",
+        f'What did you check for the statement "{OLDER_ANCHOR}"? Check again.',
+    ],
+)
+def test_exact_compound_acquisition_intents_are_bounded(phrase):
+    intent = parse_claim_explanation_intent(phrase)
+    assert intent is not None
+    assert intent.explanation_kind == "acquisition"
+    assert intent.new_verification_requested is True
 
 
 @pytest.mark.asyncio
@@ -677,13 +1027,12 @@ async def test_targeted_acquisition_explanation_is_exact_and_non_exhaustive():
         "targeted scope. This was not an exhaustive review of every potentially "
         "relevant source. I did not perform a new verification for this explanation."
     )
-    assert memory_store.calls == [
-        {"owner_id": "owner", "conversation_id": "conversation-1", "limit": 20}
-    ]
-    assert memory_store.trace_calls == ["request-1"]
+    assert memory_store.calls == []
+    assert memory_store.trace_calls == []
+    assert len(memory_store.resolution_calls) == 1
     assert outcome.trace["explanation_kind"] == "acquisition"
     assert outcome.trace["acquisition_question"] == "checked"
-    assert outcome.trace["storage_call_count"] == 2
+    assert outcome.trace["storage_call_count"] == 1
     assert outcome.trace["provider_call_count"] == 0
     assert outcome.trace["aggregate_counts"]["sources_considered"] == 2
     serialized = repr(outcome)
@@ -725,10 +1074,9 @@ async def test_latest_bounded_acquisition_response_validates_full_digest_and_cla
     )
     assert manifest["response_digest"] == _response_digest(prior_response)
     assert manifest["response_digest"] != _digest(ANCHOR)
-    assert memory_store.calls == [
-        {"owner_id": "owner", "conversation_id": "conversation-1", "limit": 20}
-    ]
-    assert memory_store.trace_calls == ["request-1"]
+    assert memory_store.calls == []
+    assert memory_store.trace_calls == []
+    assert len(memory_store.resolution_calls) == 1
     serialized = repr(outcome)
     assert prior_response not in serialized
     assert manifest["response_digest"] not in serialized
@@ -752,61 +1100,28 @@ async def test_latest_bounded_acquisition_rejects_wrong_full_response_digest():
     )
 
     assert outcome.status == "degraded"
-    assert outcome.trace["reason_code"] == "acquisition_manifest_invalid"
+    assert outcome.trace["reason_code"] == "acquisition_record_not_found"
     assert outcome.trace["provider_call_count"] == 0
     assert prior_response not in repr(outcome)
     assert manifest["response_digest"] not in repr(outcome)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("prior_response", "reason_code"),
-    [
-        (
-            (
-                "The retained file reports that a different setting is active.\n\n"
-                f"{TARGETED_BOUNDARY}"
-            ),
-            "no_record_for_latest_response",
-        ),
-        (f"This answer is limited.\n\n{ANCHOR}", "no_record_for_latest_response"),
-        (f"# Result\n\n{ANCHOR}", "no_record_for_latest_response"),
-        (f"- Summary\n\n{ANCHOR}", "no_record_for_latest_response"),
-        (f"\n\n{ANCHOR}", "prior_assistant_unavailable"),
-        (
-            "The retained file includes this claim: "
-            f"{ANCHOR}",
-            "no_record_for_latest_response",
-        ),
-        (
-            "The retained file indicates that the setting is active.",
-            "no_record_for_latest_response",
-        ),
-    ],
-)
-async def test_latest_response_requires_exact_claim_as_first_paragraph(
-    prior_response,
-    reason_code,
-):
-    manifest = _manifest(response_digest=_response_digest(prior_response))
-    memory_store = _MemoryStore(
-        records=[_record(acquisition_manifest_id=MANIFEST_ID)],
-        trace=_trace(manifest=manifest),
-    )
+async def test_immediate_resolver_record_must_match_submitted_first_paragraph():
+    class WrongParagraphStore(_MemoryStore):
+        async def resolve_acquisition_history(self, **kwargs):
+            response = await super().resolve_acquisition_history(**kwargs)
+            response["record"]["normalized_first_paragraph"] = "A changed paragraph."
+            return response
 
     outcome = await _resolve(
-        memory_store,
-        messages=_messages(
-            prior=prior_response,
-            follow_up="What did you check?",
-        ),
+        WrongParagraphStore(records=[]),
+        messages=_messages(follow_up="What did you check?"),
     )
 
     assert outcome.status == "degraded"
-    assert outcome.trace["reason_code"] == reason_code
-    assert memory_store.trace_calls == []
-    assert prior_response not in repr(outcome)
-    assert manifest["response_digest"] not in repr(outcome)
+    assert outcome.trace["resolution_status"] == "unavailable"
+    assert ANCHOR not in repr(outcome)
 
 
 @pytest.mark.asyncio
@@ -869,6 +1184,147 @@ async def test_exact_fetch_and_coverage_explanations_preserve_declared_boundarie
     assert "sufficient for the declared targeted scope" in coverage.answer
     assert "not an exhaustive review" in coverage.answer
     assert "everything relevant was checked" not in coverage.answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_shape", "expected"),
+    [
+        (
+            "cross_source_comparison",
+            "bounded comparison across 2 selected configured sources",
+        ),
+        (
+            "bounded_exhaustive_review",
+            "bounded exhaustive review of the declared configured scope",
+        ),
+    ],
+)
+async def test_trace_first_history_renders_hybrid_and_exhaustive_without_claim(
+    task_shape,
+    expected,
+):
+    manifest = _hybrid_manifest(task_shape=task_shape)
+    store = _MemoryStore(records=[], trace=_trace(manifest=manifest))
+    outcome = await _resolve(
+        store,
+        messages=_messages(follow_up="What did you check?"),
+    )
+
+    assert outcome.status == "ok"
+    assert expected in outcome.answer
+    assert outcome.answer.endswith(
+        "I did not perform a new verification for this explanation."
+    )
+    assert store.calls == []
+    assert store.trace_calls == []
+    assert len(store.resolution_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_coverage_is_declared_scope_only():
+    outcome = await _resolve(
+        _MemoryStore(
+            records=[],
+            trace=_trace(
+                manifest=_hybrid_manifest(task_shape="bounded_exhaustive_review")
+            ),
+        ),
+        messages=_messages(follow_up="Did you look at everything relevant?"),
+    )
+    assert outcome.answer.startswith(
+        "Within the declared bounded scope, yes. That does not establish universal "
+        "coverage beyond it."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "wording"),
+    [
+        ("sufficient_with_limitations", "sufficient only with recorded limitations"),
+        ("insufficient", "marked the evidence insufficient"),
+        ("unknown", "left evidence sufficiency unknown"),
+    ],
+)
+async def test_history_renders_limited_insufficient_and_unknown(status, wording):
+    outcome = await _resolve(
+        _MemoryStore(records=[], trace=_trace(manifest=_hybrid_manifest(status=status))),
+        messages=_messages(follow_up="What did you check?"),
+    )
+    assert outcome.status == "ok"
+    assert wording in outcome.answer
+    assert "requested conclusion was not established" in outcome.answer or status == (
+        "sufficient_with_limitations"
+    )
+
+
+@pytest.mark.asyncio
+async def test_older_manifest_without_next_steps_remains_compatible():
+    outcome = await _resolve(
+        _MemoryStore(
+            records=[],
+            trace=_trace(manifest=_hybrid_manifest(next_steps=False)),
+        ),
+        messages=_messages(follow_up="What did you check?"),
+    )
+    assert outcome.status == "ok"
+    assert "bounded comparison" in outcome.answer
+
+
+@pytest.mark.asyncio
+async def test_changed_premise_targeted_to_exact_history_is_explicit():
+    manifest = _manifest(strategy="exact_fetch")
+    manifest["next_steps"] = {
+        "selection_count": 2,
+        "selections": [
+            {
+                "selection_id": "selection-1",
+                "evaluation_id": "evaluation-1",
+                "evidence_plan_id": "plan-1",
+                "acquisition_manifest_id": "manifest-1",
+                "selected_next_step": "perform_additional_acquisition",
+                "conclusion_disposition": "requested_conclusion_withheld",
+                "provider_disposition": "blocked",
+                "reacquisition_guard": "changed_premise_allowed",
+                "clarification_target": None,
+                "reason_codes": ["changed_acquisition_premise_available"],
+                "additional_acquisition_executed": True,
+            },
+            {
+                "selection_id": "selection-2",
+                "evaluation_id": "evaluation-2",
+                "evidence_plan_id": "plan-2",
+                "acquisition_manifest_id": "manifest-2",
+                "selected_next_step": "answer_within_declared_scope",
+                "conclusion_disposition": "bounded_conclusion_allowed",
+                "provider_disposition": "allowed",
+                "reacquisition_guard": "not_applicable",
+                "clarification_target": None,
+                "reason_codes": ["declared_scope_sufficient"],
+                "additional_acquisition_executed": False,
+            },
+        ],
+        "additional_acquisition_count": 1,
+        "initial_attempt": {
+            "strategy": "targeted_retrieval",
+            "sufficiency_status": "insufficient",
+            "result_count": 2,
+            "retained_reference_count": 2,
+            "changed_premise_exact_fetch_followed": True,
+        },
+        "dependency_status": None,
+    }
+    outcome = await _resolve(
+        _MemoryStore(records=[], trace=_trace(manifest=manifest)),
+        messages=_messages(follow_up="What did you check?"),
+    )
+    assert outcome.status == "ok"
+    assert (
+        "first performed a targeted lookup and then one authorized changed-premise "
+        "exact fetch" in outcome.answer
+    )
+    assert "unbounded retry" not in outcome.answer
 
 
 @pytest.mark.asyncio
@@ -962,18 +1418,15 @@ async def test_privacy_suppressed_manifest_preserves_aggregate_explanation():
 
 
 @pytest.mark.asyncio
-async def test_missing_link_and_trace_dependency_failure_are_honest():
+async def test_no_claim_link_resolves_and_resolver_dependency_failure_is_honest():
     no_link_store = _MemoryStore(records=[_record()])
     no_link = await _resolve(
         no_link_store,
         messages=_messages(follow_up="What did you check?"),
     )
-    assert no_link.answer == (
-        "I don’t have a retained acquisition record linked to that earlier answer, "
-        "so I can’t honestly say what was checked or missed. I did not perform a new "
-        "verification."
-    )
-    assert no_link.status == "degraded"
+    assert no_link.status == "ok"
+    assert "retained record shows a targeted lookup" in no_link.answer
+    assert no_link_store.calls == []
     assert no_link_store.trace_calls == []
 
     unavailable_store = _MemoryStore(
@@ -985,12 +1438,12 @@ async def test_missing_link_and_trace_dependency_failure_are_honest():
         messages=_messages(follow_up="What did you check?"),
     )
     assert unavailable.answer == (
-        "I couldn’t access the retained acquisition record for that earlier answer. "
-        "I can’t honestly reconstruct what was checked from memory, and I did not "
-        "perform a new verification."
+        "I couldn’t safely access the retained acquisition record for the specified "
+        "response. I did not perform a new verification for this explanation."
     )
     assert unavailable.status == "degraded"
-    assert unavailable_store.trace_calls == ["request-1"]
+    assert unavailable_store.trace_calls == []
+    assert len(unavailable_store.resolution_calls) == 1
     assert "PRIVATE-TRACE-EXCEPTION" not in repr(unavailable)
 
 
@@ -998,103 +1451,50 @@ async def test_missing_link_and_trace_dependency_failure_are_honest():
 @pytest.mark.parametrize(
     "mutation",
     [
-        "trace_malformed",
-        "request_mismatch",
-        "owner_mismatch",
-        "conversation_mismatch",
-        "surface_mismatch",
-        "current_surface_mismatch",
-        "trace_ineligible",
-        "prompt_missing",
-        "manifest_missing",
-        "manifest_malformed",
-        "manifest_id_mismatch",
-        "assistant_mismatch",
-        "digest_mismatch",
-        "digest_malformed",
-        "not_attempted",
-        "plan_missing",
-        "plan_not_ready",
-        "sufficiency_missing",
-        "top_insufficient",
-        "nested_unknown",
-        "status_disagreement",
+        "extra_response_field",
+        "contradictory_resolved_shape",
+        "record_digest_mismatch",
+        "manifest_extra_field",
+        "manifest_status_disagreement",
+        "next_step_disposition_mismatch",
     ],
 )
-async def test_acquisition_trace_association_failures_are_bounded(mutation):
-    trace = _trace()
-    surface = "vscode"
-    if mutation == "trace_malformed":
-        trace = ["PRIVATE-TRACE-BODY"]
-    elif mutation == "request_mismatch":
-        trace["request_id"] = "request-other"
-    elif mutation == "owner_mismatch":
-        trace["owner_id"] = "other"
-    elif mutation == "conversation_mismatch":
-        trace["conversation_id"] = "conversation-other"
-    elif mutation == "surface_mismatch":
-        trace["surface"] = "other"
-    elif mutation == "current_surface_mismatch":
-        surface = "other"
-    elif mutation == "trace_ineligible":
-        trace["status"] = "failed"
-    elif mutation == "prompt_missing":
-        trace.pop("prompt")
-    elif mutation == "manifest_missing":
-        trace["prompt"].pop("evidence_acquisition")
-    elif mutation == "manifest_malformed":
-        trace["prompt"]["evidence_acquisition"] = ["PRIVATE-MANIFEST"]
-    else:
-        manifest = trace["prompt"]["evidence_acquisition"]
-        if mutation == "manifest_id_mismatch":
-            manifest["manifest_id"] = "evidence_manifest_other"
-        elif mutation == "assistant_mismatch":
-            manifest["assistant_message_id"] = "assistant-other"
-        elif mutation == "digest_mismatch":
-            manifest["response_digest"] = "sha256:" + ("0" * 64)
-        elif mutation == "digest_malformed":
-            manifest["response_digest"] = "sha256:not-a-digest"
-        elif mutation == "not_attempted":
-            manifest["attempted"] = False
-        elif mutation == "plan_missing":
-            manifest.pop("plan")
-        elif mutation == "plan_not_ready":
-            manifest["plan"]["plan_status"] = "unsupported"
-        elif mutation == "sufficiency_missing":
-            manifest.pop("sufficiency")
-        elif mutation == "top_insufficient":
-            manifest["status"] = "insufficient"
-        elif mutation == "nested_unknown":
-            manifest["sufficiency"]["status"] = "unknown"
-        elif mutation == "status_disagreement":
-            manifest["status"] = "sufficient_with_limitations"
+async def test_acquisition_resolver_and_manifest_failures_are_bounded(mutation):
+    class MutatingStore(_MemoryStore):
+        async def resolve_acquisition_history(self, **kwargs):
+            response = await super().resolve_acquisition_history(**kwargs)
+            if mutation == "extra_response_field":
+                response["private"] = "PRIVATE-RESPONSE"
+            elif mutation == "contradictory_resolved_shape":
+                response["record"] = None
+            elif mutation == "record_digest_mismatch":
+                response["record"]["response_digest"] = "sha256:" + "0" * 64
+            elif mutation == "manifest_extra_field":
+                response["record"]["acquisition_manifest"]["private"] = (
+                    "PRIVATE-MANIFEST"
+                )
+            elif mutation == "manifest_status_disagreement":
+                response["record"]["acquisition_manifest"]["status"] = "unknown"
+            else:
+                manifest = response["record"]["acquisition_manifest"]
+                manifest["next_steps"] = _hybrid_manifest()["next_steps"]
+                manifest["next_steps"]["selections"][0]["provider_disposition"] = (
+                    "blocked"
+                )
+            return response
 
     outcome = await _resolve(
-        _MemoryStore(
-            records=[_record(acquisition_manifest_id=MANIFEST_ID)],
-            trace=trace,
-        ),
+        MutatingStore(records=[]),
         messages=_messages(follow_up="What did you check?"),
-        surface=surface,
     )
 
     assert outcome.status == "degraded"
-    assert outcome.answer == (
-        "The retained acquisition record for that earlier answer was incomplete or "
-        "did not match the response, so I can’t safely describe what was checked. I "
-        "did not perform a new verification."
-    )
-    assert outcome.trace["reason_code"] == "acquisition_manifest_invalid"
+    assert outcome.trace["resolution_status"] in {"invalid", "unavailable"}
     assert outcome.trace["provider_call_count"] == 0
     serialized = repr(outcome)
-    for prohibited in (
-        "PRIVATE-TRACE-BODY",
-        "PRIVATE-MANIFEST",
-        MANIFEST_ID,
-        "request-other",
-        "assistant-other",
-    ):
-        assert prohibited not in serialized
+    assert "PRIVATE-RESPONSE" not in serialized
+    assert "PRIVATE-MANIFEST" not in serialized
+    assert MANIFEST_ID not in serialized
 
 
 @pytest.mark.asyncio
@@ -1280,12 +1680,11 @@ async def test_quoted_acquisition_target_resolves_only_one_exact_older_record():
     )
 
     assert outcome.status == "ok"
-    assert outcome.trace["target_mode"] == "quoted_anchor"
+    assert outcome.trace["target_mode"] == "quoted_first_paragraph"
     assert outcome.trace["reason_code"] == "quoted_acquisition_record_resolved"
-    assert memory_store.trace_calls == ["request-1"]
-    assert memory_store.calls == [
-        {"owner_id": "owner", "conversation_id": "conversation-1", "limit": 20}
-    ]
+    assert memory_store.trace_calls == []
+    assert memory_store.calls == []
+    assert len(memory_store.resolution_calls) == 1
     assert OLDER_ANCHOR not in outcome.answer
 
 
@@ -1300,7 +1699,7 @@ async def test_quoted_acquisition_missing_and_ambiguous_targets_do_not_choose():
         ),
     )
     assert missing.status == "degraded"
-    assert missing.trace["reason_code"] == "quoted_claim_record_not_found"
+    assert missing.trace["reason_code"] == "acquisition_record_not_found"
 
     duplicates = [
         _record(
@@ -1321,8 +1720,8 @@ async def test_quoted_acquisition_missing_and_ambiguous_targets_do_not_choose():
         ),
     )
     assert ambiguous.status == "degraded"
-    assert ambiguous.trace["reason_code"] == "ambiguous_quoted_claim"
-    assert ambiguous.trace["matched_record_count"] == 2
+    assert ambiguous.trace["reason_code"] == "acquisition_record_ambiguous"
+    assert ambiguous.trace["resolution_status"] == "ambiguous"
     assert ambiguous.trace["acquisition_trace_lookup_status"] == "not_requested"
 
 

@@ -450,47 +450,62 @@ source type, claim class, confidence, evidence strength, freshness, and material
 limitations. Opaque record and source identifiers, target text, and private record
 content are not copied into traces or explanations. Malformed targets and missing,
 ambiguous, incomplete, unsupported, or unavailable records produce an honest
-deterministic fallback. No explanation performs fresh verification.
+deterministic fallback. A support explanation performs no fresh verification.
 
-Linked claim records also support a separate, provider-free acquisition-history
-explanation. The exact immediate-prior forms are `What did you check?`, `What did
-you examine?`, `Did you look at everything relevant?`, `What might you have
-missed?`, and `What did you not check?`. An older retained claim can be targeted
-with the exact straight-double-quoted forms `What did you check for the statement
-"<exact retained claim anchor>"?`, `What did you examine for the statement
-"<exact retained claim anchor>"?`, `Did you look at everything relevant for the
-statement "<exact retained claim anchor>"?`, and `What might you have missed for
-the statement "<exact retained claim anchor>"?`. The same bounded whitespace,
-punctuation, target-length, and exact-match rules apply. Additional instructions,
-topical additions, malformed quoting, and combined re-verification requests are
-not intercepted.
+Acquisition-history explanations use a separate response-and-trace-first path and
+do not require a claim record. The exact immediate-prior forms are `What did you
+check?`, `What did you examine?`, `Did you look at everything relevant?`, `What
+might you have missed?`, and `What did you not check?`. Immediate resolution sends
+the complete immediately preceding assistant response digest and its normalized
+first paragraph to Basic Memory Store; neither service scans backward on a
+mismatch. The quoted variants use the exact straight-double-quoted first paragraph
+and let Basic Memory Store perform one bounded exact lookup. Multiple exact matches
+are ambiguous rather than silently resolved to the newest response.
 
-After deterministic claim selection, Chat Orchestrator performs exactly one
-lookup of the linked request trace. It requires matching request, owner,
-conversation, surface, manifest, assistant-message, and answer-digest
-associations; attempted acquisition; a ready plan; and matching sufficient
-top-level and nested outcomes. Support explanations such as `How are you sure?`
-remain support-focused and do not load the acquisition trace merely because a
-claim has a manifest link.
+Chat Orchestrator validates the resolver scope and its bounded manifest-only
+projection. It does not list claims or fetch a request trace for acquisition
+history. Support explanations such as `How are you sure?` remain claim-record
+based and never call the acquisition-history resolver merely because a claim has
+a manifest link. Acquisition history remains available when governed evidence is
+enabled even if claim capture was disabled for the original answer.
 
-Successful acquisition explanations render only the retained bounded method,
-aggregate considered, selected, returned, delivered, omitted, unsuccessful, and
-truncation counts, declared-scope sufficiency, and non-universal coverage
-boundary. Targeted lookup is described as targeted rather than exhaustive.
-Exact fetch is limited to the supplied exact-reference scope. Coverage questions
-begin with a direct non-universal answer, and gap questions describe only
-recorded structural limitations plus the fact that unknown evidence outside the
-declared scope cannot be identified. Privacy-suppressed manifests use retained
-aggregate counts without reconstructing identifiers.
+Successful history explanations describe only retained aggregate structure.
+Targeted retrieval reports considered and selected source counts plus returned and
+reasoning-delivered item counts. Exact fetch reports specified-reference attempts
+and material outcomes. Hybrid comparison reports selected configured sources,
+bounded context-expansion outcomes, and returned and retained references without
+claiming every possible source was compared. Bounded exhaustive history describes
+completeness only within the declared configured scope; a sufficient coverage
+answer explicitly says that it does not establish universal coverage beyond that
+scope. Limited, insufficient, and unknown histories preserve their recorded
+qualification or withholding status. Privacy-suppressed manifests use retained
+aggregate counts without reconstructing identifiers. A targeted attempt followed
+by one authorized changed-premise exact fetch is described as those two bounded
+steps, not as an unbounded retry. Older manifests without next-step history remain
+compatible.
 
-This historical path performs no provider call, memory retrieval, DSA inventory
-or acquisition, Cognitive Runtime evidence planning, or new verification. It
-never exposes source IDs or references, source names or titles, content, URLs,
-prompts, credentials, model-call data, dependency exceptions, or hidden
-reasoning. Missing links, unavailable traces, mismatched records, malformed
-manifests, and ambiguous or missing targets return bounded degraded explanations
-instead of reconstructing history from model memory. It does not implement a
-combined explanation-and-recheck flow and never claims universal completeness.
+A pure historical explanation is provider-free and ends by stating that it did
+not perform a new verification. It performs no memory retrieval, source
+acquisition, runtime evidence planning, provider call, fallback call, or claim
+capture. Missing, ambiguous, invalid, malformed, or unavailable resolver outcomes
+produce deterministic bounded wording without exposing storage reason codes,
+identifiers, digests, target text, source details, prompts, credentials, provider
+text, exceptions, or hidden reasoning.
+
+The bounded history questions may be followed by exactly `Check again.` or
+`Verify again.`, including their exact quoted-target forms. In that compound mode,
+the historical lookup and the new check remain separate. Evidence planning receives
+the deterministic task `Verify this prior statement with a new evidence check:
+"<normalized first paragraph>"`, while the stored user message remains unchanged.
+The ordinary governed acquisition, prompt-budget, sufficiency, next-step, privacy,
+and answer-boundary controls then apply to the new check. Historical evidence is
+not reused as fresh evidence. A successful or limited result is labelled `Original
+acquisition:` and `New verification:`; an insufficient or unknown result uses `New
+verification attempt:` and remains provider-free; a check that cannot establish a
+governed acquisition result uses `New verification unavailable:`. Compound labels
+are policy-owned, the combined response is claim-capture-ineligible, and the
+existing one-additional-acquisition maximum is unchanged. No actual-service
+composed verification harness is added by this behavior.
 
 ## Integration boundaries
 
