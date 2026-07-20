@@ -8065,8 +8065,7 @@ async def orchestrate_chat(
                 answer=answer,
                 sources=answer_sources,
             )
-        answer = privacy_boundary.final_answer
-        answer = enforce_final_answer(answer, evidence_acquisition)
+        claim_candidate_answer = privacy_boundary.final_answer
         if privacy_boundary.enforced:
             answer_sources = []
             if brief_metadata.get("enabled") is True:
@@ -8088,7 +8087,7 @@ async def orchestrate_chat(
             runtime_available=runtime is not None,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            answer=answer,
+            answer=claim_candidate_answer,
             is_brief=brief_metadata.get("enabled") is True,
             pending_action_present=pending_action is not None,
             capability_requested=(
@@ -8127,6 +8126,10 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
             runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
         )
+        answer = enforce_final_answer(
+            claim_candidate_answer,
+            evidence_acquisition,
+        )
 
         assistant_message_ack = await memory_store.add_message(
             conversation_id=conversation_id,
@@ -8148,6 +8151,7 @@ async def orchestrate_chat(
         claim_capture = bind_acquisition_manifest(
             claim_capture,
             evidence_manifest,
+            final_answer=answer,
         )
         prompt.trace["claim_capture"] = claim_capture.trace
         prompt.trace["answer_persistence"] = {

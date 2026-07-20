@@ -11,7 +11,7 @@ from services.evidence_acquisition import (
     BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
     COMPARISON_SCOPE_SUFFIX,
     CONFIGURED_WORKSHEET_CONTEXT_MODE,
-    LIMITATION_SUFFIX,
+    EXHAUSTIVE_SCOPE_SUFFIX,
     TARGETED_SCOPE_SUFFIX,
     WITHHELD_ANSWER,
     DsaItem,
@@ -538,6 +538,67 @@ def _sufficiency_response(
             "user_safe_summary": "Bounded sufficiency.",
         },
     }
+
+
+def _rendering_state(
+    *,
+    task_shape="targeted_lookup",
+    status="sufficient_for_declared_scope",
+    evaluations=None,
+    limitation_codes=None,
+    inventory=None,
+    declared_scope=None,
+):
+    evaluations = evaluations or [
+        {
+            "requirement_id": "targeted-evidence",
+            "requirement_kind": "targeted_evidence",
+            "criticality": "material",
+            "effective_outcome": "satisfied",
+        }
+    ]
+    requirements = [
+        {
+            "requirement_id": evaluation["requirement_id"],
+            "requirement_kind": evaluation["requirement_kind"],
+            "criticality": evaluation["criticality"],
+        }
+        for evaluation in evaluations
+    ]
+    plan_data = _plan_response(
+        status=(
+            "ready_with_limitations"
+            if status == "sufficient_with_limitations"
+            else "ready"
+        ),
+        requirements=requirements,
+        limitations=limitation_codes or [],
+    )["result"]
+    plan_data["task_shape"] = task_shape
+    response = _sufficiency_response(
+        "evidence_manifest_0123456789abcdef0123456789abcdef",
+        status=status,
+        requirements=requirements,
+        task_shape=task_shape,
+    )["result"]
+    response["evaluated_requirements"] = evaluations
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status=status,
+        inventory=(
+            DsaSourceListResponse.model_validate(inventory)
+            if inventory is not None
+            else None
+        ),
+        declared_scope=declared_scope,
+        plan=PlanResult.model_validate(plan_data),
+        manifest_id="evidence_manifest_0123456789abcdef0123456789abcdef",
+        sufficiency=SufficiencyResult.model_validate(response),
+        forced_answer=(
+            WITHHELD_ANSWER if status in {"insufficient", "unknown"} else None
+        ),
+    )
 
 
 class FakeRuntime:
@@ -2836,7 +2897,7 @@ def test_hybrid_facts_manifest_identity_and_privacy_are_prompt_aware():
         assert prohibited not in serialized
 
 
-def test_comparison_scope_overclaim_boundary_is_bounded_and_idempotent():
+def test_comparison_scope_boundary_is_unconditional_and_idempotent():
     state = _hybrid_state()
     state.sufficiency = _sufficiency_response(
         state.manifest_id,
@@ -2848,7 +2909,7 @@ def test_comparison_scope_overclaim_boundary_is_bounded_and_idempotent():
     assert answer.endswith(COMPARISON_SCOPE_SUFFIX)
     assert enforce_final_answer(answer, state).count(COMPARISON_SCOPE_SUFFIX) == 1
     assert enforce_final_answer("The selected records differ.", state) == (
-        "The selected records differ."
+        f"The selected records differ.\n\n{COMPARISON_SCOPE_SUFFIX}"
     )
 
 
@@ -3454,7 +3515,7 @@ async def test_authoritative_exact_requirement_uses_only_authoritative_attempts(
 
 
 @pytest.mark.asyncio
-async def test_exact_optional_limitation_allows_one_bounded_disclosure():
+async def test_exact_optional_limitation_discloses_actual_scope_once():
     plan = _exact_plan_response(status="ready_with_limitations")
     plan["result"]["limitation_codes"] = ["optional_source_unavailable"]
     plan["result"]["declared_requirements"].append(
@@ -3498,8 +3559,12 @@ async def test_exact_optional_limitation_allows_one_bounded_disclosure():
     )
     answer = enforce_final_answer("The exact record gives the date.", state)
     assert provider_allowed(state) is True
-    assert answer.count(LIMITATION_SUFFIX) == 1
-    assert enforce_final_answer(answer, state).count(LIMITATION_SUFFIX) == 1
+    limitation = "Limitation: an optional selected source was not available."
+    assert answer == (
+        f"The exact record gives the date.\n\n{limitation}\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert enforce_final_answer(answer, state).count(limitation) == 1
 
 
 @pytest.mark.asyncio
@@ -3789,12 +3854,16 @@ async def test_optional_limitation_allows_provider_and_is_disclosed_once():
 
     assert provider_allowed(state) is True
     answer = enforce_final_answer("The record gives the date.", state)
-    assert answer.count(LIMITATION_SUFFIX) == 1
-    assert enforce_final_answer(answer, state).count(LIMITATION_SUFFIX) == 1
+    limitation = "Limitation: an optional selected source was not available."
+    assert answer == (
+        f"The record gives the date.\n\n{limitation}\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert enforce_final_answer(answer, state).count(limitation) == 1
 
 
 @pytest.mark.asyncio
-async def test_targeted_scope_overclaim_disclosure_is_bounded_and_idempotent():
+async def test_targeted_scope_boundary_is_unconditional_and_idempotent():
     runtime = FakeRuntime()
     state = await begin_evidence_acquisition(
         runtime=runtime,
@@ -3815,9 +3884,376 @@ async def test_targeted_scope_overclaim_disclosure_is_bounded_and_idempotent():
 
     ordinary = enforce_final_answer("The targeted record gives the date.", state)
     overclaim = enforce_final_answer("There is no record anywhere.", state)
-    assert ordinary == "The targeted record gives the date."
+    assert ordinary == (
+        f"The targeted record gives the date.\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
     assert overclaim.count(TARGETED_SCOPE_SUFFIX) == 1
     assert enforce_final_answer(overclaim, state).count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "boundary"),
+    [
+        ("targeted_lookup", TARGETED_SCOPE_SUFFIX),
+        ("cross_source_comparison", COMPARISON_SCOPE_SUFFIX),
+        ("bounded_exhaustive_review", EXHAUSTIVE_SCOPE_SUFFIX),
+    ],
+)
+def test_governed_success_boundaries_follow_task_shape_not_provider_text(
+    task_shape,
+    boundary,
+):
+    state = _rendering_state(task_shape=task_shape)
+
+    answer = enforce_final_answer("The checked record supports the result.", state)
+
+    assert answer == f"The checked record supports the result.\n\n{boundary}"
+    for other_boundary in {
+        TARGETED_SCOPE_SUFFIX,
+        COMPARISON_SCOPE_SUFFIX,
+        EXHAUSTIVE_SCOPE_SUFFIX,
+    } - {boundary}:
+        assert other_boundary not in answer
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Nothing material was left unchecked.",
+        "The implementation has no remaining omissions.",
+        "The evidence conclusively settles the issue.",
+        "The records account for the entire requirement set.",
+        "There are no unresolved gaps.",
+        "The checked entries support the result.",
+        "Review coverage settles the requested question without qualification.",
+    ],
+)
+def test_provider_paraphrases_cannot_avoid_exhaustive_scope_boundary(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="bounded_exhaustive_review")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{EXHAUSTIVE_SCOPE_SUFFIX}"
+
+
+def test_policy_paragraph_normalization_is_idempotent_and_shape_owned():
+    state = _rendering_state(task_shape="bounded_exhaustive_review")
+    provider_answer = (
+        f"The records support the result.\n\n{TARGETED_SCOPE_SUFFIX}\n\n"
+        f"{EXHAUSTIVE_SCOPE_SUFFIX}"
+    )
+
+    first = enforce_final_answer(provider_answer, state)
+    second = enforce_final_answer(first, state)
+
+    assert first == (
+        f"The records support the result.\n\n{EXHAUSTIVE_SCOPE_SUFFIX}"
+    )
+    assert second == first
+    assert first.count(EXHAUSTIVE_SCOPE_SUFFIX) == 1
+    assert TARGETED_SCOPE_SUFFIX not in first
+    assert COMPARISON_SCOPE_SUFFIX not in first
+
+
+@pytest.mark.parametrize(
+    ("unavailable_count", "expected"),
+    [
+        (1, "Limitation: 1 optional source was unavailable."),
+        (2, "Limitation: 2 optional sources were unavailable."),
+    ],
+)
+def test_optional_source_limitation_uses_trusted_scoped_inventory_count(
+    unavailable_count,
+    expected,
+):
+    source_ids = [f"source_{index}" for index in range(unavailable_count)]
+    state = _rendering_state(
+        status="sufficient_with_limitations",
+        evaluations=[
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+                "effective_outcome": "unavailable",
+            }
+        ],
+        limitation_codes=["optional_source_unavailable"],
+        inventory={
+            "sources": [
+                _source(source_id, status="unavailable")
+                for source_id in source_ids
+            ]
+        },
+        declared_scope={
+            "source_ids": source_ids,
+            "source_categories": [],
+        },
+    )
+
+    answer = enforce_final_answer("The available evidence supports the result.", state)
+
+    assert answer == (
+        f"The available evidence supports the result.\n\n{expected}\n\n"
+        f"{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert enforce_final_answer(answer, state) == answer
+
+
+@pytest.mark.parametrize(
+    ("limitation_code", "expected"),
+    [
+        (
+            "source_inventory_partial",
+            "the configured source inventory was partial, so optional source "
+            "coverage remains incomplete",
+        ),
+        (
+            "source_inventory_unknown",
+            "the completeness of the configured source inventory was unknown, so "
+            "optional source coverage could not be established",
+        ),
+        (
+            "source_inventory_unavailable",
+            "the configured source inventory was unavailable, so optional source "
+            "coverage could not be established",
+        ),
+    ],
+)
+def test_inventory_limitation_disclosure_is_specific(
+    limitation_code,
+    expected,
+):
+    state = _rendering_state(
+        status="sufficient_with_limitations",
+        evaluations=[
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+                "effective_outcome": "unknown",
+            }
+        ],
+        limitation_codes=[limitation_code],
+    )
+
+    answer = enforce_final_answer("Provider-controlled limitation text.", state)
+
+    assert f"Limitation: {expected}" in answer
+    assert "Provider-controlled limitation text." in answer
+    assert answer.endswith(TARGETED_SCOPE_SUFFIX)
+
+
+def test_multiple_optional_limitations_are_deduplicated_and_bounded():
+    state = _rendering_state(
+        status="sufficient_with_limitations",
+        evaluations=[
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+                "effective_outcome": "unavailable",
+            }
+        ],
+        limitation_codes=[
+            "authoritative_source_unavailable",
+            "optional_source_unavailable",
+            "source_inventory_partial",
+            "required_capability_unavailable",
+            "declared_category_not_available",
+        ],
+        inventory={
+            "sources": [_source("source_a", status="unavailable")],
+        },
+        declared_scope={"source_ids": ["source_a"], "source_categories": []},
+    )
+
+    first = enforce_final_answer(
+        "Limitation: provider-chosen qualification.\n\nThe result is bounded.",
+        state,
+    )
+    second = enforce_final_answer(first, state)
+
+    assert first == second
+    assert "provider-chosen qualification" not in first
+    assert first.count("1 optional source was unavailable") == 1
+    assert "Additional optional evidence limitations remained." in first
+    assert first.endswith(TARGETED_SCOPE_SUFFIX)
+
+
+@pytest.mark.parametrize(
+    ("requirement_kind", "expected"),
+    [
+        ("authoritative_inventory", "authoritative source inventory"),
+        ("targeted_evidence", "requested targeted evidence"),
+        ("exact_authoritative_fetch", "exact authoritative item"),
+        ("complete_scope_coverage", "complete declared source scope"),
+        ("selected_source_coverage", "coverage of every selected source"),
+        ("structured_absence_check", "absence-supporting check"),
+        ("contradiction_search", "required contradiction search"),
+        ("counterevidence_coverage", "counterevidence coverage"),
+        ("historical_scope", "required historical scope"),
+        ("historical_sequence_coverage", "historical sequence"),
+        ("candidate_evidence_coverage", "candidate evidence coverage"),
+        ("cross_source_comparison", "selected-source comparison"),
+        ("context_delivery", "reasoning context"),
+        ("no_material_truncation", "full delivery of the material evidence"),
+    ],
+)
+def test_every_requirement_kind_has_a_user_safe_gap_description(
+    requirement_kind,
+    expected,
+):
+    state = _rendering_state(
+        status="unknown",
+        evaluations=[
+            {
+                "requirement_id": f"requirement-{requirement_kind}",
+                "requirement_kind": requirement_kind,
+                "criticality": "material",
+                "effective_outcome": "unknown",
+            }
+        ],
+    )
+
+    answer = enforce_final_answer("PRIVATE PROVIDER ANSWER", state)
+
+    assert expected in answer
+    assert "PRIVATE PROVIDER ANSWER" not in answer
+    assert answer.endswith("I’m withholding the requested conclusion.")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "expected"),
+    [
+        ("partial", "insufficient", "only partially established"),
+        (
+            "not_attempted",
+            "insufficient",
+            "required acquisition was not attempted",
+        ),
+        ("failed", "insufficient", "acquisition failed"),
+        ("excluded", "insufficient", "required evidence was excluded"),
+        ("filtered", "insufficient", "filtered or omitted before reasoning"),
+        ("truncated", "insufficient", "material evidence was truncated"),
+        ("unsupported", "insufficient", "required acquisition was unsupported"),
+        ("unavailable", "insufficient", "required evidence scope was unavailable"),
+        ("unknown", "unknown", "could not be established"),
+        ("missing", "unknown", "required acquisition fact was missing"),
+        (
+            "unresolved_contradiction",
+            "insufficient",
+            "contradictory evidence remained unresolved",
+        ),
+    ],
+)
+def test_material_gap_wording_distinguishes_effective_outcomes(
+    outcome,
+    status,
+    expected,
+):
+    state = _rendering_state(
+        task_shape="bounded_exhaustive_review",
+        status=status,
+        evaluations=[
+            {
+                "requirement_id": "complete-scope-coverage",
+                "requirement_kind": "complete_scope_coverage",
+                "criticality": "material",
+                "effective_outcome": outcome,
+            }
+        ],
+    )
+
+    answer = enforce_final_answer("PRIVATE PROVIDER ANSWER", state)
+
+    assert expected in answer
+    assert "PRIVATE PROVIDER ANSWER" not in answer
+    assert answer.endswith("I’m withholding a complete-scope conclusion.")
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "withholding"),
+    [
+        (
+            "bounded_exhaustive_review",
+            "I’m withholding a complete-scope conclusion.",
+        ),
+        (
+            "absence_or_coverage_check",
+            "I’m withholding an absence conclusion.",
+        ),
+        (
+            "contradiction_review",
+            "I’m withholding a contradiction-sensitive conclusion.",
+        ),
+        (
+            "cross_source_comparison",
+            "I’m withholding the requested conclusion.",
+        ),
+    ],
+)
+def test_blocked_response_uses_task_specific_withholding(
+    task_shape,
+    withholding,
+):
+    state = _rendering_state(
+        task_shape=task_shape,
+        status="unknown",
+        evaluations=[
+            {
+                "requirement_id": "context-delivery",
+                "requirement_kind": "context_delivery",
+                "criticality": "material",
+                "effective_outcome": "unknown",
+            }
+        ],
+    )
+
+    answer = enforce_final_answer("PRIVATE PROVIDER ANSWER", state)
+
+    assert answer.endswith(withholding)
+    assert "PRIVATE PROVIDER ANSWER" not in answer
+
+
+def test_material_gap_rendering_is_bounded_deterministic_and_private():
+    evaluations = [
+        {
+            "requirement_id": f"requirement-{index}",
+            "requirement_kind": requirement_kind,
+            "criticality": "material",
+            "effective_outcome": "failed",
+        }
+        for index, requirement_kind in enumerate(
+            [
+                "targeted_evidence",
+                "context_delivery",
+                "contradiction_search",
+                "counterevidence_coverage",
+                "no_material_truncation",
+            ]
+        )
+    ]
+    state = _rendering_state(
+        task_shape="contradiction_review",
+        status="insufficient",
+        evaluations=evaluations,
+    )
+    provider_text = (
+        "PRIVATE SOURCE TEXT https://private.invalid credential=PRIVATE_SECRET"
+    )
+
+    first = enforce_final_answer(provider_text, state)
+    second = enforce_final_answer("DIFFERENT PROVIDER TEXT", state)
+
+    assert first == second
+    assert "Additional material evidence requirements were also unresolved." in first
+    assert "PRIVATE" not in first
+    assert "https://" not in first
+    assert first.endswith(
+        "I’m withholding a contradiction-sensitive conclusion."
+    )
 
 
 @pytest.mark.asyncio

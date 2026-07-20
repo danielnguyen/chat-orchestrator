@@ -16,11 +16,19 @@ from services.claim_explanation import (
 ANCHOR = "The retained file reports that the setting is active."
 OLDER_ANCHOR = "According to this document, the service is healthy."
 MANIFEST_ID = "evidence_manifest_0123456789abcdef0123456789abcdef"
+TARGETED_BOUNDARY = (
+    "This reflects only the targeted sources checked, not a complete search of "
+    "every possible source."
+)
 
 
 def _digest(value: str = ANCHOR) -> str:
     normalized = " ".join(value.split())
     return f"sha256:{hashlib.sha256(normalized.encode()).hexdigest()}"
+
+
+def _response_digest(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def _record(**overrides):
@@ -630,6 +638,27 @@ async def test_linked_claim_keeps_support_explanation_without_trace_lookup():
 
 
 @pytest.mark.asyncio
+async def test_latest_bounded_response_keeps_support_explanation_wording():
+    prior_response = f"{ANCHOR}\n\n{TARGETED_BOUNDARY}"
+    memory_store = _MemoryStore(
+        records=[_record(acquisition_manifest_id=MANIFEST_ID)],
+        trace_error=AssertionError("support explanation must not fetch the trace"),
+    )
+
+    outcome = await _resolve(
+        memory_store,
+        messages=_messages(prior=prior_response),
+    )
+
+    assert outcome.status == "ok"
+    assert outcome.answer.startswith("I based that earlier statement on")
+    assert outcome.answer.endswith(
+        "I did not perform a new verification for this explanation."
+    )
+    assert memory_store.trace_calls == []
+
+
+@pytest.mark.asyncio
 async def test_targeted_acquisition_explanation_is_exact_and_non_exhaustive():
     memory_store = _MemoryStore(
         records=[_record(acquisition_manifest_id=MANIFEST_ID)]
@@ -667,6 +696,117 @@ async def test_targeted_acquisition_explanation_is_exact_and_non_exhaustive():
         "PRIVATE-MODEL-CALL",
     ):
         assert prohibited not in serialized
+
+
+@pytest.mark.asyncio
+async def test_latest_bounded_acquisition_response_validates_full_digest_and_claim():
+    prior_response = f"{ANCHOR}\n\n{TARGETED_BOUNDARY}"
+    manifest = _manifest(response_digest=_response_digest(prior_response))
+    memory_store = _MemoryStore(
+        records=[_record(acquisition_manifest_id=MANIFEST_ID)],
+        trace=_trace(manifest=manifest),
+    )
+
+    outcome = await _resolve(
+        memory_store,
+        messages=_messages(
+            prior=prior_response,
+            follow_up="What did you check?",
+        ),
+    )
+
+    assert outcome.status == "ok"
+    assert outcome.answer == (
+        "For that earlier answer, the retained record shows a targeted lookup. It "
+        "considered 2 configured sources, selected 2, returned 2 items, and delivered "
+        "2 to reasoning. The recorded evidence was sufficient for the declared "
+        "targeted scope. This was not an exhaustive review of every potentially "
+        "relevant source. I did not perform a new verification for this explanation."
+    )
+    assert manifest["response_digest"] == _response_digest(prior_response)
+    assert manifest["response_digest"] != _digest(ANCHOR)
+    assert memory_store.calls == [
+        {"owner_id": "owner", "conversation_id": "conversation-1", "limit": 20}
+    ]
+    assert memory_store.trace_calls == ["request-1"]
+    serialized = repr(outcome)
+    assert prior_response not in serialized
+    assert manifest["response_digest"] not in serialized
+    assert MANIFEST_ID not in serialized
+
+
+@pytest.mark.asyncio
+async def test_latest_bounded_acquisition_rejects_wrong_full_response_digest():
+    prior_response = f"{ANCHOR}\n\n{TARGETED_BOUNDARY}"
+    manifest = _manifest(response_digest=_response_digest(ANCHOR))
+
+    outcome = await _resolve(
+        _MemoryStore(
+            records=[_record(acquisition_manifest_id=MANIFEST_ID)],
+            trace=_trace(manifest=manifest),
+        ),
+        messages=_messages(
+            prior=prior_response,
+            follow_up="What did you check?",
+        ),
+    )
+
+    assert outcome.status == "degraded"
+    assert outcome.trace["reason_code"] == "acquisition_manifest_invalid"
+    assert outcome.trace["provider_call_count"] == 0
+    assert prior_response not in repr(outcome)
+    assert manifest["response_digest"] not in repr(outcome)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prior_response", "reason_code"),
+    [
+        (
+            (
+                "The retained file reports that a different setting is active.\n\n"
+                f"{TARGETED_BOUNDARY}"
+            ),
+            "no_record_for_latest_response",
+        ),
+        (f"This answer is limited.\n\n{ANCHOR}", "no_record_for_latest_response"),
+        (f"# Result\n\n{ANCHOR}", "no_record_for_latest_response"),
+        (f"- Summary\n\n{ANCHOR}", "no_record_for_latest_response"),
+        (f"\n\n{ANCHOR}", "prior_assistant_unavailable"),
+        (
+            "The retained file includes this claim: "
+            f"{ANCHOR}",
+            "no_record_for_latest_response",
+        ),
+        (
+            "The retained file indicates that the setting is active.",
+            "no_record_for_latest_response",
+        ),
+    ],
+)
+async def test_latest_response_requires_exact_claim_as_first_paragraph(
+    prior_response,
+    reason_code,
+):
+    manifest = _manifest(response_digest=_response_digest(prior_response))
+    memory_store = _MemoryStore(
+        records=[_record(acquisition_manifest_id=MANIFEST_ID)],
+        trace=_trace(manifest=manifest),
+    )
+
+    outcome = await _resolve(
+        memory_store,
+        messages=_messages(
+            prior=prior_response,
+            follow_up="What did you check?",
+        ),
+    )
+
+    assert outcome.status == "degraded"
+    assert outcome.trace["reason_code"] == reason_code
+    assert memory_store.trace_calls == []
+    assert prior_response not in repr(outcome)
+    assert manifest["response_digest"] not in repr(outcome)
 
 
 @pytest.mark.asyncio
@@ -871,6 +1011,7 @@ async def test_missing_link_and_trace_dependency_failure_are_honest():
         "manifest_id_mismatch",
         "assistant_mismatch",
         "digest_mismatch",
+        "digest_malformed",
         "not_attempted",
         "plan_missing",
         "plan_not_ready",
@@ -911,6 +1052,8 @@ async def test_acquisition_trace_association_failures_are_bounded(mutation):
             manifest["assistant_message_id"] = "assistant-other"
         elif mutation == "digest_mismatch":
             manifest["response_digest"] = "sha256:" + ("0" * 64)
+        elif mutation == "digest_malformed":
+            manifest["response_digest"] = "sha256:not-a-digest"
         elif mutation == "not_attempted":
             manifest["attempted"] = False
         elif mutation == "plan_missing":
@@ -1116,7 +1259,9 @@ async def test_quoted_acquisition_target_resolves_only_one_exact_older_record():
     )
     older_manifest = _manifest(
         assistant_message_id="assistant-old",
-        response_digest=_digest(OLDER_ANCHOR),
+        response_digest=_response_digest(
+            f"{OLDER_ANCHOR}\n\nHistorical response content is not fetched."
+        ),
     )
     trace = _trace(
         manifest=older_manifest,
@@ -1138,6 +1283,9 @@ async def test_quoted_acquisition_target_resolves_only_one_exact_older_record():
     assert outcome.trace["target_mode"] == "quoted_anchor"
     assert outcome.trace["reason_code"] == "quoted_acquisition_record_resolved"
     assert memory_store.trace_calls == ["request-1"]
+    assert memory_store.calls == [
+        {"owner_id": "owner", "conversation_id": "conversation-1", "limit": 20}
+    ]
     assert OLDER_ANCHOR not in outcome.answer
 
 
