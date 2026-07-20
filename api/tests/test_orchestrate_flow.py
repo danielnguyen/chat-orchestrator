@@ -16647,6 +16647,216 @@ async def test_orchestrate_compound_acquisition_recheck_uses_ordinary_provider_p
     assert memory_store.trace_get_calls == []
 
 
+async def _run_compound_provider_boundary_case(
+    tmp_path,
+    *,
+    provider_content,
+    request_id,
+    limited=False,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id=f"{request_id}-original",
+    )
+    target = first["answer"].split("\n\n", 1)[0]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    if limited:
+        runtime.evidence_plan_response = _targeted_plan_response(
+            request_id=request_id,
+            question=task_text,
+            status="ready_with_limitations",
+            optional=True,
+            eligible_source_ids=["vehicle_log_primary"],
+        )
+    else:
+        runtime.evidence_plan_response = None
+    original_manifest = copy.deepcopy(
+        memory_store.traces_by_request_id[f"{request_id}-original"]["prompt"][
+            "evidence_acquisition"
+        ]
+    )
+    runtime_counts = {
+        "shape": len(runtime.evidence_shape_calls),
+        "plan": len(runtime.evidence_plan_calls),
+        "sufficiency": len(runtime.evidence_sufficiency_calls),
+        "next_step": len(runtime.evidence_next_step_calls),
+        "claim_calibration": len(runtime.claim_calibration_calls),
+    }
+    dsa = FakeDSA(response=_governed_context_pack(task_text))
+    provider = FakeLiteLLM(content=provider_content)
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What did you check? Check again.",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What did you check? Check again."},
+            ],
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    return {
+        "result": result,
+        "trace": trace,
+        "provider": provider,
+        "dsa": dsa,
+        "runtime": runtime,
+        "runtime_counts": runtime_counts,
+        "memory_store": memory_store,
+        "original_manifest": original_manifest,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_content", "case_id"),
+    [
+        ("Original acquisition:\nPRIVATE-LABEL-CONTENT", "original"),
+        ("New verification:\nPRIVATE-LABEL-CONTENT", "verification"),
+        ("New verification attempt:\nPRIVATE-LABEL-CONTENT", "attempt"),
+        ("New verification unavailable:\nPRIVATE-LABEL-CONTENT", "unavailable"),
+        ("## Original acquisition:\nPRIVATE-LABEL-CONTENT", "heading"),
+        ("**New verification:**\nPRIVATE-LABEL-CONTENT", "emphasis"),
+        ("- New verification attempt:\nPRIVATE-LABEL-CONTENT", "bullet"),
+        ("new verification unavailable:\nPRIVATE-LABEL-CONTENT", "lowercase"),
+        (
+            "I did not perform a new verification for this explanation.\n"
+            "PRIVATE-LABEL-CONTENT",
+            "historical-explanation",
+        ),
+        (
+            "I did not perform a new verification.\nPRIVATE-LABEL-CONTENT",
+            "historical-short",
+        ),
+        (
+            "No new verification was performed.\nPRIVATE-LABEL-CONTENT",
+            "historical-passive",
+        ),
+        (
+            "  i DID   not perform a NEW verification.  \nPRIVATE-LABEL-CONTENT",
+            "historical-normalized",
+        ),
+    ],
+)
+async def test_orchestrate_compound_policy_label_boundary_fails_closed(
+    tmp_path,
+    provider_content,
+    case_id,
+):
+    outcome = await _run_compound_provider_boundary_case(
+        tmp_path,
+        provider_content=provider_content,
+        request_id=f"request-compound-policy-label-{case_id}",
+    )
+    result = outcome["result"]
+    trace = outcome["trace"]
+    expected_replacement = (
+        "The governed new evidence check completed, but I withheld the generated "
+        "explanation because it conflicted with the verification response boundary."
+    )
+
+    assert result["status"] == "degraded"
+    assert result["answer"].count("Original acquisition:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert "New verification attempt:" not in result["answer"]
+    assert "New verification unavailable:" not in result["answer"]
+    assert result["answer"].endswith(f"New verification:\n{expected_replacement}")
+    assert "PRIVATE-LABEL-CONTENT" not in result["answer"]
+    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["dsa"].calls) == 1
+    assert outcome["dsa"].fetch_calls == []
+    assert outcome["memory_store"].claim_record_calls == []
+    assert len(outcome["runtime"].evidence_shape_calls) == (
+        outcome["runtime_counts"]["shape"] + 1
+    )
+    assert len(outcome["runtime"].evidence_plan_calls) == (
+        outcome["runtime_counts"]["plan"] + 1
+    )
+    assert len(outcome["runtime"].evidence_sufficiency_calls) == (
+        outcome["runtime_counts"]["sufficiency"] + 1
+    )
+    assert len(outcome["runtime"].evidence_next_step_calls) == (
+        outcome["runtime_counts"]["next_step"] + 1
+    )
+    assert len(outcome["runtime"].claim_calibration_calls) == outcome[
+        "runtime_counts"
+    ]["claim_calibration"]
+    final_manifest = trace["prompt"]["evidence_acquisition"]
+    assert final_manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
+    )
+    assert final_manifest != outcome["original_manifest"]
+    assert "PRIVATE-LABEL-CONTENT" not in json.dumps(trace, sort_keys=True)
+    assert trace["fallback"]["triggered"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_content",
+    [
+        "The original acquisition was narrower than the new evidence check.",
+        "This new verification supports the statement within the declared scope.",
+        "The verification attempt used the configured sources.",
+    ],
+)
+async def test_orchestrate_compound_policy_label_boundary_allows_inline_prose(
+    tmp_path,
+    provider_content,
+):
+    outcome = await _run_compound_provider_boundary_case(
+        tmp_path,
+        provider_content=provider_content,
+        request_id="request-compound-policy-label-inline",
+    )
+    result = outcome["result"]
+    assert result["status"] == "ok"
+    assert provider_content in result["answer"]
+    assert result["answer"].count("Original acquisition:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["dsa"].calls) == 1
+    assert outcome["memory_store"].claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_compound_limited_policy_label_boundary_fails_closed(
+    tmp_path,
+):
+    outcome = await _run_compound_provider_boundary_case(
+        tmp_path,
+        provider_content="New verification:\nPRIVATE-LIMITED-LABEL-CONTENT",
+        request_id="request-compound-policy-label-limited",
+        limited=True,
+    )
+    result = outcome["result"]
+    assert result["status"] == "degraded"
+    assert result["answer"].count("Original acquisition:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert "PRIVATE-LIMITED-LABEL-CONTENT" not in result["answer"]
+    assert "Limitation:" not in result["answer"]
+    assert "verification response boundary" in result["answer"]
+    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["dsa"].calls) == 1
+    assert outcome["memory_store"].claim_record_calls == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recheck", ["Check again.", "Verify again."])
 async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verification(

@@ -252,6 +252,26 @@ class MandatoryRetrievalPolicy:
 
 SAFE_POLICY_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 SAFE_SCOPE_ID = re.compile(r"^[A-Za-z0-9_.:/@-]{1,160}$")
+_COMPOUND_POLICY_LABELS = frozenset(
+    {
+        "original acquisition",
+        "new verification",
+        "new verification attempt",
+        "new verification unavailable",
+    }
+)
+_COMPOUND_HISTORICAL_ONLY_STATEMENTS = frozenset(
+    {
+        "i did not perform a new verification for this explanation.",
+        "i did not perform a new verification.",
+        "no new verification was performed.",
+    }
+)
+_COMPOUND_MARKDOWN_LINE_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
+_COMPOUND_VERIFICATION_BOUNDARY_ANSWER = (
+    "The governed new evidence check completed, but I withheld the generated "
+    "explanation because it conflicted with the verification response boundary."
+)
 ARTIFACT_CONTENT_CLASSES = {
     "document",
     "code",
@@ -336,6 +356,31 @@ RETRIEVAL_DEBUG_STATUSES = {
     "malformed",
     "suppressed",
 }
+
+
+def _compound_provider_answer_conflicts_with_policy_labels(answer: str) -> bool:
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized_statement = " ".join(line.split()).casefold()
+        if normalized_statement in _COMPOUND_HISTORICAL_ONLY_STATEMENTS:
+            return True
+
+        label_line = line
+        for _ in range(2):
+            match = _COMPOUND_MARKDOWN_LINE_PREFIX.match(label_line)
+            if match is None:
+                break
+            label_line = label_line[match.end() :].lstrip()
+        if label_line.startswith(("**", "__")):
+            label_line = label_line[2:].lstrip()
+        label, separator, _ = label_line.partition(":")
+        if separator and label.strip().casefold() in _COMPOUND_POLICY_LABELS:
+            return True
+    return False
+
+
 RETRIEVAL_DEBUG_REASONS = {
     "fallback_provider_used",
     "mandatory_result_boundary_failed_closed",
@@ -8490,7 +8535,11 @@ async def orchestrate_chat(
                 }
             ):
                 verification_label = "New verification"
-                verification_answer = answer
+                if _compound_provider_answer_conflicts_with_policy_labels(answer):
+                    verification_answer = _COMPOUND_VERIFICATION_BOUNDARY_ANSWER
+                    status = "degraded"
+                else:
+                    verification_answer = answer
             elif (
                 compound_governed_acquisition_established
                 and sufficiency_status in {"insufficient", "unknown"}
