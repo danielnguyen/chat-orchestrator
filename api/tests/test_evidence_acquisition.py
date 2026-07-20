@@ -4821,6 +4821,207 @@ def test_strict_next_step_model_rejects_contradictory_results(updates):
         NextStepResult.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "guard",
+    ["unchanged_premise_blocked", "premise_already_attempted"],
+)
+def test_guarded_qualified_partial_next_step_is_valid(guard):
+    state = _next_step_test_state()
+    payload = _next_step_result_payload(
+        state,
+        selected_next_step="provide_qualified_partial_answer",
+        conclusion_disposition="qualified_partial_only",
+        provider_disposition="allowed",
+        reacquisition_guard=guard,
+        proposed_premise_digest="sha256:" + ("1" * 64),
+    )
+    payload["reason_codes"] = [
+        (
+            "unchanged_acquisition_premise"
+            if guard == "unchanged_premise_blocked"
+            else "acquisition_premise_already_selected"
+        ),
+        "substantive_partial_evidence_available",
+    ]
+
+    result = NextStepResult.model_validate(payload)
+
+    assert result.selected_next_step == "provide_qualified_partial_answer"
+    assert result.provider_disposition == "allowed"
+    assert result.conclusion_disposition == "qualified_partial_only"
+    assert result.reacquisition_guard == guard
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"selected_next_step": "perform_additional_acquisition"},
+        {"proposed_premise_digest": None},
+        {"sufficiency_status": "sufficient_for_declared_scope"},
+        {"sufficiency_status": "sufficient_with_limitations"},
+    ],
+)
+@pytest.mark.parametrize(
+    "guard",
+    ["unchanged_premise_blocked", "premise_already_attempted"],
+)
+def test_blocked_reacquisition_guards_reject_invalid_acquisition_state(
+    guard,
+    updates,
+):
+    state = _next_step_test_state()
+    payload = _next_step_result_payload(
+        state,
+        selected_next_step="provide_qualified_partial_answer",
+        conclusion_disposition="qualified_partial_only",
+        provider_disposition="allowed",
+        reacquisition_guard=guard,
+        proposed_premise_digest="sha256:" + ("1" * 64),
+    )
+    payload.update(updates)
+
+    with pytest.raises(ValidationError):
+        NextStepResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "selected_next_step,conclusion_disposition,provider_disposition",
+    [
+        (
+            "provide_qualified_partial_answer",
+            "requested_conclusion_withheld",
+            "blocked",
+        ),
+        (
+            "disclose_unexamined_scope",
+            "qualified_partial_only",
+            "allowed",
+        ),
+        (
+            "withhold_unsupported_conclusion",
+            "qualified_partial_only",
+            "allowed",
+        ),
+    ],
+)
+def test_guarded_fallback_keeps_step_specific_disposition_validation(
+    selected_next_step,
+    conclusion_disposition,
+    provider_disposition,
+):
+    state = _next_step_test_state()
+    payload = _next_step_result_payload(
+        state,
+        selected_next_step=selected_next_step,
+        conclusion_disposition=conclusion_disposition,
+        provider_disposition=provider_disposition,
+        reacquisition_guard="unchanged_premise_blocked",
+        proposed_premise_digest="sha256:" + ("1" * 64),
+    )
+
+    with pytest.raises(ValidationError):
+        NextStepResult.model_validate(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guard,guard_reason",
+    [
+        ("unchanged_premise_blocked", "unchanged_acquisition_premise"),
+        (
+            "premise_already_attempted",
+            "acquisition_premise_already_selected",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "sufficiency_status,outcomes",
+    [
+        (
+            "insufficient",
+            {
+                "targeted_evidence": "partial",
+                "context_delivery": "satisfied",
+            },
+        ),
+        (
+            "unknown",
+            {
+                "targeted_evidence": "satisfied",
+                "context_delivery": "unknown",
+            },
+        ),
+    ],
+)
+async def test_guarded_partial_selection_is_recorded_and_provider_free(
+    guard,
+    guard_reason,
+    sufficiency_status,
+    outcomes,
+):
+    state = _next_step_test_state(
+        sufficiency_status=sufficiency_status,
+        outcomes=outcomes,
+    )
+
+    class ProposalRuntime:
+        async def compile_evidence_plan(self, **kwargs):
+            return _exact_plan_response()
+
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=ProposalRuntime(),
+        context_pack={
+            "items": [
+                {
+                    "source_id": "source_a",
+                    "source_ref": "source_a:record_1",
+                }
+            ]
+        },
+        **SCOPE,
+    )
+    assert proposal is not None
+
+    class SelectionRuntime:
+        async def select_evidence_next_step(self, **kwargs):
+            result = _next_step_result_payload(
+                state,
+                selected_next_step="provide_qualified_partial_answer",
+                conclusion_disposition="qualified_partial_only",
+                provider_disposition="allowed",
+                reacquisition_guard=guard,
+                proposed_premise_digest=_acquisition_premise_digest(
+                    proposal.premise
+                ),
+            )
+            result["reason_codes"] = [
+                guard_reason,
+                "substantive_partial_evidence_available",
+            ]
+            return {**SCOPE, "result": result}
+
+    result = await select_evidence_next_step(
+        state=state,
+        runtime=SelectionRuntime(),
+        proposal=proposal,
+        **SCOPE,
+    )
+
+    assert result is not None
+    assert result.reacquisition_guard == guard
+    assert state.status == sufficiency_status
+    assert state.next_step_failure is None
+    assert state.next_step_history[0]["reacquisition_guard"] == guard
+    assert provider_allowed(state) is False
+    answer = enforce_final_answer("PRIVATE PROVIDER ANSWER", state)
+    assert answer.startswith(
+        "The available evidence establishes the requested targeted evidence"
+    )
+    assert "PRIVATE PROVIDER ANSWER" not in answer
+    assert answer.endswith("I’m withholding the requested conclusion.")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["provider_selected_target", "missing_local_proposal"])
 async def test_next_step_selection_rejects_untrusted_follow_up(case):

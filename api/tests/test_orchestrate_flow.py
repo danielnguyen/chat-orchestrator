@@ -13065,6 +13065,124 @@ async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guard,reason_code",
+    [
+        ("unchanged_premise_blocked", "unchanged_acquisition_premise"),
+        (
+            "premise_already_attempted",
+            "acquisition_premise_already_selected",
+        ),
+    ],
+)
+async def test_evidence_next_step_guarded_partial_is_provider_and_fetch_free(
+    tmp_path,
+    monkeypatch,
+    guard,
+    reason_code,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+
+    def guarded_partial(call):
+        return _next_step_response_from_call(
+            call,
+            status="insufficient",
+            selected_next_step="provide_qualified_partial_answer",
+            conclusion_disposition="qualified_partial_only",
+            provider_disposition="allowed",
+            reacquisition_guard=guard,
+            reason_codes=[
+                reason_code,
+                "substantive_partial_evidence_available",
+            ],
+        )
+
+    runtime = FakeRuntime(evidence_next_step_response=guarded_partial)
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        fetch_responses=[
+            _exact_fetch_response(
+                source_ref="vehicle_log_primary:record_1",
+            )
+        ],
+    )
+    dsa.source_response["sources"][0]["capabilities"] = [
+        "profile",
+        "search",
+        "fetch",
+    ]
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER CONCLUSION")
+    memory_store = FakeMemoryStore()
+    original_assemble_prompt = orchestrate_service.assemble_prompt
+
+    def filtered_assemble_prompt(**kwargs):
+        prompt = original_assemble_prompt(**kwargs)
+        trace = copy.deepcopy(prompt.trace)
+        for layer in trace["layers"]:
+            if layer.get("name") == "external_source_context":
+                layer["included"] = False
+                layer["message_count"] = 0
+                layer["metadata"]["source_refs"] = []
+        return replace(
+            prompt,
+            messages=[
+                message
+                for message in prompt.messages
+                if "External source context:" not in message["content"]
+            ],
+            trace=trace,
+        )
+
+    monkeypatch.setattr(
+        orchestrate_service,
+        "assemble_prompt",
+        filtered_assemble_prompt,
+    )
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-evidence-next-step-partial-{guard}",
+    )
+
+    assert out["answer"].startswith(
+        "The available evidence establishes the requested targeted evidence."
+    )
+    assert "reasoning context" in out["answer"]
+    assert out["answer"].endswith(
+        "I’m withholding the requested conclusion."
+    )
+    assert "PRIVATE PROVIDER CONCLUSION" not in out["answer"]
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert runtime.evidence_next_step_calls[0][
+        "proposed_acquisition_premise"
+    ] is not None
+    assert dsa.fetch_calls == []
+    assert litellm.calls == []
+    assert memory_store.claim_record_calls == []
+    next_steps = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["next_steps"]
+    assert next_steps["additional_acquisition_count"] == 0
+    assert next_steps["selections"][0]["selected_next_step"] == (
+        "provide_qualified_partial_answer"
+    )
+    assert next_steps["selections"][0]["reacquisition_guard"] == guard
+
+
+@pytest.mark.asyncio
 async def test_evidence_next_step_deterministic_partial_remains_provider_free(
     tmp_path,
     monkeypatch,

@@ -702,12 +702,10 @@ class NextStepResult(StrictModel):
             in {"unchanged_premise_blocked", "premise_already_attempted"}
         ):
             if (
-                self.selected_next_step
-                == "perform_additional_acquisition"
+                self.sufficiency_status not in {"insufficient", "unknown"}
                 or self.proposed_premise_digest is None
-                or self.provider_disposition != "blocked"
-                or self.conclusion_disposition
-                != "requested_conclusion_withheld"
+                or self.selected_next_step
+                == "perform_additional_acquisition"
             ):
                 raise ValueError("invalid_blocked_reacquisition")
         return self
