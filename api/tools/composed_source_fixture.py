@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class SourceState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = Field(pattern=r"^(ready|unavailable|empty)$")
+    mode: str = Field(pattern=r"^(ready|unavailable|empty|malformed)$")
 
 
 fixture_app = FastAPI(title="Deterministic composed-smoke source fixture")
@@ -31,9 +31,35 @@ _GOOGLE_VALUES: dict[str, list[list[str]]] = {
     ],
     "complete-sheet": [
         ["Entry", "Required", "Status"],
-        ["alpha", "yes", "reviewed"],
-        ["beta", "yes", "reviewed"],
-        ["gamma", "yes", "reviewed"],
+        [
+            "alpha",
+            "yes",
+            "reviewed " + "bounded configured detail. " * 100,
+        ],
+        [
+            "beta",
+            "yes",
+            "reviewed " + "bounded configured detail. " * 100,
+        ],
+        [
+            "gamma",
+            "yes",
+            "reviewed " + "bounded configured detail. " * 100,
+        ],
+    ],
+    "followup-sheet": [
+        ["Record", "Status", "Notes"],
+        *[
+            [
+                f"follow-up-{index}",
+                "ready",
+                (
+                    f"Bounded follow-up detail {index}. "
+                    + "Deterministic supporting context. " * 36
+                ),
+            ]
+            for index in range(1, 9)
+        ],
     ],
 }
 
@@ -104,6 +130,8 @@ async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, 
     mode = _source_modes.get(spreadsheet_id, "ready")
     if mode == "unavailable":
         raise HTTPException(status_code=503, detail="source unavailable")
+    if mode == "malformed":
+        return {"values": {"invalid": "PRIVATE MALFORMED CELL SENTINEL"}}
     values = [] if mode == "empty" else _GOOGLE_VALUES.get(spreadsheet_id)
     if values is None:
         raise HTTPException(status_code=404, detail="source not found")

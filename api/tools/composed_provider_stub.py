@@ -14,6 +14,7 @@ _fail_primary: set[str] = set()
 _primary_failed: set[str] = set()
 _fail_next_primary = False
 _watched_sentinels: dict[str, str] = {}
+_next_answers: list[str] = []
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
@@ -113,7 +114,9 @@ async def chat_completions(
             }
         )
         raise HTTPException(status_code=503, detail="primary failure fixture")
-    if latest_user_text.strip() == "What does the retained file report about the setting?":
+    if _next_answers:
+        answer = _next_answers.pop(0)
+    elif latest_user_text.strip() == "What does the retained file report about the setting?":
         answer = "The retained file reports that the setting is active."
     elif has_current and "Current plan is Alpha." in prompt_text:
         answer = "Current plan is Alpha."
@@ -197,6 +200,7 @@ async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
         _fail_primary.clear()
         _primary_failed.clear()
         _watched_sentinels.clear()
+        _next_answers.clear()
         _fail_next_primary = False
     return {"status": "ok"}
 
@@ -224,6 +228,15 @@ async def fixture_sentinels(body: dict[str, Any]) -> dict[str, Any]:
             if isinstance(name, str) and isinstance(sentinel, str) and name and sentinel:
                 _watched_sentinels[name[:80]] = sentinel[:240]
     return {"status": "ok", "count": len(_watched_sentinels)}
+
+
+@app.post("/fixture/next-answer")
+async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
+    answer = body.get("answer")
+    if not isinstance(answer, str) or not answer or len(answer) > 2_000:
+        raise HTTPException(status_code=422, detail="invalid fixture answer")
+    _next_answers.append(answer)
+    return {"status": "ok", "queued": len(_next_answers)}
 
 
 def _embedding_vector(value: Any) -> list[float]:
