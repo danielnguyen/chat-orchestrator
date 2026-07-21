@@ -16,7 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class SourceState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = Field(pattern=r"^(ready|unavailable|empty|malformed)$")
+    mode: str = Field(
+        pattern=r"^(ready|unavailable|unavailable_after_first|empty|large|malformed)$"
+    )
 
 
 fixture_app = FastAPI(title="Deterministic composed-smoke source fixture")
@@ -135,6 +137,10 @@ async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, 
     values = [] if mode == "empty" else _GOOGLE_VALUES.get(spreadsheet_id)
     if values is None:
         raise HTTPException(status_code=404, detail="source not found")
+    if mode == "large" and spreadsheet_id == "complete-sheet":
+        values = deepcopy(values)
+        for row in values[1:]:
+            row[2] = "reviewed " + "bounded configured detail. " * 130
     return {"values": deepcopy(values)}
 
 
@@ -142,7 +148,9 @@ async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, 
 async def ics_values(source_name: str) -> Response:
     _record_call(source_name, "ics_get")
     mode = _source_modes.get(source_name, "ready")
-    if mode == "unavailable":
+    if mode == "unavailable" or (
+        mode == "unavailable_after_first" and len(_calls[source_name]) > 1
+    ):
         raise HTTPException(status_code=503, detail="source unavailable")
     value = "" if mode == "empty" else _ICS_VALUES.get(source_name)
     if value is None:

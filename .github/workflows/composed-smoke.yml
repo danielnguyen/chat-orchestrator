@@ -1,0 +1,82 @@
+name: Evidence acquisition composed smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - docker-compose.composed-smoke.yml
+      - scripts/composed_smoke.sh
+      - scripts/evidence_acquisition_composed.sh
+      - api/tools/composed_provider_stub.py
+      - api/tools/composed_source_fixture.py
+      - docs/validation.md
+      - .github/workflows/composed-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  composed-smoke:
+    name: actual-service-evidence-acquisition
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout Chat Orchestrator
+        uses: actions/checkout@v4
+        with:
+          path: chat-orchestrator
+          fetch-depth: 0
+
+      - name: Checkout Cognitive Runtime
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/cognitive-runtime
+          ref: d814a0d2789269383e81db037d464cf821c6502d
+          path: cognitive-runtime
+          fetch-depth: 0
+
+      - name: Checkout Data Source Aggregator
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/data-source-aggregator
+          ref: 2d01f4f6e2909bb2776f563f5e34c547467ab86c
+          path: data-source-aggregator
+          fetch-depth: 0
+
+      - name: Checkout Basic Memory Store
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/basic-memory-store
+          ref: 774a49882729ab3d06b88c5b2eff79cfe5ce54e7
+          path: basic-memory-store
+          fetch-depth: 0
+
+      - name: Establish pinned local main refs
+        run: |
+          git -C cognitive-runtime branch --force main d814a0d2789269383e81db037d464cf821c6502d
+          git -C data-source-aggregator branch --force main 2d01f4f6e2909bb2776f563f5e34c547467ab86c
+          git -C basic-memory-store branch --force main 774a49882729ab3d06b88c5b2eff79cfe5ce54e7
+
+      - name: Validate Compose configuration
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_TMP: /tmp/chat-orchestrator-composed-config
+        run: docker compose -f docker-compose.composed-smoke.yml config >/dev/null
+
+      - name: Run focused actual-service evidence proof
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+          EVIDENCE_ACQUISITION_ONLY: "1"
+        run: make composed-smoke
+
+      - name: Upload bounded failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-composed-smoke-diagnostics
+          path: /tmp/chat-orchestrator-bounded-logs
+          if-no-files-found: ignore
+          retention-days: 3

@@ -45,16 +45,27 @@ git -C "$ROOT" merge-base --is-ancestor "$CO_COMMIT" HEAD || {
   exit 2
 }
 
+docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
+
 COMPOSED_SMOKE_TMP="$(mktemp -d /tmp/chat-orchestrator-composed-smoke.XXXXXX)"
 export COMPOSED_SMOKE_TMP
 evidence_prepare_fixture_config
 
 cleanup() {
+  local status="$?"
+  if [ "$status" -ne 0 ] && [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    docker compose -f "$COMPOSE" ps --format json \
+      >"$COMPOSED_SMOKE_LOG_DIR/service-status.jsonl" 2>/dev/null || true
+    docker compose -f "$COMPOSE" logs --no-color --tail=300 2>/dev/null \
+      | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+' \
+      >"$COMPOSED_SMOKE_LOG_DIR/bounded-service.log" || true
+  fi
   docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$COMPOSED_SMOKE_TMP"
+  return "$status"
 }
 trap cleanup EXIT
-cleanup
 
 docker compose -f "$COMPOSE" up -d --build --wait
 
