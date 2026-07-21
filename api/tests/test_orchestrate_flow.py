@@ -2,6 +2,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 from dataclasses import replace
 
 import httpx
@@ -15498,6 +15499,7 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
         self.trace_error = trace_error
         self.claim_record_list_calls = []
         self.trace_get_calls = []
+        self.acquisition_history_calls = []
         self.traces_by_request_id = {}
 
     async def create_trace(self, **kwargs):
@@ -15523,6 +15525,130 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
         if self.trace_error is not None:
             raise self.trace_error
         return copy.deepcopy(self.traces_by_request_id[request_id])
+
+    async def resolve_acquisition_history(self, **kwargs):
+        self.acquisition_history_calls.append(copy.deepcopy(kwargs))
+        if self.trace_error is not None:
+            raise self.trace_error
+        assistants = [
+            message
+            for message in self.added_messages
+            if message.get("role") == "assistant"
+            and message.get("conversation_id") == kwargs["conversation_id"]
+            and message.get("owner_id") == kwargs["owner_id"]
+        ]
+        target = kwargs["normalized_first_paragraph"]
+        if kwargs["target_mode"] == "immediate_previous":
+            candidates = assistants[-1:]
+        else:
+            candidates = [
+                message
+                for message in assistants[-50:]
+                if " ".join(
+                    re.split(r"\r?\n[ \t]*\r?\n", message["content"], maxsplit=1)[
+                        0
+                    ].split()
+                )
+                == target
+            ]
+        if not candidates:
+            return _history_resolution_response(
+                kwargs,
+                status="no_record",
+                count=0,
+                reason=(
+                    "immediate_response_mismatch"
+                    if kwargs["target_mode"] == "immediate_previous"
+                    else "quoted_response_not_found"
+                ),
+            )
+        if len(candidates) > 1:
+            return _history_resolution_response(
+                kwargs,
+                status="ambiguous",
+                count=len(candidates),
+                reason="quoted_response_ambiguous",
+            )
+        candidate = candidates[0]
+        digest = "sha256:" + hashlib.sha256(
+            candidate["content"].encode("utf-8")
+        ).hexdigest()
+        if (
+            kwargs["target_mode"] == "immediate_previous"
+            and kwargs.get("response_digest") != digest
+        ):
+            return _history_resolution_response(
+                kwargs,
+                status="no_record",
+                count=0,
+                reason="immediate_response_mismatch",
+            )
+        original_request_id = candidate.get("metadata", {}).get("request_id")
+        trace = self.traces_by_request_id.get(original_request_id)
+        manifest = (
+            trace.get("prompt", {}).get("evidence_acquisition")
+            if isinstance(trace, dict)
+            else None
+        )
+        if not isinstance(manifest, dict):
+            return _history_resolution_response(
+                kwargs,
+                status="no_record",
+                count=0,
+                reason=(
+                    "immediate_response_manifest_absent"
+                    if kwargs["target_mode"] == "immediate_previous"
+                    else "quoted_response_manifest_absent"
+                ),
+            )
+        return _history_resolution_response(
+            kwargs,
+            status="resolved",
+            count=1,
+            reason=(
+                "immediate_response_resolved"
+                if kwargs["target_mode"] == "immediate_previous"
+                else "quoted_response_resolved"
+            ),
+            manifest=copy.deepcopy(manifest),
+            digest=digest,
+            original_request_id=original_request_id,
+        )
+
+
+def _history_resolution_response(
+    request,
+    *,
+    status,
+    count,
+    reason,
+    manifest=None,
+    digest=None,
+    original_request_id=None,
+):
+    response = {
+        "schema_version": "acquisition-history-resolution.v1",
+        "request_id": request["request_id"],
+        "owner_id": request["owner_id"],
+        "conversation_id": request["conversation_id"],
+        "surface": request["surface"],
+        "target_mode": request["target_mode"],
+        "resolution_status": status,
+        "match_count": count,
+        "reason_code": reason,
+        "record": None,
+    }
+    if status == "resolved":
+        response["record"] = {
+            "original_request_id": original_request_id,
+            "assistant_message_id": manifest["assistant_message_id"],
+            "surface": request["surface"],
+            "trace_status": "ok",
+            "response_digest": digest,
+            "normalized_first_paragraph": request["normalized_first_paragraph"],
+            "acquisition_manifest": manifest,
+        }
+    return response
 
 
 async def _run_claim_capture_chat(
@@ -15561,6 +15687,7 @@ async def _run_evidence_claim_capture_chat(
     runtime=None,
     litellm=None,
     optional: bool = False,
+    claim_capture_enabled: bool = True,
     request_id: str = "request-evidence-claim-capture",
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -15616,7 +15743,7 @@ async def _run_evidence_claim_capture_chat(
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        claim_record_capture_enabled=True,
+        claim_record_capture_enabled=claim_capture_enabled,
         request_id=request_id,
     )
     return result, memory_store, runtime, litellm, dsa
@@ -15631,6 +15758,7 @@ async def _run_acquisition_explanation_follow_up(
     runtime,
     messages=None,
     request_id="request-acquisition-explanation",
+    claim_capture_enabled=True,
 ):
     rules, models = _write_default_route_files(tmp_path)
     dsa = FakeDSA()
@@ -15662,7 +15790,7 @@ async def _run_acquisition_explanation_follow_up(
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        claim_record_capture_enabled=True,
+        claim_record_capture_enabled=claim_capture_enabled,
         request_id=request_id,
     )
     return result, provider, dsa, prior_counts
@@ -16284,10 +16412,9 @@ async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_
         "status": "ok",
         "sources": [],
     }
-    assert memory_store.claim_record_list_calls == [
-        {"owner_id": "owner", "conversation_id": "conv-1", "limit": 20}
-    ]
-    assert memory_store.trace_get_calls == ["request-acquisition-original"]
+    assert memory_store.claim_record_list_calls == []
+    assert memory_store.trace_get_calls == []
+    assert len(memory_store.acquisition_history_calls) == 1
     assert len(memory_store.retrieve_calls) == prior_counts["retrieve"]
     assert len(runtime.evidence_shape_calls) == prior_counts["shape"]
     assert len(runtime.evidence_plan_calls) == prior_counts["plan"]
@@ -16304,10 +16431,10 @@ async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_
     assert trace["model_call"]["status"] == "not_called"
     assert explanation["explanation_kind"] == "acquisition"
     assert explanation["acquisition_question"] == "checked"
-    assert explanation["acquisition_trace_lookup_status"] == "completed"
+    assert explanation["acquisition_trace_lookup_status"] == "not_requested"
     assert explanation["manifest_resolution_status"] == "resolved"
     assert explanation["provider_call_count"] == 0
-    assert explanation["storage_call_count"] == 2
+    assert explanation["storage_call_count"] == 1
     serialized = json.dumps((follow_up, trace), sort_keys=True)
     for prohibited in (
         "vehicle_log_primary",
@@ -16319,6 +16446,36 @@ async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_
         "The maintenance record lists",
     ):
         assert prohibited not in serialized
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_trace_first_history_needs_no_claim_record(tmp_path):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id="request-no-claim-history-original",
+    )
+    assert memory_store.claim_record_calls == []
+    assert memory_store.listed_records == []
+
+    follow_up, provider, dsa, _ = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up="What did you check?",
+        prior_answer=first["answer"],
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-no-claim-history",
+        claim_capture_enabled=False,
+    )
+    assert follow_up["status"] == "ok"
+    assert "retained record shows a targeted lookup" in follow_up["answer"]
+    assert memory_store.claim_record_list_calls == []
+    assert memory_store.trace_get_calls == []
+    assert len(memory_store.acquisition_history_calls) == 1
+    assert provider.calls == []
+    assert dsa.calls == []
 
 
 @pytest.mark.asyncio
@@ -16374,7 +16531,7 @@ async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_f
     explanation = memory_store.trace_calls[-1]["payload"]["prompt"][
         "claim_explanation"
     ]
-    assert explanation["target_mode"] == "quoted_anchor"
+    assert explanation["target_mode"] == "quoted_first_paragraph"
     assert explanation["reason_code"] == "quoted_acquisition_record_resolved"
 
 
@@ -16417,6 +16574,7 @@ async def test_orchestrate_linked_claim_support_explanation_does_not_fetch_manif
     assert result["status"] == "ok"
     assert result["answer"].startswith("I based that earlier statement on")
     assert memory_store.trace_get_calls == []
+    assert memory_store.acquisition_history_calls == []
     assert provider.calls == []
 
 
@@ -16445,18 +16603,15 @@ async def test_orchestrate_acquisition_trace_failure_is_bounded_and_dsa_free(
 
     assert follow_up["status"] == "degraded"
     assert follow_up["answer"] == (
-        "I couldn’t access the retained acquisition record for that earlier answer. "
-        "I can’t honestly reconstruct what was checked from memory, and I did not "
-        "perform a new verification."
+        "I couldn’t safely access the retained acquisition record for the specified "
+        "response. I did not perform a new verification for this explanation."
     )
     assert provider.calls == []
     assert dsa.list_calls == []
     assert dsa.calls == []
     assert dsa.fetch_calls == []
     trace = memory_store.trace_calls[-1]["payload"]
-    assert trace["prompt"]["claim_explanation"][
-        "acquisition_trace_lookup_status"
-    ] == "failed"
+    assert trace["prompt"]["claim_explanation"]["lookup_status"] == "failed"
     assert "PRIVATE-TRACE-FAILURE" not in json.dumps((follow_up, trace))
 
 
@@ -16490,6 +16645,487 @@ async def test_orchestrate_compound_acquisition_recheck_uses_ordinary_provider_p
     assert len(memory_store.retrieve_calls) == 1
     assert memory_store.claim_record_list_calls == []
     assert memory_store.trace_get_calls == []
+
+
+async def _run_compound_provider_boundary_case(
+    tmp_path,
+    *,
+    provider_content,
+    request_id,
+    limited=False,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id=f"{request_id}-original",
+    )
+    target = first["answer"].split("\n\n", 1)[0]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    if limited:
+        runtime.evidence_plan_response = _targeted_plan_response(
+            request_id=request_id,
+            question=task_text,
+            status="ready_with_limitations",
+            optional=True,
+            eligible_source_ids=["vehicle_log_primary"],
+        )
+    else:
+        runtime.evidence_plan_response = None
+    original_manifest = copy.deepcopy(
+        memory_store.traces_by_request_id[f"{request_id}-original"]["prompt"][
+            "evidence_acquisition"
+        ]
+    )
+    runtime_counts = {
+        "shape": len(runtime.evidence_shape_calls),
+        "plan": len(runtime.evidence_plan_calls),
+        "sufficiency": len(runtime.evidence_sufficiency_calls),
+        "next_step": len(runtime.evidence_next_step_calls),
+        "claim_calibration": len(runtime.claim_calibration_calls),
+    }
+    dsa = FakeDSA(response=_governed_context_pack(task_text))
+    provider = FakeLiteLLM(content=provider_content)
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What did you check? Check again.",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What did you check? Check again."},
+            ],
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    return {
+        "result": result,
+        "trace": trace,
+        "provider": provider,
+        "dsa": dsa,
+        "runtime": runtime,
+        "runtime_counts": runtime_counts,
+        "memory_store": memory_store,
+        "original_manifest": original_manifest,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_content", "case_id"),
+    [
+        ("Original acquisition:\nPRIVATE-LABEL-CONTENT", "original"),
+        ("New verification:\nPRIVATE-LABEL-CONTENT", "verification"),
+        ("New verification attempt:\nPRIVATE-LABEL-CONTENT", "attempt"),
+        ("New verification unavailable:\nPRIVATE-LABEL-CONTENT", "unavailable"),
+        ("## Original acquisition:\nPRIVATE-LABEL-CONTENT", "heading"),
+        ("**New verification:**\nPRIVATE-LABEL-CONTENT", "emphasis"),
+        ("- New verification attempt:\nPRIVATE-LABEL-CONTENT", "bullet"),
+        ("new verification unavailable:\nPRIVATE-LABEL-CONTENT", "lowercase"),
+        (
+            "I did not perform a new verification for this explanation.\n"
+            "PRIVATE-LABEL-CONTENT",
+            "historical-explanation",
+        ),
+        (
+            "I did not perform a new verification.\nPRIVATE-LABEL-CONTENT",
+            "historical-short",
+        ),
+        (
+            "No new verification was performed.\nPRIVATE-LABEL-CONTENT",
+            "historical-passive",
+        ),
+        (
+            "  i DID   not perform a NEW verification.  \nPRIVATE-LABEL-CONTENT",
+            "historical-normalized",
+        ),
+    ],
+)
+async def test_orchestrate_compound_policy_label_boundary_fails_closed(
+    tmp_path,
+    provider_content,
+    case_id,
+):
+    outcome = await _run_compound_provider_boundary_case(
+        tmp_path,
+        provider_content=provider_content,
+        request_id=f"request-compound-policy-label-{case_id}",
+    )
+    result = outcome["result"]
+    trace = outcome["trace"]
+    expected_replacement = (
+        "The governed new evidence check completed, but I withheld the generated "
+        "explanation because it conflicted with the verification response boundary."
+    )
+
+    assert result["status"] == "degraded"
+    assert result["answer"].count("Original acquisition:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert "New verification attempt:" not in result["answer"]
+    assert "New verification unavailable:" not in result["answer"]
+    assert result["answer"].endswith(f"New verification:\n{expected_replacement}")
+    assert "PRIVATE-LABEL-CONTENT" not in result["answer"]
+    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["dsa"].calls) == 1
+    assert outcome["dsa"].fetch_calls == []
+    assert outcome["memory_store"].claim_record_calls == []
+    assert len(outcome["runtime"].evidence_shape_calls) == (
+        outcome["runtime_counts"]["shape"] + 1
+    )
+    assert len(outcome["runtime"].evidence_plan_calls) == (
+        outcome["runtime_counts"]["plan"] + 1
+    )
+    assert len(outcome["runtime"].evidence_sufficiency_calls) == (
+        outcome["runtime_counts"]["sufficiency"] + 1
+    )
+    assert len(outcome["runtime"].evidence_next_step_calls) == (
+        outcome["runtime_counts"]["next_step"] + 1
+    )
+    assert len(outcome["runtime"].claim_calibration_calls) == outcome[
+        "runtime_counts"
+    ]["claim_calibration"]
+    final_manifest = trace["prompt"]["evidence_acquisition"]
+    assert final_manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
+    )
+    assert final_manifest != outcome["original_manifest"]
+    assert "PRIVATE-LABEL-CONTENT" not in json.dumps(trace, sort_keys=True)
+    assert trace["fallback"]["triggered"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_content",
+    [
+        "The original acquisition was narrower than the new evidence check.",
+        "This new verification supports the statement within the declared scope.",
+        "The verification attempt used the configured sources.",
+    ],
+)
+async def test_orchestrate_compound_policy_label_boundary_allows_inline_prose(
+    tmp_path,
+    provider_content,
+):
+    outcome = await _run_compound_provider_boundary_case(
+        tmp_path,
+        provider_content=provider_content,
+        request_id="request-compound-policy-label-inline",
+    )
+    result = outcome["result"]
+    assert result["status"] == "ok"
+    assert provider_content in result["answer"]
+    assert result["answer"].count("Original acquisition:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["dsa"].calls) == 1
+    assert outcome["memory_store"].claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_compound_limited_policy_label_boundary_fails_closed(
+    tmp_path,
+):
+    outcome = await _run_compound_provider_boundary_case(
+        tmp_path,
+        provider_content="New verification:\nPRIVATE-LIMITED-LABEL-CONTENT",
+        request_id="request-compound-policy-label-limited",
+        limited=True,
+    )
+    result = outcome["result"]
+    assert result["status"] == "degraded"
+    assert result["answer"].count("Original acquisition:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert "PRIVATE-LIMITED-LABEL-CONTENT" not in result["answer"]
+    assert "Limitation:" not in result["answer"]
+    assert "verification response boundary" in result["answer"]
+    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["dsa"].calls) == 1
+    assert outcome["memory_store"].claim_record_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recheck", ["Check again.", "Verify again."])
+async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verification(
+    tmp_path,
+    recheck,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id="request-compound-original",
+    )
+    runtime.evidence_plan_response = None
+    verification_target = first["answer"].split("\n\n", 1)[0]
+    task_text = (
+        "Verify this prior statement with a new evidence check: "
+        f'"{verification_target}"'
+    )
+    dsa = FakeDSA(response=_governed_context_pack(task_text))
+    provider = FakeLiteLLM(content="The new retained evidence confirms the statement.")
+    rules, models = _write_default_route_files(tmp_path)
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            f"What did you check? {recheck}",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": f"What did you check? {recheck}"},
+            ],
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=f"request-compound-{recheck.split()[0].lower()}",
+    )
+
+    assert result["answer"].startswith("Original acquisition:\n")
+    assert "\n\nNew verification:\n" in result["answer"]
+    assert "The new retained evidence confirms the statement." in result["answer"]
+    assert len(memory_store.acquisition_history_calls) == 1
+    assert memory_store.claim_record_list_calls == []
+    assert memory_store.trace_get_calls == []
+    assert runtime.evidence_shape_calls[-1]["task_text"] == task_text
+    assert len(dsa.calls) == 1
+    assert len(provider.calls) == 1
+    assert memory_store.claim_record_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    history_trace = trace["prompt"]["claim_explanation"]
+    assert history_trace["compound_mode"] is True
+    assert history_trace["resolution_status"] == "resolved"
+    serialized_trace = json.dumps(trace, sort_keys=True)
+    assert verification_target not in serialized_trace
+    assert "response_digest" not in history_trace
+    final_manifest = trace["prompt"]["evidence_acquisition"]
+    assert final_manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
+    )
+    assert final_manifest != memory_store.traces_by_request_id[
+        "request-compound-original"
+    ]["prompt"]["evidence_acquisition"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_check(
+    tmp_path,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id="request-quoted-compound-original",
+    )
+    runtime.evidence_plan_response = None
+    target = first["answer"].split("\n\n", 1)[0]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    question = f'What did you check for the statement "{target}"? Check again.'
+    provider = FakeLiteLLM(content="The new check supports the quoted statement.")
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": question},
+            ],
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=FakeDSA(response=_governed_context_pack(task_text)),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-quoted-compound",
+    )
+    assert "Original acquisition:\n" in result["answer"]
+    assert "\n\nNew verification:\n" in result["answer"]
+    assert runtime.evidence_shape_calls[-1]["task_text"] == task_text
+    assert memory_store.acquisition_history_calls[-1]["target_mode"] == (
+        "quoted_first_paragraph"
+    )
+    assert "response_digest" not in memory_store.acquisition_history_calls[-1] or (
+        memory_store.acquisition_history_calls[-1]["response_digest"] is None
+    )
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_path):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id="request-compound-insufficient-original",
+    )
+    runtime.evidence_plan_response = None
+    target = first["answer"].split("\n\n", 1)[0]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    failed_response = _governed_context_pack(task_text)
+    failed_response["items"] = []
+    failed_response["sources_used"] = []
+    failed_response["budget"]["returned_results"] = 0
+    failed_response["diagnostics"]["selected_source_ids"] = []
+    failed_response["diagnostics"]["candidate_counts_by_source"] = {
+        "vehicle_log_primary": 0
+    }
+    provider = FailingLiteLLM()
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What did you check? Check again.",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What did you check? Check again."},
+            ],
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=FakeDSA(response=failed_response),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="request-compound-insufficient",
+    )
+    assert result["answer"].startswith("Original acquisition:\n")
+    assert "\n\nNew verification attempt:\n" in result["answer"]
+    assert provider.calls == []
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_compound_limited_verification_keeps_policy_boundary(
+    tmp_path,
+):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id="request-compound-limited-original",
+    )
+    target = first["answer"].split("\n\n", 1)[0]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    request_id = "request-compound-limited"
+    runtime.evidence_plan_response = _targeted_plan_response(
+        request_id=request_id,
+        question=task_text,
+        status="ready_with_limitations",
+        optional=True,
+        eligible_source_ids=["vehicle_log_primary"],
+    )
+    provider = FakeLiteLLM(content="The new evidence supports the statement.")
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What did you check? Verify again.",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What did you check? Verify again."},
+            ],
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=FakeDSA(response=_governed_context_pack(task_text)),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+    assert "\n\nNew verification:\n" in result["answer"]
+    new_section = result["answer"].split("\n\nNew verification:\n", 1)[1]
+    assert "Limitation:" in new_section
+    assert (
+        "This reflects only the targeted sources checked, not a complete search of "
+        "every possible source." in new_section
+    )
+    assert len(provider.calls) == 1
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_compound_without_governed_path_is_unavailable(tmp_path):
+    memory_store = ClaimExplanationMemoryStore()
+    first, _, _, _, _ = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        claim_capture_enabled=False,
+        request_id="request-compound-unavailable-original",
+    )
+    rules, models = _write_default_route_files(tmp_path)
+    provider = FailingLiteLLM()
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What did you check? Check again.",
+            conversation_id="conv-1",
+            messages=[
+                {"role": "assistant", "content": first["answer"]},
+                {"role": "user", "content": "What did you check? Check again."},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        evidence_acquisition_enabled=True,
+        request_id="request-compound-unavailable",
+    )
+    assert result["answer"].endswith(
+        "New verification unavailable:\n"
+        "I couldn’t complete a governed new evidence check for that statement."
+    )
+    assert provider.calls == []
+    assert memory_store.claim_record_calls == []
 
 
 @pytest.mark.asyncio

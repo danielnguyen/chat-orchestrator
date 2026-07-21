@@ -214,3 +214,50 @@ class MemoryStoreClient:
 
     async def get_trace(self, request_id: str) -> dict[str, Any]:
         return await self._get(f"/v1/traces/{request_id}")
+
+    async def resolve_acquisition_history(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        target_mode: str,
+        normalized_first_paragraph: str,
+        response_digest: str | None = None,
+    ) -> dict[str, Any]:
+        if target_mode == "immediate_previous":
+            if response_digest is None:
+                raise ValueError("acquisition_history_response_digest_required")
+        elif target_mode == "quoted_first_paragraph":
+            if response_digest is not None:
+                raise ValueError("acquisition_history_response_digest_not_allowed")
+        else:
+            raise ValueError("acquisition_history_target_mode_invalid")
+        payload: dict[str, Any] = {
+            "schema_version": "acquisition-history-resolution.v1",
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "target_mode": target_mode,
+            "normalized_first_paragraph": normalized_first_paragraph,
+        }
+        if response_digest is not None:
+            payload["response_digest"] = response_digest
+        response = await self._post(
+            "/v1/internal/acquisition-history/resolve",
+            request_id=request_id,
+            json=payload,
+        )
+        expected_scope = {
+            "schema_version": "acquisition-history-resolution.v1",
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "target_mode": target_mode,
+        }
+        if any(response.get(key) != value for key, value in expected_scope.items()):
+            raise RuntimeError("acquisition_history_response_context_mismatch")
+        return response
