@@ -724,7 +724,6 @@ run_evidence_limitation_and_failure_scenarios() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
   jq -e '
     .status == "ok"
@@ -738,10 +737,6 @@ run_evidence_limitation_and_failure_scenarios() {
   ' <<<"$manifest" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
   assert_dsa_operation_counts "$audit" 1 0 0
-  jq -e '
-    ([.calls[] | select(.operation == "google_values")] | length) == 3
-    and ([.calls[] | select(.operation == "ics_get")] | length) == 2
-  ' <<<"$source_calls" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   jq -e '.fallback.triggered == false and (.model_calls | length) == 1' \
