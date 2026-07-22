@@ -731,9 +731,9 @@ run_evidence_clarification_scenario() {
   client="client-evidence-clarification"
   question="Check whether every mandatory record in the register is reviewed."
   provider_post "/fixture/reset" '{}'
+  restrict_dsa_config_to "complete_register.yaml"
   reset_source_fixture
   configure_source_fixture "complete-sheet" "empty_after_first"
-  restrict_dsa_config_to "complete_register.yaml"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-clarification")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" '{"enabled":true,"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
