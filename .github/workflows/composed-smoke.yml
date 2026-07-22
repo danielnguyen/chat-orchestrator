@@ -72,6 +72,12 @@ jobs:
           EVIDENCE_ACQUISITION_ONLY: "1"
         run: make composed-smoke
 
+      - name: Run complete composed smoke regression
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+        run: make composed-smoke
+
       - name: Upload bounded failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

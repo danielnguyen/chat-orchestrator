@@ -25,6 +25,7 @@ from services.evidence_acquisition import (
     SufficiencyResult,
     _acquisition_premise_digest,
     _build_acquisition_facts,
+    _expected_sufficiency_constraints,
     _manifest_id,
     begin_evidence_acquisition,
     bind_manifest_response,
@@ -508,22 +509,9 @@ def _sufficiency_response(
         }
         for requirement in requirements
     ]
-    constraints = (
-        []
-        if status == "sufficient_for_declared_scope"
-        else [
-            "qualify_conclusion",
-            "disclose_limitations",
-            "identify_unexamined_scope",
-        ]
-        if status == "sufficient_with_limitations"
-        else [
-            "qualify_conclusion",
-            "disclose_limitations",
-            "identify_unexamined_scope",
-            "additional_acquisition_or_clarification_required",
-            "withhold_unqualified_conclusion",
-        ]
+    constraints = _expected_sufficiency_constraints(
+        status,
+        task_shape=task_shape,
     )
     reasons = (
         ["all_declared_requirements_satisfied"]
@@ -548,6 +536,77 @@ def _sufficiency_response(
             "user_safe_summary": "Bounded sufficiency.",
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "task_shape", "expected"),
+    [
+        ("sufficient_for_declared_scope", "bounded_exhaustive_review", []),
+        (
+            "sufficient_with_limitations",
+            "contradiction_review",
+            [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+            ],
+        ),
+        (
+            "insufficient",
+            "targeted_lookup",
+            [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ],
+        ),
+        (
+            "unknown",
+            "cross_source_comparison",
+            [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ],
+        ),
+        *[
+            (
+                status,
+                task_shape,
+                [
+                    "qualify_conclusion",
+                    "disclose_limitations",
+                    "identify_unexamined_scope",
+                    "additional_acquisition_or_clarification_required",
+                    "withhold_unqualified_conclusion",
+                    constraint,
+                ],
+            )
+            for status in ("insufficient", "unknown")
+            for task_shape, constraint in (
+                ("bounded_exhaustive_review", "withhold_exhaustive_conclusion"),
+                ("absence_or_coverage_check", "withhold_absence_conclusion"),
+                (
+                    "contradiction_review",
+                    "withhold_contradiction_sensitive_conclusion",
+                ),
+            )
+        ],
+    ],
+)
+def test_expected_sufficiency_constraints_are_exact_and_task_specific(
+    status,
+    task_shape,
+    expected,
+):
+    assert _expected_sufficiency_constraints(
+        status,
+        task_shape=task_shape,
+    ) == expected
 
 
 def _rendering_state(
@@ -914,6 +973,213 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
     assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == (
         "unknown"
     )
+
+
+class ProducerContractSufficiencyRuntime:
+    def __init__(self, constraint_mutation=None):
+        self.calls = []
+        self.constraint_mutation = constraint_mutation
+
+    async def evaluate_evidence_sufficiency(self, **kwargs):
+        self.calls.append(kwargs)
+        facts = {
+            fact["requirement_id"]: fact["outcome"]
+            for fact in kwargs["acquisition_facts"]
+        }
+        evaluations = [
+            {
+                **requirement,
+                "effective_outcome": facts[requirement["requirement_id"]],
+            }
+            for requirement in kwargs["declared_requirements"]
+        ]
+        material_outcomes = [
+            evaluation["effective_outcome"]
+            for evaluation in evaluations
+            if evaluation["criticality"] == "material"
+        ]
+        concrete_failures = {
+            "partial",
+            "not_attempted",
+            "unavailable",
+            "unsupported",
+            "failed",
+            "excluded",
+            "filtered",
+            "truncated",
+            "unresolved_contradiction",
+        }
+        status = (
+            "insufficient"
+            if any(outcome in concrete_failures for outcome in material_outcomes)
+            else "unknown"
+            if any(outcome in {"missing", "unknown"} for outcome in material_outcomes)
+            else "sufficient_for_declared_scope"
+        )
+        constraints = (
+            []
+            if status == "sufficient_for_declared_scope"
+            else [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ]
+        )
+        task_constraint = {
+            "bounded_exhaustive_review": "withhold_exhaustive_conclusion",
+            "absence_or_coverage_check": "withhold_absence_conclusion",
+            "contradiction_review": "withhold_contradiction_sensitive_conclusion",
+        }.get(kwargs["task_shape"])
+        if task_constraint is not None:
+            constraints.append(task_constraint)
+        if self.constraint_mutation is not None:
+            constraints = self.constraint_mutation(list(constraints))
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "evidence_plan_id",
+                    "acquisition_manifest_id",
+                )
+            },
+            "result": {
+                "evaluation_id": "evidence_eval_producer_contract",
+                "task_shape": kwargs["task_shape"],
+                "sufficiency_status": status,
+                "evaluated_requirements": evaluations,
+                "reason_codes": [
+                    "material_requirement_not_satisfied"
+                    if status == "insufficient"
+                    else "material_requirement_unknown"
+                    if status == "unknown"
+                    else "all_declared_requirements_satisfied"
+                ],
+                "answer_constraints": constraints,
+                "qualification_required": status
+                != "sufficient_for_declared_scope",
+                "additional_acquisition_required": status
+                in {"insufficient", "unknown"},
+                "user_safe_summary": "Bounded producer response.",
+            },
+        }
+
+
+async def _evaluate_filtered_exhaustive_sufficiency(runtime):
+    state = _exhaustive_state()
+    dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
+    context, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=_exhaustive_targeted_context_pack(),
+        dsa_trace={"called": True, "status": "success"},
+    )
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=context,
+        dsa_trace=trace,
+        retained_source_refs=set(),
+        **SCOPE,
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_producer_shaped_exhaustive_blocking_constraints_are_accepted():
+    runtime = ProducerContractSufficiencyRuntime()
+
+    state = await _evaluate_filtered_exhaustive_sufficiency(runtime)
+
+    assert len(runtime.calls) == 1
+    assert state.status == "insufficient"
+    assert state.sufficiency is not None
+    assert state.sufficiency.evaluation_id == "evidence_eval_producer_contract"
+    assert state.sufficiency.sufficiency_status == "insufficient"
+    assert state.sufficiency.answer_constraints == [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+        "additional_acquisition_or_clarification_required",
+        "withhold_unqualified_conclusion",
+        "withhold_exhaustive_conclusion",
+    ]
+    assert [
+        evaluation.model_dump(mode="json")
+        for evaluation in state.sufficiency.evaluated_requirements
+    ] == [
+        {
+            **requirement,
+            "effective_outcome": next(
+                fact["outcome"]
+                for fact in state.acquisition_facts
+                if fact["requirement_id"] == requirement["requirement_id"]
+            ),
+        }
+        for requirement in runtime.calls[0]["declared_requirements"]
+    ]
+    assert runtime.calls[0]["acquisition_facts"] == state.acquisition_facts
+    assert state.forced_answer == WITHHELD_ANSWER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "constraint_mutation",
+    [
+        lambda constraints: constraints[:-1],
+        lambda constraints: [
+            *constraints[:-1],
+            "withhold_absence_conclusion",
+        ],
+        lambda constraints: [constraints[1], constraints[0], *constraints[2:]],
+        lambda constraints: [*constraints, "withhold_absence_conclusion"],
+    ],
+    ids=["missing", "wrong", "reordered", "extra"],
+)
+async def test_malformed_exhaustive_constraints_fail_closed(constraint_mutation):
+    state = await _evaluate_filtered_exhaustive_sufficiency(
+        ProducerContractSufficiencyRuntime(constraint_mutation)
+    )
+
+    assert state.status == "sufficiency_dependency_failed"
+    assert state.sufficiency is None
+    assert state.forced_answer == WITHHELD_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_specialized_constraint_on_targeted_lookup_fails_closed():
+    setup_runtime = FakeRuntime(sufficiency_status="insufficient")
+    state = await begin_evidence_acquisition(
+        runtime=setup_runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+    runtime = ProducerContractSufficiencyRuntime(
+        lambda constraints: [*constraints, "withhold_exhaustive_conclusion"]
+    )
+
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=_validated_context_pack(),
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs=set(),
+        **SCOPE,
+    )
+
+    assert state.status == "sufficiency_dependency_failed"
+    assert state.sufficiency is None
+    assert provider_allowed(state) is False
 
 
 @pytest.mark.asyncio

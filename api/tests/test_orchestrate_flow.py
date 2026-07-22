@@ -995,6 +995,7 @@ class FakeRuntime:
                 if isinstance(self.evidence_sufficiency_response, list)
                 else self.evidence_sufficiency_response
             )
+            response = response(kwargs) if callable(response) else response
             self._last_evidence_sufficiency_result = response["result"]
             return response
         evaluations = [
@@ -1049,6 +1050,13 @@ class FakeRuntime:
                 "withhold_unqualified_conclusion",
             ]
         )
+        task_constraint = {
+            "bounded_exhaustive_review": "withhold_exhaustive_conclusion",
+            "absence_or_coverage_check": "withhold_absence_conclusion",
+            "contradiction_review": "withhold_contradiction_sensitive_conclusion",
+        }.get(kwargs["task_shape"])
+        if status in {"insufficient", "unknown"} and task_constraint is not None:
+            constraints.append(task_constraint)
         reasons = (
             ["all_declared_requirements_satisfied"]
             if status == "sufficient_for_declared_scope"
@@ -12249,6 +12257,7 @@ async def _run_bounded_exhaustive_case(
     memory_store=None,
     privacy_context_response=None,
     privacy_context_enabled: bool = False,
+    evidence_sufficiency_response=None,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Review every maintenance record in the configured worksheet."
@@ -12264,6 +12273,7 @@ async def _run_bounded_exhaustive_case(
             question=question,
             status=plan_status,
         ),
+        evidence_sufficiency_response=evidence_sufficiency_response,
         privacy_context_response=privacy_context_response,
     )
     dsa = FakeDSA(
@@ -12453,7 +12463,11 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         withholding="I’m withholding a complete-scope conclusion.",
     )
     assert len(dsa.context_calls) == 1
+    assert len(dsa.calls) == 1
+    assert dsa.fetch_calls == []
     assert litellm.calls == []
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
     facts = {
         fact["requirement_id"]: fact["outcome"]
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
@@ -12465,12 +12479,121 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         "contradiction-search": "filtered",
         "no-material-truncation": "filtered",
     }
-    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
+    assert len(memory_store.trace_calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
-    ]["acquisition"]
+    ]
+    assert manifest["status"] == "insufficient"
+    assert manifest["sufficiency"]["status"] == "insufficient"
+    assert manifest["sufficiency"]["answer_constraints"] == [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+        "additional_acquisition_or_clarification_required",
+        "withhold_unqualified_conclusion",
+        "withhold_exhaustive_conclusion",
+    ]
+    assert manifest["next_steps"]["selection_count"] == 1
+    assert manifest["next_steps"]["selections"][0]["selected_next_step"] == (
+        "disclose_unexamined_scope"
+    )
+    assert manifest["next_steps"]["additional_acquisition_count"] == 0
+    acquisition = manifest["acquisition"]
     assert len(acquisition["source_references_returned"]) == 1
     assert acquisition["source_references_retained"] == []
     assert len(acquisition["source_references_filtered_or_omitted"]) == 1
+    assert len(
+        [
+            message
+            for message in memory_store.added_messages
+            if message["role"] == "assistant"
+        ]
+    ) == 1
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing", "wrong", "reordered", "extra"],
+)
+async def test_bounded_exhaustive_malformed_sufficiency_constraints_fail_closed(
+    tmp_path,
+    malformation,
+):
+    def malformed_response(kwargs):
+        facts = {
+            fact["requirement_id"]: fact["outcome"]
+            for fact in kwargs["acquisition_facts"]
+        }
+        constraints = [
+            "qualify_conclusion",
+            "disclose_limitations",
+            "identify_unexamined_scope",
+            "additional_acquisition_or_clarification_required",
+            "withhold_unqualified_conclusion",
+            "withhold_exhaustive_conclusion",
+        ]
+        if malformation == "missing":
+            constraints.pop()
+        elif malformation == "wrong":
+            constraints[-1] = "withhold_absence_conclusion"
+        elif malformation == "reordered":
+            constraints[0], constraints[1] = constraints[1], constraints[0]
+        else:
+            constraints.append("withhold_absence_conclusion")
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "evidence_plan_id",
+                    "acquisition_manifest_id",
+                )
+            },
+            "result": {
+                "evaluation_id": "evidence_eval_malformed_constraints",
+                "task_shape": kwargs["task_shape"],
+                "sufficiency_status": "insufficient",
+                "evaluated_requirements": [
+                    {
+                        **requirement,
+                        "effective_outcome": facts[requirement["requirement_id"]],
+                    }
+                    for requirement in kwargs["declared_requirements"]
+                ],
+                "reason_codes": ["material_requirement_not_satisfied"],
+                "answer_constraints": constraints,
+                "qualification_required": True,
+                "additional_acquisition_required": True,
+                "user_safe_summary": "Malformed producer fixture.",
+            },
+        }
+
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(
+            tmp_path=tmp_path,
+            context_responses=[_configured_worksheet_context_response(truncated=True)],
+            evidence_sufficiency_response=malformed_response,
+        )
+    )
+
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert runtime.evidence_next_step_calls == []
+    assert litellm.calls == []
+    assert len(dsa.context_calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["status"] == "sufficiency_dependency_failed"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert "complete-scope conclusion" not in out["answer"]
+    assert memory_store.claim_record_calls == []
 
 
 @pytest.mark.asyncio

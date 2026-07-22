@@ -119,6 +119,12 @@ AnswerConstraint = Literal[
     "withhold_absence_conclusion",
     "withhold_contradiction_sensitive_conclusion",
 ]
+SufficiencyStatus = Literal[
+    "sufficient_for_declared_scope",
+    "sufficient_with_limitations",
+    "insufficient",
+    "unknown",
+]
 AcquisitionStrategy = Literal[
     "targeted_retrieval",
     "exact_fetch",
@@ -456,12 +462,7 @@ class RequirementEvaluation(StrictModel):
 class SufficiencyResult(StrictModel):
     evaluation_id: Identifier
     task_shape: TaskShape
-    sufficiency_status: Literal[
-        "sufficient_for_declared_scope",
-        "sufficient_with_limitations",
-        "insufficient",
-        "unknown",
-    ]
+    sufficiency_status: SufficiencyStatus
     evaluated_requirements: list[RequirementEvaluation] = Field(max_length=32)
     reason_codes: list[SufficiencyReasonCode] = Field(max_length=9)
     answer_constraints: list[AnswerConstraint] = Field(max_length=8)
@@ -484,6 +485,35 @@ class SufficiencyResult(StrictModel):
         if self.additional_acquisition_required != acquisition_expected:
             raise ValueError("additional_acquisition_flag_mismatch")
         return self
+
+
+def _expected_sufficiency_constraints(
+    status: SufficiencyStatus,
+    *,
+    task_shape: TaskShape,
+) -> list[AnswerConstraint]:
+    if status == "sufficient_for_declared_scope":
+        return []
+    limitations: list[AnswerConstraint] = [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+    ]
+    if status == "sufficient_with_limitations":
+        return limitations
+    constraints: list[AnswerConstraint] = [
+        *limitations,
+        "additional_acquisition_or_clarification_required",
+        "withhold_unqualified_conclusion",
+    ]
+    task_constraint: dict[TaskShape, AnswerConstraint] = {
+        "bounded_exhaustive_review": "withhold_exhaustive_conclusion",
+        "absence_or_coverage_check": "withhold_absence_conclusion",
+        "contradiction_review": "withhold_contradiction_sensitive_conclusion",
+    }
+    if task_shape in task_constraint:
+        constraints.append(task_constraint[task_shape])
+    return constraints
 
 
 class SufficiencyResponse(StrictModel):
@@ -3489,22 +3519,9 @@ async def evaluate_acquisition_sufficiency(
         )
         if response.result.sufficiency_status != expected_status:
             raise ValueError("sufficiency_status_mismatch")
-        expected_constraints = (
-            []
-            if expected_status == "sufficient_for_declared_scope"
-            else [
-                "qualify_conclusion",
-                "disclose_limitations",
-                "identify_unexamined_scope",
-            ]
-            if expected_status == "sufficient_with_limitations"
-            else [
-                "qualify_conclusion",
-                "disclose_limitations",
-                "identify_unexamined_scope",
-                "additional_acquisition_or_clarification_required",
-                "withhold_unqualified_conclusion",
-            ]
+        expected_constraints = _expected_sufficiency_constraints(
+            expected_status,
+            task_shape=state.plan.task_shape,
         )
         if response.result.answer_constraints != expected_constraints:
             raise ValueError("sufficiency_constraints_mismatch")
