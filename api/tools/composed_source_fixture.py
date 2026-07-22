@@ -17,7 +17,10 @@ class SourceState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: str = Field(
-        pattern=r"^(ready|unavailable|unavailable_after_first|empty|large|malformed)$"
+        pattern=(
+            r"^(ready|unavailable|unavailable_after_first|empty|"
+            r"empty_after_first|large|malformed)$"
+        )
     )
 
 
@@ -129,12 +132,16 @@ async def fixture_calls() -> dict[str, Any]:
 @fixture_app.get("/google/{spreadsheet_id}")
 async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, Any]:
     _record_call(spreadsheet_id, "google_values", range_name=range_name)
+    call_ordinal = len(_calls[spreadsheet_id])
     mode = _source_modes.get(spreadsheet_id, "ready")
     if mode == "unavailable":
         raise HTTPException(status_code=503, detail="source unavailable")
     if mode == "malformed":
         return {"values": {"invalid": "PRIVATE MALFORMED CELL SENTINEL"}}
-    values = [] if mode == "empty" else _GOOGLE_VALUES.get(spreadsheet_id)
+    return_empty = mode == "empty" or (
+        mode == "empty_after_first" and call_ordinal > 1
+    )
+    values = [] if return_empty else _GOOGLE_VALUES.get(spreadsheet_id)
     if values is None:
         raise HTTPException(status_code=404, detail="source not found")
     if mode == "large" and spreadsheet_id == "complete-sheet":
