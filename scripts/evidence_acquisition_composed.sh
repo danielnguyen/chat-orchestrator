@@ -741,7 +741,6 @@ run_evidence_clarification_scenario() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
-  echo "Evidence clarification observed: response_status=$(jq -r '.status' <<<"$response") sufficiency=$(jq -r '.sufficiency.status' <<<"$manifest") next_step=$(jq -r '.next_steps.selections[0].selected_next_step' <<<"$manifest") target=$(jq -r '.next_steps.selections[0].clarification_target' <<<"$manifest") provider_chat=$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_calls")"
   jq -e '
     .status == "degraded"
     and .answer == "Which bounded source or source set should I examine?"
