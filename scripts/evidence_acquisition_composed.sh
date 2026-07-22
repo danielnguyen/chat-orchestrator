@@ -177,7 +177,8 @@ YAML
 
 run_evidence_chat() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
-  local external_context
+  local external_context model_override
+  model_override="${6:-}"
   external_context="$(jq -c '
     . + {
       source_ids: (.source_ids // []),
@@ -190,8 +191,10 @@ run_evidence_chat() {
     --arg client "$client" \
     --arg conversation "$conversation_id" \
     --arg question "$question" \
+    --arg model_override "$model_override" \
     --argjson external_context "$external_context" \
-    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private",external_context_enabled:true,external_context:$external_context}')"
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private",external_context_enabled:true,external_context:$external_context}
+    + if $model_override == "" then {} else {model_override:$model_override} end')"
 }
 
 fetch_source_fixture_calls() {
@@ -229,8 +232,17 @@ wait_for_http() {
 }
 
 restart_orchestrator_with_reserve() {
+  COMPOSED_ALLOW_MANUAL_OVERRIDE=false
   COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$1"
-  export COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE
+  export COMPOSED_ALLOW_MANUAL_OVERRIDE COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+}
+
+restart_orchestrator_for_changed_premise() {
+  COMPOSED_ALLOW_MANUAL_OVERRIDE=true
+  COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE=14744
+  export COMPOSED_ALLOW_MANUAL_OVERRIDE COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE
   docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
 }
@@ -770,10 +782,10 @@ run_evidence_changed_premise_scenarios() {
   reset_source_fixture
   configure_source_fixture "followup-sheet" "alternating_large_compact"
   reset_dsa_audit
-  restart_orchestrator_with_reserve 8000
+  restart_orchestrator_for_changed_premise
   queue_provider_answer "The exact follow-up record confirms the bounded detail."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-followup")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   first_request_id="$request_id"
   trace="$(fetch_trace "$request_id")"
@@ -785,7 +797,21 @@ run_evidence_changed_premise_scenarios() {
   initial_result_count="$(jq -r '.next_steps.initial_attempt.result_count' <<<"$manifest")"
   initial_retained_count="$(jq -r '.next_steps.initial_attempt.retained_reference_count' <<<"$manifest")"
   exact_retained_count="$(jq -r '.acquisition.prompt_retained_item_count' <<<"$manifest")"
-  echo "Evidence changed premise observed: response_status=$(jq -r '.status' <<<"$response") strategy=$(jq -r '.acquisition.strategy_attempted' <<<"$manifest") results=$(jq -r '.acquisition.item_count' <<<"$manifest") retained=$(jq -r '.acquisition.prompt_retained_item_count' <<<"$manifest") sufficiency=$(jq -r '.sufficiency.status' <<<"$manifest") next_step=$(jq -r '.next_steps.selections[0].selected_next_step' <<<"$manifest") google_calls=$(jq '[.calls[] | select(.source == "followup-sheet" and .operation == "google_values")] | length' <<<"$source_calls") large_characters=$(jq -r '[.calls[] | select(.source == "followup-sheet" and .variant == "large")][0].returned_cell_character_count // 0' <<<"$source_calls") compact_characters=$(jq -r '[.calls[] | select(.source == "followup-sheet" and .variant == "compact")][0].returned_cell_character_count // 0' <<<"$source_calls") effective_budget=$(jq -r '.retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget' <<<"$trace") estimated_before=$(jq -r '.retrieval.prompt_assembly.prompt_budget.estimated_tokens_before_budgeting' <<<"$trace") estimated_after=$(jq -r '.retrieval.prompt_assembly.prompt_budget.estimated_tokens_after_budgeting' <<<"$trace") dropped_external=$(jq -r '.retrieval.prompt_assembly.prompt_budget.dropped_context.by_layer.external_context // 0' <<<"$trace") dsa_context_pack=$(jq '[.[] | select(.operation == "context_pack")] | length' <<<"$audit") dsa_fetch=$(jq '[.[] | select(.operation == "fetch")] | length' <<<"$audit") provider_chat=$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_calls")"
+  jq -e '
+    .router_decision.selected_model == "chat_local_fast"
+    and .router_decision.routing_contract.manual_override_requested == "chat_local_fast"
+    and .router_decision.routing_contract.manual_override_applied == true
+    and .router_decision.routing_contract.manual_override_rejection_reason == null
+    and .manual_override.requested_model == "chat_local_fast"
+    and .manual_override.applied == true
+    and .manual_override.rejection_reason == null
+    and .retrieval.prompt_assembly.prompt_budget.effective_min_context_limit == 16000
+    and .retrieval.prompt_assembly.prompt_budget.output_token_reserve == 14744
+    and .retrieval.prompt_assembly.prompt_budget.context_safety_margin == 256
+    and .retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget == 1000
+    and .retrieval.prompt_assembly.prompt_budget.profile_clamp.supplied == false
+    and .retrieval.prompt_assembly.prompt_budget.profile_clamp.applied == false
+  ' <<<"$trace" >/dev/null
   jq -e '
     .status == "ok"
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
@@ -826,7 +852,7 @@ run_evidence_changed_premise_scenarios() {
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 2 2
 
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
@@ -834,6 +860,19 @@ run_evidence_changed_premise_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
+  jq -e '
+    .router_decision.selected_model == "chat_local_fast"
+    and .router_decision.routing_contract.manual_override_requested == "chat_local_fast"
+    and .router_decision.routing_contract.manual_override_applied == true
+    and .router_decision.routing_contract.manual_override_rejection_reason == null
+    and .retrieval.prompt_assembly.prompt_budget.effective_min_context_limit == 16000
+    and .retrieval.prompt_assembly.prompt_budget.output_token_reserve == 14744
+    and .retrieval.prompt_assembly.prompt_budget.context_safety_margin == 256
+    and .retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget == 1000
+    and .retrieval.prompt_assembly.prompt_budget.profile_clamp.supplied == false
+    and .retrieval.prompt_assembly.prompt_budget.profile_clamp.applied == false
+    and .fallback.triggered == false
+  ' <<<"$trace" >/dev/null
   jq -e '
     .status == "degraded"
     and (.answer | contains("requested conclusion"))
@@ -869,7 +908,7 @@ run_evidence_changed_premise_scenarios() {
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   configure_source_fixture "followup-sheet" "ready"
   restart_orchestrator_with_reserve 2048
-  echo "Evidence changed premise: initial_request=$first_request_id targeted_results=$initial_result_count targeted_retained=$initial_retained_count changed_premise_authorizations=1 exact_fetch=1 exact_retained=$exact_retained_count selections=2 provider=1 repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
+  echo "Evidence changed premise: initial_request=$first_request_id model=chat_local_fast effective_budget=1000 targeted_results=$initial_result_count targeted_retained=$initial_retained_count changed_premise_authorizations=1 exact_fetch=1 exact_retained=$exact_retained_count selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
 }
 
 run_evidence_adversarial_provider_scenario() {

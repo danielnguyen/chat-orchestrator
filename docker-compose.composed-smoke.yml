@@ -160,7 +160,7 @@ services:
       LITELLM_BASE_URL: http://provider:8000
       ROUTER_RULES_PATH: /app/router/rules.yaml
       MODEL_REGISTRY_PATH: /app/router/model_registry.yaml
-      ALLOW_MANUAL_OVERRIDE: "false"
+      ALLOW_MANUAL_OVERRIDE: ${COMPOSED_ALLOW_MANUAL_OVERRIDE:-false}
       DSA_ENABLED: "true"
       DSA_BASE_URL: http://dsa:8000
       DSA_API_KEY: smoke-dsa-key
