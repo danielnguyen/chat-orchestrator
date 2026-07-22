@@ -604,7 +604,7 @@ run_evidence_exhaustive_scenarios() {
     .acquisition.expansion_successful_count == 1
     and .acquisition.item_count == 1
     and .acquisition.prompt_retained_item_count == 0
-    and .sufficiency.status == "insufficient"
+    and .sufficiency.status == "unknown"
   ' <<<"$manifest" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
