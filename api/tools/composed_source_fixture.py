@@ -19,7 +19,7 @@ class SourceState(BaseModel):
     mode: str = Field(
         pattern=(
             r"^(ready|unavailable|unavailable_after_first|empty|"
-            r"empty_after_first|large|malformed)$"
+            r"empty_after_first|alternating_large_compact|large|malformed)$"
         )
     )
 
@@ -27,6 +27,33 @@ class SourceState(BaseModel):
 fixture_app = FastAPI(title="Deterministic composed-smoke source fixture")
 _calls: dict[str, list[dict[str, Any]]] = defaultdict(list)
 _source_modes: dict[str, str] = {}
+
+_FOLLOWUP_LARGE_VALUES: list[list[str]] = [
+    ["Record", "Status", "Notes"],
+    *[
+        [
+            f"follow-up-{index}",
+            "ready",
+            (
+                f"Bounded follow-up detail {index}. "
+                + "Expanded deterministic context. " * 150
+            ),
+        ]
+        for index in range(1, 9)
+    ],
+]
+
+_FOLLOWUP_COMPACT_VALUES: list[list[str]] = [
+    ["Record", "Status", "Notes"],
+    *[
+        [
+            f"follow-up-{index}",
+            "ready",
+            f"Bounded exact detail {index}.",
+        ]
+        for index in range(1, 9)
+    ],
+]
 
 _GOOGLE_VALUES: dict[str, list[list[str]]] = {
     "targeted-sheet": [
@@ -131,23 +158,43 @@ async def fixture_calls() -> dict[str, Any]:
 
 @fixture_app.get("/google/{spreadsheet_id}")
 async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, Any]:
-    _record_call(spreadsheet_id, "google_values", range_name=range_name)
+    call = _record_call(spreadsheet_id, "google_values", range_name=range_name)
     call_ordinal = len(_calls[spreadsheet_id])
     mode = _source_modes.get(spreadsheet_id, "ready")
     if mode == "unavailable":
         raise HTTPException(status_code=503, detail="source unavailable")
     if mode == "malformed":
         return {"values": {"invalid": "PRIVATE MALFORMED CELL SENTINEL"}}
-    return_empty = mode == "empty" or (
-        mode == "empty_after_first" and call_ordinal > 1
-    )
-    values = [] if return_empty else _GOOGLE_VALUES.get(spreadsheet_id)
+    variant = "compact"
+    if mode == "alternating_large_compact" and spreadsheet_id == "followup-sheet":
+        variant = "large" if call_ordinal % 2 == 1 else "compact"
+        values = (
+            _FOLLOWUP_LARGE_VALUES
+            if variant == "large"
+            else _FOLLOWUP_COMPACT_VALUES
+        )
+    else:
+        return_empty = mode == "empty" or (
+            mode == "empty_after_first" and call_ordinal > 1
+        )
+        values = [] if return_empty else _GOOGLE_VALUES.get(spreadsheet_id)
     if values is None:
         raise HTTPException(status_code=404, detail="source not found")
     if mode == "large" and spreadsheet_id == "complete-sheet":
+        variant = "large"
         values = deepcopy(values)
         for row in values[1:]:
             row[2] = "reviewed " + "bounded configured detail. " * 130
+    call.update(
+        {
+            "mode": mode,
+            "variant": variant,
+            "returned_row_count": len(values),
+            "returned_cell_character_count": sum(
+                len(str(cell)) for row in values for cell in row
+            ),
+        }
+    )
     return {"values": deepcopy(values)}
 
 
@@ -165,15 +212,19 @@ async def ics_values(source_name: str) -> Response:
     return Response(content=value, media_type="text/calendar")
 
 
-def _record_call(source_name: str, operation: str, **fields: Any) -> None:
-    _calls[source_name].append(
-        {
-            "source": source_name,
-            "operation": operation,
-            "ordinal": len(_calls[source_name]) + 1,
-            **fields,
-        }
-    )
+def _record_call(
+    source_name: str,
+    operation: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    call = {
+        "source": source_name,
+        "operation": operation,
+        "ordinal": len(_calls[source_name]) + 1,
+        **fields,
+    }
+    _calls[source_name].append(call)
+    return call
 
 
 class FixtureGoogleSheetsClient:

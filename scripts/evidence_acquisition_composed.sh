@@ -759,7 +759,8 @@ run_evidence_clarification_scenario() {
 
 run_evidence_changed_premise_scenarios() {
   local owner client conversation_id question external response request_id trace
-  local manifest provider_calls diagnostics audit first_request_id
+  local manifest provider_calls diagnostics audit source_calls first_request_id
+  local initial_result_count initial_retained_count exact_retained_count
   owner="owner-evidence-followup"
   client="client-evidence-followup"
   question="Verify the follow-up records."
@@ -767,6 +768,7 @@ run_evidence_changed_premise_scenarios() {
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
+  configure_source_fixture "followup-sheet" "alternating_large_compact"
   reset_dsa_audit
   restart_orchestrator_with_reserve 8000
   queue_provider_answer "The exact follow-up record confirms the bounded detail."
@@ -779,6 +781,10 @@ run_evidence_changed_premise_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
+  source_calls="$(fetch_source_fixture_calls)"
+  initial_result_count="$(jq -r '.next_steps.initial_attempt.result_count' <<<"$manifest")"
+  initial_retained_count="$(jq -r '.next_steps.initial_attempt.retained_reference_count' <<<"$manifest")"
+  exact_retained_count="$(jq -r '.acquisition.prompt_retained_item_count' <<<"$manifest")"
   jq -e '
     .status == "ok"
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
@@ -804,6 +810,18 @@ run_evidence_changed_premise_scenarios() {
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "fetch")] | length) == 1
   ' <<<"$audit" >/dev/null
+  jq -e '
+    [.calls[] | select(
+      .source == "followup-sheet" and .operation == "google_values"
+    )] as $calls
+    | ($calls | length) == 2
+    and [$calls[].ordinal] == [1, 2]
+    and [$calls[].variant] == ["large", "compact"]
+    and ([$calls[].mode] | all(. == "alternating_large_compact"))
+    and ($calls[0].returned_row_count == $calls[1].returned_row_count)
+    and ($calls[0].returned_cell_character_count
+      > $calls[1].returned_cell_character_count)
+  ' <<<"$source_calls" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 2 2
 
@@ -814,6 +832,7 @@ run_evidence_changed_premise_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
+  source_calls="$(fetch_source_fixture_calls)"
   jq -e '
     .status == "degraded"
     and (.answer | contains("requested conclusion"))
@@ -831,11 +850,25 @@ run_evidence_changed_premise_scenarios() {
     ([.[] | select(.operation == "context_pack")] | length) == 2
     and ([.[] | select(.operation == "fetch")] | length) == 1
   ' <<<"$audit" >/dev/null
+  jq -e '
+    [.calls[] | select(
+      .source == "followup-sheet" and .operation == "google_values"
+    )] as $calls
+    | ($calls | length) == 3
+    and [$calls[].ordinal] == [1, 2, 3]
+    and [$calls[].variant] == ["large", "compact", "large"]
+    and ([$calls[].mode] | all(. == "alternating_large_compact"))
+    and ($calls[0].returned_cell_character_count
+      > $calls[1].returned_cell_character_count)
+    and ($calls[0].returned_cell_character_count
+      == $calls[2].returned_cell_character_count)
+  ' <<<"$source_calls" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  configure_source_fixture "followup-sheet" "ready"
   restart_orchestrator_with_reserve 2048
-  echo "Evidence changed premise: initial_request=$first_request_id targeted=1 exact_fetch=1 selections=2 provider=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
+  echo "Evidence changed premise: initial_request=$first_request_id targeted_results=$initial_result_count targeted_retained=$initial_retained_count changed_premise_authorizations=1 exact_fetch=1 exact_retained=$exact_retained_count selections=2 provider=1 repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
 }
 
 run_evidence_adversarial_provider_scenario() {
