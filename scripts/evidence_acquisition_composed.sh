@@ -1624,6 +1624,7 @@ run_evidence_history_unknown_scenario() {
   local shape_status plan_status strategy_status sufficiency_status dependency_status
   local selection_count next_step model_status persistence_counts
   local assistant_count trace_count claim_count
+  local sufficiency_flags qualification_required additional_acquisition_required
   owner="owner-history-unknown"
   client="client-history-unknown"
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}'
@@ -1676,6 +1677,17 @@ run_evidence_history_unknown_scenario() {
     strategy_status sufficiency_status dependency_status selection_count \
     next_step model_status <<<"$safe_fields"
   echo "Unknown acquisition safe state: response=$response_status manifest=$manifest_status shape=$shape_status plan=$plan_status strategy=$strategy_status sufficiency=$sufficiency_status dependency=$dependency_status selections=$selection_count next=$next_step model=$model_status"
+  sufficiency_flags="$(jq -r '
+    def bounded_boolean:
+      if type == "boolean" then tostring else "missing" end;
+    [
+      (.sufficiency.qualification_required | bounded_boolean),
+      (.sufficiency.additional_acquisition_required | bounded_boolean)
+    ] | @tsv
+  ' <<<"$manifest")"
+  IFS=$'\t' read -r qualification_required additional_acquisition_required \
+    <<<"$sufficiency_flags"
+  echo "Unknown sufficiency flags: qualification_required=$qualification_required additional_acquisition_required=$additional_acquisition_required"
 
   assert_jq "history.unknown.original.response_status" "$response" \
     '.status == "degraded"'
@@ -1698,11 +1710,12 @@ run_evidence_history_unknown_scenario() {
     and .acquisition.item_count == 0
     and .acquisition.prompt_retained_item_count == 0
   '
-  assert_jq "history.unknown.original.sufficiency" "$manifest" '
-    .sufficiency.status == "unknown"
-    and .sufficiency.qualification_required == false
-    and .sufficiency.additional_acquisition_required == true
-  '
+  assert_jq "history.unknown.original.sufficiency_status" "$manifest" \
+    '.sufficiency.status == "unknown"'
+  assert_jq "history.unknown.original.qualification_required" "$manifest" \
+    '.sufficiency.qualification_required == true'
+  assert_jq "history.unknown.original.additional_acquisition_required" "$manifest" \
+    '.sufficiency.additional_acquisition_required == true'
   assert_jq "history.unknown.original.next_step" "$manifest" '
     .next_steps.selection_count == 1
     and .next_steps.additional_acquisition_count == 0
