@@ -12,6 +12,7 @@ on:
           - all
           - history-hybrid
           - history-exhaustive
+          - history-unknown
   pull_request:
     branches:
       - main
