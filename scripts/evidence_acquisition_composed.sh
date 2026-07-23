@@ -1220,7 +1220,7 @@ run_evidence_history_scenarios() {
   trace="$(fetch_trace "$history_request")"
   jq -e '
     .status == "ok"
-    and (.answer | contains("specified references"))
+    and (.answer | contains("an exact fetch for 1 specified reference."))
     and (.answer | endswith("I did not perform a new verification for this explanation."))
   ' <<<"$history" >/dev/null
   jq -e '
