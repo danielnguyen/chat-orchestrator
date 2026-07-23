@@ -1081,7 +1081,7 @@ run_evidence_changed_premise_scenarios() {
       == $calls[2].returned_cell_character_count)
   ' <<<"$source_calls" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 1 1
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   configure_source_fixture "followup-sheet" "ready"
