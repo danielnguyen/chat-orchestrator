@@ -806,51 +806,35 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  echo "Evidence unavailable checkpoint: response_contract"
   jq -e '
     .status == "degraded"
     and (.answer | contains("acquisition failed"))
   ' <<<"$response" >/dev/null
-  echo "Evidence unavailable checkpoint: sufficiency"
   jq -e '.sufficiency.status == "insufficient"' <<<"$manifest" >/dev/null
-  echo "Evidence unavailable checkpoint: provider_call_count"
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  echo "Evidence unavailable checkpoint: provider_free_trace"
   assert_provider_free_trace "$trace"
-  echo "Evidence unavailable checkpoint: dsa_operation_counts"
   assert_dsa_operation_counts "$audit" 0 0 0
-  echo "Evidence unavailable checkpoint: dsa_error_trace"
-  echo "Evidence unavailable checkpoint: dsa_called"
-  jq -e '.dsa.called == true' <<<"$trace" >/dev/null
-  echo "Evidence unavailable checkpoint: dsa_status"
-  jq -e '.dsa.status == "error"' <<<"$trace" >/dev/null
-  echo "Evidence unavailable checkpoint: dsa_error_code"
-  jq -e '.dsa.error_code == "http_502"' <<<"$trace" >/dev/null
-  echo "Evidence unavailable checkpoint: dsa_error_trace_complete"
-  echo "Evidence unavailable checkpoint: fixture_call_count"
+  jq -e '
+    .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "error"
+    and .retrieval.prompt_assembly.dsa.error_code == "http_502"
+  ' <<<"$trace" >/dev/null
   jq -e '
     ([.calls[] | select(
       .source == "calendar-alpha" and .operation == "ics_get"
     )] | length) == 1
   ' <<<"$source_calls" >/dev/null
-  echo "Evidence unavailable checkpoint: runtime_event_counts"
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
-  echo "Evidence unavailable checkpoint: claim_calibration_count"
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  echo "Evidence unavailable checkpoint: persisted_answer_match"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Evidence unavailable checkpoint: persistence_counts"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
-  echo "Evidence unavailable checkpoint: privacy_boundary"
   case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")" in
     *PRIVATE*|*fixture-source-failure*|*credentials*|*Traceback*)
       echo "unavailable source diagnostics exposed private dependency data" >&2
       return 1
       ;;
   esac
-  echo "Evidence unavailable checkpoint: fixture_restore"
   configure_source_fixture "calendar-alpha" "ready"
-  echo "Evidence unavailable checkpoint: complete"
 
   owner="owner-evidence-malformed"
   client="client-evidence-malformed"
@@ -882,9 +866,9 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_provider_free_trace "$trace"
   assert_dsa_operation_counts "$audit" 0 0 0
   jq -e '
-    .dsa.called == true
-    and .dsa.status == "error"
-    and .dsa.error_code == "http_500"
+    .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "error"
+    and .retrieval.prompt_assembly.dsa.error_code == "http_500"
   ' <<<"$trace" >/dev/null
   jq -e '
     ([.calls[] | select(
