@@ -1228,16 +1228,144 @@ assert_pure_history() {
 }
 
 run_evidence_history_hybrid_scenario() {
-  local owner client conversation_id external response answer
+  local owner client conversation_id external response request_id answer trace manifest
+  local provider_calls diagnostics audit safe_fields response_status manifest_status
+  local shape_status plan_status strategy_status sufficiency_status dependency_status
+  local selection_count next_step model_status persistence_counts
+  local assistant_count trace_count claim_count
   owner="owner-history-hybrid"
   client="client-history-hybrid"
   external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
+  reset_dsa_audit
   queue_provider_answer "The selected calendars show bounded differences."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-hybrid")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Compare these two review calendars and explain the differences between them." "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  safe_fields="$(jq -nr \
+    --argjson response "$response" \
+    --argjson manifest "$manifest" \
+    --argjson trace "$trace" '
+      def safe_label:
+        if type == "string"
+          and length >= 1
+          and length <= 120
+          and test("^[A-Za-z0-9_.:-]{1,120}$")
+        then . else "missing" end;
+      [
+        ($response.status | safe_label),
+        ($manifest.status | safe_label),
+        ($manifest.shape.task_shape | safe_label),
+        ($manifest.plan.plan_status | safe_label),
+        ($manifest.acquisition.strategy_attempted | safe_label),
+        ($manifest.sufficiency.status | safe_label),
+        (if $manifest.next_steps.dependency_status == null
+         then "none"
+         else ($manifest.next_steps.dependency_status | safe_label)
+         end),
+        (if ($manifest.next_steps.selection_count | type) == "number"
+          and $manifest.next_steps.selection_count >= 0
+          and $manifest.next_steps.selection_count <= 2
+          and $manifest.next_steps.selection_count
+            == ($manifest.next_steps.selection_count | floor)
+         then ($manifest.next_steps.selection_count | tostring)
+         else "missing"
+         end),
+        ($manifest.next_steps.selections[-1].selected_next_step | safe_label),
+        ($trace.model_call.status | safe_label)
+      ] | @tsv
+    ')"
+  IFS=$'\t' read -r response_status manifest_status shape_status plan_status \
+    strategy_status sufficiency_status dependency_status selection_count \
+    next_step model_status <<<"$safe_fields"
+  echo "Hybrid acquisition safe state: response=$response_status manifest=$manifest_status shape=$shape_status plan=$plan_status strategy=$strategy_status sufficiency=$sufficiency_status dependency=$dependency_status selections=$selection_count next=$next_step model=$model_status"
+
+  assert_jq "history.hybrid.original.response_status" "$response" \
+    '.status == "ok"'
+  assert_jq "history.hybrid.original.manifest_status" "$manifest" \
+    '.status == "sufficient_for_declared_scope"'
+  assert_jq "history.hybrid.original.shape" "$manifest" '
+    .shape.derivation_status == "derived"
+    and .shape.task_shape == "cross_source_comparison"
+    and .shape.clarification_required == false
+  '
+  assert_jq "history.hybrid.original.plan" "$manifest" '
+    .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["hybrid"]
+    and .plan.completeness_expectation == "complete_for_selected_sources"
+    and .plan.contradiction_search_required == false
+  '
+  assert_jq "history.hybrid.original.acquisition" "$manifest" '
+    .acquisition.strategy_attempted == "hybrid"
+    and .acquisition.expansion_attempt_count == 2
+    and .acquisition.expansion_successful_count == 2
+    and .acquisition.sources_selected == ["calendar_alpha", "calendar_beta"]
+    and .acquisition.sources_used == ["calendar_alpha", "calendar_beta"]
+    and .acquisition.prompt_retained_item_count >= 2
+  '
+  assert_jq "history.hybrid.original.sufficiency" "$manifest" '
+    .sufficiency.status == "sufficient_for_declared_scope"
+    and .sufficiency.qualification_required == false
+    and .sufficiency.additional_acquisition_required == false
+  '
+  assert_jq "history.hybrid.original.next_step" "$manifest" '
+    .next_steps.selection_count == 1
+    and .next_steps.additional_acquisition_count == 0
+    and .next_steps.dependency_status == null
+    and .next_steps.selections[0].selected_next_step
+      == "answer_within_declared_scope"
+    and .next_steps.selections[0].provider_disposition == "allowed"
+    and .next_steps.selections[0].reacquisition_guard == "not_applicable"
+    and .next_steps.selections[0].additional_acquisition_executed == false
+  '
+  assert_jq "history.hybrid.original.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_jq "history.hybrid.original.model" "$trace" '
+    .model_call.status == "ok"
+    and (.model_calls | length) == 1
+    and .fallback.triggered == false
+  '
+  assert_jq "history.hybrid.original.runtime" "$diagnostics" '
+    ([.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_shape_derived"
+    )] | length) == 1
+    and ([.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_plan_compiled"
+    )] | length) == 1
+    and ([.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_sufficiency_evaluated"
+    )] | length) == 1
+    and ([.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_next_step_selected"
+    )] | length) == 1
+  ' --arg request_id "$request_id"
+  assert_jq "history.hybrid.original.dsa" "$audit" '
+    ([.[] | select(.operation == "context_pack")] | length) == 1
+    and ([.[] | select(.operation == "context")] | length) == 2
+    and ([.[] | select(.operation == "fetch")] | length) == 0
+  '
+  assistant_count="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id = '$conversation_id' AND role = 'assistant' AND metadata->>'request_id' = '$request_id';")"
+  trace_count="$(psql_exec -At -c "SELECT count(*) FROM traces WHERE conversation_id = '$conversation_id' AND request_id = '$request_id';")"
+  claim_count="$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE conversation_id = '$conversation_id' AND request_id = '$request_id';")"
+  persistence_counts="$(jq -nc \
+    --arg assistant "$assistant_count" \
+    --arg trace "$trace_count" \
+    --arg claims "$claim_count" \
+    '{assistant:$assistant,trace:$trace,claims:$claims}')"
+  assert_jq "history.hybrid.original.persistence" "$persistence_counts" '
+    .assistant == "1" and .trace == "1" and .claims == "0"
+  '
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What did you examine?" "bounded comparison across 2 selected configured sources" \
     "history.hybrid"
