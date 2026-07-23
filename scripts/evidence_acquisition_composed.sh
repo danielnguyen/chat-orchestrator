@@ -1337,7 +1337,7 @@ run_evidence_claim_subset_scenario() {
   source_message_id="$(add_message "$conversation_id" "$owner" "$client" "user" "The setting is active in the retained file.")"
   derived_id="$(seed_derived \
     "$conversation_id" "$owner" "$client" "$source_message_id" \
-    "The setting is active in the retained file." "active" "evidence-claim" "active")"
+    "The setting is active in the retained file." "active" "006" "active")"
   provider_sentinel="provider-manifest-sentinel"
   queue_provider_answer "The retained file reports that the setting is active with $provider_sentinel."
   response="$(run_evidence_chat_with_artifacts \
