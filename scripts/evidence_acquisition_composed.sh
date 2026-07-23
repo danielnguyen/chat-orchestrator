@@ -2058,6 +2058,7 @@ run_evidence_claim_subset_scenario() {
 run_evidence_history_negative_scenarios() {
   local owner client conversation_id external response answer messages history request_id trace
   local target sentinel newer newer_answer original_request same_owner_conversation
+  local corrupt_count privacy_invalid_count
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}'
 
   owner="owner-history-mismatch"
@@ -2072,24 +2073,36 @@ run_evidence_history_negative_scenarios() {
   queue_provider_answer "A newer persisted bounded response is available."
   newer="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   newer_answer="$(jq -r '.answer' <<<"$newer")"
-  test "$answer" != "$newer_answer"
-  assert_request_persistence_counts "$conversation_id" "$(jq -r '.request_id' <<<"$newer")" 0
+  if [[ "$answer" == "$newer_answer" ]]; then
+    echo "Assertion failed: history.negatives.immediate.answers_differ" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$(jq -r '.request_id' <<<"$newer")" 0; then
+    echo "Assertion failed: history.negatives.immediate.newer_persistence" >&2
+    return 1
+  fi
   messages="$(jq -nc --arg answer "$answer" '[{role:"assistant",content:$answer},{role:"user",content:"What did you check?"}]')"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  jq -e '
+  assert_jq "history.negatives.immediate.response" "$history" '
     .status == "degraded"
     and (.answer | contains("no retained acquisition record could be resolved"))
     and (.answer | endswith("I did not perform a new verification for this explanation."))
-  ' <<<"$history" >/dev/null
-  assert_history_request_boundaries "$conversation_id" "$history" "no_record"
+  '
+  if ! assert_history_request_boundaries \
+    "$conversation_id" "$history" "no_record"; then
+    echo "Assertion failed: history.negatives.immediate.boundaries" >&2
+    return 1
+  fi
   case "$(jq -c . <<<"$history")$(jq -c . <<<"$HISTORY_TRACE")" in
     *"$original_request"*|*records_primary*|*The\ retained\ migration\ record*)
-      echo "immediate history mismatch scanned backward to the older record" >&2
+      echo "Assertion failed: history.negatives.immediate.no_backward_scan" >&2
       return 1
       ;;
   esac
+  echo "History negative case passed: immediate"
 
   target="A quoted acquisition statement that was never persisted."
   messages="$(jq -nc --arg answer "$newer_answer" --arg target "$target" '
@@ -2097,11 +2110,16 @@ run_evidence_history_negative_scenarios() {
   ')"
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  jq -e '
+  assert_jq "history.negatives.quoted_not_found.response" "$history" '
     .status == "degraded"
     and (.answer | contains("no retained acquisition record could be resolved"))
-  ' <<<"$history" >/dev/null
-  assert_history_request_boundaries "$conversation_id" "$history" "no_record"
+  '
+  if ! assert_history_request_boundaries \
+    "$conversation_id" "$history" "no_record"; then
+    echo "Assertion failed: history.negatives.quoted_not_found.boundaries" >&2
+    return 1
+  fi
+  echo "History negative case passed: quoted_not_found"
 
   owner="owner-history-ambiguous"
   client="client-history-ambiguous"
@@ -2118,12 +2136,17 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  jq -e '
+  assert_jq "history.negatives.ambiguous.response" "$history" '
     .status == "degraded"
     and (.answer | contains("more than one exact prior response matched"))
     and (.answer | contains("no record was selected"))
-  ' <<<"$history" >/dev/null
-  assert_history_request_boundaries "$conversation_id" "$history" "ambiguous"
+  '
+  if ! assert_history_request_boundaries \
+    "$conversation_id" "$history" "ambiguous"; then
+    echo "Assertion failed: history.negatives.ambiguous.boundaries" >&2
+    return 1
+  fi
+  echo "History negative case passed: ambiguous"
 
   owner="owner-history-corrupt"
   client="client-history-corrupt"
@@ -2134,7 +2157,7 @@ run_evidence_history_negative_scenarios() {
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
-  psql_exec -c "
+  if ! psql_exec -c "
     UPDATE traces
     SET prompt_json = jsonb_set(
       prompt_json,
@@ -2142,17 +2165,35 @@ run_evidence_history_negative_scenarios() {
       '\"association-corrupted\"'::jsonb
     )
     WHERE request_id = '$request_id';
-  " >/dev/null
+  " >/dev/null; then
+    echo "Assertion failed: history.negatives.corrupt.mutation" >&2
+    return 1
+  fi
+  if ! corrupt_count="$(psql_exec -At -c "
+    SELECT count(*)
+    FROM traces
+    WHERE request_id = '$request_id'
+      AND prompt_json #>> '{evidence_acquisition,assistant_message_id}'
+        = 'association-corrupted';
+  ")" || [[ "$corrupt_count" != "1" ]]; then
+    echo "Assertion failed: history.negatives.corrupt.mutation" >&2
+    return 1
+  fi
   messages="$(jq -nc --arg answer "$answer" '[{role:"assistant",content:$answer},{role:"user",content:"What did you check?"}]')"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  jq -e '
+  assert_jq "history.negatives.corrupt.response" "$history" '
     .status == "degraded"
     and (.answer | contains("failed association or privacy validation"))
     and (.answer | contains("association-corrupted") | not)
-  ' <<<"$history" >/dev/null
-  assert_history_request_boundaries "$conversation_id" "$history" "invalid"
+  '
+  if ! assert_history_request_boundaries \
+    "$conversation_id" "$history" "invalid"; then
+    echo "Assertion failed: history.negatives.corrupt.boundaries" >&2
+    return 1
+  fi
+  echo "History negative case passed: corrupt"
 
   owner="owner-history-private-invalid"
   client="client-history-private-invalid"
@@ -2164,7 +2205,7 @@ run_evidence_history_negative_scenarios() {
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
   sentinel="PRIVATE-CREDENTIAL-SENTINEL"
-  psql_exec -c "
+  if ! psql_exec -c "
     UPDATE traces
     SET prompt_json = jsonb_set(
       prompt_json,
@@ -2173,25 +2214,42 @@ run_evidence_history_negative_scenarios() {
       true
     )
     WHERE request_id = '$request_id';
-  " >/dev/null
+  " >/dev/null; then
+    echo "Assertion failed: history.negatives.privacy_invalid.mutation" >&2
+    return 1
+  fi
+  if ! privacy_invalid_count="$(psql_exec -At -c "
+    SELECT count(*)
+    FROM traces
+    WHERE request_id = '$request_id'
+      AND prompt_json #>> '{evidence_acquisition,acquisition,api_key}'
+        = '$sentinel';
+  ")" || [[ "$privacy_invalid_count" != "1" ]]; then
+    echo "Assertion failed: history.negatives.privacy_invalid.mutation" >&2
+    return 1
+  fi
   messages="$(jq -nc --arg answer "$answer" '[{role:"assistant",content:$answer},{role:"user",content:"What did you check?"}]')"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
   trace="$(fetch_trace "$(jq -r '.request_id' <<<"$history")")"
-  jq -e \
-    --arg sentinel "$sentinel" '
+  assert_jq "history.negatives.privacy_invalid.response" "$history" '
       .status == "degraded"
       and (.answer | contains("failed association or privacy validation"))
       and (.answer | contains($sentinel) | not)
-    ' <<<"$history" >/dev/null
+    ' --arg sentinel "$sentinel"
   case "$(jq -c . <<<"$trace")" in
     *PRIVATE-CREDENTIAL-SENTINEL*)
-      echo "privacy-invalid history leaked corrupted content" >&2
+      echo "Assertion failed: history.negatives.privacy_invalid.trace_privacy" >&2
       return 1
       ;;
   esac
-  assert_history_request_boundaries "$conversation_id" "$history" "invalid"
+  if ! assert_history_request_boundaries \
+    "$conversation_id" "$history" "invalid"; then
+    echo "Assertion failed: history.negatives.privacy_invalid.boundaries" >&2
+    return 1
+  fi
+  echo "History negative case passed: privacy_invalid"
 
   owner="owner-history-isolated"
   client="client-history-isolated"
@@ -2200,17 +2258,22 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  jq -e '
+  assert_jq "history.negatives.owner_isolation.response" "$history" '
     .status == "degraded"
     and (.answer | contains("no retained acquisition record could be resolved"))
-  ' <<<"$history" >/dev/null
+  '
   case "$(jq -c . <<<"$history")" in
     *owner-history-private-invalid*|*PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
-      echo "owner-isolated history exposed the original record" >&2
+      echo "Assertion failed: history.negatives.owner_isolation.privacy" >&2
       return 1
       ;;
   esac
-  assert_history_request_boundaries "$conversation_id" "$history" "no_record"
+  if ! assert_history_request_boundaries \
+    "$conversation_id" "$history" "no_record"; then
+    echo "Assertion failed: history.negatives.owner_isolation.boundaries" >&2
+    return 1
+  fi
+  echo "History negative case passed: owner_isolation"
 
   owner="owner-history-private-invalid"
   client="client-history-private-invalid"
@@ -2219,17 +2282,22 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$same_owner_conversation" "$messages")"
-  jq -e '
+  assert_jq "history.negatives.conversation_isolation.response" "$history" '
     .status == "degraded"
     and (.answer | contains("no retained acquisition record could be resolved"))
-  ' <<<"$history" >/dev/null
+  '
   case "$(jq -c . <<<"$history")" in
     *PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
-      echo "conversation-isolated history exposed the original record" >&2
+      echo "Assertion failed: history.negatives.conversation_isolation.privacy" >&2
       return 1
       ;;
   esac
-  assert_history_request_boundaries "$same_owner_conversation" "$history" "no_record"
+  if ! assert_history_request_boundaries \
+    "$same_owner_conversation" "$history" "no_record"; then
+    echo "Assertion failed: history.negatives.conversation_isolation.boundaries" >&2
+    return 1
+  fi
+  echo "History negative case passed: conversation_isolation"
   echo "Evidence history negatives: immediate_no_backward_scan=1 quoted_not_found=1 quoted_ambiguity=1 malformed_association=1 privacy_invalid=1 owner_isolation=1 conversation_isolation=1 provider=0"
 }
 
@@ -2432,6 +2500,10 @@ run_evidence_acquisition_composed_suite() {
     history-unknown)
       run_evidence_history_unknown_scenario
       echo "Evidence acquisition composed smoke passed: scenarios=history-unknown"
+      ;;
+    history-negatives)
+      run_evidence_history_negative_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=history-negatives"
       ;;
     *)
       if [[ "$scenario" =~ ^[A-Za-z0-9_.:-]{1,120}$ ]]; then
