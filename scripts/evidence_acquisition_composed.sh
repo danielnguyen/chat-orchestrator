@@ -1153,6 +1153,7 @@ assert_pure_history() {
   local messages response request_id trace
   local diagnostic_fields lookup_status resolution_status manifest_resolution_status
   local reason_code projection_status projection_reason selected_source_count serialized
+  local budget_disclosed candidate_disclosed disclosure_fields
   messages="$(jq -nc \
     --arg answer "$prior_answer" \
     --arg question "$question" \
@@ -1212,6 +1213,13 @@ assert_pure_history() {
         ;;
       history.exhaustive)
         echo "Exhaustive history safe state: lookup=$lookup_status resolution=$resolution_status manifest=$manifest_resolution_status reason=$reason_code projection_status=$projection_status projection_reason=$projection_reason selected_sources=$selected_source_count"
+        disclosure_fields="$(jq -r '[
+          (.answer | contains("Acquisition was truncated by the retrieval budget.")),
+          (.answer | contains("Candidate selection was truncated."))
+        ] | @tsv' <<<"$response")"
+        IFS=$'\t' read -r budget_disclosed candidate_disclosed \
+          <<<"$disclosure_fields"
+        echo "Exhaustive history truncation disclosure: budget=$budget_disclosed candidate=$candidate_disclosed"
         ;;
     esac
   fi
@@ -1390,6 +1398,10 @@ run_evidence_history_exhaustive_scenario() {
   local shape_status plan_status strategy_status sufficiency_status dependency_status
   local selection_count next_step model_status persistence_counts
   local assistant_count trace_count claim_count
+  local detail_fields selected_count selected_expected used_count used_expected
+  local expansion_attempts expansion_success expansion_truncated item_count
+  local retained_count aggregate_budget_truncated search_budget_truncated
+  local expansion_budget_truncated candidate_truncated
   owner="owner-history-exhaustive"
   client="client-history-exhaustive"
   external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":1}'
@@ -1443,7 +1455,9 @@ run_evidence_history_exhaustive_scenario() {
     strategy_status sufficiency_status dependency_status selection_count \
     next_step model_status <<<"$safe_fields"
   echo "Exhaustive acquisition safe state: response=$response_status manifest=$manifest_status shape=$shape_status plan=$plan_status strategy=$strategy_status sufficiency=$sufficiency_status dependency=$dependency_status selections=$selection_count next=$next_step model=$model_status"
-  detail_fields="$(jq -nr --argjson manifest "$manifest" '
+  detail_fields="$(jq -nr \
+    --argjson manifest "$manifest" \
+    --argjson trace "$trace" '
     def bounded_integer($maximum):
       if type == "number"
         and . >= 0
@@ -1465,16 +1479,22 @@ run_evidence_history_exhaustive_scenario() {
       ($manifest.acquisition.sources_used == ["complete_register"] | tostring),
       ($manifest.acquisition.expansion_attempt_count | bounded_integer(16)),
       ($manifest.acquisition.expansion_successful_count | bounded_integer(16)),
+      ($manifest.acquisition.expansion_truncated_count | bounded_integer(16)),
       ($manifest.acquisition.item_count | bounded_integer(10000)),
       ($manifest.acquisition.prompt_retained_item_count | bounded_integer(10000)),
       ($manifest.acquisition.dsa_budget_truncation | bounded_boolean),
+      ($trace.retrieval.prompt_assembly.dsa.search_budget_truncated
+        | bounded_boolean),
+      ($trace.retrieval.prompt_assembly.dsa.expansion_budget_truncated
+        | bounded_boolean),
       ($manifest.acquisition.candidate_truncation | bounded_boolean)
     ] | @tsv
   ')"
   IFS=$'\t' read -r selected_count selected_expected used_count used_expected \
-    expansion_attempts expansion_success item_count retained_count \
-    dsa_truncated candidate_truncated <<<"$detail_fields"
-  echo "Exhaustive acquisition details: selected_count=$selected_count selected_expected=$selected_expected used_count=$used_count used_expected=$used_expected expansion_attempts=$expansion_attempts expansion_success=$expansion_success item_count=$item_count retained_count=$retained_count dsa_truncated=$dsa_truncated candidate_truncated=$candidate_truncated"
+    expansion_attempts expansion_success expansion_truncated item_count \
+    retained_count aggregate_budget_truncated search_budget_truncated \
+    expansion_budget_truncated candidate_truncated <<<"$detail_fields"
+  echo "Exhaustive acquisition details: selected_count=$selected_count selected_expected=$selected_expected used_count=$used_count used_expected=$used_expected expansion_attempts=$expansion_attempts expansion_success=$expansion_success expansion_truncated=$expansion_truncated item_count=$item_count retained_count=$retained_count aggregate_budget_truncated=$aggregate_budget_truncated search_budget_truncated=$search_budget_truncated expansion_budget_truncated=$expansion_budget_truncated candidate_truncated=$candidate_truncated"
 
   assert_jq "history.exhaustive.original.response_status" "$response" \
     '.status == "ok"'
@@ -1505,9 +1525,24 @@ run_evidence_history_exhaustive_scenario() {
     .acquisition.item_count == 1
     and .acquisition.prompt_retained_item_count == 1
   '
-  assert_jq "history.exhaustive.original.truncation" "$manifest" '
-    .acquisition.dsa_budget_truncation == false
-    and .acquisition.candidate_truncation == false
+  assert_jq "history.exhaustive.original.aggregate_truncation" "$manifest" '
+    .acquisition.dsa_budget_truncation == true
+    and .acquisition.candidate_truncation == true
+  '
+  assert_jq "history.exhaustive.original.search_truncation" "$trace" '
+    .retrieval.prompt_assembly.dsa.search_budget_truncated == true
+    and .retrieval.prompt_assembly.dsa.candidate_truncated == true
+  '
+  assert_jq "history.exhaustive.original.expansion_complete" "$trace" '
+    .retrieval.prompt_assembly.dsa.expansion_budget_truncated == false
+    and .retrieval.prompt_assembly.dsa.context_expansion_call_count == 1
+    and .retrieval.prompt_assembly.dsa.final_combined_item_count == 1
+  '
+  assert_jq "history.exhaustive.original.expansion_outcome" "$manifest" '
+    .acquisition.expansion_attempt_count == 1
+    and .acquisition.expansion_successful_count == 1
+    and .acquisition.expansion_truncated_count == 0
+    and .acquisition.prompt_retained_item_count == 1
   '
   assert_jq "history.exhaustive.original.sufficiency" "$manifest" '
     .sufficiency.status == "sufficient_for_declared_scope"
