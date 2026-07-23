@@ -1135,11 +1135,21 @@ normalized_first_paragraph() {
   awk 'BEGIN { RS = "" } { gsub(/[[:space:]]+/, " "); print; exit }'
 }
 
+assert_jq() {
+  local label="$1" json="$2" predicate="$3"
+  shift 3
+  if ! jq -e "$@" "$predicate" <<<"$json" >/dev/null 2>&1; then
+    echo "Assertion failed: $label" >&2
+    return 1
+  fi
+}
+
 assert_pure_history() {
   local owner="$1" client="$2" conversation_id="$3" prior_answer="$4"
-  local question="$5" expected_fragment="$6" messages response request_id trace
+  local question="$5" expected_fragment="$6" scenario_label="$7"
+  local messages response request_id trace
   local diagnostic_fields lookup_status resolution_status manifest_resolution_status
-  local reason_code selected_source_count serialized
+  local reason_code projection_status projection_reason selected_source_count serialized
   messages="$(jq -nc \
     --arg answer "$prior_answer" \
     --arg question "$question" \
@@ -1149,14 +1159,16 @@ assert_pure_history() {
   response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
-  if [[ "$expected_fragment" == "bounded comparison across 2 selected configured sources" ]]; then
+  if [[ "$scenario_label" == "history.hybrid" ]]; then
     diagnostic_fields="$(jq -er '
       .prompt.claim_explanation as $explanation
       | [
           $explanation.lookup_status,
           $explanation.resolution_status,
           $explanation.manifest_resolution_status,
-          $explanation.reason_code
+          $explanation.reason_code,
+          $explanation.manifest_projection_status,
+          $explanation.manifest_projection_reason
         ] as $labels
       | ($labels | map(
           if type == "string" then
@@ -1186,35 +1198,49 @@ assert_pure_history() {
         end
     ' <<<"$trace")"
     IFS=$'\t' read -r lookup_status resolution_status \
-      manifest_resolution_status reason_code selected_source_count \
+      manifest_resolution_status reason_code projection_status projection_reason \
+      selected_source_count \
       <<<"$diagnostic_fields"
-    echo "Evidence hybrid history trace: lookup=$lookup_status resolution=$resolution_status manifest=$manifest_resolution_status reason=$reason_code selected_source_count=$selected_source_count"
+    if [[ "${EVIDENCE_SCENARIO:-all}" == "history-hybrid" || "$projection_status" != "accepted" ]]; then
+      echo "Hybrid history safe state: lookup=$lookup_status resolution=$resolution_status manifest=$manifest_resolution_status reason=$reason_code projection_status=$projection_status projection_reason=$projection_reason selected_sources=$selected_source_count"
+    fi
   fi
-  echo "Evidence pure history checkpoint: response_fragment"
-  jq -e \
-    --arg fragment "$expected_fragment" '
-      .answer | contains($fragment)
-    ' <<<"$response" >/dev/null
-  echo "Evidence pure history checkpoint: response_suffix"
-  jq -e '
+  assert_jq "${scenario_label}.response_fragment" "$response" \
+    '.answer | contains($fragment)' --arg fragment "$expected_fragment"
+  assert_jq "${scenario_label}.response_suffix" "$response" '
     .answer
     | endswith("I did not perform a new verification for this explanation.")
-  ' <<<"$response" >/dev/null
-  echo "Evidence pure history checkpoint: trace_target_mode"
-  jq -e '
+  '
+  assert_jq "${scenario_label}.trace_target_mode" "$trace" '
     .prompt.claim_explanation.target_mode == "immediate_previous"
-  ' <<<"$trace" >/dev/null
-  echo "Evidence pure history checkpoint: request_boundaries"
-  assert_history_request_boundaries "$conversation_id" "$response" "resolved"
+  '
+  if ! assert_history_request_boundaries "$conversation_id" "$response" "resolved"; then
+    echo "Assertion failed: ${scenario_label}.request_boundaries" >&2
+    return 1
+  fi
   serialized="$(jq -c . <<<"$response")$(jq -c '.prompt.claim_explanation' <<<"$trace")"
-  echo "Evidence pure history checkpoint: privacy_boundary"
   case "$serialized" in
     *records_primary*|*complete_register*|*calendar_alpha*|*calendar_beta*|*google_sheets:*|*http://*|*PRIVATE*)
-      echo "trace-first acquisition history exposed a private identifier or content" >&2
+      echo "Assertion failed: ${scenario_label}.privacy_boundary" >&2
       return 1
       ;;
   esac
-  echo "Evidence pure history checkpoint: complete"
+}
+
+run_evidence_history_hybrid_scenario() {
+  local owner client conversation_id external response answer
+  owner="owner-history-hybrid"
+  client="client-history-hybrid"
+  external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  queue_provider_answer "The selected calendars show bounded differences."
+  conversation_id="$(resolve_conversation "$owner" "$client" "history-hybrid")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Compare these two review calendars and explain the differences between them." "$external")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
+    "What did you examine?" "bounded comparison across 2 selected configured sources" \
+    "history.hybrid"
 }
 
 run_evidence_history_scenarios() {
@@ -1234,7 +1260,8 @@ run_evidence_history_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you check?" "retained record shows a targeted lookup"
+    "What did you check?" "retained record shows a targeted lookup" \
+    "history.targeted"
 
   owner="owner-history-exact"
   client="client-history-exact"
@@ -1281,18 +1308,7 @@ run_evidence_history_scenarios() {
   ' <<<"$trace" >/dev/null
   assert_history_request_boundaries "$conversation_id" "$history" "resolved"
 
-  owner="owner-history-hybrid"
-  client="client-history-hybrid"
-  external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
-  provider_post "/fixture/reset" '{}'
-  reset_source_fixture
-  queue_provider_answer "The selected calendars show bounded differences."
-  conversation_id="$(resolve_conversation "$owner" "$client" "history-hybrid")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Compare these two review calendars and explain the differences between them." "$external")"
-  answer="$(jq -r '.answer' <<<"$response")"
-  echo "Evidence hybrid history diagnostic: start"
-  assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you examine?" "bounded comparison across 2 selected configured sources"
+  run_evidence_history_hybrid_scenario
 
   owner="owner-history-exhaustive"
   client="client-history-exhaustive"
@@ -1304,7 +1320,8 @@ run_evidence_history_scenarios() {
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Check whether every mandatory entry in the register is reviewed." "$external")"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "Did you look at everything relevant?" "Within the declared bounded scope, yes."
+    "Did you look at everything relevant?" "Within the declared bounded scope, yes." \
+    "history.exhaustive"
 
   owner="owner-history-limited"
   client="client-history-limited"
@@ -1315,7 +1332,8 @@ run_evidence_history_scenarios() {
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"allowed_sensitivity":"medium"}')"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What might you have missed?" "sufficient only with recorded limitations"
+    "What might you have missed?" "sufficient only with recorded limitations" \
+    "history.limited"
 
   owner="owner-history-unknown"
   client="client-history-unknown"
@@ -1325,7 +1343,8 @@ run_evidence_history_scenarios() {
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the zephyr artifact." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you not check?" "sufficiency remained unknown"
+    "What did you not check?" "sufficiency remained unknown" \
+    "history.unknown"
   echo "Evidence history: targeted=resolved exact_quoted=resolved hybrid=resolved exhaustive=resolved limited=resolved unknown=resolved claim_dependency=0 provider=0 dsa=0 cr_evidence=0"
 }
 
@@ -1359,7 +1378,8 @@ run_evidence_privacy_history_scenario() {
       ;;
   esac
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you check?" "retained record shows a targeted lookup"
+    "What did you check?" "retained record shows a targeted lookup" \
+    "history.private"
   serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$manifest")$(jq -c . <<<"$trace")$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
   case "$serialized" in
     *records_primary*|*google_sheets:*|*targeted-sheet*|*fixture_google*|*http://source-fixture*|*The\ migration\ record\ confirms*|*PRIVATE\ SOURCE\ DETAIL*)
@@ -1875,18 +1895,35 @@ run_evidence_compound_scenarios() {
 }
 
 run_evidence_acquisition_composed_suite() {
-  run_evidence_targeted_scenario
-  run_evidence_exact_scenario
-  run_evidence_hybrid_scenarios
-  run_evidence_exhaustive_scenarios
-  run_evidence_limitation_and_failure_scenarios
-  run_evidence_clarification_scenario
-  run_evidence_changed_premise_scenarios
-  run_evidence_adversarial_provider_scenario
-  run_evidence_claim_subset_scenario
-  run_evidence_history_scenarios
-  run_evidence_privacy_history_scenario
-  run_evidence_history_negative_scenarios
-  run_evidence_compound_scenarios
-  echo "Evidence acquisition composed smoke passed: scenarios=targeted,exact,hybrid,exhaustive,limited,unknown,failure,clarification,changed-premise,repeated-premise,adversarial-provider,claim-subset,trace-first-history,privacy-history,history-negatives,compound-verification"
+  local scenario="${EVIDENCE_SCENARIO:-all}"
+  case "$scenario" in
+    ""|all)
+      run_evidence_targeted_scenario
+      run_evidence_exact_scenario
+      run_evidence_hybrid_scenarios
+      run_evidence_exhaustive_scenarios
+      run_evidence_limitation_and_failure_scenarios
+      run_evidence_clarification_scenario
+      run_evidence_changed_premise_scenarios
+      run_evidence_adversarial_provider_scenario
+      run_evidence_claim_subset_scenario
+      run_evidence_history_scenarios
+      run_evidence_privacy_history_scenario
+      run_evidence_history_negative_scenarios
+      run_evidence_compound_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=targeted,exact,hybrid,exhaustive,limited,unknown,failure,clarification,changed-premise,repeated-premise,adversarial-provider,claim-subset,trace-first-history,privacy-history,history-negatives,compound-verification"
+      ;;
+    history-hybrid)
+      run_evidence_history_hybrid_scenario
+      echo "Evidence acquisition composed smoke passed: scenarios=history-hybrid"
+      ;;
+    *)
+      if [[ "$scenario" =~ ^[A-Za-z0-9_.:-]{1,120}$ ]]; then
+        echo "Unsupported evidence scenario: $scenario" >&2
+      else
+        echo "Unsupported evidence scenario: invalid" >&2
+      fi
+      return 1
+      ;;
+  esac
 }

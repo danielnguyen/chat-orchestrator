@@ -1,6 +1,16 @@
 name: Evidence acquisition composed smoke
 
 on:
+  workflow_dispatch:
+    inputs:
+      evidence_scenario:
+        description: Evidence scenario to execute
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - history-hybrid
   pull_request:
     branches:
       - main
@@ -70,9 +80,11 @@ jobs:
         env:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
           EVIDENCE_ACQUISITION_ONLY: "1"
+          EVIDENCE_SCENARIO: ${{ github.event_name == 'workflow_dispatch' && inputs.evidence_scenario || 'all' }}
         run: make composed-smoke
 
       - name: Run complete composed smoke regression
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
         working-directory: chat-orchestrator
         env:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs

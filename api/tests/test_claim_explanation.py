@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
+import re
 
 import pytest
 from clients.memory_store import MemoryStoreClient
 from services.claim_explanation import (
+    AcquisitionHistoryProjection,
     ClaimExplanationIntent,
     ClaimExplanationOutcome,
+    _diagnose_acquisition_history_projection,
+    _project_acquisition_history,
     is_claim_explanation_intent,
     parse_claim_explanation_intent,
     resolve_claim_explanation,
@@ -363,6 +368,145 @@ def _suppressed_trace():
         acquisition[field] = []
     acquisition["source_identifiers_suppressed"] = True
     return trace
+
+
+def _set_path(value, path, replacement):
+    target = value
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
+    return value
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        _manifest(),
+        _manifest(strategy="exact_fetch"),
+        _hybrid_manifest(),
+        _hybrid_manifest(task_shape="bounded_exhaustive_review"),
+        _suppressed_trace()["prompt"]["evidence_acquisition"],
+    ],
+)
+def test_diagnosed_projection_preserves_valid_manifest_acceptance(manifest):
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert isinstance(diagnosed, AcquisitionHistoryProjection)
+    assert diagnosed.history is not None
+    assert diagnosed.reason == "accepted"
+    assert _project_acquisition_history(manifest) == diagnosed.history
+
+
+@pytest.mark.parametrize(
+    ("manifest", "reason"),
+    [
+        (None, "manifest_not_object"),
+        ({}, "manifest_top_level_keys_invalid"),
+        (_set_path(_manifest(), ["enabled"], False), "manifest_enabled_invalid"),
+        (_set_path(_manifest(), ["attempted"], False), "manifest_attempted_invalid"),
+        (_set_path(_manifest(), ["manifest_id"], "unsafe id"), "manifest_id_invalid"),
+        (
+            _set_path(_manifest(), ["assistant_message_id"], "unsafe id"),
+            "assistant_message_id_invalid",
+        ),
+        (
+            _set_path(_manifest(), ["response_digest"], "invalid"),
+            "response_digest_invalid",
+        ),
+        (
+            _set_path(_manifest(), ["plan", "selected_strategies"], ["hybrid"]),
+            "strategy_mismatch",
+        ),
+        (
+            _set_path(_manifest(), ["inventory", "inventory_source_count"], -1),
+            "inventory_count_invalid_inventory_source_count",
+        ),
+        (
+            _set_path(
+                _manifest(),
+                ["acquisition", "sources_selected"],
+                ["source-a", "source-c"],
+            ),
+            "selected_sources_not_subset_of_considered",
+        ),
+        (
+            _set_path(
+                _manifest(), ["acquisition", "prompt_retained_item_count"], 3
+            ),
+            "prompt_retained_count_exceeds_usable_count",
+        ),
+        (
+            _set_path(
+                _hybrid_manifest(),
+                ["acquisition", "expansion_successful_count"],
+                1,
+            ),
+            "expansion_attempt_projection_invalid",
+        ),
+        (
+            _set_path(
+                _hybrid_manifest(),
+                ["next_steps", "selections", 0, "provider_disposition"],
+                "blocked",
+            ),
+            "next_step_selection_consistency_invalid",
+        ),
+    ],
+)
+def test_diagnosed_projection_reasons_are_safe_and_wrapper_stays_fail_closed(
+    manifest, reason
+):
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == reason
+    assert _project_acquisition_history(manifest) is None
+    assert __import__("re").fullmatch(r"[a-z0-9_]{1,120}", diagnosed.reason)
+    assert "PRIVATE" not in diagnosed.reason
+
+
+def test_all_projection_rejection_labels_are_bounded_and_privacy_safe():
+    source = inspect.getsource(_diagnose_acquisition_history_projection)
+    reasons = set(re.findall(r'reject\("([a-z0-9_]+)"\)', source))
+    reasons.update(
+        f"inventory_count_invalid_{field}"
+        for field in (
+            "inventory_source_count",
+            "declared_source_count",
+            "declared_category_count",
+            "available_source_count",
+            "unavailable_source_count",
+            "disabled_source_count",
+            "unknown_source_count",
+        )
+    )
+    reasons.update(
+        f"identity_projection_invalid_{field}"
+        for field in (
+            "sources_considered",
+            "sources_selected",
+            "sources_used",
+            "source_references_returned",
+            "source_references_retained",
+            "source_references_filtered_or_omitted",
+            "source_references_attempted",
+            "source_references_unsuccessful",
+            "unavailable_source_ids",
+            "failed_source_ids",
+        )
+    )
+    reasons.update(
+        f"acquisition_count_invalid_{field}"
+        for field in (
+            "item_count",
+            "usable_item_count",
+            "prompt_retained_item_count",
+        )
+    )
+
+    assert len(reasons) == 88
+    assert all(re.fullmatch(r"[a-z0-9_]{1,120}", reason) for reason in reasons)
+    assert all("private" not in reason for reason in reasons)
 
 
 class _MemoryStore:
@@ -1034,6 +1178,8 @@ async def test_targeted_acquisition_explanation_is_exact_and_non_exhaustive():
     assert outcome.trace["acquisition_question"] == "checked"
     assert outcome.trace["storage_call_count"] == 1
     assert outcome.trace["provider_call_count"] == 0
+    assert outcome.trace["manifest_projection_status"] == "accepted"
+    assert outcome.trace["manifest_projection_reason"] == "accepted"
     assert outcome.trace["aggregate_counts"]["sources_considered"] == 2
     serialized = repr(outcome)
     for prohibited in (
@@ -1101,6 +1247,8 @@ async def test_latest_bounded_acquisition_rejects_wrong_full_response_digest():
 
     assert outcome.status == "degraded"
     assert outcome.trace["reason_code"] == "acquisition_record_not_found"
+    assert outcome.trace["manifest_projection_status"] == "not_attempted"
+    assert outcome.trace["manifest_projection_reason"] == "not_attempted"
     assert outcome.trace["provider_call_count"] == 0
     assert prior_response not in repr(outcome)
     assert manifest["response_digest"] not in repr(outcome)
@@ -1121,6 +1269,8 @@ async def test_immediate_resolver_record_must_match_submitted_first_paragraph():
 
     assert outcome.status == "degraded"
     assert outcome.trace["resolution_status"] == "unavailable"
+    assert outcome.trace["manifest_projection_status"] == "not_attempted"
+    assert outcome.trace["manifest_projection_reason"] == "not_attempted"
     assert ANCHOR not in repr(outcome)
 
 
@@ -1414,6 +1564,16 @@ async def test_privacy_suppressed_manifest_preserves_aggregate_explanation():
     )
     assert invalid.status == "degraded"
     assert invalid.trace["reason_code"] == "acquisition_manifest_invalid"
+    assert invalid.trace["manifest_projection_status"] == "rejected"
+    assert (
+        invalid.trace["manifest_projection_reason"]
+        == "identity_projection_invalid_sources_considered"
+    )
+    assert invalid.answer == (
+        "The retained acquisition record failed association or privacy validation, "
+        "so I can’t safely explain it. I did not perform a new verification for this "
+        "explanation."
+    )
     assert "PRIVATE-SOURCE-ID" not in repr(invalid)
 
 
@@ -1700,6 +1860,8 @@ async def test_quoted_acquisition_missing_and_ambiguous_targets_do_not_choose():
     )
     assert missing.status == "degraded"
     assert missing.trace["reason_code"] == "acquisition_record_not_found"
+    assert missing.trace["manifest_projection_status"] == "not_attempted"
+    assert missing.trace["manifest_projection_reason"] == "not_attempted"
 
     duplicates = [
         _record(
@@ -1722,6 +1884,8 @@ async def test_quoted_acquisition_missing_and_ambiguous_targets_do_not_choose():
     assert ambiguous.status == "degraded"
     assert ambiguous.trace["reason_code"] == "acquisition_record_ambiguous"
     assert ambiguous.trace["resolution_status"] == "ambiguous"
+    assert ambiguous.trace["manifest_projection_status"] == "not_attempted"
+    assert ambiguous.trace["manifest_projection_reason"] == "not_attempted"
     assert ambiguous.trace["acquisition_trace_lookup_status"] == "not_requested"
 
 

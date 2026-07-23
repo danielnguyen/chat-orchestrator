@@ -608,6 +608,12 @@ class AcquisitionHistory:
     final_next_step: str | None
 
 
+@dataclass(frozen=True)
+class AcquisitionHistoryProjection:
+    history: AcquisitionHistory | None
+    reason: str
+
+
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 _MANIFEST_IDENTITY_FIELDS = (
     "sources_considered",
@@ -917,8 +923,15 @@ def _next_step_selection_is_consistent(selection: dict[str, Any]) -> bool:
     )
 
 
-def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
-    if not isinstance(manifest, dict) or frozenset(manifest) not in {
+def _diagnose_acquisition_history_projection(
+    manifest: Any,
+) -> AcquisitionHistoryProjection:
+    def reject(reason: str) -> AcquisitionHistoryProjection:
+        return AcquisitionHistoryProjection(history=None, reason=reason)
+
+    if not isinstance(manifest, dict):
+        return reject("manifest_not_object")
+    if frozenset(manifest) not in {
         frozenset(
             {
                 "enabled",
@@ -951,7 +964,7 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
             }
         ),
     }:
-        return None
+        return reject("manifest_top_level_keys_invalid")
     accepted_statuses = {
         "sufficient_for_declared_scope",
         "sufficient_with_limitations",
@@ -964,34 +977,53 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
     inventory = manifest.get("inventory")
     acquisition = manifest.get("acquisition")
     status = manifest.get("status")
+    if manifest.get("enabled") is not True:
+        return reject("manifest_enabled_invalid")
+    if manifest.get("attempted") is not True:
+        return reject("manifest_attempted_invalid")
     if (
-        manifest.get("enabled") is not True
-        or manifest.get("attempted") is not True
-        or not isinstance(manifest.get("manifest_id"), str)
+        not isinstance(manifest.get("manifest_id"), str)
         or _SAFE_IDENTIFIER.fullmatch(manifest["manifest_id"]) is None
-        or not isinstance(manifest.get("assistant_message_id"), str)
-        or _SAFE_IDENTIFIER.fullmatch(manifest["assistant_message_id"]) is None
-        or not isinstance(manifest.get("response_digest"), str)
-        or _RESPONSE_DIGEST_RE.fullmatch(manifest["response_digest"]) is None
-        or status not in accepted_statuses
-        or not isinstance(plan, dict)
-        or plan.get("plan_status") not in {"ready", "ready_with_limitations"}
-        or not isinstance(sufficiency, dict)
-        or sufficiency.get("status") not in accepted_statuses
-        or sufficiency.get("status") != status
-        or not isinstance(shape, dict)
-        or shape.get("derivation_status") != "derived"
-        or shape.get("task_shape")
-        not in {
-            "targeted_lookup",
-            "cross_source_comparison",
-            "bounded_exhaustive_review",
-        }
-        or shape.get("clarification_required") is not False
-        or not isinstance(inventory, dict)
-        or not isinstance(acquisition, dict)
     ):
-        return None
+        return reject("manifest_id_invalid")
+    if (
+        not isinstance(manifest.get("assistant_message_id"), str)
+        or _SAFE_IDENTIFIER.fullmatch(manifest["assistant_message_id"]) is None
+    ):
+        return reject("assistant_message_id_invalid")
+    if (
+        not isinstance(manifest.get("response_digest"), str)
+        or _RESPONSE_DIGEST_RE.fullmatch(manifest["response_digest"]) is None
+    ):
+        return reject("response_digest_invalid")
+    if status not in accepted_statuses:
+        return reject("manifest_status_invalid")
+    if not isinstance(plan, dict):
+        return reject("plan_missing")
+    if plan.get("plan_status") not in {"ready", "ready_with_limitations"}:
+        return reject("plan_status_invalid")
+    if not isinstance(sufficiency, dict):
+        return reject("sufficiency_missing")
+    if sufficiency.get("status") not in accepted_statuses:
+        return reject("sufficiency_status_invalid")
+    if sufficiency.get("status") != status:
+        return reject("manifest_sufficiency_status_mismatch")
+    if not isinstance(shape, dict):
+        return reject("shape_missing")
+    if shape.get("derivation_status") != "derived":
+        return reject("shape_derivation_status_invalid")
+    if shape.get("task_shape") not in {
+        "targeted_lookup",
+        "cross_source_comparison",
+        "bounded_exhaustive_review",
+    }:
+        return reject("task_shape_invalid")
+    if shape.get("clarification_required") is not False:
+        return reject("clarification_required_invalid")
+    if not isinstance(inventory, dict):
+        return reject("inventory_missing")
+    if not isinstance(acquisition, dict):
+        return reject("acquisition_missing")
 
     task_shape = shape["task_shape"]
     selected_strategies = plan.get("selected_strategies")
@@ -999,15 +1031,14 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
     if (
         not isinstance(selected_strategies, list)
         or len(selected_strategies) != 1
-        or selected_strategies[0] not in {
-            "targeted_retrieval",
-            "exact_fetch",
-            "hybrid",
-        }
-        or strategy != selected_strategies[0]
-        or not isinstance(plan.get("contradiction_search_required"), bool)
+        or selected_strategies[0]
+        not in {"targeted_retrieval", "exact_fetch", "hybrid"}
     ):
-        return None
+        return reject("selected_strategies_invalid")
+    if strategy != selected_strategies[0]:
+        return reject("strategy_mismatch")
+    if not isinstance(plan.get("contradiction_search_required"), bool):
+        return reject("contradiction_search_flag_invalid")
     expected_composition = {
         ("targeted_lookup", "targeted_retrieval"): "targeted_scope",
         ("targeted_lookup", "exact_fetch"): "targeted_scope",
@@ -1017,7 +1048,7 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
     if plan.get("completeness_expectation") != expected_composition.get(
         (task_shape, strategy)
     ):
-        return None
+        return reject("completeness_expectation_mismatch")
 
     limitation_codes = plan.get("limitation_codes")
     if (
@@ -1026,7 +1057,7 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
         or any(code not in _PLAN_LIMITATION_CODES for code in limitation_codes)
         or len(limitation_codes) != len(set(limitation_codes))
     ):
-        return None
+        return reject("limitation_codes_invalid")
     inventory_status = inventory.get("inventory_status")
     if inventory_status not in {
         "complete_for_declared_scope",
@@ -1034,7 +1065,7 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
         "unknown",
         "unavailable",
     }:
-        return None
+        return reject("inventory_status_invalid")
 
     inventory_counts: dict[str, int] = {}
     for field in (
@@ -1048,12 +1079,12 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
     ):
         count = _bounded_count(inventory.get(field), maximum=64)
         if count is None:
-            return None
+            return reject(f"inventory_count_invalid_{field}")
         inventory_counts[field] = count
 
     suppressed = acquisition.get("source_identifiers_suppressed", False)
     if not isinstance(suppressed, bool):
-        return None
+        return reject("source_identifiers_suppressed_invalid")
     identity_values: dict[str, tuple[int, set[str] | None]] = {}
     for field in _MANIFEST_IDENTITY_FIELDS:
         projected = _identity_projection(
@@ -1063,13 +1094,15 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
             maximum=64,
         )
         if projected is None:
-            return None
+            return reject(f"identity_projection_invalid_{field}")
         identity_values[field] = projected
 
     attempts = _exact_attempt_projection(acquisition, suppressed=suppressed)
     expansions = _expansion_attempt_projection(acquisition, suppressed=suppressed)
-    if attempts is None or expansions is None:
-        return None
+    if attempts is None:
+        return reject("exact_attempt_projection_invalid")
+    if expansions is None:
+        return reject("expansion_attempt_projection_invalid")
     exact_attempt_count, exact_outcomes = attempts
     expansion_attempt_count, expansion_outcomes = expansions
 
@@ -1091,39 +1124,45 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
     unsuccessful_count, unsuccessful_values = identity_values[
         "source_references_unsuccessful"
     ]
-    if (
-        selected_count > considered_count
-        or used_count > selected_count
-        or retained_count > returned_count
-        or omitted_count != returned_count - retained_count
-        or not (
+    if selected_count > considered_count:
+        return reject("selected_count_exceeds_considered")
+    if used_count > selected_count:
+        return reject("used_count_exceeds_selected")
+    if retained_count > returned_count:
+        return reject("retained_count_exceeds_returned")
+    if omitted_count != returned_count - retained_count:
+        return reject("omitted_count_mismatch")
+    if not (
+        exact_attempt_count
+        <= attempted_count
+        <= exact_attempt_count + expansion_attempt_count
+    ):
+        return reject("attempted_reference_count_out_of_bounds")
+    if not (
+        exact_attempt_count - exact_outcomes["satisfied"]
+        <= unsuccessful_count
+        <= (
             exact_attempt_count
-            <= attempted_count
-            <= exact_attempt_count + expansion_attempt_count
-        )
-        or not (
-            exact_attempt_count - exact_outcomes["satisfied"]
-            <= unsuccessful_count
-            <= (
-                exact_attempt_count
-                - exact_outcomes["satisfied"]
-                + expansion_attempt_count
-                - expansion_outcomes["satisfied"]
-            )
+            - exact_outcomes["satisfied"]
+            + expansion_attempt_count
+            - expansion_outcomes["satisfied"]
         )
     ):
-        return None
-    if not suppressed and (
-        not selected_values.issubset(considered_values)
-        or not used_values.issubset(selected_values)
-        or not retained_values.issubset(returned_values)
-        or omitted_values != returned_values - retained_values
-        or (
-            strategy == "exact_fetch"
-            and unsuccessful_values != attempted_values - returned_values
-        )
+        return reject("unsuccessful_reference_count_out_of_bounds")
+    if not suppressed and not selected_values.issubset(considered_values):
+        return reject("selected_sources_not_subset_of_considered")
+    if not suppressed and not used_values.issubset(selected_values):
+        return reject("used_sources_not_subset_of_selected")
+    if not suppressed and not retained_values.issubset(returned_values):
+        return reject("retained_references_not_subset_of_returned")
+    if not suppressed and omitted_values != returned_values - retained_values:
+        return reject("omitted_reference_set_mismatch")
+    if (
+        not suppressed
+        and strategy == "exact_fetch"
+        and unsuccessful_values != attempted_values - returned_values
     ):
-        return None
+        return reject("exact_unsuccessful_reference_set_mismatch")
 
     acquisition_counts: dict[str, int] = {}
     for field in (
@@ -1133,25 +1172,45 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
     ):
         count = _bounded_count(acquisition.get(field), maximum=10000)
         if count is None:
-            return None
+            return reject(f"acquisition_count_invalid_{field}")
         acquisition_counts[field] = count
+    if acquisition_counts["usable_item_count"] > acquisition_counts["item_count"]:
+        return reject("usable_item_count_exceeds_item_count")
     if (
-        acquisition_counts["usable_item_count"] > acquisition_counts["item_count"]
-        or acquisition_counts["prompt_retained_item_count"]
+        acquisition_counts["prompt_retained_item_count"]
         > acquisition_counts["usable_item_count"]
-        or returned_count != acquisition_counts["usable_item_count"]
-        or retained_count != acquisition_counts["prompt_retained_item_count"]
-        or acquisition.get("context_delivery_status")
-        not in {"retained", "filtered", "unknown"}
-        or not isinstance(acquisition.get("dsa_budget_truncation"), bool)
-        or not isinstance(acquisition.get("candidate_truncation"), bool)
-        or not isinstance(sufficiency.get("qualification_required"), bool)
-        or not isinstance(sufficiency.get("additional_acquisition_required"), bool)
-        or (strategy == "targeted_retrieval" and (exact_attempt_count or expansion_attempt_count))
-        or (strategy == "exact_fetch" and (exact_attempt_count == 0 or expansion_attempt_count))
-        or (strategy == "hybrid" and (exact_attempt_count or expansion_attempt_count == 0))
     ):
-        return None
+        return reject("prompt_retained_count_exceeds_usable_count")
+    if returned_count != acquisition_counts["usable_item_count"]:
+        return reject("returned_reference_count_mismatch")
+    if retained_count != acquisition_counts["prompt_retained_item_count"]:
+        return reject("retained_reference_count_mismatch")
+    if acquisition.get("context_delivery_status") not in {
+        "retained",
+        "filtered",
+        "unknown",
+    }:
+        return reject("context_delivery_status_invalid")
+    if not isinstance(acquisition.get("dsa_budget_truncation"), bool):
+        return reject("dsa_budget_truncation_invalid")
+    if not isinstance(acquisition.get("candidate_truncation"), bool):
+        return reject("candidate_truncation_invalid")
+    if not isinstance(sufficiency.get("qualification_required"), bool):
+        return reject("qualification_required_invalid")
+    if not isinstance(sufficiency.get("additional_acquisition_required"), bool):
+        return reject("additional_acquisition_required_invalid")
+    if strategy == "targeted_retrieval" and (
+        exact_attempt_count or expansion_attempt_count
+    ):
+        return reject("targeted_strategy_attempt_accounting_invalid")
+    if strategy == "exact_fetch" and (
+        exact_attempt_count == 0 or expansion_attempt_count
+    ):
+        return reject("exact_strategy_attempt_accounting_invalid")
+    if strategy == "hybrid" and (
+        exact_attempt_count or expansion_attempt_count == 0
+    ):
+        return reject("hybrid_strategy_attempt_accounting_invalid")
 
     next_steps = manifest.get("next_steps")
     changed_follow_up = False
@@ -1164,20 +1223,20 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
             "initial_attempt",
             "dependency_status",
         }:
-            return None
+            return reject("next_steps_shape_invalid")
         selection_count = _bounded_count(next_steps.get("selection_count"), maximum=2)
         additional_count = _bounded_count(
             next_steps.get("additional_acquisition_count"), maximum=1
         )
         selections = next_steps.get("selections")
+        if selection_count is None or additional_count is None:
+            return reject("next_step_selection_count_invalid")
         if (
-            selection_count is None
-            or additional_count is None
-            or not isinstance(selections, list)
+            not isinstance(selections, list)
             or len(selections) != selection_count
             or len(selections) > 2
         ):
-            return None
+            return reject("next_step_selections_invalid")
         allowed_steps = {
             "answer_within_declared_scope",
             "provide_qualified_partial_answer",
@@ -1209,72 +1268,84 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
             "project_scope",
         }
         for selection in selections:
-            if (
-                not isinstance(selection, dict)
-                or set(selection)
-                != {
+            expected_fields = {
+                "selection_id",
+                "evaluation_id",
+                "evidence_plan_id",
+                "acquisition_manifest_id",
+                "selected_next_step",
+                "conclusion_disposition",
+                "provider_disposition",
+                "reacquisition_guard",
+                "clarification_target",
+                "reason_codes",
+                "additional_acquisition_executed",
+            }
+            if not isinstance(selection, dict) or set(selection) != expected_fields:
+                return reject("next_step_selection_fields_invalid")
+            if selection.get("selected_next_step") not in allowed_steps:
+                return reject("next_step_selection_enum_invalid")
+            if any(
+                not isinstance(selection.get(field), str)
+                or _SAFE_IDENTIFIER.fullmatch(selection[field]) is None
+                for field in (
                     "selection_id",
                     "evaluation_id",
                     "evidence_plan_id",
                     "acquisition_manifest_id",
-                    "selected_next_step",
-                    "conclusion_disposition",
-                    "provider_disposition",
-                    "reacquisition_guard",
-                    "clarification_target",
-                    "reason_codes",
-                    "additional_acquisition_executed",
-                }
-                or selection.get("selected_next_step") not in allowed_steps
-                or any(
-                    not isinstance(selection.get(field), str)
-                    or _SAFE_IDENTIFIER.fullmatch(selection[field]) is None
-                    for field in (
-                        "selection_id",
-                        "evaluation_id",
-                        "evidence_plan_id",
-                        "acquisition_manifest_id",
-                    )
                 )
-                or selection.get("conclusion_disposition")
-                not in allowed_conclusions
+            ):
+                return reject("next_step_selection_identifier_invalid")
+            if (
+                selection.get("conclusion_disposition") not in allowed_conclusions
                 or selection.get("provider_disposition") not in allowed_providers
                 or selection.get("reacquisition_guard") not in allowed_guards
                 or selection.get("clarification_target") not in allowed_targets
-                or not isinstance(selection.get("reason_codes"), list)
-                or len(selection["reason_codes"]) > 16
+            ):
+                return reject("next_step_selection_enum_invalid")
+            reason_codes = selection.get("reason_codes")
+            if (
+                not isinstance(reason_codes, list)
+                or len(reason_codes) > 16
                 or any(
                     not isinstance(code, str) or not code or len(code) > 120
-                    for code in selection["reason_codes"]
+                    for code in reason_codes
                 )
-                or len(selection["reason_codes"]) != len(set(selection["reason_codes"]))
-                or selection["reason_codes"] != sorted(selection["reason_codes"])
-                or not isinstance(selection.get("additional_acquisition_executed"), bool)
-                or not _next_step_selection_is_consistent(selection)
+                or len(reason_codes) != len(set(reason_codes))
+                or reason_codes != sorted(reason_codes)
             ):
-                return None
+                return reject("next_step_reason_codes_invalid")
+            if not isinstance(
+                selection.get("additional_acquisition_executed"), bool
+            ):
+                return reject("next_step_selection_enum_invalid")
+            if not _next_step_selection_is_consistent(selection):
+                return reject("next_step_selection_consistency_invalid")
         final_next_step = (
             selections[-1]["selected_next_step"] if selections else None
         )
         initial_attempt = next_steps.get("initial_attempt")
-        if initial_attempt is not None and (
-            not isinstance(initial_attempt, dict)
-            or set(initial_attempt)
-            != {
+        if initial_attempt is not None:
+            if not isinstance(initial_attempt, dict) or set(initial_attempt) != {
                 "strategy",
                 "sufficiency_status",
                 "result_count",
                 "retained_reference_count",
                 "changed_premise_exact_fetch_followed",
-            }
-            or initial_attempt.get("strategy") != "targeted_retrieval"
-            or initial_attempt.get("sufficiency_status")
-            not in accepted_statuses
-            or _bounded_count(initial_attempt.get("result_count")) is None
-            or _bounded_count(initial_attempt.get("retained_reference_count")) is None
-            or initial_attempt.get("changed_premise_exact_fetch_followed") is not True
-        ):
-            return None
+            }:
+                return reject("initial_attempt_shape_invalid")
+            if initial_attempt.get("strategy") != "targeted_retrieval":
+                return reject("initial_attempt_strategy_invalid")
+            if initial_attempt.get("sufficiency_status") not in accepted_statuses:
+                return reject("initial_attempt_status_invalid")
+            if (
+                _bounded_count(initial_attempt.get("result_count")) is None
+                or _bounded_count(initial_attempt.get("retained_reference_count"))
+                is None
+            ):
+                return reject("initial_attempt_count_invalid")
+            if initial_attempt.get("changed_premise_exact_fetch_followed") is not True:
+                return reject("initial_attempt_followup_flag_invalid")
         changed_follow_up = bool(
             additional_count == 1
             and strategy == "exact_fetch"
@@ -1289,13 +1360,14 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
         executed_count = sum(
             selection["additional_acquisition_executed"] for selection in selections
         )
-        if (
-            next_steps.get("dependency_status") not in {None, "dependency_failure"}
-            or executed_count != additional_count
-            or (additional_count == 0 and initial_attempt is not None)
-            or (additional_count == 1 and not changed_follow_up)
-        ):
-            return None
+        if next_steps.get("dependency_status") not in {None, "dependency_failure"}:
+            return reject("next_step_dependency_status_invalid")
+        if executed_count != additional_count:
+            return reject("next_step_execution_count_mismatch")
+        if additional_count == 0 and initial_attempt is not None:
+            return reject("unexpected_initial_attempt")
+        if additional_count == 1 and not changed_follow_up:
+            return reject("changed_followup_inconsistent")
 
     counts = {
         **inventory_counts,
@@ -1323,7 +1395,7 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
         "failed_sources": identity_values["failed_source_ids"][0],
         **acquisition_counts,
     }
-    return AcquisitionHistory(
+    history = AcquisitionHistory(
         task_shape=task_shape,
         strategy=strategy,
         sufficiency_status=status,
@@ -1340,6 +1412,11 @@ def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
         changed_premise_exact_follow_up=changed_follow_up,
         final_next_step=final_next_step,
     )
+    return AcquisitionHistoryProjection(history=history, reason="accepted")
+
+
+def _project_acquisition_history(manifest: Any) -> AcquisitionHistory | None:
+    return _diagnose_acquisition_history_projection(manifest).history
 
 
 def _count_phrase(count: int, singular: str, plural: str | None = None) -> str:
@@ -1562,6 +1639,8 @@ def _acquisition_resolution_trace(
     intent: ClaimExplanationIntent,
     resolution_status: str,
     status: str,
+    manifest_projection_status: str = "not_attempted",
+    manifest_projection_reason: str = "not_attempted",
     counts: dict[str, int] | None = None,
     identifiers_suppressed: bool = False,
 ) -> dict[str, Any]:
@@ -1594,6 +1673,8 @@ def _acquisition_resolution_trace(
         "claim_record_lookup_status": "not_requested",
         "acquisition_trace_lookup_status": "not_requested",
         "manifest_resolution_status": resolution_status,
+        "manifest_projection_status": manifest_projection_status,
+        "manifest_projection_reason": manifest_projection_reason,
         "storage_call_count": 1,
         "provider_call_count": 0,
         "aggregate_counts": counts or {},
@@ -1617,6 +1698,8 @@ async def _resolve_acquisition_explanation(
     conversation_id: str,
     surface: str,
 ) -> ClaimExplanationOutcome:
+    manifest_projection_status = "not_attempted"
+    manifest_projection_reason = "not_attempted"
     prior_response: str | None = None
     if intent.mode == "latest":
         prior_response = _prior_assistant(messages, intent)
@@ -1754,12 +1837,19 @@ async def _resolve_acquisition_explanation(
             lookup_status = "invalid"
             history = None
         else:
-            history = _project_acquisition_history(record.acquisition_manifest)
+            projection = _diagnose_acquisition_history_projection(
+                record.acquisition_manifest
+            )
+            history = projection.history
             if history is None:
+                manifest_projection_status = "rejected"
+                manifest_projection_reason = projection.reason
                 answer = _ACQUISITION_RESOLUTION_INVALID
                 resolution_status = "invalid"
                 lookup_status = "completed"
             else:
+                manifest_projection_status = "accepted"
+                manifest_projection_reason = "accepted"
                 answer = _render_acquisition(
                     history,
                     intent.acquisition_question or "checked",
@@ -1778,6 +1868,8 @@ async def _resolve_acquisition_explanation(
             intent=intent,
             resolution_status=resolution_status,
             status=lookup_status,
+            manifest_projection_status=manifest_projection_status,
+            manifest_projection_reason=manifest_projection_reason,
             counts=history.counts if history is not None else None,
             identifiers_suppressed=(
                 history.identifiers_suppressed if history is not None else False
