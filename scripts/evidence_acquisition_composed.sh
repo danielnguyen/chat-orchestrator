@@ -1240,7 +1240,7 @@ run_evidence_history_scenarios() {
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Compare these two review calendars and explain the differences between them." "$external")"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you examine?" "bounded comparison across selected configured sources"
+    "What did you examine?" "bounded comparison across 2 selected configured sources"
 
   owner="owner-history-exhaustive"
   client="client-history-exhaustive"
