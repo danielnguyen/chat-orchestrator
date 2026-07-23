@@ -440,6 +440,8 @@ assert_history_request_boundaries() {
   HISTORY_RESPONSE="$response"
 }
 
+readonly EVIDENCE_HYBRID_COMPARISON_QUESTION="Compare these two review calendar records and explain the differences between them."
+
 run_evidence_targeted_scenario() {
   local owner client conversation_id question external response request_id answer
   local trace provider_calls fixture_calls diagnostics manifest
@@ -543,7 +545,7 @@ run_evidence_exact_scenario() {
 run_evidence_hybrid_scenarios() {
   local owner client conversation_id question external response request_id answer
   local trace provider_calls diagnostics manifest audit fixture_calls
-  question="Compare these two review calendar records and explain the differences between them."
+  question="$EVIDENCE_HYBRID_COMPARISON_QUESTION"
   external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
 
   owner="owner-evidence-hybrid"
@@ -1241,7 +1243,7 @@ run_evidence_history_hybrid_scenario() {
   reset_dsa_audit
   queue_provider_answer "The selected calendars show bounded differences."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-hybrid")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Compare these two review calendars and explain the differences between them." "$external")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$EVIDENCE_HYBRID_COMPARISON_QUESTION" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
