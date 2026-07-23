@@ -1138,7 +1138,7 @@ normalized_first_paragraph() {
 assert_pure_history() {
   local owner="$1" client="$2" conversation_id="$3" prior_answer="$4"
   local question="$5" expected_fragment="$6" messages response request_id trace
-  local serialized
+  local selected_source_count serialized
   messages="$(jq -nc \
     --arg answer "$prior_answer" \
     --arg question "$question" \
@@ -1148,22 +1148,38 @@ assert_pure_history() {
   response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
+  if [[ "$expected_fragment" == "bounded comparison across 2 selected configured sources" ]]; then
+    selected_source_count="$(jq -er '
+      .prompt.claim_explanation.aggregate_counts.sources_selected
+      | select(type == "number" and . >= 0 and . <= 64 and . == floor)
+    ' <<<"$trace")"
+    echo "Evidence hybrid history selected-source count: $selected_source_count"
+  fi
+  echo "Evidence pure history checkpoint: response_fragment"
   jq -e \
     --arg fragment "$expected_fragment" '
-      (.answer | contains($fragment))
-      and (.answer | endswith("I did not perform a new verification for this explanation."))
+      .answer | contains($fragment)
     ' <<<"$response" >/dev/null
+  echo "Evidence pure history checkpoint: response_suffix"
+  jq -e '
+    .answer
+    | endswith("I did not perform a new verification for this explanation.")
+  ' <<<"$response" >/dev/null
+  echo "Evidence pure history checkpoint: trace_target_mode"
   jq -e '
     .prompt.claim_explanation.target_mode == "immediate_previous"
   ' <<<"$trace" >/dev/null
+  echo "Evidence pure history checkpoint: request_boundaries"
   assert_history_request_boundaries "$conversation_id" "$response" "resolved"
   serialized="$(jq -c . <<<"$response")$(jq -c '.prompt.claim_explanation' <<<"$trace")"
+  echo "Evidence pure history checkpoint: privacy_boundary"
   case "$serialized" in
     *records_primary*|*complete_register*|*calendar_alpha*|*calendar_beta*|*google_sheets:*|*http://*|*PRIVATE*)
       echo "trace-first acquisition history exposed a private identifier or content" >&2
       return 1
       ;;
   esac
+  echo "Evidence pure history checkpoint: complete"
 }
 
 run_evidence_history_scenarios() {
@@ -1239,6 +1255,7 @@ run_evidence_history_scenarios() {
   conversation_id="$(resolve_conversation "$owner" "$client" "history-hybrid")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Compare these two review calendars and explain the differences between them." "$external")"
   answer="$(jq -r '.answer' <<<"$response")"
+  echo "Evidence hybrid history diagnostic: start"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What did you examine?" "bounded comparison across 2 selected configured sources"
 
