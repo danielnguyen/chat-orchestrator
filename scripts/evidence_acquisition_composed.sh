@@ -820,11 +820,13 @@ run_evidence_limitation_and_failure_scenarios() {
   echo "Evidence unavailable checkpoint: dsa_operation_counts"
   assert_dsa_operation_counts "$audit" 0 0 0
   echo "Evidence unavailable checkpoint: dsa_error_trace"
-  jq -e '
-    .dsa.called == true
-    and .dsa.status == "error"
-    and .dsa.error_code == "http_502"
-  ' <<<"$trace" >/dev/null
+  echo "Evidence unavailable checkpoint: dsa_called"
+  jq -e '.dsa.called == true' <<<"$trace" >/dev/null
+  echo "Evidence unavailable checkpoint: dsa_status"
+  jq -e '.dsa.status == "error"' <<<"$trace" >/dev/null
+  echo "Evidence unavailable checkpoint: dsa_error_code"
+  jq -e '.dsa.error_code == "http_502"' <<<"$trace" >/dev/null
+  echo "Evidence unavailable checkpoint: dsa_error_trace_complete"
   echo "Evidence unavailable checkpoint: fixture_call_count"
   jq -e '
     ([.calls[] | select(
