@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import re
+from dataclasses import replace
 
 import pytest
 from clients.memory_store import MemoryStoreClient
@@ -13,6 +14,7 @@ from services.claim_explanation import (
     ClaimExplanationOutcome,
     _diagnose_acquisition_history_projection,
     _project_acquisition_history,
+    _render_acquisition,
     is_claim_explanation_intent,
     parse_claim_explanation_intent,
     resolve_claim_explanation,
@@ -395,6 +397,52 @@ def test_diagnosed_projection_preserves_valid_manifest_acceptance(manifest):
     assert diagnosed.history is not None
     assert diagnosed.reason == "accepted"
     assert _project_acquisition_history(manifest) == diagnosed.history
+
+
+def _history_with_truncation(*, task_shape="bounded_exhaustive_review"):
+    history = _project_acquisition_history(_hybrid_manifest(task_shape=task_shape))
+    assert history is not None
+    return replace(history, budget_truncated=True, candidate_truncated=True)
+
+
+def test_bounded_exhaustive_history_distinguishes_seed_search_truncation():
+    answer = _render_acquisition(_history_with_truncation(), "coverage")
+
+    assert (
+        "The preliminary seed search was truncated, but the configured-scope "
+        "expansion completed without truncation."
+    ) in answer
+    assert "Preliminary seed candidate selection was truncated." in answer
+    assert "Acquisition was truncated by the retrieval budget." not in answer
+    assert "Candidate selection was truncated." not in answer
+
+
+def test_non_exhaustive_history_preserves_generic_truncation_wording():
+    answer = _render_acquisition(
+        _history_with_truncation(task_shape="cross_source_comparison"),
+        "coverage",
+    )
+
+    assert "Acquisition was truncated by the retrieval budget." in answer
+    assert "Candidate selection was truncated." in answer
+    assert "configured-scope expansion completed without truncation" not in answer
+
+
+def test_material_exhaustive_truncation_preserves_generic_wording():
+    history = _history_with_truncation()
+    history = replace(
+        history,
+        counts={
+            **history.counts,
+            "expansion_successful": 0,
+            "expansion_truncated": 1,
+        },
+    )
+    answer = _render_acquisition(history, "coverage")
+
+    assert "Acquisition was truncated by the retrieval budget." in answer
+    assert "Candidate selection was truncated." in answer
+    assert "configured-scope expansion completed without truncation" not in answer
 
 
 @pytest.mark.parametrize(

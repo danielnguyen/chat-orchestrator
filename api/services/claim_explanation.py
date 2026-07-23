@@ -1492,10 +1492,27 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
         sentences.append("The completeness of the retained source inventory was unknown.")
     elif history.inventory_status == "unavailable":
         sentences.append("The retained source inventory was unavailable.")
+    configured_scope_expansion_completed = (
+        history.task_shape == "bounded_exhaustive_review"
+        and history.strategy == "hybrid"
+        and counts["expansion_attempts"] > 0
+        and counts["expansion_successful"] == counts["expansion_attempts"]
+        and counts["expansion_truncated"] == 0
+        and counts["references_retained"] > 0
+    )
     if history.budget_truncated:
-        sentences.append("Acquisition was truncated by the retrieval budget.")
+        sentences.append(
+            "The preliminary seed search was truncated, but the configured-scope "
+            "expansion completed without truncation."
+            if configured_scope_expansion_completed
+            else "Acquisition was truncated by the retrieval budget."
+        )
     if history.candidate_truncated:
-        sentences.append("Candidate selection was truncated.")
+        sentences.append(
+            "Preliminary seed candidate selection was truncated."
+            if configured_scope_expansion_completed
+            else "Candidate selection was truncated."
+        )
     if (
         "optional_source_unavailable" in history.limitation_codes
         and not counts["unavailable_source_count"]
