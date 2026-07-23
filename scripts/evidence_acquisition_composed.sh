@@ -817,7 +817,7 @@ run_evidence_limitation_and_failure_scenarios() {
   jq -e '
     .dsa.called == true
     and .dsa.status == "error"
-    and .dsa.error_code == "http_500"
+    and .dsa.error_code == "http_502"
   ' <<<"$trace" >/dev/null
   jq -e '
     ([.calls[] | select(
