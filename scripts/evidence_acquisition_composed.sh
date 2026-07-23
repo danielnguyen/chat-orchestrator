@@ -1138,7 +1138,8 @@ normalized_first_paragraph() {
 assert_pure_history() {
   local owner="$1" client="$2" conversation_id="$3" prior_answer="$4"
   local question="$5" expected_fragment="$6" messages response request_id trace
-  local selected_source_count serialized
+  local diagnostic_fields lookup_status resolution_status manifest_resolution_status
+  local reason_code selected_source_count serialized
   messages="$(jq -nc \
     --arg answer "$prior_answer" \
     --arg question "$question" \
@@ -1149,11 +1150,45 @@ assert_pure_history() {
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   if [[ "$expected_fragment" == "bounded comparison across 2 selected configured sources" ]]; then
-    selected_source_count="$(jq -er '
-      .prompt.claim_explanation.aggregate_counts.sources_selected
-      | select(type == "number" and . >= 0 and . <= 64 and . == floor)
+    diagnostic_fields="$(jq -er '
+      .prompt.claim_explanation as $explanation
+      | [
+          $explanation.lookup_status,
+          $explanation.resolution_status,
+          $explanation.manifest_resolution_status,
+          $explanation.reason_code
+        ] as $labels
+      | ($labels | map(
+          if type == "string" then
+            length >= 1
+            and length <= 120
+            and test("^[A-Za-z0-9_.:-]{1,120}$")
+          else
+            false
+          end
+        ) | all) as $labels_are_safe
+      | if $labels_are_safe then
+          $explanation.aggregate_counts.sources_selected as $count
+          | ($labels + [
+              if ($count | type) == "number" then
+                if $count >= 0 and $count <= 64 and $count == ($count | floor) then
+                  ($count | tostring)
+                else
+                  "missing"
+                end
+              else
+                "missing"
+              end
+            ])
+          | @tsv
+        else
+          empty
+        end
     ' <<<"$trace")"
-    echo "Evidence hybrid history selected-source count: $selected_source_count"
+    IFS=$'\t' read -r lookup_status resolution_status \
+      manifest_resolution_status reason_code selected_source_count \
+      <<<"$diagnostic_fields"
+    echo "Evidence hybrid history trace: lookup=$lookup_status resolution=$resolution_status manifest=$manifest_resolution_status reason=$reason_code selected_source_count=$selected_source_count"
   fi
   echo "Evidence pure history checkpoint: response_fragment"
   jq -e \
