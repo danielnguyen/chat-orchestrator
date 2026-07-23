@@ -11,6 +11,7 @@ on:
         options:
           - all
           - history-hybrid
+          - history-exhaustive
   pull_request:
     branches:
       - main
