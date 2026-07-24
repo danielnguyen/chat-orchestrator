@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
+from models import MaterialScopeReferences
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Identifier = Annotated[
@@ -815,9 +816,12 @@ class DsaSourceEntry(StrictModel):
     last_checked_at: datetime | None
     last_error: Annotated[str, Field(max_length=240)] | None = None
     authority_role: Literal["authoritative", "supplemental", "unknown"] = "unknown"
+    scope_refs: MaterialScopeReferences | None = None
 
     @model_validator(mode="after")
     def validate_collections(self) -> DsaSourceEntry:
+        if "scope_refs" in self.model_fields_set and self.scope_refs is None:
+            raise ValueError("scope_references_null")
         if len(set(self.domain_tags)) != len(self.domain_tags):
             raise ValueError("duplicate_source_category")
         if len(set(self.capabilities)) != len(self.capabilities):
@@ -1565,6 +1569,147 @@ def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
     }[source_list.inventory_status]
 
 
+_SCOPE_REFERENCE_FIELDS = {
+    "time": "time_scope_ref",
+    "version": "version_scope_ref",
+    "domain": "domain_scope_ref",
+    "project": "project_scope_ref",
+}
+
+
+def _declared_source_universe(
+    source_list: DsaSourceListResponse,
+    *,
+    source_ids: list[str],
+    source_categories: list[str],
+    exact_source_refs: list[dict[str, str]],
+) -> list[DsaSourceEntry]:
+    categories = set(source_categories)
+    if exact_source_refs:
+        referenced_ids = {item["source_id"] for item in exact_source_refs}
+        sources = [
+            source
+            for source in source_list.sources
+            if source.source_id in referenced_ids
+        ]
+        if categories:
+            sources = [
+                source
+                for source in sources
+                if set(source.domain_tags) & categories
+            ]
+        return sources
+    if source_ids:
+        declared_ids = set(source_ids)
+        return [
+            source
+            for source in source_list.sources
+            if source.source_id in declared_ids
+        ]
+    if categories:
+        return [
+            source
+            for source in source_list.sources
+            if set(source.domain_tags) & categories
+        ]
+    return list(source_list.sources)
+
+
+def _resolve_declared_scope(
+    source_list: DsaSourceListResponse,
+    *,
+    external_context: dict[str, Any] | None,
+    exact_source_refs: list[dict[str, str]],
+) -> tuple[dict[str, Any], bool]:
+    config = external_context if isinstance(external_context, dict) else {}
+    source_ids = sorted(
+        {
+            item
+            for item in config.get("source_ids", [])
+            if isinstance(item, str) and item
+        }
+    )
+    source_categories = sorted(
+        {
+            item
+            for item in config.get("domain_tags", [])
+            if isinstance(item, str) and item
+        }
+    )
+    unresolved_scope = {
+        "source_ids": source_ids,
+        "source_categories": source_categories,
+        "exact_source_refs": exact_source_refs,
+        "inventory_status": _adapt_inventory_status(source_list),
+        "time_scope_ref": None,
+        "version_scope_ref": None,
+        "domain_scope_ref": None,
+        "project_scope_ref": None,
+    }
+    universe = _declared_source_universe(
+        source_list,
+        source_ids=source_ids,
+        source_categories=source_categories,
+        exact_source_refs=exact_source_refs,
+    )
+    configured_ids = {source.source_id for source in source_list.sources}
+    explicitly_declared_ids = (
+        {item["source_id"] for item in exact_source_refs}
+        if exact_source_refs
+        else set(source_ids)
+    )
+    declared_sources_complete = not explicitly_declared_ids or (
+        explicitly_declared_ids <= configured_ids
+    )
+    requested_scope = config.get("scope_refs")
+    requested = (
+        MaterialScopeReferences.model_validate(requested_scope)
+        if isinstance(requested_scope, dict)
+        else None
+    )
+    if requested is not None:
+        requested_values = requested.model_dump(exclude_none=True)
+        universe = [
+            source
+            for source in universe
+            if source.scope_refs is not None
+            and all(
+                getattr(source.scope_refs, dimension) == value
+                for dimension, value in requested_values.items()
+            )
+        ]
+        matching_ids = {source.source_id for source in universe}
+        if not matching_ids:
+            return unresolved_scope, False
+        if exact_source_refs and matching_ids != {
+            item["source_id"] for item in exact_source_refs
+        }:
+            return unresolved_scope, False
+        unresolved_scope["source_ids"] = sorted(matching_ids)
+
+    resolved_scope = dict(unresolved_scope)
+    requested_values = requested.model_dump(exclude_none=True) if requested else {}
+    for dimension, declared_field in _SCOPE_REFERENCE_FIELDS.items():
+        if dimension in requested_values:
+            resolved_scope[declared_field] = requested_values[dimension]
+            continue
+        values = [
+            getattr(source.scope_refs, dimension)
+            if source.scope_refs is not None
+            else None
+            for source in universe
+        ]
+        if (
+            universe
+            and declared_sources_complete
+            and all(value is not None for value in values)
+        ):
+            distinct_values = set(values)
+            if len(distinct_values) == 1:
+                resolved_scope[declared_field] = values[0]
+    return resolved_scope, True
+
+
 def _acquisition_premise_digest(premise: EvidenceAcquisitionPremise) -> str:
     scope = premise.declared_scope.model_copy(
         update={
@@ -2134,31 +2279,32 @@ async def begin_evidence_acquisition(
         )
         return state
 
-    config = external_context if isinstance(external_context, dict) else {}
-    source_ids = sorted(
-        {
-            item
-            for item in config.get("source_ids", [])
-            if isinstance(item, str) and item
-        }
-    )
-    source_categories = sorted(
-        {
-            item
-            for item in config.get("domain_tags", [])
-            if isinstance(item, str) and item
-        }
-    )
-    state.declared_scope = {
-        "source_ids": source_ids,
-        "source_categories": source_categories,
-        "exact_source_refs": exact_source_refs,
-        "inventory_status": _adapt_inventory_status(state.inventory),
-        "time_scope_ref": None,
-        "version_scope_ref": None,
-        "domain_scope_ref": None,
-        "project_scope_ref": None,
-    }
+    try:
+        state.declared_scope, selector_matched = _resolve_declared_scope(
+            state.inventory,
+            external_context=external_context,
+            exact_source_refs=exact_source_refs,
+        )
+    except Exception:
+        state.status = "inventory_dependency_failed"
+        state.forced_answer = UNSUPPORTED_ANSWER
+        state.manifest_id = _manifest_id(
+            scope=scope,
+            plan_id=None,
+            selected_strategies=[],
+            declared_scope=None,
+        )
+        return state
+    if not selector_matched:
+        state.status = "scope_selector_no_match"
+        state.forced_answer = UNSUPPORTED_ANSWER
+        state.manifest_id = _manifest_id(
+            scope=scope,
+            plan_id=None,
+            selected_strategies=[],
+            declared_scope=state.declared_scope,
+        )
+        return state
     try:
         plan_raw = await runtime.compile_evidence_plan(
             **scope,

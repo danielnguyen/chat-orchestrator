@@ -24,10 +24,12 @@ from services.evidence_acquisition import (
     ShapeResult,
     SufficiencyResult,
     _acquisition_premise_digest,
+    _adapt_inventory,
     _build_acquisition_facts,
     _expected_sufficiency_constraints,
     _manifest_id,
     _provider_answer_claims_universal_scope,
+    _resolve_declared_scope,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_current_acquisition_premise,
@@ -109,6 +111,7 @@ def _source(
     display_name=None,
     connector="neutral_connector",
     last_error=None,
+    scope_refs=None,
 ):
     source = {
         "source_id": source_id,
@@ -125,6 +128,8 @@ def _source(
     }
     if authority_role is not None:
         source["authority_role"] = authority_role
+    if scope_refs is not None:
+        source["scope_refs"] = scope_refs
     return source
 
 
@@ -856,6 +861,94 @@ def test_public_external_context_cannot_declare_inventory_trust():
     assert "inventory_status" not in serialized
 
 
+def test_material_scope_selector_public_contract_normalizes_and_serializes():
+    payload = _chat_request_with_exact_refs([], source_ids=["source_a"])
+    payload["external_context"]["scope_refs"] = {
+        "project": "firefox",
+        "time": "fy2026",
+    }
+
+    request = ChatRequest.model_validate(payload)
+
+    assert request.external_context is not None
+    assert request.external_context.scope_refs is not None
+    assert request.external_context.scope_refs.model_dump(exclude_none=True) == {
+        "time": "fy2026",
+        "project": "firefox",
+    }
+    assert request.model_dump()["external_context"]["scope_refs"] == {
+        "time": "fy2026",
+        "project": "firefox",
+    }
+    ordinary = ChatRequest.model_validate(
+        {
+            "owner_id": "owner",
+            "surface": "dev",
+            "messages": [{"role": "user", "content": QUESTION}],
+            "external_context": {"enabled": True},
+        }
+    )
+    assert "scope_refs" not in ordinary.model_dump()["external_context"]
+
+
+@pytest.mark.parametrize(
+    "scope_refs",
+    [
+        {},
+        None,
+        {"time": None},
+        {"time": 2026},
+        {"time": ""},
+        {"time": "fy 2026"},
+        {"time": "https://private.invalid/window"},
+        {"time": "fy2026?private=true"},
+        {"time": "fy/2026"},
+        {"time": "x" * 121},
+        {"owner": "private-owner"},
+        {"time": "fy2026", "project": None},
+    ],
+    ids=[
+        "empty",
+        "null-object",
+        "null-value",
+        "non-string",
+        "blank",
+        "whitespace",
+        "url",
+        "query-string",
+        "unsafe-character",
+        "overlong",
+        "unknown-key",
+        "partially-malformed",
+    ],
+)
+def test_material_scope_selector_public_contract_rejects_malformed_values(
+    scope_refs,
+):
+    payload = _chat_request_with_exact_refs([])
+    payload["external_context"]["scope_refs"] = scope_refs
+
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate(payload)
+
+
+def test_external_context_outer_unknown_fields_remain_ignored_with_scope_selector():
+    payload = _chat_request_with_exact_refs([])
+    payload["external_context"].update(
+        {
+            "scope_refs": {"domain": "credential-management"},
+            "future_compatibility_field": "ignored",
+        }
+    )
+
+    request = ChatRequest.model_validate(payload)
+
+    assert request.external_context is not None
+    serialized = request.external_context.model_dump()
+    assert serialized["scope_refs"]["domain"] == "credential-management"
+    assert "future_compatibility_field" not in serialized
+
+
 @pytest.mark.parametrize(
     "references",
     [
@@ -916,6 +1009,351 @@ def test_exact_reference_public_contract_rejects_scope_and_opt_in_mismatch():
             ChatRequest.model_validate(request)
 
 
+@pytest.mark.parametrize(
+    "scope_refs",
+    [
+        {"time": "fy2026"},
+        {"version": "release-152", "project": "firefox"},
+        {
+            "time": "fy2026",
+            "version": "release-152",
+            "domain": "credential-management",
+            "project": "firefox",
+        },
+    ],
+)
+def test_dsa_source_inventory_accepts_legacy_and_strict_scope_metadata(scope_refs):
+    inventory = DsaSourceListResponse.model_validate(
+        {
+            "sources": [
+                _source("legacy_source"),
+                _source("scoped_source", scope_refs=scope_refs),
+            ]
+        }
+    )
+
+    assert inventory.sources[0].scope_refs is None
+    assert inventory.sources[1].scope_refs is not None
+    assert inventory.sources[1].scope_refs.model_dump(exclude_none=True) == scope_refs
+
+
+@pytest.mark.parametrize(
+    "scope_refs",
+    [
+        {},
+        None,
+        {"time": None},
+        {"time": 2026},
+        {"time": "fy 2026"},
+        {"version": "https://private.invalid/release"},
+        {"domain": "credentials?private=true"},
+        {"project": "fire/fox"},
+        {"project": "x" * 121},
+        {"unknown": "private"},
+        {"time": "fy2026", "project": None},
+    ],
+    ids=[
+        "empty",
+        "null-object",
+        "null-value",
+        "non-string",
+        "whitespace",
+        "url",
+        "query-string",
+        "unsafe-character",
+        "overlong",
+        "unknown-key",
+        "partially-malformed",
+    ],
+)
+def test_dsa_source_inventory_rejects_malformed_scope_metadata(scope_refs):
+    source = _source("source_a")
+    source["scope_refs"] = scope_refs
+
+    with pytest.raises(ValidationError):
+        DsaSourceListResponse.model_validate({"sources": [source]})
+
+
+@pytest.mark.asyncio
+async def test_malformed_source_scope_metadata_fails_inventory_before_plan():
+    runtime = FakeRuntime()
+    source = _source("source_a")
+    source["scope_refs"] = {"time": "fy 2026"}
+    dsa = FakeDsa([source])
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"scope_refs": {"time": "fy2026"}},
+        **SCOPE,
+    )
+
+    assert state.status == "inventory_dependency_failed"
+    assert state.plan is None
+    assert dsa.calls == ["list_sources"]
+    assert [name for name, _ in runtime.calls] == ["shape"]
+
+
+def _scope_source(
+    source_id,
+    *,
+    scope_refs=None,
+    tags=None,
+):
+    return _source(
+        source_id,
+        capabilities=["search", "fetch", "context"],
+        tags=tags,
+        scope_refs=scope_refs,
+    )
+
+
+def _resolved_scope(
+    sources,
+    *,
+    external_context=None,
+    exact_source_refs=None,
+):
+    return _resolve_declared_scope(
+        DsaSourceListResponse.model_validate({"sources": sources}),
+        external_context=external_context,
+        exact_source_refs=exact_source_refs or [],
+    )
+
+
+@pytest.mark.parametrize(
+    ("external_context", "expected_ids", "expected_refs"),
+    [
+        (
+            {"scope_refs": {"time": "fy2026"}},
+            ["source_a", "source_c"],
+            {"time_scope_ref": "fy2026"},
+        ),
+        (
+            {
+                "scope_refs": {
+                    "time": "fy2026",
+                    "project": "firefox",
+                }
+            },
+            ["source_a"],
+            {"time_scope_ref": "fy2026", "project_scope_ref": "firefox"},
+        ),
+        (
+            {
+                "source_ids": ["source_b", "source_a"],
+                "scope_refs": {"time": "fy2026"},
+            },
+            ["source_a"],
+            {"time_scope_ref": "fy2026"},
+        ),
+        (
+            {
+                "domain_tags": ["selected"],
+                "scope_refs": {"time": "fy2026"},
+            },
+            ["source_a"],
+            {"time_scope_ref": "fy2026"},
+        ),
+    ],
+    ids=["one-dimension", "conjunctive", "source-ids", "categories"],
+)
+def test_scope_selector_narrows_only_the_already_declared_universe(
+    external_context,
+    expected_ids,
+    expected_refs,
+):
+    sources = [
+        _scope_source(
+            "source_c",
+            scope_refs={"time": "fy2026", "project": "thunderbird"},
+        ),
+        _scope_source(
+            "source_a",
+            scope_refs={"time": "fy2026", "project": "firefox"},
+            tags=["records", "selected"],
+        ),
+        _scope_source(
+            "source_b",
+            scope_refs={"time": "fy2025", "project": "firefox"},
+            tags=["records", "selected"],
+        ),
+    ]
+
+    scope, matched = _resolved_scope(
+        sources,
+        external_context=external_context,
+    )
+
+    assert matched is True
+    assert scope["source_ids"] == expected_ids
+    for field, value in expected_refs.items():
+        assert scope[field] == value
+
+
+def test_scope_selector_preserves_exact_references_only_when_all_sources_survive():
+    references = [
+        {"source_id": "source_a", "source_ref": "connector:a:item"},
+        {"source_id": "source_b", "source_ref": "connector:b:item"},
+    ]
+    sources = [
+        _scope_source("source_a", scope_refs={"time": "fy2026"}),
+        _scope_source("source_b", scope_refs={"time": "fy2026"}),
+    ]
+
+    scope, matched = _resolved_scope(
+        sources,
+        external_context={
+            "domain_tags": ["records"],
+            "scope_refs": {"time": "fy2026"},
+        },
+        exact_source_refs=references,
+    )
+
+    assert matched is True
+    assert scope["source_ids"] == ["source_a", "source_b"]
+    assert scope["exact_source_refs"] == references
+
+    sources[1]["scope_refs"] = {"time": "fy2025"}
+    _, matched = _resolved_scope(
+        sources,
+        external_context={"scope_refs": {"time": "fy2026"}},
+        exact_source_refs=references,
+    )
+    assert matched is False
+
+
+@pytest.mark.parametrize(
+    "external_context",
+    [
+        {"scope_refs": {"time": "fy2030"}},
+        {
+            "scope_refs": {
+                "time": "fy2026",
+                "project": "thunderbird",
+            }
+        },
+    ],
+    ids=["zero-matches", "dimensions-split-across-sources"],
+)
+@pytest.mark.asyncio
+async def test_scope_selector_mismatch_stops_before_plan_or_acquisition(
+    external_context,
+):
+    runtime = FakeRuntime()
+    dsa = FakeDsa(
+        [
+            _scope_source(
+                "source_a",
+                scope_refs={"time": "fy2026", "project": "firefox"},
+            ),
+            _scope_source(
+                "source_b",
+                scope_refs={"time": "fy2025", "project": "thunderbird"},
+            ),
+        ]
+    )
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=external_context,
+        **SCOPE,
+    )
+
+    assert state.status == "scope_selector_no_match"
+    assert state.plan is None
+    assert state.forced_answer == (
+        "I can’t safely complete that evidence request with the currently "
+        "available source capabilities."
+    )
+    assert dsa.calls == ["list_sources"]
+    assert [name for name, _ in runtime.calls] == ["shape"]
+
+
+@pytest.mark.parametrize(
+    ("dimension", "declared_field"),
+    [
+        ("time", "time_scope_ref"),
+        ("version", "version_scope_ref"),
+        ("domain", "domain_scope_ref"),
+        ("project", "project_scope_ref"),
+    ],
+)
+def test_unrequested_scope_derivation_requires_unanimous_non_null_values(
+    dimension,
+    declared_field,
+):
+    value = f"{dimension}-shared"
+    unanimous = [
+        _scope_source("source_a", scope_refs={dimension: value}),
+        _scope_source("source_b", scope_refs={dimension: value}),
+    ]
+    mixed = copy.deepcopy(unanimous)
+    mixed[1]["scope_refs"][dimension] = f"{dimension}-other"
+    missing = copy.deepcopy(unanimous)
+    missing[1].pop("scope_refs")
+
+    scope, _ = _resolved_scope(unanimous)
+    assert scope[declared_field] == value
+    scope, _ = _resolved_scope(mixed)
+    assert scope[declared_field] is None
+    scope, _ = _resolved_scope(missing)
+    assert scope[declared_field] is None
+    scope, _ = _resolved_scope(
+        unanimous,
+        external_context={"source_ids": ["source_a", "missing_source"]},
+    )
+    assert scope[declared_field] is None
+    scope, _ = _resolved_scope([])
+    assert scope[declared_field] is None
+
+
+def test_requested_narrowing_precedes_independent_unrequested_derivation():
+    scope, matched = _resolved_scope(
+        [
+            _scope_source(
+                "source_a",
+                scope_refs={"time": "fy2026", "project": "firefox"},
+            ),
+            _scope_source(
+                "source_b",
+                scope_refs={"time": "fy2025", "project": "thunderbird"},
+            ),
+        ],
+        external_context={"scope_refs": {"project": "firefox"}},
+    )
+
+    assert matched is True
+    assert scope["source_ids"] == ["source_a"]
+    assert scope["project_scope_ref"] == "firefox"
+    assert scope["time_scope_ref"] == "fy2026"
+
+
+def test_categories_names_and_identifiers_cannot_manufacture_material_scope():
+    scope, matched = _resolved_scope(
+        [
+            _source(
+                "fy2026",
+                display_name="Firefox release-152 credential-management",
+                tags=["firefox", "credential-management"],
+            )
+        ],
+        external_context={"domain_tags": ["credential-management"]},
+    )
+
+    assert matched is True
+    assert scope["source_categories"] == ["credential-management"]
+    assert scope["time_scope_ref"] is None
+    assert scope["version_scope_ref"] is None
+    assert scope["domain_scope_ref"] is None
+    assert scope["project_scope_ref"] is None
+
+
 @pytest.mark.asyncio
 async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilities():
     runtime = FakeRuntime()
@@ -974,6 +1412,94 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
     assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == (
         "unknown"
     )
+
+
+@pytest.mark.asyncio
+async def test_scope_selector_and_unanimous_refs_reach_cr_without_raw_metadata():
+    plan = _plan_response()
+    plan["result"]["eligible_source_ids"] = ["source_a"]
+    runtime = FakeRuntime(plan=plan)
+    dsa = FakeDsa(
+        [
+            _source(
+                "source_b",
+                scope_refs={
+                    "time": "fy2025",
+                    "version": "release-151",
+                    "domain": "credential-management",
+                    "project": "thunderbird",
+                },
+            ),
+            _source(
+                "source_a",
+                scope_refs={
+                    "time": "fy2026",
+                    "version": "release-152",
+                    "domain": "credential-management",
+                    "project": "firefox",
+                },
+            ),
+        ]
+    )
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"scope_refs": {"project": "firefox"}},
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    assert state.declared_scope == {
+        "source_ids": ["source_a"],
+        "source_categories": [],
+        "exact_source_refs": [],
+        "inventory_status": "unknown",
+        "time_scope_ref": "fy2026",
+        "version_scope_ref": "release-152",
+        "domain_scope_ref": "credential-management",
+        "project_scope_ref": "firefox",
+    }
+    plan_payload = runtime.calls[1][1]
+    assert plan_payload["declared_scope"] == state.declared_scope
+    assert plan_payload["source_inventory"] == _adapt_inventory(state.inventory)
+    assert "scope_refs" not in json.dumps(plan_payload["source_inventory"])
+    retained_manifest = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace={"called": False, "status": "not_called"},
+        retained_source_refs=set(),
+    )
+    retained_text = json.dumps(retained_manifest, sort_keys=True)
+    for raw_metadata in ("fy2025", "release-151", "thunderbird"):
+        assert raw_metadata not in retained_text
+
+
+@pytest.mark.asyncio
+async def test_legacy_inventory_without_selector_preserves_null_scope_contract():
+    runtime = FakeRuntime()
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    assert state.declared_scope == {
+        "source_ids": [],
+        "source_categories": [],
+        "exact_source_refs": [],
+        "inventory_status": "unknown",
+        "time_scope_ref": None,
+        "version_scope_ref": None,
+        "domain_scope_ref": None,
+        "project_scope_ref": None,
+    }
 
 
 class ProducerContractSufficiencyRuntime:
@@ -5169,6 +5695,82 @@ def test_current_acquisition_premise_uses_only_compiled_plan_inputs():
     serialized = json.dumps(premise.model_dump(mode="json"), sort_keys=True)
     for prohibited in ("request_id", "manifest_id", "provider", "PRIVATE"):
         assert prohibited not in serialized
+
+
+def test_legacy_no_scope_premise_digest_remains_stable():
+    premise = build_current_acquisition_premise(_next_step_test_state())
+
+    assert _acquisition_premise_digest(premise) == (
+        "sha256:6e798adb98a8e683748af8039a3c45e818565bcb6eecde51885fd9b0b00f1d67"
+    )
+
+
+def test_material_scope_premise_digest_is_canonical_for_source_and_field_order():
+    base = build_current_acquisition_premise(_next_step_test_state()).model_dump(
+        mode="json"
+    )
+    base["declared_scope"].update(
+        {
+            "time_scope_ref": "fy2026",
+            "version_scope_ref": "release-152",
+            "domain_scope_ref": "credential-management",
+            "project_scope_ref": "firefox",
+        }
+    )
+    first_source = base["source_inventory"][0]
+    second_source = {
+        **first_source,
+        "source_id": "source_b",
+        "source_categories": list(reversed(first_source["source_categories"])),
+        "capabilities": list(reversed(first_source["capabilities"])),
+    }
+    base["source_inventory"] = [first_source, second_source]
+    reordered = copy.deepcopy(base)
+    reordered["source_inventory"] = list(reversed(reordered["source_inventory"]))
+    reordered["declared_scope"] = dict(
+        reversed(list(reordered["declared_scope"].items()))
+    )
+
+    assert _acquisition_premise_digest(
+        EvidenceAcquisitionPremise.model_validate(base)
+    ) == _acquisition_premise_digest(
+        EvidenceAcquisitionPremise.model_validate(reordered)
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope_field", "value"),
+    [
+        ("time_scope_ref", "fy2026"),
+        ("version_scope_ref", "release-152"),
+        ("domain_scope_ref", "credential-management"),
+        ("project_scope_ref", "firefox"),
+    ],
+)
+def test_each_material_scope_reference_changes_existing_premise_identity(
+    scope_field,
+    value,
+):
+    state = _next_step_test_state()
+    original = build_current_acquisition_premise(state)
+    changed_data = original.model_dump(mode="json")
+    changed_data["declared_scope"][scope_field] = value
+    changed = EvidenceAcquisitionPremise.model_validate(changed_data)
+
+    assert _acquisition_premise_digest(changed) != _acquisition_premise_digest(
+        original
+    )
+    assert _manifest_id(
+        scope=SCOPE,
+        plan_id=state.plan.plan_id,
+        selected_strategies=state.plan.selected_strategies,
+        declared_scope=changed.declared_scope.model_dump(mode="json"),
+    ) != _manifest_id(
+        scope=SCOPE,
+        plan_id=state.plan.plan_id,
+        selected_strategies=state.plan.selected_strategies,
+        declared_scope=original.declared_scope.model_dump(mode="json"),
+    )
 
 
 @pytest.mark.parametrize(

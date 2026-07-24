@@ -136,6 +136,20 @@ attempts every declared reference without retry, and never falls back to
 semantic search. Every response must match the declared source ID and exact
 reference.
 
+Configured source inventory entries may also carry an optional strict
+`scope_refs` object with bounded `time`, `version`, `domain`, and `project`
+identifiers. Legacy entries without this object remain valid. A request may use
+the same shape at `external_context.scope_refs`; requested dimensions match
+configured values exactly and conjunctively, then narrow the source universe
+already declared by exact references, source IDs, or domain tags. A selector
+with no configured match stops before evidence-plan compilation or acquisition.
+For an unrequested dimension, Chat Orchestrator derives a reference only when
+every source in the non-empty declared universe has the same non-null configured
+value. The resolved four references enter the existing declared scope and
+acquisition premise sent to Cognitive Runtime. Per-source scope metadata is not
+added to Cognitive Runtime source descriptors, provider evidence, retained
+manifests, claim records, history output, or user-visible responses.
+
 Context-pack items may also declare bounded `available_context` descriptors for
 connector-owned expansion modes. The targeted path strictly validates and then
 removes those descriptors without executing them.

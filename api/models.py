@@ -104,6 +104,39 @@ EvidenceIdentifier = Annotated[
 ]
 
 
+class MaterialScopeReferences(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    time: Optional[EvidenceIdentifier] = None
+    version: Optional[EvidenceIdentifier] = None
+    domain: Optional[EvidenceIdentifier] = None
+    project: Optional[EvidenceIdentifier] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_supplied_values(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            if not value:
+                raise ValueError("scope_references_empty")
+            if any(item is None for item in value.values()):
+                raise ValueError("scope_reference_null")
+        return value
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "MaterialScopeReferences":
+        if not self.model_fields_set:
+            raise ValueError("scope_references_empty")
+        return self
+
+    @model_serializer(mode="wrap")
+    def omit_unsupplied_dimensions(self, handler):
+        return {
+            key: value
+            for key, value in handler(self).items()
+            if key in self.model_fields_set
+        }
+
+
 class ExactSourceReferenceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -128,11 +161,14 @@ class ExternalContextRequest(BaseModel):
         max_length=16,
     )
     domain_tags: Optional[List[str]] = None
+    scope_refs: Optional[MaterialScopeReferences] = None
     allowed_sensitivity: Optional[str] = None
     max_results: Optional[int] = Field(default=None, ge=1, le=20)
 
     @model_validator(mode="after")
     def validate_exact_source_refs(self) -> "ExternalContextRequest":
+        if "scope_refs" in self.model_fields_set and self.scope_refs is None:
+            raise ValueError("scope_references_null")
         references = self.exact_source_refs or []
         source_refs = [item.source_ref for item in references]
         if len(set(source_refs)) != len(source_refs):
@@ -144,10 +180,12 @@ class ExternalContextRequest(BaseModel):
         return self
 
     @model_serializer(mode="wrap")
-    def omit_absent_exact_source_refs(self, handler):
+    def omit_absent_structured_fields(self, handler):
         serialized = handler(self)
         if self.exact_source_refs is None:
             serialized.pop("exact_source_refs", None)
+        if self.scope_refs is None:
+            serialized.pop("scope_refs", None)
         return serialized
 
 
