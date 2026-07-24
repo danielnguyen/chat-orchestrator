@@ -146,8 +146,8 @@ Permanent scenario output is limited to fixed completion markers, exact bounded
 counts, and stable assertion labels. Privacy cases must not print material scope
 values, source identifiers or references, excerpts, candidate JSON, full prompts,
 provider responses, or unrestricted dependency errors. This validation proves
-runtime behavior only; it does not change the Phase 5.2 checklist or claim phase
-closure.
+runtime behavior only; project conformance remains subject to its separate
+review process.
 
 ## Artifact composed smoke check
 
