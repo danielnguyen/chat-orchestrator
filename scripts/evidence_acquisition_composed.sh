@@ -1117,7 +1117,7 @@ run_evidence_changed_premise_scenarios() {
 
 run_evidence_adversarial_provider_scenario() {
   local owner client conversation_id response request_id answer trace manifest
-  local provider_calls diagnostics audit
+  local provider_calls diagnostics audit endorsed_text
   owner="owner-evidence-adversarial"
   client="client-evidence-adversarial"
   provider_post "/fixture/reset" '{}'
@@ -1184,6 +1184,7 @@ run_evidence_adversarial_provider_scenario() {
     echo "Assertion failed: adversarial.scope.persistence" >&2
     return 1
   fi
+  echo "Adversarial provider case passed: affirmative"
 
   owner="owner-evidence-adversarial-negated"
   client="client-evidence-adversarial-negated"
@@ -1252,7 +1253,76 @@ run_evidence_adversarial_provider_scenario() {
     echo "Assertion failed: adversarial.negated.persistence" >&2
     return 1
   fi
-  echo "Evidence adversarial provider: affirmative_replaced=1 negated_preserved=1 affirmative_provider=1 negated_provider=1 retry=0"
+  echo "Adversarial provider case passed: negated"
+
+  owner="owner-evidence-adversarial-endorsed"
+  client="client-evidence-adversarial-endorsed"
+  endorsed_text='The earlier answer claimed, "Every possible source was fully examined." I agree.'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_provider_answer "$endorsed_text"
+  conversation_id="$(resolve_conversation "$owner" "$client" "evidence-adversarial-endorsed")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "adversarial.endorsed.response_status" "$response" \
+    '.status == "ok"'
+  assert_jq "adversarial.endorsed.provider_text_absent" "$response" \
+    '.answer | contains($provider_text) | not' \
+    --arg provider_text "$endorsed_text"
+  assert_jq "adversarial.endorsed.replacement" "$response" '
+    ([.answer | scan("I withheld the generated answer because it claimed evidence coverage beyond the examined scope\\.")] | length) == 1
+  '
+  assert_jq "adversarial.endorsed.boundary" "$response" '
+    .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
+  '
+  assert_jq "adversarial.endorsed.manifest" "$manifest" '
+    .shape.task_shape == "targeted_lookup"
+    and .acquisition.sources_considered == ["records_primary"]
+    and .acquisition.sources_selected == ["records_primary"]
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "adversarial.endorsed.inventory" "$manifest" '
+    .inventory.inventory_status == "complete_for_declared_scope"
+    and .inventory.inventory_source_count == 6
+    and .inventory.declared_source_count == 1
+  '
+  assert_jq "adversarial.endorsed.provider_calls" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.endorsed.dsa" >&2
+    return 1
+  fi
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.endorsed.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events \
+    "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.endorsed.claim_calibration" >&2
+    return 1
+  fi
+  assert_jq "adversarial.endorsed.dispatch" "$trace" \
+    '.fallback.triggered == false and (.model_calls | length) == 1'
+  if ! assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.endorsed.persistence" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.endorsed.persistence" >&2
+    return 1
+  fi
+  echo "Adversarial provider case passed: endorsed_quote"
+  echo "Evidence adversarial provider: affirmative_replaced=1 negated_preserved=1 endorsed_quote_replaced=1 affirmative_provider=1 negated_provider=1 endorsed_provider=1"
 }
 
 normalized_first_paragraph() {
