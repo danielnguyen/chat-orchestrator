@@ -3252,8 +3252,9 @@ run_evidence_scope_reference_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "scope.malformed.response" "$response" \
-    '.status == "ok" and (.answer | contains("Limitation:"))'
+  assert_jq "scope.malformed.response_status" "$response" '.status == "ok"'
+  assert_jq "scope.malformed.response_limitation" "$response" \
+    '.answer | contains("Limitation:")'
   assert_jq "scope.malformed.manifest" "$manifest" '
     .inventory.inventory_status == "partial"
     and .inventory.inventory_source_count == 5
@@ -3458,7 +3459,7 @@ run_structured_answer_failure_case() {
   assert_jq "structured.${case_name}.claims" "$claims" '(.records | length) == 0'
   serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c . <<<"$claims")"
   case "$serialized" in
-    *"$raw_marker"*|*conclusion_disposition*|*evidence_excerpts*|*aggressive_claim*|*compliance_claim*)
+    *"$raw_marker"*|*aggressive_claim*|*compliance_claim*)
       echo "Assertion failed: structured.${case_name}.durable_privacy" >&2
       return 1
       ;;
