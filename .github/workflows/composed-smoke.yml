@@ -15,10 +15,12 @@ on:
           - history-unknown
           - history-negatives
           - compound
+          - adversarial-provider
   pull_request:
     branches:
       - main
     paths:
+      - api/**
       - docker-compose.composed-smoke.yml
       - scripts/composed_smoke.sh
       - scripts/evidence_acquisition_composed.sh
