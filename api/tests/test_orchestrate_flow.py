@@ -995,6 +995,7 @@ class FakeRuntime:
                 if isinstance(self.evidence_sufficiency_response, list)
                 else self.evidence_sufficiency_response
             )
+            response = response(kwargs) if callable(response) else response
             self._last_evidence_sufficiency_result = response["result"]
             return response
         evaluations = [
@@ -1049,6 +1050,13 @@ class FakeRuntime:
                 "withhold_unqualified_conclusion",
             ]
         )
+        task_constraint = {
+            "bounded_exhaustive_review": "withhold_exhaustive_conclusion",
+            "absence_or_coverage_check": "withhold_absence_conclusion",
+            "contradiction_review": "withhold_contradiction_sensitive_conclusion",
+        }.get(kwargs["task_shape"])
+        if status in {"insufficient", "unknown"} and task_constraint is not None:
+            constraints.append(task_constraint)
         reasons = (
             ["all_declared_requirements_satisfied"]
             if status == "sufficient_for_declared_scope"
@@ -12249,6 +12257,7 @@ async def _run_bounded_exhaustive_case(
     memory_store=None,
     privacy_context_response=None,
     privacy_context_enabled: bool = False,
+    evidence_sufficiency_response=None,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Review every maintenance record in the configured worksheet."
@@ -12264,6 +12273,7 @@ async def _run_bounded_exhaustive_case(
             question=question,
             status=plan_status,
         ),
+        evidence_sufficiency_response=evidence_sufficiency_response,
         privacy_context_response=privacy_context_response,
     )
     dsa = FakeDSA(
@@ -12453,7 +12463,11 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         withholding="I’m withholding a complete-scope conclusion.",
     )
     assert len(dsa.context_calls) == 1
+    assert len(dsa.calls) == 1
+    assert dsa.fetch_calls == []
     assert litellm.calls == []
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
     facts = {
         fact["requirement_id"]: fact["outcome"]
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
@@ -12465,12 +12479,121 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         "contradiction-search": "filtered",
         "no-material-truncation": "filtered",
     }
-    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
+    assert len(memory_store.trace_calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
-    ]["acquisition"]
+    ]
+    assert manifest["status"] == "insufficient"
+    assert manifest["sufficiency"]["status"] == "insufficient"
+    assert manifest["sufficiency"]["answer_constraints"] == [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+        "additional_acquisition_or_clarification_required",
+        "withhold_unqualified_conclusion",
+        "withhold_exhaustive_conclusion",
+    ]
+    assert manifest["next_steps"]["selection_count"] == 1
+    assert manifest["next_steps"]["selections"][0]["selected_next_step"] == (
+        "disclose_unexamined_scope"
+    )
+    assert manifest["next_steps"]["additional_acquisition_count"] == 0
+    acquisition = manifest["acquisition"]
     assert len(acquisition["source_references_returned"]) == 1
     assert acquisition["source_references_retained"] == []
     assert len(acquisition["source_references_filtered_or_omitted"]) == 1
+    assert len(
+        [
+            message
+            for message in memory_store.added_messages
+            if message["role"] == "assistant"
+        ]
+    ) == 1
+    assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing", "wrong", "reordered", "extra"],
+)
+async def test_bounded_exhaustive_malformed_sufficiency_constraints_fail_closed(
+    tmp_path,
+    malformation,
+):
+    def malformed_response(kwargs):
+        facts = {
+            fact["requirement_id"]: fact["outcome"]
+            for fact in kwargs["acquisition_facts"]
+        }
+        constraints = [
+            "qualify_conclusion",
+            "disclose_limitations",
+            "identify_unexamined_scope",
+            "additional_acquisition_or_clarification_required",
+            "withhold_unqualified_conclusion",
+            "withhold_exhaustive_conclusion",
+        ]
+        if malformation == "missing":
+            constraints.pop()
+        elif malformation == "wrong":
+            constraints[-1] = "withhold_absence_conclusion"
+        elif malformation == "reordered":
+            constraints[0], constraints[1] = constraints[1], constraints[0]
+        else:
+            constraints.append("withhold_absence_conclusion")
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "evidence_plan_id",
+                    "acquisition_manifest_id",
+                )
+            },
+            "result": {
+                "evaluation_id": "evidence_eval_malformed_constraints",
+                "task_shape": kwargs["task_shape"],
+                "sufficiency_status": "insufficient",
+                "evaluated_requirements": [
+                    {
+                        **requirement,
+                        "effective_outcome": facts[requirement["requirement_id"]],
+                    }
+                    for requirement in kwargs["declared_requirements"]
+                ],
+                "reason_codes": ["material_requirement_not_satisfied"],
+                "answer_constraints": constraints,
+                "qualification_required": True,
+                "additional_acquisition_required": True,
+                "user_safe_summary": "Malformed producer fixture.",
+            },
+        }
+
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_bounded_exhaustive_case(
+            tmp_path=tmp_path,
+            context_responses=[_configured_worksheet_context_response(truncated=True)],
+            evidence_sufficiency_response=malformed_response,
+        )
+    )
+
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert runtime.evidence_next_step_calls == []
+    assert litellm.calls == []
+    assert len(dsa.context_calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["status"] == "sufficiency_dependency_failed"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert "complete-scope conclusion" not in out["answer"]
+    assert memory_store.claim_record_calls == []
 
 
 @pytest.mark.asyncio
@@ -13892,29 +14015,25 @@ async def test_evidence_acquisition_ambiguous_shape_is_provider_and_dsa_free(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "All maintenance records use this date.",
-        "None of the maintenance records use another date.",
-        "There is no record of any other date.",
-    ],
-)
 async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_disclosure(
     tmp_path,
-    provider_answer,
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
     dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    provider_answer = (
+        "Every possible source was fully examined, and no evidence exists outside "
+        "this result."
+    )
     litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Verify the maintenance record.",
             external_context_enabled=True,
         ),
-        memory_store=FakeMemoryStore(),
+        memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
         dsa=dsa,
@@ -13927,11 +14046,169 @@ async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_discl
         request_id="rid-evidence-overclaim",
     )
 
-    assert out["answer"].endswith(
-        "This reflects only the targeted sources checked, not a complete search "
-        "of every possible source."
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
     )
+    assert len(litellm.calls) == 1
+    assert "Every possible source was fully examined" not in out["answer"]
+    assert "no evidence exists outside this result" not in out["answer"]
+    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
     assert out["answer"].count("This reflects only the targeted sources checked") == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["shape"]["task_shape"] == "targeted_lookup"
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
+    assert trace["fallback"]["triggered"] is False
+    assert len(trace["model_calls"]) == 1
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == out["answer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_answer", "request_id"),
+    [
+        (
+            'The report claimed, "Every possible source was fully examined," '
+            "and that claim is correct.",
+            "rid-evidence-endorsed-same-sentence",
+        ),
+        (
+            'The earlier answer claimed, "Every possible source was fully examined." '
+            "I agree.",
+            "rid-evidence-endorsed-adjacent",
+        ),
+        (
+            'The phrase "All possible sources were checked" is not supported by '
+            "the evidence, but it is nevertheless true.",
+            "rid-evidence-rejected-then-endorsed",
+        ),
+    ],
+)
+async def test_evidence_acquisition_replaces_endorsed_quoted_scope_claims(
+    tmp_path,
+    provider_answer,
+    request_id,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert out["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert provider_answer not in out["answer"]
+    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"].count(replacement) == 1
+    assert out["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["shape"]["task_shape"] == "targeted_lookup"
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
+    assert trace["fallback"]["triggered"] is False
+    assert len(trace["model_calls"]) == 1
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == out["answer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_answer", "request_id"),
+    [
+        (
+            "Not every possible source was fully examined.",
+            "rid-evidence-negated-scope",
+        ),
+        (
+            'The earlier answer claimed, "Every possible source was fully examined."',
+            "rid-evidence-metalinguistic-scope",
+        ),
+        (
+            'The earlier answer claimed, "Every possible source was fully examined." '
+            "I disagree.",
+            "rid-evidence-adjacent-rejection",
+        ),
+    ],
+)
+async def test_evidence_acquisition_preserves_non_assertive_scope_mentions(
+    tmp_path,
+    provider_answer,
+    request_id,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert out["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert out["answer"] == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"].count(provider_answer) == 1
+    assert replacement not in out["answer"]
+    assert out["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["shape"]["task_shape"] == "targeted_lookup"
+    assert manifest["acquisition"]["sources_considered"] == ["vehicle_log_primary"]
+    assert manifest["acquisition"]["sources_selected"] == ["vehicle_log_primary"]
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
+    assert trace["fallback"]["triggered"] is False
+    assert len(trace["model_calls"]) == 1
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == out["answer"]
 
 
 @pytest.mark.asyncio
@@ -16724,6 +17001,18 @@ async def _run_compound_provider_boundary_case(
     }
 
 
+def _assert_compound_claim_capture_excluded(trace):
+    claim_capture = trace["prompt"]["claim_capture"]
+    assert claim_capture["enabled"] is True
+    assert claim_capture["eligibility_status"] == "ineligible"
+    assert claim_capture["reason_code"] == "compound_verification_response"
+    assert claim_capture["runtime_call_count"] == 0
+    assert claim_capture["storage_call_count"] == 0
+    assert claim_capture["evidence_count"] == 0
+    assert claim_capture["calibration_status"] == "not_attempted"
+    assert claim_capture["persistence_status"] == "not_attempted"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider_content", "case_id"),
@@ -16798,6 +17087,7 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
     assert len(outcome["runtime"].claim_calibration_calls) == outcome[
         "runtime_counts"
     ]["claim_calibration"]
+    _assert_compound_claim_capture_excluded(trace)
     final_manifest = trace["prompt"]["evidence_acquisition"]
     assert final_manifest["response_digest"] == (
         "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
@@ -16915,6 +17205,8 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
     assert len(provider.calls) == 1
     assert memory_store.claim_record_calls == []
     trace = memory_store.trace_calls[-1]["payload"]
+    _assert_compound_claim_capture_excluded(trace)
+    assert runtime.claim_calibration_calls == []
     history_trace = trace["prompt"]["claim_explanation"]
     assert history_trace["compound_mode"] is True
     assert history_trace["resolution_status"] == "resolved"
@@ -17030,7 +17322,10 @@ async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_p
     assert result["answer"].startswith("Original acquisition:\n")
     assert "\n\nNew verification attempt:\n" in result["answer"]
     assert provider.calls == []
+    assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    _assert_compound_claim_capture_excluded(trace)
 
 
 @pytest.mark.asyncio

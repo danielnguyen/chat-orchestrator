@@ -75,9 +75,42 @@ Current prerequisites are:
 
 - Docker with Compose support;
 - `git`, `curl`, `jq`, and `python3`; and
-- sibling checkouts at `../basic-memory-store` and `../cognitive-runtime`, with their local `main` branches updated to compatible current code.
+- sibling checkouts at `../basic-memory-store`, `../cognitive-runtime`, and
+  `../data-source-aggregator`, with their local `main` branches updated to
+  compatible current code.
 
-The script performs its own compatibility preflight and stops before startup if a sibling checkout is missing or incompatible. It builds Chat Orchestrator and the sibling services from their worktrees together with a deterministic local OpenAI-compatible provider, PostgreSQL, and Qdrant. Storage is removed during cleanup.
+The script performs its own compatibility preflight and stops before startup if a
+sibling checkout is missing or incompatible. It builds the real Chat Orchestrator,
+Cognitive Runtime, Data Source Aggregator, and Basic Memory Store HTTP services
+together with PostgreSQL, Qdrant, a deterministic local OpenAI-compatible provider,
+and a deterministic external-source fixture. The fixture supplies raw spreadsheet
+cells below the real Google Sheets connector and local ICS documents to the real ICS
+connector; it does not produce DSA envelopes, plans, sufficiency decisions,
+manifests, traces, or policy responses. Service authentication and normal
+owner/conversation scope remain enabled.
+
+Run only the focused evidence-acquisition proof with:
+
+```bash
+EVIDENCE_ACQUISITION_ONLY=1 make composed-smoke
+```
+
+That mode exercises real HTTP planning, inventory and capability discovery,
+targeted retrieval, exact fetch, hybrid comparison, configured-worksheet review,
+prompt retention, sufficiency, deterministic next-step selection, one bounded
+changed-premise exact follow-up, provider gating, response qualification, durable
+message/trace/manifest association, eligible claim support, response-first
+acquisition history, privacy suppression, isolation, and compound new verification.
+Positive records are created through the normal CO and BMS lifecycle. SQL reads are
+used only to confirm durability; the two fail-closed history cases corrupt an
+already-valid retained trace after that lifecycle has completed.
+
+The focused fixture never contacts Google or another mutable source system. Source
+configuration, dummy non-secret credential structure, DSA audit state, CR state,
+PostgreSQL data, and Qdrant data are disposable and removed during cleanup. A
+failed hosted run may upload only filtered service lifecycle/access lines and
+container status; full prompts, provider text, source content, credentials, and raw
+exceptions are excluded.
 
 ## Artifact composed smoke check
 

@@ -119,6 +119,12 @@ AnswerConstraint = Literal[
     "withhold_absence_conclusion",
     "withhold_contradiction_sensitive_conclusion",
 ]
+SufficiencyStatus = Literal[
+    "sufficient_for_declared_scope",
+    "sufficient_with_limitations",
+    "insufficient",
+    "unknown",
+]
 AcquisitionStrategy = Literal[
     "targeted_retrieval",
     "exact_fetch",
@@ -194,6 +200,10 @@ EXHAUSTIVE_SCOPE_SUFFIX = (
     "This conclusion is complete only for the declared source scope that was checked; "
     "sources outside that scope were not examined."
 )
+SCOPE_OVERCLAIM_REPLACEMENT = (
+    "I withheld the generated answer because it claimed evidence coverage beyond "
+    "the examined scope."
+)
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
     "max_rows": 20,
@@ -206,6 +216,51 @@ _SCOPE_BOUNDARIES = {
     "cross_source_comparison": COMPARISON_SCOPE_SUFFIX,
     "bounded_exhaustive_review": EXHAUSTIVE_SCOPE_SUFFIX,
 }
+_UNIVERSAL_SCOPE_CLAIM_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bevery\s+possible\s+source\s+was\s+fully\s+examined\b",
+        r"\ball\s+possible\s+sources\s+were\s+checked\b",
+        r"\bno\s+evidence\s+exists\s+outside\s+this\s+result\b",
+        r"\bno\s+evidence\s+exists\s+beyond\s+the\s+checked\s+material\b",
+        r"\bthe\s+search\s+was\s+complete\s+across\s+every\s+relevant\s+source\b",
+    )
+)
+_UNIVERSAL_SCOPE_EXTERNAL_NEGATION = re.compile(
+    r"(?:\bnot|\b(?:is|was)\s+false\s+that|"
+    r"\b(?:is|was)\s+not\s+true\s+that|"
+    r"\b(?:cannot|can't)\s+(?:say|conclude|confirm|establish)\s+that)\s*$",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX = re.compile(
+    r"(?:\b(?:claimed|said|stated|quoted)\s*[,;:]?|"
+    r"\b(?:asked|questioned)\s+whether|"
+    r"\b(?:rejected|disputed)\s+(?:the\s+)?(?:statement|claim|phrase))\s*$",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX = re.compile(
+    r"^\s*(?:is|was)\s+(?:not\s+(?:supported|established|true)|"
+    r"unsupported|false|rejected)\b",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_SAME_SENTENCE_ENDORSEMENT = re.compile(
+    r"\b(?:and\s+(?:that\s+claim\s+is\s+correct|"
+    r"that\s+statement\s+is\s+true|the\s+phrase\s+is\s+accurate|"
+    r"i\s+agree)|but\s+(?:it\s+is\s+(?:nevertheless\s+true|"
+    r"still\s+correct)|that\s+claim\s+is\s+supported))\b",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_ADJACENT_ENDORSEMENT = re.compile(
+    r"^\s*(?:i\s+(?:agree|concur)|that\s+is\s+(?:correct|true)|"
+    r"that\s+claim\s+is\s+correct|this\s+statement\s+is\s+accurate|"
+    r"the\s+claim\s+is\s+supported|the\s+report\s+was\s+right|"
+    r"the\s+earlier\s+answer\s+was\s+(?:correct|right))"
+    r"\s*[.!?]?(?:[\"'”’]|\*{1,2}|_{1,2})*\s*$",
+    re.IGNORECASE,
+)
+_PROVIDER_SCOPE_SENTENCE = re.compile(
+    r".+?(?:[.!?](?:[\"'”’]|\*{1,2}|_{1,2})*(?=\s|$)|$)"
+)
 _REQUIREMENT_DESCRIPTIONS = {
     "authoritative_inventory": "the authoritative source inventory",
     "targeted_evidence": "the requested targeted evidence",
@@ -456,12 +511,7 @@ class RequirementEvaluation(StrictModel):
 class SufficiencyResult(StrictModel):
     evaluation_id: Identifier
     task_shape: TaskShape
-    sufficiency_status: Literal[
-        "sufficient_for_declared_scope",
-        "sufficient_with_limitations",
-        "insufficient",
-        "unknown",
-    ]
+    sufficiency_status: SufficiencyStatus
     evaluated_requirements: list[RequirementEvaluation] = Field(max_length=32)
     reason_codes: list[SufficiencyReasonCode] = Field(max_length=9)
     answer_constraints: list[AnswerConstraint] = Field(max_length=8)
@@ -484,6 +534,35 @@ class SufficiencyResult(StrictModel):
         if self.additional_acquisition_required != acquisition_expected:
             raise ValueError("additional_acquisition_flag_mismatch")
         return self
+
+
+def _expected_sufficiency_constraints(
+    status: SufficiencyStatus,
+    *,
+    task_shape: TaskShape,
+) -> list[AnswerConstraint]:
+    if status == "sufficient_for_declared_scope":
+        return []
+    limitations: list[AnswerConstraint] = [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+    ]
+    if status == "sufficient_with_limitations":
+        return limitations
+    constraints: list[AnswerConstraint] = [
+        *limitations,
+        "additional_acquisition_or_clarification_required",
+        "withhold_unqualified_conclusion",
+    ]
+    task_constraint: dict[TaskShape, AnswerConstraint] = {
+        "bounded_exhaustive_review": "withhold_exhaustive_conclusion",
+        "absence_or_coverage_check": "withhold_absence_conclusion",
+        "contradiction_review": "withhold_contradiction_sensitive_conclusion",
+    }
+    if task_shape in task_constraint:
+        constraints.append(task_constraint[task_shape])
+    return constraints
 
 
 class SufficiencyResponse(StrictModel):
@@ -3489,22 +3568,9 @@ async def evaluate_acquisition_sufficiency(
         )
         if response.result.sufficiency_status != expected_status:
             raise ValueError("sufficiency_status_mismatch")
-        expected_constraints = (
-            []
-            if expected_status == "sufficient_for_declared_scope"
-            else [
-                "qualify_conclusion",
-                "disclose_limitations",
-                "identify_unexamined_scope",
-            ]
-            if expected_status == "sufficient_with_limitations"
-            else [
-                "qualify_conclusion",
-                "disclose_limitations",
-                "identify_unexamined_scope",
-                "additional_acquisition_or_clarification_required",
-                "withhold_unqualified_conclusion",
-            ]
+        expected_constraints = _expected_sufficiency_constraints(
+            expected_status,
+            task_shape=state.plan.task_shape,
         )
         if response.result.answer_constraints != expected_constraints:
             raise ValueError("sufficiency_constraints_mismatch")
@@ -3593,7 +3659,97 @@ def enforce_final_answer(
     boundary = _SCOPE_BOUNDARIES.get(state.sufficiency.task_shape)
     if boundary:
         policy_paragraphs.append(boundary)
+    if _provider_answer_claims_universal_scope(answer, policy_paragraphs):
+        answer = SCOPE_OVERCLAIM_REPLACEMENT
     return _compose_policy_answer(answer, policy_paragraphs)
+
+
+def _provider_answer_claims_universal_scope(
+    answer: str,
+    policy_paragraphs: list[str],
+) -> bool:
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", answer.strip())
+        if paragraph.strip()
+    ]
+    owned_policy_paragraphs = {
+        *_SCOPE_BOUNDARIES.values(),
+        *policy_paragraphs,
+    }
+    provider_paragraphs = [
+        paragraph
+        for paragraph in paragraphs
+        if paragraph not in owned_policy_paragraphs
+    ]
+    for paragraph in provider_paragraphs:
+        normalized = re.sub(r"\s+", " ", paragraph).strip()
+        sentences = [
+            sentence_match.group(0).strip()
+            for sentence_match in _PROVIDER_SCOPE_SENTENCE.finditer(normalized)
+        ]
+        for sentence_index, sentence in enumerate(sentences):
+            next_sentence = (
+                sentences[sentence_index + 1]
+                if sentence_index + 1 < len(sentences)
+                else None
+            )
+            for claim_pattern in _UNIVERSAL_SCOPE_CLAIM_PATTERNS:
+                for claim_match in claim_pattern.finditer(sentence):
+                    if _scope_claim_is_explicitly_negated(sentence, claim_match):
+                        continue
+                    if _scope_claim_is_safe_quoted_reference(
+                        sentence,
+                        claim_match,
+                        next_sentence,
+                    ):
+                        continue
+                    return True
+    return False
+
+
+def _scope_claim_is_explicitly_negated(
+    sentence: str,
+    claim_match: re.Match[str],
+) -> bool:
+    prefix = sentence[: claim_match.start()].rstrip(" \t\"'“”‘’*_")
+    return _UNIVERSAL_SCOPE_EXTERNAL_NEGATION.search(prefix) is not None
+
+
+def _scope_claim_is_safe_quoted_reference(
+    sentence: str,
+    claim_match: re.Match[str],
+    next_sentence: str | None,
+) -> bool:
+    quote_bounds: tuple[int, int] | None = None
+    for opening_quote, closing_quote in (("\"", "\""), ("“", "”")):
+        opening_index = sentence.rfind(opening_quote, 0, claim_match.start())
+        if opening_index < 0:
+            continue
+        closing_index = sentence.find(closing_quote, claim_match.end())
+        if closing_index >= 0:
+            quote_bounds = (opening_index, closing_index)
+            break
+    if quote_bounds is None:
+        return False
+    opening_index, closing_index = quote_bounds
+    prefix = sentence[:opening_index].rstrip()
+    suffix = sentence[closing_index + 1 :]
+    has_safe_context = (
+        _UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX.search(prefix) is not None
+        or _UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX.search(suffix) is not None
+    )
+    if not has_safe_context:
+        return False
+    if _UNIVERSAL_SCOPE_SAME_SENTENCE_ENDORSEMENT.search(suffix) is not None:
+        return False
+    if (
+        next_sentence is not None
+        and _UNIVERSAL_SCOPE_ADJACENT_ENDORSEMENT.fullmatch(next_sentence)
+        is not None
+    ):
+        return False
+    return True
 
 
 def _compose_policy_answer(answer: str, policy_paragraphs: list[str]) -> str:

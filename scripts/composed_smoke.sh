@@ -4,10 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
+DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="183f229d23c44fb22428e4c407e5cb06aa1d6617"
-CR_COMMIT="b70e6d439b38ed2702cd3fae7e343b60299780c3"
-CO_COMMIT="4fc2146f0ce29fe90fc2eda659241a9e5d939c1b"
+BMS_COMMIT="774a49882729ab3d06b88c5b2eff79cfe5ce54e7"
+CR_COMMIT="d814a0d2789269383e81db037d464cf821c6502d"
+DSA_COMMIT="2d01f4f6e2909bb2776f563f5e34c547467ab86c"
+CO_COMMIT="677d6aef095ecef5dbace2f90196cbf2ab184c9a"
+
+# shellcheck source=scripts/evidence_acquisition_composed.sh
+source "$ROOT/scripts/evidence_acquisition_composed.sh"
 
 for command in git docker curl jq python3; do
   command -v "$command" >/dev/null || {
@@ -16,7 +21,7 @@ for command in git docker curl jq python3; do
   }
 done
 
-for repository in "$BMS" "$CR"; do
+for repository in "$BMS" "$CR" "$DSA"; do
   test -d "$repository/.git" || {
     echo "composed-smoke prerequisite missing: sibling repository $repository" >&2
     exit 2
@@ -31,16 +36,36 @@ git -C "$CR" merge-base --is-ancestor "$CR_COMMIT" main || {
   echo "cognitive-runtime/main does not contain required merge $CR_COMMIT" >&2
   exit 2
 }
+git -C "$DSA" merge-base --is-ancestor "$DSA_COMMIT" main || {
+  echo "data-source-aggregator/main does not contain required merge $DSA_COMMIT" >&2
+  exit 2
+}
 git -C "$ROOT" merge-base --is-ancestor "$CO_COMMIT" HEAD || {
   echo "chat-orchestrator/HEAD does not contain required merge $CO_COMMIT" >&2
   exit 2
 }
 
+docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
+
+COMPOSED_SMOKE_TMP="$(mktemp -d /tmp/chat-orchestrator-composed-smoke.XXXXXX)"
+export COMPOSED_SMOKE_TMP
+evidence_prepare_fixture_config
+
 cleanup() {
+  local status="$?"
+  if [ "$status" -ne 0 ] && [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    docker compose -f "$COMPOSE" ps --format json \
+      >"$COMPOSED_SMOKE_LOG_DIR/service-status.jsonl" 2>/dev/null || true
+    docker compose -f "$COMPOSE" logs --no-color --tail=300 2>/dev/null \
+      | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+' \
+      >"$COMPOSED_SMOKE_LOG_DIR/bounded-service.log" || true
+  fi
   docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "$COMPOSED_SMOKE_TMP"
+  return "$status"
 }
 trap cleanup EXIT
-cleanup
 
 docker compose -f "$COMPOSE" up -d --build --wait
 
@@ -791,6 +816,13 @@ if [ "${WAVE2E_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: evidence-acquisition-only"
+  run_evidence_acquisition_composed_suite
+  echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
+  exit 0
+fi
+
 # Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
 owner="owner-smoke-a"
 client="client-smoke-a"
@@ -940,6 +972,7 @@ jq -e '
 
 run_wave2e_retrieval_scenario
 run_claim_traceability_scenario
+run_evidence_acquisition_composed_suite
 
-echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation"
-echo "Topology: CO HTTP -> deterministic provider HTTP; BMS HTTP -> PostgreSQL 16 + Qdrant; CR HTTP -> disposable SQLite."
+echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation, evidence-acquisition"
+echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."

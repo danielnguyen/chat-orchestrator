@@ -25,7 +25,9 @@ from services.evidence_acquisition import (
     SufficiencyResult,
     _acquisition_premise_digest,
     _build_acquisition_facts,
+    _expected_sufficiency_constraints,
     _manifest_id,
+    _provider_answer_claims_universal_scope,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_current_acquisition_premise,
@@ -508,22 +510,9 @@ def _sufficiency_response(
         }
         for requirement in requirements
     ]
-    constraints = (
-        []
-        if status == "sufficient_for_declared_scope"
-        else [
-            "qualify_conclusion",
-            "disclose_limitations",
-            "identify_unexamined_scope",
-        ]
-        if status == "sufficient_with_limitations"
-        else [
-            "qualify_conclusion",
-            "disclose_limitations",
-            "identify_unexamined_scope",
-            "additional_acquisition_or_clarification_required",
-            "withhold_unqualified_conclusion",
-        ]
+    constraints = _expected_sufficiency_constraints(
+        status,
+        task_shape=task_shape,
     )
     reasons = (
         ["all_declared_requirements_satisfied"]
@@ -548,6 +537,77 @@ def _sufficiency_response(
             "user_safe_summary": "Bounded sufficiency.",
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "task_shape", "expected"),
+    [
+        ("sufficient_for_declared_scope", "bounded_exhaustive_review", []),
+        (
+            "sufficient_with_limitations",
+            "contradiction_review",
+            [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+            ],
+        ),
+        (
+            "insufficient",
+            "targeted_lookup",
+            [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ],
+        ),
+        (
+            "unknown",
+            "cross_source_comparison",
+            [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ],
+        ),
+        *[
+            (
+                status,
+                task_shape,
+                [
+                    "qualify_conclusion",
+                    "disclose_limitations",
+                    "identify_unexamined_scope",
+                    "additional_acquisition_or_clarification_required",
+                    "withhold_unqualified_conclusion",
+                    constraint,
+                ],
+            )
+            for status in ("insufficient", "unknown")
+            for task_shape, constraint in (
+                ("bounded_exhaustive_review", "withhold_exhaustive_conclusion"),
+                ("absence_or_coverage_check", "withhold_absence_conclusion"),
+                (
+                    "contradiction_review",
+                    "withhold_contradiction_sensitive_conclusion",
+                ),
+            )
+        ],
+    ],
+)
+def test_expected_sufficiency_constraints_are_exact_and_task_specific(
+    status,
+    task_shape,
+    expected,
+):
+    assert _expected_sufficiency_constraints(
+        status,
+        task_shape=task_shape,
+    ) == expected
 
 
 def _rendering_state(
@@ -914,6 +974,213 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
     assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == (
         "unknown"
     )
+
+
+class ProducerContractSufficiencyRuntime:
+    def __init__(self, constraint_mutation=None):
+        self.calls = []
+        self.constraint_mutation = constraint_mutation
+
+    async def evaluate_evidence_sufficiency(self, **kwargs):
+        self.calls.append(kwargs)
+        facts = {
+            fact["requirement_id"]: fact["outcome"]
+            for fact in kwargs["acquisition_facts"]
+        }
+        evaluations = [
+            {
+                **requirement,
+                "effective_outcome": facts[requirement["requirement_id"]],
+            }
+            for requirement in kwargs["declared_requirements"]
+        ]
+        material_outcomes = [
+            evaluation["effective_outcome"]
+            for evaluation in evaluations
+            if evaluation["criticality"] == "material"
+        ]
+        concrete_failures = {
+            "partial",
+            "not_attempted",
+            "unavailable",
+            "unsupported",
+            "failed",
+            "excluded",
+            "filtered",
+            "truncated",
+            "unresolved_contradiction",
+        }
+        status = (
+            "insufficient"
+            if any(outcome in concrete_failures for outcome in material_outcomes)
+            else "unknown"
+            if any(outcome in {"missing", "unknown"} for outcome in material_outcomes)
+            else "sufficient_for_declared_scope"
+        )
+        constraints = (
+            []
+            if status == "sufficient_for_declared_scope"
+            else [
+                "qualify_conclusion",
+                "disclose_limitations",
+                "identify_unexamined_scope",
+                "additional_acquisition_or_clarification_required",
+                "withhold_unqualified_conclusion",
+            ]
+        )
+        task_constraint = {
+            "bounded_exhaustive_review": "withhold_exhaustive_conclusion",
+            "absence_or_coverage_check": "withhold_absence_conclusion",
+            "contradiction_review": "withhold_contradiction_sensitive_conclusion",
+        }.get(kwargs["task_shape"])
+        if task_constraint is not None:
+            constraints.append(task_constraint)
+        if self.constraint_mutation is not None:
+            constraints = self.constraint_mutation(list(constraints))
+        return {
+            **{
+                key: kwargs[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "evidence_plan_id",
+                    "acquisition_manifest_id",
+                )
+            },
+            "result": {
+                "evaluation_id": "evidence_eval_producer_contract",
+                "task_shape": kwargs["task_shape"],
+                "sufficiency_status": status,
+                "evaluated_requirements": evaluations,
+                "reason_codes": [
+                    "material_requirement_not_satisfied"
+                    if status == "insufficient"
+                    else "material_requirement_unknown"
+                    if status == "unknown"
+                    else "all_declared_requirements_satisfied"
+                ],
+                "answer_constraints": constraints,
+                "qualification_required": status
+                != "sufficient_for_declared_scope",
+                "additional_acquisition_required": status
+                in {"insufficient", "unknown"},
+                "user_safe_summary": "Bounded producer response.",
+            },
+        }
+
+
+async def _evaluate_filtered_exhaustive_sufficiency(runtime):
+    state = _exhaustive_state()
+    dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
+    context, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=_exhaustive_targeted_context_pack(),
+        dsa_trace={"called": True, "status": "success"},
+    )
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=context,
+        dsa_trace=trace,
+        retained_source_refs=set(),
+        **SCOPE,
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_producer_shaped_exhaustive_blocking_constraints_are_accepted():
+    runtime = ProducerContractSufficiencyRuntime()
+
+    state = await _evaluate_filtered_exhaustive_sufficiency(runtime)
+
+    assert len(runtime.calls) == 1
+    assert state.status == "insufficient"
+    assert state.sufficiency is not None
+    assert state.sufficiency.evaluation_id == "evidence_eval_producer_contract"
+    assert state.sufficiency.sufficiency_status == "insufficient"
+    assert state.sufficiency.answer_constraints == [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+        "additional_acquisition_or_clarification_required",
+        "withhold_unqualified_conclusion",
+        "withhold_exhaustive_conclusion",
+    ]
+    assert [
+        evaluation.model_dump(mode="json")
+        for evaluation in state.sufficiency.evaluated_requirements
+    ] == [
+        {
+            **requirement,
+            "effective_outcome": next(
+                fact["outcome"]
+                for fact in state.acquisition_facts
+                if fact["requirement_id"] == requirement["requirement_id"]
+            ),
+        }
+        for requirement in runtime.calls[0]["declared_requirements"]
+    ]
+    assert runtime.calls[0]["acquisition_facts"] == state.acquisition_facts
+    assert state.forced_answer == WITHHELD_ANSWER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "constraint_mutation",
+    [
+        lambda constraints: constraints[:-1],
+        lambda constraints: [
+            *constraints[:-1],
+            "withhold_absence_conclusion",
+        ],
+        lambda constraints: [constraints[1], constraints[0], *constraints[2:]],
+        lambda constraints: [*constraints, "withhold_absence_conclusion"],
+    ],
+    ids=["missing", "wrong", "reordered", "extra"],
+)
+async def test_malformed_exhaustive_constraints_fail_closed(constraint_mutation):
+    state = await _evaluate_filtered_exhaustive_sufficiency(
+        ProducerContractSufficiencyRuntime(constraint_mutation)
+    )
+
+    assert state.status == "sufficiency_dependency_failed"
+    assert state.sufficiency is None
+    assert state.forced_answer == WITHHELD_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_specialized_constraint_on_targeted_lookup_fails_closed():
+    setup_runtime = FakeRuntime(sufficiency_status="insufficient")
+    state = await begin_evidence_acquisition(
+        runtime=setup_runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+    runtime = ProducerContractSufficiencyRuntime(
+        lambda constraints: [*constraints, "withhold_exhaustive_conclusion"]
+    )
+
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=_validated_context_pack(),
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs=set(),
+        **SCOPE,
+    )
+
+    assert state.status == "sufficiency_dependency_failed"
+    assert state.sufficiency is None
+    assert provider_allowed(state) is False
 
 
 @pytest.mark.asyncio
@@ -3924,6 +4191,318 @@ def test_governed_success_boundaries_follow_task_shape_not_provider_text(
         EXHAUSTIVE_SCOPE_SUFFIX,
     } - {boundary}:
         assert other_boundary not in answer
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "boundary", "provider_answer"),
+    [
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "Every possible source was fully examined.",
+        ),
+        (
+            "cross_source_comparison",
+            COMPARISON_SCOPE_SUFFIX,
+            "All possible sources were checked.",
+        ),
+        (
+            "bounded_exhaustive_review",
+            EXHAUSTIVE_SCOPE_SUFFIX,
+            "No evidence exists outside this result.",
+        ),
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "No evidence exists beyond the checked material.",
+        ),
+        (
+            "cross_source_comparison",
+            COMPARISON_SCOPE_SUFFIX,
+            "The search was complete across every relevant source.",
+        ),
+    ],
+)
+def test_provider_universal_scope_claims_are_replaced(
+    task_shape,
+    boundary,
+    provider_answer,
+):
+    state = _rendering_state(task_shape=task_shape)
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert provider_answer not in answer
+    assert answer == f"{replacement}\n\n{boundary}"
+    assert answer.count(replacement) == 1
+    assert answer.count(boundary) == 1
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "boundary", "provider_answer"),
+    [
+        (
+            "bounded_exhaustive_review",
+            EXHAUSTIVE_SCOPE_SUFFIX,
+            "Within the declared scope, all configured records were reviewed.",
+        ),
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "I cannot say every possible source was examined.",
+        ),
+        (
+            "cross_source_comparison",
+            COMPARISON_SCOPE_SUFFIX,
+            "Not every potentially relevant source was checked.",
+        ),
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "No contradictory evidence was found in the selected records.",
+        ),
+    ],
+)
+def test_bounded_provider_scope_statements_are_preserved(
+    task_shape,
+    boundary,
+    provider_answer,
+):
+    state = _rendering_state(task_shape=task_shape)
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{boundary}"
+    assert "I withheld the generated answer" not in answer
+    assert answer.count(boundary) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "# EVERY POSSIBLE SOURCE WAS FULLY EXAMINED.",
+        "- All   possible\n sources\twere checked.",
+        "**No evidence exists outside this result.**",
+    ],
+)
+def test_provider_scope_claim_formatting_cannot_evade_replacement(provider_answer):
+    state = _rendering_state()
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert provider_answer not in answer
+    assert answer.count("I withheld the generated answer") == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+_ENDORSED_QUOTED_SCOPE_CLAIMS = (
+    'The report claimed, "Every possible source was fully examined," and that claim is correct.',
+    'The earlier answer claimed, "Every possible source was fully examined." I agree.',
+    'The phrase "All possible sources were checked" is not supported by the '
+    "evidence, but it is nevertheless true.",
+    'The report stated, "No evidence exists outside this result." That is correct.',
+    'The earlier answer quoted, "The search was complete across every relevant '
+    'source." The earlier answer was right.',
+    'The report claimed, "Every possible source was fully examined," and I agree.',
+)
+
+_NON_ENDORSING_QUOTED_SCOPE_REFERENCES = (
+    'The report claimed, "Every possible source was fully examined," and that claim is false.',
+    'The earlier answer claimed, "Every possible source was fully examined." I disagree.',
+    'The phrase "All possible sources were checked" is not supported by the '
+    "evidence, and I reject it.",
+    'The report stated, "No evidence exists outside this result." I have not verified that claim.',
+    'The earlier answer quoted, "The search was complete across every relevant '
+    'source." The earlier answer was wrong.',
+    'The report claimed, "Every possible source was fully examined." I do not agree.',
+)
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Every possible source was fully examined.",
+        "All possible sources were checked.",
+        "No evidence exists outside this result.",
+        "No evidence exists beyond the checked material.",
+        "The search was complete across every relevant source.",
+        "The evidence shows that every possible source was fully examined.",
+        "According to the results, all possible sources were checked.",
+        "I confirmed that no evidence exists outside this result.",
+        '"Every possible source was fully examined."',
+        "# EVERY POSSIBLE SOURCE WAS FULLY EXAMINED.",
+        "- All   possible\n sources\twere checked.",
+        "**No evidence exists outside this result.**",
+    ],
+)
+def test_provider_scope_claim_helper_rejects_affirmative_assertions(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
+
+
+@pytest.mark.parametrize("provider_answer", _ENDORSED_QUOTED_SCOPE_CLAIMS)
+def test_provider_scope_claim_helper_rejects_endorsed_quoted_assertions(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        'The report claimed, "Every possible source was fully examined," '
+        "and that statement is true.",
+        'The report quoted, "Every possible source was fully examined," '
+        "and the phrase is accurate.",
+        'The report claimed, "Every possible source was fully examined," '
+        "but it is still correct.",
+        'The report claimed, "Every possible source was fully examined," '
+        "but that claim is supported.",
+        'The report claimed, "Every possible source was fully examined." I concur.',
+        'The report claimed, "Every possible source was fully examined." '
+        "That is true.",
+        'The report claimed, "Every possible source was fully examined." '
+        "That claim is correct.",
+        'The report claimed, "Every possible source was fully examined." '
+        "This statement is accurate.",
+        'The report claimed, "Every possible source was fully examined." '
+        "The claim is supported.",
+        'The report claimed, "Every possible source was fully examined." '
+        "The report was right.",
+        'The report claimed, "Every possible source was fully examined." '
+        "The earlier answer was correct.",
+    ],
+)
+def test_provider_scope_claim_helper_rejects_bounded_endorsement_vocabulary(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Within the declared scope, all configured records were reviewed.",
+        "I cannot say every possible source was examined.",
+        "Not every potentially relevant source was checked.",
+        "No contradictory evidence was found in the selected records.",
+        "Not every possible source was fully examined.",
+        "It is false that all possible sources were checked.",
+        "It is not true that no evidence exists outside this result.",
+        "We cannot conclude that the search was complete across every relevant source.",
+        'The earlier answer claimed, "Every possible source was fully examined."',
+        'The phrase "All possible sources were checked" is not supported by the evidence.',
+        'The user asked whether "no evidence exists outside this result."',
+        'I rejected the statement "The search was complete across every relevant source."',
+    ],
+)
+def test_provider_scope_claim_helper_allows_bounded_negated_and_metalinguistic_text(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is False
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    _NON_ENDORSING_QUOTED_SCOPE_REFERENCES,
+)
+def test_provider_scope_claim_helper_allows_non_endorsing_quoted_references(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is False
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Every possible source was fully examined.",
+        "All possible sources were checked.",
+        "No evidence exists outside this result.",
+        "No evidence exists beyond the checked material.",
+        "The search was complete across every relevant source.",
+        "The evidence shows that every possible source was fully examined.",
+        "According to the results, all possible sources were checked.",
+        "I confirmed that no evidence exists outside this result.",
+        '"Every possible source was fully examined."',
+    ],
+)
+def test_targeted_answer_boundary_replaces_affirmative_scope_claims(provider_answer):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert provider_answer not in answer
+    assert answer == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert answer.count(replacement) == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize("provider_answer", _ENDORSED_QUOTED_SCOPE_CLAIMS)
+def test_targeted_answer_boundary_replaces_endorsed_quoted_scope_claims(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert provider_answer not in answer
+    assert answer == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert answer.count(replacement) == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Not every possible source was fully examined.",
+        "It is false that all possible sources were checked.",
+        "It is not true that no evidence exists outside this result.",
+        "We cannot conclude that the search was complete across every relevant source.",
+        'The earlier answer claimed, "Every possible source was fully examined."',
+        'The phrase "All possible sources were checked" is not supported by the evidence.',
+        'The user asked whether "no evidence exists outside this result."',
+        'I rejected the statement "The search was complete across every relevant source."',
+    ],
+)
+def test_targeted_answer_boundary_preserves_negated_and_metalinguistic_text(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert "I withheld the generated answer" not in answer
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    _NON_ENDORSING_QUOTED_SCOPE_REFERENCES,
+)
+def test_targeted_answer_boundary_preserves_non_endorsing_quoted_references(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert "I withheld the generated answer" not in answer
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
 
 
 @pytest.mark.parametrize(
