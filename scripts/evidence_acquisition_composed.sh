@@ -499,7 +499,7 @@ run_evidence_targeted_scenario() {
     ([.calls[] | select(.source == "targeted-sheet" and .operation == "google_values")] | length) == 1
   ' <<<"$fixture_calls" >/dev/null
   assert_jq "targeted.inventory" "$manifest" '
-    .inventory.inventory_status == "complete"
+    .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
@@ -939,7 +939,7 @@ run_evidence_clarification_scenario() {
   assert_jq "clarification.additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "clarification.inventory" "$manifest" '
-    .inventory.inventory_status == "complete"
+    .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 1
     and .inventory.declared_source_count == 0
   '
@@ -1155,7 +1155,7 @@ run_evidence_adversarial_provider_scenario() {
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
   assert_jq "adversarial.scope.inventory" "$manifest" '
-    .inventory.inventory_status == "complete"
+    .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
@@ -2506,7 +2506,7 @@ run_evidence_compound_scenarios() {
   assert_jq "compound.verification.no_additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "compound.verification.inventory" "$manifest" '
-    .inventory.inventory_status == "complete"
+    .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
@@ -2591,7 +2591,7 @@ run_evidence_compound_scenarios() {
   assert_jq "compound.label_conflict.no_additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "compound.label_conflict.inventory" "$manifest" '
-    .inventory.inventory_status == "complete"
+    .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
@@ -2687,7 +2687,7 @@ run_evidence_compound_scenarios() {
   assert_jq "compound.attempt.no_additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "compound.attempt.inventory" "$manifest" '
-    .inventory.inventory_status == "complete"
+    .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
