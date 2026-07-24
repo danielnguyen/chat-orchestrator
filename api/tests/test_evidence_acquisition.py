@@ -27,6 +27,7 @@ from services.evidence_acquisition import (
     _build_acquisition_facts,
     _expected_sufficiency_constraints,
     _manifest_id,
+    _provider_answer_claims_universal_scope,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_current_acquisition_premise,
@@ -4295,6 +4296,106 @@ def test_provider_scope_claim_formatting_cannot_evade_replacement(provider_answe
 
     assert provider_answer not in answer
     assert answer.count("I withheld the generated answer") == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Every possible source was fully examined.",
+        "All possible sources were checked.",
+        "No evidence exists outside this result.",
+        "No evidence exists beyond the checked material.",
+        "The search was complete across every relevant source.",
+        "The evidence shows that every possible source was fully examined.",
+        "According to the results, all possible sources were checked.",
+        "I confirmed that no evidence exists outside this result.",
+        '"Every possible source was fully examined."',
+        "# EVERY POSSIBLE SOURCE WAS FULLY EXAMINED.",
+        "- All   possible\n sources\twere checked.",
+        "**No evidence exists outside this result.**",
+    ],
+)
+def test_provider_scope_claim_helper_rejects_affirmative_assertions(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Within the declared scope, all configured records were reviewed.",
+        "I cannot say every possible source was examined.",
+        "Not every potentially relevant source was checked.",
+        "No contradictory evidence was found in the selected records.",
+        "Not every possible source was fully examined.",
+        "It is false that all possible sources were checked.",
+        "It is not true that no evidence exists outside this result.",
+        "We cannot conclude that the search was complete across every relevant source.",
+        'The earlier answer claimed, "Every possible source was fully examined."',
+        'The phrase "All possible sources were checked" is not supported by the evidence.',
+        'The user asked whether "no evidence exists outside this result."',
+        'I rejected the statement "The search was complete across every relevant source."',
+    ],
+)
+def test_provider_scope_claim_helper_allows_bounded_negated_and_metalinguistic_text(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is False
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Every possible source was fully examined.",
+        "All possible sources were checked.",
+        "No evidence exists outside this result.",
+        "No evidence exists beyond the checked material.",
+        "The search was complete across every relevant source.",
+        "The evidence shows that every possible source was fully examined.",
+        "According to the results, all possible sources were checked.",
+        "I confirmed that no evidence exists outside this result.",
+        '"Every possible source was fully examined."',
+    ],
+)
+def test_targeted_answer_boundary_replaces_affirmative_scope_claims(provider_answer):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert provider_answer not in answer
+    assert answer == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert answer.count(replacement) == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "Not every possible source was fully examined.",
+        "It is false that all possible sources were checked.",
+        "It is not true that no evidence exists outside this result.",
+        "We cannot conclude that the search was complete across every relevant source.",
+        'The earlier answer claimed, "Every possible source was fully examined."',
+        'The phrase "All possible sources were checked" is not supported by the evidence.',
+        'The user asked whether "no evidence exists outside this result."',
+        'I rejected the statement "The search was complete across every relevant source."',
+    ],
+)
+def test_targeted_answer_boundary_preserves_negated_and_metalinguistic_text(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert "I withheld the generated answer" not in answer
     assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
 
 

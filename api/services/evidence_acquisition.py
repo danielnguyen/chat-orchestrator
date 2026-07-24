@@ -226,6 +226,26 @@ _UNIVERSAL_SCOPE_CLAIM_PATTERNS = tuple(
         r"\bthe\s+search\s+was\s+complete\s+across\s+every\s+relevant\s+source\b",
     )
 )
+_UNIVERSAL_SCOPE_EXTERNAL_NEGATION = re.compile(
+    r"(?:\bnot|\b(?:is|was)\s+false\s+that|"
+    r"\b(?:is|was)\s+not\s+true\s+that|"
+    r"\b(?:cannot|can't)\s+(?:say|conclude|confirm|establish)\s+that)\s*$",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX = re.compile(
+    r"(?:\b(?:claimed|said|stated|quoted)\s*[,;:]?|"
+    r"\b(?:asked|questioned)\s+whether|"
+    r"\b(?:rejected|disputed)\s+(?:the\s+)?(?:statement|claim|phrase))\s*$",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX = re.compile(
+    r"^\s*(?:is|was)\s+(?:not\s+(?:supported|established|true)|"
+    r"unsupported|false|rejected)\b",
+    re.IGNORECASE,
+)
+_PROVIDER_SCOPE_SENTENCE = re.compile(
+    r".+?(?:[.!?](?:[\"'”’]|\*{1,2}|_{1,2})*(?=\s|$)|$)"
+)
 _REQUIREMENT_DESCRIPTIONS = {
     "authoritative_inventory": "the authoritative source inventory",
     "targeted_evidence": "the requested targeted evidence",
@@ -3642,15 +3662,54 @@ def _provider_answer_claims_universal_scope(
         *_SCOPE_BOUNDARIES.values(),
         *policy_paragraphs,
     }
-    provider_text = " ".join(
+    provider_paragraphs = [
         paragraph
         for paragraph in paragraphs
         if paragraph not in owned_policy_paragraphs
-    )
-    normalized = re.sub(r"\s+", " ", provider_text)
-    return any(
-        pattern.search(normalized)
-        for pattern in _UNIVERSAL_SCOPE_CLAIM_PATTERNS
+    ]
+    for paragraph in provider_paragraphs:
+        normalized = re.sub(r"\s+", " ", paragraph).strip()
+        for sentence_match in _PROVIDER_SCOPE_SENTENCE.finditer(normalized):
+            sentence = sentence_match.group(0).strip()
+            for claim_pattern in _UNIVERSAL_SCOPE_CLAIM_PATTERNS:
+                for claim_match in claim_pattern.finditer(sentence):
+                    if _scope_claim_is_explicitly_negated(sentence, claim_match):
+                        continue
+                    if _scope_claim_is_quoted_metalinguistic(sentence, claim_match):
+                        continue
+                    return True
+    return False
+
+
+def _scope_claim_is_explicitly_negated(
+    sentence: str,
+    claim_match: re.Match[str],
+) -> bool:
+    prefix = sentence[: claim_match.start()].rstrip(" \t\"'“”‘’*_")
+    return _UNIVERSAL_SCOPE_EXTERNAL_NEGATION.search(prefix) is not None
+
+
+def _scope_claim_is_quoted_metalinguistic(
+    sentence: str,
+    claim_match: re.Match[str],
+) -> bool:
+    quote_bounds: tuple[int, int] | None = None
+    for opening_quote, closing_quote in (("\"", "\""), ("“", "”")):
+        opening_index = sentence.rfind(opening_quote, 0, claim_match.start())
+        if opening_index < 0:
+            continue
+        closing_index = sentence.find(closing_quote, claim_match.end())
+        if closing_index >= 0:
+            quote_bounds = (opening_index, closing_index)
+            break
+    if quote_bounds is None:
+        return False
+    opening_index, closing_index = quote_bounds
+    prefix = sentence[:opening_index].rstrip()
+    suffix = sentence[closing_index + 1 :]
+    return (
+        _UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX.search(prefix) is not None
+        or _UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX.search(suffix) is not None
     )
 
 

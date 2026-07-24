@@ -14068,6 +14068,73 @@ async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_discl
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_answer", "request_id"),
+    [
+        (
+            "Not every possible source was fully examined.",
+            "rid-evidence-negated-scope",
+        ),
+        (
+            'The earlier answer claimed, "Every possible source was fully examined."',
+            "rid-evidence-metalinguistic-scope",
+        ),
+    ],
+)
+async def test_evidence_acquisition_preserves_non_assertive_scope_mentions(
+    tmp_path,
+    provider_answer,
+    request_id,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert out["status"] == "ok"
+    assert len(litellm.calls) == 1
+    assert out["answer"] == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"].count(provider_answer) == 1
+    assert replacement not in out["answer"]
+    assert out["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["shape"]["task_shape"] == "targeted_lookup"
+    assert manifest["acquisition"]["sources_considered"] == ["vehicle_log_primary"]
+    assert manifest["acquisition"]["sources_selected"] == ["vehicle_log_primary"]
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
+    assert trace["fallback"]["triggered"] is False
+    assert len(trace["model_calls"]) == 1
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == out["answer"]
+
+
+@pytest.mark.asyncio
 async def test_evidence_acquisition_provider_cannot_rewrite_policy_history(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
