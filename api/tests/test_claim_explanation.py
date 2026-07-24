@@ -445,75 +445,486 @@ def test_material_exhaustive_truncation_preserves_generic_wording():
     assert "configured-scope expansion completed without truncation" not in answer
 
 
-@pytest.mark.parametrize(
-    ("manifest", "reason"),
-    [
-        (None, "manifest_not_object"),
-        ({}, "manifest_top_level_keys_invalid"),
-        (_set_path(_manifest(), ["enabled"], False), "manifest_enabled_invalid"),
-        (_set_path(_manifest(), ["attempted"], False), "manifest_attempted_invalid"),
-        (_set_path(_manifest(), ["manifest_id"], "unsafe id"), "manifest_id_invalid"),
-        (
-            _set_path(_manifest(), ["assistant_message_id"], "unsafe id"),
-            "assistant_message_id_invalid",
-        ),
-        (
-            _set_path(_manifest(), ["response_digest"], "invalid"),
-            "response_digest_invalid",
-        ),
-        (
-            _set_path(_manifest(), ["plan", "selected_strategies"], ["hybrid"]),
-            "strategy_mismatch",
-        ),
-        (
-            _set_path(_manifest(), ["inventory", "inventory_source_count"], -1),
-            "inventory_count_invalid_inventory_source_count",
-        ),
-        (
-            _set_path(
-                _manifest(),
-                ["acquisition", "sources_selected"],
-                ["source-a", "source-c"],
-            ),
-            "selected_sources_not_subset_of_considered",
-        ),
-        (
-            _set_path(
-                _manifest(), ["acquisition", "prompt_retained_item_count"], 3
-            ),
-            "prompt_retained_count_exceeds_usable_count",
-        ),
-        (
-            _set_path(
-                _hybrid_manifest(),
-                ["acquisition", "expansion_successful_count"],
-                1,
-            ),
-            "expansion_attempt_projection_invalid",
-        ),
-        (
-            _set_path(
-                _hybrid_manifest(),
-                ["next_steps", "selections", 0, "provider_disposition"],
-                "blocked",
-            ),
-            "next_step_selection_consistency_invalid",
-        ),
-    ],
+def _replace_manifest(value):
+    def mutation(_manifest_value):
+        return copy.deepcopy(value)
+
+    return mutation
+
+
+def _change(*changes):
+    def mutation(manifest):
+        for path, value in changes:
+            _set_path(manifest, list(path), copy.deepcopy(value))
+        return manifest
+
+    return mutation
+
+
+def _delete(path):
+    def mutation(manifest):
+        target = manifest
+        for part in path[:-1]:
+            target = target[part]
+        del target[path[-1]]
+        return manifest
+
+    return mutation
+
+
+def _suppressed_manifest():
+    return _suppressed_trace()["prompt"]["evidence_acquisition"]
+
+
+def _exact_manifest():
+    return _manifest(strategy="exact_fetch")
+
+
+def _targeted_with_expansion_manifest():
+    manifest = _hybrid_manifest()
+    manifest["shape"]["task_shape"] = "targeted_lookup"
+    manifest["plan"].update(
+        {
+            "selected_strategies": ["targeted_retrieval"],
+            "completeness_expectation": "targeted_scope",
+            "contradiction_search_required": False,
+        }
+    )
+    manifest["acquisition"]["strategy_attempted"] = "targeted_retrieval"
+    return manifest
+
+
+def _exact_without_attempt_manifest():
+    manifest = _exact_manifest()
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_attempted"] = []
+    acquisition["exact_reference_attempts"] = []
+    acquisition["exact_reference_attempt_count"] = 0
+    acquisition["exact_reference_successful_count"] = 0
+    return manifest
+
+
+def _hybrid_without_attempt_manifest():
+    manifest = _hybrid_manifest()
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_attempted"] = []
+    acquisition["expansion_attempts"] = []
+    acquisition["expansion_attempt_count"] = 0
+    acquisition["expansion_successful_count"] = 0
+    return manifest
+
+
+def _initial_attempt():
+    return {
+        "strategy": "targeted_retrieval",
+        "sufficiency_status": "unknown",
+        "result_count": 2,
+        "retained_reference_count": 0,
+        "changed_premise_exact_fetch_followed": True,
+    }
+
+
+def _additional_acquisition_selection():
+    return {
+        "selection_id": "selection-followup",
+        "evaluation_id": "evaluation-followup",
+        "evidence_plan_id": "plan-followup",
+        "acquisition_manifest_id": "manifest-followup",
+        "selected_next_step": "perform_additional_acquisition",
+        "conclusion_disposition": "requested_conclusion_withheld",
+        "provider_disposition": "blocked",
+        "reacquisition_guard": "changed_premise_allowed",
+        "clarification_target": None,
+        "reason_codes": ["changed_acquisition_premise_available"],
+        "additional_acquisition_executed": True,
+    }
+
+
+def _answer_selection():
+    return copy.deepcopy(_hybrid_manifest()["next_steps"]["selections"][0])
+
+
+def _changed_followup_manifest():
+    manifest = _exact_manifest()
+    manifest["next_steps"] = {
+        "selection_count": 2,
+        "selections": [_additional_acquisition_selection(), _answer_selection()],
+        "additional_acquisition_count": 1,
+        "initial_attempt": _initial_attempt(),
+        "dependency_status": None,
+    }
+    return manifest
+
+
+def _hybrid_inconsistent_followup_manifest():
+    manifest = _hybrid_manifest()
+    manifest["next_steps"] = {
+        "selection_count": 1,
+        "selections": [_additional_acquisition_selection()],
+        "additional_acquisition_count": 1,
+        "initial_attempt": _initial_attempt(),
+        "dependency_status": None,
+    }
+    return manifest
+
+
+def _case(reason, mutation, factory=_manifest):
+    return pytest.param(factory, mutation, reason, id=reason)
+
+
+_INVENTORY_COUNT_FIELDS = (
+    "inventory_source_count",
+    "declared_source_count",
+    "declared_category_count",
+    "available_source_count",
+    "unavailable_source_count",
+    "disabled_source_count",
+    "unknown_source_count",
 )
-def test_diagnosed_projection_reasons_are_safe_and_wrapper_stays_fail_closed(
-    manifest, reason
+_IDENTITY_FIELDS = (
+    "sources_considered",
+    "sources_selected",
+    "sources_used",
+    "source_references_returned",
+    "source_references_retained",
+    "source_references_filtered_or_omitted",
+    "source_references_attempted",
+    "source_references_unsuccessful",
+    "unavailable_source_ids",
+    "failed_source_ids",
+)
+_ACQUISITION_COUNT_FIELDS = (
+    "item_count",
+    "usable_item_count",
+    "prompt_retained_item_count",
+)
+
+
+PROJECTION_REJECTION_CASES = [
+    _case("manifest_not_object", _replace_manifest(None)),
+    _case("manifest_top_level_keys_invalid", _change((("unexpected",), True))),
+    _case("manifest_enabled_invalid", _change((("enabled",), False))),
+    _case("manifest_attempted_invalid", _change((("attempted",), False))),
+    _case("manifest_id_invalid", _change((("manifest_id",), "unsafe id"))),
+    _case(
+        "assistant_message_id_invalid",
+        _change((("assistant_message_id",), "unsafe id")),
+    ),
+    _case("response_digest_invalid", _change((("response_digest",), "invalid"))),
+    _case("manifest_status_invalid", _change((("status",), "invalid"))),
+    _case("plan_missing", _change((("plan",), None))),
+    _case("plan_status_invalid", _change((("plan", "plan_status"), "invalid"))),
+    _case("sufficiency_missing", _change((("sufficiency",), None))),
+    _case(
+        "sufficiency_status_invalid",
+        _change((("sufficiency", "status"), "invalid")),
+    ),
+    _case(
+        "manifest_sufficiency_status_mismatch",
+        _change((("sufficiency", "status"), "unknown")),
+    ),
+    _case("shape_missing", _change((("shape",), None))),
+    _case(
+        "shape_derivation_status_invalid",
+        _change((("shape", "derivation_status"), "ambiguous")),
+    ),
+    _case("task_shape_invalid", _change((("shape", "task_shape"), "invalid"))),
+    _case(
+        "clarification_required_invalid",
+        _change((("shape", "clarification_required"), True)),
+    ),
+    _case("inventory_missing", _change((("inventory",), None))),
+    _case("acquisition_missing", _change((("acquisition",), None))),
+    _case(
+        "selected_strategies_invalid",
+        _change((("plan", "selected_strategies"), [])),
+    ),
+    _case(
+        "strategy_mismatch",
+        _change((("acquisition", "strategy_attempted"), "hybrid")),
+    ),
+    _case(
+        "contradiction_search_flag_invalid",
+        _change((("plan", "contradiction_search_required"), "false")),
+    ),
+    _case(
+        "completeness_expectation_mismatch",
+        _change((("plan", "completeness_expectation"), "complete")),
+    ),
+    _case(
+        "limitation_codes_invalid",
+        _change((("plan", "limitation_codes"), ["unsupported"])),
+    ),
+    _case(
+        "inventory_status_invalid",
+        _change((("inventory", "inventory_status"), "invalid")),
+    ),
+    *[
+        _case(
+            f"inventory_count_invalid_{field}",
+            _change((("inventory", field), -1)),
+        )
+        for field in _INVENTORY_COUNT_FIELDS
+    ],
+    _case(
+        "source_identifiers_suppressed_invalid",
+        _change((("acquisition", "source_identifiers_suppressed"), "false")),
+    ),
+    *[
+        _case(
+            f"identity_projection_invalid_{field}",
+            _change((("acquisition", field), None)),
+        )
+        for field in _IDENTITY_FIELDS
+    ],
+    _case(
+        "exact_attempt_projection_invalid",
+        _change((("acquisition", "exact_reference_attempt_count"), 1)),
+    ),
+    _case(
+        "expansion_attempt_projection_invalid",
+        _change((("acquisition", "expansion_successful_count"), 1)),
+        _hybrid_manifest,
+    ),
+    _case(
+        "selected_count_exceeds_considered",
+        _change(
+            (("acquisition", "sources_considered_count"), 1),
+            (("acquisition", "sources_selected_count"), 2),
+        ),
+        _suppressed_manifest,
+    ),
+    _case(
+        "used_count_exceeds_selected",
+        _change(
+            (("acquisition", "sources_selected_count"), 1),
+            (("acquisition", "sources_used_count"), 2),
+        ),
+        _suppressed_manifest,
+    ),
+    _case(
+        "retained_count_exceeds_returned",
+        _change(
+            (("acquisition", "source_references_returned_count"), 1),
+            (("acquisition", "source_references_retained_count"), 2),
+        ),
+        _suppressed_manifest,
+    ),
+    _case(
+        "omitted_count_mismatch",
+        _change((("acquisition", "source_references_filtered_or_omitted_count"), 1)),
+        _suppressed_manifest,
+    ),
+    _case(
+        "attempted_reference_count_out_of_bounds",
+        _change((("acquisition", "source_references_attempted_count"), 1)),
+        _suppressed_manifest,
+    ),
+    _case(
+        "unsuccessful_reference_count_out_of_bounds",
+        _change((("acquisition", "source_references_unsuccessful_count"), 1)),
+        _suppressed_manifest,
+    ),
+    _case(
+        "selected_sources_not_subset_of_considered",
+        _change((("acquisition", "sources_selected"), ["source-a", "source-c"])),
+    ),
+    _case(
+        "used_sources_not_subset_of_selected",
+        _change((("acquisition", "sources_used"), ["source-a", "source-c"])),
+    ),
+    _case(
+        "retained_references_not_subset_of_returned",
+        _change(
+            (
+                ("acquisition", "source_references_retained"),
+                ["source-a:record-1", "source-c:record-3"],
+            )
+        ),
+    ),
+    _case(
+        "omitted_reference_set_mismatch",
+        _change(
+            (("acquisition", "source_references_retained"), ["source-a:record-1"]),
+            (
+                ("acquisition", "source_references_filtered_or_omitted"),
+                ["source-c:record-3"],
+            ),
+        ),
+    ),
+    _case(
+        "exact_unsuccessful_reference_set_mismatch",
+        _change(
+            (("acquisition", "source_references_returned"), ["source-a:record-1"]),
+            (("acquisition", "source_references_retained"), ["source-a:record-1"]),
+        ),
+        _exact_manifest,
+    ),
+    *[
+        _case(
+            f"acquisition_count_invalid_{field}",
+            _change((("acquisition", field), -1)),
+        )
+        for field in _ACQUISITION_COUNT_FIELDS
+    ],
+    _case(
+        "usable_item_count_exceeds_item_count",
+        _change((("acquisition", "item_count"), 1)),
+    ),
+    _case(
+        "prompt_retained_count_exceeds_usable_count",
+        _change((("acquisition", "prompt_retained_item_count"), 3)),
+    ),
+    _case(
+        "returned_reference_count_mismatch",
+        _change(
+            (("acquisition", "usable_item_count"), 1),
+            (("acquisition", "prompt_retained_item_count"), 1),
+        ),
+    ),
+    _case(
+        "retained_reference_count_mismatch",
+        _change((("acquisition", "prompt_retained_item_count"), 1)),
+    ),
+    _case(
+        "context_delivery_status_invalid",
+        _change((("acquisition", "context_delivery_status"), "invalid")),
+    ),
+    _case(
+        "dsa_budget_truncation_invalid",
+        _change((("acquisition", "dsa_budget_truncation"), "false")),
+    ),
+    _case(
+        "candidate_truncation_invalid",
+        _change((("acquisition", "candidate_truncation"), "false")),
+    ),
+    _case(
+        "qualification_required_invalid",
+        _change((("sufficiency", "qualification_required"), "false")),
+    ),
+    _case(
+        "additional_acquisition_required_invalid",
+        _change((("sufficiency", "additional_acquisition_required"), "false")),
+    ),
+    _case(
+        "targeted_strategy_attempt_accounting_invalid",
+        lambda manifest: manifest,
+        _targeted_with_expansion_manifest,
+    ),
+    _case(
+        "exact_strategy_attempt_accounting_invalid",
+        lambda manifest: manifest,
+        _exact_without_attempt_manifest,
+    ),
+    _case(
+        "hybrid_strategy_attempt_accounting_invalid",
+        lambda manifest: manifest,
+        _hybrid_without_attempt_manifest,
+    ),
+    _case("next_steps_shape_invalid", _change((("next_steps",), {})), _hybrid_manifest),
+    _case(
+        "next_step_selection_count_invalid",
+        _change((("next_steps", "selection_count"), -1)),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_selections_invalid",
+        _change((("next_steps", "selection_count"), 0)),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_selection_fields_invalid",
+        _delete(("next_steps", "selections", 0, "reason_codes")),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_selection_enum_invalid",
+        _change((("next_steps", "selections", 0, "selected_next_step"), "invalid")),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_selection_identifier_invalid",
+        _change((("next_steps", "selections", 0, "selection_id"), "unsafe id")),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_reason_codes_invalid",
+        _change((("next_steps", "selections", 0, "reason_codes"), ["z", "a"])),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_selection_consistency_invalid",
+        _change((("next_steps", "selections", 0, "provider_disposition"), "blocked")),
+        _hybrid_manifest,
+    ),
+    _case(
+        "initial_attempt_shape_invalid",
+        _change((("next_steps", "initial_attempt"), {})),
+        _changed_followup_manifest,
+    ),
+    _case(
+        "initial_attempt_strategy_invalid",
+        _change((("next_steps", "initial_attempt", "strategy"), "exact_fetch")),
+        _changed_followup_manifest,
+    ),
+    _case(
+        "initial_attempt_status_invalid",
+        _change((("next_steps", "initial_attempt", "sufficiency_status"), "invalid")),
+        _changed_followup_manifest,
+    ),
+    _case(
+        "initial_attempt_count_invalid",
+        _change((("next_steps", "initial_attempt", "result_count"), -1)),
+        _changed_followup_manifest,
+    ),
+    _case(
+        "initial_attempt_followup_flag_invalid",
+        _change(
+            (("next_steps", "initial_attempt", "changed_premise_exact_fetch_followed"), False)
+        ),
+        _changed_followup_manifest,
+    ),
+    _case(
+        "next_step_dependency_status_invalid",
+        _change((("next_steps", "dependency_status"), "invalid")),
+        _hybrid_manifest,
+    ),
+    _case(
+        "next_step_execution_count_mismatch",
+        _change((("next_steps", "additional_acquisition_count"), 1)),
+        _hybrid_manifest,
+    ),
+    _case(
+        "unexpected_initial_attempt",
+        _change((("next_steps", "initial_attempt"), _initial_attempt())),
+        _hybrid_manifest,
+    ),
+    _case(
+        "changed_followup_inconsistent",
+        lambda manifest: manifest,
+        _hybrid_inconsistent_followup_manifest,
+    ),
+]
+
+
+@pytest.mark.parametrize("factory,mutation,reason", PROJECTION_REJECTION_CASES)
+def test_every_projection_rejection_reason_is_behaviorally_reachable(
+    factory,
+    mutation,
+    reason,
 ):
+    manifest = mutation(factory())
     diagnosed = _diagnose_acquisition_history_projection(manifest)
 
     assert diagnosed.history is None
     assert diagnosed.reason == reason
     assert _project_acquisition_history(manifest) is None
-    assert __import__("re").fullmatch(r"[a-z0-9_]{1,120}", diagnosed.reason)
-    assert "PRIVATE" not in diagnosed.reason
+    assert re.fullmatch(r"[a-z0-9_]{1,120}", diagnosed.reason)
+    assert "private" not in diagnosed.reason
+    assert MANIFEST_ID not in diagnosed.reason
 
 
-def test_all_projection_rejection_labels_are_bounded_and_privacy_safe():
+def _production_projection_rejection_reasons():
     source = inspect.getsource(_diagnose_acquisition_history_projection)
     reasons = set(re.findall(r'reject\("([a-z0-9_]+)"\)', source))
     reasons.update(
@@ -552,9 +963,21 @@ def test_all_projection_rejection_labels_are_bounded_and_privacy_safe():
         )
     )
 
-    assert len(reasons) == 88
-    assert all(re.fullmatch(r"[a-z0-9_]{1,120}", reason) for reason in reasons)
-    assert all("private" not in reason for reason in reasons)
+    return reasons
+
+
+def test_projection_behavioral_registry_matches_safe_production_reason_inventory():
+    production_reasons = _production_projection_rejection_reasons()
+    behavioral_reasons = {case.values[2] for case in PROJECTION_REJECTION_CASES}
+
+    assert len(PROJECTION_REJECTION_CASES) == 88
+    assert len(behavioral_reasons) == 88
+    assert behavioral_reasons == production_reasons
+    assert all(
+        re.fullmatch(r"[a-z0-9_]{1,120}", reason)
+        for reason in production_reasons
+    )
+    assert all("private" not in reason for reason in production_reasons)
 
 
 class _MemoryStore:
