@@ -1141,6 +1141,41 @@ normalized_first_paragraph() {
   awk 'BEGIN { RS = "" } { gsub(/[[:space:]]+/, " "); print; exit }'
 }
 
+print_compound_claim_capture_state() {
+  local case_name="$1" trace="$2" fields
+  local enabled eligibility reason runtime_calls storage_calls
+  fields="$(jq -r '
+    def boolean_or_missing:
+      if type == "boolean" then tostring else "missing" end;
+    def label_or_missing:
+      if type == "string"
+        and length >= 1
+        and length <= 120
+        and test("^[A-Za-z0-9_.:-]{1,120}$")
+      then . else "missing" end;
+    def count_or_missing:
+      if type == "number"
+        and floor == .
+        and . >= 0
+        and . <= 4
+      then tostring else "missing" end;
+    (.prompt.claim_capture // {}) as $capture
+    | [
+        ($capture.enabled | boolean_or_missing),
+        ($capture.eligibility_status | label_or_missing),
+        ($capture.reason_code | label_or_missing),
+        ($capture.runtime_call_count | count_or_missing),
+        ($capture.storage_call_count | count_or_missing)
+      ]
+    | @tsv
+  ' <<<"$trace")"
+  IFS=$'\t' read -r \
+    enabled eligibility reason runtime_calls storage_calls <<<"$fields"
+  printf 'Compound claim-capture state: case=%s enabled=%s eligibility=%s reason=%s runtime_calls=%s storage_calls=%s\n' \
+    "$case_name" "$enabled" "$eligibility" "$reason" \
+    "$runtime_calls" "$storage_calls"
+}
+
 assert_jq() {
   local label="$1" json="$2" predicate="$3"
   shift 3
@@ -2381,9 +2416,18 @@ run_evidence_compound_scenarios() {
     '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
   assert_jq "compound.verification.trace_history_provider" "$trace" \
     '.prompt.claim_explanation.provider_call_count == 0'
-  assert_jq "compound.verification.trace_claim_capture" "$trace" '
-    .prompt.claim_capture.eligibility_status == "ineligible"
-    and (.prompt.claim_capture.reason_code | contains("compound"))
+  print_compound_claim_capture_state "verification" "$trace"
+  assert_jq "compound.verification.claim_capture_enabled" "$trace" \
+    '.prompt.claim_capture.enabled == true'
+  assert_jq "compound.verification.claim_capture_status" "$trace" \
+    '.prompt.claim_capture.eligibility_status == "ineligible"'
+  assert_jq "compound.verification.claim_capture_reason" "$trace" \
+    '.prompt.claim_capture.reason_code == "compound_verification_response"'
+  assert_jq "compound.verification.claim_capture_calls" "$trace" '
+    .prompt.claim_capture.runtime_call_count == 0
+    and .prompt.claim_capture.storage_call_count == 0
+    and .prompt.claim_capture.calibration_status == "not_attempted"
+    and .prompt.claim_capture.persistence_status == "not_attempted"
   '
   assert_jq "compound.verification.trace_fallback" "$trace" \
     '.fallback.triggered == false'
@@ -2490,8 +2534,19 @@ run_evidence_compound_scenarios() {
     '.prompt.claim_explanation.storage_call_count == 1'
   assert_jq "compound.label_conflict.trace_manifest_resolution" "$trace" \
     '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
-  assert_jq "compound.label_conflict.trace_claim_capture" "$trace" \
+  print_compound_claim_capture_state "label_conflict" "$trace"
+  assert_jq "compound.label_conflict.claim_capture_enabled" "$trace" \
+    '.prompt.claim_capture.enabled == true'
+  assert_jq "compound.label_conflict.claim_capture_status" "$trace" \
     '.prompt.claim_capture.eligibility_status == "ineligible"'
+  assert_jq "compound.label_conflict.claim_capture_reason" "$trace" \
+    '.prompt.claim_capture.reason_code == "compound_verification_response"'
+  assert_jq "compound.label_conflict.claim_capture_calls" "$trace" '
+    .prompt.claim_capture.runtime_call_count == 0
+    and .prompt.claim_capture.storage_call_count == 0
+    and .prompt.claim_capture.calibration_status == "not_attempted"
+    and .prompt.claim_capture.persistence_status == "not_attempted"
+  '
   assert_jq "compound.label_conflict.trace_fallback" "$trace" \
     '.fallback.triggered == false'
   assert_jq "compound.label_conflict.trace_model_count" "$trace" \
@@ -2570,8 +2625,19 @@ run_evidence_compound_scenarios() {
     '.prompt.claim_explanation.storage_call_count == 1'
   assert_jq "compound.attempt.trace_manifest_resolution" "$trace" \
     '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
-  assert_jq "compound.attempt.trace_claim_capture" "$trace" \
+  print_compound_claim_capture_state "attempt" "$trace"
+  assert_jq "compound.attempt.claim_capture_enabled" "$trace" \
+    '.prompt.claim_capture.enabled == true'
+  assert_jq "compound.attempt.claim_capture_status" "$trace" \
     '.prompt.claim_capture.eligibility_status == "ineligible"'
+  assert_jq "compound.attempt.claim_capture_reason" "$trace" \
+    '.prompt.claim_capture.reason_code == "compound_verification_response"'
+  assert_jq "compound.attempt.claim_capture_calls" "$trace" '
+    .prompt.claim_capture.runtime_call_count == 0
+    and .prompt.claim_capture.storage_call_count == 0
+    and .prompt.claim_capture.calibration_status == "not_attempted"
+    and .prompt.claim_capture.persistence_status == "not_attempted"
+  '
   if ! assert_provider_free_trace "$trace" >/dev/null 2>&1; then
     echo "Assertion failed: compound.attempt.provider_free_trace" >&2
     return 1

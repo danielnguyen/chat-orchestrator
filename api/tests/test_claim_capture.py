@@ -61,6 +61,7 @@ def _public_source(*, ref_id: str = "derived-text-1"):
 def _prepare(**overrides):
     values = {
         "enabled": True,
+        "compound_verification_requested": False,
         "runtime_available": True,
         "runtime_session_id": "runtime-session-1",
         "runtime_turn_id": "runtime-turn-1",
@@ -239,6 +240,31 @@ def test_unsupported_response_paths_skip_capture(overrides, reason):
     assert state.candidate is None
     assert state.trace["eligibility_status"] == "ineligible"
     assert state.trace["reason_code"] == reason
+
+
+def test_compound_verification_response_is_ineligible_without_runtime_calls():
+    state = _prepare(compound_verification_requested=True)
+
+    assert state.candidate is None
+    assert state.trace["enabled"] is True
+    assert state.trace["eligibility_status"] == "ineligible"
+    assert state.trace["reason_code"] == "compound_verification_response"
+    assert state.trace["runtime_call_count"] == 0
+    assert state.trace["storage_call_count"] == 0
+    assert state.trace["calibration_status"] == "not_attempted"
+    assert state.trace["persistence_status"] == "not_attempted"
+
+
+def test_global_disable_precedes_compound_verification_exclusion():
+    state = _prepare(
+        enabled=False,
+        compound_verification_requested=True,
+    )
+
+    assert state.candidate is None
+    assert state.trace["enabled"] is False
+    assert state.trace["eligibility_status"] == "ineligible"
+    assert state.trace["reason_code"] == "disabled"
 
 
 @pytest.mark.parametrize(

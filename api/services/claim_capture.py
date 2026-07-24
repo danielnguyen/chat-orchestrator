@@ -285,6 +285,7 @@ def _source_identity(source: Any) -> tuple[str, str] | None:
 def prepare_claim_capture(
     *,
     enabled: bool,
+    compound_verification_requested: bool = False,
     runtime_available: bool,
     runtime_session_id: Any,
     runtime_turn_id: Any,
@@ -303,6 +304,11 @@ def prepare_claim_capture(
 ) -> ClaimCaptureState:
     if not enabled:
         return _ineligible(enabled=False, reason_code="disabled")
+    if compound_verification_requested:
+        return _ineligible(
+            enabled=True,
+            reason_code="compound_verification_response",
+        )
     if not runtime_available:
         return _ineligible(enabled=True, reason_code="runtime_unavailable")
     if not _valid_identifier(runtime_session_id) or not _valid_identifier(runtime_turn_id):

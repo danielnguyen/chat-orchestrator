@@ -8467,12 +8467,16 @@ async def orchestrate_chat(
         }
 
         references = _trace_references(retrieval_bundle)
+        claim_capture_trace_enabled = (
+            claim_record_capture_enabled
+            and (
+                evidence_provider_allowed
+                or compound_verification_requested
+            )
+        )
         claim_capture = prepare_claim_capture(
-            enabled=(
-                claim_record_capture_enabled
-                and evidence_provider_allowed
-                and not compound_verification_requested
-            ),
+            enabled=claim_capture_trace_enabled,
+            compound_verification_requested=compound_verification_requested,
             runtime_available=runtime is not None,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),

@@ -16847,6 +16847,18 @@ async def _run_compound_provider_boundary_case(
     }
 
 
+def _assert_compound_claim_capture_excluded(trace):
+    claim_capture = trace["prompt"]["claim_capture"]
+    assert claim_capture["enabled"] is True
+    assert claim_capture["eligibility_status"] == "ineligible"
+    assert claim_capture["reason_code"] == "compound_verification_response"
+    assert claim_capture["runtime_call_count"] == 0
+    assert claim_capture["storage_call_count"] == 0
+    assert claim_capture["evidence_count"] == 0
+    assert claim_capture["calibration_status"] == "not_attempted"
+    assert claim_capture["persistence_status"] == "not_attempted"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider_content", "case_id"),
@@ -16921,6 +16933,7 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
     assert len(outcome["runtime"].claim_calibration_calls) == outcome[
         "runtime_counts"
     ]["claim_calibration"]
+    _assert_compound_claim_capture_excluded(trace)
     final_manifest = trace["prompt"]["evidence_acquisition"]
     assert final_manifest["response_digest"] == (
         "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
@@ -17038,6 +17051,8 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
     assert len(provider.calls) == 1
     assert memory_store.claim_record_calls == []
     trace = memory_store.trace_calls[-1]["payload"]
+    _assert_compound_claim_capture_excluded(trace)
+    assert runtime.claim_calibration_calls == []
     history_trace = trace["prompt"]["claim_explanation"]
     assert history_trace["compound_mode"] is True
     assert history_trace["resolution_status"] == "resolved"
@@ -17153,7 +17168,10 @@ async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_p
     assert result["answer"].startswith("Original acquisition:\n")
     assert "\n\nNew verification attempt:\n" in result["answer"]
     assert provider.calls == []
+    assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    _assert_compound_claim_capture_excluded(trace)
 
 
 @pytest.mark.asyncio
