@@ -4193,6 +4193,112 @@ def test_governed_success_boundaries_follow_task_shape_not_provider_text(
 
 
 @pytest.mark.parametrize(
+    ("task_shape", "boundary", "provider_answer"),
+    [
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "Every possible source was fully examined.",
+        ),
+        (
+            "cross_source_comparison",
+            COMPARISON_SCOPE_SUFFIX,
+            "All possible sources were checked.",
+        ),
+        (
+            "bounded_exhaustive_review",
+            EXHAUSTIVE_SCOPE_SUFFIX,
+            "No evidence exists outside this result.",
+        ),
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "No evidence exists beyond the checked material.",
+        ),
+        (
+            "cross_source_comparison",
+            COMPARISON_SCOPE_SUFFIX,
+            "The search was complete across every relevant source.",
+        ),
+    ],
+)
+def test_provider_universal_scope_claims_are_replaced(
+    task_shape,
+    boundary,
+    provider_answer,
+):
+    state = _rendering_state(task_shape=task_shape)
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert provider_answer not in answer
+    assert answer == f"{replacement}\n\n{boundary}"
+    assert answer.count(replacement) == 1
+    assert answer.count(boundary) == 1
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "boundary", "provider_answer"),
+    [
+        (
+            "bounded_exhaustive_review",
+            EXHAUSTIVE_SCOPE_SUFFIX,
+            "Within the declared scope, all configured records were reviewed.",
+        ),
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "I cannot say every possible source was examined.",
+        ),
+        (
+            "cross_source_comparison",
+            COMPARISON_SCOPE_SUFFIX,
+            "Not every potentially relevant source was checked.",
+        ),
+        (
+            "targeted_lookup",
+            TARGETED_SCOPE_SUFFIX,
+            "No contradictory evidence was found in the selected records.",
+        ),
+    ],
+)
+def test_bounded_provider_scope_statements_are_preserved(
+    task_shape,
+    boundary,
+    provider_answer,
+):
+    state = _rendering_state(task_shape=task_shape)
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{boundary}"
+    assert "I withheld the generated answer" not in answer
+    assert answer.count(boundary) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        "# EVERY POSSIBLE SOURCE WAS FULLY EXAMINED.",
+        "- All   possible\n sources\twere checked.",
+        "**No evidence exists outside this result.**",
+    ],
+)
+def test_provider_scope_claim_formatting_cannot_evade_replacement(provider_answer):
+    state = _rendering_state()
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert provider_answer not in answer
+    assert answer.count("I withheld the generated answer") == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
     ("task_shape", "boundary"),
     [
         ("targeted_lookup", TARGETED_SCOPE_SUFFIX),

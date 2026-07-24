@@ -200,6 +200,10 @@ EXHAUSTIVE_SCOPE_SUFFIX = (
     "This conclusion is complete only for the declared source scope that was checked; "
     "sources outside that scope were not examined."
 )
+SCOPE_OVERCLAIM_REPLACEMENT = (
+    "I withheld the generated answer because it claimed evidence coverage beyond "
+    "the examined scope."
+)
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
     "max_rows": 20,
@@ -212,6 +216,16 @@ _SCOPE_BOUNDARIES = {
     "cross_source_comparison": COMPARISON_SCOPE_SUFFIX,
     "bounded_exhaustive_review": EXHAUSTIVE_SCOPE_SUFFIX,
 }
+_UNIVERSAL_SCOPE_CLAIM_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bevery\s+possible\s+source\s+was\s+fully\s+examined\b",
+        r"\ball\s+possible\s+sources\s+were\s+checked\b",
+        r"\bno\s+evidence\s+exists\s+outside\s+this\s+result\b",
+        r"\bno\s+evidence\s+exists\s+beyond\s+the\s+checked\s+material\b",
+        r"\bthe\s+search\s+was\s+complete\s+across\s+every\s+relevant\s+source\b",
+    )
+)
 _REQUIREMENT_DESCRIPTIONS = {
     "authoritative_inventory": "the authoritative source inventory",
     "targeted_evidence": "the requested targeted evidence",
@@ -3610,7 +3624,34 @@ def enforce_final_answer(
     boundary = _SCOPE_BOUNDARIES.get(state.sufficiency.task_shape)
     if boundary:
         policy_paragraphs.append(boundary)
+    if _provider_answer_claims_universal_scope(answer, policy_paragraphs):
+        answer = SCOPE_OVERCLAIM_REPLACEMENT
     return _compose_policy_answer(answer, policy_paragraphs)
+
+
+def _provider_answer_claims_universal_scope(
+    answer: str,
+    policy_paragraphs: list[str],
+) -> bool:
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", answer.strip())
+        if paragraph.strip()
+    ]
+    owned_policy_paragraphs = {
+        *_SCOPE_BOUNDARIES.values(),
+        *policy_paragraphs,
+    }
+    provider_text = " ".join(
+        paragraph
+        for paragraph in paragraphs
+        if paragraph not in owned_policy_paragraphs
+    )
+    normalized = re.sub(r"\s+", " ", provider_text)
+    return any(
+        pattern.search(normalized)
+        for pattern in _UNIVERSAL_SCOPE_CLAIM_PATTERNS
+    )
 
 
 def _compose_policy_answer(answer: str, policy_paragraphs: list[str]) -> str:

@@ -14015,29 +14015,25 @@ async def test_evidence_acquisition_ambiguous_shape_is_provider_and_dsa_free(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "All maintenance records use this date.",
-        "None of the maintenance records use another date.",
-        "There is no record of any other date.",
-    ],
-)
 async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_disclosure(
     tmp_path,
-    provider_answer,
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
     dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    provider_answer = (
+        "Every possible source was fully examined, and no evidence exists outside "
+        "this result."
+    )
     litellm = FakeLiteLLM(content=provider_answer)
+    memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Verify the maintenance record.",
             external_context_enabled=True,
         ),
-        memory_store=FakeMemoryStore(),
+        memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
         dsa=dsa,
@@ -14050,11 +14046,25 @@ async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_discl
         request_id="rid-evidence-overclaim",
     )
 
-    assert out["answer"].endswith(
-        "This reflects only the targeted sources checked, not a complete search "
-        "of every possible source."
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
     )
+    assert len(litellm.calls) == 1
+    assert "Every possible source was fully examined" not in out["answer"]
+    assert "no evidence exists outside this result" not in out["answer"]
+    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
     assert out["answer"].count("This reflects only the targeted sources checked") == 1
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["shape"]["task_shape"] == "targeted_lookup"
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
+    assert trace["fallback"]["triggered"] is False
+    assert len(trace["model_calls"]) == 1
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == out["answer"]
 
 
 @pytest.mark.asyncio
