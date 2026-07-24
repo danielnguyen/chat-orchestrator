@@ -442,6 +442,9 @@ assert_history_request_boundaries() {
 
 readonly EVIDENCE_HYBRID_COMPARISON_QUESTION="Compare these two review calendar records and explain the differences between them."
 readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory record in the register is reviewed."
+readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
+readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
+readonly EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
 
 run_evidence_targeted_scenario() {
   local owner client conversation_id question external response request_id answer
@@ -2086,11 +2089,14 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  assert_jq "history.negatives.immediate.response" "$history" '
-    .status == "degraded"
-    and (.answer | contains("no retained acquisition record could be resolved"))
-    and (.answer | endswith("I did not perform a new verification for this explanation."))
-  '
+  assert_jq "history.negatives.immediate.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.immediate.response_wording" "$history" \
+    '.answer | contains($expected)' \
+    --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
+  assert_jq "history.negatives.immediate.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "no_record"; then
     echo "Assertion failed: history.negatives.immediate.boundaries" >&2
@@ -2110,10 +2116,14 @@ run_evidence_history_negative_scenarios() {
   ')"
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  assert_jq "history.negatives.quoted_not_found.response" "$history" '
-    .status == "degraded"
-    and (.answer | contains("no retained acquisition record could be resolved"))
-  '
+  assert_jq "history.negatives.quoted_not_found.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.quoted_not_found.response_wording" "$history" \
+    '.answer | contains($expected)' \
+    --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
+  assert_jq "history.negatives.quoted_not_found.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "no_record"; then
     echo "Assertion failed: history.negatives.quoted_not_found.boundaries" >&2
@@ -2136,11 +2146,14 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  assert_jq "history.negatives.ambiguous.response" "$history" '
-    .status == "degraded"
-    and (.answer | contains("more than one exact prior response matched"))
-    and (.answer | contains("no record was selected"))
-  '
+  assert_jq "history.negatives.ambiguous.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.ambiguous.response_wording" "$history" \
+    '.answer | contains($expected)' \
+    --arg expected "$EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE"
+  assert_jq "history.negatives.ambiguous.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "ambiguous"; then
     echo "Assertion failed: history.negatives.ambiguous.boundaries" >&2
@@ -2183,11 +2196,15 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  assert_jq "history.negatives.corrupt.response" "$history" '
-    .status == "degraded"
-    and (.answer | contains("failed association or privacy validation"))
-    and (.answer | contains("association-corrupted") | not)
-  '
+  assert_jq "history.negatives.corrupt.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.corrupt.response_wording" "$history" \
+    '.answer | contains("failed association or privacy validation")'
+  assert_jq "history.negatives.corrupt.response_privacy" "$history" \
+    '.answer | contains("association-corrupted") | not'
+  assert_jq "history.negatives.corrupt.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "invalid"; then
     echo "Assertion failed: history.negatives.corrupt.boundaries" >&2
@@ -2233,11 +2250,15 @@ run_evidence_history_negative_scenarios() {
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
   trace="$(fetch_trace "$(jq -r '.request_id' <<<"$history")")"
-  assert_jq "history.negatives.privacy_invalid.response" "$history" '
-      .status == "degraded"
-      and (.answer | contains("failed association or privacy validation"))
-      and (.answer | contains($sentinel) | not)
-    ' --arg sentinel "$sentinel"
+  assert_jq "history.negatives.privacy_invalid.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.privacy_invalid.response_wording" "$history" \
+    '.answer | contains("failed association or privacy validation")'
+  assert_jq "history.negatives.privacy_invalid.response_privacy" "$history" \
+    '.answer | contains($sentinel) | not' --arg sentinel "$sentinel"
+  assert_jq "history.negatives.privacy_invalid.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$trace")" in
     *PRIVATE-CREDENTIAL-SENTINEL*)
       echo "Assertion failed: history.negatives.privacy_invalid.trace_privacy" >&2
@@ -2258,10 +2279,14 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
-  assert_jq "history.negatives.owner_isolation.response" "$history" '
-    .status == "degraded"
-    and (.answer | contains("no retained acquisition record could be resolved"))
-  '
+  assert_jq "history.negatives.owner_isolation.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.owner_isolation.response_wording" "$history" \
+    '.answer | contains($expected)' \
+    --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
+  assert_jq "history.negatives.owner_isolation.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$history")" in
     *owner-history-private-invalid*|*PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
       echo "Assertion failed: history.negatives.owner_isolation.privacy" >&2
@@ -2282,10 +2307,14 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   history="$(run_evidence_messages "$owner" "$client" "$same_owner_conversation" "$messages")"
-  assert_jq "history.negatives.conversation_isolation.response" "$history" '
-    .status == "degraded"
-    and (.answer | contains("no retained acquisition record could be resolved"))
-  '
+  assert_jq "history.negatives.conversation_isolation.response_status" "$history" \
+    '.status == "degraded"'
+  assert_jq "history.negatives.conversation_isolation.response_wording" "$history" \
+    '.answer | contains($expected)' \
+    --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
+  assert_jq "history.negatives.conversation_isolation.response_suffix" "$history" \
+    '.answer | endswith($suffix)' \
+    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$history")" in
     *PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
       echo "Assertion failed: history.negatives.conversation_isolation.privacy" >&2
