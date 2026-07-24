@@ -4384,6 +4384,16 @@ def _normalize_external_context_config(
         if cleaned_domain_tags:
             normalized["domain_tags"] = cleaned_domain_tags
 
+    scope_refs = external_context.get("scope_refs")
+    if isinstance(scope_refs, dict):
+        cleaned_scope_refs = {
+            dimension: value
+            for dimension in ("time", "version", "domain", "project")
+            if isinstance((value := scope_refs.get(dimension)), str) and value
+        }
+        if cleaned_scope_refs:
+            normalized["scope_refs"] = cleaned_scope_refs
+
     if external_context.get("enabled") is not None:
         normalized["enabled"] = bool(external_context.get("enabled"))
 
@@ -7047,8 +7057,8 @@ async def orchestrate_chat(
         )
         if evidence_path_deferred:
             external_config = (
-                external_context_request
-                if isinstance(external_context_request, dict)
+                normalized_external_config
+                if normalized_external_config
                 else None
             )
             if exact_reference_request and (
@@ -7161,6 +7171,8 @@ async def orchestrate_chat(
                         hybrid_external_config["source_ids"] = list(
                             governed_plan.eligible_source_ids
                         )
+                        if hybrid_external_config.get("scope_refs"):
+                            hybrid_external_config["domain_tags"] = []
                         hybrid_external_config["max_results"] = len(
                             governed_plan.eligible_source_ids
                         )
@@ -7208,11 +7220,22 @@ async def orchestrate_chat(
                             if governed_plan is not None
                             else last_user_text
                         )
+                        targeted_external_config = external_config
+                        if (
+                            governed_plan is not None
+                            and isinstance(external_config, dict)
+                            and external_config.get("scope_refs")
+                        ):
+                            targeted_external_config = dict(external_config)
+                            targeted_external_config["source_ids"] = list(
+                                governed_plan.eligible_source_ids
+                            )
+                            targeted_external_config["domain_tags"] = []
                         external_context_pack, dsa_trace = await _resolve_external_context(
                             dsa=dsa,
                             dsa_enabled=dsa_enabled,
                             external_context_enabled=external_context_enabled,
-                            external_context=external_config,
+                            external_context=targeted_external_config,
                             external_calls_allowed=not local_only,
                             query=acquisition_query,
                             response_validator=(

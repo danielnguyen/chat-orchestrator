@@ -12164,6 +12164,8 @@ async def _run_hybrid_comparison_case(
     memory_store=None,
     privacy_context_response=None,
     privacy_context_enabled: bool = False,
+    configured_scope_refs: dict[str, str] | None = None,
+    requested_scope_refs: dict[str, str] | None = None,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Compare the maintenance history in these two vehicle logs."
@@ -12201,6 +12203,9 @@ async def _run_hybrid_comparison_case(
             )
         ]
     }
+    if configured_scope_refs is not None:
+        for source in source_response["sources"]:
+            source["scope_refs"] = dict(configured_scope_refs)
     dsa = FakeDSA(
         response=context_pack or _multi_source_governed_context_pack(question),
         source_response=source_response,
@@ -12227,6 +12232,14 @@ async def _run_hybrid_comparison_case(
         payload=_first_party_chat_payload(
             question,
             external_context_enabled=True,
+            external_context=(
+                {
+                    "enabled": True,
+                    "scope_refs": dict(requested_scope_refs),
+                }
+                if requested_scope_refs is not None
+                else None
+            ),
         ),
         memory_store=memory_store,
         litellm=litellm,
@@ -12950,6 +12963,266 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
 
 
 @pytest.mark.asyncio
+async def test_trusted_scope_selector_narrows_targeted_cr_and_dsa_without_metadata_leak(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "vehicle_log_secondary",
+                    "display_name": "PRIVATE SECONDARY SOURCE",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["vehicle", "maintenance"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                    "scope_refs": {
+                        "time": "fy2025",
+                        "version": "release-151",
+                        "domain": "credential-management",
+                        "project": "private-other-project",
+                    },
+                },
+                {
+                    "source_id": "vehicle_log_primary",
+                    "display_name": "Vehicle Log",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["vehicle", "maintenance"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                    "scope_refs": {
+                        "time": "fy2026",
+                        "version": "release-152",
+                        "domain": "credential-management",
+                        "project": "firefox",
+                    },
+                },
+            ],
+        },
+    )
+    memory_store = ClaimExplanationMemoryStore()
+    litellm = FakeLiteLLM(content="The selected record is current.")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context={
+                "enabled": True,
+                "domain_tags": ["maintenance"],
+                "scope_refs": {"project": "firefox"},
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-trusted-scope-targeted",
+    )
+
+    assert out["status"] == "ok"
+    assert runtime.evidence_plan_calls[0]["declared_scope"] == {
+        "source_ids": ["vehicle_log_primary"],
+        "source_categories": ["maintenance"],
+        "exact_source_refs": [],
+        "inventory_status": "complete_for_declared_scope",
+        "time_scope_ref": "fy2026",
+        "version_scope_ref": "release-152",
+        "domain_scope_ref": "credential-management",
+        "project_scope_ref": "firefox",
+    }
+    assert dsa.calls[0]["source_ids"] == ["vehicle_log_primary"]
+    assert dsa.calls[0]["domain_tags"] is None
+    assert len(litellm.calls) == 1
+    retained = json.dumps(memory_store.trace_calls[0]["payload"], sort_keys=True)
+    provider_prompt = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    public_response = json.dumps(out, sort_keys=True)
+    for raw_metadata in (
+        "fy2025",
+        "release-151",
+        "private-other-project",
+        "PRIVATE SECONDARY SOURCE",
+    ):
+        assert raw_metadata not in retained
+        assert raw_metadata not in provider_prompt
+        assert raw_metadata not in public_response
+
+    history, history_provider, history_dsa, _ = (
+        await _run_acquisition_explanation_follow_up(
+            tmp_path,
+            follow_up="What did you check?",
+            prior_answer=out["answer"],
+            memory_store=memory_store,
+            runtime=runtime,
+            request_id="rid-trusted-scope-history",
+            claim_capture_enabled=False,
+        )
+    )
+    assert history["status"] == "ok"
+    assert history_provider.calls == []
+    assert history_dsa.calls == []
+    bounded_history = json.dumps(
+        (history, memory_store.trace_calls[-1]["payload"]),
+        sort_keys=True,
+    )
+    for raw_metadata in (
+        "fy2025",
+        "release-151",
+        "private-other-project",
+        "PRIVATE SECONDARY SOURCE",
+    ):
+        assert raw_metadata not in bounded_history
+
+
+@pytest.mark.asyncio
+async def test_scope_selector_mismatch_is_plan_acquisition_and_provider_free(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA()
+    dsa.source_response["sources"][0]["scope_refs"] = {"project": "firefox"}
+    memory_store = FakeMemoryStore()
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER ANSWER")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+            external_context={
+                "enabled": True,
+                "scope_refs": {"project": "thunderbird"},
+            },
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-trusted-scope-mismatch",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(dsa.list_calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert litellm.calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["prompt"]["evidence_acquisition"]["status"] == (
+        "scope_selector_no_match"
+    )
+    serialized = json.dumps(trace, sort_keys=True)
+    assert "thunderbird" not in serialized
+    assert "PRIVATE PROVIDER ANSWER" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_malformed_trusted_scope_inventory_is_plan_and_provider_free(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA()
+    dsa.source_response["sources"][0]["scope_refs"] = {
+        "project": "fire fox"
+    }
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER ANSWER")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+            external_context={
+                "enabled": True,
+                "scope_refs": {"project": "firefox"},
+            },
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-malformed-trusted-scope",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(dsa.list_calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scope_selector_excluding_exact_reference_stops_before_fetch(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    dsa = FakeDSA()
+    dsa.source_response["sources"][0]["capabilities"] = ["profile", "fetch"]
+    dsa.source_response["sources"][0]["scope_refs"] = {"project": "firefox"}
+    litellm = FakeLiteLLM(content="PRIVATE PROVIDER ANSWER")
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify this exact maintenance record.",
+            external_context_enabled=True,
+            external_context={
+                **_exact_external_context(),
+                "scope_refs": {"project": "thunderbird"},
+            },
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-trusted-scope-exact-mismatch",
+    )
+
+    assert out["status"] == "degraded"
+    assert runtime.evidence_plan_calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
     tmp_path,
     monkeypatch,
@@ -13635,6 +13908,44 @@ async def test_hybrid_comparison_executes_declared_expansion_per_source_and_pers
     assert manifest["acquisition"]["source_references_filtered_or_omitted"] == []
     assert manifest["acquisition"]["prompt_retained_item_count"] == 4
     assert memory_store.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_scope_selector_constrains_hybrid_context_pack_and_expansion(
+    tmp_path,
+):
+    out, runtime, dsa, litellm, _ = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path,
+        configured_scope_refs={
+            "time": "fy2026",
+            "version": "release-152",
+            "domain": "credential-management",
+            "project": "firefox",
+        },
+        requested_scope_refs={"project": "firefox"},
+    )
+
+    assert out["status"] == "ok"
+    assert runtime.evidence_plan_calls[0]["declared_scope"] == {
+        "source_ids": ["vehicle_log_primary", "vehicle_log_secondary"],
+        "source_categories": [],
+        "exact_source_refs": [],
+        "inventory_status": "unknown",
+        "time_scope_ref": "fy2026",
+        "version_scope_ref": "release-152",
+        "domain_scope_ref": "credential-management",
+        "project_scope_ref": "firefox",
+    }
+    assert dsa.calls[0]["source_ids"] == [
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ]
+    assert dsa.calls[0]["domain_tags"] is None
+    assert [call["source_ref"] for call in dsa.context_calls] == [
+        "vehicle_log_primary:record_1",
+        "vehicle_log_secondary:record_2",
+    ]
+    assert len(litellm.calls) == 1
 
 
 @pytest.mark.asyncio
