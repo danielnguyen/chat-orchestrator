@@ -985,6 +985,10 @@ run_evidence_changed_premise_scenarios() {
   configure_source_fixture "followup-sheet" "alternating_large_compact"
   reset_dsa_audit
   restart_orchestrator_for_changed_premise
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:followup_records:Followup!A2:C2" \
+    "Record: follow-up-1"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-followup")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
   request_id="$(jq -r '.request_id' <<<"$response")"
