@@ -957,7 +957,6 @@ run_evidence_clarification_scenario() {
 run_evidence_changed_premise_scenarios() {
   local owner client conversation_id question external response request_id trace
   local manifest provider_calls diagnostics audit source_calls
-  local initial_result_count initial_retained_count exact_retained_count
   owner="owner-evidence-followup"
   client="client-evidence-followup"
   question="Verify the follow-up records."
@@ -978,9 +977,6 @@ run_evidence_changed_premise_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
-  initial_result_count="$(jq -r '.next_steps.initial_attempt.result_count' <<<"$manifest")"
-  initial_retained_count="$(jq -r '.next_steps.initial_attempt.retained_reference_count' <<<"$manifest")"
-  exact_retained_count="$(jq -r '.acquisition.prompt_retained_item_count' <<<"$manifest")"
   jq -e '
     .router_decision.selected_model == "chat_local_fast"
     and .router_decision.routing_contract.manual_override_requested == "chat_local_fast"
@@ -1010,17 +1006,17 @@ run_evidence_changed_premise_scenarios() {
     and .next_steps.additional_acquisition_count == 1
     and .next_steps.selection_count == 2
     and .next_steps.initial_attempt.strategy == "targeted_retrieval"
-    and (.next_steps.initial_attempt.result_count > 1)
+    and .next_steps.initial_attempt.result_count == 2
     and .next_steps.initial_attempt.retained_reference_count == 0
     and .next_steps.initial_attempt.changed_premise_exact_fetch_followed == true
     and [.next_steps.selections[].selected_next_step] == ["perform_additional_acquisition","answer_within_declared_scope"]
     and .next_steps.selections[0].reacquisition_guard == "changed_premise_allowed"
     and .next_steps.selections[0].additional_acquisition_executed == true
   ' <<<"$manifest" >/dev/null
-  jq -e '
-    ([.[] | select(.operation == "context_pack")] | length) == 1
-    and ([.[] | select(.operation == "fetch")] | length) == 1
-  ' <<<"$audit" >/dev/null
+  if ! assert_dsa_operation_counts "$audit" 1 0 1 >/dev/null 2>&1; then
+    echo "Assertion failed: changed_premise.initial.dsa" >&2
+    return 1
+  fi
   jq -e '
     [.calls[] | select(
       .source == "followup-sheet" and .operation == "google_values"
@@ -1042,6 +1038,7 @@ run_evidence_changed_premise_scenarios() {
     "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
 
+  reset_dsa_audit
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -1088,10 +1085,10 @@ run_evidence_changed_premise_scenarios() {
     and .next_steps.selections[0].selected_next_step != "perform_additional_acquisition"
     and .next_steps.selections[0].additional_acquisition_executed == false
   ' <<<"$manifest" >/dev/null
-  jq -e '
-    ([.[] | select(.operation == "context_pack")] | length) == 2
-    and ([.[] | select(.operation == "fetch")] | length) == 1
-  ' <<<"$audit" >/dev/null
+  if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: changed_premise.repeated.dsa" >&2
+    return 1
+  fi
   jq -e '
     [.calls[] | select(
       .source == "followup-sheet" and .operation == "google_values"
@@ -1115,7 +1112,7 @@ run_evidence_changed_premise_scenarios() {
     test "$ALLOW_MANUAL_OVERRIDE" = "false"
     test "$PROMPT_OUTPUT_TOKEN_RESERVE" = "2048"
   '
-  echo "Evidence changed premise: model=chat_local_fast effective_budget=1000 targeted_results=$initial_result_count targeted_retained=$initial_retained_count changed_premise_authorizations=1 exact_fetch=1 exact_retained=$exact_retained_count selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
+  echo "Evidence changed premise: model=chat_local_fast effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
 }
 
 run_evidence_adversarial_provider_scenario() {
@@ -1187,7 +1184,75 @@ run_evidence_adversarial_provider_scenario() {
     echo "Assertion failed: adversarial.scope.persistence" >&2
     return 1
   fi
-  echo "Evidence adversarial provider: provider_chat=1 replacement=1 scope_boundary=1 retry=0 manifest_scope_unchanged=1"
+
+  owner="owner-evidence-adversarial-negated"
+  client="client-evidence-adversarial-negated"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_provider_answer "Not every possible source was fully examined."
+  conversation_id="$(resolve_conversation "$owner" "$client" "evidence-adversarial-negated")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "adversarial.negated.response_status" "$response" \
+    '.status == "ok"'
+  assert_jq "adversarial.negated.preserved" "$response" '
+    ([.answer | scan("Not every possible source was fully examined\\.")] | length) == 1
+  '
+  assert_jq "adversarial.negated.no_replacement" "$response" '
+    .answer
+    | contains("I withheld the generated answer because it claimed evidence coverage beyond the examined scope.")
+    | not
+  '
+  assert_jq "adversarial.negated.boundary" "$response" '
+    .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
+  '
+  assert_jq "adversarial.negated.manifest" "$manifest" '
+    .shape.task_shape == "targeted_lookup"
+    and .acquisition.sources_considered == ["records_primary"]
+    and .acquisition.sources_selected == ["records_primary"]
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "adversarial.negated.inventory" "$manifest" '
+    .inventory.inventory_status == "complete_for_declared_scope"
+    and .inventory.inventory_source_count == 6
+    and .inventory.declared_source_count == 1
+  '
+  assert_jq "adversarial.negated.provider_calls" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.negated.dsa" >&2
+    return 1
+  fi
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.negated.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events \
+    "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.negated.claim_calibration" >&2
+    return 1
+  fi
+  assert_jq "adversarial.negated.dispatch" "$trace" \
+    '.fallback.triggered == false and (.model_calls | length) == 1'
+  if ! assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.negated.persistence" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: adversarial.negated.persistence" >&2
+    return 1
+  fi
+  echo "Evidence adversarial provider: affirmative_replaced=1 negated_preserved=1 affirmative_provider=1 negated_provider=1 retry=0"
 }
 
 normalized_first_paragraph() {
