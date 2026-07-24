@@ -243,6 +243,21 @@ _UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX = re.compile(
     r"unsupported|false|rejected)\b",
     re.IGNORECASE,
 )
+_UNIVERSAL_SCOPE_SAME_SENTENCE_ENDORSEMENT = re.compile(
+    r"\b(?:and\s+(?:that\s+claim\s+is\s+correct|"
+    r"that\s+statement\s+is\s+true|the\s+phrase\s+is\s+accurate|"
+    r"i\s+agree)|but\s+(?:it\s+is\s+(?:nevertheless\s+true|"
+    r"still\s+correct)|that\s+claim\s+is\s+supported))\b",
+    re.IGNORECASE,
+)
+_UNIVERSAL_SCOPE_ADJACENT_ENDORSEMENT = re.compile(
+    r"^\s*(?:i\s+(?:agree|concur)|that\s+is\s+(?:correct|true)|"
+    r"that\s+claim\s+is\s+correct|this\s+statement\s+is\s+accurate|"
+    r"the\s+claim\s+is\s+supported|the\s+report\s+was\s+right|"
+    r"the\s+earlier\s+answer\s+was\s+(?:correct|right))"
+    r"\s*[.!?]?(?:[\"'”’]|\*{1,2}|_{1,2})*\s*$",
+    re.IGNORECASE,
+)
 _PROVIDER_SCOPE_SENTENCE = re.compile(
     r".+?(?:[.!?](?:[\"'”’]|\*{1,2}|_{1,2})*(?=\s|$)|$)"
 )
@@ -3669,13 +3684,25 @@ def _provider_answer_claims_universal_scope(
     ]
     for paragraph in provider_paragraphs:
         normalized = re.sub(r"\s+", " ", paragraph).strip()
-        for sentence_match in _PROVIDER_SCOPE_SENTENCE.finditer(normalized):
-            sentence = sentence_match.group(0).strip()
+        sentences = [
+            sentence_match.group(0).strip()
+            for sentence_match in _PROVIDER_SCOPE_SENTENCE.finditer(normalized)
+        ]
+        for sentence_index, sentence in enumerate(sentences):
+            next_sentence = (
+                sentences[sentence_index + 1]
+                if sentence_index + 1 < len(sentences)
+                else None
+            )
             for claim_pattern in _UNIVERSAL_SCOPE_CLAIM_PATTERNS:
                 for claim_match in claim_pattern.finditer(sentence):
                     if _scope_claim_is_explicitly_negated(sentence, claim_match):
                         continue
-                    if _scope_claim_is_quoted_metalinguistic(sentence, claim_match):
+                    if _scope_claim_is_safe_quoted_reference(
+                        sentence,
+                        claim_match,
+                        next_sentence,
+                    ):
                         continue
                     return True
     return False
@@ -3689,9 +3716,10 @@ def _scope_claim_is_explicitly_negated(
     return _UNIVERSAL_SCOPE_EXTERNAL_NEGATION.search(prefix) is not None
 
 
-def _scope_claim_is_quoted_metalinguistic(
+def _scope_claim_is_safe_quoted_reference(
     sentence: str,
     claim_match: re.Match[str],
+    next_sentence: str | None,
 ) -> bool:
     quote_bounds: tuple[int, int] | None = None
     for opening_quote, closing_quote in (("\"", "\""), ("“", "”")):
@@ -3707,10 +3735,21 @@ def _scope_claim_is_quoted_metalinguistic(
     opening_index, closing_index = quote_bounds
     prefix = sentence[:opening_index].rstrip()
     suffix = sentence[closing_index + 1 :]
-    return (
+    has_safe_context = (
         _UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX.search(prefix) is not None
         or _UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX.search(suffix) is not None
     )
+    if not has_safe_context:
+        return False
+    if _UNIVERSAL_SCOPE_SAME_SENTENCE_ENDORSEMENT.search(suffix) is not None:
+        return False
+    if (
+        next_sentence is not None
+        and _UNIVERSAL_SCOPE_ADJACENT_ENDORSEMENT.fullmatch(next_sentence)
+        is not None
+    ):
+        return False
+    return True
 
 
 def _compose_policy_answer(answer: str, policy_paragraphs: list[str]) -> str:

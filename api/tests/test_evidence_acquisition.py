@@ -4299,6 +4299,29 @@ def test_provider_scope_claim_formatting_cannot_evade_replacement(provider_answe
     assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
 
 
+_ENDORSED_QUOTED_SCOPE_CLAIMS = (
+    'The report claimed, "Every possible source was fully examined," and that claim is correct.',
+    'The earlier answer claimed, "Every possible source was fully examined." I agree.',
+    'The phrase "All possible sources were checked" is not supported by the '
+    "evidence, but it is nevertheless true.",
+    'The report stated, "No evidence exists outside this result." That is correct.',
+    'The earlier answer quoted, "The search was complete across every relevant '
+    'source." The earlier answer was right.',
+    'The report claimed, "Every possible source was fully examined," and I agree.',
+)
+
+_NON_ENDORSING_QUOTED_SCOPE_REFERENCES = (
+    'The report claimed, "Every possible source was fully examined," and that claim is false.',
+    'The earlier answer claimed, "Every possible source was fully examined." I disagree.',
+    'The phrase "All possible sources were checked" is not supported by the '
+    "evidence, and I reject it.",
+    'The report stated, "No evidence exists outside this result." I have not verified that claim.',
+    'The earlier answer quoted, "The search was complete across every relevant '
+    'source." The earlier answer was wrong.',
+    'The report claimed, "Every possible source was fully examined." I do not agree.',
+)
+
+
 @pytest.mark.parametrize(
     "provider_answer",
     [
@@ -4322,6 +4345,45 @@ def test_provider_scope_claim_helper_rejects_affirmative_assertions(
     assert _provider_answer_claims_universal_scope(provider_answer, []) is True
 
 
+@pytest.mark.parametrize("provider_answer", _ENDORSED_QUOTED_SCOPE_CLAIMS)
+def test_provider_scope_claim_helper_rejects_endorsed_quoted_assertions(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    [
+        'The report claimed, "Every possible source was fully examined," '
+        "and that statement is true.",
+        'The report quoted, "Every possible source was fully examined," '
+        "and the phrase is accurate.",
+        'The report claimed, "Every possible source was fully examined," '
+        "but it is still correct.",
+        'The report claimed, "Every possible source was fully examined," '
+        "but that claim is supported.",
+        'The report claimed, "Every possible source was fully examined." I concur.',
+        'The report claimed, "Every possible source was fully examined." '
+        "That is true.",
+        'The report claimed, "Every possible source was fully examined." '
+        "That claim is correct.",
+        'The report claimed, "Every possible source was fully examined." '
+        "This statement is accurate.",
+        'The report claimed, "Every possible source was fully examined." '
+        "The claim is supported.",
+        'The report claimed, "Every possible source was fully examined." '
+        "The report was right.",
+        'The report claimed, "Every possible source was fully examined." '
+        "The earlier answer was correct.",
+    ],
+)
+def test_provider_scope_claim_helper_rejects_bounded_endorsement_vocabulary(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
+
+
 @pytest.mark.parametrize(
     "provider_answer",
     [
@@ -4340,6 +4402,16 @@ def test_provider_scope_claim_helper_rejects_affirmative_assertions(
     ],
 )
 def test_provider_scope_claim_helper_allows_bounded_negated_and_metalinguistic_text(
+    provider_answer,
+):
+    assert _provider_answer_claims_universal_scope(provider_answer, []) is False
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    _NON_ENDORSING_QUOTED_SCOPE_REFERENCES,
+)
+def test_provider_scope_claim_helper_allows_non_endorsing_quoted_references(
     provider_answer,
 ):
     assert _provider_answer_claims_universal_scope(provider_answer, []) is False
@@ -4374,6 +4446,24 @@ def test_targeted_answer_boundary_replaces_affirmative_scope_claims(provider_ans
     assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
 
 
+@pytest.mark.parametrize("provider_answer", _ENDORSED_QUOTED_SCOPE_CLAIMS)
+def test_targeted_answer_boundary_replaces_endorsed_quoted_scope_claims(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    replacement = (
+        "I withheld the generated answer because it claimed evidence coverage "
+        "beyond the examined scope."
+    )
+    assert provider_answer not in answer
+    assert answer == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert answer.count(replacement) == 1
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
 @pytest.mark.parametrize(
     "provider_answer",
     [
@@ -4388,6 +4478,22 @@ def test_targeted_answer_boundary_replaces_affirmative_scope_claims(provider_ans
     ],
 )
 def test_targeted_answer_boundary_preserves_negated_and_metalinguistic_text(
+    provider_answer,
+):
+    state = _rendering_state(task_shape="targeted_lookup")
+
+    answer = enforce_final_answer(provider_answer, state)
+
+    assert answer == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert "I withheld the generated answer" not in answer
+    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
+
+
+@pytest.mark.parametrize(
+    "provider_answer",
+    _NON_ENDORSING_QUOTED_SCOPE_REFERENCES,
+)
+def test_targeted_answer_boundary_preserves_non_endorsing_quoted_references(
     provider_answer,
 ):
     state = _rendering_state(task_shape="targeted_lookup")
