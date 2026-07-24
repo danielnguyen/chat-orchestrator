@@ -65,6 +65,8 @@ async def chat_completions(
     messages = body.get("messages")
     messages = messages if isinstance(messages, list) else []
     model = body.get("model")
+    tools = body.get("tools")
+    tool_count = len(tools) if isinstance(tools, list) else 0
     prompt_text = "\n".join(
         message.get("content", "")
         for message in messages
@@ -132,6 +134,7 @@ async def chat_completions(
                 "kind": "chat",
                 "request_id": x_request_id,
                 "model": model,
+                "tool_count": tool_count,
                 "message_count": len(messages),
                 "normalized_messages": normalized_messages,
                 "prompt_fingerprint": prompt_fingerprint,
@@ -165,6 +168,7 @@ async def chat_completions(
             "kind": "chat",
             "request_id": x_request_id,
             "model": model,
+            "tool_count": tool_count,
             "message_count": len(messages),
             "normalized_messages": normalized_messages,
             "prompt_fingerprint": prompt_fingerprint,

@@ -17,6 +17,11 @@ source_id: records_primary
 display_name: Migration Records
 description: Bounded migration records.
 domain_tags: [records, migration]
+scope_refs:
+  time: fy2026
+  version: release-152
+  domain: credential-management
+  project: firefox
 connector: google_sheets
 enabled: true
 authority_role: authoritative
@@ -71,6 +76,11 @@ source_id: complete_register
 display_name: Configured Review Register
 description: Complete configured worksheet for a bounded review.
 domain_tags: [register, review]
+scope_refs:
+  time: fy2026
+  version: release-152
+  domain: compliance-review
+  project: firefox
 connector: google_sheets
 enabled: true
 authority_role: authoritative
@@ -98,6 +108,11 @@ source_id: followup_records
 display_name: Follow-up Records
 description: Bounded records supporting one exact follow-up.
 domain_tags: [followup, records]
+scope_refs:
+  time: fy2026
+  version: release-153
+  domain: credential-management
+  project: firefox
 connector: google_sheets
 enabled: true
 authority_role: authoritative
@@ -348,6 +363,95 @@ fetch_dsa_audit() {
   else
     echo '[]'
   fi
+}
+
+fetch_dsa_inventory() {
+  curl -fsS "http://127.0.0.1:14374/v1/sources" \
+    -H "X-API-Key: smoke-dsa-key"
+}
+
+assert_runtime_scope_plan() {
+  local diagnostics="$1" inventory="$2" request_id="$3"
+  local declared_scope="$4" _expected_eligible_source="$5"
+  local expected_task_shape="${6:-targeted_lookup}"
+  local expected_strategies="${7:-[\"targeted_retrieval\"]}"
+  local question_digest selected_strategies adapted_inventory material expected_digest
+  question_digest="$(jq -er --arg request_id "$request_id" '
+    [.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_shape_derived"
+    ) | .event_payload_json.question_anchor_digest] as $digests
+    | if ($digests | length) == 1 then $digests[0] else empty end
+  ' <<<"$diagnostics")"
+  selected_strategies="$(jq -ec --arg request_id "$request_id" '
+    [.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_plan_compiled"
+    ) | .event_payload_json.selected_strategies] as $values
+    | if ($values | length) == 1 then $values[0] else empty end
+  ' <<<"$diagnostics")"
+  adapted_inventory="$(jq -ec '
+    def capability:
+      if . == "search" then "targeted_retrieval"
+      elif . == "fetch" then "exact_fetch"
+      elif . == "context" then "context_expansion"
+      else empty
+      end;
+    [.sources[] | {
+      source_id,
+      source_categories: (.domain_tags | sort),
+      capabilities: ([.capabilities[] | capability] | unique | sort),
+      availability: (
+        if (.enabled | not) or .status == "disabled" then "disabled"
+        elif .status == "ready" then "available"
+        elif .status == "unavailable" then "unavailable"
+        else "unknown"
+        end
+      ),
+      authority_role
+    }] | sort_by(.source_id)
+  ' <<<"$inventory")"
+  material="$(jq -nSc \
+    --arg question_digest "$question_digest" \
+    --arg task_shape "$expected_task_shape" \
+    --argjson declared_scope "$declared_scope" \
+    --argjson source_inventory "$adapted_inventory" \
+    --argjson selected_strategies "$selected_strategies" \
+    '{
+      question_anchor_digest:$question_digest,
+      task_shape:$task_shape,
+      declared_scope:$declared_scope,
+      source_inventory:$source_inventory,
+      selected_strategies:($selected_strategies | sort)
+    }')"
+  expected_digest="sha256:$(printf '%s' "$material" | sha256sum | cut -d' ' -f1)"
+  jq -e \
+    --arg request_id "$request_id" \
+    --arg digest "$expected_digest" \
+    --arg task_shape "$expected_task_shape" \
+    --argjson strategies "$expected_strategies" '
+      [.events[] | select(
+        .event_payload_json.request_id == $request_id
+        and .event_type == "evidence_plan_compiled"
+      ) | .event_payload_json] as $events
+      | ($events | length) == 1
+      and $events[0].acquisition_premise_digest == $digest
+      and $events[0].task_shape == $task_shape
+      and $events[0].eligible_source_count == 1
+      and $events[0].authoritative_source_count == 1
+      and $events[0].selected_strategies == $strategies
+    ' <<<"$diagnostics" >/dev/null
+}
+
+assert_governed_dispatch_boundary() {
+  local trace="$1"
+  jq -e '
+    .fallback.triggered == false
+    and (.model_calls | length) == 1
+    and .retrieval.prompt_assembly.evidence_response.provider_tool_count == 0
+    and .prompt.capabilities.executor_call_count == 0
+    and .prompt.capabilities.dispatch_completed == false
+  ' <<<"$trace" >/dev/null
 }
 
 runtime_diagnostics_from_trace() {
@@ -1197,7 +1301,8 @@ run_evidence_adversarial_provider_scenario() {
     '.fallback.triggered == false
     and (.model_calls | length) == 1
     and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
-    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0'
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == "invalid_json"'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
     echo "Assertion failed: adversarial.malformed_freeform.persistence" >&2
@@ -1344,7 +1449,8 @@ run_evidence_adversarial_provider_scenario() {
     '.fallback.triggered == false
     and (.model_calls | length) == 1
     and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
-    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0'
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == "reference_not_retained"'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
     echo "Assertion failed: adversarial.forged_reference.persistence" >&2
@@ -1356,6 +1462,8 @@ run_evidence_adversarial_provider_scenario() {
     return 1
   fi
   echo "Adversarial provider case passed: forged_reference"
+  EVIDENCE_ADVERSARIAL_FREEFORM_REJECTED=1
+  EVIDENCE_ADVERSARIAL_FORGED_REJECTED=1
   echo "Evidence adversarial provider: affirmative_replaced=0 negated_preserved=0 endorsed_quote_replaced=0 affirmative_provider=1 negated_provider=1 endorsed_provider=1"
 }
 
@@ -2917,6 +3025,634 @@ run_evidence_compound_scenarios() {
   echo "Evidence compound: history_resolver=1 fresh_cr_shape=1 fresh_plan=1 fresh_dsa=1 fresh_sufficiency=1 fresh_next_step=1 provider=1 manifest_distinct=1 label_conflict_retry=0 insufficient_provider=0 claims=0"
 }
 
+run_evidence_scope_reference_scenarios() {
+  local owner client conversation_id response request_id answer trace manifest
+  local provider_calls diagnostics audit inventory claims external declared_scope
+  local serialized optional_config optional_backup history history_trace
+  local missing_scope partial_scope
+
+  inventory="$(fetch_dsa_inventory)"
+  assert_jq "scope.producer.inventory" "$inventory" '
+    .inventory_scope == "configured_sources"
+    and .inventory_status == "complete"
+    and (.sources | length) == 6
+    and ([.sources[] | select(
+      .source_id == "records_primary"
+      and .scope_refs == {
+        time:"fy2026",
+        version:"release-152",
+        domain:"credential-management",
+        project:"firefox"
+      }
+    )] | length) == 1
+    and ([.sources[] | select(
+      .source_id == "followup_records"
+      and .scope_refs.version == "release-153"
+      and .scope_refs.domain == "credential-management"
+    )] | length) == 1
+    and ([.sources[] | select(
+      .source_id == "complete_register"
+      and .scope_refs.version == "release-152"
+      and .scope_refs.domain == "compliance-review"
+    )] | length) == 1
+    and ([.sources[] | select(
+      (.source_id == "calendar_alpha" or .source_id == "calendar_beta")
+      and (has("scope_refs") | not)
+    )] | length) == 2
+  '
+
+  owner="owner-scope-requested"
+  client="client-scope-requested"
+  external='{"enabled":true,"scope_refs":{"time":"fy2026","version":"release-152","domain":"credential-management","project":"firefox"},"allowed_sensitivity":"medium","max_results":5}'
+  declared_scope='{"source_ids":["records_primary"],"source_categories":[],"exact_source_refs":[],"inventory_status":"complete_for_declared_scope","time_scope_ref":"fy2026","version_scope_ref":"release-152","domain_scope_ref":"credential-management","project_scope_ref":"firefox"}'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_evidence_candidate "supports" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
+  conversation_id="$(resolve_conversation "$owner" "$client" "scope-requested")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  claims="$(list_claim_records "$owner" "$conversation_id")"
+  assert_jq "scope.requested.response" "$response" '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: The migration record confirms the bounded setting."))
+    and (.answer | contains("scope_refs") | not)
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+  '
+  assert_jq "scope.requested.manifest" "$manifest" '
+    .shape.task_shape == "targeted_lookup"
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["targeted_retrieval"]
+    and .acquisition.sources_considered == ["records_primary"]
+    and .acquisition.sources_selected == ["records_primary"]
+    and .acquisition.sources_used == ["records_primary"]
+    and .inventory.inventory_status == "complete_for_declared_scope"
+    and .inventory.inventory_source_count == 6
+    and .inventory.declared_source_count == 1
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "scope.requested.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | contains("The migration record confirms the bounded setting."))] | length) == 1
+  '
+  assert_jq "scope.requested.dsa_sources" "$audit" '
+    ([.[] | select(.operation == "context_pack" and .source_ids == ["records_primary"])] | length) == 1
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$declared_scope" "records_primary"
+  assert_governed_dispatch_boundary "$trace"
+  assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  assert_jq "scope.requested.claim" "$claims" \
+    '(.records | length) == 1
+    and (.records[0].validated_evidence_references | length) == 1
+    and .records[0].validated_evidence_references[0].ref_type == "external_source"
+    and (.records[0].validated_evidence_references[0].ref_id | test("^external-source:[0-9a-f]{64}$"))'
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c . <<<"$provider_calls")$(jq -c . <<<"$claims")"
+  case "$serialized" in
+    *followup_records*|*complete_register*|*release-153*|*compliance-review*|*scope_refs*)
+      echo "Assertion failed: scope.requested.privacy" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  echo "Scope reference case passed: requested"
+
+  owner="owner-scope-derived"
+  client="client-scope-derived"
+  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_evidence_candidate "supports" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
+  conversation_id="$(resolve_conversation "$owner" "$client" "scope-derived")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "scope.derived.response" "$response" '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+  '
+  assert_jq "scope.derived.manifest" "$manifest" '
+    .acquisition.sources_considered == ["records_primary"]
+    and .acquisition.sources_selected == ["records_primary"]
+    and .acquisition.sources_used == ["records_primary"]
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "scope.derived.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_jq "scope.derived.dsa_sources" "$audit" '
+    ([.[] | select(.operation == "context_pack" and .source_ids == ["records_primary"])] | length) == 1
+  '
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$declared_scope" "records_primary"
+  assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c . <<<"$provider_calls")"
+  case "$serialized" in
+    *fy2026*|*release-152*|*credential-management*|*scope_refs*)
+      echo "Assertion failed: scope.derived.no_metadata_leak" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  echo "Scope reference case passed: derived"
+
+  owner="owner-scope-missing"
+  client="client-scope-missing"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "scope-missing")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Reconstruct what happened across the records last week." \
+    '{"enabled":true,"source_ids":["calendar_alpha"],"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "scope.missing.response" "$response" \
+    '.status == "degraded" and (.answer | contains("can’t safely complete that evidence request"))'
+  assert_jq "scope.missing.manifest" "$manifest" '
+    .status == "unsupported_plan"
+    and .shape.task_shape == "historical_reconstruction"
+    and .plan.plan_status == "unsupported"
+    and .plan.selected_strategies == []
+    and (.plan.limitation_codes | index("historical_time_scope_missing")) != null
+    and .acquisition.strategy_attempted == null
+    and .acquisition.item_count == 0
+    and .sufficiency.status == "not_evaluated"
+  '
+  assert_jq "scope.missing.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 0'
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 0 0
+  missing_scope='{"source_ids":["calendar_alpha"],"source_categories":[],"exact_source_refs":[],"inventory_status":"complete_for_declared_scope","time_scope_ref":null,"version_scope_ref":null,"domain_scope_ref":null,"project_scope_ref":null}'
+  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$missing_scope" "calendar_alpha" "historical_reconstruction" '[]'
+  assert_provider_free_trace "$trace"
+  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  echo "Scope reference case passed: missing"
+
+  optional_config="$COMPOSED_SMOKE_TMP/config/sources/records_optional.yaml"
+  optional_backup="$COMPOSED_SMOKE_TMP/config/sources/records_optional.yaml.valid"
+  cp "$optional_config" "$optional_backup"
+  sed -i '/^domain_tags:/a scope_refs:\n  project: null' "$optional_config"
+  restart_dsa
+  inventory="$(fetch_dsa_inventory)"
+  assert_jq "scope.malformed.partial_inventory" "$inventory" '
+    .inventory_scope == "configured_sources"
+    and .inventory_status == "partial"
+    and (.sources | length) == 5
+    and ([.sources[] | select(.source_id == "records_optional")] | length) == 0
+    and ([.sources[] | select(.source_id == "records_primary" and .scope_refs.project == "firefox")] | length) == 1
+  '
+  owner="owner-scope-malformed"
+  client="client-scope-malformed"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "scope-malformed")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." \
+    '{"enabled":true,"scope_refs":{"time":"fy2026","version":"release-152","domain":"credential-management","project":"firefox"},"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "scope.malformed.response" "$response" \
+    '.status == "ok" and (.answer | contains("Limitation:"))'
+  assert_jq "scope.malformed.manifest" "$manifest" '
+    .inventory.inventory_status == "partial"
+    and .inventory.inventory_source_count == 5
+    and .inventory.declared_source_count == 1
+    and .plan.plan_status == "ready_with_limitations"
+    and .acquisition.sources_selected == ["records_primary"]
+    and .sufficiency.status == "sufficient_with_limitations"
+    and .next_steps.selections[0].selected_next_step == "provide_qualified_partial_answer"
+  '
+  assert_jq "scope.malformed.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_jq "scope.malformed.dsa_sources" "$audit" '
+    ([.[] | select(.operation == "context_pack" and .source_ids == ["records_primary"])] | length) == 1
+  '
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  partial_scope='{"source_ids":["records_primary"],"source_categories":[],"exact_source_refs":[],"inventory_status":"partial","time_scope_ref":"fy2026","version_scope_ref":"release-152","domain_scope_ref":"credential-management","project_scope_ref":"firefox"}'
+  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$partial_scope" "records_primary"
+  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c . <<<"$provider_calls")"
+  case "$serialized" in
+    *records_optional*|*project:null*|*scope_refs*)
+      echo "Assertion failed: scope.malformed.privacy" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
+    "What did you check?" "retained record shows a targeted lookup" \
+    "scope.malformed.history"
+  serialized="$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
+  case "$serialized" in
+    *records_optional*|*scope_refs*|*project:null*)
+      echo "Assertion failed: scope.malformed.history_privacy" >&2
+      return 1
+      ;;
+  esac
+  mv "$optional_backup" "$optional_config"
+  restart_dsa
+  inventory="$(fetch_dsa_inventory)"
+  assert_jq "scope.malformed.restored" "$inventory" \
+    '.inventory_status == "complete" and (.sources | length) == 6'
+  echo "Scope reference case passed: malformed"
+
+  owner="owner-scope-mismatch"
+  client="client-scope-mismatch"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "scope-mismatch")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." \
+    '{"enabled":true,"scope_refs":{"version":"release-999"},"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "scope.mismatch.response" "$response" \
+    '.status == "degraded" and (.answer | contains("can’t safely complete that evidence request"))'
+  assert_jq "scope.mismatch.manifest" "$manifest" '
+    .status == "scope_selector_no_match"
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.strategy_attempted == null
+    and .acquisition.item_count == 0
+    and .sufficiency.status == "not_evaluated"
+  '
+  assert_jq "scope.mismatch.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 0'
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_provider_free_trace "$trace"
+  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")" in
+    *release-999*)
+      echo "Assertion failed: scope.mismatch.no_fabrication" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  echo "Scope reference case passed: mismatched"
+
+  owner="owner-scope-private"
+  client="client-scope-private"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  restart_orchestrator_with_privacy true
+  conversation_id="$(resolve_conversation "$owner" "$client" "scope-private")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." \
+    '{"enabled":true,"scope_refs":{"time":"fy2026","version":"release-152","domain":"credential-management","project":"firefox"},"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "scope.privacy.manifest" "$manifest" '
+    .acquisition.source_identifiers_suppressed == true
+    and .acquisition.sources_considered == []
+    and .acquisition.sources_considered_count == 1
+    and .acquisition.source_references_returned == []
+    and .acquisition.source_references_returned_count == 2
+  '
+  assert_jq "scope.privacy.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_jq "scope.privacy.dsa_sources" "$audit" '
+    ([.[] | select(.operation == "context_pack" and .source_ids == ["records_primary"])] | length) == 1
+  '
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$declared_scope" "records_primary"
+  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")"
+  case "$serialized" in
+    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*conclusion_disposition*|*The\ migration\ record\ confirms*)
+      echo "Assertion failed: scope.privacy.suppression" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
+    "What did you check?" "retained record shows a targeted lookup" \
+    "scope.privacy.history"
+  history="$HISTORY_RESPONSE"
+  history_trace="$HISTORY_TRACE"
+  serialized="$(jq -c . <<<"$history")$(jq -c . <<<"$history_trace")"
+  case "$serialized" in
+    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*conclusion_disposition*)
+      echo "Assertion failed: scope.privacy.history_suppression" >&2
+      return 1
+      ;;
+  esac
+  restart_orchestrator_with_privacy false
+  echo "Scope reference case passed: privacy"
+
+  assert_jq "scope.summary.producer" "$inventory" \
+    '.inventory_status == "complete" and (.sources | length) == 6'
+  assert_jq "scope.summary.selector" "$declared_scope" \
+    '.source_ids == ["records_primary"]'
+  echo "Evidence scope references: producer=1 requested=1 derived=1 missing=1 malformed=1 mismatched=1 privacy=1 selector_sources=1 mismatch_acquisition=0 mismatch_provider=0"
+}
+
+run_structured_answer_failure_case() {
+  local case_name="$1" candidate="$2" expected_reason="$3" raw_marker="$4"
+  local owner client conversation_id response request_id answer trace manifest
+  local provider_calls diagnostics audit claims serialized
+  owner="owner-structured-${case_name}"
+  client="client-structured-${case_name}"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_provider_answer "$candidate"
+  conversation_id="$(resolve_conversation "$owner" "$client" "structured-${case_name}")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Verify the migration record." \
+    '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  claims="$(list_claim_records "$owner" "$conversation_id")"
+  assert_jq "structured.${case_name}.response" "$response" '
+    .status == "degraded"
+    and ([.answer | scan("The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion\\.")] | length) == 1
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+    and (.answer | contains($raw) | not)
+    and (.answer | contains("I withheld the generated answer because it claimed evidence coverage beyond the examined scope.") | not)
+  ' --arg raw "$raw_marker"
+  assert_jq "structured.${case_name}.manifest" "$manifest" '
+    .shape.task_shape == "targeted_lookup"
+    and .plan.plan_status == "ready"
+    and .acquisition.sources_selected == ["records_primary"]
+    and .acquisition.prompt_retained_item_count == 2
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "structured.${case_name}.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+  '
+  assert_jq "structured.${case_name}.validation" "$trace" \
+    '.retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == $reason' \
+    --arg reason "$expected_reason"
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  assert_governed_dispatch_boundary "$trace"
+  assert_jq "structured.${case_name}.claims" "$claims" '(.records | length) == 0'
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c . <<<"$claims")"
+  case "$serialized" in
+    *"$raw_marker"*|*conclusion_disposition*|*evidence_excerpts*|*aggressive_claim*|*compliance_claim*)
+      echo "Assertion failed: structured.${case_name}.durable_privacy" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  STRUCTURED_MALFORMED_OWNER="$owner"
+  STRUCTURED_MALFORMED_CLIENT="$client"
+  STRUCTURED_MALFORMED_CONVERSATION="$conversation_id"
+  STRUCTURED_MALFORMED_ANSWER="$answer"
+  STRUCTURED_MALFORMED_MARKER="$raw_marker"
+  echo "Structured answer case passed: $case_name"
+}
+
+run_evidence_structured_answer_recovery_scenarios() {
+  local owner client conversation_id response request_id answer trace manifest
+  local provider_calls diagnostics audit claims response_digest serialized
+  local candidate
+
+  owner="owner-structured-supports"
+  client="client-structured-supports"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_evidence_candidate "supports" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
+  conversation_id="$(resolve_conversation "$owner" "$client" "structured-supports")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Verify the migration record." \
+    '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  claims="$(list_claim_records "$owner" "$conversation_id")"
+  assert_jq "structured.supports.response" "$response" '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: The migration record confirms the bounded setting."))
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+    and (.answer | contains("conclusion_disposition") | not)
+    and (.answer | contains("source_ref") | not)
+  '
+  assert_jq "structured.supports.validation" "$trace" '
+    .retrieval.prompt_assembly.evidence_response == {
+      contract_active:true,
+      validation_status:"valid",
+      validated_excerpt_count:1,
+      failure_reason:null,
+      provider_tool_count:0
+    }
+  '
+  assert_jq "structured.supports.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+  '
+  assert_jq "structured.supports.manifest" "$manifest" '
+    .acquisition.sources_selected == ["records_primary"]
+    and .acquisition.prompt_retained_item_count == 2
+    and .sufficiency.status == "sufficient_for_declared_scope"
+    and (.manifest_id | test("^evidence_manifest_[0-9a-f]{32}$"))
+    and (.response_digest | test("^sha256:[0-9a-f]{64}$"))
+  '
+  response_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
+  assert_jq "structured.supports.digest" "$manifest" \
+    '.response_digest == $digest' --arg digest "$response_digest"
+  assert_jq "structured.supports.claim" "$claims" '
+    (.records | length) == 1
+    and .records[0].claim_anchor == "The retained evidence supports the requested conclusion."
+    and (.records[0].validated_evidence_references | length) == 1
+    and .records[0].validated_evidence_references[0].ref_type == "external_source"
+    and (.records[0].validated_evidence_references[0].ref_id | test("^external-source:[0-9a-f]{64}$"))
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  assert_governed_dispatch_boundary "$trace"
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  STRUCTURED_VALID_OWNER="$owner"
+  STRUCTURED_VALID_CLIENT="$client"
+  STRUCTURED_VALID_CONVERSATION="$conversation_id"
+  STRUCTURED_VALID_ANSWER="$answer"
+  echo "Structured answer case passed: valid_supports"
+
+  owner="owner-structured-does-not-support"
+  client="client-structured-does-not-support"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_evidence_candidate "does_not_support" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
+  conversation_id="$(resolve_conversation "$owner" "$client" "structured-does-not-support")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Verify the migration record." \
+    '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "structured.does_not_support.response" "$response" '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence does not support the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: The migration record confirms the bounded setting."))
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+    and (.answer | contains("conclusion_disposition") | not)
+  '
+  assert_jq "structured.does_not_support.validation" "$trace" '
+    .retrieval.prompt_assembly.evidence_response.validation_status == "valid"
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 1
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == null
+  '
+  assert_jq "structured.does_not_support.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+  '
+  response_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
+  assert_jq "structured.does_not_support.digest" "$manifest" \
+    '.response_digest == $digest' --arg digest "$response_digest"
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  assert_governed_dispatch_boundary "$trace"
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  echo "Structured answer case passed: valid_does_not_support"
+
+  candidate='{"conclusion_disposition":"supports","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"The migration record confirms the bounded setting."}],"aggressive_claim":"Complete across all obligations."}'
+  run_structured_answer_failure_case \
+    "extra_field" "$candidate" "invalid_candidate" "Complete across all obligations."
+
+  candidate='{"conclusion_disposition":"supports","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"This paraphrase is not present in retained evidence."}]}'
+  run_structured_answer_failure_case \
+    "non_extractive" "$candidate" "excerpt_not_extractive" \
+    "This paraphrase is not present in retained evidence."
+
+  candidate='{"conclusion_disposition":"supports","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"All pertinent evidence across the entire relevant universe has been exhaustively reviewed."}]}'
+  run_structured_answer_failure_case \
+    "universal" "$candidate" "excerpt_not_extractive" \
+    "All pertinent evidence across the entire relevant universe has been exhaustively reviewed."
+
+  candidate='{"conclusion_disposition":"does_not_support","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"No relevant evidence exists anywhere within or beyond the declared universe."}]}'
+  run_structured_answer_failure_case \
+    "absence" "$candidate" "excerpt_not_extractive" \
+    "No relevant evidence exists anywhere within or beyond the declared universe."
+
+  candidate='{"conclusion_disposition":"mixed","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"Every possible contradiction and counterexample has been fully resolved."}]}'
+  run_structured_answer_failure_case \
+    "contradiction" "$candidate" "excerpt_not_extractive" \
+    "Every possible contradiction and counterexample has been fully resolved."
+
+  candidate='{"conclusion_disposition":"complete_compliance","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"The migration record confirms the bounded setting."}],"compliance_claim":"Complete compliance across every obligation is established."}'
+  run_structured_answer_failure_case \
+    "full_compliance" "$candidate" "invalid_candidate" \
+    "Complete compliance across every obligation is established."
+
+  assert_pure_history \
+    "$STRUCTURED_VALID_OWNER" "$STRUCTURED_VALID_CLIENT" \
+    "$STRUCTURED_VALID_CONVERSATION" "$STRUCTURED_VALID_ANSWER" \
+    "What did you check?" "retained record shows a targeted lookup" \
+    "structured.history.valid"
+  serialized="$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
+  case "$serialized" in
+    *conclusion_disposition*|*The\ migration\ record\ confirms\ the\ bounded\ setting*)
+      echo "Assertion failed: structured.history.valid_privacy" >&2
+      return 1
+      ;;
+  esac
+  assert_pure_history \
+    "$STRUCTURED_MALFORMED_OWNER" "$STRUCTURED_MALFORMED_CLIENT" \
+    "$STRUCTURED_MALFORMED_CONVERSATION" "$STRUCTURED_MALFORMED_ANSWER" \
+    "What did you check?" "retained record shows a targeted lookup" \
+    "structured.history.malformed"
+  serialized="$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
+  case "$serialized" in
+    *conclusion_disposition*|*"$STRUCTURED_MALFORMED_MARKER"*|*invalid_candidate*|*excerpt_not_extractive*)
+      echo "Assertion failed: structured.history.malformed_privacy" >&2
+      return 1
+      ;;
+  esac
+
+  test "${EVIDENCE_ADVERSARIAL_FREEFORM_REJECTED:-0}" = "1"
+  test "${EVIDENCE_ADVERSARIAL_FORGED_REJECTED:-0}" = "1"
+  echo "Evidence structured answer recovery: valid_supports=1 valid_does_not_support=1 freeform_rejected=1 extra_field_rejected=1 forged_reference_rejected=1 non_extractive_rejected=1 universal_rejected=1 absence_rejected=1 contradiction_rejected=1 full_compliance_rejected=1 repair_calls=0 content_fallbacks=0"
+}
+
 run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
@@ -2935,6 +3671,9 @@ run_evidence_acquisition_composed_suite() {
       run_evidence_history_negative_scenarios
       run_evidence_compound_scenarios
       echo "Evidence acquisition composed smoke passed: scenarios=targeted,exact,hybrid,exhaustive,limited,unknown,failure,clarification,changed-premise,repeated-premise,adversarial-provider,claim-subset,trace-first-history,privacy-history,history-negatives,compound-verification"
+      run_evidence_scope_reference_scenarios
+      run_evidence_structured_answer_recovery_scenarios
+      echo "Evidence acquisition recovery proof passed: scenarios=scope-references,structured-answer-recovery"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario
@@ -2959,6 +3698,15 @@ run_evidence_acquisition_composed_suite() {
     adversarial-provider)
       run_evidence_adversarial_provider_scenario
       echo "Evidence acquisition composed smoke passed: scenarios=adversarial-provider"
+      ;;
+    scope-references)
+      run_evidence_scope_reference_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=scope-references"
+      ;;
+    structured-answer-recovery)
+      run_evidence_adversarial_provider_scenario
+      run_evidence_structured_answer_recovery_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=structured-answer-recovery"
       ;;
     *)
       if [[ "$scenario" =~ ^[A-Za-z0-9_.:-]{1,120}$ ]]; then
