@@ -536,6 +536,10 @@ run_evidence_exact_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "Record: migration"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exact")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -548,7 +552,7 @@ run_evidence_exact_scenario() {
 
   jq -e '
     .status == "ok"
-    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | startswith("The retained evidence is mixed and does not establish a single conclusion."))
     and (.answer | contains("Retained evidence excerpt 1: Record: migration"))
     and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
