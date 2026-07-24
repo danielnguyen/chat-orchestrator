@@ -1680,6 +1680,10 @@ run_evidence_history_exhaustive_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:complete_register:Register!A2:C4" \
+    "Entry: alpha"
   conversation_id="$(resolve_conversation "$owner" "$client" "history-exhaustive")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2054,6 +2058,10 @@ run_evidence_history_scenarios() {
   external='{"enabled":true,"source_ids":["records_primary"],"exact_source_refs":[{"source_id":"records_primary","source_ref":"google_sheets:records_primary:Records!A2:C2"}],"allowed_sensitivity":"medium"}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "Record: migration"
   conversation_id="$(resolve_conversation "$owner" "$client" "history-exact")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the exact migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
