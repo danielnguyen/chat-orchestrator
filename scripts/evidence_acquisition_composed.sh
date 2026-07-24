@@ -3253,16 +3253,22 @@ run_evidence_scope_reference_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   assert_jq "scope.malformed.response_status" "$response" '.status == "ok"'
-  assert_jq "scope.malformed.response_limitation" "$response" \
-    '.answer | contains("Limitation:")'
-  assert_jq "scope.malformed.manifest" "$manifest" '
+  assert_jq "scope.malformed.response_boundary" "$response" '
+    .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
+  '
+  assert_jq "scope.malformed.inventory" "$manifest" '
     .inventory.inventory_status == "partial"
     and .inventory.inventory_source_count == 5
     and .inventory.declared_source_count == 1
-    and .plan.plan_status == "ready_with_limitations"
-    and .acquisition.sources_selected == ["records_primary"]
-    and .sufficiency.status == "sufficient_with_limitations"
-    and .next_steps.selections[0].selected_next_step == "provide_qualified_partial_answer"
+  '
+  assert_jq "scope.malformed.plan" "$manifest" \
+    '.plan.plan_status == "ready_with_limitations"'
+  assert_jq "scope.malformed.acquisition" "$manifest" \
+    '.acquisition.sources_selected == ["records_primary"]'
+  assert_jq "scope.malformed.sufficiency" "$manifest" \
+    '.sufficiency.status == "sufficient_with_limitations"'
+  assert_jq "scope.malformed.next_step" "$manifest" '
+    .next_steps.selections[0].selected_next_step == "provide_qualified_partial_answer"
   '
   assert_jq "scope.malformed.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
