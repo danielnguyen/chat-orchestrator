@@ -449,8 +449,8 @@ assert_governed_dispatch_boundary() {
     .fallback.triggered == false
     and (.model_calls | length) == 1
     and .retrieval.prompt_assembly.evidence_response.provider_tool_count == 0
-    and .prompt.capabilities.executor_call_count == 0
-    and .prompt.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
   ' <<<"$trace" >/dev/null
 }
 
