@@ -2361,41 +2361,85 @@ run_evidence_compound_scenarios() {
   verification_target="$(printf '%s' "$original_answer" | normalized_first_paragraph)"
   expected_task="Verify this prior statement with a new evidence check: \"$verification_target\""
   expected_digest="sha256:$(printf '%s' "$expected_task" | sha256sum | cut -d' ' -f1)"
-  jq -e '
-    .status == "ok"
-    and (.answer | startswith("Original acquisition:\n"))
-    and (.answer | contains("\n\nNew verification:\n"))
-    and (.answer | contains("The new retained evidence supports the prior statement."))
-    and (.answer | contains("I did not perform a new verification for this explanation.") | not)
-    and ([.answer | scan("Original acquisition:")] | length) == 1
-    and ([.answer | scan("New verification:")] | length) == 1
-  ' <<<"$response" >/dev/null
-  jq -e '
-    .prompt.claim_explanation.compound_mode == true
-    and .prompt.claim_explanation.manifest_resolution_status == "resolved"
-    and .prompt.claim_explanation.provider_call_count == 0
-    and .prompt.claim_capture.eligibility_status == "ineligible"
+  assert_jq "compound.verification.response_status" "$response" \
+    '.status == "ok"'
+  assert_jq "compound.verification.original_section" "$response" \
+    '.answer | startswith("Original acquisition:\n")'
+  assert_jq "compound.verification.new_verification_section" "$response" \
+    '.answer | contains("\n\nNew verification:\n")'
+  assert_jq "compound.verification.provider_answer" "$response" \
+    '.answer | contains("The new retained evidence supports the prior statement.")'
+  assert_jq "compound.verification.no_historical_suffix" "$response" \
+    '.answer | contains("I did not perform a new verification for this explanation.") | not'
+  assert_jq "compound.verification.original_section_count" "$response" \
+    '([.answer | scan("Original acquisition:")] | length) == 1'
+  assert_jq "compound.verification.verification_section_count" "$response" \
+    '([.answer | scan("New verification:")] | length) == 1'
+  assert_jq "compound.verification.trace_compound_mode" "$trace" \
+    '.prompt.claim_explanation.compound_mode == true'
+  assert_jq "compound.verification.trace_manifest_resolution" "$trace" \
+    '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
+  assert_jq "compound.verification.trace_history_provider" "$trace" \
+    '.prompt.claim_explanation.provider_call_count == 0'
+  assert_jq "compound.verification.trace_claim_capture" "$trace" '
+    .prompt.claim_capture.eligibility_status == "ineligible"
     and (.prompt.claim_capture.reason_code | contains("compound"))
-    and .fallback.triggered == false
-    and (.model_calls | length) == 1
-  ' <<<"$trace" >/dev/null
-  test "$(jq -r '.manifest_id' <<<"$manifest")" != "$(jq -r '.manifest_id' <<<"$original_manifest")"
-  test "$(jq -r '.response_digest' <<<"$manifest")" != "$(jq -r '.response_digest' <<<"$original_manifest")"
-  test "$(jq -r '.response_digest' <<<"$manifest")" = "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
-  jq -e '.next_steps.additional_acquisition_count == 0' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
-  assert_dsa_operation_counts "$audit" 1 0 0
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  jq -e --arg request_id "$request_id" --arg digest "$expected_digest" '
+  '
+  assert_jq "compound.verification.trace_fallback" "$trace" \
+    '.fallback.triggered == false'
+  assert_jq "compound.verification.trace_model_count" "$trace" \
+    '(.model_calls | length) == 1'
+  if ! test "$(jq -r '.manifest_id' <<<"$manifest")" != \
+    "$(jq -r '.manifest_id' <<<"$original_manifest")"; then
+    echo "Assertion failed: compound.verification.manifest_distinct" >&2
+    return 1
+  fi
+  if ! test "$(jq -r '.response_digest' <<<"$manifest")" != \
+    "$(jq -r '.response_digest' <<<"$original_manifest")"; then
+    echo "Assertion failed: compound.verification.response_digest_distinct" >&2
+    return 1
+  fi
+  if ! test "$(jq -r '.response_digest' <<<"$manifest")" = \
+    "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"; then
+    echo "Assertion failed: compound.verification.response_digest_matches" >&2
+    return 1
+  fi
+  assert_jq "compound.verification.no_additional_acquisition" "$manifest" \
+    '.next_steps.additional_acquisition_count == 0'
+  assert_jq "compound.verification.provider_calls" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.verification.dsa" >&2
+    return 1
+  fi
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.verification.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events \
+    "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.verification.claim_calibration" >&2
+    return 1
+  fi
+  assert_jq "compound.verification.question_anchor" "$diagnostics" '
     ([.events[] | select(
       .event_type == "evidence_shape_derived"
       and .event_payload_json.request_id == $request_id
       and .event_payload_json.question_anchor_digest == $digest
     )] | length) == 1
-  ' <<<"$diagnostics" >/dev/null
-  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  ' --arg request_id "$request_id" --arg digest "$expected_digest"
+  if ! assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: compound.verification.answer_persistence" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.verification.request_persistence" >&2
+    return 1
+  fi
+  echo "Compound case passed: verification"
 
   owner="owner-evidence-compound-label"
   client="client-evidence-compound-label"
@@ -2418,40 +2462,73 @@ run_evidence_compound_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   replacement="The governed new evidence check completed, but I withheld the generated explanation because it conflicted with the verification response boundary."
-  jq -e \
-    --arg replacement "$replacement" '
-      .status == "degraded"
-      and (.answer | startswith("Original acquisition:\n"))
-      and (.answer | contains("\n\nNew verification:\n" + $replacement))
-      and ([.answer | scan("Original acquisition:")] | length) == 1
-      and ([.answer | scan("New verification:")] | length) == 1
-      and (.answer | contains("PRIVATE-LABEL-SENTINEL") | not)
-      and (.answer | contains("New verification unavailable:") | not)
-      and (.answer | contains("No fresh check occurred.") | not)
-  ' <<<"$response" >/dev/null
-  test "$(jq -r '.response_digest' <<<"$manifest")" = "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
-  jq -e '
-    .next_steps.additional_acquisition_count == 0
-  ' <<<"$manifest" >/dev/null
-  jq -e '
-    .prompt.claim_explanation.storage_call_count == 1
-    and .prompt.claim_explanation.manifest_resolution_status == "resolved"
-    and .prompt.claim_capture.eligibility_status == "ineligible"
-    and .fallback.triggered == false
-    and (.model_calls | length) == 1
-  ' <<<"$trace" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
-  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_jq "compound.label_conflict.response_status" "$response" \
+    '.status == "degraded"'
+  assert_jq "compound.label_conflict.original_section" "$response" \
+    '.answer | startswith("Original acquisition:\n")'
+  assert_jq "compound.label_conflict.replacement" "$response" \
+    '.answer | contains("\n\nNew verification:\n" + $replacement)' \
+    --arg replacement "$replacement"
+  assert_jq "compound.label_conflict.original_section_count" "$response" \
+    '([.answer | scan("Original acquisition:")] | length) == 1'
+  assert_jq "compound.label_conflict.verification_section_count" "$response" \
+    '([.answer | scan("New verification:")] | length) == 1'
+  assert_jq "compound.label_conflict.private_content" "$response" \
+    '.answer | contains("PRIVATE-LABEL-SENTINEL") | not'
+  assert_jq "compound.label_conflict.unavailable_label" "$response" \
+    '.answer | contains("New verification unavailable:") | not'
+  assert_jq "compound.label_conflict.discarded_text" "$response" \
+    '.answer | contains("No fresh check occurred.") | not'
+  if ! test "$(jq -r '.response_digest' <<<"$manifest")" = \
+    "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"; then
+    echo "Assertion failed: compound.label_conflict.response_digest" >&2
+    return 1
+  fi
+  assert_jq "compound.label_conflict.no_additional_acquisition" "$manifest" \
+    '.next_steps.additional_acquisition_count == 0'
+  assert_jq "compound.label_conflict.trace_storage" "$trace" \
+    '.prompt.claim_explanation.storage_call_count == 1'
+  assert_jq "compound.label_conflict.trace_manifest_resolution" "$trace" \
+    '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
+  assert_jq "compound.label_conflict.trace_claim_capture" "$trace" \
+    '.prompt.claim_capture.eligibility_status == "ineligible"'
+  assert_jq "compound.label_conflict.trace_fallback" "$trace" \
+    '.fallback.triggered == false'
+  assert_jq "compound.label_conflict.trace_model_count" "$trace" \
+    '(.model_calls | length) == 1'
+  assert_jq "compound.label_conflict.provider_calls" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.label_conflict.dsa" >&2
+    return 1
+  fi
   case "$(jq -c . <<<"$trace")" in
     *PRIVATE-LABEL-SENTINEL*|*New\ verification\ unavailable:*|*No\ fresh\ check\ occurred.*)
-      echo "discarded provider label content entered the final trace" >&2
+      echo "Assertion failed: compound.label_conflict.trace_privacy" >&2
       return 1
       ;;
   esac
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.label_conflict.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events \
+    "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.label_conflict.claim_calibration" >&2
+    return 1
+  fi
+  if ! assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: compound.label_conflict.answer_persistence" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.label_conflict.request_persistence" >&2
+    return 1
+  fi
+  echo "Compound case passed: label_conflict"
 
   owner="owner-evidence-compound-attempt"
   client="client-evidence-compound-attempt"
@@ -2471,31 +2548,61 @@ run_evidence_compound_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  jq -e '
-    .status == "degraded"
-    and (.answer | startswith("Original acquisition:\n"))
-    and (.answer | contains("\n\nNew verification attempt:\n"))
-    and (.answer | contains("requested conclusion"))
-    and ([.answer | scan("Original acquisition:")] | length) == 1
-    and ([.answer | scan("New verification attempt:")] | length) == 1
-    and (.answer | contains("\n\nNew verification:\n") | not)
-  ' <<<"$response" >/dev/null
-  jq -e '
-    .sufficiency.status == "unknown"
-    and .next_steps.additional_acquisition_count == 0
-  ' <<<"$manifest" >/dev/null
-  jq -e '
-    .prompt.claim_explanation.storage_call_count == 1
-    and .prompt.claim_explanation.manifest_resolution_status == "resolved"
-    and .prompt.claim_capture.eligibility_status == "ineligible"
-  ' <<<"$trace" >/dev/null
-  assert_provider_free_trace "$trace"
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  assert_dsa_operation_counts "$audit" 1 0 0
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  assert_jq "compound.attempt.response_status" "$response" \
+    '.status == "degraded"'
+  assert_jq "compound.attempt.original_section" "$response" \
+    '.answer | startswith("Original acquisition:\n")'
+  assert_jq "compound.attempt.attempt_section" "$response" \
+    '.answer | contains("\n\nNew verification attempt:\n")'
+  assert_jq "compound.attempt.withheld_conclusion" "$response" \
+    '.answer | contains("requested conclusion")'
+  assert_jq "compound.attempt.original_section_count" "$response" \
+    '([.answer | scan("Original acquisition:")] | length) == 1'
+  assert_jq "compound.attempt.attempt_section_count" "$response" \
+    '([.answer | scan("New verification attempt:")] | length) == 1'
+  assert_jq "compound.attempt.no_verification_section" "$response" \
+    '.answer | contains("\n\nNew verification:\n") | not'
+  assert_jq "compound.attempt.sufficiency" "$manifest" \
+    '.sufficiency.status == "unknown"'
+  assert_jq "compound.attempt.no_additional_acquisition" "$manifest" \
+    '.next_steps.additional_acquisition_count == 0'
+  assert_jq "compound.attempt.trace_storage" "$trace" \
+    '.prompt.claim_explanation.storage_call_count == 1'
+  assert_jq "compound.attempt.trace_manifest_resolution" "$trace" \
+    '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
+  assert_jq "compound.attempt.trace_claim_capture" "$trace" \
+    '.prompt.claim_capture.eligibility_status == "ineligible"'
+  if ! assert_provider_free_trace "$trace" >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.provider_free_trace" >&2
+    return 1
+  fi
+  assert_jq "compound.attempt.provider_calls" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 0'
+  if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.dsa" >&2
+    return 1
+  fi
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events \
+    "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.claim_calibration" >&2
+    return 1
+  fi
+  if ! assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.answer_persistence" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.request_persistence" >&2
+    return 1
+  fi
+  echo "Compound case passed: attempt"
   echo "Evidence compound: history_resolver=1 fresh_cr_shape=1 fresh_plan=1 fresh_dsa=1 fresh_sufficiency=1 fresh_next_step=1 provider=1 manifest_distinct=1 label_conflict_retry=0 insufficient_provider=0 claims=0"
 }
 
@@ -2533,6 +2640,10 @@ run_evidence_acquisition_composed_suite() {
     history-negatives)
       run_evidence_history_negative_scenarios
       echo "Evidence acquisition composed smoke passed: scenarios=history-negatives"
+      ;;
+    compound)
+      run_evidence_compound_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=compound"
       ;;
     *)
       if [[ "$scenario" =~ ^[A-Za-z0-9_.:-]{1,120}$ ]]; then
