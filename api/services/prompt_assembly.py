@@ -57,6 +57,20 @@ PROMPT_INJECTION_MARKERS = (
     "prior instructions",
     "previous instructions",
 )
+EVIDENCE_RESPONSE_CONTRACT = (
+    "Governed evidence response contract:\n"
+    "- Return exactly one JSON object and no other text.\n"
+    "- Use exactly this shape: "
+    '{"conclusion_disposition":"supports|does_not_support|mixed|descriptive",'
+    '"evidence_excerpts":[{"source_ref":"exact retained source_ref",'
+    '"excerpt":"exact extractive text from that retained evidence"}]}\n'
+    "- Include between 1 and 8 evidence excerpts with distinct source_ref values.\n"
+    "- Copy each excerpt exactly from retained external evidence, apart from "
+    "whitespace normalization.\n"
+    "- Do not provide free-form explanation, conclusion wording, limitation "
+    "wording, or scope claims.\n"
+    "- Do not use Markdown fences or request tools."
+)
 
 
 @dataclass(frozen=True)
@@ -360,6 +374,7 @@ def _apply_prompt_budget(
     world_state_messages: list[dict[str, str]],
     relationship_context_messages: list[dict[str, str]],
     runtime_messages: list[dict[str, str]],
+    evidence_response_contract_messages: list[dict[str, str]],
     retrieval_bundle: dict[str, Any],
     external_context_pack: dict[str, Any] | None,
     memory_recall_messages: list[dict[str, str]],
@@ -418,6 +433,16 @@ def _apply_prompt_budget(
                     {},
                 ),
                 (
+                    "evidence_response_contract",
+                    evidence_response_contract_messages,
+                    {
+                        "contract_active": bool(
+                            evidence_response_contract_messages
+                        ),
+                        "schema_version": "governed-evidence-response.v1",
+                    },
+                ),
+                (
                     "external_source_context",
                     build_external_context_messages(working_external),
                     external_context_trace(working_external),
@@ -441,6 +466,8 @@ def _apply_prompt_budget(
         messages_out: list[dict[str, str]] = []
         layers_out: list[dict[str, Any]] = []
         for name, layer_messages, metadata in ordered:
+            if name == "evidence_response_contract" and not layer_messages:
+                continue
             base_layer = base_by_name.get(name, {})
             layer = _layer_trace(
                 name,
@@ -1106,6 +1133,7 @@ def assemble_prompt(
     privacy_context_trace_data: dict[str, Any] | None = None,
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
+    evidence_response_contract: bool = False,
     dsa_trace: dict[str, Any] | None = None,
     memory_recall_messages: list[dict[str, str]] | None = None,
     memory_recall_trace: dict[str, Any] | None = None,
@@ -1589,6 +1617,24 @@ def assemble_prompt(
         )
     )
 
+    evidence_response_contract_messages = (
+        [{"role": "system", "content": EVIDENCE_RESPONSE_CONTRACT}]
+        if evidence_response_contract
+        else []
+    )
+    if evidence_response_contract_messages:
+        messages.extend(evidence_response_contract_messages)
+        layers.append(
+            _layer_trace(
+                "evidence_response_contract",
+                evidence_response_contract_messages,
+                metadata={
+                    "contract_active": evidence_response_contract,
+                    "schema_version": "governed-evidence-response.v1",
+                },
+            )
+        )
+
     external_context_messages = build_external_context_messages(external_context_pack)
     messages.extend(external_context_messages)
     layers.append(
@@ -1652,6 +1698,9 @@ def assemble_prompt(
                 world_state_messages=world_state_messages,
                 relationship_context_messages=relationship_context_messages,
                 runtime_messages=runtime_messages,
+                evidence_response_contract_messages=(
+                    evidence_response_contract_messages
+                ),
                 retrieval_bundle=retrieval_bundle,
                 external_context_pack=external_context_pack,
                 memory_recall_messages=memory_recall_layer_messages,

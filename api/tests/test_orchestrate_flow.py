@@ -34,6 +34,7 @@ from services.capabilities import (
 from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
+    MALFORMED_EVIDENCE_RESPONSE,
     TARGETED_SCOPE_SUFFIX,
     EvidenceAcquisitionPremise,
     _acquisition_premise_digest,
@@ -1982,7 +1983,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         encoding="utf-8",
     )
 
-    memory_store = FakeMemoryStore()
+    memory_store = ClaimCaptureMemoryStore()
     litellm = FakeLiteLLM()
 
     out = await orchestrate_chat(
@@ -11601,6 +11602,52 @@ def _multi_source_governed_context_pack(query: str) -> dict[str, object]:
     return response
 
 
+def _evidence_candidate(
+    *excerpts: tuple[str, str],
+    disposition: str = "supports",
+) -> str:
+    return json.dumps(
+        {
+            "conclusion_disposition": disposition,
+            "evidence_excerpts": [
+                {"source_ref": source_ref, "excerpt": excerpt}
+                for source_ref, excerpt in excerpts
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+
+def _rendered_evidence_answer(
+    *excerpts: str,
+    disposition: str = "supports",
+    boundary: str = TARGETED_SCOPE_SUFFIX,
+) -> str:
+    conclusions = {
+        "supports": "The retained evidence supports the requested conclusion.",
+        "does_not_support": (
+            "The retained evidence does not support the requested conclusion."
+        ),
+        "mixed": (
+            "The retained evidence is mixed and does not establish a single "
+            "conclusion."
+        ),
+        "descriptive": (
+            "The retained evidence supports only the following bounded description."
+        ),
+    }
+    return "\n\n".join(
+        [
+            conclusions[disposition],
+            *[
+                f"Retained evidence excerpt {index}: {excerpt}"
+                for index, excerpt in enumerate(excerpts, start=1)
+            ],
+            boundary,
+        ]
+    )
+
+
 def _hybrid_context_response(
     *,
     source_id: str,
@@ -12135,7 +12182,14 @@ async def _run_governed_context_case(
             }
         )
     memory_store = FakeMemoryStore()
-    litellm = FakeLiteLLM()
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(question, external_context_enabled=True),
         memory_store=memory_store,
@@ -12158,9 +12212,7 @@ async def _run_hybrid_comparison_case(
     tmp_path,
     context_pack: dict[str, object] | None = None,
     context_responses=None,
-    provider_answer: str = (
-        "The two selected logs show different maintenance patterns."
-    ),
+    provider_answer: str | None = None,
     memory_store=None,
     privacy_context_response=None,
     privacy_context_enabled: bool = False,
@@ -12226,7 +12278,19 @@ async def _run_hybrid_comparison_case(
             ]
         ),
     )
-    litellm = FakeLiteLLM(content=provider_answer)
+    litellm = FakeLiteLLM(
+        content=provider_answer
+        or _evidence_candidate(
+            (
+                "vehicle_log_primary:expanded_1",
+                "Primary expanded history includes an oil change.",
+            ),
+            (
+                "vehicle_log_secondary:expanded_2",
+                "Secondary expanded history includes a tire rotation.",
+            ),
+        )
+    )
     memory_store = memory_store or FakeMemoryStore()
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -12263,14 +12327,12 @@ async def _run_bounded_exhaustive_case(
     context_pack: dict[str, object] | None = None,
     context_responses=None,
     plan_status: str = "ready",
-    provider_answer: str = (
-        "Within the configured worksheet, all records in the declared scope "
-        "were reviewed."
-    ),
+    provider_answer: str | None = None,
     memory_store=None,
     privacy_context_response=None,
     privacy_context_enabled: bool = False,
     evidence_sufficiency_response=None,
+    claim_record_capture_enabled: bool = False,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Review every maintenance record in the configured worksheet."
@@ -12317,7 +12379,15 @@ async def _run_bounded_exhaustive_case(
             else [_configured_worksheet_context_response()]
         ),
     )
-    litellm = FakeLiteLLM(content=provider_answer)
+    litellm = FakeLiteLLM(
+        content=provider_answer
+        or _evidence_candidate(
+            (
+                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20",
+                "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
+            )
+        )
+    )
     memory_store = memory_store or FakeMemoryStore()
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -12335,6 +12405,7 @@ async def _run_bounded_exhaustive_case(
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
         privacy_context_enabled=privacy_context_enabled,
+        claim_record_capture_enabled=claim_record_capture_enabled,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -12351,9 +12422,9 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
         await _run_bounded_exhaustive_case(tmp_path=tmp_path)
     )
 
-    assert out["answer"] == (
-        "Within the configured worksheet, all records in the declared scope "
-        f"were reviewed.\n\n{EXHAUSTIVE_SCOPE_SUFFIX}"
+    assert out["answer"] == _rendered_evidence_answer(
+        "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
+        boundary=EXHAUSTIVE_SCOPE_SUFFIX,
     )
     assert len(runtime.interaction_governance_calls) == 1
     assert len(runtime.evidence_shape_calls) == 1
@@ -12755,9 +12826,10 @@ async def test_bounded_exhaustive_current_unsupported_plan_never_acquires(
 async def test_bounded_exhaustive_privacy_suppresses_expansion_identifiers(
     tmp_path,
 ):
-    out, _, dsa, litellm, memory_store = (
+    out, runtime, dsa, litellm, memory_store = (
         await _run_bounded_exhaustive_case(
             tmp_path=tmp_path,
+            memory_store=ClaimCaptureMemoryStore(),
             privacy_context_response=_privacy_runtime_response(
                 surface_type="desktop_private",
                 sensitivity_level="sensitive",
@@ -12768,6 +12840,7 @@ async def test_bounded_exhaustive_privacy_suppresses_expansion_identifiers(
                 reason_codes=["safe_summary_required"],
             ),
             privacy_context_enabled=True,
+            claim_record_capture_enabled=True,
         )
     )
 
@@ -12775,6 +12848,11 @@ async def test_bounded_exhaustive_privacy_suppresses_expansion_identifiers(
         "Details cannot safely be shown on this surface.\n\n"
         f"{EXHAUSTIVE_SCOPE_SUFFIX}"
     )
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
+        "reason_code"
+    ] == "privacy_suppressed"
     assert len(dsa.context_calls) == 1
     assert len(litellm.calls) == 1
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
@@ -12862,7 +12940,14 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
             runtime.call_order.append("provider")
             return await super().chat(**kwargs)
 
-    litellm = OrderedLiteLlm(content="The record lists 2025-07-12.")
+    litellm = OrderedLiteLlm(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -12882,8 +12967,8 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         request_id="rid-evidence-targeted",
     )
 
-    assert out["answer"] == (
-        f"The record lists 2025-07-12.\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == _rendered_evidence_answer(
+        "The maintenance record lists 2025-07-12.",
     )
     assert len(runtime.evidence_shape_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
@@ -13017,7 +13102,14 @@ async def test_trusted_scope_selector_narrows_targeted_cr_and_dsa_without_metada
         },
     )
     memory_store = ClaimExplanationMemoryStore()
-    litellm = FakeLiteLLM(content="The selected record is current.")
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -13244,7 +13336,14 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
         "fetch",
     ]
     memory_store = FakeMemoryStore()
-    litellm = FakeLiteLLM(content="The exact record lists 2025-07-12.")
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The exact maintenance item lists 2025-07-12.",
+            )
+        )
+    )
     original_assemble_prompt = orchestrate_service.assemble_prompt
     assembly_count = 0
 
@@ -13294,8 +13393,8 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
         request_id="rid-evidence-next-step-exact",
     )
 
-    assert out["answer"] == (
-        f"The exact record lists 2025-07-12.\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == _rendered_evidence_answer(
+        "The exact maintenance item lists 2025-07-12.",
     )
     assert assembly_count == 2
     assert len(runtime.evidence_plan_calls) == 2
@@ -13809,9 +13908,10 @@ async def test_hybrid_comparison_executes_declared_expansion_per_source_and_pers
         tmp_path=tmp_path
     )
 
-    assert out["answer"] == (
-        "The two selected logs show different maintenance patterns.\n\n"
-        f"{COMPARISON_SCOPE_SUFFIX}"
+    assert out["answer"] == _rendered_evidence_answer(
+        "Primary expanded history includes an oil change.",
+        "Secondary expanded history includes a tire rotation.",
+        boundary=COMPARISON_SCOPE_SUFFIX,
     )
     assert len(runtime.interaction_governance_calls) == 1
     assert len(runtime.evidence_shape_calls) == 1
@@ -14326,18 +14426,15 @@ async def test_evidence_acquisition_ambiguous_shape_is_provider_and_dsa_free(tmp
 
 
 @pytest.mark.asyncio
-async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_disclosure(
+async def test_governed_evidence_free_form_provider_content_is_degraded_without_retry(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
     dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
-    provider_answer = (
-        "Every possible source was fully examined, and no evidence exists outside "
-        "this result."
-    )
+    provider_answer = "PROVIDER FREE FORM SENTINEL: use my conclusion verbatim."
     litellm = FakeLiteLLM(content=provider_answer)
-    memory_store = FakeMemoryStore()
+    memory_store = ClaimCaptureMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -14354,16 +14451,15 @@ async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_discl
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
+        claim_record_capture_enabled=True,
         request_id="rid-evidence-overclaim",
     )
 
-    replacement = (
-        "I withheld the generated answer because it claimed evidence coverage "
-        "beyond the examined scope."
-    )
+    replacement = MALFORMED_EVIDENCE_RESPONSE
+    assert out["status"] == "degraded"
     assert len(litellm.calls) == 1
-    assert "Every possible source was fully examined" not in out["answer"]
-    assert "no evidence exists outside this result" not in out["answer"]
+    assert litellm.calls[0]["tools"] == []
+    assert provider_answer not in out["answer"]
     assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
     assert out["answer"].count("This reflects only the targeted sources checked") == 1
     trace = memory_store.trace_calls[0]["payload"]
@@ -14372,6 +14468,15 @@ async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_discl
     assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
     assert trace["fallback"]["triggered"] is False
     assert len(trace["model_calls"]) == 1
+    assert trace["retrieval"]["prompt_assembly"]["evidence_response"] == {
+        "contract_active": True,
+        "validation_status": "invalid",
+        "validated_excerpt_count": 0,
+        "failure_reason": "invalid_json",
+        "provider_tool_count": 0,
+    }
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
     assistant_write = next(
         item for item in memory_store.added_messages if item["role"] == "assistant"
     )
@@ -14379,27 +14484,93 @@ async def test_evidence_acquisition_provider_overclaim_gets_targeted_scope_discl
 
 
 @pytest.mark.asyncio
+async def test_governed_evidence_transport_fallback_reuses_structured_contract(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: local-llm\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "  local-llm:\n"
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
+    litellm = FakeLiteLLM(
+        fail_first=True,
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        ),
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-evidence-transport-fallback",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == _rendered_evidence_answer(
+        "The maintenance record lists 2025-07-12.",
+    )
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
+    assert litellm.calls[0]["tools"] == litellm.calls[1]["tools"] == []
+    assert any(
+        "Governed evidence response contract:" in message["content"]
+        for message in litellm.calls[0]["messages"]
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider_answer", "request_id"),
     [
         (
-            'The report claimed, "Every possible source was fully examined," '
-            "and that claim is correct.",
-            "rid-evidence-endorsed-same-sentence",
+            '```json\n{"conclusion_disposition":"supports"}\n```',
+            "rid-evidence-fenced-candidate",
         ),
         (
-            'The earlier answer claimed, "Every possible source was fully examined." '
-            "I agree.",
-            "rid-evidence-endorsed-adjacent",
+            'Before {"conclusion_disposition":"supports"}',
+            "rid-evidence-candidate-preamble",
         ),
         (
-            'The phrase "All possible sources were checked" is not supported by '
-            "the evidence, but it is nevertheless true.",
-            "rid-evidence-rejected-then-endorsed",
+            '{"conclusion_disposition":"supports"} trailing',
+            "rid-evidence-candidate-trailing-prose",
         ),
     ],
 )
-async def test_evidence_acquisition_replaces_endorsed_quoted_scope_claims(
+async def test_governed_evidence_rejects_structurally_malformed_provider_content(
     tmp_path,
     provider_answer,
     request_id,
@@ -14428,11 +14599,8 @@ async def test_evidence_acquisition_replaces_endorsed_quoted_scope_claims(
         request_id=request_id,
     )
 
-    replacement = (
-        "I withheld the generated answer because it claimed evidence coverage "
-        "beyond the examined scope."
-    )
-    assert out["status"] == "ok"
+    replacement = MALFORMED_EVIDENCE_RESPONSE
+    assert out["status"] == "degraded"
     assert len(litellm.calls) == 1
     assert provider_answer not in out["answer"]
     assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
@@ -14455,21 +14623,20 @@ async def test_evidence_acquisition_replaces_endorsed_quoted_scope_claims(
     ("provider_answer", "request_id"),
     [
         (
-            "Not every possible source was fully examined.",
-            "rid-evidence-negated-scope",
+            "The provider would like this sentence shown unchanged.",
+            "rid-evidence-arbitrary-prose",
         ),
         (
-            'The earlier answer claimed, "Every possible source was fully examined."',
-            "rid-evidence-metalinguistic-scope",
+            "A neutral explanation written outside the JSON contract.",
+            "rid-evidence-neutral-prose",
         ),
         (
-            'The earlier answer claimed, "Every possible source was fully examined." '
-            "I disagree.",
-            "rid-evidence-adjacent-rejection",
+            "The evidence details should be phrased exactly this way.",
+            "rid-evidence-provider-wording",
         ),
     ],
 )
-async def test_evidence_acquisition_preserves_non_assertive_scope_mentions(
+async def test_governed_evidence_never_surfaces_non_contract_provider_prose(
     tmp_path,
     provider_answer,
     request_id,
@@ -14498,15 +14665,11 @@ async def test_evidence_acquisition_preserves_non_assertive_scope_mentions(
         request_id=request_id,
     )
 
-    replacement = (
-        "I withheld the generated answer because it claimed evidence coverage "
-        "beyond the examined scope."
-    )
-    assert out["status"] == "ok"
+    replacement = MALFORMED_EVIDENCE_RESPONSE
+    assert out["status"] == "degraded"
     assert len(litellm.calls) == 1
-    assert out["answer"] == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert out["answer"].count(provider_answer) == 1
-    assert replacement not in out["answer"]
+    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert provider_answer not in out["answer"]
     assert out["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
     trace = memory_store.trace_calls[0]["payload"]
     manifest = trace["prompt"]["evidence_acquisition"]
@@ -14551,7 +14714,10 @@ async def test_evidence_acquisition_provider_cannot_rewrite_policy_history(tmp_p
         request_id="rid-evidence-provider-policy",
     )
 
-    assert out["answer"] == f"{malicious}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == (
+        f"{MALFORMED_EVIDENCE_RESPONSE}\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert malicious not in out["answer"]
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
     ]
@@ -14578,7 +14744,14 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
         )
     )
     dsa = FakeDSA(response=_governed_context_pack(question))
-    litellm = FakeLiteLLM(content="The record lists 2025-07-12.")
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(question, external_context_enabled=True),
@@ -14602,8 +14775,9 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
     ] is None
     limitation = "Limitation: an optional selected source was not available."
     assert out["answer"] == (
-        f"The record lists 2025-07-12.\n\n{limitation}\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
+        "The retained evidence supports the requested conclusion.\n\n"
+        "Retained evidence excerpt 1: The maintenance record lists 2025-07-12.\n\n"
+        f"{limitation}\n\n{TARGETED_SCOPE_SUFFIX}"
     )
     assert out["answer"].count(limitation) == 1
     trace = runtime.evidence_sufficiency_calls[0]
@@ -15303,7 +15477,14 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
     )
     dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
     dsa.source_response["sources"][0]["capabilities"] = ["profile", "search", "fetch"]
-    litellm = FakeLiteLLM(content="The exact record gives the date.")
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "neutral_connector:vehicle_log_primary:record_1",
+                "The exact maintenance item lists 2025-07-12.",
+            )
+        )
+    )
     memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
@@ -15325,8 +15506,8 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
         request_id=request_id,
     )
 
-    assert out["answer"] == (
-        f"The exact record gives the date.\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == _rendered_evidence_answer(
+        "The exact maintenance item lists 2025-07-12.",
     )
     assert dsa.calls == []
     assert len(dsa.fetch_calls) == 1
@@ -15403,7 +15584,14 @@ async def test_evidence_acquisition_source_id_scope_still_uses_targeted_retrieva
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
     dsa = FakeDSA(response=_governed_context_pack(question))
-    litellm = FakeLiteLLM(content="The targeted record gives the date.")
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -15427,8 +15615,8 @@ async def test_evidence_acquisition_source_id_scope_still_uses_targeted_retrieva
         request_id="rid-targeted-source-id-regression",
     )
 
-    assert out["answer"] == (
-        f"The targeted record gives the date.\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == _rendered_evidence_answer(
+        "The maintenance record lists 2025-07-12.",
     )
     assert dsa.fetch_calls == []
     assert len(dsa.calls) == 1
@@ -16314,7 +16502,12 @@ async def _run_evidence_claim_capture_chat(
     )
     memory_store = memory_store or ClaimCaptureMemoryStore()
     litellm = litellm or FakeLiteLLM(
-        content="The retained file reports that the setting is active."
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
     )
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -16502,8 +16695,10 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
         await _run_evidence_claim_capture_chat(tmp_path)
     )
 
-    claim_anchor = "The retained file reports that the setting is active."
-    assert result["answer"] == f"{claim_anchor}\n\n{TARGETED_SCOPE_SUFFIX}"
+    claim_anchor = "The retained evidence supports the requested conclusion."
+    assert result["answer"] == _rendered_evidence_answer(
+        "The maintenance record lists 2025-07-12.",
+    )
     assert len(litellm.calls) == 1
     assert len(runtime.claim_calibration_calls) == 1
     assert len(memory_store.claim_record_calls) == 1
@@ -16561,20 +16756,18 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
     )
     assert claim_support == [
         {
-            "ref_type": "derived_text",
-            "ref_id": "derived-text-1",
+            "ref_type": "external_source",
+            "ref_id": "vehicle_log_primary:record_1",
             "owner_id": "owner",
-            "conversation_id": "conv-1",
+            "conversation_id": None,
             "support_kind": "direct",
-            "authority": "user_report",
-            "freshness_state": "active",
+            "authority": "trusted_integration",
+            "freshness_state": "unknown_freshness",
         }
     ]
     serialized_payload = json.dumps(claim_payload, sort_keys=True)
     for prohibited in (
-        "vehicle_log_primary",
         "vehicle_log_secondary",
-        "record_1",
         "record_2",
         "sources_considered",
         "sources_selected",
@@ -16625,7 +16818,7 @@ async def test_governed_exact_claim_links_full_bounded_response_to_manifest(
         "fetch",
     ]
     memory_store = ClaimCaptureMemoryStore()
-    claim_anchor = "The retained file reports that the setting is active."
+    claim_anchor = "The retained evidence supports the requested conclusion."
 
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -16634,7 +16827,14 @@ async def test_governed_exact_claim_links_full_bounded_response_to_manifest(
             external_context=_exact_external_context(),
         ),
         memory_store=memory_store,
-        litellm=FakeLiteLLM(content=claim_anchor),
+        litellm=FakeLiteLLM(
+            content=_evidence_candidate(
+                (
+                    "neutral_connector:vehicle_log_primary:record_1",
+                    "The exact maintenance item lists 2025-07-12.",
+                )
+            )
+        ),
         runtime=runtime,
         dsa=dsa,
         dsa_enabled=True,
@@ -16647,7 +16847,9 @@ async def test_governed_exact_claim_links_full_bounded_response_to_manifest(
         request_id=request_id,
     )
 
-    assert result["answer"] == f"{claim_anchor}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert result["answer"] == _rendered_evidence_answer(
+        "The exact maintenance item lists 2025-07-12.",
+    )
     assert len(dsa.fetch_calls) == 1
     assert len(runtime.claim_calibration_calls) == 1
     assert runtime.claim_calibration_calls[0]["claim_anchor"] == claim_anchor
@@ -16696,9 +16898,8 @@ async def test_invalid_bound_manifest_skips_claim_storage_without_exposing_manif
         await _run_evidence_claim_capture_chat(tmp_path)
     )
 
-    assert result["answer"] == (
-        "The retained file reports that the setting is active.\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
+    assert result["answer"] == _rendered_evidence_answer(
+        "The maintenance record lists 2025-07-12.",
     )
     assert len(litellm.calls) == 1
     assert len(runtime.claim_calibration_calls) == 1
@@ -16724,9 +16925,8 @@ async def test_governed_manifest_claim_storage_rejection_is_nonfatal_and_not_ret
         memory_store=memory_store,
     )
 
-    assert result["answer"] == (
-        "The retained file reports that the setting is active.\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
+    assert result["answer"] == _rendered_evidence_answer(
+        "The maintenance record lists 2025-07-12.",
     )
     assert len(litellm.calls) == 1
     assert len(memory_store.claim_record_calls) == 1
@@ -16746,9 +16946,11 @@ async def test_governed_manifest_claim_storage_rejection_is_nonfatal_and_not_ret
 async def test_provider_text_cannot_select_the_claim_acquisition_manifest_id(tmp_path):
     fake_manifest_id = "evidence_manifest_provider_selected"
     litellm = FakeLiteLLM(
-        content=(
-            "The retained file reports that "
-            f"{fake_manifest_id} is the active setting."
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
         )
     )
     result, memory_store, _, _, _ = await _run_evidence_claim_capture_chat(
@@ -16760,7 +16962,7 @@ async def test_provider_text_cannot_select_the_claim_acquisition_manifest_id(tmp
         "evidence_acquisition"
     ]
     claim_payload = memory_store.claim_record_calls[0]["payload"]
-    assert fake_manifest_id in result["answer"]
+    assert fake_manifest_id not in result["answer"]
     assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
     assert claim_payload["acquisition_manifest_id"] != fake_manifest_id
 
@@ -16775,9 +16977,11 @@ async def test_limited_evidence_answer_captures_pre_boundary_claim_and_full_resp
 
     assert len(litellm.calls) == 1
     limitation = "Limitation: an optional selected source was not available."
-    claim_anchor = "The retained file reports that the setting is active."
+    claim_anchor = "The retained evidence supports the requested conclusion."
     assert result["answer"] == (
-        f"{claim_anchor}\n\n{limitation}\n\n{TARGETED_SCOPE_SUFFIX}"
+        f"{claim_anchor}\n\n"
+        "Retained evidence excerpt 1: The maintenance record lists 2025-07-12.\n\n"
+        f"{limitation}\n\n{TARGETED_SCOPE_SUFFIX}"
     )
     assert len(runtime.claim_calibration_calls) == 1
     assert runtime.claim_calibration_calls[0]["claim_anchor"] == claim_anchor
@@ -16801,7 +17005,7 @@ async def test_limited_evidence_answer_captures_pre_boundary_claim_and_full_resp
     )
     assert limitation not in json.dumps(claim_payload, sort_keys=True)
     assert TARGETED_SCOPE_SUFFIX not in json.dumps(claim_payload, sort_keys=True)
-    assert capture["reason_code"] == "single_claim_single_file_source"
+    assert capture["reason_code"] == "single_claim_single_external_source"
     assert capture["acquisition_manifest_status"] == "bound"
     assert capture["acquisition_manifest_linked"] is True
 
@@ -17124,7 +17328,7 @@ async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_f
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_linked_claim_support_explanation_does_not_fetch_manifest(
+async def test_external_source_claim_support_explanation_stays_bounded_and_provider_free(
     tmp_path,
 ):
     memory_store = ClaimExplanationMemoryStore(
@@ -17159,8 +17363,11 @@ async def test_orchestrate_linked_claim_support_explanation_does_not_fetch_manif
         request_id="request-linked-support-explanation",
     )
 
-    assert result["status"] == "ok"
-    assert result["answer"].startswith("I based that earlier statement on")
+    assert result["status"] == "degraded"
+    assert result["answer"].startswith(
+        "The retained evidence record for that earlier answer was incomplete or "
+        "unsupported"
+    )
     assert memory_store.trace_get_calls == []
     assert memory_store.acquisition_history_calls == []
     assert provider.calls == []
@@ -17368,8 +17575,7 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
     result = outcome["result"]
     trace = outcome["trace"]
     expected_replacement = (
-        "The governed new evidence check completed, but I withheld the generated "
-        "explanation because it conflicted with the verification response boundary."
+        f"{MALFORMED_EVIDENCE_RESPONSE}\n\n{TARGETED_SCOPE_SUFFIX}"
     )
 
     assert result["status"] == "degraded"
@@ -17417,7 +17623,7 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
         "The verification attempt used the configured sources.",
     ],
 )
-async def test_orchestrate_compound_policy_label_boundary_allows_inline_prose(
+async def test_orchestrate_compound_free_form_prose_is_malformed(
     tmp_path,
     provider_content,
 ):
@@ -17427,8 +17633,9 @@ async def test_orchestrate_compound_policy_label_boundary_allows_inline_prose(
         request_id="request-compound-policy-label-inline",
     )
     result = outcome["result"]
-    assert result["status"] == "ok"
-    assert provider_content in result["answer"]
+    assert result["status"] == "degraded"
+    assert provider_content not in result["answer"]
+    assert MALFORMED_EVIDENCE_RESPONSE in result["answer"]
     assert result["answer"].count("Original acquisition:") == 1
     assert result["answer"].count("New verification:") == 1
     assert len(outcome["provider"].calls) == 1
@@ -17452,7 +17659,8 @@ async def test_orchestrate_compound_limited_policy_label_boundary_fails_closed(
     assert result["answer"].count("New verification:") == 1
     assert "PRIVATE-LIMITED-LABEL-CONTENT" not in result["answer"]
     assert "Limitation:" not in result["answer"]
-    assert "verification response boundary" in result["answer"]
+    assert MALFORMED_EVIDENCE_RESPONSE in result["answer"]
+    assert TARGETED_SCOPE_SUFFIX in result["answer"]
     assert len(outcome["provider"].calls) == 1
     assert len(outcome["dsa"].calls) == 1
     assert outcome["memory_store"].claim_record_calls == []
@@ -17478,7 +17686,14 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
         f'"{verification_target}"'
     )
     dsa = FakeDSA(response=_governed_context_pack(task_text))
-    provider = FakeLiteLLM(content="The new retained evidence confirms the statement.")
+    provider = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
     rules, models = _write_default_route_files(tmp_path)
 
     result = await orchestrate_chat(
@@ -17507,7 +17722,10 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
 
     assert result["answer"].startswith("Original acquisition:\n")
     assert "\n\nNew verification:\n" in result["answer"]
-    assert "The new retained evidence confirms the statement." in result["answer"]
+    assert "The retained evidence supports the requested conclusion." in result[
+        "answer"
+    ]
+    assert "The maintenance record lists 2025-07-12." in result["answer"]
     assert len(memory_store.acquisition_history_calls) == 1
     assert memory_store.claim_record_list_calls == []
     assert memory_store.trace_get_calls == []
@@ -17548,7 +17766,14 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
     target = first["answer"].split("\n\n", 1)[0]
     task_text = f'Verify this prior statement with a new evidence check: "{target}"'
     question = f'What did you check for the statement "{target}"? Check again.'
-    provider = FakeLiteLLM(content="The new check supports the quoted statement.")
+    provider = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
     rules, models = _write_default_route_files(tmp_path)
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -17660,7 +17885,14 @@ async def test_orchestrate_compound_limited_verification_keeps_policy_boundary(
         optional=True,
         eligible_source_ids=["vehicle_log_primary"],
     )
-    provider = FakeLiteLLM(content="The new evidence supports the statement.")
+    provider = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
     rules, models = _write_default_route_files(tmp_path)
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(

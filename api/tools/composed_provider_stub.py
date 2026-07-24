@@ -16,6 +16,39 @@ _fail_next_primary = False
 _watched_sentinels: dict[str, str] = {}
 _next_answers: list[str] = []
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+_EXTERNAL_EVIDENCE_ITEM = re.compile(
+    r"source_ref: (?P<source_ref>[^\n]+)\n(?P<text>[^\n]+)"
+)
+
+
+def _bounded_excerpt(value: str) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= 500:
+        return normalized
+    boundary = normalized.rfind(" ", 0, 501)
+    return normalized[: boundary if boundary > 0 else 500]
+
+
+def _governed_evidence_candidate(prompt_text: str) -> str | None:
+    if "Governed evidence response contract:" not in prompt_text:
+        return None
+    matches = list(_EXTERNAL_EVIDENCE_ITEM.finditer(prompt_text))
+    if not matches:
+        return None
+    evidence_excerpts = [
+        {
+            "source_ref": match.group("source_ref"),
+            "excerpt": _bounded_excerpt(match.group("text")),
+        }
+        for match in matches[:8]
+    ]
+    return json.dumps(
+        {
+            "conclusion_disposition": "supports",
+            "evidence_excerpts": evidence_excerpts,
+        },
+        separators=(",", ":"),
+    )
 
 
 @app.get("/healthz")
@@ -114,8 +147,11 @@ async def chat_completions(
             }
         )
         raise HTTPException(status_code=503, detail="primary failure fixture")
+    governed_candidate = _governed_evidence_candidate(prompt_text)
     if _next_answers:
         answer = _next_answers.pop(0)
+    elif governed_candidate is not None:
+        answer = governed_candidate
     elif latest_user_text.strip() == "What does the retained file report about the setting?":
         answer = "The retained file reports that the setting is active."
     elif has_current and "Current plan is Alpha." in prompt_text:

@@ -191,25 +191,42 @@ unknown, missing, partial, excluded, not-attempted, and unresolved-contradiction
 outcomes. It also states which class of conclusion is being withheld. Provider
 text and provider fallback are not consulted for that rendering.
 
-A sufficient result permits the existing single provider path. A
+A sufficient result permits one governed provider call with no capability
+tools. That call receives a required prompt-budgeted response contract and must
+return only a strict JSON object containing a closed conclusion disposition and
+one to eight distinct source references with exact extractive excerpts. Each
+reference must identify one prompt-retained external item, and each
+whitespace-normalized excerpt must be a case-preserving, token-bounded substring
+of that item. Returned-but-not-retained references, forged references,
+paraphrases, case changes, reordered text, duplicate references, and malformed
+JSON fail validation. There is no content repair, retry, or content-triggered
+fallback call.
+
+Chat Orchestrator renders the conclusion, neutral excerpt attribution,
+limitation disclosure, and task-specific scope boundary from deterministic
+templates. Arbitrary provider prose is never part of a governed evidence
+answer. A malformed candidate produces a degraded, user-safe response without
+raw provider content while retaining the truthful acquisition manifest and
+provider-call count. Transport failures retain their existing fallback behavior
+and reuse the same structured contract and prompt. A
 `sufficient_with_limitations` result adds a deterministic disclosure derived
 from optional requirement evaluations, plan limitations, and bounded trusted
 inventory counts when those counts are established. Distinct causes are
-deduplicated, sorted, and capped; private source identifiers and provider prose
+deduplicated, sorted, and capped; private source identifiers and provider output
 do not enter the disclosure.
 
 Every governed successful targeted answer receives a stable statement that only
 the targeted sources were checked. This applies to semantic retrieval and exact
-fetch whether or not the provider uses universal wording.
+fetch independently of provider wording.
 Hybrid comparison facts are satisfied only when every planned source contributed
 targeted evidence, one successful expansion, and prompt-retained evidence, with
 at least two expanded source scopes surviving prompt budgeting. There is no
 targeted-only fallback. Every governed successful comparison receives a stable
 selected-source and bounded-context statement.
-Provider prose cannot select or upgrade the plan, acquisition facts, sufficiency
-status, limitation disclosure, answer constraints, or scope boundary. Reapplying
-the final-answer policy does not duplicate or cross-apply policy-owned
-paragraphs.
+The provider candidate cannot select or upgrade the plan, acquisition facts,
+sufficiency status, limitation disclosure, answer constraints, source authority,
+or scope boundary. Reapplying the final-answer policy does not duplicate or
+cross-apply policy-owned paragraphs.
 
 The bounded exhaustive executor accepts only a ready
 `bounded_exhaustive_review` plan with no limitations, no exact references, the
@@ -276,15 +293,18 @@ unsupported counts. Manifest identity includes the bounded target, declared
 mode, and outcome history. Privacy suppression clears source IDs, seed
 references, context modes, and internal context query IDs while preserving
 aggregate attempt semantics. Expanded evidence is not automatically claim
-support, and the existing single-file claim boundary is unchanged.
+support.
 
-When the existing claim-capture boundary accepts a single-sentence claim backed
-by one retained file source, Chat Orchestrator may link that claim record to the
-same turn's acquisition manifest. Claim eligibility and calibration use the
-post-privacy answer before evidence-policy limitation and scope paragraphs are
-added. The resulting single-sentence claim remains the first paragraph of the
-final answer. Policy-owned paragraphs are not calibrated and are not copied into
-the claim record.
+For a valid governed candidate with exactly one selected excerpt and a
+non-mixed disposition, Chat Orchestrator may create a narrow trusted
+single-claim candidate after policy rendering and privacy enforcement. Claim
+calibration receives only the policy-owned conclusion anchor and that validated
+external-source reference; provider JSON, unselected retained evidence, and
+merely acquired evidence are not claim support. An opaque reference that does
+not fit the bounded claim identifier contract is represented by a deterministic
+SHA-256-derived identifier. Multiple excerpts, mixed dispositions, compound
+responses, privacy suppression, malformed candidates, actions, callbacks, and
+briefs remain claim-ineligible. Existing artifact claim capture is unchanged.
 
 The complete governed final answer is then persisted as the assistant message.
 The manifest is bound to that message and to a SHA-256 digest of the exact
@@ -299,10 +319,10 @@ first paragraphs fail closed.
 The request trace containing the bound manifest is persisted before the claim
 record is created. Only the validated manifest identifier is added at the top
 level of the claim-record request. The calibrated evidence reference remains the
-one file reference actually used to support the claim; source inventories,
-acquisition attempts, returned or retained external references, policy
-paragraphs, and sufficiency details are not copied into claim support or
-calibration.
+one validated file or external reference actually used to support the claim;
+source inventories, acquisition attempts, unselected returned or retained
+external references, policy paragraphs, and sufficiency details are not copied
+into claim support or calibration.
 
 Manifest association is validated independently of provider text. It requires an
 attempted acquisition, a ready plan, matching sufficient top-level and nested
@@ -518,8 +538,8 @@ acquisition:` and `New verification:`; an insufficient or unknown result uses `N
 verification attempt:` and remains provider-free; a check that cannot establish a
 governed acquisition result uses `New verification unavailable:`. Compound labels
 are policy-owned, the combined response is claim-capture-ineligible, and the
-existing one-additional-acquisition maximum is unchanged. No actual-service
-composed verification harness is added by this behavior.
+existing one-additional-acquisition maximum is unchanged. Provider candidate
+JSON is neither reconstructed nor retained by history or compound rendering.
 
 ## Integration boundaries
 
