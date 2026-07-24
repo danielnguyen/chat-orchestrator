@@ -2328,10 +2328,18 @@ run_evidence_history_negative_scenarios() {
   client="client-history-mismatch"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-mismatch")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   original_request="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:records_primary:Records!A3:C3" \
+    "A second retained row prevents count-only proof."
   newer="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   newer_answer="$(jq -r '.answer' <<<"$newer")"
   if [[ "$answer" == "$newer_answer" ]]; then
