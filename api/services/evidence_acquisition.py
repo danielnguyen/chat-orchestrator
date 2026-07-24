@@ -8,7 +8,15 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from models import MaterialScopeReferences
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 Identifier = Annotated[
     str,
@@ -201,9 +209,9 @@ EXHAUSTIVE_SCOPE_SUFFIX = (
     "This conclusion is complete only for the declared source scope that was checked; "
     "sources outside that scope were not examined."
 )
-SCOPE_OVERCLAIM_REPLACEMENT = (
-    "I withheld the generated answer because it claimed evidence coverage beyond "
-    "the examined scope."
+MALFORMED_EVIDENCE_RESPONSE = (
+    "The generated evidence response could not be used safely, so I’m not "
+    "presenting a substantive conclusion."
 )
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
@@ -216,52 +224,23 @@ _SCOPE_BOUNDARIES = {
     "targeted_lookup": TARGETED_SCOPE_SUFFIX,
     "cross_source_comparison": COMPARISON_SCOPE_SUFFIX,
     "bounded_exhaustive_review": EXHAUSTIVE_SCOPE_SUFFIX,
+    "contradiction_review": (
+        "This conclusion is limited to the contradiction-sensitive evidence scope "
+        "that was checked."
+    ),
+    "absence_or_coverage_check": (
+        "This conclusion addresses absence only within the declared source scope "
+        "that was checked."
+    ),
+    "historical_reconstruction": (
+        "This reconstruction is limited to the declared historical evidence scope "
+        "that was checked."
+    ),
+    "recommendation_or_decision_support": (
+        "This recommendation is limited to the declared decision evidence scope "
+        "that was checked."
+    ),
 }
-_UNIVERSAL_SCOPE_CLAIM_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"\bevery\s+possible\s+source\s+was\s+fully\s+examined\b",
-        r"\ball\s+possible\s+sources\s+were\s+checked\b",
-        r"\bno\s+evidence\s+exists\s+outside\s+this\s+result\b",
-        r"\bno\s+evidence\s+exists\s+beyond\s+the\s+checked\s+material\b",
-        r"\bthe\s+search\s+was\s+complete\s+across\s+every\s+relevant\s+source\b",
-    )
-)
-_UNIVERSAL_SCOPE_EXTERNAL_NEGATION = re.compile(
-    r"(?:\bnot|\b(?:is|was)\s+false\s+that|"
-    r"\b(?:is|was)\s+not\s+true\s+that|"
-    r"\b(?:cannot|can't)\s+(?:say|conclude|confirm|establish)\s+that)\s*$",
-    re.IGNORECASE,
-)
-_UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX = re.compile(
-    r"(?:\b(?:claimed|said|stated|quoted)\s*[,;:]?|"
-    r"\b(?:asked|questioned)\s+whether|"
-    r"\b(?:rejected|disputed)\s+(?:the\s+)?(?:statement|claim|phrase))\s*$",
-    re.IGNORECASE,
-)
-_UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX = re.compile(
-    r"^\s*(?:is|was)\s+(?:not\s+(?:supported|established|true)|"
-    r"unsupported|false|rejected)\b",
-    re.IGNORECASE,
-)
-_UNIVERSAL_SCOPE_SAME_SENTENCE_ENDORSEMENT = re.compile(
-    r"\b(?:and\s+(?:that\s+claim\s+is\s+correct|"
-    r"that\s+statement\s+is\s+true|the\s+phrase\s+is\s+accurate|"
-    r"i\s+agree)|but\s+(?:it\s+is\s+(?:nevertheless\s+true|"
-    r"still\s+correct)|that\s+claim\s+is\s+supported))\b",
-    re.IGNORECASE,
-)
-_UNIVERSAL_SCOPE_ADJACENT_ENDORSEMENT = re.compile(
-    r"^\s*(?:i\s+(?:agree|concur)|that\s+is\s+(?:correct|true)|"
-    r"that\s+claim\s+is\s+correct|this\s+statement\s+is\s+accurate|"
-    r"the\s+claim\s+is\s+supported|the\s+report\s+was\s+right|"
-    r"the\s+earlier\s+answer\s+was\s+(?:correct|right))"
-    r"\s*[.!?]?(?:[\"'”’]|\*{1,2}|_{1,2})*\s*$",
-    re.IGNORECASE,
-)
-_PROVIDER_SCOPE_SENTENCE = re.compile(
-    r".+?(?:[.!?](?:[\"'”’]|\*{1,2}|_{1,2})*(?=\s|$)|$)"
-)
 _REQUIREMENT_DESCRIPTIONS = {
     "authoritative_inventory": "the authoritative source inventory",
     "targeted_evidence": "the requested targeted evidence",
@@ -352,6 +331,61 @@ _CLARIFICATION_QUESTIONS = {
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+EvidenceConclusionDisposition = Literal[
+    "supports",
+    "does_not_support",
+    "mixed",
+    "descriptive",
+]
+EvidenceCandidateFailureReason = Literal[
+    "invalid_json",
+    "invalid_candidate",
+    "reference_not_retained",
+    "reference_not_unique",
+    "excerpt_not_extractive",
+    "excerpt_token_boundary_invalid",
+]
+
+
+class EvidenceResponseExcerpt(StrictModel):
+    source_ref: Annotated[StrictStr, Field(min_length=1, max_length=240)]
+    excerpt: Annotated[StrictStr, Field(min_length=1, max_length=500)]
+
+
+class EvidenceResponseCandidate(StrictModel):
+    conclusion_disposition: EvidenceConclusionDisposition
+    evidence_excerpts: list[EvidenceResponseExcerpt] = Field(
+        min_length=1,
+        max_length=8,
+    )
+
+    @field_validator("evidence_excerpts")
+    @classmethod
+    def reject_duplicate_source_references(
+        cls,
+        value: list[EvidenceResponseExcerpt],
+    ) -> list[EvidenceResponseExcerpt]:
+        source_refs = [item.source_ref for item in value]
+        if len(source_refs) != len(set(source_refs)):
+            raise ValueError("duplicate_source_reference")
+        return value
+
+
+@dataclass(frozen=True)
+class ValidatedEvidenceExcerpt:
+    source_ref: str
+    excerpt: str
+
+
+@dataclass(frozen=True)
+class EvidenceCandidateValidation:
+    validation_status: Literal["valid", "invalid"]
+    conclusion_disposition: EvidenceConclusionDisposition | None
+    validated_excerpt_count: int
+    validated_source_references: tuple[str, ...]
+    failure_reason: EvidenceCandidateFailureReason | None
 
 
 class ShapeResult(StrictModel):
@@ -3798,122 +3832,188 @@ def enforce_final_answer(
         return state.forced_answer
     if state.sufficiency is None:
         return WITHHELD_ANSWER
-
-    policy_paragraphs: list[str] = []
-    if state.sufficiency.sufficiency_status == "sufficient_with_limitations":
-        policy_paragraphs.append(_render_limitation_disclosure(state))
     boundary = _SCOPE_BOUNDARIES.get(state.sufficiency.task_shape)
-    if boundary:
-        policy_paragraphs.append(boundary)
-    if _provider_answer_claims_universal_scope(answer, policy_paragraphs):
-        answer = SCOPE_OVERCLAIM_REPLACEMENT
-    return _compose_policy_answer(answer, policy_paragraphs)
+    if boundary is None or boundary in answer.split("\n\n"):
+        return answer
+    return f"{answer}\n\n{boundary}"
 
 
-def _provider_answer_claims_universal_scope(
-    answer: str,
-    policy_paragraphs: list[str],
-) -> bool:
-    paragraphs = [
-        paragraph.strip()
-        for paragraph in re.split(r"\n\s*\n", answer.strip())
-        if paragraph.strip()
-    ]
-    owned_policy_paragraphs = {
-        *_SCOPE_BOUNDARIES.values(),
-        *policy_paragraphs,
-    }
-    provider_paragraphs = [
-        paragraph
-        for paragraph in paragraphs
-        if paragraph not in owned_policy_paragraphs
-    ]
-    for paragraph in provider_paragraphs:
-        normalized = re.sub(r"\s+", " ", paragraph).strip()
-        sentences = [
-            sentence_match.group(0).strip()
-            for sentence_match in _PROVIDER_SCOPE_SENTENCE.finditer(normalized)
-        ]
-        for sentence_index, sentence in enumerate(sentences):
-            next_sentence = (
-                sentences[sentence_index + 1]
-                if sentence_index + 1 < len(sentences)
-                else None
-            )
-            for claim_pattern in _UNIVERSAL_SCOPE_CLAIM_PATTERNS:
-                for claim_match in claim_pattern.finditer(sentence):
-                    if _scope_claim_is_explicitly_negated(sentence, claim_match):
-                        continue
-                    if _scope_claim_is_safe_quoted_reference(
-                        sentence,
-                        claim_match,
-                        next_sentence,
-                    ):
-                        continue
-                    return True
-    return False
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in output:
+            raise ValueError("duplicate_json_key")
+        output[key] = value
+    return output
 
 
-def _scope_claim_is_explicitly_negated(
-    sentence: str,
-    claim_match: re.Match[str],
-) -> bool:
-    prefix = sentence[: claim_match.start()].rstrip(" \t\"'“”‘’*_")
-    return _UNIVERSAL_SCOPE_EXTERNAL_NEGATION.search(prefix) is not None
-
-
-def _scope_claim_is_safe_quoted_reference(
-    sentence: str,
-    claim_match: re.Match[str],
-    next_sentence: str | None,
-) -> bool:
-    quote_bounds: tuple[int, int] | None = None
-    for opening_quote, closing_quote in (("\"", "\""), ("“", "”")):
-        opening_index = sentence.rfind(opening_quote, 0, claim_match.start())
-        if opening_index < 0:
-            continue
-        closing_index = sentence.find(closing_quote, claim_match.end())
-        if closing_index >= 0:
-            quote_bounds = (opening_index, closing_index)
-            break
-    if quote_bounds is None:
-        return False
-    opening_index, closing_index = quote_bounds
-    prefix = sentence[:opening_index].rstrip()
-    suffix = sentence[closing_index + 1 :]
-    has_safe_context = (
-        _UNIVERSAL_SCOPE_METALINGUISTIC_PREFIX.search(prefix) is not None
-        or _UNIVERSAL_SCOPE_METALINGUISTIC_SUFFIX.search(suffix) is not None
+def _invalid_candidate(
+    reason: EvidenceCandidateFailureReason,
+) -> tuple[EvidenceCandidateValidation, tuple[ValidatedEvidenceExcerpt, ...]]:
+    return (
+        EvidenceCandidateValidation(
+            validation_status="invalid",
+            conclusion_disposition=None,
+            validated_excerpt_count=0,
+            validated_source_references=(),
+            failure_reason=reason,
+        ),
+        (),
     )
-    if not has_safe_context:
-        return False
-    if _UNIVERSAL_SCOPE_SAME_SENTENCE_ENDORSEMENT.search(suffix) is not None:
-        return False
+
+
+def _normalized_evidence_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _has_bounded_substring(text: str, excerpt: str) -> tuple[bool, bool]:
+    start = text.find(excerpt)
+    saw_unbounded_match = False
+    while start >= 0:
+        end = start + len(excerpt)
+        starts_inside_token = (
+            start > 0 and text[start - 1].isalnum() and excerpt[0].isalnum()
+        )
+        ends_inside_token = (
+            end < len(text) and text[end].isalnum() and excerpt[-1].isalnum()
+        )
+        if not starts_inside_token and not ends_inside_token:
+            return True, saw_unbounded_match
+        saw_unbounded_match = True
+        start = text.find(excerpt, start + 1)
+    return False, saw_unbounded_match
+
+
+def validate_evidence_response_candidate(
+    provider_content: Any,
+    *,
+    context_pack: dict[str, Any] | None,
+    retained_source_refs: list[str],
+) -> tuple[EvidenceCandidateValidation, tuple[ValidatedEvidenceExcerpt, ...]]:
+    if not isinstance(provider_content, str):
+        return _invalid_candidate("invalid_json")
+    try:
+        raw_candidate = json.loads(
+            provider_content,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _invalid_candidate("invalid_json")
+    if not isinstance(raw_candidate, dict):
+        return _invalid_candidate("invalid_candidate")
+    try:
+        candidate = EvidenceResponseCandidate.model_validate(raw_candidate)
+    except ValidationError:
+        return _invalid_candidate("invalid_candidate")
+
+    retained = set(retained_source_refs)
+    items_by_ref: dict[str, list[dict[str, Any]]] = {}
+    items = context_pack.get("items", []) if isinstance(context_pack, dict) else []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            source_ref = item.get("source_ref")
+            if isinstance(source_ref, str) and source_ref in retained:
+                items_by_ref.setdefault(source_ref, []).append(item)
+
+    validated: list[ValidatedEvidenceExcerpt] = []
+    for requested in candidate.evidence_excerpts:
+        matching_items = items_by_ref.get(requested.source_ref, [])
+        if not matching_items:
+            return _invalid_candidate("reference_not_retained")
+        if len(matching_items) != 1:
+            return _invalid_candidate("reference_not_unique")
+        retained_text = matching_items[0].get("text")
+        if not isinstance(retained_text, str):
+            return _invalid_candidate("excerpt_not_extractive")
+        normalized_text = _normalized_evidence_text(retained_text)
+        normalized_excerpt = _normalized_evidence_text(requested.excerpt)
+        if not normalized_excerpt:
+            return _invalid_candidate("excerpt_not_extractive")
+        matched, unbounded = _has_bounded_substring(
+            normalized_text,
+            normalized_excerpt,
+        )
+        if not matched:
+            return _invalid_candidate(
+                "excerpt_token_boundary_invalid"
+                if unbounded
+                else "excerpt_not_extractive"
+            )
+        validated.append(
+            ValidatedEvidenceExcerpt(
+                source_ref=requested.source_ref,
+                excerpt=normalized_excerpt,
+            )
+        )
+
+    return (
+        EvidenceCandidateValidation(
+            validation_status="valid",
+            conclusion_disposition=candidate.conclusion_disposition,
+            validated_excerpt_count=len(validated),
+            validated_source_references=tuple(
+                item.source_ref for item in validated
+            ),
+            failure_reason=None,
+        ),
+        tuple(validated),
+    )
+
+
+_EVIDENCE_CONCLUSION_SENTENCES: dict[EvidenceConclusionDisposition, str] = {
+    "supports": "The retained evidence supports the requested conclusion.",
+    "does_not_support": (
+        "The retained evidence does not support the requested conclusion."
+    ),
+    "mixed": (
+        "The retained evidence is mixed and does not establish a single conclusion."
+    ),
+    "descriptive": (
+        "The retained evidence supports only the following bounded description."
+    ),
+}
+
+
+def governed_evidence_claim_anchor(
+    validation: EvidenceCandidateValidation,
+) -> str | None:
+    disposition = validation.conclusion_disposition
+    if validation.validation_status != "valid" or disposition is None:
+        return None
+    return _EVIDENCE_CONCLUSION_SENTENCES[disposition]
+
+
+def render_governed_evidence_answer(
+    *,
+    state: EvidenceAcquisitionState,
+    validation: EvidenceCandidateValidation,
+    excerpts: tuple[ValidatedEvidenceExcerpt, ...],
+) -> str:
     if (
-        next_sentence is not None
-        and _UNIVERSAL_SCOPE_ADJACENT_ENDORSEMENT.fullmatch(next_sentence)
-        is not None
+        validation.validation_status != "valid"
+        or validation.conclusion_disposition is None
+        or validation.validated_excerpt_count != len(excerpts)
     ):
-        return False
-    return True
-
-
-def _compose_policy_answer(answer: str, policy_paragraphs: list[str]) -> str:
+        return MALFORMED_EVIDENCE_RESPONSE
     paragraphs = [
-        paragraph.strip()
-        for paragraph in re.split(r"\n\s*\n", answer.strip())
-        if paragraph.strip()
+        _EVIDENCE_CONCLUSION_SENTENCES[validation.conclusion_disposition],
+        *[
+            f"Retained evidence excerpt {index}: {item.excerpt}"
+            for index, item in enumerate(excerpts, start=1)
+        ],
     ]
-    owned_policy_paragraphs = {
-        *_SCOPE_BOUNDARIES.values(),
-        *policy_paragraphs,
-    }
-    provider_paragraphs = [
-        paragraph
-        for paragraph in paragraphs
-        if paragraph not in owned_policy_paragraphs
-    ]
-    return "\n\n".join([*provider_paragraphs, *policy_paragraphs])
+    if (
+        state.sufficiency is not None
+        and state.sufficiency.sufficiency_status == "sufficient_with_limitations"
+    ):
+        paragraphs.append(_render_limitation_disclosure(state))
+    task_shape = state.sufficiency.task_shape if state.sufficiency else None
+    boundary = _SCOPE_BOUNDARIES.get(task_shape)
+    if boundary:
+        paragraphs.append(boundary)
+    return "\n\n".join(paragraphs)
 
 
 def _render_requirement_outcome(

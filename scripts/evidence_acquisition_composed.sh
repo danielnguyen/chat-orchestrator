@@ -221,6 +221,15 @@ queue_provider_answer() {
     "$(jq -nc --arg answer "$answer" '{answer:$answer}')"
 }
 
+queue_evidence_candidate() {
+  local disposition="$1" source_ref="$2" excerpt="$3"
+  queue_provider_answer "$(jq -nc \
+    --arg disposition "$disposition" \
+    --arg source_ref "$source_ref" \
+    --arg excerpt "$excerpt" \
+    '{conclusion_disposition:$disposition,evidence_excerpts:[{source_ref:$source_ref,excerpt:$excerpt}]}')"
+}
+
 wait_for_http() {
   local url="$1"
   local attempt
@@ -470,6 +479,9 @@ run_evidence_targeted_scenario() {
 
   jq -e '
     .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: Record: migration"))
+    and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
   ' <<<"$response" >/dev/null
   jq -e '
@@ -524,7 +536,6 @@ run_evidence_exact_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "The exact migration record confirms the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exact")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -537,7 +548,9 @@ run_evidence_exact_scenario() {
 
   jq -e '
     .status == "ok"
-    and (.answer | startswith("The exact migration record confirms"))
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: Record: migration"))
+    and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
   ' <<<"$response" >/dev/null
   jq -e '
@@ -568,7 +581,6 @@ run_evidence_hybrid_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "The selected calendars record review events on different days."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-hybrid")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -581,6 +593,8 @@ run_evidence_hybrid_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   jq -e '
     .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This comparison is limited to the selected sources and bounded context checked, not every potentially relevant source."))
   ' <<<"$response" >/dev/null
   jq -e '
@@ -652,7 +666,6 @@ run_evidence_exhaustive_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "The configured register shows that every mandatory entry was reviewed."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exhaustive")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -664,6 +677,8 @@ run_evidence_exhaustive_scenarios() {
   audit="$(fetch_dsa_audit)"
   jq -e '
     .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This conclusion is complete only for the declared source scope that was checked; sources outside that scope were not examined."))
     and (.answer | contains("universal") | not)
   ' <<<"$response" >/dev/null
@@ -727,7 +742,6 @@ run_evidence_limitation_and_failure_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "The available migration record supports the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-limited")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -967,7 +981,6 @@ run_evidence_changed_premise_scenarios() {
   configure_source_fixture "followup-sheet" "alternating_large_compact"
   reset_dsa_audit
   restart_orchestrator_for_changed_premise
-  queue_provider_answer "The exact follow-up record confirms the bounded detail."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-followup")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1117,7 +1130,7 @@ run_evidence_changed_premise_scenarios() {
 
 run_evidence_adversarial_provider_scenario() {
   local owner client conversation_id response request_id answer trace manifest
-  local provider_calls diagnostics audit endorsed_text
+  local provider_calls diagnostics audit forged_candidate
   owner="owner-evidence-adversarial"
   client="client-evidence-adversarial"
   provider_post "/fixture/reset" '{}'
@@ -1133,65 +1146,71 @@ run_evidence_adversarial_provider_scenario() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "adversarial.scope.response_status" "$response" \
-    '.status == "ok"'
-  assert_jq "adversarial.scope.provider_overclaim_absent" "$response" '
+  assert_jq "adversarial.malformed_freeform.response_status" "$response" \
+    '.status == "degraded"'
+  assert_jq "adversarial.malformed_freeform.raw_content_absent" "$response" '
     (.answer | contains("Every possible source was fully examined") | not)
     and (.answer | contains("no evidence exists outside this result") | not)
   '
-  assert_jq "adversarial.scope.replacement" "$response" '
-    ([.answer | scan("I withheld the generated answer because it claimed evidence coverage beyond the examined scope\\.")] | length) == 1
+  assert_jq "adversarial.malformed_freeform.safe_answer" "$response" '
+    ([.answer | scan("The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion\\.")] | length) == 1
   '
-  assert_jq "adversarial.scope.boundary" "$response" '
+  assert_jq "adversarial.malformed_freeform.boundary" "$response" '
     .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
   '
-  assert_jq "adversarial.scope.manifest" "$manifest" '
+  assert_jq "adversarial.malformed_freeform.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
     and .acquisition.sources_considered == ["records_primary"]
     and .acquisition.sources_selected == ["records_primary"]
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
-  assert_jq "adversarial.scope.inventory" "$manifest" '
+  assert_jq "adversarial.malformed_freeform.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
-  assert_jq "adversarial.scope.provider_calls" "$provider_calls" \
+  assert_jq "adversarial.malformed_freeform.provider_calls" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.scope.dsa" >&2
+    echo "Assertion failed: adversarial.malformed_freeform.dsa" >&2
     return 1
   fi
   if ! assert_evidence_runtime_events \
     "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.scope.runtime" >&2
+    echo "Assertion failed: adversarial.malformed_freeform.runtime" >&2
     return 1
   fi
   if ! assert_claim_calibration_events \
     "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.scope.claim_calibration" >&2
+    echo "Assertion failed: adversarial.malformed_freeform.claim_calibration" >&2
     return 1
   fi
-  assert_jq "adversarial.scope.dispatch" "$trace" \
-    '.fallback.triggered == false and (.model_calls | length) == 1'
+  assert_jq "adversarial.malformed_freeform.dispatch" "$trace" \
+    '.fallback.triggered == false
+    and (.model_calls | length) == 1
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.scope.persistence" >&2
+    echo "Assertion failed: adversarial.malformed_freeform.persistence" >&2
     return 1
   fi
   if ! assert_request_persistence_counts \
     "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.scope.persistence" >&2
+    echo "Assertion failed: adversarial.malformed_freeform.persistence" >&2
     return 1
   fi
-  echo "Adversarial provider case passed: affirmative"
+  echo "Adversarial provider case passed: malformed_freeform"
 
   owner="owner-evidence-adversarial-negated"
   client="client-evidence-adversarial-negated"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "Not every possible source was fully examined."
+  queue_evidence_candidate \
+    "mixed" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-adversarial-negated")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1201,67 +1220,71 @@ run_evidence_adversarial_provider_scenario() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "adversarial.negated.response_status" "$response" \
+  assert_jq "adversarial.valid_mixed.response_status" "$response" \
     '.status == "ok"'
-  assert_jq "adversarial.negated.preserved" "$response" '
-    ([.answer | scan("Not every possible source was fully examined\\.")] | length) == 1
+  assert_jq "adversarial.valid_mixed.policy_answer" "$response" '
+    ([.answer | scan("The retained evidence is mixed and does not establish a single conclusion\\.")] | length) == 1
+    and ([.answer | scan("Retained evidence excerpt 1: The migration record confirms the bounded setting\\.")] | length) == 1
   '
-  assert_jq "adversarial.negated.no_replacement" "$response" '
+  assert_jq "adversarial.valid_mixed.no_malformed_answer" "$response" '
     .answer
-    | contains("I withheld the generated answer because it claimed evidence coverage beyond the examined scope.")
+    | contains("The generated evidence response could not be used safely")
     | not
   '
-  assert_jq "adversarial.negated.boundary" "$response" '
+  assert_jq "adversarial.valid_mixed.boundary" "$response" '
     .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
   '
-  assert_jq "adversarial.negated.manifest" "$manifest" '
+  assert_jq "adversarial.valid_mixed.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
     and .acquisition.sources_considered == ["records_primary"]
     and .acquisition.sources_selected == ["records_primary"]
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
-  assert_jq "adversarial.negated.inventory" "$manifest" '
+  assert_jq "adversarial.valid_mixed.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
-  assert_jq "adversarial.negated.provider_calls" "$provider_calls" \
+  assert_jq "adversarial.valid_mixed.provider_calls" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.negated.dsa" >&2
+    echo "Assertion failed: adversarial.valid_mixed.dsa" >&2
     return 1
   fi
   if ! assert_evidence_runtime_events \
     "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.negated.runtime" >&2
+    echo "Assertion failed: adversarial.valid_mixed.runtime" >&2
     return 1
   fi
   if ! assert_claim_calibration_events \
     "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.negated.claim_calibration" >&2
+    echo "Assertion failed: adversarial.valid_mixed.claim_calibration" >&2
     return 1
   fi
-  assert_jq "adversarial.negated.dispatch" "$trace" \
-    '.fallback.triggered == false and (.model_calls | length) == 1'
+  assert_jq "adversarial.valid_mixed.dispatch" "$trace" \
+    '.fallback.triggered == false
+    and (.model_calls | length) == 1
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "valid"
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 1'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.negated.persistence" >&2
+    echo "Assertion failed: adversarial.valid_mixed.persistence" >&2
     return 1
   fi
   if ! assert_request_persistence_counts \
     "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.negated.persistence" >&2
+    echo "Assertion failed: adversarial.valid_mixed.persistence" >&2
     return 1
   fi
-  echo "Adversarial provider case passed: negated"
+  echo "Adversarial provider case passed: valid_mixed"
 
   owner="owner-evidence-adversarial-endorsed"
   client="client-evidence-adversarial-endorsed"
-  endorsed_text='The earlier answer claimed, "Every possible source was fully examined." I agree.'
+  forged_candidate='{"conclusion_disposition":"supports","evidence_excerpts":[{"source_ref":"forged:outside-retained-scope","excerpt":"The migration record confirms the bounded setting."}]}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "$endorsed_text"
+  queue_provider_answer "$forged_candidate"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-adversarial-endorsed")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1271,58 +1294,61 @@ run_evidence_adversarial_provider_scenario() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "adversarial.endorsed.response_status" "$response" \
-    '.status == "ok"'
-  assert_jq "adversarial.endorsed.provider_text_absent" "$response" \
+  assert_jq "adversarial.forged_reference.response_status" "$response" \
+    '.status == "degraded"'
+  assert_jq "adversarial.forged_reference.raw_content_absent" "$response" \
     '.answer | contains($provider_text) | not' \
-    --arg provider_text "$endorsed_text"
-  assert_jq "adversarial.endorsed.replacement" "$response" '
-    ([.answer | scan("I withheld the generated answer because it claimed evidence coverage beyond the examined scope\\.")] | length) == 1
+    --arg provider_text "$forged_candidate"
+  assert_jq "adversarial.forged_reference.safe_answer" "$response" '
+    ([.answer | scan("The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion\\.")] | length) == 1
   '
-  assert_jq "adversarial.endorsed.boundary" "$response" '
+  assert_jq "adversarial.forged_reference.boundary" "$response" '
     .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
   '
-  assert_jq "adversarial.endorsed.manifest" "$manifest" '
+  assert_jq "adversarial.forged_reference.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
     and .acquisition.sources_considered == ["records_primary"]
     and .acquisition.sources_selected == ["records_primary"]
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
-  assert_jq "adversarial.endorsed.inventory" "$manifest" '
+  assert_jq "adversarial.forged_reference.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
-  assert_jq "adversarial.endorsed.provider_calls" "$provider_calls" \
+  assert_jq "adversarial.forged_reference.provider_calls" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.endorsed.dsa" >&2
+    echo "Assertion failed: adversarial.forged_reference.dsa" >&2
     return 1
   fi
   if ! assert_evidence_runtime_events \
     "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.endorsed.runtime" >&2
+    echo "Assertion failed: adversarial.forged_reference.runtime" >&2
     return 1
   fi
   if ! assert_claim_calibration_events \
     "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.endorsed.claim_calibration" >&2
+    echo "Assertion failed: adversarial.forged_reference.claim_calibration" >&2
     return 1
   fi
-  assert_jq "adversarial.endorsed.dispatch" "$trace" \
-    '.fallback.triggered == false and (.model_calls | length) == 1'
+  assert_jq "adversarial.forged_reference.dispatch" "$trace" \
+    '.fallback.triggered == false
+    and (.model_calls | length) == 1
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.endorsed.persistence" >&2
+    echo "Assertion failed: adversarial.forged_reference.persistence" >&2
     return 1
   fi
   if ! assert_request_persistence_counts \
     "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
-    echo "Assertion failed: adversarial.endorsed.persistence" >&2
+    echo "Assertion failed: adversarial.forged_reference.persistence" >&2
     return 1
   fi
-  echo "Adversarial provider case passed: endorsed_quote"
-  echo "Evidence adversarial provider: affirmative_replaced=1 negated_preserved=1 endorsed_quote_replaced=1 affirmative_provider=1 negated_provider=1 endorsed_provider=1"
+  echo "Adversarial provider case passed: forged_reference"
+  echo "Evidence adversarial provider: affirmative_replaced=0 negated_preserved=0 endorsed_quote_replaced=0 affirmative_provider=1 negated_provider=1 endorsed_provider=1"
 }
 
 normalized_first_paragraph() {
@@ -1499,7 +1525,6 @@ run_evidence_history_hybrid_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "The selected calendars show bounded differences."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-hybrid")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$EVIDENCE_HYBRID_COMPARISON_QUESTION" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1647,7 +1672,6 @@ run_evidence_history_exhaustive_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "The configured register shows every mandatory entry was reviewed."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-exhaustive")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2008,7 +2032,6 @@ run_evidence_history_scenarios() {
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
-  queue_provider_answer "The migration record supports the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-targeted")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2023,7 +2046,6 @@ run_evidence_history_scenarios() {
   external='{"enabled":true,"source_ids":["records_primary"],"exact_source_refs":[{"source_id":"records_primary","source_ref":"google_sheets:records_primary:Records!A2:C2"}],"allowed_sensitivity":"medium"}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
-  queue_provider_answer "The exact migration record supports the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-exact")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the exact migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2031,7 +2053,6 @@ run_evidence_history_scenarios() {
   original_manifest_id="$(fetch_trace "$request_id" | jq -r '.prompt.evidence_acquisition.manifest_id')"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   first_paragraph="$(printf '%s' "$answer" | normalized_first_paragraph)"
-  queue_provider_answer "A newer bounded migration response is available."
   newer="$(run_evidence_chat \
     "$owner" "$client" "$conversation_id" "Verify the migration record." \
     '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
@@ -2070,7 +2091,6 @@ run_evidence_history_scenarios() {
   client="client-history-limited"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
-  queue_provider_answer "The available migration record supports the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-limited")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"allowed_sensitivity":"medium"}')"
   answer="$(jq -r '.answer' <<<"$response")"
@@ -2091,7 +2111,6 @@ run_evidence_privacy_history_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   restart_orchestrator_with_privacy true
-  queue_provider_answer "PRIVATE SOURCE DETAIL from the migration record."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-private")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2131,7 +2150,7 @@ run_evidence_privacy_history_scenario() {
 run_evidence_claim_subset_scenario() {
   local owner client conversation_id source_message_id derived_id response request_id
   local answer trace manifest claims claim_digest response_digest association_count
-  local provider_calls diagnostics audit manifest_id provider_sentinel
+  local provider_calls diagnostics audit manifest_id
   local rejected_claim_id rejected_manifest_id rejected_body rejected_response
   local rejected_status rejected_count valid_count claims_after
   owner="owner-evidence-claim"
@@ -2144,8 +2163,10 @@ run_evidence_claim_subset_scenario() {
   derived_id="$(seed_derived \
     "$conversation_id" "$owner" "$client" "$source_message_id" \
     "The setting is active in the retained file." "active" "006" "active")"
-  provider_sentinel="provider-manifest-sentinel"
-  queue_provider_answer "The retained file reports that the setting is active with $provider_sentinel."
+  queue_evidence_candidate \
+    "supports" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
   response="$(run_evidence_chat_with_artifacts \
     "$owner" "$client" "$conversation_id" \
     "What do the retained file and migration records report about the setting?" \
@@ -2162,15 +2183,16 @@ run_evidence_claim_subset_scenario() {
   jq -e \
     --arg request_id "$request_id" \
     --arg derived_id "$derived_id" \
-    --arg manifest_id "$manifest_id" \
-    --arg provider_sentinel "$provider_sentinel" '
+    --arg manifest_id "$manifest_id" '
       (.records | length) == 1
       and .records[0].request_id == $request_id
       and .records[0].acquisition_manifest_id == $manifest_id
-      and (.records[0].acquisition_manifest_id | contains($provider_sentinel) | not)
       and (.records[0].validated_evidence_references | length) == 1
-      and .records[0].validated_evidence_references[0].ref_type == "derived_text"
-      and .records[0].validated_evidence_references[0].ref_id == $derived_id
+      and .records[0].validated_evidence_references[0].ref_type == "external_source"
+      and (.records[0].validated_evidence_references[0].ref_id
+        | test("^external-source:[0-9a-f]{64}$"))
+      and .records[0].validated_evidence_references[0].ref_id != $derived_id
+      and .records[0].claim_anchor == "The retained evidence supports the requested conclusion."
       and (.records[0].claim_anchor | contains("This reflects only") | not)
     ' <<<"$claims" >/dev/null
   jq -e \
@@ -2184,10 +2206,9 @@ run_evidence_claim_subset_scenario() {
   response_digest="$(jq -r '.response_digest' <<<"$manifest")"
   test "$claim_digest" != "$response_digest"
   test "$response_digest" = "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
-  test "$manifest_id" != "$provider_sentinel"
-  case "$(jq -c . <<<"$manifest")" in
-    *provider-manifest-sentinel*)
-      echo "provider text influenced the retained acquisition manifest" >&2
+  case "$(jq -c . <<<"$manifest")$(jq -c . <<<"$claims")" in
+    *The\ migration\ record\ confirms*)
+      echo "validated provider excerpt entered retained claim or manifest data" >&2
       return 1
       ;;
   esac
@@ -2291,12 +2312,10 @@ run_evidence_history_negative_scenarios() {
   client="client-history-mismatch"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
-  queue_provider_answer "The retained migration record supports the bounded setting."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-mismatch")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   original_request="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
-  queue_provider_answer "A newer persisted bounded response is available."
   newer="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   newer_answer="$(jq -r '.answer' <<<"$newer")"
   if [[ "$answer" == "$newer_answer" ]]; then
@@ -2359,10 +2378,8 @@ run_evidence_history_negative_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   conversation_id="$(resolve_conversation "$owner" "$client" "history-ambiguous")"
-  queue_provider_answer "The duplicate bounded statement is supported."
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   answer="$(jq -r '.answer' <<<"$response")"
-  queue_provider_answer "The duplicate bounded statement is supported."
   run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external" >/dev/null
   target="$(printf '%s' "$answer" | normalized_first_paragraph)"
   messages="$(jq -nc --arg target "$target" '[{role:"assistant",content:"A newer answer."},{role:"user",content:("What did you check for the statement \"" + $target + "\"?")}]')"
@@ -2388,7 +2405,6 @@ run_evidence_history_negative_scenarios() {
   client="client-history-corrupt"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
-  queue_provider_answer "The corruptible bounded statement is supported."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-corrupt")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2439,7 +2455,6 @@ run_evidence_history_negative_scenarios() {
   client="client-history-private-invalid"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
-  queue_provider_answer "The private-boundary statement is supported."
   conversation_id="$(resolve_conversation "$owner" "$client" "history-private-invalid")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2564,7 +2579,6 @@ run_evidence_compound_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-compound")"
-  queue_provider_answer "The migration record supports the original bounded statement."
   original="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   original_request="$(jq -r '.request_id' <<<"$original")"
   original_answer="$(jq -r '.answer' <<<"$original")"
@@ -2572,7 +2586,6 @@ run_evidence_compound_scenarios() {
   messages="$(jq -nc --arg answer "$original_answer" '[{role:"assistant",content:$answer},{role:"user",content:"What did you check? Check again."}]')"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
-  queue_provider_answer "The new retained evidence supports the prior statement."
   response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
@@ -2591,7 +2604,9 @@ run_evidence_compound_scenarios() {
   assert_jq "compound.verification.new_verification_section" "$response" \
     '.answer | contains("\n\nNew verification:\n")'
   assert_jq "compound.verification.provider_answer" "$response" \
-    '.answer | contains("The new retained evidence supports the prior statement.")'
+    '(.answer | contains("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1:"))
+    and (.answer | contains("conclusion_disposition") | not)'
   assert_jq "compound.verification.no_historical_suffix" "$response" \
     '.answer | contains("I did not perform a new verification for this explanation.") | not'
   assert_jq "compound.verification.original_section_count" "$response" \
@@ -2685,7 +2700,6 @@ run_evidence_compound_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-compound-label")"
-  queue_provider_answer "The migration record supports the original bounded statement."
   original="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
   original_answer="$(jq -r '.answer' <<<"$original")"
   messages="$(jq -nc --arg answer "$original_answer" '[{role:"assistant",content:$answer},{role:"user",content:"What did you check? Verify again."}]')"
@@ -2700,13 +2714,15 @@ run_evidence_compound_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  replacement="The governed new evidence check completed, but I withheld the generated explanation because it conflicted with the verification response boundary."
+  replacement="The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion."
   assert_jq "compound.label_conflict.response_status" "$response" \
     '.status == "degraded"'
   assert_jq "compound.label_conflict.original_section" "$response" \
     '.answer | startswith("Original acquisition:\n")'
   assert_jq "compound.label_conflict.replacement" "$response" \
-    '.answer | contains("\n\nNew verification:\n" + $replacement)' \
+    '.answer
+    | contains("\n\nNew verification:\n" + $replacement)
+    and endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")' \
     --arg replacement "$replacement"
   assert_jq "compound.label_conflict.original_section_count" "$response" \
     '([.answer | scan("Original acquisition:")] | length) == 1'

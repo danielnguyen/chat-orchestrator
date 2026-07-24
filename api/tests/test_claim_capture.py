@@ -6,6 +6,7 @@ import pytest
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import RuntimeClient
 from services.claim_capture import (
+    TrustedGovernedClaim,
     bind_acquisition_manifest,
     bind_assistant_message,
     calibrate_claim_capture,
@@ -62,6 +63,7 @@ def _prepare(**overrides):
     values = {
         "enabled": True,
         "compound_verification_requested": False,
+        "trusted_governed_claim": None,
         "runtime_available": True,
         "runtime_session_id": "runtime-session-1",
         "runtime_turn_id": "runtime-turn-1",
@@ -265,6 +267,72 @@ def test_global_disable_precedes_compound_verification_exclusion():
     assert state.trace["enabled"] is False
     assert state.trace["eligibility_status"] == "ineligible"
     assert state.trace["reason_code"] == "disabled"
+
+
+def test_trusted_governed_external_claim_uses_only_validated_reference():
+    state = _prepare(
+        trusted_governed_claim=TrustedGovernedClaim(
+            claim_anchor="The retained evidence supports the requested conclusion.",
+            source_ref="external:record-1",
+        ),
+        answer="PRIVATE PROVIDER JSON MUST NOT BECOME THE CLAIM ANCHOR",
+        retained_artifacts=[],
+        public_sources=[],
+        trace_references=[],
+    )
+
+    assert state.candidate is not None
+    assert state.candidate.claim_anchor == (
+        "The retained evidence supports the requested conclusion."
+    )
+    assert state.candidate.evidence_reference == {
+        "ref_type": "external_source",
+        "ref_id": "external:record-1",
+        "owner_id": "owner",
+        "conversation_id": None,
+        "support_kind": "direct",
+        "authority": "trusted_integration",
+        "freshness_state": "unknown_freshness",
+    }
+    assert state.trace["reason_code"] == "single_claim_single_external_source"
+
+
+def test_trusted_governed_claim_hashes_unsafe_opaque_reference():
+    source_ref = "https://private.invalid/" + ("x" * 200)
+    state = _prepare(
+        trusted_governed_claim=TrustedGovernedClaim(
+            claim_anchor=(
+                "The retained evidence does not support the requested conclusion."
+            ),
+            source_ref=source_ref,
+        )
+    )
+
+    expected = f"external-source:{hashlib.sha256(source_ref.encode()).hexdigest()}"
+    assert state.candidate is not None
+    assert state.candidate.evidence_reference["ref_id"] == expected
+    assert source_ref not in str(state.candidate.evidence_reference)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"enabled": False}, "disabled"),
+        ({"compound_verification_requested": True}, "compound_verification_response"),
+        ({"privacy_suppressed": True}, "privacy_suppressed"),
+    ],
+)
+def test_trusted_governed_claim_preserves_fail_closed_precedence(overrides, reason):
+    state = _prepare(
+        trusted_governed_claim=TrustedGovernedClaim(
+            claim_anchor="The retained evidence supports the requested conclusion.",
+            source_ref="external:record-1",
+        ),
+        **overrides,
+    )
+
+    assert state.candidate is None
+    assert state.trace["reason_code"] == reason
 
 
 @pytest.mark.parametrize(

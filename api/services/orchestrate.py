@@ -37,11 +37,13 @@ from services.capabilities import (
     validate_and_digest_capability_request,
 )
 from services.claim_capture import (
+    TrustedGovernedClaim,
     bind_acquisition_manifest,
     bind_assistant_message,
     calibrate_claim_capture,
     claim_record_payload,
     finish_claim_record_persistence,
+    governed_external_reference_id,
     mark_trace_status_update_failed,
     prepare_claim_capture,
 )
@@ -61,14 +63,17 @@ from services.evidence_acquisition import (
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
+    governed_evidence_claim_anchor,
     ineligible_exact_evidence_state,
     promote_exact_fetch_proposal,
     provider_allowed,
+    render_governed_evidence_answer,
     retain_initial_attempt_summary,
     select_evidence_next_step,
     suppress_manifest_identifiers,
     validate_bounded_exhaustive_context_pack_response,
     validate_context_pack_response,
+    validate_evidence_response_candidate,
 )
 from services.fallback import resolve_provider_attempt_plan
 from services.jellyfin_action_connector import (
@@ -252,26 +257,6 @@ class MandatoryRetrievalPolicy:
 
 SAFE_POLICY_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 SAFE_SCOPE_ID = re.compile(r"^[A-Za-z0-9_.:/@-]{1,160}$")
-_COMPOUND_POLICY_LABELS = frozenset(
-    {
-        "original acquisition",
-        "new verification",
-        "new verification attempt",
-        "new verification unavailable",
-    }
-)
-_COMPOUND_HISTORICAL_ONLY_STATEMENTS = frozenset(
-    {
-        "i did not perform a new verification for this explanation.",
-        "i did not perform a new verification.",
-        "no new verification was performed.",
-    }
-)
-_COMPOUND_MARKDOWN_LINE_PREFIX = re.compile(r"^(?:#{1,6}\s+|[-+*]\s+)")
-_COMPOUND_VERIFICATION_BOUNDARY_ANSWER = (
-    "The governed new evidence check completed, but I withheld the generated "
-    "explanation because it conflicted with the verification response boundary."
-)
 ARTIFACT_CONTENT_CLASSES = {
     "document",
     "code",
@@ -356,29 +341,6 @@ RETRIEVAL_DEBUG_STATUSES = {
     "malformed",
     "suppressed",
 }
-
-
-def _compound_provider_answer_conflicts_with_policy_labels(answer: str) -> bool:
-    for raw_line in answer.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        normalized_statement = " ".join(line.split()).casefold()
-        if normalized_statement in _COMPOUND_HISTORICAL_ONLY_STATEMENTS:
-            return True
-
-        label_line = line
-        for _ in range(2):
-            match = _COMPOUND_MARKDOWN_LINE_PREFIX.match(label_line)
-            if match is None:
-                break
-            label_line = label_line[match.end() :].lstrip()
-        if label_line.startswith(("**", "__")):
-            label_line = label_line[2:].lstrip()
-        label, separator, _ = label_line.partition(":")
-        if separator and label.strip().casefold() in _COMPOUND_POLICY_LABELS:
-            return True
-    return False
 
 
 RETRIEVAL_DEBUG_REASONS = {
@@ -7542,6 +7504,10 @@ async def orchestrate_chat(
                 runtime_trace=runtime_trace,
                 interrupt_trace=interrupt_trace,
                 external_context_pack=external_context_pack,
+                evidence_response_contract=bool(
+                    evidence_acquisition is not None
+                    and evidence_acquisition.supported_governed_path
+                ),
                 dsa_trace=dsa_trace,
                 memory_recall_messages=provider_memory_recall_messages,
                 memory_recall_trace=provider_memory_recall_trace,
@@ -7842,6 +7808,10 @@ async def orchestrate_chat(
                             runtime_trace=runtime_trace,
                             interrupt_trace=interrupt_trace,
                             external_context_pack=external_context_pack,
+                            evidence_response_contract=bool(
+                                evidence_acquisition is not None
+                                and evidence_acquisition.supported_governed_path
+                            ),
                             dsa_trace=dsa_trace,
                             memory_recall_messages=(
                                 provider_memory_recall_messages
@@ -7999,6 +7969,27 @@ async def orchestrate_chat(
                 or compound_governed_acquisition_established
             )
         )
+        governed_evidence_provider_call = bool(
+            evidence_provider_allowed
+            and evidence_acquisition is not None
+            and not evidence_acquisition.follow_existing_path
+            and evidence_acquisition.supported_governed_path
+        )
+        provider_tools = (
+            [] if governed_evidence_provider_call else capability_descriptors
+        )
+        provider_descriptor_fingerprint = (
+            None
+            if governed_evidence_provider_call
+            else capability_exposure_trace.get("descriptor_fingerprint")
+        )
+        provider_descriptor_count = (
+            0
+            if governed_evidence_provider_call
+            else capability_exposure_trace.get("descriptor_count")
+        )
+        governed_validation = None
+        validated_governed_excerpts = ()
         capability_dispatch_blocked_by_evidence = bool(
             exact_reference_request
             and evidence_acquisition is not None
@@ -8017,7 +8008,7 @@ async def orchestrate_chat(
                     request_id=request_id,
                     model=selected_model,
                     messages=messages,
-                    tools=capability_descriptors,
+                    tools=provider_tools,
                 )
                 model_calls.append(
                     {
@@ -8032,12 +8023,10 @@ async def orchestrate_chat(
                             prompt_fingerprint=prompt_fingerprint,
                             prompt_trace=prompt.trace,
                         ),
-                        "capability_descriptor_fingerprint": capability_exposure_trace.get(
-                            "descriptor_fingerprint"
+                        "capability_descriptor_fingerprint": (
+                            provider_descriptor_fingerprint
                         ),
-                        "capability_descriptor_count": capability_exposure_trace.get(
-                            "descriptor_count"
-                        ),
+                        "capability_descriptor_count": provider_descriptor_count,
                     }
                 )
         except Exception as e:
@@ -8055,12 +8044,10 @@ async def orchestrate_chat(
                         prompt_fingerprint=prompt_fingerprint,
                         prompt_trace=prompt.trace,
                     ),
-                    "capability_descriptor_fingerprint": capability_exposure_trace.get(
-                        "descriptor_fingerprint"
+                    "capability_descriptor_fingerprint": (
+                        provider_descriptor_fingerprint
                     ),
-                    "capability_descriptor_count": capability_exposure_trace.get(
-                        "descriptor_count"
-                    ),
+                    "capability_descriptor_count": provider_descriptor_count,
                 }
             )
             fallback_attempt = provider_attempt_plan[1] if len(provider_attempt_plan) > 1 else None
@@ -8072,12 +8059,12 @@ async def orchestrate_chat(
                     "prompt_fingerprint": prompt_fingerprint["fingerprint"],
                     "message_count": prompt_fingerprint["message_count"],
                 }
-                fallback_fingerprint = capability_exposure_trace.get("descriptor_fingerprint")
+                fallback_fingerprint = provider_descriptor_fingerprint
                 prompt.trace["capabilities"]["fallback"].update(
                     {
                         "descriptor_fingerprint": fallback_fingerprint,
                         "same_descriptor_fingerprint": fallback_fingerprint
-                        == capability_exposure_trace.get("descriptor_fingerprint"),
+                        == provider_descriptor_fingerprint,
                     }
                 )
                 selected_model = fallback_attempt.model
@@ -8088,7 +8075,7 @@ async def orchestrate_chat(
                         request_id=request_id,
                         model=selected_model,
                         messages=messages,
-                        tools=capability_descriptors,
+                        tools=provider_tools,
                     )
                     model_calls.append(
                         {
@@ -8103,12 +8090,10 @@ async def orchestrate_chat(
                                 prompt_fingerprint=prompt_fingerprint,
                                 prompt_trace=prompt.trace,
                             ),
-                            "capability_descriptor_fingerprint": capability_exposure_trace.get(
-                                "descriptor_fingerprint"
+                            "capability_descriptor_fingerprint": (
+                                provider_descriptor_fingerprint
                             ),
-                            "capability_descriptor_count": capability_exposure_trace.get(
-                                "descriptor_count"
-                            ),
+                            "capability_descriptor_count": provider_descriptor_count,
                         }
                     )
                     model_error = model_calls[0].get("error_code")
@@ -8127,12 +8112,10 @@ async def orchestrate_chat(
                                 prompt_fingerprint=prompt_fingerprint,
                                 prompt_trace=prompt.trace,
                             ),
-                            "capability_descriptor_fingerprint": capability_exposure_trace.get(
-                                "descriptor_fingerprint"
+                            "capability_descriptor_fingerprint": (
+                                provider_descriptor_fingerprint
                             ),
-                            "capability_descriptor_count": capability_exposure_trace.get(
-                                "descriptor_count"
-                            ),
+                            "capability_descriptor_count": provider_descriptor_count,
                         }
                     )
                     final_attempt = dict(model_calls[-1])
@@ -8201,28 +8184,73 @@ async def orchestrate_chat(
                 raise
 
         prompt.trace["capabilities"]["provider_call_count"] = len(model_calls)
-        raw_answer = (
-            evidence_acquisition.forced_answer
-            if evidence_acquisition is not None
-            and evidence_acquisition.forced_answer is not None
-            else _apply_capability_registry_response_boundary(
-                provider_text(completion),
-                capability_registry_trace,
+        if governed_evidence_provider_call and evidence_acquisition is not None:
+            governed_validation, validated_governed_excerpts = (
+                validate_evidence_response_candidate(
+                    provider_text(completion),
+                    context_pack=external_context_pack,
+                    retained_source_refs=retained_external_refs,
+                )
             )
-        )
+            raw_answer = render_governed_evidence_answer(
+                state=evidence_acquisition,
+                validation=governed_validation,
+                excerpts=validated_governed_excerpts,
+            )
+            prompt.trace["evidence_response"] = {
+                "contract_active": True,
+                "validation_status": governed_validation.validation_status,
+                "validated_excerpt_count": (
+                    governed_validation.validated_excerpt_count
+                ),
+                "failure_reason": governed_validation.failure_reason,
+                "provider_tool_count": 0,
+            }
+            if governed_validation.validation_status == "invalid":
+                status = "degraded"
+        else:
+            raw_answer = (
+                evidence_acquisition.forced_answer
+                if evidence_acquisition is not None
+                and evidence_acquisition.forced_answer is not None
+                else _apply_capability_registry_response_boundary(
+                    provider_text(completion),
+                    capability_registry_trace,
+                )
+            )
         capability_request = None
         pending_action: dict[str, Any] | None = None
         try:
             capability_request = (
                 None
-                if capability_dispatch_blocked_by_evidence
+                if (
+                    governed_evidence_provider_call
+                    or capability_dispatch_blocked_by_evidence
+                )
                 else (
                     pending_capability_request
                     if pending_continuation is not None
                     else parse_provider_capability_request(completion)
                 )
             )
-            if capability_dispatch_blocked_by_evidence:
+            if governed_evidence_provider_call:
+                prompt.trace["capabilities"]["validation"] = {
+                    "validation_status": "not_requested",
+                    "reason_code": "governed_evidence_response",
+                }
+                prompt.trace["capabilities"]["execution"] = {
+                    "executor_called": False,
+                    "executor_call_count": 0,
+                    "executor_result_status": "not_called",
+                    "failure_reason_code": "governed_evidence_response",
+                    "response_status": "not_executed",
+                }
+                prompt.trace["capabilities"]["follow_up"] = (
+                    _capability_follow_up_empty_trace()
+                )
+                prompt.trace["capabilities"]["dispatch_completed"] = False
+                prompt.trace["capabilities"]["executor_call_count"] = 0
+            elif capability_dispatch_blocked_by_evidence:
                 prompt.trace["capabilities"]["validation"] = {
                     "validation_status": "not_requested",
                     "reason_code": "evidence_request_ineligible",
@@ -8354,7 +8382,7 @@ async def orchestrate_chat(
             prompt.trace["capabilities"]["dispatch_completed"] = False
             prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
-        if capability_dispatch_blocked_by_evidence:
+        if governed_evidence_provider_call or capability_dispatch_blocked_by_evidence:
             action_summary_trace, action_summary_answer = (
                 _action_summary_empty_trace(),
                 None,
@@ -8385,25 +8413,40 @@ async def orchestrate_chat(
             and evidence_acquisition.forced_answer is not None
         ):
             raw_answer = evidence_acquisition.forced_answer
-        response_review = review_response(
-            ResponseReviewInput(
-                candidate_text=raw_answer,
-                handoff=handoff,
-                presentation=presentation,
-                prompt_trace=prompt.trace,
+        if governed_evidence_provider_call:
+            prompt.trace["response_review"] = {
+                "status": "not_requested",
+                "reason": "governed_evidence_response",
+            }
+            prompt.trace["response_action"] = {
+                "status": "not_requested",
+                "reason": "governed_evidence_response",
+            }
+            candidate_answer = raw_answer
+        else:
+            response_review = review_response(
+                ResponseReviewInput(
+                    candidate_text=raw_answer,
+                    handoff=handoff,
+                    presentation=presentation,
+                    prompt_trace=prompt.trace,
+                )
             )
-        )
-        response_action = apply_response_action(
-            ResponseActionInput(
-                mode=response_action_mode,
-                candidate_text=raw_answer,
-                response_review=response_review,
+            response_action = apply_response_action(
+                ResponseActionInput(
+                    mode=response_action_mode,
+                    candidate_text=raw_answer,
+                    response_review=response_review,
+                )
             )
-        )
-        prompt.trace["response_review"] = response_review.to_trace()
-        prompt.trace["response_action"] = response_action.to_trace()
-        candidate_answer = response_action.candidate_text
-        if memory_recall_composition.explicit_callbacks and not privacy_prompt_suppressed:
+            prompt.trace["response_review"] = response_review.to_trace()
+            prompt.trace["response_action"] = response_action.to_trace()
+            candidate_answer = response_action.candidate_text
+        if (
+            not governed_evidence_provider_call
+            and memory_recall_composition.explicit_callbacks
+            and not privacy_prompt_suppressed
+        ):
             callback_text = memory_recall_composition.explicit_callbacks[0]
             if callback_text and callback_text not in candidate_answer:
                 candidate_answer = f"{callback_text}\n\n{candidate_answer}"
@@ -8412,7 +8455,10 @@ async def orchestrate_chat(
             prompt.trace["memory_episode_recall_composition"]["final_callback_applied"] = False
         answer = candidate_answer
         brief_metadata = {"enabled": False}
-        if effective_payload.get("response_mode") == "brief":
+        if (
+            not governed_evidence_provider_call
+            and effective_payload.get("response_mode") == "brief"
+        ):
             brief_grounding = _merge_brief_grounding(
                 memory_recall_composition.brief_grounding,
                 _external_context_brief_grounding(
@@ -8490,6 +8536,21 @@ async def orchestrate_chat(
         }
 
         references = _trace_references(retrieval_bundle)
+        trusted_governed_claim = None
+        if (
+            governed_validation is not None
+            and governed_validation.validation_status == "valid"
+            and governed_validation.conclusion_disposition != "mixed"
+            and len(validated_governed_excerpts) == 1
+        ):
+            governed_claim_anchor = governed_evidence_claim_anchor(
+                governed_validation
+            )
+            if governed_claim_anchor is not None:
+                trusted_governed_claim = TrustedGovernedClaim(
+                    claim_anchor=governed_claim_anchor,
+                    source_ref=validated_governed_excerpts[0].source_ref,
+                )
         claim_capture_trace_enabled = (
             claim_record_capture_enabled
             and (
@@ -8500,6 +8561,7 @@ async def orchestrate_chat(
         claim_capture = prepare_claim_capture(
             enabled=claim_capture_trace_enabled,
             compound_verification_requested=compound_verification_requested,
+            trusted_governed_claim=trusted_governed_claim,
             runtime_available=runtime is not None,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
@@ -8507,10 +8569,13 @@ async def orchestrate_chat(
             is_brief=brief_metadata.get("enabled") is True,
             pending_action_present=pending_action is not None,
             capability_requested=(
-                capability_request is not None
-                or isinstance(
-                    prompt.trace.get("capabilities", {}).get("execution"),
-                    dict,
+                not governed_evidence_provider_call
+                and (
+                    capability_request is not None
+                    or isinstance(
+                        prompt.trace.get("capabilities", {}).get("execution"),
+                        dict,
+                    )
                 )
             ),
             capability_executed=(
@@ -8532,6 +8597,18 @@ async def orchestrate_chat(
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
         )
+        if claim_capture.candidate is not None and (
+            claim_capture.candidate.evidence_reference.get("ref_type")
+            == "external_source"
+        ):
+            reference_identity = {
+                "ref_type": "external_source",
+                "ref_id": governed_external_reference_id(
+                    validated_governed_excerpts[0].source_ref
+                ),
+            }
+            if reference_identity not in references:
+                references.append(reference_identity)
         claim_capture = await calibrate_claim_capture(
             runtime=runtime,
             state=claim_capture,
@@ -8562,11 +8639,7 @@ async def orchestrate_chat(
                 }
             ):
                 verification_label = "New verification"
-                if _compound_provider_answer_conflicts_with_policy_labels(answer):
-                    verification_answer = _COMPOUND_VERIFICATION_BOUNDARY_ANSWER
-                    status = "degraded"
-                else:
-                    verification_answer = answer
+                verification_answer = answer
             elif (
                 compound_governed_acquisition_established
                 and sufficiency_status in {"insufficient", "unknown"}

@@ -42,6 +42,11 @@ _ACCORDING_TO_ATTRIBUTION = re.compile(
     rf"{_FILE_SOURCE_NOUN},\s+.+\.$",
     re.IGNORECASE,
 )
+_TRUSTED_GOVERNED_CLAIM_ANCHORS = {
+    "The retained evidence supports the requested conclusion.",
+    "The retained evidence does not support the requested conclusion.",
+    "The retained evidence supports only the following bounded description.",
+}
 
 
 class _EvidenceReference(BaseModel):
@@ -191,7 +196,13 @@ class _ClaimRecordResponse(BaseModel):
 @dataclass(frozen=True)
 class ClaimCaptureCandidate:
     claim_anchor: str
-    evidence_reference: dict[str, str]
+    evidence_reference: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TrustedGovernedClaim:
+    claim_anchor: str
+    source_ref: str
 
 
 @dataclass(frozen=True)
@@ -282,10 +293,18 @@ def _source_identity(source: Any) -> tuple[str, str] | None:
     return ref_type, ref_id
 
 
+def governed_external_reference_id(source_ref: str) -> str:
+    if _valid_identifier(source_ref):
+        return source_ref
+    digest = hashlib.sha256(source_ref.encode("utf-8")).hexdigest()
+    return f"external-source:{digest}"
+
+
 def prepare_claim_capture(
     *,
     enabled: bool,
     compound_verification_requested: bool = False,
+    trusted_governed_claim: TrustedGovernedClaim | None = None,
     runtime_available: bool,
     runtime_session_id: Any,
     runtime_turn_id: Any,
@@ -321,6 +340,41 @@ def prepare_claim_capture(
         return _ineligible(enabled=True, reason_code="action_response")
     if callback_applied:
         return _ineligible(enabled=True, reason_code="callback_response")
+    if trusted_governed_claim is not None:
+        claim_anchor = trusted_governed_claim.claim_anchor
+        if claim_anchor not in _TRUSTED_GOVERNED_CLAIM_ANCHORS:
+            return _ineligible(
+                enabled=True,
+                reason_code="trusted_governed_claim_invalid",
+            )
+        if not trusted_governed_claim.source_ref or not _valid_identifier(owner_id):
+            return _ineligible(
+                enabled=True,
+                reason_code="source_identity_unavailable",
+            )
+        evidence_reference = {
+            "ref_type": "external_source",
+            "ref_id": governed_external_reference_id(
+                trusted_governed_claim.source_ref
+            ),
+            "owner_id": owner_id,
+            "conversation_id": None,
+            "support_kind": "direct",
+            "authority": "trusted_integration",
+            "freshness_state": "unknown_freshness",
+        }
+        return ClaimCaptureState(
+            trace=_trace(
+                enabled=True,
+                eligibility_status="eligible",
+                reason_code="single_claim_single_external_source",
+                evidence_count=1,
+            ),
+            candidate=ClaimCaptureCandidate(
+                claim_anchor=claim_anchor,
+                evidence_reference=evidence_reference,
+            ),
+        )
     claim_anchor, answer_reason = _normalized_claim_anchor(answer)
     if answer_reason is not None or claim_anchor is None:
         return _ineligible(enabled=True, reason_code=answer_reason or "empty_answer")
@@ -474,7 +528,7 @@ async def calibrate_claim_capture(
         trace={
             **trace,
             "calibration_status": "completed",
-            "reason_code": "single_claim_single_file_source",
+            "reason_code": trace["reason_code"],
             "claim_id": result["claim_id"],
             "claim_anchor_digest": result["claim_anchor_digest"],
         },
@@ -670,7 +724,7 @@ def finish_claim_record_persistence(
         trace={
             **trace,
             "persistence_status": "persisted",
-            "reason_code": "single_claim_single_file_source",
+            "reason_code": trace["reason_code"],
         },
     )
 

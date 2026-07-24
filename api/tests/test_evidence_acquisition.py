@@ -11,24 +11,25 @@ from services.evidence_acquisition import (
     BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
     COMPARISON_SCOPE_SUFFIX,
     CONFIGURED_WORKSHEET_CONTEXT_MODE,
-    EXHAUSTIVE_SCOPE_SUFFIX,
+    MALFORMED_EVIDENCE_RESPONSE,
     TARGETED_SCOPE_SUFFIX,
     WITHHELD_ANSWER,
     DsaItem,
     DsaSourceListResponse,
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
+    EvidenceCandidateValidation,
     NextStepResult,
     PlanResult,
     RequirementEvaluation,
     ShapeResult,
     SufficiencyResult,
+    ValidatedEvidenceExcerpt,
     _acquisition_premise_digest,
     _adapt_inventory,
     _build_acquisition_facts,
     _expected_sufficiency_constraints,
     _manifest_id,
-    _provider_answer_claims_universal_scope,
     _resolve_declared_scope,
     begin_evidence_acquisition,
     bind_manifest_response,
@@ -43,6 +44,7 @@ from services.evidence_acquisition import (
     execute_hybrid_comparison,
     promote_exact_fetch_proposal,
     provider_allowed,
+    render_governed_evidence_answer,
     retain_initial_attempt_summary,
     select_evidence_next_step,
     suppress_manifest_identifiers,
@@ -50,6 +52,7 @@ from services.evidence_acquisition import (
     validate_configured_worksheet_response,
     validate_context_pack_response,
     validate_context_response,
+    validate_evidence_response_candidate,
     validate_fetch_response,
 )
 from settings import Settings
@@ -3708,12 +3711,9 @@ def test_comparison_scope_boundary_is_unconditional_and_idempotent():
         evidence_plan_id=state.plan.plan_id,
     )["result"]
     state.sufficiency = SufficiencyResult.model_validate(state.sufficiency)
-    answer = enforce_final_answer("All records match.", state)
+    answer = _render_valid_answer(state)
     assert answer.endswith(COMPARISON_SCOPE_SUFFIX)
-    assert enforce_final_answer(answer, state).count(COMPARISON_SCOPE_SUFFIX) == 1
-    assert enforce_final_answer("The selected records differ.", state) == (
-        f"The selected records differ.\n\n{COMPARISON_SCOPE_SUFFIX}"
-    )
+    assert answer.count(COMPARISON_SCOPE_SUFFIX) == 1
 
 
 @pytest.mark.parametrize(
@@ -4360,14 +4360,12 @@ async def test_exact_optional_limitation_discloses_actual_scope_once():
         retained_source_refs={"connector:source_a:item-1"},
         **SCOPE,
     )
-    answer = enforce_final_answer("The exact record gives the date.", state)
+    answer = _render_valid_answer(state)
     assert provider_allowed(state) is True
     limitation = "Limitation: an optional selected source was not available."
-    assert answer == (
-        f"The exact record gives the date.\n\n{limitation}\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
-    )
-    assert enforce_final_answer(answer, state).count(limitation) == 1
+    assert limitation in answer
+    assert answer.endswith(TARGETED_SCOPE_SUFFIX)
+    assert answer.count(limitation) == 1
 
 
 @pytest.mark.asyncio
@@ -4656,497 +4654,377 @@ async def test_optional_limitation_allows_provider_and_is_disclosed_once():
     )
 
     assert provider_allowed(state) is True
-    answer = enforce_final_answer("The record gives the date.", state)
+    answer = _render_valid_answer(state)
     limitation = "Limitation: an optional selected source was not available."
-    assert answer == (
-        f"The record gives the date.\n\n{limitation}\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
+    assert limitation in answer
+    assert answer.endswith(TARGETED_SCOPE_SUFFIX)
+    assert answer.count(limitation) == 1
+
+def _candidate(
+    *,
+    disposition="supports",
+    excerpts=None,
+):
+    return json.dumps(
+        {
+            "conclusion_disposition": disposition,
+            "evidence_excerpts": excerpts
+            or [
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "PRIVATE SOURCE CONTENT",
+                }
+            ],
+        },
+        separators=(",", ":"),
     )
-    assert enforce_final_answer(answer, state).count(limitation) == 1
 
 
-@pytest.mark.asyncio
-async def test_targeted_scope_boundary_is_unconditional_and_idempotent():
-    runtime = FakeRuntime()
-    state = await begin_evidence_acquisition(
-        runtime=runtime,
-        dsa=FakeDsa([_source("source_a")]),
-        task_text=QUESTION,
-        interaction_kind="question",
-        external_context=None,
-        **SCOPE,
-    )
-    await evaluate_acquisition_sufficiency(
-        state=state,
-        runtime=runtime,
+def _render_valid_answer(state, *, disposition="supports"):
+    validation, excerpts = validate_evidence_response_candidate(
+        _candidate(disposition=disposition),
         context_pack=_validated_context_pack(),
-        dsa_trace={"status": "success", "called": True},
-        retained_source_refs={"source_a:record_1"},
-        **SCOPE,
+        retained_source_refs=["source_a:record_1"],
+    )
+    return render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=excerpts,
     )
 
-    ordinary = enforce_final_answer("The targeted record gives the date.", state)
-    overclaim = enforce_final_answer("There is no record anywhere.", state)
-    assert ordinary == (
-        f"The targeted record gives the date.\n\n{TARGETED_SCOPE_SUFFIX}"
+
+def test_governed_candidate_accepts_exact_retained_excerpt():
+    validation, excerpts = validate_evidence_response_candidate(
+        _candidate(),
+        context_pack=_validated_context_pack(),
+        retained_source_refs=["source_a:record_1"],
     )
-    assert overclaim.count(TARGETED_SCOPE_SUFFIX) == 1
-    assert enforce_final_answer(overclaim, state).count(TARGETED_SCOPE_SUFFIX) == 1
+
+    assert validation == EvidenceCandidateValidation(
+        validation_status="valid",
+        conclusion_disposition="supports",
+        validated_excerpt_count=1,
+        validated_source_references=("source_a:record_1",),
+        failure_reason=None,
+    )
+    assert excerpts == (
+        ValidatedEvidenceExcerpt(
+            source_ref="source_a:record_1",
+            excerpt="PRIVATE SOURCE CONTENT",
+        ),
+    )
+
+
+def test_governed_candidate_preserves_order_and_normalizes_whitespace():
+    context_pack = _validated_context_pack()
+    context_pack["items"].append(
+        {
+            **context_pack["items"][0],
+            "result_id": "result_2",
+            "source_id": "source_b",
+            "source_ref": "source_b:record_2",
+            "text": "Second\n retained\t evidence.",
+        }
+    )
+    context_pack["sources_used"] = ["source_a", "source_b"]
+    validation, excerpts = validate_evidence_response_candidate(
+        _candidate(
+            disposition="mixed",
+            excerpts=[
+                {
+                    "source_ref": "source_b:record_2",
+                    "excerpt": "Second retained evidence.",
+                },
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "PRIVATE SOURCE CONTENT",
+                },
+            ],
+        ),
+        context_pack=context_pack,
+        retained_source_refs=[
+            "source_a:record_1",
+            "source_b:record_2",
+        ],
+    )
+
+    assert validation.validation_status == "valid"
+    assert validation.validated_source_references == (
+        "source_b:record_2",
+        "source_a:record_1",
+    )
+    assert [item.excerpt for item in excerpts] == [
+        "Second retained evidence.",
+        "PRIVATE SOURCE CONTENT",
+    ]
+
+
+def test_governed_candidate_accepts_punctuation_and_token_bounded_substring():
+    context_pack = _validated_context_pack()
+    context_pack["items"][0]["text"] = "Status: ready; evidence confirmed."
+    validation, excerpts = validate_evidence_response_candidate(
+        _candidate(
+            excerpts=[
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "ready; evidence",
+                }
+            ]
+        ),
+        context_pack=context_pack,
+        retained_source_refs=["source_a:record_1"],
+    )
+
+    assert validation.validation_status == "valid"
+    assert excerpts[0].excerpt == "ready; evidence"
 
 
 @pytest.mark.parametrize(
-    ("task_shape", "boundary"),
+    ("content", "reason"),
     [
-        ("targeted_lookup", TARGETED_SCOPE_SUFFIX),
-        ("cross_source_comparison", COMPARISON_SCOPE_SUFFIX),
-        ("bounded_exhaustive_review", EXHAUSTIVE_SCOPE_SUFFIX),
+        ("free-form provider prose", "invalid_json"),
+        ("null", "invalid_candidate"),
+        ('"scalar"', "invalid_candidate"),
+        ("{}", "invalid_candidate"),
+        ('```json\n{"conclusion_disposition":"supports"}\n```', "invalid_json"),
+        ('preamble {"conclusion_disposition":"supports"}', "invalid_json"),
+        ('{"conclusion_disposition":"supports"} trailing', "invalid_json"),
+        ('[{"conclusion_disposition":"supports"}]', "invalid_candidate"),
+        ('{"conclusion_disposition":"unsupported","evidence_excerpts":[]}', "invalid_candidate"),
+        ('{"conclusion_disposition":"supports","evidence_excerpts":[]}', "invalid_candidate"),
+        (
+            '{"conclusion_disposition":"supports",'
+            '"conclusion_disposition":"mixed","evidence_excerpts":[]}',
+            "invalid_json",
+        ),
+        (
+            '{"conclusion_disposition":"supports","evidence_excerpts":'
+            '[{"source_ref":"source_a:record_1","excerpt":"PRIVATE SOURCE CONTENT"}],'
+            '"extra":true}',
+            "invalid_candidate",
+        ),
+        (
+            '{"conclusion_disposition":"supports","evidence_excerpts":'
+            '[{"source_ref":"source_a:record_1","excerpt":null}]}',
+            "invalid_candidate",
+        ),
+        (
+            '{"conclusion_disposition":"supports","evidence_excerpts":'
+            '[{"source_ref":1,"excerpt":"PRIVATE SOURCE CONTENT"}]}',
+            "invalid_candidate",
+        ),
+        (
+            '{"conclusion_disposition":"supports","evidence_excerpts":'
+            '[{"source_ref":null,"excerpt":"PRIVATE SOURCE CONTENT"}]}',
+            "invalid_candidate",
+        ),
+        (
+            '{"conclusion_disposition":"supports","evidence_excerpts":['
+            '{"source_ref":"source_a:record_1","excerpt":"PRIVATE SOURCE CONTENT"},'
+            '{"source_ref":"source_b:record_2","excerpt":2}]}',
+            "invalid_candidate",
+        ),
     ],
 )
-def test_governed_success_boundaries_follow_task_shape_not_provider_text(
+def test_governed_candidate_rejects_malformed_structures(content, reason):
+    validation, excerpts = validate_evidence_response_candidate(
+        content,
+        context_pack=_validated_context_pack(),
+        retained_source_refs=["source_a:record_1"],
+    )
+
+    assert validation.validation_status == "invalid"
+    assert validation.failure_reason == reason
+    assert validation.validated_source_references == ()
+    assert excerpts == ()
+
+
+@pytest.mark.parametrize(
+    ("excerpts", "reason"),
+    [
+        (
+            [{"source_ref": "forged:record", "excerpt": "PRIVATE SOURCE CONTENT"}],
+            "reference_not_retained",
+        ),
+        (
+            [
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "private source content",
+                }
+            ],
+            "excerpt_not_extractive",
+        ),
+        (
+            [
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "PRIVATE CONTENT SOURCE",
+                }
+            ],
+            "excerpt_not_extractive",
+        ),
+        (
+            [
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "RIVATE",
+                }
+            ],
+            "excerpt_token_boundary_invalid",
+        ),
+        (
+            [
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "PRIVATE SOURCE CONTENT",
+                },
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "PRIVATE SOURCE CONTENT",
+                },
+            ],
+            "invalid_candidate",
+        ),
+        (
+            [
+                {
+                    "source_ref": "source_a:record_1",
+                    "excerpt": "x" * 501,
+                }
+            ],
+            "invalid_candidate",
+        ),
+        (
+            [
+                {
+                    "source_ref": "x" * 241,
+                    "excerpt": "PRIVATE SOURCE CONTENT",
+                }
+            ],
+            "invalid_candidate",
+        ),
+    ],
+)
+def test_governed_candidate_rejects_untrusted_or_nonextractive_evidence(
+    excerpts,
+    reason,
+):
+    validation, _ = validate_evidence_response_candidate(
+        _candidate(excerpts=excerpts),
+        context_pack=_validated_context_pack(),
+        retained_source_refs=["source_a:record_1"],
+    )
+
+    assert validation.failure_reason == reason
+
+
+def test_returned_but_not_prompt_retained_reference_is_rejected():
+    validation, _ = validate_evidence_response_candidate(
+        _candidate(),
+        context_pack=_validated_context_pack(),
+        retained_source_refs=[],
+    )
+
+    assert validation.failure_reason == "reference_not_retained"
+
+
+@pytest.mark.parametrize(
+    "task_shape",
+    [
+        "targeted_lookup",
+        "cross_source_comparison",
+        "bounded_exhaustive_review",
+        "contradiction_review",
+        "absence_or_coverage_check",
+        "historical_reconstruction",
+        "recommendation_or_decision_support",
+    ],
+)
+@pytest.mark.parametrize(
+    "disposition",
+    ["supports", "does_not_support", "mixed", "descriptive"],
+)
+def test_governed_renderer_is_policy_owned_for_every_shape_and_disposition(
     task_shape,
-    boundary,
+    disposition,
 ):
     state = _rendering_state(task_shape=task_shape)
-
-    answer = enforce_final_answer("The checked record supports the result.", state)
-
-    assert answer == f"The checked record supports the result.\n\n{boundary}"
-    for other_boundary in {
-        TARGETED_SCOPE_SUFFIX,
-        COMPARISON_SCOPE_SUFFIX,
-        EXHAUSTIVE_SCOPE_SUFFIX,
-    } - {boundary}:
-        assert other_boundary not in answer
-
-
-@pytest.mark.parametrize(
-    ("task_shape", "boundary", "provider_answer"),
-    [
-        (
-            "targeted_lookup",
-            TARGETED_SCOPE_SUFFIX,
-            "Every possible source was fully examined.",
-        ),
-        (
-            "cross_source_comparison",
-            COMPARISON_SCOPE_SUFFIX,
-            "All possible sources were checked.",
-        ),
-        (
-            "bounded_exhaustive_review",
-            EXHAUSTIVE_SCOPE_SUFFIX,
-            "No evidence exists outside this result.",
-        ),
-        (
-            "targeted_lookup",
-            TARGETED_SCOPE_SUFFIX,
-            "No evidence exists beyond the checked material.",
-        ),
-        (
-            "cross_source_comparison",
-            COMPARISON_SCOPE_SUFFIX,
-            "The search was complete across every relevant source.",
-        ),
-    ],
-)
-def test_provider_universal_scope_claims_are_replaced(
-    task_shape,
-    boundary,
-    provider_answer,
-):
-    state = _rendering_state(task_shape=task_shape)
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    replacement = (
-        "I withheld the generated answer because it claimed evidence coverage "
-        "beyond the examined scope."
-    )
-    assert provider_answer not in answer
-    assert answer == f"{replacement}\n\n{boundary}"
-    assert answer.count(replacement) == 1
-    assert answer.count(boundary) == 1
-
-
-@pytest.mark.parametrize(
-    ("task_shape", "boundary", "provider_answer"),
-    [
-        (
-            "bounded_exhaustive_review",
-            EXHAUSTIVE_SCOPE_SUFFIX,
-            "Within the declared scope, all configured records were reviewed.",
-        ),
-        (
-            "targeted_lookup",
-            TARGETED_SCOPE_SUFFIX,
-            "I cannot say every possible source was examined.",
-        ),
-        (
-            "cross_source_comparison",
-            COMPARISON_SCOPE_SUFFIX,
-            "Not every potentially relevant source was checked.",
-        ),
-        (
-            "targeted_lookup",
-            TARGETED_SCOPE_SUFFIX,
-            "No contradictory evidence was found in the selected records.",
-        ),
-    ],
-)
-def test_bounded_provider_scope_statements_are_preserved(
-    task_shape,
-    boundary,
-    provider_answer,
-):
-    state = _rendering_state(task_shape=task_shape)
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    assert answer == f"{provider_answer}\n\n{boundary}"
-    assert "I withheld the generated answer" not in answer
-    assert answer.count(boundary) == 1
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "# EVERY POSSIBLE SOURCE WAS FULLY EXAMINED.",
-        "- All   possible\n sources\twere checked.",
-        "**No evidence exists outside this result.**",
-    ],
-)
-def test_provider_scope_claim_formatting_cannot_evade_replacement(provider_answer):
-    state = _rendering_state()
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    assert provider_answer not in answer
-    assert answer.count("I withheld the generated answer") == 1
-    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
-
-
-_ENDORSED_QUOTED_SCOPE_CLAIMS = (
-    'The report claimed, "Every possible source was fully examined," and that claim is correct.',
-    'The earlier answer claimed, "Every possible source was fully examined." I agree.',
-    'The phrase "All possible sources were checked" is not supported by the '
-    "evidence, but it is nevertheless true.",
-    'The report stated, "No evidence exists outside this result." That is correct.',
-    'The earlier answer quoted, "The search was complete across every relevant '
-    'source." The earlier answer was right.',
-    'The report claimed, "Every possible source was fully examined," and I agree.',
-)
-
-_NON_ENDORSING_QUOTED_SCOPE_REFERENCES = (
-    'The report claimed, "Every possible source was fully examined," and that claim is false.',
-    'The earlier answer claimed, "Every possible source was fully examined." I disagree.',
-    'The phrase "All possible sources were checked" is not supported by the '
-    "evidence, and I reject it.",
-    'The report stated, "No evidence exists outside this result." I have not verified that claim.',
-    'The earlier answer quoted, "The search was complete across every relevant '
-    'source." The earlier answer was wrong.',
-    'The report claimed, "Every possible source was fully examined." I do not agree.',
-)
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "Every possible source was fully examined.",
-        "All possible sources were checked.",
-        "No evidence exists outside this result.",
-        "No evidence exists beyond the checked material.",
-        "The search was complete across every relevant source.",
-        "The evidence shows that every possible source was fully examined.",
-        "According to the results, all possible sources were checked.",
-        "I confirmed that no evidence exists outside this result.",
-        '"Every possible source was fully examined."',
-        "# EVERY POSSIBLE SOURCE WAS FULLY EXAMINED.",
-        "- All   possible\n sources\twere checked.",
-        "**No evidence exists outside this result.**",
-    ],
-)
-def test_provider_scope_claim_helper_rejects_affirmative_assertions(
-    provider_answer,
-):
-    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
-
-
-@pytest.mark.parametrize("provider_answer", _ENDORSED_QUOTED_SCOPE_CLAIMS)
-def test_provider_scope_claim_helper_rejects_endorsed_quoted_assertions(
-    provider_answer,
-):
-    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        'The report claimed, "Every possible source was fully examined," '
-        "and that statement is true.",
-        'The report quoted, "Every possible source was fully examined," '
-        "and the phrase is accurate.",
-        'The report claimed, "Every possible source was fully examined," '
-        "but it is still correct.",
-        'The report claimed, "Every possible source was fully examined," '
-        "but that claim is supported.",
-        'The report claimed, "Every possible source was fully examined." I concur.',
-        'The report claimed, "Every possible source was fully examined." '
-        "That is true.",
-        'The report claimed, "Every possible source was fully examined." '
-        "That claim is correct.",
-        'The report claimed, "Every possible source was fully examined." '
-        "This statement is accurate.",
-        'The report claimed, "Every possible source was fully examined." '
-        "The claim is supported.",
-        'The report claimed, "Every possible source was fully examined." '
-        "The report was right.",
-        'The report claimed, "Every possible source was fully examined." '
-        "The earlier answer was correct.",
-    ],
-)
-def test_provider_scope_claim_helper_rejects_bounded_endorsement_vocabulary(
-    provider_answer,
-):
-    assert _provider_answer_claims_universal_scope(provider_answer, []) is True
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "Within the declared scope, all configured records were reviewed.",
-        "I cannot say every possible source was examined.",
-        "Not every potentially relevant source was checked.",
-        "No contradictory evidence was found in the selected records.",
-        "Not every possible source was fully examined.",
-        "It is false that all possible sources were checked.",
-        "It is not true that no evidence exists outside this result.",
-        "We cannot conclude that the search was complete across every relevant source.",
-        'The earlier answer claimed, "Every possible source was fully examined."',
-        'The phrase "All possible sources were checked" is not supported by the evidence.',
-        'The user asked whether "no evidence exists outside this result."',
-        'I rejected the statement "The search was complete across every relevant source."',
-    ],
-)
-def test_provider_scope_claim_helper_allows_bounded_negated_and_metalinguistic_text(
-    provider_answer,
-):
-    assert _provider_answer_claims_universal_scope(provider_answer, []) is False
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    _NON_ENDORSING_QUOTED_SCOPE_REFERENCES,
-)
-def test_provider_scope_claim_helper_allows_non_endorsing_quoted_references(
-    provider_answer,
-):
-    assert _provider_answer_claims_universal_scope(provider_answer, []) is False
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "Every possible source was fully examined.",
-        "All possible sources were checked.",
-        "No evidence exists outside this result.",
-        "No evidence exists beyond the checked material.",
-        "The search was complete across every relevant source.",
-        "The evidence shows that every possible source was fully examined.",
-        "According to the results, all possible sources were checked.",
-        "I confirmed that no evidence exists outside this result.",
-        '"Every possible source was fully examined."',
-    ],
-)
-def test_targeted_answer_boundary_replaces_affirmative_scope_claims(provider_answer):
-    state = _rendering_state(task_shape="targeted_lookup")
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    replacement = (
-        "I withheld the generated answer because it claimed evidence coverage "
-        "beyond the examined scope."
-    )
-    assert provider_answer not in answer
-    assert answer == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert answer.count(replacement) == 1
-    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
-
-
-@pytest.mark.parametrize("provider_answer", _ENDORSED_QUOTED_SCOPE_CLAIMS)
-def test_targeted_answer_boundary_replaces_endorsed_quoted_scope_claims(
-    provider_answer,
-):
-    state = _rendering_state(task_shape="targeted_lookup")
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    replacement = (
-        "I withheld the generated answer because it claimed evidence coverage "
-        "beyond the examined scope."
-    )
-    assert provider_answer not in answer
-    assert answer == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert answer.count(replacement) == 1
-    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "Not every possible source was fully examined.",
-        "It is false that all possible sources were checked.",
-        "It is not true that no evidence exists outside this result.",
-        "We cannot conclude that the search was complete across every relevant source.",
-        'The earlier answer claimed, "Every possible source was fully examined."',
-        'The phrase "All possible sources were checked" is not supported by the evidence.',
-        'The user asked whether "no evidence exists outside this result."',
-        'I rejected the statement "The search was complete across every relevant source."',
-    ],
-)
-def test_targeted_answer_boundary_preserves_negated_and_metalinguistic_text(
-    provider_answer,
-):
-    state = _rendering_state(task_shape="targeted_lookup")
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    assert answer == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert "I withheld the generated answer" not in answer
-    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    _NON_ENDORSING_QUOTED_SCOPE_REFERENCES,
-)
-def test_targeted_answer_boundary_preserves_non_endorsing_quoted_references(
-    provider_answer,
-):
-    state = _rendering_state(task_shape="targeted_lookup")
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    assert answer == f"{provider_answer}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert "I withheld the generated answer" not in answer
-    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
-
-
-@pytest.mark.parametrize(
-    ("task_shape", "boundary"),
-    [
-        ("targeted_lookup", TARGETED_SCOPE_SUFFIX),
-        ("cross_source_comparison", COMPARISON_SCOPE_SUFFIX),
-        ("bounded_exhaustive_review", EXHAUSTIVE_SCOPE_SUFFIX),
-    ],
-)
-def test_provider_authored_limitation_paragraph_is_preserved(
-    task_shape,
-    boundary,
-):
-    state = _rendering_state(task_shape=task_shape)
-    provider_answer = (
-        "The report supports the migration.\n\n"
-        "Limitation: the report applies only to version 2."
+    validation, excerpts = validate_evidence_response_candidate(
+        _candidate(disposition=disposition),
+        context_pack=_validated_context_pack(),
+        retained_source_refs=["source_a:record_1"],
     )
 
-    answer = enforce_final_answer(provider_answer, state)
+    first = render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=excerpts,
+    )
+    second = render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=excerpts,
+    )
 
-    assert answer == f"{provider_answer}\n\n{boundary}"
-    assert enforce_final_answer(answer, state) == answer
-
-
-@pytest.mark.parametrize(
-    "provider_paragraph",
-    [
-        "Limitation: the report applies only to version 2.",
-        "Limitation — the report applies only to version 2.",
-        "Limitations: the report applies only to version 2.",
-        "Limited to: version 2.",
-    ],
-)
-def test_provider_limitation_like_paragraphs_are_not_policy_owned(
-    provider_paragraph,
-):
-    state = _rendering_state()
-
-    answer = enforce_final_answer(provider_paragraph, state)
-
-    assert answer == f"{provider_paragraph}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert enforce_final_answer(answer, state) == answer
+    assert first == second
+    assert first.startswith("The retained evidence")
+    assert "Retained evidence excerpt 1: PRIVATE SOURCE CONTENT" in first
+    assert "source_a:record_1" not in first
+    assert _candidate(disposition=disposition) not in first
 
 
-def test_limited_answer_preserves_provider_limitation_before_policy_paragraphs():
+def test_limited_governed_renderer_uses_existing_limitation_and_scope_boundary():
     state = _rendering_state(
         status="sufficient_with_limitations",
         evaluations=[
             {
-                "requirement_id": "optional-selected-source-coverage",
+                "requirement_id": "targeted-evidence",
+                "requirement_kind": "targeted_evidence",
+                "criticality": "material",
+                "effective_outcome": "satisfied",
+            },
+            {
+                "requirement_id": "optional-source",
                 "requirement_kind": "selected_source_coverage",
                 "criticality": "optional",
                 "effective_outcome": "unavailable",
-            }
+            },
         ],
         limitation_codes=["optional_source_unavailable"],
     )
-    provider_answer = (
-        "The report supports the migration.\n\n"
-        "Limitation: the report applies only to version 2."
-    )
-    policy_limitation = (
-        "Limitation: an optional selected source was not available."
+    validation, excerpts = validate_evidence_response_candidate(
+        _candidate(disposition="descriptive"),
+        context_pack=_validated_context_pack(),
+        retained_source_refs=["source_a:record_1"],
     )
 
-    answer = enforce_final_answer(provider_answer, state)
-
-    assert answer == (
-        f"{provider_answer}\n\n{policy_limitation}\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
-    )
-    assert enforce_final_answer(answer, state) == answer
-    assert answer.count(policy_limitation) == 1
-    assert answer.count(TARGETED_SCOPE_SUFFIX) == 1
-
-
-@pytest.mark.parametrize(
-    "provider_answer",
-    [
-        "Nothing material was left unchecked.",
-        "The implementation has no remaining omissions.",
-        "The evidence conclusively settles the issue.",
-        "The records account for the entire requirement set.",
-        "There are no unresolved gaps.",
-        "The checked entries support the result.",
-        "Review coverage settles the requested question without qualification.",
-    ],
-)
-def test_provider_paraphrases_cannot_avoid_exhaustive_scope_boundary(
-    provider_answer,
-):
-    state = _rendering_state(task_shape="bounded_exhaustive_review")
-
-    answer = enforce_final_answer(provider_answer, state)
-
-    assert answer == f"{provider_answer}\n\n{EXHAUSTIVE_SCOPE_SUFFIX}"
-
-
-def test_policy_paragraph_normalization_is_idempotent_and_shape_owned():
-    state = _rendering_state(task_shape="bounded_exhaustive_review")
-    provider_answer = (
-        f"The records support the result.\n\n{TARGETED_SCOPE_SUFFIX}\n\n"
-        f"{EXHAUSTIVE_SCOPE_SUFFIX}"
+    answer = render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=excerpts,
     )
 
-    first = enforce_final_answer(provider_answer, state)
-    second = enforce_final_answer(first, state)
+    assert "Limitation:" in answer
+    assert answer.endswith(TARGETED_SCOPE_SUFFIX)
 
-    assert first == (
-        f"The records support the result.\n\n{EXHAUSTIVE_SCOPE_SUFFIX}"
+
+def test_malformed_candidate_renderer_is_deterministic_and_content_free():
+    state = _rendering_state()
+    validation, excerpts = validate_evidence_response_candidate(
+        "PRIVATE MALFORMED PROVIDER OUTPUT",
+        context_pack=_validated_context_pack(),
+        retained_source_refs=["source_a:record_1"],
     )
-    assert second == first
-    assert first.count(EXHAUSTIVE_SCOPE_SUFFIX) == 1
-    assert TARGETED_SCOPE_SUFFIX not in first
-    assert COMPARISON_SCOPE_SUFFIX not in first
 
+    answer = render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=excerpts,
+    )
+
+    assert answer == MALFORMED_EVIDENCE_RESPONSE
+    assert "PRIVATE MALFORMED PROVIDER OUTPUT" not in answer
 
 @pytest.mark.parametrize(
     ("unavailable_count", "expected"),
@@ -5183,13 +5061,11 @@ def test_optional_source_limitation_uses_trusted_scoped_inventory_count(
         },
     )
 
-    answer = enforce_final_answer("The available evidence supports the result.", state)
+    answer = _render_valid_answer(state)
 
-    assert answer == (
-        f"The available evidence supports the result.\n\n{expected}\n\n"
-        f"{TARGETED_SCOPE_SUFFIX}"
-    )
-    assert enforce_final_answer(answer, state) == answer
+    assert expected in answer
+    assert answer.count(expected) == 1
+    assert answer.endswith(TARGETED_SCOPE_SUFFIX)
 
 
 @pytest.mark.parametrize(
@@ -5229,10 +5105,9 @@ def test_inventory_limitation_disclosure_is_specific(
         limitation_codes=[limitation_code],
     )
 
-    answer = enforce_final_answer("Provider-controlled limitation text.", state)
+    answer = _render_valid_answer(state)
 
     assert f"Limitation: {expected}" in answer
-    assert "Provider-controlled limitation text." in answer
     assert answer.endswith(TARGETED_SCOPE_SUFFIX)
 
 
@@ -5260,14 +5135,10 @@ def test_multiple_optional_limitations_are_deduplicated_and_bounded():
         declared_scope={"source_ids": ["source_a"], "source_categories": []},
     )
 
-    first = enforce_final_answer(
-        "Limitation: provider-chosen qualification.\n\nThe result is bounded.",
-        state,
-    )
-    second = enforce_final_answer(first, state)
+    first = _render_valid_answer(state)
+    second = _render_valid_answer(state)
 
     assert first == second
-    assert "Limitation: provider-chosen qualification." in first
     assert first.count("1 optional source was unavailable") == 1
     assert "Additional optional evidence limitations remained." in first
     assert first.endswith(TARGETED_SCOPE_SUFFIX)

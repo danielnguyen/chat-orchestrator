@@ -1,7 +1,7 @@
 from services.assistant_handoff import build_assistant_handoff
 from services.companion_presentation import build_companion_presentation
 from services.memory_recall_composition import compose_memory_recall_context
-from services.prompt_assembly import assemble_prompt
+from services.prompt_assembly import EVIDENCE_RESPONSE_CONTRACT, assemble_prompt
 
 
 def _build_handoff(**overrides):
@@ -130,7 +130,9 @@ def test_assemble_prompt_preserves_existing_layer_order_and_wording():
 def test_assemble_prompt_marks_empty_layers_omitted():
     out = assemble_prompt(
         profile={"prompt_overlay": ""},
-        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        retrieval_bundle={
+            "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+        },
         current_messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -300,6 +302,52 @@ def test_assemble_prompt_includes_compact_external_source_context_without_text_i
     }
     assert "Battery replacement. Date: 2025-07-12." not in str(layer["metadata"])
     assert out.trace["dsa"]["status"] == "success"
+
+
+def test_governed_evidence_contract_is_required_before_external_evidence():
+    evidence_text = "Battery replacement. Date: 2025-07-12."
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "When was it replaced?"}],
+        evidence_response_contract=True,
+        external_context_pack={
+            "sources_used": ["vehicle_log_primary"],
+            "items": [
+                {
+                    "source_ref": "vehicle_log_primary:record_1",
+                    "source_name": "Vehicle log",
+                    "title": "Battery replacement",
+                    "text": evidence_text,
+                }
+            ],
+        },
+    )
+
+    contents = [message["content"] for message in out.messages]
+    assert contents.index(EVIDENCE_RESPONSE_CONTRACT) < next(
+        index
+        for index, content in enumerate(contents)
+        if content.startswith("External source context:")
+    )
+    assert contents.index(EVIDENCE_RESPONSE_CONTRACT) < contents.index(
+        "When was it replaced?"
+    )
+    contract_layer = next(
+        layer
+        for layer in out.trace["layers"]
+        if layer["name"] == "evidence_response_contract"
+    )
+    assert contract_layer == {
+        "name": "evidence_response_contract",
+        "included": True,
+        "message_count": 1,
+        "metadata": {
+            "contract_active": True,
+            "schema_version": "governed-evidence-response.v1",
+        },
+    }
+    assert evidence_text not in str(contract_layer)
 
 
 def test_assemble_prompt_includes_surface_presence_in_top_level_trace_only():
