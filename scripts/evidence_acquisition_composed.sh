@@ -3403,7 +3403,7 @@ run_evidence_scope_reference_scenarios() {
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")"
   case "$serialized" in
-    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*conclusion_disposition*|*The\ migration\ record\ confirms*)
+    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*evidence_excerpts*|*The\ migration\ record\ confirms*)
       echo "Assertion failed: scope.privacy.suppression" >&2
       return 1
       ;;
@@ -3417,7 +3417,7 @@ run_evidence_scope_reference_scenarios() {
   history_trace="$HISTORY_TRACE"
   serialized="$(jq -c . <<<"$history")$(jq -c . <<<"$history_trace")"
   case "$serialized" in
-    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*conclusion_disposition*)
+    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*evidence_excerpts*)
       echo "Assertion failed: scope.privacy.history_suppression" >&2
       return 1
       ;;
