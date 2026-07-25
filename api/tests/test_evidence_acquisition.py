@@ -4618,6 +4618,227 @@ async def test_non_returned_prompt_reference_is_unknown_and_not_retained():
     assert "not_returned" not in json.dumps(manifest, sort_keys=True)
 
 
+def _optional_coverage_plan(limitation_codes):
+    requirements = [
+        *_plan_response()["result"]["declared_requirements"],
+        {
+            "requirement_id": "optional-selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "optional",
+        },
+    ]
+    return PlanResult.model_validate(
+        _plan_response(
+            status="ready_with_limitations",
+            requirements=requirements,
+            limitations=limitation_codes,
+        )["result"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("limitation_codes", "expected_outcome"),
+    [
+        (["source_inventory_partial"], "partial"),
+        (["source_inventory_unknown"], "unknown"),
+        (["source_inventory_unavailable"], "unavailable"),
+        (["optional_source_unavailable"], "unavailable"),
+        (["authoritative_source_unavailable"], "unavailable"),
+        ([], "satisfied"),
+        (
+            [
+                "source_inventory_partial",
+                "source_inventory_unknown",
+                "source_inventory_unavailable",
+            ],
+            "unavailable",
+        ),
+        (
+            ["source_inventory_partial", "source_inventory_unknown"],
+            "unknown",
+        ),
+    ],
+    ids=[
+        "partial-inventory",
+        "unknown-inventory",
+        "unavailable-inventory",
+        "optional-source-unavailable",
+        "authoritative-source-unavailable",
+        "complete-coverage",
+        "unavailable-precedence",
+        "unknown-precedence",
+    ],
+)
+def test_optional_selected_source_coverage_preserves_inventory_limitations(
+    limitation_codes,
+    expected_outcome,
+):
+    facts = _build_acquisition_facts(
+        plan=_optional_coverage_plan(limitation_codes),
+        context_pack=_validated_context_pack(),
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs={"source_a:record_1"},
+    )
+
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in facts
+    } == {
+        "context-delivery": "satisfied",
+        "optional-selected-source-coverage": expected_outcome,
+        "targeted-evidence": "satisfied",
+    }
+
+
+def test_material_selected_source_coverage_keeps_path_specific_outcome():
+    requirements = [
+        *_plan_response()["result"]["declared_requirements"],
+        {
+            "requirement_id": "material-selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "optional-selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "optional",
+        },
+    ]
+    plan = PlanResult.model_validate(
+        _plan_response(
+            status="ready_with_limitations",
+            requirements=requirements,
+            limitations=["source_inventory_partial"],
+        )["result"]
+    )
+
+    facts = _build_acquisition_facts(
+        plan=plan,
+        context_pack=_validated_context_pack(),
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs={"source_a:record_1"},
+    )
+
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in facts
+    } == {
+        "context-delivery": "satisfied",
+        "material-selected-source-coverage": "unknown",
+        "optional-selected-source-coverage": "partial",
+        "targeted-evidence": "satisfied",
+    }
+
+
+class PartialInventorySufficiencyRuntime(FakeRuntime):
+    def __init__(self, *, erase_limitation=False):
+        super().__init__(
+            plan={
+                **_plan_response(
+                    status="ready_with_limitations",
+                    requirements=[
+                        *_plan_response()["result"]["declared_requirements"],
+                        {
+                            "requirement_id": "optional-selected-source-coverage",
+                            "requirement_kind": "selected_source_coverage",
+                            "criticality": "optional",
+                        },
+                    ],
+                    limitations=["source_inventory_partial"],
+                ),
+            }
+        )
+        self.erase_limitation = erase_limitation
+
+    async def evaluate_evidence_sufficiency(self, **kwargs):
+        self.calls.append(("sufficiency", kwargs))
+        status = (
+            "sufficient_for_declared_scope"
+            if self.erase_limitation
+            else "sufficient_with_limitations"
+        )
+        response = _sufficiency_response(
+            kwargs["acquisition_manifest_id"],
+            status=status,
+            requirements=kwargs["declared_requirements"],
+            task_shape=kwargs["task_shape"],
+            evidence_plan_id=kwargs["evidence_plan_id"],
+        )
+        optional = next(
+            item
+            for item in response["result"]["evaluated_requirements"]
+            if item["requirement_id"] == "optional-selected-source-coverage"
+        )
+        optional["effective_outcome"] = "partial"
+        return response
+
+
+@pytest.mark.asyncio
+async def test_partial_inventory_fact_produces_limited_sufficiency():
+    runtime = PartialInventorySufficiencyRuntime()
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=_validated_context_pack(),
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs={"source_a:record_1"},
+        **SCOPE,
+    )
+
+    sufficiency_call = runtime.calls[-1][1]
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in sufficiency_call["acquisition_facts"]
+    }["optional-selected-source-coverage"] == "partial"
+    assert state.status == "sufficient_with_limitations"
+    assert state.sufficiency is not None
+    assert state.sufficiency.sufficiency_status == "sufficient_with_limitations"
+    assert state.sufficiency.answer_constraints == [
+        "qualify_conclusion",
+        "disclose_limitations",
+        "identify_unexamined_scope",
+    ]
+    assert provider_allowed(state) is True
+
+
+@pytest.mark.asyncio
+async def test_cr_cannot_erase_partial_inventory_limitation():
+    runtime = PartialInventorySufficiencyRuntime(erase_limitation=True)
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=_validated_context_pack(),
+        dsa_trace={"status": "success", "called": True},
+        retained_source_refs={"source_a:record_1"},
+        **SCOPE,
+    )
+
+    assert state.status == "sufficiency_dependency_failed"
+    assert state.sufficiency is None
+    assert state.forced_answer == WITHHELD_ANSWER
+    assert state.next_step is None
+    assert state.next_step_selection_attempted is False
+    assert provider_allowed(state) is False
+
+
 @pytest.mark.asyncio
 async def test_optional_limitation_allows_provider_and_is_disclosed_once():
     requirements = [
