@@ -11815,6 +11815,7 @@ def _targeted_plan_response(
     optional: bool = False,
     task_shape: str = "targeted_lookup",
     eligible_source_ids: list[str] | None = None,
+    limitation_codes: list[str] | None = None,
 ) -> dict[str, object]:
     requirements = [
         {
@@ -11863,7 +11864,11 @@ def _targeted_plan_response(
             "selected_strategies": [strategy] if strategy else [],
             "declared_requirements": requirements,
             "limitation_codes": (
-                ["optional_source_unavailable"] if optional else []
+                limitation_codes
+                if limitation_codes is not None
+                else ["optional_source_unavailable"]
+                if optional
+                else []
             ),
             "user_safe_summary": "A bounded strategy result.",
         },
@@ -14789,6 +14794,99 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
         fact["requirement_id"]: fact["outcome"]
         for fact in trace["acquisition_facts"]
     }["optional-selected-source-coverage"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_partial_inventory_remains_limited_through_governed_answer(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    request_id = "rid-evidence-partial-inventory"
+    runtime = FakeRuntime(
+        evidence_plan_response=_targeted_plan_response(
+            request_id=request_id,
+            question=question,
+            status="ready_with_limitations",
+            optional=True,
+            limitation_codes=["source_inventory_partial"],
+        )
+    )
+    source_response = copy.deepcopy(FakeDSA().source_response)
+    source_response.update(
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "partial",
+        }
+    )
+    source_response["sources"][0]["last_error"] = (
+        "malformed_optional_source scope_refs=PRIVATE"
+    )
+    dsa = FakeDSA(
+        response=_governed_context_pack(question),
+        source_response=source_response,
+    )
+    provider = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    limitation = (
+        "Limitation: the configured source inventory was partial, so optional "
+        "source coverage remains incomplete."
+    )
+    assert result["status"] == "ok"
+    assert result["answer"].startswith(
+        "The retained evidence supports the requested conclusion."
+    )
+    assert result["answer"].count(limitation) == 1
+    assert result["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
+    assert result["answer"].endswith(TARGETED_SCOPE_SUFFIX)
+    assert "conclusion_disposition" not in result["answer"]
+    assert len(provider.calls) == 1
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }["optional-selected-source-coverage"] == "partial"
+    trace = memory_store.trace_calls[0]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["sufficiency"]["status"] == "sufficient_with_limitations"
+    selection = manifest["next_steps"]["selections"][0]
+    assert selection["selected_next_step"] == "provide_qualified_partial_answer"
+    assert selection["conclusion_disposition"] == "qualified_partial_only"
+    assert selection["provider_disposition"] == "allowed"
+    assert trace["fallback"]["triggered"] is False
+    assert len(trace["model_calls"]) == 1
+    serialized = json.dumps((result, trace, provider.calls), sort_keys=True)
+    assert "malformed_optional_source" not in serialized
+    assert "scope_refs" not in serialized
+    assistant_write = next(
+        item for item in memory_store.added_messages if item["role"] == "assistant"
+    )
+    assert assistant_write["content"] == result["answer"]
 
 
 @pytest.mark.asyncio

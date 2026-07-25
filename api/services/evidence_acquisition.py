@@ -3488,6 +3488,23 @@ def _bounded_exhaustive_fact_outcomes(
     }
 
 
+def _optional_selected_source_coverage_outcome(
+    limitation_codes: list[str],
+) -> str:
+    codes = set(limitation_codes)
+    if codes & {
+        "source_inventory_unavailable",
+        "authoritative_source_unavailable",
+        "optional_source_unavailable",
+    }:
+        return "unavailable"
+    if "source_inventory_unknown" in codes:
+        return "unknown"
+    if "source_inventory_partial" in codes:
+        return "partial"
+    return "satisfied"
+
+
 def _build_acquisition_facts(
     *,
     plan: PlanResult,
@@ -3582,14 +3599,8 @@ def _build_acquisition_facts(
             requirement.requirement_kind == "selected_source_coverage"
             and requirement.criticality == "optional"
         ):
-            outcome = (
-                "unavailable"
-                if {
-                    "authoritative_source_unavailable",
-                    "optional_source_unavailable",
-                }
-                & set(plan.limitation_codes)
-                else "satisfied"
+            outcome = _optional_selected_source_coverage_outcome(
+                plan.limitation_codes
             )
         else:
             outcome = "unknown"
