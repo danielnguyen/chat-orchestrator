@@ -3106,6 +3106,30 @@ run_evidence_scope_reference_scenarios() {
     and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
       | select(.content | contains("The migration record confirms the bounded setting."))] | length) == 1
   '
+  assert_jq "scope.requested.provider_scope_exclusion" "$provider_calls" '
+    all(.calls[] | select(.kind == "chat") | .normalized_messages[];
+      (.content | contains("fy2026") | not)
+      and (.content | contains("release-152") | not)
+      and (.content | contains("credential-management") | not)
+      and (.content | contains("firefox") | not)
+      and (.content | contains("scope_refs") | not)
+      and (.content | contains("time_scope_ref") | not)
+      and (.content | contains("version_scope_ref") | not)
+      and (.content | contains("domain_scope_ref") | not)
+      and (.content | contains("project_scope_ref") | not)
+    )
+  '
+  assert_jq "scope.requested.response_scope_exclusion" "$response" '
+    (.answer | contains("fy2026") | not)
+    and (.answer | contains("release-152") | not)
+    and (.answer | contains("credential-management") | not)
+    and (.answer | contains("firefox") | not)
+    and (.answer | contains("scope_refs") | not)
+    and (.answer | contains("time_scope_ref") | not)
+    and (.answer | contains("version_scope_ref") | not)
+    and (.answer | contains("domain_scope_ref") | not)
+    and (.answer | contains("project_scope_ref") | not)
+  '
   assert_jq "scope.requested.dsa_sources" "$audit" '
     ([.[] | select(.operation == "context_pack" and .source_ids == ["records_primary"])] | length) == 1
   '
@@ -3401,9 +3425,14 @@ run_evidence_scope_reference_scenarios() {
   assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
     "$declared_scope" "records_primary"
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")"
+  serialized="$(jq -c . <<<"$response")$(jq -c '
+    del(
+      .prompt.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
+      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition
+    )
+  ' <<<"$trace")"
   case "$serialized" in
-    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*evidence_excerpts*|*The\ migration\ record\ confirms*)
+    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*conclusion_disposition*|*evidence_excerpts*|*The\ migration\ record\ confirms*)
       echo "Assertion failed: scope.privacy.suppression" >&2
       return 1
       ;;
@@ -3415,9 +3444,14 @@ run_evidence_scope_reference_scenarios() {
     "scope.privacy.history"
   history="$HISTORY_RESPONSE"
   history_trace="$HISTORY_TRACE"
-  serialized="$(jq -c . <<<"$history")$(jq -c . <<<"$history_trace")"
+  serialized="$(jq -c . <<<"$history")$(jq -c '
+    del(
+      .prompt.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
+      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition
+    )
+  ' <<<"$history_trace")"
   case "$serialized" in
-    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*evidence_excerpts*)
+    *fy2026*|*release-152*|*credential-management*|*firefox*|*records_primary*|*google_sheets:*|*conclusion_disposition*|*evidence_excerpts*)
       echo "Assertion failed: scope.privacy.history_suppression" >&2
       return 1
       ;;
