@@ -76,7 +76,7 @@ jobs:
           git -C cognitive-runtime branch --force main d814a0d2789269383e81db037d464cf821c6502d
           git -C data-source-aggregator branch --force main e23f582e4aac32a12c7ad3c71278fc21e5697ea4
           git -C basic-memory-store branch --force main 774a49882729ab3d06b88c5b2eff79cfe5ce54e7
-          git -C chat-orchestrator merge-base --is-ancestor f537a869f9c1eb2f9425856943e2779dc19153ca HEAD
+          git -C chat-orchestrator merge-base --is-ancestor db8d4208595778cbe7a138e9001ef32f6f2e213e HEAD
 
       - name: Validate Compose configuration
         working-directory: chat-orchestrator

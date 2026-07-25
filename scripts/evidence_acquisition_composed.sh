@@ -3253,8 +3253,12 @@ run_evidence_scope_reference_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   assert_jq "scope.malformed.response_status" "$response" '.status == "ok"'
+  assert_jq "scope.malformed.response_limitation" "$response" '
+    ([.answer | scan("Limitation: the configured source inventory was partial, so optional source coverage remains incomplete\\.")] | length) == 1
+  '
   assert_jq "scope.malformed.response_boundary" "$response" '
-    .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
+    ([.answer | scan("This reflects only the targeted sources checked, not a complete search of every possible source\\.")] | length) == 1
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
   '
   assert_jq "scope.malformed.inventory" "$manifest" '
     .inventory.inventory_status == "partial"
@@ -3264,14 +3268,29 @@ run_evidence_scope_reference_scenarios() {
   assert_jq "scope.malformed.plan" "$manifest" \
     '.plan.plan_status == "ready_with_limitations"'
   assert_jq "scope.malformed.acquisition" "$manifest" \
-    '.acquisition.sources_selected == ["records_primary"]'
+    '.acquisition.sources_selected == ["records_primary"]
+    and ([.acquisition.requirement_facts[] | select(
+      .requirement_id == "optional-selected-source-coverage"
+      and .outcome == "partial"
+    )] | length) == 1'
   assert_jq "scope.malformed.sufficiency" "$manifest" \
     '.sufficiency.status == "sufficient_with_limitations"'
   assert_jq "scope.malformed.next_step" "$manifest" '
     .next_steps.selections[0].selected_next_step == "provide_qualified_partial_answer"
+    and .next_steps.selections[0].conclusion_disposition == "qualified_partial_only"
+    and .next_steps.selections[0].provider_disposition == "allowed"
   '
-  assert_jq "scope.malformed.provider" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_jq "scope.malformed.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
+  '
+  assert_jq "scope.malformed.dispatch" "$trace" '
+    .fallback.triggered == false
+    and (.model_calls | length) == 1
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "valid"
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+  '
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_jq "scope.malformed.dsa_sources" "$audit" '
     ([.[] | select(.operation == "context_pack" and .source_ids == ["records_primary"])] | length) == 1

@@ -9,7 +9,7 @@ COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="774a49882729ab3d06b88c5b2eff79cfe5ce54e7"
 CR_COMMIT="d814a0d2789269383e81db037d464cf821c6502d"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="f537a869f9c1eb2f9425856943e2779dc19153ca"
+CO_COMMIT="db8d4208595778cbe7a138e9001ef32f6f2e213e"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
