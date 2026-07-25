@@ -93,7 +93,7 @@ The evidence topology pins the merged trusted-scope DSA producer at
 `e23f582e4aac32a12c7ad3c71278fc21e5697ea4` and requires Chat Orchestrator to
 contain the merged policy-owned evidence-answer boundary at
 `db8d4208595778cbe7a138e9001ef32f6f2e213e`, including the merged partial-inventory
-sufficiency correction from PR #93. The disposable DSA configuration
+sufficiency correction. The disposable DSA configuration
 contains operator-owned material scope references for selected sources; those
 values are emitted by the real DSA inventory and are never manufactured by the
 external-source fixture.
