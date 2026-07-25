@@ -89,6 +89,15 @@ connector; it does not produce DSA envelopes, plans, sufficiency decisions,
 manifests, traces, or policy responses. Service authentication and normal
 owner/conversation scope remain enabled.
 
+The evidence topology pins the merged trusted-scope DSA producer at
+`e23f582e4aac32a12c7ad3c71278fc21e5697ea4` and requires Chat Orchestrator to
+contain the merged policy-owned evidence-answer boundary at
+`db8d4208595778cbe7a138e9001ef32f6f2e213e`, including the merged partial-inventory
+sufficiency correction. The disposable DSA configuration
+contains operator-owned material scope references for selected sources; those
+values are emitted by the real DSA inventory and are never manufactured by the
+external-source fixture.
+
 Run only the focused evidence-acquisition proof with:
 
 ```bash
@@ -105,12 +114,41 @@ Positive records are created through the normal CO and BMS lifecycle. SQL reads 
 used only to confirm durability; the two fail-closed history cases corrupt an
 already-valid retained trace after that lifecycle has completed.
 
+Two focused final selectors are also available:
+
+```bash
+EVIDENCE_ACQUISITION_ONLY=1 EVIDENCE_SCENARIO=scope-references make composed-smoke
+EVIDENCE_ACQUISITION_ONLY=1 EVIDENCE_SCENARIO=structured-answer-recovery make composed-smoke
+```
+
+`scope-references` exercises requested conjunctive narrowing, unanimous
+unrequested derivation, missing material time scope, disabled malformed producer
+metadata, selector mismatch, and privacy suppression through the real DSA and CR
+contracts. `structured-answer-recovery` first retains the existing adversarial
+provider family, then proves valid supports and does-not-support candidates plus
+strict rejection of extra fields, non-extractive excerpts, and semantically
+distinct universal, absence, contradiction, and full-compliance attempts. Its
+history checks confirm that provider JSON, excerpts, malformed wording, validation
+internals, and hidden scope metadata are not reconstructed.
+
+Normal pull-request validation uses `all`: it runs every established focused
+scenario, both final recovery families, and only then the complete composed-smoke
+regression. Standalone dispatches are diagnostic supplements and do not replace
+that normal sequence.
+
 The focused fixture never contacts Google or another mutable source system. Source
 configuration, dummy non-secret credential structure, DSA audit state, CR state,
 PostgreSQL data, and Qdrant data are disposable and removed during cleanup. A
 failed hosted run may upload only filtered service lifecycle/access lines and
 container status; full prompts, provider text, source content, credentials, and raw
 exceptions are excluded.
+
+Permanent scenario output is limited to fixed completion markers, exact bounded
+counts, and stable assertion labels. Privacy cases must not print material scope
+values, source identifiers or references, excerpts, candidate JSON, full prompts,
+provider responses, or unrestricted dependency errors. This validation proves
+runtime behavior only; project conformance remains subject to its separate
+review process.
 
 ## Artifact composed smoke check
 
