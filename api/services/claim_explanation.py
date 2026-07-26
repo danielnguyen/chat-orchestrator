@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
@@ -63,6 +64,17 @@ _QUOTED_COMPOUND_ACQUISITION_INTENT_RE = re.compile(
 )
 _PARAGRAPH_SEPARATOR = re.compile(r"\r?\n[ \t]*\r?\n")
 _RESPONSE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_CLASSIFIER_MAX_CHARACTERS = 320
+_CLASSIFIER_MAX_WORDS = 48
+_HISTORY_CLASSIFIER_INTENTS = {
+    "not_history_followup",
+    "support_explanation",
+    "acquisition_checked",
+    "acquisition_coverage",
+    "acquisition_gaps",
+    "new_verification_request",
+    "ambiguous_history_followup",
+}
 
 _TARGET_UNAVAILABLE = (
     "I can’t safely identify which earlier statement you mean from the supplied "
@@ -290,6 +302,128 @@ class AcquisitionHistoryResolveResponse(BaseModel):
         return self
 
 
+class HistoryFollowupClassifierOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    intent: Literal[
+        "not_history_followup",
+        "support_explanation",
+        "acquisition_checked",
+        "acquisition_coverage",
+        "acquisition_gaps",
+        "new_verification_request",
+        "ambiguous_history_followup",
+    ]
+    confidence: float = Field(ge=0.0, le=1.0)
+    target_mode: Literal["immediate_previous", "explicit_reference"]
+    new_verification_requested: bool
+
+    @model_validator(mode="after")
+    def validate_consistency(self):
+        if self.intent == "new_verification_request" and not self.new_verification_requested:
+            raise ValueError("new_verification_intent_requires_explicit_request")
+        if (
+            self.intent in {"not_history_followup", "ambiguous_history_followup"}
+            and self.new_verification_requested
+        ):
+            raise ValueError("nonactionable_intent_forbids_verification")
+        return self
+
+
+class ImmediateHistoryRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    record_kind: Literal["support", "acquisition"]
+    assistant_message_id: Identifier
+    original_request_id: Identifier
+    support_record: ClaimRecord | None = None
+    acquisition_record: AcquisitionHistoryResolvedRecord | None = None
+
+    @model_validator(mode="after")
+    def validate_record_kind(self):
+        if self.record_kind == "support":
+            if self.support_record is None or self.acquisition_record is not None:
+                raise ValueError("support_immediate_record_invalid")
+        elif self.acquisition_record is None or self.support_record is not None:
+            raise ValueError("acquisition_immediate_record_invalid")
+        return self
+
+
+class ImmediateHistoryResolveResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["immediate-history-resolution.v1"]
+    request_id: Identifier
+    owner_id: Identifier
+    conversation_id: Identifier
+    surface: Annotated[str, Field(min_length=1, max_length=64)]
+    explanation_kind: Literal["support", "acquisition"]
+    resolution_status: Literal[
+        "resolved", "no_record", "ambiguous", "invalid", "unavailable"
+    ]
+    match_count: int = Field(ge=0, le=2)
+    reason_code: Literal[
+        "support_record_resolved",
+        "acquisition_record_resolved",
+        "immediate_response_not_found",
+        "immediate_response_invalid",
+        "support_record_not_found",
+        "support_record_ambiguous",
+        "support_record_invalid",
+        "acquisition_record_not_found",
+        "acquisition_record_invalid",
+        "history_store_unavailable",
+    ]
+    record: ImmediateHistoryRecord | None = None
+
+    @model_validator(mode="after")
+    def validate_resolution(self):
+        allowed_reasons = {
+            "resolved": {
+                "support": {"support_record_resolved"},
+                "acquisition": {"acquisition_record_resolved"},
+            },
+            "no_record": {
+                "support": {"immediate_response_not_found", "support_record_not_found"},
+                "acquisition": {
+                    "immediate_response_not_found",
+                    "acquisition_record_not_found",
+                },
+            },
+            "ambiguous": {
+                "support": {"support_record_ambiguous"},
+                "acquisition": set(),
+            },
+            "invalid": {
+                "support": {"immediate_response_invalid", "support_record_invalid"},
+                "acquisition": {
+                    "immediate_response_invalid",
+                    "acquisition_record_invalid",
+                },
+            },
+            "unavailable": {
+                "support": {"history_store_unavailable"},
+                "acquisition": {"history_store_unavailable"},
+            },
+        }
+        if self.reason_code not in allowed_reasons[self.resolution_status][
+            self.explanation_kind
+        ]:
+            raise ValueError("immediate_history_reason_inconsistent")
+        if self.resolution_status == "resolved":
+            if (
+                self.record is None
+                or self.match_count != 1
+                or self.record.record_kind != self.explanation_kind
+            ):
+                raise ValueError("resolved_immediate_history_record_required")
+        elif self.record is not None:
+            raise ValueError("unresolved_immediate_history_record_forbidden")
+        if self.resolution_status == "ambiguous" and self.match_count != 2:
+            raise ValueError("ambiguous_immediate_history_match_count_invalid")
+        return self
+
+
 @dataclass(frozen=True)
 class ClaimExplanationIntent:
     mode: Literal["latest", "quoted_anchor"]
@@ -311,6 +445,151 @@ class ClaimExplanationOutcome:
 
 def normalize_text(value: str) -> str:
     return " ".join(value.split())
+
+
+def history_classifier_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "history_followup_classification",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "enum": sorted(_HISTORY_CLASSIFIER_INTENTS),
+                    },
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "target_mode": {
+                        "type": "string",
+                        "enum": ["immediate_previous", "explicit_reference"],
+                    },
+                    "new_verification_requested": {"type": "boolean"},
+                },
+                "required": [
+                    "intent",
+                    "confidence",
+                    "target_mode",
+                    "new_verification_requested",
+                ],
+            },
+        },
+    }
+
+
+def parse_history_classifier_completion(value: Any) -> dict[str, Any]:
+    allowed_fields = {
+        "choices",
+        "usage",
+        "id",
+        "object",
+        "created",
+        "model",
+        "system_fingerprint",
+    }
+    if not isinstance(value, dict) or set(value) - allowed_fields:
+        raise ValueError("classifier_completion_invalid")
+    choices = value.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError("classifier_choices_invalid")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise ValueError("classifier_choice_invalid")
+    message = choice.get("message")
+    if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
+        raise ValueError("classifier_tool_call_forbidden")
+    if message.get("refusal") not in (None, ""):
+        raise ValueError("classifier_refusal_invalid")
+    if set(message) - {"role", "content", "refusal", "tool_calls"}:
+        raise ValueError("classifier_message_invalid")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("classifier_content_invalid")
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("classifier_json_invalid") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("classifier_json_object_required")
+    output = HistoryFollowupClassifierOutput.model_validate(decoded)
+    return {"source": "classifier", **output.model_dump()}
+
+
+def deterministic_history_followup_candidate(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    normalized = normalize_text(value).casefold()
+    if normalized.endswith(("?", ".")):
+        normalized = normalized[:-1].rstrip()
+    if normalized in {"verify that again", "check that again"}:
+        return {
+            "source": "deterministic",
+            "intent": "new_verification_request",
+            "confidence": 1.0,
+            "target_mode": "immediate_previous",
+            "new_verification_requested": True,
+        }
+    intent = parse_claim_explanation_intent(value)
+    if intent is None or intent.mode != "latest":
+        return None
+    if intent.explanation_kind == "support":
+        history_intent = "support_explanation"
+    else:
+        history_intent = {
+            "checked": "acquisition_checked",
+            "coverage": "acquisition_coverage",
+            "gaps": "acquisition_gaps",
+        }[intent.acquisition_question or "checked"]
+    return {
+        "source": "deterministic",
+        "intent": history_intent,
+        "confidence": 1.0,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": intent.new_verification_requested,
+    }
+
+
+def classifier_eligible_history_followup(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = normalize_text(value)
+    if (
+        not text
+        or len(text) > _CLASSIFIER_MAX_CHARACTERS
+        or len(text.split()) > _CLASSIFIER_MAX_WORDS
+    ):
+        return False
+    normalized = text.casefold()
+    if re.search(r"\b(?:should\s+(?:i|we|you)|how\s+(?:do|can)\s+i)\b", normalized):
+        return False
+    if re.search(r"\bwhat\s+did\s+(?!you\b)[a-z][a-z'-]*\s+(?:check|review|examine)", normalized):
+        return False
+    deictic = re.search(
+        r"\b(?:that|this|previous|earlier|prior|your answer|this answer|that answer|conclusion)\b",
+        normalized,
+    ) is not None
+    second_person = re.search(
+        r"\b(?:you|your)\b",
+        normalized,
+    ) is not None
+    concept = re.search(
+        r"\b(?:support|supported|basis|based|evidence|source|sources|sure|"
+        r"conclusion|record|records|check|checked|review|reviewed|examine|examined|"
+        r"consult|consulted|cover|covered|everything|miss|missed|skip|skipped|gap|"
+        r"gaps|verify|verification|recheck)\b",
+        normalized,
+    ) is not None
+    interrogative = (
+        "?" in text
+        or re.match(
+            r"^(?:how|what|where|which|did|do|can|could|would|anything|was|were)\b",
+            normalized,
+        )
+        is not None
+    )
+    return bool(interrogative and concept and (deictic or second_person))
 
 
 def parse_claim_explanation_intent(value: Any) -> ClaimExplanationIntent | None:
@@ -506,6 +785,9 @@ def _render(record: ClaimRecord) -> str:
     evidence_wording = {
         "derived_text": "one retained file excerpt",
         "artifact": "one retained file record",
+        "external_source": "one governed external-source record",
+        "tool_output": "one retained tool result",
+        "integration_event": "one retained integration event",
     }[evidence_type]
     sentences = [
         (
@@ -546,11 +828,28 @@ def _record_support_status(
     if len(record.validated_evidence_references) != 1:
         return "unsupported"
     reference = record.validated_evidence_references[0]
+    supported_reference = (
+        reference.ref_type in {"artifact", "derived_text"}
+        and reference.authority == "user_report"
+        and record.strongest_authority == "user_report"
+    ) or (
+        reference.ref_type == "external_source"
+        and reference.authority
+        in {
+            "peer_reviewed_evidence",
+            "clinical_guidance",
+            "manufacturer_guidance",
+            "trusted_integration",
+        }
+        and record.strongest_authority == reference.authority
+    ) or (
+        reference.ref_type in {"tool_output", "integration_event"}
+        and reference.authority in {"tool_output", "trusted_integration"}
+        and record.strongest_authority == reference.authority
+    )
     if (
-        reference.ref_type not in {"artifact", "derived_text"}
+        not supported_reference
         or reference.support_kind != "direct"
-        or reference.authority != "user_report"
-        or record.strongest_authority != "user_report"
         or reference.owner_id != owner_id
         or reference.conversation_id not in {None, conversation_id}
     ):
@@ -1894,6 +2193,208 @@ async def _resolve_acquisition_explanation(
         ),
         new_verification_requested=intent.new_verification_requested,
         verification_target=(target if intent.new_verification_requested else None),
+    )
+
+
+def _immediate_history_trace(
+    *,
+    explanation_kind: str,
+    acquisition_question: str | None,
+    resolution_status: str,
+    reason_code: str,
+    render_status: str,
+    resolved_record_kind: str | None = None,
+    manifest_projection_status: str = "not_applicable",
+    manifest_projection_reason: str = "not_applicable",
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "intent_status": "matched",
+        "explanation_kind": explanation_kind,
+        "acquisition_question": acquisition_question,
+        "target_mode": "immediate_previous",
+        "lookup_status": "completed",
+        "resolution_status": resolution_status,
+        "reason_code": reason_code,
+        "render_status": render_status,
+        "resolved_record_kind": resolved_record_kind,
+        "manifest_projection_status": manifest_projection_status,
+        "manifest_projection_reason": manifest_projection_reason,
+        "storage_call_count": 1,
+        "provider_call_count": 0,
+        "privacy_suppression_applied": True,
+    }
+
+
+def _immediate_history_fallback_answer(explanation_kind: str, status: str) -> str:
+    if explanation_kind == "support":
+        return {
+            "no_record": _NO_RECORD,
+            "ambiguous": _AMBIGUOUS,
+            "invalid": _INVALID_RECORD,
+            "unavailable": _DEPENDENCY_UNAVAILABLE,
+        }.get(status, _DEPENDENCY_UNAVAILABLE)
+    return {
+        "no_record": _ACQUISITION_RESOLUTION_NO_RECORD,
+        "ambiguous": _ACQUISITION_RESOLUTION_AMBIGUOUS,
+        "invalid": _ACQUISITION_RESOLUTION_INVALID,
+        "unavailable": _ACQUISITION_RESOLUTION_UNAVAILABLE,
+    }.get(status, _ACQUISITION_RESOLUTION_UNAVAILABLE)
+
+
+async def resolve_immediate_claim_explanation(
+    *,
+    policy: dict[str, Any],
+    memory_store: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> ClaimExplanationOutcome:
+    explanation_kind = policy["explanation_kind"]
+    acquisition_question = policy.get("acquisition_question")
+    try:
+        payload = await memory_store.resolve_immediate_history(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            explanation_kind=explanation_kind,
+        )
+        response = ImmediateHistoryResolveResponse.model_validate(payload)
+        expected_scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "explanation_kind": explanation_kind,
+        }
+        if any(getattr(response, key) != value for key, value in expected_scope.items()):
+            raise ValueError("immediate_history_scope_mismatch")
+    except Exception:
+        return ClaimExplanationOutcome(
+            handled=True,
+            answer=_immediate_history_fallback_answer(explanation_kind, "unavailable"),
+            status="degraded",
+            trace=_immediate_history_trace(
+                explanation_kind=explanation_kind,
+                acquisition_question=acquisition_question,
+                resolution_status="unavailable",
+                reason_code="history_store_unavailable",
+                render_status="not_attempted",
+            ),
+        )
+
+    if response.resolution_status != "resolved":
+        return ClaimExplanationOutcome(
+            handled=True,
+            answer=_immediate_history_fallback_answer(
+                explanation_kind, response.resolution_status
+            ),
+            status="degraded",
+            trace=_immediate_history_trace(
+                explanation_kind=explanation_kind,
+                acquisition_question=acquisition_question,
+                resolution_status=response.resolution_status,
+                reason_code=response.reason_code,
+                render_status="not_attempted",
+            ),
+        )
+
+    record = response.record
+    if record is None:
+        raise AssertionError("validated resolved immediate history requires a record")
+    verification_requested = bool(
+        policy.get("new_verification_requested")
+        and policy.get("new_verification_allowed_after_history_resolution")
+    )
+    answer: str | None = None
+    target: str | None = None
+    manifest_projection_status = "not_applicable"
+    manifest_projection_reason = "not_applicable"
+    if record.record_kind == "support" and record.support_record is not None:
+        support = record.support_record
+        if (
+            support.request_id == record.original_request_id
+            and support.assistant_message_id == record.assistant_message_id
+            and support.surface == surface
+            and _record_matches_scope(
+                support,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            and _record_support_status(
+                support,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            == "supported"
+        ):
+            answer = _render(support)
+            target = support.claim_anchor
+    elif record.record_kind == "acquisition" and record.acquisition_record is not None:
+        acquisition = record.acquisition_record
+        if (
+            acquisition.original_request_id == record.original_request_id
+            and acquisition.assistant_message_id == record.assistant_message_id
+            and acquisition.surface == surface
+            and acquisition.acquisition_manifest.get("assistant_message_id")
+            == record.assistant_message_id
+            and acquisition.acquisition_manifest.get("response_digest")
+            == acquisition.response_digest
+        ):
+            projection = _diagnose_acquisition_history_projection(
+                acquisition.acquisition_manifest
+            )
+            manifest_projection_reason = projection.reason
+            if projection.history is not None:
+                manifest_projection_status = "accepted"
+                answer = _render_acquisition(
+                    projection.history,
+                    acquisition_question or "checked",
+                )
+                target = acquisition.normalized_first_paragraph
+            else:
+                manifest_projection_status = "rejected"
+
+    if answer is None or target is None:
+        reason_code = (
+            "support_record_invalid"
+            if explanation_kind == "support"
+            else "acquisition_record_invalid"
+        )
+        return ClaimExplanationOutcome(
+            handled=True,
+            answer=_immediate_history_fallback_answer(explanation_kind, "invalid"),
+            status="degraded",
+            trace=_immediate_history_trace(
+                explanation_kind=explanation_kind,
+                acquisition_question=acquisition_question,
+                resolution_status="invalid",
+                reason_code=reason_code,
+                render_status="rejected",
+                manifest_projection_status=manifest_projection_status,
+                manifest_projection_reason=manifest_projection_reason,
+            ),
+        )
+    if verification_requested:
+        answer = _without_no_new_verification(answer)
+    return ClaimExplanationOutcome(
+        handled=True,
+        answer=answer,
+        status="ok",
+        trace=_immediate_history_trace(
+            explanation_kind=explanation_kind,
+            acquisition_question=acquisition_question,
+            resolution_status="resolved",
+            reason_code=response.reason_code,
+            render_status="completed",
+            resolved_record_kind=record.record_kind,
+            manifest_projection_status=manifest_projection_status,
+            manifest_projection_reason=manifest_projection_reason,
+        ),
+        new_verification_requested=verification_requested,
+        verification_target=target if verification_requested else None,
     )
 
 

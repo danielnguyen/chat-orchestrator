@@ -34,3 +34,8 @@ models:
     max_context_tokens: 200000
     avg_latency_bucket: slow
     cost_per_1k_tokens: 0.01
+
+logical_routes:
+  intent_classifier:
+    model: gpt-5-mini
+    provider: cloud

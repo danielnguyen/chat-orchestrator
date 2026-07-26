@@ -5,6 +5,25 @@ import pytest
 from clients.runtime import RuntimeClient
 
 
+def _history_policy(**overrides):
+    policy = {
+        "status": "accepted",
+        "intent": "support_explanation",
+        "candidate_source": "deterministic",
+        "target_mode": "immediate_previous",
+        "explanation_kind": "support",
+        "acquisition_question": None,
+        "history_lookup_allowed": True,
+        "new_verification_requested": False,
+        "new_verification_allowed_after_history_resolution": False,
+        "clarification_required": False,
+        "confidence_band": "high",
+        "reason_codes": ["deterministic_candidate_accepted"],
+    }
+    policy.update(overrides)
+    return policy
+
+
 def _status_error(path: str, status_code: int) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", f"http://runtime.local{path}")
     response = httpx.Response(status_code, request=request)
@@ -377,6 +396,126 @@ async def test_select_evidence_next_step_sends_one_bounded_follow_up_input():
     assert "proposed_acquisition_premise" not in calls[0][1]
 
 
+@pytest.mark.asyncio
+async def test_interaction_governance_sends_and_validates_history_candidate():
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+    candidate = {
+        "source": "deterministic",
+        "intent": "support_explanation",
+        "confidence": 1.0,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": False,
+    }
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return {
+            "request_id": "rid-history",
+            "owner_id": "owner",
+            "conversation_id": "conv",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {"history_followup_policy": _history_policy()},
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+    await client.evaluate_interaction_governance(
+        request_id="rid-history",
+        owner_id="owner",
+        conversation_id="conv",
+        surface="dev",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        current_user_text="How are you sure?",
+        history_followup_candidate=candidate,
+    )
+
+    assert calls == [
+        (
+            "/v1/runtime/interaction-governance/evaluate",
+            {
+                "request_id": "rid-history",
+                "owner_id": "owner",
+                "conversation_id": "conv",
+                "surface": "dev",
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "current_user_text": "How are you sure?",
+                "history_followup_candidate": candidate,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "request_id": "rid-history",
+            "owner_id": "wrong-owner",
+            "conversation_id": "conv",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {"history_followup_policy": _history_policy()},
+        },
+        {
+            "request_id": "rid-history",
+            "owner_id": "owner",
+            "conversation_id": "conv",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "history_followup_policy": _history_policy(
+                    record_id="forbidden-record"
+                )
+            },
+        },
+        {
+            "request_id": "rid-history",
+            "owner_id": "owner",
+            "conversation_id": "conv",
+            "surface": "dev",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "history_followup_policy": _history_policy(
+                    history_lookup_allowed=False
+                )
+            },
+        },
+    ],
+)
+async def test_interaction_governance_rejects_mismatched_or_malformed_history_policy(
+    response,
+):
+    client = RuntimeClient("http://runtime.local", None)
+
+    async def fake_post(path, *, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="history_followup_policy_response"):
+        await client.evaluate_interaction_governance(
+            request_id="rid-history",
+            owner_id="owner",
+            conversation_id="conv",
+            surface="dev",
+            runtime_session_id="rtsession_1",
+            runtime_turn_id="rtturn_1",
+            current_user_text="How are you sure?",
+            history_followup_candidate={
+                "source": "deterministic",
+                "intent": "support_explanation",
+                "confidence": 1.0,
+                "target_mode": "immediate_previous",
+                "new_verification_requested": False,
+            },
+        )
 @pytest.mark.asyncio
 async def test_compile_companion_policy_prefers_profile_endpoint_then_falls_back_on_404():
     client = RuntimeClient("http://runtime.local", None)

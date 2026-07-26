@@ -43,6 +43,7 @@ from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,
+    _load_logical_route,
     _registry_allows_exact_capability,
     _relationship_projection_allows,
     _resolve_capability_continuation_policy,
@@ -17634,6 +17635,7 @@ def _assert_compound_claim_capture_excluded(trace):
     ("provider_content", "case_id"),
     [
         ("Original acquisition:\nPRIVATE-LABEL-CONTENT", "original"),
+        ("Original support:\nPRIVATE-LABEL-CONTENT", "original-support"),
         ("New verification:\nPRIVATE-LABEL-CONTENT", "verification"),
         ("New verification attempt:\nPRIVATE-LABEL-CONTENT", "attempt"),
         ("New verification unavailable:\nPRIVATE-LABEL-CONTENT", "unavailable"),
@@ -25172,3 +25174,805 @@ async def test_orchestrate_malformed_required_bundle_still_fails(tmp_path):
             request_id="rid-retrieval-diagnostics-malformed-required",
         )
     assert memory_store.trace_calls == []
+
+
+def _write_history_route_files(tmp_path, *, model="gpt-5-mini", provider="cloud"):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n"
+        "logical_routes:\n"
+        "  intent_classifier:\n"
+        f"    model: {model}\n"
+        f"    provider: {provider}\n",
+        encoding="utf-8",
+    )
+    return rules, models
+
+
+def _history_policy_for(candidate, *, status="accepted"):
+    projection = {
+        "support_explanation": ("support", None),
+        "acquisition_checked": ("acquisition", "checked"),
+        "acquisition_coverage": ("acquisition", "coverage"),
+        "acquisition_gaps": ("acquisition", "gaps"),
+        "new_verification_request": ("support", None),
+    }.get(candidate["intent"], (None, None))
+    policy = {
+        "status": status,
+        "intent": candidate["intent"],
+        "candidate_source": candidate["source"],
+        "target_mode": candidate["target_mode"],
+        "explanation_kind": projection[0],
+        "acquisition_question": projection[1],
+        "history_lookup_allowed": status == "accepted",
+        "new_verification_requested": candidate["new_verification_requested"],
+        "new_verification_allowed_after_history_resolution": (
+            status == "accepted" and candidate["new_verification_requested"]
+        ),
+        "clarification_required": status == "clarification_required",
+        "confidence_band": (
+            "high"
+            if (
+                status == "clarification_required"
+                and candidate["intent"] == "ambiguous_history_followup"
+            )
+            else "medium"
+            if status == "clarification_required"
+            else "low"
+            if status == "rejected"
+            else "high"
+        ),
+        "reason_codes": [
+            {
+                "accepted": (
+                    "deterministic_candidate_accepted"
+                    if candidate["source"] == "deterministic"
+                    else "classifier_candidate_accepted"
+                ),
+                "clarification_required": (
+                    "ambiguous_candidate"
+                    if candidate["intent"] == "ambiguous_history_followup"
+                    else "classifier_confidence_requires_clarification"
+                ),
+                "rejected": "classifier_confidence_rejected",
+                "not_applicable": "not_history_candidate",
+                "explicit_reference": "explicit_reference_routed",
+            }[status]
+        ],
+    }
+    if status != "accepted":
+        policy["history_lookup_allowed"] = False
+        policy["new_verification_allowed_after_history_resolution"] = False
+    if status == "explicit_reference":
+        policy["target_mode"] = "explicit_reference"
+    return policy
+
+
+class HistoryPolicyRuntime(FakeRuntime):
+    def __init__(self, *, policy_status="accepted"):
+        super().__init__()
+        self.policy_status = policy_status
+
+    async def evaluate_interaction_governance(self, **kwargs):
+        self.interaction_governance_calls.append(copy.deepcopy(kwargs))
+        candidate = kwargs.get("history_followup_candidate")
+        result = {
+            "interaction_kind": "question",
+            "tension_level": "low",
+            "literal_command_confidence": 0.1,
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "clarifying_question_allowed": True,
+            "action_allowed": False,
+            "requires_confirmation": False,
+            "persona_scope_hint": None,
+            "privacy_sensitivity_hint": "normal",
+            "response_posture": "direct",
+            "confidence": 0.9,
+            "reason_summary": ["question_markers"],
+        }
+        if candidate is not None:
+            result["history_followup_policy"] = _history_policy_for(
+                candidate,
+                status=self.policy_status,
+            )
+        return {
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "surface": kwargs["surface"],
+            "runtime_session_id": kwargs.get("runtime_session_id"),
+            "runtime_turn_id": kwargs.get("runtime_turn_id"),
+            "result": result,
+        }
+
+
+def _history_support_record():
+    anchor = "The retained record supports the conclusion."
+    return {
+        "claim_id": "claim-private-id",
+        "schema_version": "claim-record.v1",
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "request_id": "original-private-request",
+        "assistant_message_id": "assistant-private-message",
+        "surface": "node_red",
+        "runtime_session_id": "runtime-private-session",
+        "runtime_turn_id": "runtime-private-turn",
+        "acquisition_manifest_id": None,
+        "claim_anchor": anchor,
+        "claim_anchor_digest": "sha256:" + hashlib.sha256(anchor.encode()).hexdigest(),
+        "claim_class": "source_backed_fact",
+        "calibration_status": "supported",
+        "evidence_strength": "moderate",
+        "confidence": "high",
+        "strongest_authority": "trusted_integration",
+        "freshness_summary": "current",
+        "uncertainty_disclosure_required": False,
+        "validated_evidence_references": [
+            {
+                "ref_type": "external_source",
+                "ref_id": "private-source:record-1",
+                "owner_id": "owner",
+                "conversation_id": None,
+                "support_kind": "direct",
+                "authority": "trusted_integration",
+                "freshness_state": "active",
+            }
+        ],
+        "limitation_codes": ["single_source"],
+        "user_safe_summary": "PRIVATE RAW SUMMARY",
+        "created_at": "2026-07-26T00:00:00Z",
+    }
+
+
+class ImmediateHistoryMemoryStore(FakeMemoryStore):
+    def __init__(self, *, resolve_support=True, routing_policy=None):
+        super().__init__()
+        self.immediate_history_calls = []
+        self.resolve_support = resolve_support
+        self.history_routing_policy = routing_policy
+
+    async def resolve_profile(self, **kwargs):
+        profile = await super().resolve_profile(**kwargs)
+        if self.history_routing_policy is not None:
+            profile["routing_policy"] = copy.deepcopy(self.history_routing_policy)
+        return profile
+
+    async def resolve_immediate_history(self, **kwargs):
+        self.immediate_history_calls.append(copy.deepcopy(kwargs))
+        kind = kwargs["explanation_kind"]
+        response = {
+            "schema_version": "immediate-history-resolution.v1",
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "surface": kwargs["surface"],
+            "explanation_kind": kind,
+            "resolution_status": "no_record",
+            "match_count": 0,
+            "reason_code": (
+                "support_record_not_found"
+                if kind == "support"
+                else "acquisition_record_not_found"
+            ),
+            "record": None,
+        }
+        if kind == "support" and self.resolve_support:
+            response.update(
+                resolution_status="resolved",
+                match_count=1,
+                reason_code="support_record_resolved",
+                record={
+                    "record_kind": "support",
+                    "assistant_message_id": "assistant-private-message",
+                    "original_request_id": "original-private-request",
+                    "support_record": _history_support_record(),
+                    "acquisition_record": None,
+                },
+            )
+        return response
+
+
+async def _run_history_followup(
+    tmp_path,
+    *,
+    text,
+    completion=None,
+    policy_status="accepted",
+    payload_overrides=None,
+    model="gpt-5-mini",
+    provider="cloud",
+    routing_policy=None,
+    litellm_override=None,
+):
+    rules, models = _write_history_route_files(
+        tmp_path,
+        model=model,
+        provider=provider,
+    )
+    memory_store = ImmediateHistoryMemoryStore(routing_policy=routing_policy)
+    runtime = HistoryPolicyRuntime(policy_status=policy_status)
+    litellm = litellm_override or FakeLiteLLM(completion=completion)
+    payload = _first_party_chat_payload(
+        text,
+        conversation_id="conv-1",
+        messages=[{"role": "user", "content": text}],
+    )
+    payload.update(payload_overrides or {})
+    result = await orchestrate_chat(
+        payload=payload,
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        history_followup_enabled=True,
+        request_id="request-history-followup",
+    )
+    return result, memory_store, runtime, litellm
+
+
+def _classifier_completion(intent, *, confidence=0.91, target="immediate_previous", verify=False):
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "intent": intent,
+                            "confidence": confidence,
+                            "target_mode": target,
+                            "new_verification_requested": verify,
+                        }
+                    )
+                }
+            }
+        ]
+    }
+
+
+def test_intent_classifier_logical_route_is_closed_and_configurable(tmp_path):
+    _, cloud = _write_history_route_files(tmp_path)
+    assert _load_logical_route(str(cloud), "intent_classifier") == {
+        "model": "gpt-5-mini",
+        "provider": "cloud",
+    }
+    _, local = _write_history_route_files(
+        tmp_path,
+        model="local-intent-model",
+        provider="local",
+    )
+    assert _load_logical_route(str(local), "intent_classifier") == {
+        "model": "local-intent-model",
+        "provider": "local",
+    }
+    local.write_text("models: {}\nlogical_routes: {}\n", encoding="utf-8")
+    assert _load_logical_route(str(local), "intent_classifier") is None
+    local.write_text(
+        "models: {}\nlogical_routes:\n  intent_classifier:\n    model: x\n    provider: other\n",
+        encoding="utf-8",
+    )
+    assert _load_logical_route(str(local), "intent_classifier") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "intent", "kind"),
+    [
+        ("How are you sure?", "support_explanation", "support"),
+        ("What did you check?", "acquisition_checked", "acquisition"),
+        ("Did you look at everything relevant?", "acquisition_coverage", "acquisition"),
+        ("What might you have missed?", "acquisition_gaps", "acquisition"),
+    ],
+)
+async def test_canonical_history_uses_zero_classifier_and_one_immediate_lookup(
+    tmp_path, text, intent, kind
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text=text,
+    )
+
+    assert result["selected_model"] == "not_called"
+    assert litellm.calls == []
+    assert len(runtime.interaction_governance_calls) == 2
+    candidate = runtime.interaction_governance_calls[1]["history_followup_candidate"]
+    assert candidate["source"] == "deterministic"
+    assert candidate["intent"] == intent
+    assert candidate["confidence"] == 1.0
+    assert len(memory_store.immediate_history_calls) == 1
+    assert memory_store.immediate_history_calls[0]["explanation_kind"] == kind
+    assert memory_store.retrieve_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+    assert trace["classifier_call_count"] == 0
+    assert trace["cr_history_policy_call_count"] == 1
+    assert trace["bms_call_count"] == 1
+    assert trace["answer_provider_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record(tmp_path):
+    text = "Where did that conclusion come from?"
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text=text,
+        completion=_classifier_completion("support_explanation"),
+    )
+
+    assert "governed external-source record" in result["answer"]
+    assert result["selected_model"] == "not_called"
+    assert len(litellm.calls) == 1
+    classifier_call = litellm.calls[0]
+    assert classifier_call["model"] == "gpt-5-mini"
+    assert classifier_call["messages"][-1] == {"role": "user", "content": text}
+    serialized_classifier = json.dumps(classifier_call, sort_keys=True)
+    for forbidden in (
+        "PRIVATE RAW SUMMARY",
+        "assistant-private-message",
+        "original-private-request",
+        "private-source:record-1",
+        "conv-1",
+        "owner",
+    ):
+        assert forbidden not in serialized_classifier
+    candidate = runtime.interaction_governance_calls[1]["history_followup_candidate"]
+    assert candidate == {
+        "source": "classifier",
+        "intent": "support_explanation",
+        "confidence": 0.91,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": False,
+    }
+    assert len(memory_store.immediate_history_calls) == 1
+    assert all(message["role"] == "user" for message in _first_party_chat_payload(text)["messages"])
+    protected = json.dumps(
+        (result, memory_store.trace_calls[-1]["payload"]),
+        sort_keys=True,
+    )
+    history_trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "history_followup"
+    ]
+    assert set(history_trace) == {
+        "feature_enabled",
+        "deterministic_match_status",
+        "classifier_eligibility",
+        "classifier_logical_route",
+        "classifier_call_count",
+        "classifier_status",
+        "candidate_source",
+        "candidate_intent",
+        "candidate_target_mode",
+        "confidence_band",
+        "cr_history_policy_call_count",
+        "cr_policy_status",
+        "history_lookup_allowed",
+        "clarification_required",
+        "explicit_verification_requested",
+        "verification_after_history_allowed",
+        "bms_call_count",
+        "bms_resolution_status",
+        "bms_reason_code",
+        "resolved_record_kind",
+        "render_status",
+        "fresh_verification_entry_status",
+        "answer_provider_call_count",
+    }
+    assert text not in protected
+    for forbidden in (
+        "PRIVATE RAW SUMMARY",
+        "assistant-private-message",
+        "original-private-request",
+        "private-source:record-1",
+    ):
+        assert forbidden not in protected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "intent", "verify"),
+    [
+        ("Where did that conclusion come from?", "support_explanation", False),
+        ("Which records did you look at?", "acquisition_checked", False),
+        ("Did you cover everything available?", "acquisition_coverage", False),
+        ("Anything you may have skipped?", "acquisition_gaps", False),
+        ("Can you verify that again now?", "new_verification_request", True),
+    ],
+)
+async def test_natural_history_paraphrase_matrix_calls_classifier_and_bms_once(
+    tmp_path, text, intent, verify
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text=text,
+        completion=_classifier_completion(intent, verify=verify),
+    )
+    assert result["selected_model"] == "not_called"
+    assert len(litellm.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 2
+    assert len(memory_store.immediate_history_calls) == 1
+    assert memory_store.retrieve_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What should I check on my car?",
+        "What did John check?",
+        "How do I verify a checksum?",
+        "Which records should I bring to the appointment?",
+        "What is the weather?",
+        "unrelated " * 60 + "evidence",
+    ],
+)
+async def test_negative_controls_do_not_classify_or_lookup_immediate_history(tmp_path, text):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text=text,
+    )
+
+    assert result["answer"] == "hello"
+    assert len(litellm.calls) == 1
+    assert "response_format" not in litellm.calls[0]
+    assert len(runtime.interaction_governance_calls) == 1
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "completion",
+    [
+        {"choices": [{"message": {"content": "not json"}}]},
+        {"choices": [{"message": {"content": "```json\n{}\n```"}}]},
+        _classifier_completion("unsupported_intent"),
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "intent": "support_explanation",
+                                "confidence": 0.9,
+                                "target_mode": "immediate_previous",
+                                "new_verification_requested": False,
+                                "record_id": "private",
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+    ],
+)
+async def test_classifier_failures_are_provider_free_clarifications(tmp_path, completion):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=completion,
+    )
+
+    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert len(litellm.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 1
+    assert memory_store.immediate_history_calls == []
+    assert memory_store.retrieve_calls == []
+    assert result["selected_model"] == "not_called"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout("classifier timed out"),
+        _http_status_error(503, {"error": "classifier unavailable"}),
+        RuntimeError("classifier client failed"),
+    ],
+)
+async def test_classifier_transport_failures_make_one_attempt_and_clarify(
+    tmp_path, error
+):
+    classifier = SequenceLiteLLM([error])
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        litellm_override=classifier,
+    )
+    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert len(litellm.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 1
+    assert memory_store.immediate_history_calls == []
+    assert memory_store.retrieve_calls == []
+    assert "classifier timed out" not in json.dumps(
+        memory_store.trace_calls[-1]["payload"], sort_keys=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_classifier_is_disallowed_by_local_only_but_local_route_is_allowed(
+    tmp_path,
+):
+    blocked, blocked_store, blocked_runtime, blocked_litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion("support_explanation"),
+        payload_overrides={"sensitivity": "local_only"},
+    )
+    assert blocked["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert blocked_litellm.calls == []
+    assert len(blocked_runtime.interaction_governance_calls) == 1
+    assert blocked_store.immediate_history_calls == []
+
+    allowed, allowed_store, allowed_runtime, allowed_litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion("support_explanation"),
+        payload_overrides={"sensitivity": "local_only"},
+        model="local-intent-model",
+        provider="local",
+    )
+    assert allowed["selected_model"] == "not_called"
+    assert len(allowed_litellm.calls) == 1
+    assert allowed_litellm.calls[0]["model"] == "local-intent-model"
+    assert len(allowed_runtime.interaction_governance_calls) == 2
+    assert len(allowed_store.immediate_history_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload_overrides", "routing_policy"),
+    [
+        ({}, {"local_only": True}),
+        (
+            {
+                "surface_context": {
+                    "surface_type": "node_red",
+                    "sensitivity_level": "highly_sensitive",
+                }
+            },
+            None,
+        ),
+        ({}, {"allowed_providers": ["local"]}),
+    ],
+)
+async def test_cloud_classifier_respects_profile_surface_and_provider_policy(
+    tmp_path, payload_overrides, routing_policy
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion("support_explanation"),
+        payload_overrides=payload_overrides,
+        routing_policy=routing_policy,
+    )
+    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert litellm.calls == []
+    assert len(runtime.interaction_governance_calls) == 1
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["unsupported", ""])
+async def test_malformed_classifier_route_fails_closed_without_provider_or_bms(
+    tmp_path, provider
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion("support_explanation"),
+        provider=provider,
+    )
+    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert litellm.calls == []
+    assert len(runtime.interaction_governance_calls) == 1
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+async def test_classifier_explicit_reference_without_exact_quote_clarifies_without_lookup(
+    tmp_path,
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="What supported the earlier answer?",
+        completion=_classifier_completion(
+            "support_explanation",
+            target="explicit_reference",
+        ),
+        policy_status="explicit_reference",
+    )
+    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert len(litellm.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 2
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("intent", "policy_status", "expected_clarification", "expected_calls"),
+    [
+        ("support_explanation", "clarification_required", True, 1),
+        ("ambiguous_history_followup", "clarification_required", True, 1),
+        ("support_explanation", "rejected", False, 2),
+        ("not_history_followup", "not_applicable", False, 2),
+    ],
+)
+async def test_cr_history_policy_dispositions_control_provider_free_handling(
+    tmp_path, intent, policy_status, expected_clarification, expected_calls
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion(intent),
+        policy_status=policy_status,
+    )
+    if expected_clarification:
+        assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+        assert result["selected_model"] == "not_called"
+    else:
+        assert result["selected_model"] == "gpt-4o-mini"
+    assert len(litellm.calls) == expected_calls
+    assert len(runtime.interaction_governance_calls) == 2
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_cr_history_policy_is_bounded_and_provider_free(tmp_path):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion("support_explanation"),
+        policy_status="malformed",
+    )
+    assert result["answer"] == orchestrate_service._HISTORY_POLICY_UNAVAILABLE
+    assert result["selected_model"] == "not_called"
+    assert len(litellm.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 2
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+async def test_quoted_exact_target_remains_classifier_free_and_uses_legacy_path(tmp_path):
+    text = 'What supports the statement "An earlier exact statement"?'
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text=text,
+    )
+    assert result["selected_model"] == "not_called"
+    assert litellm.calls == []
+    assert len(runtime.interaction_governance_calls) == 1
+    assert memory_store.immediate_history_calls == []
+
+
+@pytest.mark.asyncio
+async def test_feature_disabled_preserves_existing_history_behavior(tmp_path):
+    rules, models = _write_history_route_files(tmp_path)
+    memory_store = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    provider = FailingLiteLLM()
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "How are you sure?",
+            conversation_id="conv-1",
+            messages=[{"role": "user", "content": "How are you sure?"}],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        history_followup_enabled=False,
+        request_id="request-disabled-history",
+    )
+    assert result["answer"].startswith("I can’t safely identify which earlier statement")
+    assert memory_store.immediate_history_calls == []
+    assert len(runtime.interaction_governance_calls) == 1
+    assert provider.calls == []
+    assert "history_followup" not in memory_store.trace_calls[-1]["payload"]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_support_reverification_enters_existing_governed_path_once(tmp_path):
+    rules, models = _write_history_route_files(tmp_path)
+    memory_store = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    target = _history_support_record()["claim_anchor"]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    dsa = FakeDSA(response=_governed_context_pack(task_text))
+    classifier = _classifier_completion(
+        "new_verification_request",
+        verify=True,
+    )
+    provider = SequenceLiteLLM(
+        [
+            classifier,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": _evidence_candidate(
+                                (
+                                    "vehicle_log_primary:record_1",
+                                    "The maintenance record lists 2025-07-12.",
+                                )
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Can you verify that again now?",
+            conversation_id="conv-1",
+            external_context_enabled=True,
+            messages=[
+                {"role": "user", "content": "Can you verify that again now?"}
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        history_followup_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-support-reverification",
+    )
+
+    assert result["answer"].startswith("Original support:\n")
+    assert "\n\nNew verification:\n" in result["answer"]
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["model"] == "gpt-5-mini"
+    assert len(memory_store.immediate_history_calls) == 1
+    assert len(dsa.calls) == 1
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    trace = memory_store.trace_calls[-1]["payload"]
+    history = trace["prompt"]["history_followup"]
+    assert history["classifier_call_count"] == 1
+    assert history["answer_provider_call_count"] == 0
+    assert history["fresh_verification_entry_status"] == "entered_existing_governed_path"
+    assert len(trace["model_calls"]) == 1
+    assert trace["model_calls"][0]["model"] != "gpt-5-mini"
+    assert trace["prompt"]["claim_capture"]["reason_code"] == (
+        "compound_verification_response"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_fresh_path_keeps_history_and_calls_no_provider_or_retrieval(
+    tmp_path,
+):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="Can you verify that again now?",
+        completion=_classifier_completion(
+            "new_verification_request",
+            verify=True,
+        ),
+    )
+    assert result["answer"].startswith("Original support:\n")
+    assert "\n\nNew verification unavailable:\n" in result["answer"]
+    assert len(litellm.calls) == 1
+    assert memory_store.retrieve_calls == []
+    assert len(runtime.interaction_governance_calls) == 2
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+    assert trace["fresh_verification_entry_status"] == (
+        "unavailable_after_history_resolution"
+    )

@@ -3,11 +3,182 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from services.privacy_context import validate_privacy_policy_result
 
 _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
 _COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
 _COMPANION_ENDPOINT_KEY = "_cognitive_runtime_compile_endpoint"
+
+_HISTORY_INTENTS = {
+    "not_history_followup",
+    "support_explanation",
+    "acquisition_checked",
+    "acquisition_coverage",
+    "acquisition_gaps",
+    "new_verification_request",
+    "ambiguous_history_followup",
+}
+_HISTORY_REASON_CODES = {
+    "no_candidate",
+    "not_history_candidate",
+    "ambiguous_candidate",
+    "deterministic_candidate_accepted",
+    "classifier_candidate_accepted",
+    "classifier_confidence_requires_clarification",
+    "classifier_confidence_rejected",
+    "explicit_reference_routed",
+}
+_HISTORY_PROJECTION = {
+    "support_explanation": ("support", None),
+    "acquisition_checked": ("acquisition", "checked"),
+    "acquisition_coverage": ("acquisition", "coverage"),
+    "acquisition_gaps": ("acquisition", "gaps"),
+    "new_verification_request": ("support", None),
+}
+
+
+class _HistoryFollowupPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: str
+    intent: str | None = None
+    candidate_source: str | None = None
+    target_mode: str | None = None
+    explanation_kind: str | None = None
+    acquisition_question: str | None = None
+    history_lookup_allowed: bool
+    new_verification_requested: bool
+    new_verification_allowed_after_history_resolution: bool
+    clarification_required: bool
+    confidence_band: str
+    reason_codes: list[str] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_closed_policy(self):
+        if self.status not in {
+            "not_applicable",
+            "accepted",
+            "clarification_required",
+            "rejected",
+            "explicit_reference",
+        }:
+            raise ValueError("history_policy_status_invalid")
+        if self.intent is not None and self.intent not in _HISTORY_INTENTS:
+            raise ValueError("history_policy_intent_invalid")
+        if self.candidate_source not in {None, "deterministic", "classifier"}:
+            raise ValueError("history_policy_source_invalid")
+        if self.target_mode not in {None, "immediate_previous", "explicit_reference"}:
+            raise ValueError("history_policy_target_invalid")
+        if self.explanation_kind not in {None, "support", "acquisition"}:
+            raise ValueError("history_policy_explanation_kind_invalid")
+        if self.acquisition_question not in {None, "checked", "coverage", "gaps"}:
+            raise ValueError("history_policy_acquisition_question_invalid")
+        if self.confidence_band not in {"not_applicable", "low", "medium", "high"}:
+            raise ValueError("history_policy_confidence_band_invalid")
+        if any(code not in _HISTORY_REASON_CODES for code in self.reason_codes):
+            raise ValueError("history_policy_reason_code_invalid")
+        if len(self.reason_codes) != len(set(self.reason_codes)):
+            raise ValueError("history_policy_reason_codes_duplicate")
+        projection = _HISTORY_PROJECTION.get(self.intent or "")
+        if projection is None:
+            if self.explanation_kind is not None or self.acquisition_question is not None:
+                raise ValueError("history_policy_projection_invalid")
+        elif (self.explanation_kind, self.acquisition_question) != projection:
+            raise ValueError("history_policy_projection_invalid")
+        if self.intent is not None and (
+            self.candidate_source is None or self.target_mode is None
+        ):
+            raise ValueError("history_policy_candidate_projection_incomplete")
+        if self.intent == "new_verification_request" and not self.new_verification_requested:
+            raise ValueError("history_policy_verification_intent_inconsistent")
+        if (
+            self.intent in {"not_history_followup", "ambiguous_history_followup"}
+            and self.new_verification_requested
+        ):
+            raise ValueError("history_policy_nonactionable_verification_inconsistent")
+        if self.status == "accepted":
+            expected_reason = (
+                "deterministic_candidate_accepted"
+                if self.candidate_source == "deterministic"
+                else "classifier_candidate_accepted"
+            )
+            if (
+                self.intent not in _HISTORY_PROJECTION
+                or self.target_mode != "immediate_previous"
+                or not self.history_lookup_allowed
+                or self.clarification_required
+                or self.confidence_band != "high"
+                or self.new_verification_allowed_after_history_resolution
+                != self.new_verification_requested
+                or self.reason_codes != [expected_reason]
+            ):
+                raise ValueError("accepted_history_policy_inconsistent")
+        elif self.status == "clarification_required":
+            expected_reason = (
+                "ambiguous_candidate"
+                if self.intent == "ambiguous_history_followup"
+                else "classifier_confidence_requires_clarification"
+            )
+            if (
+                self.history_lookup_allowed
+                or not self.clarification_required
+                or self.new_verification_allowed_after_history_resolution
+                or self.reason_codes != [expected_reason]
+                or (
+                    self.intent != "ambiguous_history_followup"
+                    and (
+                        self.candidate_source != "classifier"
+                        or self.confidence_band != "medium"
+                    )
+                )
+            ):
+                raise ValueError("clarification_history_policy_inconsistent")
+        elif (
+            self.history_lookup_allowed
+            or self.clarification_required
+            or self.new_verification_allowed_after_history_resolution
+        ):
+            raise ValueError("nonaccepted_history_policy_inconsistent")
+        if self.status == "explicit_reference" and self.target_mode != "explicit_reference":
+            raise ValueError("explicit_reference_history_policy_inconsistent")
+        if self.status == "explicit_reference" and self.reason_codes != [
+            "explicit_reference_routed"
+        ]:
+            raise ValueError("explicit_reference_history_policy_inconsistent")
+        if self.status == "rejected" and (
+            self.candidate_source != "classifier"
+            or self.confidence_band != "low"
+            or self.reason_codes != ["classifier_confidence_rejected"]
+        ):
+            raise ValueError("rejected_history_policy_inconsistent")
+        if self.status == "not_applicable" and (
+            self.intent != "not_history_followup"
+            or self.reason_codes != ["not_history_candidate"]
+        ):
+            raise ValueError("not_applicable_history_policy_inconsistent")
+        return self
+
+
+def validate_history_followup_policy_response(
+    response: Any,
+    *,
+    scope: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(response, dict) or any(
+        response.get(field) != value for field, value in scope.items()
+    ):
+        raise RuntimeError("history_followup_policy_response_context_mismatch")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("history_followup_policy_response_invalid")
+    try:
+        policy = _HistoryFollowupPolicy.model_validate(
+            result.get("history_followup_policy")
+        )
+    except Exception as exc:
+        raise RuntimeError("history_followup_policy_response_invalid") from exc
+    return policy.model_dump()
 
 
 class RuntimeClient:
@@ -783,6 +954,7 @@ class RuntimeClient:
         current_user_text: str | None = None,
         recent_messages: list[dict[str, Any]] | None = None,
         surface_metadata_json: dict[str, Any] | None = None,
+        history_followup_candidate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -804,7 +976,24 @@ class RuntimeClient:
             payload["recent_messages"] = recent_messages
         if surface_metadata_json is not None:
             payload["surface_metadata_json"] = surface_metadata_json
-        return await self._post("/v1/runtime/interaction-governance/evaluate", json=payload)
+        if history_followup_candidate is not None:
+            payload["history_followup_candidate"] = history_followup_candidate
+        response = await self._post(
+            "/v1/runtime/interaction-governance/evaluate", json=payload
+        )
+        if history_followup_candidate is not None:
+            scope = {
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "surface": surface,
+            }
+            if runtime_session_id is not None:
+                scope["runtime_session_id"] = runtime_session_id
+            if runtime_turn_id is not None:
+                scope["runtime_turn_id"] = runtime_turn_id
+            validate_history_followup_policy_response(response, scope=scope)
+        return response
 
     async def evaluate_persona_containment(
         self,

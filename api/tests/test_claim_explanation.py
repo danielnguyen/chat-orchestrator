@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import inspect
+import json
 import re
 from dataclasses import replace
 
@@ -15,9 +16,14 @@ from services.claim_explanation import (
     _diagnose_acquisition_history_projection,
     _project_acquisition_history,
     _render_acquisition,
+    classifier_eligible_history_followup,
+    deterministic_history_followup_candidate,
+    history_classifier_response_format,
     is_claim_explanation_intent,
     parse_claim_explanation_intent,
+    parse_history_classifier_completion,
     resolve_claim_explanation,
+    resolve_immediate_claim_explanation,
 )
 
 ANCHOR = "The retained file reports that the setting is active."
@@ -2530,3 +2536,476 @@ async def test_invalid_unsupported_and_insufficient_records_fail_closed(record, 
     assert outcome.trace["reason_code"] == reason
     assert "incomplete or unsupported" in outcome.answer
     assert "PRIVATE" not in repr(outcome)
+
+
+@pytest.mark.parametrize(
+    ("text", "intent", "question", "verify"),
+    [
+        ("How are you sure?", "support_explanation", None, False),
+        ("What did you check?", "acquisition_checked", "checked", False),
+        ("Did you look at everything relevant?", "acquisition_coverage", "coverage", False),
+        ("What might you have missed?", "acquisition_gaps", "gaps", False),
+        ("What did you check? Verify again.", "acquisition_checked", "checked", True),
+        ("Verify that again.", "new_verification_request", None, True),
+    ],
+)
+def test_deterministic_history_candidate_matrix(text, intent, question, verify):
+    candidate = deterministic_history_followup_candidate(text)
+    assert candidate == {
+        "source": "deterministic",
+        "intent": intent,
+        "confidence": 1.0,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": verify,
+    }
+    assert question == {
+        "acquisition_checked": "checked",
+        "acquisition_coverage": "coverage",
+        "acquisition_gaps": "gaps",
+    }.get(intent)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Where did that conclusion come from?",
+        "Which records did you look at?",
+        "Did you cover everything available?",
+        "Anything you may have skipped?",
+        "Can you verify that again now?",
+    ],
+)
+def test_natural_history_paraphrases_are_classifier_eligible(text):
+    assert classifier_eligible_history_followup(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What should I check on my car?",
+        "What did John check?",
+        "How do I verify a checksum?",
+        "Which records should I bring to the appointment?",
+        "What is the weather?",
+        "What is a confidence interval?",
+        "unrelated " * 60 + "evidence",
+    ],
+)
+def test_ordinary_or_long_turns_are_not_classifier_eligible(text):
+    assert classifier_eligible_history_followup(text) is False
+
+
+def test_classifier_contract_is_strict_and_adds_source_only_after_parsing():
+    payload = {
+        "intent": "support_explanation",
+        "confidence": 0.91,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": False,
+    }
+    completion = {"choices": [{"message": {"content": json.dumps(payload)}}]}
+    assert parse_history_classifier_completion(completion) == {
+        "source": "classifier",
+        **payload,
+    }
+    schema = history_classifier_response_format()["json_schema"]
+    assert schema["strict"] is True
+    assert schema["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        {"choices": []},
+        {"choices": [{"message": {"content": "```json\n{}\n```"}}]},
+        {"choices": [{"message": {"content": "before {}"}}]},
+        {"choices": [{"message": {"content": "{}"}}]},
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "intent": "support_explanation",
+                                "confidence": 0.9,
+                                "target_mode": "immediate_previous",
+                                "new_verification_requested": False,
+                                "reasoning": "PRIVATE",
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "intent": "new_verification_request",
+                                "confidence": 0.9,
+                                "target_mode": "immediate_previous",
+                                "new_verification_requested": False,
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "intent": "support_explanation",
+                                "confidence": 0.9,
+                                "target_mode": "immediate_previous",
+                                "new_verification_requested": False,
+                            }
+                        ),
+                        "tool_calls": [{"id": "forbidden"}],
+                    }
+                }
+            ]
+        },
+    ],
+)
+def test_classifier_completion_rejects_malformed_or_inconsistent_output(completion):
+    with pytest.raises(ValueError):
+        parse_history_classifier_completion(completion)
+
+
+class _ImmediateMemoryStore:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    async def resolve_immediate_history(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        return copy.deepcopy(self.response)
+
+
+def _accepted_history_policy(**overrides):
+    policy = {
+        "status": "accepted",
+        "intent": "support_explanation",
+        "candidate_source": "deterministic",
+        "target_mode": "immediate_previous",
+        "explanation_kind": "support",
+        "acquisition_question": None,
+        "history_lookup_allowed": True,
+        "new_verification_requested": False,
+        "new_verification_allowed_after_history_resolution": False,
+        "clarification_required": False,
+        "confidence_band": "high",
+        "reason_codes": ["deterministic_candidate_accepted"],
+    }
+    policy.update(overrides)
+    return policy
+
+
+def _immediate_response(
+    *, record, kind="support", status="resolved", reason=None, match_count=None
+):
+    return {
+        "schema_version": "immediate-history-resolution.v1",
+        "request_id": "request-history",
+        "owner_id": "owner",
+        "conversation_id": "conversation-1",
+        "surface": "vscode",
+        "explanation_kind": kind,
+        "resolution_status": status,
+        "match_count": (
+            match_count
+            if match_count is not None
+            else 1
+            if status == "resolved"
+            else 2
+            if status == "ambiguous"
+            else 0
+        ),
+        "reason_code": reason
+        or ("support_record_resolved" if kind == "support" else "acquisition_record_resolved"),
+        "record": record,
+    }
+
+
+@pytest.mark.asyncio
+async def test_immediate_support_uses_exact_record_and_suppresses_identifiers():
+    support = _record(
+        request_id="original-request",
+        assistant_message_id="assistant-message",
+    )
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": "assistant-message",
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.status == "ok"
+    assert outcome.answer.startswith("I based that earlier statement on one retained file excerpt")
+    assert outcome.answer.endswith("I did not perform a new verification for this explanation.")
+    assert store.calls == [
+        {
+            "request_id": "request-history",
+            "owner_id": "owner",
+            "conversation_id": "conversation-1",
+            "surface": "vscode",
+            "explanation_kind": "support",
+        }
+    ]
+    serialized = json.dumps((outcome.answer, outcome.trace), sort_keys=True)
+    for private in (
+        "PRIVATE-OPAQUE-REFERENCE",
+        "assistant-message",
+        "original-request",
+        "claim-1",
+    ):
+        assert private not in serialized
+
+
+@pytest.mark.asyncio
+async def test_immediate_governed_external_support_renders_structural_facts_only():
+    reference = {
+        **_record()["validated_evidence_references"][0],
+        "ref_type": "external_source",
+        "ref_id": "private-source:record-1",
+        "conversation_id": None,
+        "authority": "trusted_integration",
+        "freshness_state": "unknown_freshness",
+    }
+    support = _record(
+        request_id="original-request",
+        assistant_message_id="assistant-message",
+        strongest_authority="trusted_integration",
+        validated_evidence_references=[reference],
+    )
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": "assistant-message",
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert "one governed external-source record" in outcome.answer
+    assert "private-source:record-1" not in outcome.answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("intent", "question", "expected"),
+    [
+        ("acquisition_checked", "checked", "targeted lookup"),
+        ("acquisition_coverage", "coverage", "It considered 2 configured"),
+        ("acquisition_gaps", "gaps", "not an exhaustive review"),
+    ],
+)
+async def test_immediate_acquisition_reuses_strict_projection_and_renderer(
+    intent, question, expected
+):
+    manifest = _manifest(
+        assistant_message_id="assistant-message",
+        response_digest=_response_digest("full assistant response"),
+    )
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            kind="acquisition",
+            record={
+                "record_kind": "acquisition",
+                "assistant_message_id": "assistant-message",
+                "original_request_id": "original-request",
+                "support_record": None,
+                "acquisition_record": {
+                    "original_request_id": "original-request",
+                    "assistant_message_id": "assistant-message",
+                    "surface": "vscode",
+                    "trace_status": "ok",
+                    "response_digest": _response_digest("full assistant response"),
+                    "normalized_first_paragraph": ANCHOR,
+                    "acquisition_manifest": manifest,
+                },
+            },
+        )
+    )
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(
+            intent=intent,
+            explanation_kind="acquisition",
+            acquisition_question=question,
+        ),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.status == "ok"
+    assert expected in outcome.answer
+    assert outcome.trace["manifest_projection_status"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_immediate_no_record_blocks_explicit_verification():
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record=None,
+            status="no_record",
+            reason="support_record_not_found",
+        )
+    )
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(
+            intent="new_verification_request",
+            new_verification_requested=True,
+            new_verification_allowed_after_history_resolution=True,
+        ),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.status == "degraded"
+    assert outcome.new_verification_requested is False
+    assert "did not perform a new verification" in outcome.answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        ("no_record", "support_record_not_found"),
+        ("ambiguous", "support_record_ambiguous"),
+        ("invalid", "support_record_invalid"),
+        ("unavailable", "history_store_unavailable"),
+    ],
+)
+async def test_immediate_support_unresolved_outcomes_fail_honestly_without_verification(
+    status, reason
+):
+    store = _ImmediateMemoryStore(
+        _immediate_response(record=None, status=status, reason=reason)
+    )
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(
+            new_verification_requested=True,
+            new_verification_allowed_after_history_resolution=True,
+        ),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+    assert outcome.status == "degraded"
+    assert outcome.new_verification_requested is False
+    assert "did not perform a new verification" in outcome.answer
+    assert outcome.trace["resolution_status"] == status
+    assert outcome.trace["reason_code"] == reason
+
+
+@pytest.mark.asyncio
+async def test_memory_store_immediate_history_request_is_exact_and_identifier_free():
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = []
+
+    async def fake_post(path, *, request_id=None, json=None):
+        calls.append((path, request_id, copy.deepcopy(json)))
+        return {
+            **json,
+            "resolution_status": "no_record",
+            "match_count": 0,
+            "reason_code": "support_record_not_found",
+            "record": None,
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+    await client.resolve_immediate_history(
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+        explanation_kind="support",
+    )
+
+    assert calls == [
+        (
+            "/v1/internal/immediate-history/resolve",
+            "request-history",
+            {
+                "schema_version": "immediate-history-resolution.v1",
+                "request_id": "request-history",
+                "owner_id": "owner",
+                "conversation_id": "conversation-1",
+                "surface": "vscode",
+                "explanation_kind": "support",
+            },
+        )
+    ]
+    serialized = json.dumps(calls[0][2], sort_keys=True)
+    for forbidden in (
+        "assistant_message_id",
+        "original_request_id",
+        "response_digest",
+        "normalized_first_paragraph",
+        "claim_id",
+        "trace_id",
+        "manifest_id",
+        "source_id",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+async def test_memory_store_immediate_history_rejects_response_scope_mismatch():
+    client = MemoryStoreClient("http://memory.local", "secret")
+
+    async def fake_post(path, *, request_id=None, json=None):
+        return {
+            **json,
+            "owner_id": "other-owner",
+            "resolution_status": "no_record",
+            "match_count": 0,
+            "reason_code": "support_record_not_found",
+            "record": None,
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="immediate_history_response_context_mismatch"):
+        await client.resolve_immediate_history(
+            request_id="request-history",
+            owner_id="owner",
+            conversation_id="conversation-1",
+            surface="vscode",
+            explanation_kind="support",
+        )
