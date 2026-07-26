@@ -3838,8 +3838,8 @@ assert_history_runtime_policy() {
       and (
         if $expected == 2 then
           ([ $events[] | select(
-            .event_payload_json.result.history_followup_policy.status == $status
-            and .event_payload_json.result.history_followup_policy.intent == $intent
+            .event_payload_json.history_followup_policy.status == $status
+            and .event_payload_json.history_followup_policy.intent == $intent
           ) ] | length) == 1
         else true end
       )
