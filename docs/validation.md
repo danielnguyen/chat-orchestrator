@@ -89,7 +89,7 @@ connector; it does not produce DSA envelopes, plans, sufficiency decisions,
 manifests, traces, or policy responses. Service authentication and normal
 owner/conversation scope remain enabled.
 
-The evidence topology requires the merged Phase 5.3 foundations at or after
+The evidence topology requires the merged immediate-history foundations at or after
 Chat Orchestrator `6fec8fd9adc7671e99447470ab238b2d30259d51`, Cognitive Runtime
 `f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67`, Basic Memory Store
 `af9420da0235c208bcf842a0ca81f88e537d93be`, and Data Source Aggregator
@@ -162,7 +162,7 @@ The focused mode and the complete regression both reset provider, DSA audit,
 external-source, feature-toggle, and disposable conversation state. This is
 deployment-equivalent composed proof for the repository contracts; it is not a
 reconstruction of the original Telegram deployment or evidence for its historical
-runtime state. Phase 5.3 checklist verdicts and deployment reconstruction remain a
+runtime state. Project checklist verdicts and deployment reconstruction remain a
 separate projects-side review.
 
 Normal pull-request validation uses `all`: it runs every established focused
