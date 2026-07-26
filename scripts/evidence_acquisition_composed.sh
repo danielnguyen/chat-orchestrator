@@ -3966,7 +3966,7 @@ assert_pure_history_case() {
 run_history_followup_composed_suite() {
   local owner client conversation_id response trace calls diagnostics audit request_id answer
   local external claims status_code unauthorized original_trace original_manifest final_manifest
-  local intent question case_name
+  local intent question case_name assistant_message_id expected_digest
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
 
   provider_post "/fixture/reset" '{}'
@@ -3991,6 +3991,61 @@ run_history_followup_composed_suite() {
     and (.answer | endswith("I did not perform a new verification for this explanation."))
   '
   echo "H1 canonical acquisition after CO restart passed"
+
+  # Regression: an ordinary DSA-augmented answer has no governed plan or
+  # sufficiency evaluation, but its exact retained acquisition remains explainable.
+  owner="owner-history-ordinary-dsa"
+  client="client-history-ordinary-dsa"
+  conversation_id="$(resolve_conversation "$owner" "$client" "history-ordinary-dsa")"
+  question="What is the migration setting?"
+  answer='Migration: ready
+Setting: bounded
+Cost note: \$1 145.25
+Retained details:
+- Primary migration row
+- Follow-up migration row'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_provider_answer "$answer"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  original_manifest="$(jq -ec '.prompt.evidence_acquisition' <<<"$trace")"
+  assistant_message_id="$(
+    psql_exec -At -c "SELECT id FROM messages WHERE conversation_id = '$conversation_id' AND role = 'assistant' AND metadata->>'request_id' = '$request_id' ORDER BY created_at DESC LIMIT 1;"
+  )"
+  expected_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
+  assert_jq "history.ordinary.original" "$response" '
+    .status == "ok"
+    and .answer == $answer
+  ' --arg answer "$answer"
+  assert_jq "history.ordinary.manifest" "$original_manifest" '
+    .status == "not_applicable"
+    and .shape.derivation_status == "not_applicable"
+    and .shape.task_shape == null
+    and .plan.plan_status == "not_compiled"
+    and .plan.selected_strategies == []
+    and .acquisition.strategy_attempted == null
+    and .acquisition.dsa_outcome == "success"
+    and .acquisition.item_count >= 2
+    and .acquisition.prompt_retained_item_count >= 2
+    and .sufficiency.status == "not_evaluated"
+    and .assistant_message_id == $assistant_message_id
+    and .response_digest == $response_digest
+  ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  HISTORY_ORIGINAL_ANSWER="$answer"
+  provider_post "/fixture/reset" '{}'
+  reset_dsa_audit
+  response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
+  assert_jq "history.ordinary.follow_up" "$response" '
+    (.answer | contains("retained record shows ordinary external context augmentation"))
+    and (.answer | contains("evidence sufficiency was not evaluated"))
+    and (.answer | endswith("I did not perform a new verification for this explanation."))
+  '
+  echo "H1 ordinary DSA acquisition association regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
   owner="owner-history-h2"
@@ -4291,7 +4346,7 @@ MATRIX
   reset_source_fixture
   reset_dsa_audit
   restart_orchestrator_with_history_followup false
-  echo "Server-owned history-followup composed proof passed: scenarios=H1,H2,H3,H4,H5,H6,H7,H8"
+  echo "Server-owned history-followup composed proof passed: scenarios=H1,ordinary-dsa-association,H2,H3,H4,H5,H6,H7,H8"
 }
 
 run_evidence_acquisition_composed_suite() {

@@ -25377,6 +25377,224 @@ class ImmediateHistoryMemoryStore(FakeMemoryStore):
         return response
 
 
+class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
+    def __init__(self):
+        super().__init__()
+        self.immediate_history_calls = []
+        self.persisted_traces = {}
+
+    async def add_message(self, **kwargs):
+        message_id = f"message-{len(self.added_messages) + 1}"
+        self.added_messages.append({**copy.deepcopy(kwargs), "message_id": message_id})
+        return {"message_id": message_id}
+
+    async def create_trace(self, **kwargs):
+        self.trace_calls.append(copy.deepcopy(kwargs))
+        self.persisted_traces[kwargs["request_id"]] = copy.deepcopy(kwargs["payload"])
+        return {"trace_id": f"trace-{len(self.trace_calls)}"}
+
+    async def resolve_immediate_history(self, **kwargs):
+        self.immediate_history_calls.append(copy.deepcopy(kwargs))
+        assistants = [
+            message
+            for message in self.added_messages
+            if message["role"] == "assistant"
+            and message["owner_id"] == kwargs["owner_id"]
+            and message["conversation_id"] == kwargs["conversation_id"]
+        ]
+        assert assistants
+        assistant = assistants[-1]
+        original_request_id = assistant["metadata"]["request_id"]
+        trace = self.persisted_traces[original_request_id]
+        manifest = trace["prompt"]["evidence_acquisition"]
+        response_digest = "sha256:" + hashlib.sha256(
+            assistant["content"].encode()
+        ).hexdigest()
+        assert manifest["assistant_message_id"] == assistant["message_id"]
+        assert manifest["response_digest"] == response_digest
+        assert trace["owner_id"] == kwargs["owner_id"]
+        assert trace["conversation_id"] == kwargs["conversation_id"]
+        assert trace["surface"] == kwargs["surface"]
+        return {
+            "schema_version": "immediate-history-resolution.v1",
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "surface": kwargs["surface"],
+            "explanation_kind": "acquisition",
+            "resolution_status": "resolved",
+            "match_count": 1,
+            "reason_code": "acquisition_record_resolved",
+            "record": {
+                "record_kind": "acquisition",
+                "assistant_message_id": assistant["message_id"],
+                "original_request_id": original_request_id,
+                "support_record": None,
+                "acquisition_record": {
+                    "original_request_id": original_request_id,
+                    "assistant_message_id": assistant["message_id"],
+                    "surface": kwargs["surface"],
+                    "trace_status": trace["status"],
+                    "response_digest": response_digest,
+                    "normalized_first_paragraph": assistant["content"].split("\n", 1)[0],
+                    "acquisition_manifest": copy.deepcopy(manifest),
+                },
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followup(
+    tmp_path,
+):
+    rules, models = _write_history_route_files(tmp_path)
+    original_request_id = "request-ordinary-dsa-original"
+    question = "What service was performed on the Jeep?"
+    runtime = HistoryPolicyRuntime()
+    runtime.evidence_shape_response = {
+        "request_id": original_request_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "node_red",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "derivation_id": "evidence_shape_ordinary_dsa",
+            "question_anchor": question,
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
+            "derivation_status": "not_applicable",
+            "task_shape": None,
+            "candidate_task_shapes": [],
+            "evidence_scope_material": False,
+            "clarification_required": False,
+            "reason_codes": ["non_evidence_interaction"],
+            "user_safe_summary": "Evidence planning does not apply.",
+        },
+    }
+    context_pack = _multi_source_governed_context_pack(question)
+    context_pack["sources_used"][1] = "vehicle_log_ev"
+    context_pack["items"][1]["source_id"] = "vehicle_log_ev"
+    context_pack["items"][1]["source_ref"] = "vehicle_log_ev:record_2"
+    context_pack["items"].append(
+        {
+            **copy.deepcopy(context_pack["items"][0]),
+            "result_id": "result_3",
+            "source_ref": "vehicle_log_primary:record_3",
+            "text": "The retained service record includes a power-steering flush.",
+        }
+    )
+    context_pack["budget"]["returned_results"] = 3
+    context_pack["diagnostics"]["selected_source_ids"] = [
+        "vehicle_log_primary",
+        "vehicle_log_ev",
+    ]
+    context_pack["diagnostics"]["considered_source_ids"] = [
+        "vehicle_log_primary",
+        "vehicle_log_ev",
+    ]
+    answer_text = (
+        "Date: 09/03/2026\n"
+        "Odometer: 83 061 km\n"
+        "Shop: Jeep Woodbine\n"
+        "Cost: \\$1 145.25\n"
+        "Services performed:\n"
+        "- Engine oil change\n"
+        "- Transfer-case & 4×4 axle fluid refill\n"
+        "- Power-steering flush\n"
+        "- Suspension lubrication (addressed creak noise)"
+    )
+    memory_store = PersistedOrdinaryAcquisitionMemoryStore()
+    provider = FakeLiteLLM(content=answer_text)
+    dsa = FakeDSA(response=context_pack)
+
+    original = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            conversation_id="conv-1",
+            external_context_enabled=True,
+            messages=[{"role": "user", "content": question}],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        history_followup_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=original_request_id,
+    )
+
+    persisted_assistant = memory_store.added_messages[-1]
+    original_trace = memory_store.persisted_traces[original_request_id]
+    manifest = original_trace["prompt"]["evidence_acquisition"]
+    exact_digest = "sha256:" + hashlib.sha256(
+        persisted_assistant["content"].encode()
+    ).hexdigest()
+    assert original["answer"] == answer_text
+    assert persisted_assistant["content"] == original["answer"]
+    assert manifest["assistant_message_id"] == persisted_assistant["message_id"]
+    assert manifest["response_digest"] == exact_digest
+    assert manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(original["answer"].encode()).hexdigest()
+    )
+    assert manifest["status"] == "not_applicable"
+    assert manifest["plan"]["plan_status"] == "not_compiled"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["acquisition"]["dsa_outcome"] == "success"
+    assert manifest["acquisition"]["prompt_retained_item_count"] == 3
+
+    follow_up = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "what did you check?",
+            conversation_id=original["conversation_id"],
+            messages=[{"role": "user", "content": "what did you check?"}],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        history_followup_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-ordinary-dsa-follow-up",
+    )
+
+    follow_up_prompt_trace = memory_store.persisted_traces[
+        "request-ordinary-dsa-follow-up"
+    ]["prompt"]
+    history_trace = follow_up_prompt_trace["history_followup"]
+    candidate_calls = [
+        call
+        for call in runtime.interaction_governance_calls
+        if call.get("history_followup_candidate") is not None
+    ]
+    assert follow_up["status"] == "ok"
+    assert follow_up["selected_model"] == "not_called"
+    assert "ordinary external context" in follow_up["answer"]
+    assert "3 items" in follow_up["answer"]
+    assert follow_up["answer"].endswith(
+        "I did not perform a new verification for this explanation."
+    )
+    assert len(memory_store.immediate_history_calls) == 1
+    assert len(candidate_calls) == 1
+    assert len(provider.calls) == 1
+    assert history_trace["bms_resolution_status"] == "resolved"
+    assert follow_up_prompt_trace["claim_explanation"][
+        "manifest_projection_status"
+    ] == "accepted"
+    assert history_trace["fresh_verification_entry_status"] == "not_requested"
+    assert history_trace["answer_provider_call_count"] == 0
+
+
 async def _run_history_followup(
     tmp_path,
     *,
