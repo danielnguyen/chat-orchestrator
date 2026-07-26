@@ -4213,9 +4213,13 @@ MATRIX
   final_manifest="$(jq -ec '.prompt.evidence_acquisition' <<<"$trace")"
   assert_classifier_request "$calls" "$question"
   if ! assert_jq "history.h7.response" "$response" '
-    .status == "ok"
+    (.status == "ok" or .status == "degraded")
     and (.answer | startswith("Original support:\n"))
     and (.answer | contains("\n\nNew verification:\n"))
+    and (.answer | contains("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1:"))
+    and (.answer | contains("New verification unavailable:") | not)
+    and (.answer | contains("conflicted with the verification response boundary") | not)
     and ([.answer | scan("Original support:")] | length) == 1
     and ([.answer | scan("New verification:")] | length) == 1
   ' >/dev/null 2>&1; then
