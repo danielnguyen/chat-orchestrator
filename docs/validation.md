@@ -89,11 +89,11 @@ connector; it does not produce DSA envelopes, plans, sufficiency decisions,
 manifests, traces, or policy responses. Service authentication and normal
 owner/conversation scope remain enabled.
 
-The evidence topology pins the merged trusted-scope DSA producer at
-`e23f582e4aac32a12c7ad3c71278fc21e5697ea4` and requires Chat Orchestrator to
-contain the merged policy-owned evidence-answer boundary at
-`db8d4208595778cbe7a138e9001ef32f6f2e213e`, including the merged partial-inventory
-sufficiency correction. The disposable DSA configuration
+The evidence topology requires the merged Phase 5.3 foundations at or after
+Chat Orchestrator `6fec8fd9adc7671e99447470ab238b2d30259d51`, Cognitive Runtime
+`f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67`, Basic Memory Store
+`af9420da0235c208bcf842a0ca81f88e537d93be`, and Data Source Aggregator
+`e23f582e4aac32a12c7ad3c71278fc21e5697ea4`. The disposable DSA configuration
 contains operator-owned material scope references for selected sources; those
 values are emitted by the real DSA inventory and are never manufactured by the
 external-source fixture.
@@ -130,6 +130,40 @@ strict rejection of extra fields, non-extractive excerpts, and semantically
 distinct universal, absence, contradiction, and full-compliance attempts. Its
 history checks confirm that provider JSON, excerpts, malformed wording, validation
 internals, and hidden scope metadata are not reconstructed.
+
+Run only the server-owned immediate-history proof with:
+
+```bash
+HISTORY_FOLLOWUP_ONLY=1 make composed-smoke
+```
+
+This mode starts the same disposable topology—CO, CR, BMS, DSA, PostgreSQL,
+Qdrant, the bounded OpenAI-compatible provider fixture, and the external-source
+fixture—with history follow-ups disabled by default. It creates durable governed
+answers through the actual services, then recreates only the orchestrator with
+history enabled. PostgreSQL, BMS, CR, DSA, Qdrant, and the provider remain running,
+so successful current-turn-only follow-ups prove that neither a client cache nor
+orchestrator process state supplies the previous answer.
+
+The scenarios cover canonical support and acquisition wording without a model,
+four natural paraphrases using one strict `intent_classifier` call to the configured
+`gpt-5-mini` route, CR policy, BMS newest-response resolution, provider-free
+historical rendering, classifier degradation and local-only denial, CR confidence
+boundaries, no backward scan, one explicitly requested governed verification, and
+unauthenticated BMS rejection. Classifier calls are counted separately from answer
+provider calls: pure history has no answer-provider call, while explicit fresh
+verification has one classifier call and one governed answer call after successful
+history resolution. Provider diagnostics retain only bounded structural fields and
+the existing disposable normalized-message fixture data needed to prove the strict
+schema, token limit, zero tools, fixed instruction, current-user-only input, and
+absence of history or identifiers.
+
+The focused mode and the complete regression both reset provider, DSA audit,
+external-source, feature-toggle, and disposable conversation state. This is
+deployment-equivalent composed proof for the repository contracts; it is not a
+reconstruction of the original Telegram deployment or evidence for its historical
+runtime state. Phase 5.3 checklist verdicts and deployment reconstruction remain a
+separate projects-side review.
 
 Normal pull-request validation uses `all`: it runs every established focused
 scenario, both final recovery families, and only then the complete composed-smoke

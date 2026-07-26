@@ -67,6 +67,31 @@ async def chat_completions(
     model = body.get("model")
     tools = body.get("tools")
     tool_count = len(tools) if isinstance(tools, list) else 0
+    response_format = body.get("response_format")
+    json_schema = (
+        response_format.get("json_schema")
+        if isinstance(response_format, dict)
+        else None
+    )
+    schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
+    classifier_diagnostics = {
+        "response_format_type": (
+            response_format.get("type") if isinstance(response_format, dict) else None
+        ),
+        "response_schema_name": (
+            json_schema.get("name") if isinstance(json_schema, dict) else None
+        ),
+        "response_schema_strict": (
+            json_schema.get("strict") if isinstance(json_schema, dict) else None
+        ),
+        "response_schema_additional_properties": (
+            schema.get("additionalProperties") if isinstance(schema, dict) else None
+        ),
+        "response_schema_required": (
+            schema.get("required") if isinstance(schema, dict) else None
+        ),
+        "max_completion_tokens": body.get("max_completion_tokens"),
+    }
     prompt_text = "\n".join(
         message.get("content", "")
         for message in messages
@@ -135,6 +160,7 @@ async def chat_completions(
                 "request_id": x_request_id,
                 "model": model,
                 "tool_count": tool_count,
+                **classifier_diagnostics,
                 "message_count": len(messages),
                 "normalized_messages": normalized_messages,
                 "prompt_fingerprint": prompt_fingerprint,
@@ -169,6 +195,7 @@ async def chat_completions(
             "request_id": x_request_id,
             "model": model,
             "tool_count": tool_count,
+            **classifier_diagnostics,
             "message_count": len(messages),
             "normalized_messages": normalized_messages,
             "prompt_fingerprint": prompt_fingerprint,
