@@ -4003,7 +4003,8 @@ run_history_followup_composed_suite() {
   assert_pure_history_case "$owner" "$conversation_id" "$response" "How are you sure?" deterministic support_explanation support 0
   assert_jq "history.h2.answer" "$response" '
     (.answer | contains("governed external-source record"))
-    and (.answer | contains("high confidence"))
+    and (.answer | contains("source-backed fact"))
+    and (.answer | test("with (low|medium|high) confidence and (weak|moderate|strong) support"))
     and (.answer | endswith("I did not perform a new verification for this explanation."))
   '
   echo "H2 canonical support passed"
