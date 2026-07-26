@@ -3906,7 +3906,7 @@ assert_pure_history_case() {
     and .prompt.history_followup.bms_call_count == 1
     and .prompt.history_followup.bms_resolution_status == "resolved"
     and .prompt.history_followup.resolved_record_kind == $kind
-    and .prompt.history_followup.render_status == "rendered"
+    and .prompt.history_followup.render_status == "completed"
     and .prompt.history_followup.answer_provider_call_count == 0
     and .prompt.history_followup.classifier_call_count == $classifier_calls
     and .prompt.history_followup.fresh_verification_entry_status == "not_requested"
