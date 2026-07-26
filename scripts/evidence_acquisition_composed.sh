@@ -4212,13 +4212,28 @@ MATRIX
   audit="$(fetch_dsa_audit)"
   final_manifest="$(jq -ec '.prompt.evidence_acquisition' <<<"$trace")"
   assert_classifier_request "$calls" "$question"
-  assert_jq "history.h7.response" "$response" '
+  if ! assert_jq "history.h7.response" "$response" '
     .status == "ok"
     and (.answer | startswith("Original support:\n"))
     and (.answer | contains("\n\nNew verification:\n"))
     and ([.answer | scan("Original support:")] | length) == 1
     and ([.answer | scan("New verification:")] | length) == 1
-  '
+  ' >/dev/null 2>&1; then
+    jq -c '{
+      status,
+      selected_model,
+      trusted_labels: [
+        .answer | split("\n")[]
+        | select(. == "Original support:"
+          or . == "Original acquisition:"
+          or . == "New verification:"
+          or . == "New verification attempt:"
+          or . == "New verification unavailable:")
+      ]
+    }' <<<"$response" >&2
+    echo "Assertion failed: history.h7.response" >&2
+    return 1
+  fi
   assert_jq "history.h7.trace" "$trace" '
     .prompt.history_followup.classifier_call_count == 1
     and .prompt.history_followup.cr_history_policy_call_count == 1
