@@ -4148,7 +4148,9 @@ MATRIX
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What is the weather?")"
-  test "$(jq -r '.answer' <<<"$response")" = "neutral smoke response"
+  assert_jq "history.h6.newest_ordinary_response" "$response" '
+    .status == "ok" and .selected_model != "not_called"
+  '
   claims="$(list_claim_records "$owner" "$conversation_id")"
   assert_jq "history.h6.newest_has_no_support_record" "$claims" '
     (.records | length) == 1
@@ -4170,9 +4172,18 @@ MATRIX
     and .prompt.history_followup.answer_provider_call_count == 0
     and .model_calls == []
   '
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$calls" >/dev/null
-  assert_dsa_operation_counts "$audit" 0 0 0
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 0 0 0 0
+  assert_jq "history.h6.provider_free" "$calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 0
+  '
+  if ! assert_dsa_operation_counts "$audit" 0 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: history.h6.dsa" >&2
+    return 1
+  fi
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 0 0 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: history.h6.evidence_runtime" >&2
+    return 1
+  fi
   case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")" in
     *"The migration record confirms"*) echo "H6 scanned backward into older support" >&2; return 1 ;;
   esac
