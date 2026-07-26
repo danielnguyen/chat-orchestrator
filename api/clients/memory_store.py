@@ -261,3 +261,31 @@ class MemoryStoreClient:
         if any(response.get(key) != value for key, value in expected_scope.items()):
             raise RuntimeError("acquisition_history_response_context_mismatch")
         return response
+
+    async def resolve_immediate_history(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        explanation_kind: str,
+    ) -> dict[str, Any]:
+        payload = {
+            "schema_version": "immediate-history-resolution.v1",
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "explanation_kind": explanation_kind,
+        }
+        response = await self._post(
+            "/v1/internal/immediate-history/resolve",
+            request_id=request_id,
+            json=payload,
+        )
+        if not isinstance(response, dict) or any(
+            response.get(key) != value for key, value in payload.items()
+        ):
+            raise RuntimeError("immediate_history_response_context_mismatch")
+        return response

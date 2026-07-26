@@ -15,6 +15,7 @@ import yaml
 from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
+from clients.runtime import validate_history_followup_policy_response
 from router.engine import evaluate_route
 from services.action_connectors import ActionConnectorRegistry
 from services.assistant_handoff import build_assistant_handoff
@@ -47,7 +48,16 @@ from services.claim_capture import (
     mark_trace_status_update_failed,
     prepare_claim_capture,
 )
-from services.claim_explanation import resolve_claim_explanation
+from services.claim_explanation import (
+    ClaimExplanationOutcome,
+    classifier_eligible_history_followup,
+    deterministic_history_followup_candidate,
+    history_classifier_response_format,
+    parse_claim_explanation_intent,
+    parse_history_classifier_completion,
+    resolve_claim_explanation,
+    resolve_immediate_claim_explanation,
+)
 from services.companion_presentation import build_companion_presentation
 from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
@@ -107,6 +117,52 @@ from services.response_shape import (
 from services.routing_contract import routing_trace_metadata
 from services.style_envelope import build_style_guidance_block, resolve_style_envelope
 from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
+
+_HISTORY_CLARIFICATION = (
+    "Are you asking what supported the immediately previous answer, what I checked, "
+    "what may have been missed, or whether you want a new verification?"
+)
+_HISTORY_POLICY_UNAVAILABLE = (
+    "I couldn’t safely determine whether this refers to the immediately previous "
+    "answer. I did not perform a history lookup or a new verification."
+)
+_HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
+_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
+_COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
+    "The governed new evidence check completed, but I withheld the generated "
+    "explanation because it conflicted with the verification response boundary."
+)
+_COMPOUND_VERIFICATION_LABELS = (
+    "Original acquisition",
+    "Original support",
+    "New verification",
+    "New verification attempt",
+    "New verification unavailable",
+)
+_COMPOUND_VERIFICATION_LABEL_ALTERNATION = "|".join(
+    re.escape(label) for label in _COMPOUND_VERIFICATION_LABELS
+)
+_COMPOUND_VERIFICATION_LABEL_LINE_RE = re.compile(
+    r"^[ \t]{0,3}"
+    r"(?:Retained evidence excerpt [1-9][0-9]{0,2}:[ \t]+)?"
+    r"(?:(?:#{1,6}|[-+*])[ \t]+){0,2}"
+    r"(?:\*\*|__|\*|_)?"
+    rf"(?:{_COMPOUND_VERIFICATION_LABEL_ALTERNATION})"
+    r"(?:\*\*|__|\*|_)?:(?:\*\*|__|\*|_)?(?=$|[ \t])",
+    re.IGNORECASE | re.MULTILINE,
+)
+_HISTORY_CLASSIFIER_SYSTEM_PROMPT = """Classify only the current user turn into one
+history-follow-up intent.
+Return exactly one JSON object matching the supplied schema. Do not explain your choice.
+Use immediate_previous only for an unquoted request about the immediately previous answer.
+Use explicit_reference only when the current text itself explicitly selects an earlier target.
+support_explanation asks what supported or justified the answer.
+acquisition_checked asks what was examined.
+acquisition_coverage asks whether available scope was covered.
+acquisition_gaps asks what may have been missed.
+new_verification_request explicitly asks for a fresh check.
+ambiguous_history_followup is plausibly historical but its requested kind is unclear.
+not_history_followup is an ordinary question or instruction."""
 
 
 def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
@@ -4032,6 +4088,8 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         summary["evidence_acquisition"] = trace["evidence_acquisition"]
     if isinstance(trace.get("claim_explanation"), dict):
         summary["claim_explanation"] = trace["claim_explanation"]
+    if isinstance(trace.get("history_followup"), dict):
+        summary["history_followup"] = trace["history_followup"]
     return summary
 
 
@@ -5957,6 +6015,190 @@ def _load_model_registry(path: str) -> dict[str, Any]:
         return {}
 
 
+def _load_logical_route(path: str, route_name: str) -> dict[str, str] | None:
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    routes = data.get("logical_routes")
+    if not isinstance(routes, dict):
+        return None
+    route = routes.get(route_name)
+    if not isinstance(route, dict) or set(route) != {"model", "provider"}:
+        return None
+    model = route.get("model")
+    provider = route.get("provider")
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or len(model) > 120
+        or provider not in {"local", "cloud"}
+    ):
+        return None
+    return {"model": model.strip(), "provider": provider}
+
+
+def _history_trace(*, enabled: bool) -> dict[str, Any]:
+    return {
+        "feature_enabled": enabled,
+        "deterministic_match_status": "not_evaluated",
+        "classifier_eligibility": "not_evaluated",
+        "classifier_logical_route": _HISTORY_CLASSIFIER_ROUTE,
+        "classifier_call_count": 0,
+        "classifier_status": "not_called",
+        "candidate_source": None,
+        "candidate_intent": None,
+        "candidate_target_mode": None,
+        "confidence_band": "not_applicable",
+        "cr_history_policy_call_count": 0,
+        "cr_policy_status": "not_applicable",
+        "history_lookup_allowed": False,
+        "clarification_required": False,
+        "explicit_verification_requested": False,
+        "verification_after_history_allowed": False,
+        "bms_call_count": 0,
+        "bms_resolution_status": "not_called",
+        "bms_reason_code": "not_called",
+        "resolved_record_kind": None,
+        "render_status": "not_attempted",
+        "fresh_verification_entry_status": "not_requested",
+        "answer_provider_call_count": 0,
+    }
+
+
+def _has_compound_verification_label_conflict(answer: str) -> bool:
+    return _COMPOUND_VERIFICATION_LABEL_LINE_RE.search(answer) is not None
+
+
+def _classifier_cloud_allowed(
+    *,
+    provider: str,
+    local_only: bool,
+    routing_policy: dict[str, Any],
+    effective_payload: dict[str, Any],
+) -> bool:
+    allowed_providers = routing_policy.get("allowed_providers")
+    if allowed_providers is not None:
+        if (
+            not isinstance(allowed_providers, list)
+            or not allowed_providers
+            or any(value not in {"local", "cloud"} for value in allowed_providers)
+            or provider not in allowed_providers
+        ):
+            return False
+    if provider == "local":
+        return True
+    if local_only:
+        return False
+    surface_context = effective_payload.get("surface_context")
+    surface_context = surface_context if isinstance(surface_context, dict) else {}
+    surface_sensitivity = surface_context.get("sensitivity_level")
+    if surface_sensitivity in {
+        "sensitive",
+        "high",
+        "highly_sensitive",
+        "restricted",
+    }:
+        return False
+    sensitivity_domains = surface_context.get("sensitivity_domains")
+    if isinstance(sensitivity_domains, list) and sensitivity_domains:
+        return False
+    return True
+
+
+async def _classify_history_followup(
+    *,
+    current_user_text: str,
+    request_id: str,
+    litellm: Any,
+    model_registry_path: str,
+    timeout_ms: int,
+    local_only: bool,
+    routing_policy: dict[str, Any],
+    effective_payload: dict[str, Any],
+    trace: dict[str, Any],
+) -> dict[str, Any] | None:
+    route = _load_logical_route(model_registry_path, _HISTORY_CLASSIFIER_ROUTE)
+    if route is None:
+        trace["classifier_status"] = "route_unavailable"
+        return None
+    if not _classifier_cloud_allowed(
+        provider=route["provider"],
+        local_only=local_only,
+        routing_policy=routing_policy,
+        effective_payload=effective_payload,
+    ):
+        trace["classifier_status"] = "provider_disallowed"
+        return None
+    if litellm is None or not callable(getattr(litellm, "chat", None)):
+        trace["classifier_status"] = "client_unavailable"
+        return None
+    trace["classifier_call_count"] = 1
+    try:
+        completion = await litellm.chat(
+            request_id=request_id,
+            model=route["model"],
+            messages=[
+                {"role": "system", "content": _HISTORY_CLASSIFIER_SYSTEM_PROMPT},
+                {"role": "user", "content": current_user_text},
+            ],
+            response_format=history_classifier_response_format(),
+            max_completion_tokens=_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS,
+            timeout_ms=timeout_ms,
+        )
+        candidate = parse_history_classifier_completion(completion)
+    except Exception:
+        trace["classifier_status"] = "failed"
+        return None
+    trace["classifier_status"] = "accepted"
+    return candidate
+
+
+async def _resolve_history_policy(
+    *,
+    runtime: Any,
+    candidate: dict[str, Any],
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    surface_session_id: str | None,
+    active_mode: str | None,
+    current_user_text: str,
+    recent_messages: list[dict[str, str]],
+    surface_metadata_json: dict[str, Any] | None,
+) -> dict[str, Any]:
+    response = await runtime.evaluate_interaction_governance(
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        surface_session_id=surface_session_id,
+        active_mode=active_mode,
+        current_user_text=current_user_text or None,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
+        history_followup_candidate=candidate,
+    )
+    scope = {
+        "request_id": request_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "surface": surface,
+    }
+    if runtime_session_id is not None:
+        scope["runtime_session_id"] = runtime_session_id
+    if runtime_turn_id is not None:
+        scope["runtime_turn_id"] = runtime_turn_id
+    return validate_history_followup_policy_response(response, scope=scope)
+
+
 def _latency_rank(bucket: str) -> int:
     return {"fast": 0, "medium": 1, "slow": 2}.get(bucket, 3)
 
@@ -6180,6 +6422,8 @@ async def orchestrate_chat(
     capability_registry_enabled: bool = False,
     claim_record_capture_enabled: bool = False,
     evidence_acquisition_enabled: bool = False,
+    history_followup_enabled: bool = False,
+    intent_classifier_timeout_ms: int = 3000,
     response_action_mode: str = "shadow",
     interrupt_policy_mode: str = "off",
     dsa: DataSourceAggregatorClient | None = None,
@@ -6531,20 +6775,197 @@ async def orchestrate_chat(
     evidence_path_deferred = False
     compound_verification_requested = False
     compound_history_answer = ""
+    compound_history_label = "Original acquisition"
     compound_verification_target: str | None = None
     evidence_task_text = last_user_text
+    history_followup_trace = _history_trace(enabled=history_followup_enabled)
 
     try:
-        claim_explanation = await resolve_claim_explanation(
-            enabled=claim_record_capture_enabled,
-            acquisition_history_enabled=evidence_acquisition_enabled,
-            messages=payload.get("messages"),
-            memory_store=memory_store,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
+        parsed_exact_intent = (
+            parse_claim_explanation_intent(last_user_text)
+            if history_followup_enabled
+            else None
         )
+        if (
+            history_followup_enabled
+            and parsed_exact_intent is not None
+            and parsed_exact_intent.mode == "quoted_anchor"
+        ):
+            history_followup_trace["deterministic_match_status"] = "quoted_exact_path"
+            history_followup_trace["classifier_eligibility"] = "not_applicable"
+            history_followup_trace["classifier_status"] = "not_called_quoted_path"
+            claim_explanation = await resolve_claim_explanation(
+                enabled=claim_record_capture_enabled,
+                acquisition_history_enabled=evidence_acquisition_enabled,
+                messages=payload.get("messages"),
+                memory_store=memory_store,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+            )
+        elif history_followup_enabled:
+            claim_explanation = ClaimExplanationOutcome(False, None, None, {})
+            candidate = deterministic_history_followup_candidate(last_user_text)
+            if candidate is not None:
+                history_followup_trace["deterministic_match_status"] = "matched"
+                history_followup_trace["classifier_eligibility"] = "not_applicable"
+                history_followup_trace["classifier_status"] = "not_called_deterministic"
+            else:
+                history_followup_trace["deterministic_match_status"] = "not_matched"
+                eligible = classifier_eligible_history_followup(last_user_text)
+                history_followup_trace["classifier_eligibility"] = (
+                    "eligible" if eligible else "ineligible"
+                )
+                if eligible:
+                    candidate = await _classify_history_followup(
+                        current_user_text=last_user_text,
+                        request_id=request_id,
+                        litellm=litellm,
+                        model_registry_path=model_registry_path,
+                        timeout_ms=intent_classifier_timeout_ms,
+                        local_only=local_only,
+                        routing_policy=routing_policy,
+                        effective_payload=effective_payload,
+                        trace=history_followup_trace,
+                    )
+                    if candidate is None:
+                        history_followup_trace["clarification_required"] = True
+                        history_followup_trace["render_status"] = "clarification"
+                        claim_explanation = ClaimExplanationOutcome(
+                            True,
+                            _HISTORY_CLARIFICATION,
+                            "degraded",
+                            {},
+                        )
+                else:
+                    history_followup_trace["classifier_status"] = "not_called_ineligible"
+
+            if candidate is not None:
+                history_followup_trace["candidate_source"] = candidate["source"]
+                history_followup_trace["candidate_intent"] = candidate["intent"]
+                history_followup_trace["candidate_target_mode"] = candidate["target_mode"]
+                history_followup_trace["explicit_verification_requested"] = bool(
+                    candidate["new_verification_requested"]
+                )
+                if runtime is None:
+                    history_followup_trace["cr_policy_status"] = "unavailable"
+                    history_followup_trace["render_status"] = "failure"
+                    claim_explanation = ClaimExplanationOutcome(
+                        True,
+                        _HISTORY_POLICY_UNAVAILABLE,
+                        "degraded",
+                        {},
+                    )
+                else:
+                    history_followup_trace["cr_history_policy_call_count"] = 1
+                    try:
+                        history_policy = await _resolve_history_policy(
+                            runtime=runtime,
+                            candidate=candidate,
+                            request_id=request_id,
+                            owner_id=payload["owner_id"],
+                            conversation_id=conversation_id,
+                            surface=surface,
+                            runtime_session_id=runtime_session_trace.get(
+                                "runtime_session_id"
+                            ),
+                            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                            surface_session_id=surface_session_id,
+                            active_mode=active_mode,
+                            current_user_text=last_user_text,
+                            recent_messages=recent_messages,
+                            surface_metadata_json=surface_metadata_json,
+                        )
+                    except Exception:
+                        history_policy = None
+                    if history_policy is None:
+                        history_followup_trace["cr_policy_status"] = "unavailable"
+                        history_followup_trace["render_status"] = "failure"
+                        claim_explanation = ClaimExplanationOutcome(
+                            True,
+                            _HISTORY_POLICY_UNAVAILABLE,
+                            "degraded",
+                            {},
+                        )
+                    else:
+                        history_followup_trace["cr_policy_status"] = history_policy[
+                            "status"
+                        ]
+                        history_followup_trace["confidence_band"] = history_policy[
+                            "confidence_band"
+                        ]
+                        history_followup_trace["history_lookup_allowed"] = bool(
+                            history_policy["history_lookup_allowed"]
+                        )
+                        history_followup_trace["clarification_required"] = bool(
+                            history_policy["clarification_required"]
+                        )
+                        history_followup_trace[
+                            "verification_after_history_allowed"
+                        ] = bool(
+                            history_policy[
+                                "new_verification_allowed_after_history_resolution"
+                            ]
+                        )
+                        if (
+                            history_policy["status"] == "accepted"
+                            and history_policy["target_mode"] == "immediate_previous"
+                            and history_policy["history_lookup_allowed"] is True
+                        ):
+                            history_followup_trace["bms_call_count"] = 1
+                            claim_explanation = await resolve_immediate_claim_explanation(
+                                policy=history_policy,
+                                memory_store=memory_store,
+                                request_id=request_id,
+                                owner_id=payload["owner_id"],
+                                conversation_id=conversation_id,
+                                surface=surface,
+                            )
+                            history_followup_trace["bms_resolution_status"] = (
+                                claim_explanation.trace.get("resolution_status")
+                            )
+                            history_followup_trace["bms_reason_code"] = (
+                                claim_explanation.trace.get("reason_code")
+                            )
+                            history_followup_trace["resolved_record_kind"] = (
+                                claim_explanation.trace.get("resolved_record_kind")
+                            )
+                            history_followup_trace["render_status"] = (
+                                claim_explanation.trace.get("render_status")
+                            )
+                            if claim_explanation.new_verification_requested:
+                                history_followup_trace[
+                                    "fresh_verification_entry_status"
+                                ] = "eligible_after_history_resolution"
+                            compound_history_label = (
+                                "Original support"
+                                if history_policy["explanation_kind"] == "support"
+                                else "Original acquisition"
+                            )
+                        elif history_policy["status"] in {
+                            "clarification_required",
+                            "explicit_reference",
+                        }:
+                            history_followup_trace["clarification_required"] = True
+                            history_followup_trace["render_status"] = "clarification"
+                            claim_explanation = ClaimExplanationOutcome(
+                                True,
+                                _HISTORY_CLARIFICATION,
+                                "degraded",
+                                {},
+                            )
+        else:
+            claim_explanation = await resolve_claim_explanation(
+                enabled=claim_record_capture_enabled,
+                acquisition_history_enabled=evidence_acquisition_enabled,
+                messages=payload.get("messages"),
+                memory_store=memory_store,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+            )
         compound_verification_requested = bool(
             claim_explanation.handled
             and claim_explanation.new_verification_requested
@@ -6557,6 +6978,36 @@ async def orchestrate_chat(
                     "Verify this prior statement with a new evidence check: "
                     f'"{compound_verification_target}"'
                 )
+        fresh_history_path_available = bool(
+            evidence_acquisition_enabled
+            and dsa_enabled
+            and dsa is not None
+            and runtime is not None
+            and external_context_enabled
+            and not local_only
+            and runtime_session_trace.get("runtime_session_id")
+            and turn_state_trace.get("runtime_turn_id")
+        )
+        if (
+            history_followup_enabled
+            and compound_verification_requested
+            and not fresh_history_path_available
+        ):
+            history_followup_trace["fresh_verification_entry_status"] = (
+                "unavailable_after_history_resolution"
+            )
+            combined_answer = (
+                f"{compound_history_label}:\n{compound_history_answer}\n\n"
+                "New verification unavailable:\n"
+                "I couldn’t complete a governed new evidence check for that statement."
+            )
+            claim_explanation = ClaimExplanationOutcome(
+                True,
+                combined_answer,
+                "degraded",
+                claim_explanation.trace,
+            )
+            compound_verification_requested = False
         if (
             claim_explanation.handled
             and not compound_verification_requested
@@ -6612,11 +7063,21 @@ async def orchestrate_chat(
                     "prompt_assembly": {
                         "status": "not_requested",
                         "claim_explanation": claim_explanation.trace,
+                        **(
+                            {"history_followup": history_followup_trace}
+                            if history_followup_enabled
+                            else {}
+                        ),
                     },
                 },
                 "prompt": {
                     "status": "not_requested",
                     "claim_explanation": claim_explanation.trace,
+                    **(
+                        {"history_followup": history_followup_trace}
+                        if history_followup_enabled
+                        else {}
+                    ),
                     "runtime_session": runtime_session_trace,
                     "turn_state": turn_state_trace,
                 },
@@ -7949,6 +8410,8 @@ async def orchestrate_chat(
             )
         if compound_verification_requested:
             prompt.trace["claim_explanation"] = claim_explanation.trace
+        if history_followup_enabled:
+            prompt.trace["history_followup"] = history_followup_trace
 
         await _advance_runtime_turn(
             runtime=runtime,
@@ -8624,6 +9087,10 @@ async def orchestrate_chat(
             evidence_acquisition,
         )
         if compound_verification_requested:
+            if history_followup_enabled:
+                history_followup_trace["fresh_verification_entry_status"] = (
+                    "entered_existing_governed_path"
+                )
             sufficiency_status = (
                 evidence_acquisition.sufficiency.sufficiency_status
                 if evidence_acquisition is not None
@@ -8640,6 +9107,9 @@ async def orchestrate_chat(
             ):
                 verification_label = "New verification"
                 verification_answer = answer
+                if _has_compound_verification_label_conflict(verification_answer):
+                    verification_answer = _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT
+                    status = "degraded"
             elif (
                 compound_governed_acquisition_established
                 and sufficiency_status in {"insufficient", "unknown"}
@@ -8653,7 +9123,7 @@ async def orchestrate_chat(
                     "statement."
                 )
             answer = (
-                f"Original acquisition:\n{compound_history_answer}\n\n"
+                f"{compound_history_label}:\n{compound_history_answer}\n\n"
                 f"{verification_label}:\n{verification_answer}"
             )
 

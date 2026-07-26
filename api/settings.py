@@ -58,6 +58,16 @@ class Settings(BaseSettings):
         default=False,
         alias="EVIDENCE_ACQUISITION_ENABLED",
     )
+    history_followup_enabled: bool = Field(
+        default=False,
+        alias="HISTORY_FOLLOWUP_ENABLED",
+    )
+    intent_classifier_timeout_ms: int = Field(
+        default=3000,
+        alias="INTENT_CLASSIFIER_TIMEOUT_MS",
+        ge=100,
+        le=30000,
+    )
     dsa_base_url: str = Field(default="http://localhost:5174", alias="DSA_BASE_URL")
     dsa_timeout_ms: int = Field(default=5000, alias="DSA_TIMEOUT_MS", ge=100, le=30000)
     dsa_enabled: bool = Field(default=False, alias="DSA_ENABLED")
@@ -111,6 +121,11 @@ class Settings(BaseSettings):
                 raise ValueError("evidence acquisition requires interaction governance")
             if not self.dsa_enabled:
                 raise ValueError("evidence acquisition requires Data Source Aggregator")
+        if self.history_followup_enabled:
+            if not self.cognitive_runtime_base_url:
+                raise ValueError("history follow-up requires Cognitive Runtime")
+            if not self.cognitive_runtime_interaction_governance_enabled:
+                raise ValueError("history follow-up requires interaction governance")
         return self
 
 

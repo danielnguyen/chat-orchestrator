@@ -541,6 +541,95 @@ are policy-owned, the combined response is claim-capture-ineligible, and the
 existing one-additional-acquisition maximum is unchanged. Provider candidate
 JSON is neither reconstructed nor retained by history or compound rendering.
 
+## Server-owned immediate-history follow-ups
+
+`HISTORY_FOLLOWUP_ENABLED=false` keeps the established quoted and request-supplied
+history behavior above unchanged. When enabled, the current user turn may enter a
+server-owned immediate-history path without the client resending the previous
+assistant response. `INTENT_CLASSIFIER_TIMEOUT_MS` defaults to 3000 milliseconds
+and is bounded like other dependency timeouts.
+
+Exact quoted targets are parsed first and remain on the separately bounded
+exact-reference path. Exact canonical support, acquisition-checked, coverage,
+gaps, and re-verification forms then use a deterministic fast path with no model
+call. Only short, structurally plausible unresolved wording is
+classifier-eligible; ordinary topic questions, advice about what the user should
+check, questions about what another person checked, generic checksum
+instructions, and materially long turns do not call the classifier.
+
+Eligible paraphrases may make at most one LiteLLM call through the logical route
+`intent_classifier`, initially mapped to the cloud model `gpt-5-mini`. This route
+is independent of answer routing, so configuring a future local model changes no
+durable contract. The request has no tools, uses a strict JSON-schema response
+format and a small output-token limit, and carries only a bounded current user
+turn plus a fixed classification instruction. It never receives previous
+assistant text, retained records, evidence, source identity, owner or conversation
+identity, profile overlays, hidden reasoning, or the answer prompt.
+
+The classifier runs only after effective profile and pre-classification privacy
+signals are available. A cloud route is unavailable to local-only requests or
+profiles, disallowed providers, and high or restricted surface sensitivity. A
+future local route may run under local-only policy. Missing or malformed route
+configuration, unavailable LiteLLM, timeout, transport failure, malformed output,
+and policy-disallowed classification fail closed to one narrow clarification.
+There is no repair call, semantic retry, alternate classifier, or answer-model
+fallback.
+
+Every valid deterministic or classifier candidate receives one additional
+interaction-governance evaluation from Cognitive Runtime. Chat Orchestrator
+strictly validates the response scope and complete closed history policy.
+Cognitive Runtime owns confidence thresholds, ambiguity, target-mode disposition,
+and permission to attempt immediate history. Rejected and not-applicable results
+preserve ordinary handling. Clarification is provider-free. A classifier claiming
+an explicit reference without a parsed exact quote cannot select a target and
+receives clarification.
+
+Only an accepted immediate-previous policy with history lookup allowed makes one
+`POST /v1/internal/immediate-history/resolve` call. The request contains only the
+schema version, current request, owner, conversation, surface, and explanation
+kind. Basic Memory Store owns selection of the single newest durable assistant
+response and its exactly associated support or acquisition record. Chat
+Orchestrator does not send prior response bytes or record identifiers, call the
+legacy acquisition resolver for this path, list claim records, fetch traces,
+search semantically, or scan backward after a missing or invalid newest record.
+
+Resolved support records and acquisition manifests use the existing deterministic
+renderers. Support rendering accepts approved retained file, governed
+external-source, tool-output, and integration-event reference shapes, but exposes
+only closed structural facts such as evidence category, claim class, confidence,
+strength, freshness, and bounded limitations. Acquisition rendering continues to
+use the strict manifest projection for checked, coverage, and gaps questions.
+Neither renderer exposes identifiers, URLs, excerpts, source names, raw summaries,
+provider prose, or hidden reasoning. Pure historical output is persisted exactly
+as returned with `selected_model = "not_called"` and states that no new verification
+was performed.
+
+Fresh verification begins only when Cognitive Runtime explicitly permits it after
+one valid immediate record resolves and that record supplies an exact bounded
+target paragraph. The existing governed evidence path then runs once; historical
+evidence is not reused as fresh evidence. Support-backed compounds use
+`Original support:`. Acquisition-backed compounds retain `Original acquisition:`,
+and the existing `New verification:`, `New verification attempt:`, and `New
+verification unavailable:` labels remain policy-owned. If the governed path is
+unavailable, the combined provider-free response says so rather than silently
+returning only history or pretending a new check occurred.
+
+When enabled, the request trace adds one bounded `history_followup` summary with
+feature, deterministic match, eligibility, logical route, classifier status and
+call count, closed candidate projection, confidence band, Cognitive Runtime
+policy status and call count, lookup and clarification permissions, explicit
+verification flags, Basic Memory Store status and call count, resolved record
+kind, render status, fresh-verification entry status, and historical-rendering
+answer-provider call count. It contains no turn text, prompts, raw classifier
+output, exact confidence reasoning, record or source identifiers, provider
+responses, or unrestricted exceptions. Classifier accounting is separate from
+answer-provider `model_calls`.
+
+This path does not implement vague arbitrary-history search, backward scanning,
+provider reconstruction of history, classifier-selected records, automatic
+verification, client-cache authority, or cross-device active-thread handoff.
+Actual-service composition and deployed client proof are separate validation work.
+
 ## Integration boundaries
 
 ### Basic Memory Store

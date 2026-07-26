@@ -18,6 +18,9 @@ class LiteLLMClient:
         model: str,
         messages: list[dict[str, str]],
         tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
+        max_completion_tokens: int | None = None,
+        timeout_ms: int | None = None,
     ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -29,7 +32,12 @@ class LiteLLMClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if max_completion_tokens is not None:
+            payload["max_completion_tokens"] = max_completion_tokens
+        timeout = self.timeout if timeout_ms is None else timeout_ms / 1000
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/v1/chat/completions",
                 headers=headers,
