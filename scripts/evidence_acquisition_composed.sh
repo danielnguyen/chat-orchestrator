@@ -4230,6 +4230,11 @@ MATRIX
       has_retained_excerpt: (.answer | contains("Retained evidence excerpt 1:")),
       has_unavailable_label: (.answer | contains("New verification unavailable:")),
       has_boundary_withholding: (.answer | contains("conflicted with the verification response boundary")),
+      evidence_validation: {
+        status: $trace.retrieval.prompt_assembly.evidence_response.validation_status,
+        retained_excerpt_count: $trace.retrieval.prompt_assembly.evidence_response.validated_excerpt_count,
+        reason: $trace.retrieval.prompt_assembly.evidence_response.failure_reason
+      },
       trusted_labels: [
         .answer | split("\n")[]
         | select(. == "Original support:"
@@ -4238,7 +4243,7 @@ MATRIX
           or . == "New verification attempt:"
           or . == "New verification unavailable:")
       ]
-    }' <<<"$response" >&2
+    }' --argjson trace "$trace" <<<"$response" >&2
     echo "Assertion failed: history.h7.response" >&2
     return 1
   fi
