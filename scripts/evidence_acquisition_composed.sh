@@ -4226,6 +4226,10 @@ MATRIX
     jq -c '{
       status,
       selected_model,
+      has_governed_support: (.answer | contains("The retained evidence supports the requested conclusion.")),
+      has_retained_excerpt: (.answer | contains("Retained evidence excerpt 1:")),
+      has_unavailable_label: (.answer | contains("New verification unavailable:")),
+      has_boundary_withholding: (.answer | contains("conflicted with the verification response boundary")),
       trusted_labels: [
         .answer | split("\n")[]
         | select(. == "Original support:"
