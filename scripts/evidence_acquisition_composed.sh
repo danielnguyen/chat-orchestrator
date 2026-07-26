@@ -3918,13 +3918,40 @@ assert_pure_history_case() {
   assert_jq "history.pure.provider_count" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length) == $classifier_calls
   ' --argjson classifier_calls "$classifier_calls"
-  assert_dsa_operation_counts "$audit" 0 0 0
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 0 0 0 0
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  assert_history_runtime_policy "$diagnostics" "$request_id" 2 accepted "$intent"
-  assert_history_trace_privacy "$trace" "$question" "$HISTORY_ORIGINAL_ANSWER"
-  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  if ! assert_dsa_operation_counts "$audit" 0 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.dsa" >&2
+    return 1
+  fi
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 0 0 0 0 >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.evidence_runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events \
+    "$diagnostics" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.claim_runtime" >&2
+    return 1
+  fi
+  if ! assert_history_runtime_policy \
+    "$diagnostics" "$request_id" 2 accepted "$intent" >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.policy_runtime" >&2
+    return 1
+  fi
+  if ! assert_history_trace_privacy \
+    "$trace" "$question" "$HISTORY_ORIGINAL_ANSWER" >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.trace_privacy" >&2
+    return 1
+  fi
+  if ! assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.answer_persistence" >&2
+    return 1
+  fi
+  if ! assert_request_persistence_counts \
+    "$conversation_id" "$request_id" 0 >/dev/null 2>&1; then
+    echo "Assertion failed: history.pure.persistence_counts" >&2
+    return 1
+  fi
   case "$(jq -c . <<<"$response")" in
     *records_primary*|*google_sheets:*|*http://*|*claim_id*|*manifest_id*|*"The migration record confirms"*)
       echo "history answer exposed retained identifiers or source content" >&2
