@@ -4200,9 +4200,6 @@ MATRIX
   reset_dsa_audit
   question="Can you verify that again now?"
   queue_history_classifier new_verification_request 0.91 true
-  queue_evidence_candidate supports \
-    "google_sheets:records_primary:Records!A2:C2" \
-    "The migration record confirms the bounded setting."
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question" private "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
   answer="$(jq -er '.answer' <<<"$response")"
