@@ -128,6 +128,29 @@ _HISTORY_POLICY_UNAVAILABLE = (
 )
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
+_COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
+    "The governed new evidence check completed, but I withheld the generated "
+    "explanation because it conflicted with the verification response boundary."
+)
+_COMPOUND_VERIFICATION_LABELS = (
+    "Original acquisition",
+    "Original support",
+    "New verification",
+    "New verification attempt",
+    "New verification unavailable",
+)
+_COMPOUND_VERIFICATION_LABEL_ALTERNATION = "|".join(
+    re.escape(label) for label in _COMPOUND_VERIFICATION_LABELS
+)
+_COMPOUND_VERIFICATION_LABEL_LINE_RE = re.compile(
+    r"^[ \t]{0,3}"
+    r"(?:Retained evidence excerpt [1-9][0-9]{0,2}:[ \t]+)?"
+    r"(?:(?:#{1,6}|[-+*])[ \t]+){0,2}"
+    r"(?:\*\*|__|\*|_)?"
+    rf"(?:{_COMPOUND_VERIFICATION_LABEL_ALTERNATION})"
+    r"(?:\*\*|__|\*|_)?:(?:\*\*|__|\*|_)?(?=$|[ \t])",
+    re.IGNORECASE | re.MULTILINE,
+)
 _HISTORY_CLASSIFIER_SYSTEM_PROMPT = """Classify only the current user turn into one
 history-follow-up intent.
 Return exactly one JSON object matching the supplied schema. Do not explain your choice.
@@ -6045,6 +6068,10 @@ def _history_trace(*, enabled: bool) -> dict[str, Any]:
     }
 
 
+def _has_compound_verification_label_conflict(answer: str) -> bool:
+    return _COMPOUND_VERIFICATION_LABEL_LINE_RE.search(answer) is not None
+
+
 def _classifier_cloud_allowed(
     *,
     provider: str,
@@ -9080,6 +9107,9 @@ async def orchestrate_chat(
             ):
                 verification_label = "New verification"
                 verification_answer = answer
+                if _has_compound_verification_label_conflict(verification_answer):
+                    verification_answer = _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT
+                    status = "degraded"
             elif (
                 compound_governed_acquisition_established
                 and sufficiency_status in {"insufficient", "unknown"}

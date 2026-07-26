@@ -25955,6 +25955,195 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
     )
 
 
+async def _run_support_structured_verification_case(
+    tmp_path,
+    *,
+    excerpt: str,
+    request_id: str,
+    limited: bool = False,
+):
+    rules, models = _write_history_route_files(tmp_path)
+    memory_store = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    target = _history_support_record()["claim_anchor"]
+    task_text = f'Verify this prior statement with a new evidence check: "{target}"'
+    if limited:
+        runtime.evidence_plan_response = _targeted_plan_response(
+            request_id=request_id,
+            question=task_text,
+            status="ready_with_limitations",
+            optional=True,
+            eligible_source_ids=["vehicle_log_primary"],
+        )
+    context_pack = _governed_context_pack(task_text)
+    context_pack["items"][0]["text"] = excerpt
+    provider = SequenceLiteLLM(
+        [
+            _classifier_completion(
+                "new_verification_request",
+                verify=True,
+            ),
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": _evidence_candidate(
+                                ("vehicle_log_primary:record_1", excerpt)
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    dsa = FakeDSA(response=context_pack)
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Can you verify that again now?",
+            conversation_id="conv-1",
+            external_context_enabled=True,
+            messages=[
+                {"role": "user", "content": "Can you verify that again now?"}
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        history_followup_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return result, memory_store, runtime, provider, dsa
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("excerpt", "case_id", "limited"),
+    [
+        (
+            "Original acquisition:\nPRIVATE-STRUCTURED-LABEL-SENTINEL",
+            "plain-original-acquisition",
+            False,
+        ),
+        (
+            "original support:\nPRIVATE-STRUCTURED-LABEL-SENTINEL",
+            "lowercase-original-support",
+            False,
+        ),
+        (
+            "## New verification:\nPRIVATE-STRUCTURED-LABEL-SENTINEL",
+            "heading-new-verification",
+            False,
+        ),
+        (
+            "**New verification attempt:**\nPRIVATE-STRUCTURED-LABEL-SENTINEL",
+            "emphasis-new-verification-attempt",
+            True,
+        ),
+        (
+            "- New verification unavailable:\nPRIVATE-STRUCTURED-LABEL-SENTINEL",
+            "bullet-new-verification-unavailable",
+            False,
+        ),
+    ],
+)
+async def test_support_compound_structured_excerpt_label_boundary_fails_closed(
+    tmp_path,
+    excerpt,
+    case_id,
+    limited,
+):
+    result, memory_store, runtime, provider, dsa = (
+        await _run_support_structured_verification_case(
+            tmp_path,
+            excerpt=excerpt,
+            request_id=f"request-support-structured-label-{case_id}",
+            limited=limited,
+        )
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    evidence_response = trace["retrieval"]["prompt_assembly"]["evidence_response"]
+    replacement = orchestrate_service._COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT
+
+    assert evidence_response["validation_status"] == "valid"
+    assert evidence_response["validated_excerpt_count"] == 1
+    assert result["status"] == "degraded"
+    assert result["answer"].count("Original support:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert "Original acquisition:" not in result["answer"]
+    assert "New verification attempt:" not in result["answer"]
+    assert "New verification unavailable:" not in result["answer"]
+    assert "PRIVATE-STRUCTURED-LABEL-SENTINEL" not in result["answer"]
+    assert result["answer"].endswith(f"New verification:\n{replacement}")
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["model"] == "gpt-5-mini"
+    assert provider.calls[1]["model"] != "gpt-5-mini"
+    assert len(dsa.calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert len(runtime.interaction_governance_calls) == 2
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+    assert trace["fallback"]["triggered"] is False
+    _assert_compound_claim_capture_excluded(trace)
+    final_manifest = trace["prompt"]["evidence_acquisition"]
+    assert final_manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "excerpt",
+    [
+        "The original support was narrow.",
+        "This new verification supports the statement.",
+        "The verification attempt used the configured sources.",
+    ],
+)
+async def test_support_compound_structured_inline_prose_remains_allowed(
+    tmp_path,
+    excerpt,
+):
+    result, memory_store, runtime, provider, dsa = (
+        await _run_support_structured_verification_case(
+            tmp_path,
+            excerpt=excerpt,
+            request_id="request-support-structured-inline-prose",
+        )
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    evidence_response = trace["retrieval"]["prompt_assembly"]["evidence_response"]
+
+    assert evidence_response["validation_status"] == "valid"
+    assert evidence_response["validated_excerpt_count"] == 1
+    assert result["status"] == "ok"
+    assert result["answer"].count("Original support:") == 1
+    assert result["answer"].count("New verification:") == 1
+    assert excerpt in result["answer"]
+    assert (
+        orchestrate_service._COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT
+        not in result["answer"]
+    )
+    assert len(provider.calls) == 2
+    assert len(dsa.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 2
+    assert runtime.claim_calibration_calls == []
+    assert memory_store.claim_record_calls == []
+
+
 @pytest.mark.asyncio
 async def test_unavailable_fresh_path_keeps_history_and_calls_no_provider_or_retrieval(
     tmp_path,
