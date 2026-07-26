@@ -6,10 +6,10 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="774a49882729ab3d06b88c5b2eff79cfe5ce54e7"
-CR_COMMIT="d814a0d2789269383e81db037d464cf821c6502d"
+BMS_COMMIT="af9420da0235c208bcf842a0ca81f88e537d93be"
+CR_COMMIT="f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="db8d4208595778cbe7a138e9001ef32f6f2e213e"
+CO_COMMIT="6fec8fd9adc7671e99447470ab238b2d30259d51"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -823,6 +823,13 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+if [ "${HISTORY_FOLLOWUP_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: history-followup-only"
+  run_history_followup_composed_suite
+  echo "Topology: thin CO client -> CR history policy -> BMS newest durable response; optional classifier/DSA/provider calls are asserted per scenario."
+  exit 0
+fi
+
 # Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
 owner="owner-smoke-a"
 client="client-smoke-a"
@@ -973,6 +980,7 @@ jq -e '
 run_wave2e_retrieval_scenario
 run_claim_traceability_scenario
 run_evidence_acquisition_composed_suite
+run_history_followup_composed_suite
 
-echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation, evidence-acquisition"
+echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation, evidence-acquisition, server-owned-history-followups"
 echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."

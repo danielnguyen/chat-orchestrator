@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: d814a0d2789269383e81db037d464cf821c6502d
+          ref: f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -67,16 +67,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: 774a49882729ab3d06b88c5b2eff79cfe5ce54e7
+          ref: af9420da0235c208bcf842a0ca81f88e537d93be
           path: basic-memory-store
           fetch-depth: 0
 
       - name: Establish pinned local main refs
         run: |
-          git -C cognitive-runtime branch --force main d814a0d2789269383e81db037d464cf821c6502d
+          git -C cognitive-runtime branch --force main f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67
           git -C data-source-aggregator branch --force main e23f582e4aac32a12c7ad3c71278fc21e5697ea4
-          git -C basic-memory-store branch --force main 774a49882729ab3d06b88c5b2eff79cfe5ce54e7
-          git -C chat-orchestrator merge-base --is-ancestor db8d4208595778cbe7a138e9001ef32f6f2e213e HEAD
+          git -C basic-memory-store branch --force main af9420da0235c208bcf842a0ca81f88e537d93be
+          git -C chat-orchestrator merge-base --is-ancestor 6fec8fd9adc7671e99447470ab238b2d30259d51 HEAD
 
       - name: Validate Compose configuration
         working-directory: chat-orchestrator
@@ -90,6 +90,14 @@ jobs:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
           EVIDENCE_ACQUISITION_ONLY: "1"
           EVIDENCE_SCENARIO: ${{ github.event_name == 'workflow_dispatch' && inputs.evidence_scenario || 'all' }}
+        run: make composed-smoke
+
+      - name: Run server-owned immediate-history proof
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+          HISTORY_FOLLOWUP_ONLY: "1"
         run: make composed-smoke
 
       - name: Run complete composed smoke regression
