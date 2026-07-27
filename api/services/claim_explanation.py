@@ -879,12 +879,19 @@ def _record_matches_scope(
 @dataclass(frozen=True)
 class AcquisitionHistory:
     task_shape: Literal[
+        "ordinary_context_augmentation",
         "targeted_lookup",
         "cross_source_comparison",
         "bounded_exhaustive_review",
     ]
-    strategy: Literal["targeted_retrieval", "exact_fetch", "hybrid"]
+    strategy: Literal[
+        "context_augmentation",
+        "targeted_retrieval",
+        "exact_fetch",
+        "hybrid",
+    ]
     sufficiency_status: Literal[
+        "not_evaluated",
         "sufficient_for_declared_scope",
         "sufficient_with_limitations",
         "insufficient",
@@ -943,6 +950,25 @@ _PLAN_LIMITATION_CODES = {
     "historical_sequence_not_supported",
     "decision_support_scope_insufficient",
     "optional_source_unavailable",
+}
+_SHAPE_REASON_CODES = {
+    "source_context_present",
+    "external_verification_required",
+    "freshness_sensitive",
+    "high_stakes_accuracy_required",
+    "explicit_evidence_language",
+    "targeted_lookup_derived",
+    "exhaustive_scope_requested",
+    "comparison_requested",
+    "contradiction_requested",
+    "absence_scope_requested",
+    "historical_reconstruction_requested",
+    "decision_support_requested",
+    "prior_shape_inherited",
+    "ordinary_chat_without_material_evidence_scope",
+    "non_evidence_interaction",
+    "ambiguous_interaction_without_shape_signal",
+    "multiple_incompatible_shapes",
 }
 
 
@@ -1276,6 +1302,7 @@ def _diagnose_acquisition_history_projection(
     inventory = manifest.get("inventory")
     acquisition = manifest.get("acquisition")
     status = manifest.get("status")
+    ordinary_context = status == "not_applicable"
     if manifest.get("enabled") is not True:
         return reject("manifest_enabled_invalid")
     if manifest.get("attempted") is not True:
@@ -1295,23 +1322,67 @@ def _diagnose_acquisition_history_projection(
         or _RESPONSE_DIGEST_RE.fullmatch(manifest["response_digest"]) is None
     ):
         return reject("response_digest_invalid")
-    if status not in accepted_statuses:
+    if status not in accepted_statuses and not ordinary_context:
         return reject("manifest_status_invalid")
     if not isinstance(plan, dict):
         return reject("plan_missing")
-    if plan.get("plan_status") not in {"ready", "ready_with_limitations"}:
+    if ordinary_context:
+        if plan != {
+            "plan_id": None,
+            "plan_status": "not_compiled",
+            "completeness_expectation": None,
+            "contradiction_search_required": False,
+            "selected_strategies": [],
+            "material_requirement_count": 0,
+            "optional_requirement_count": 0,
+            "limitation_codes": [],
+        }:
+            return reject("ordinary_plan_invalid")
+    elif plan.get("plan_status") not in {"ready", "ready_with_limitations"}:
         return reject("plan_status_invalid")
     if not isinstance(sufficiency, dict):
         return reject("sufficiency_missing")
-    if sufficiency.get("status") not in accepted_statuses:
+    if ordinary_context:
+        if sufficiency != {
+            "evaluation_id": None,
+            "status": "not_evaluated",
+            "reason_codes": [],
+            "answer_constraints": [],
+            "qualification_required": False,
+            "additional_acquisition_required": False,
+        }:
+            return reject("ordinary_sufficiency_invalid")
+    elif sufficiency.get("status") not in accepted_statuses:
         return reject("sufficiency_status_invalid")
-    if sufficiency.get("status") != status:
+    if not ordinary_context and sufficiency.get("status") != status:
         return reject("manifest_sufficiency_status_mismatch")
     if not isinstance(shape, dict):
         return reject("shape_missing")
-    if shape.get("derivation_status") != "derived":
+    if ordinary_context:
+        reason_codes = shape.get("reason_codes")
+        if (
+            set(shape)
+            != {
+                "derivation_status",
+                "task_shape",
+                "candidate_count",
+                "clarification_required",
+                "reason_codes",
+            }
+            or shape.get("derivation_status") != "not_applicable"
+            or shape.get("task_shape") is not None
+            or shape.get("candidate_count") != 0
+            or shape.get("clarification_required") is not False
+            or not isinstance(reason_codes, list)
+            or not reason_codes
+            or len(reason_codes) > 17
+            or any(code not in _SHAPE_REASON_CODES for code in reason_codes)
+            or len(reason_codes) != len(set(reason_codes))
+        ):
+            return reject("ordinary_shape_invalid")
+    elif shape.get("derivation_status") != "derived":
         return reject("shape_derivation_status_invalid")
-    if shape.get("task_shape") not in {
+    if not ordinary_context and shape.get("task_shape") not in {
         "targeted_lookup",
         "cross_source_comparison",
         "bounded_exhaustive_review",
@@ -1324,17 +1395,28 @@ def _diagnose_acquisition_history_projection(
     if not isinstance(acquisition, dict):
         return reject("acquisition_missing")
 
-    task_shape = shape["task_shape"]
+    task_shape = (
+        "ordinary_context_augmentation"
+        if ordinary_context
+        else shape["task_shape"]
+    )
     selected_strategies = plan.get("selected_strategies")
-    strategy = acquisition.get("strategy_attempted")
-    if (
+    strategy = (
+        "context_augmentation"
+        if ordinary_context
+        else acquisition.get("strategy_attempted")
+    )
+    if ordinary_context:
+        if acquisition.get("strategy_attempted") is not None:
+            return reject("ordinary_strategy_invalid")
+    elif (
         not isinstance(selected_strategies, list)
         or len(selected_strategies) != 1
         or selected_strategies[0]
         not in {"targeted_retrieval", "exact_fetch", "hybrid"}
     ):
         return reject("selected_strategies_invalid")
-    if strategy != selected_strategies[0]:
+    if not ordinary_context and strategy != selected_strategies[0]:
         return reject("strategy_mismatch")
     if not isinstance(plan.get("contradiction_search_required"), bool):
         return reject("contradiction_search_flag_invalid")
@@ -1344,8 +1426,10 @@ def _diagnose_acquisition_history_projection(
         ("cross_source_comparison", "hybrid"): "complete_for_selected_sources",
         ("bounded_exhaustive_review", "hybrid"): "complete_for_declared_scope",
     }
-    if plan.get("completeness_expectation") != expected_composition.get(
-        (task_shape, strategy)
+    if (
+        not ordinary_context
+        and plan.get("completeness_expectation")
+        != expected_composition.get((task_shape, strategy))
     ):
         return reject("completeness_expectation_mismatch")
 
@@ -1490,6 +1574,11 @@ def _diagnose_acquisition_history_projection(
         "unknown",
     }:
         return reject("context_delivery_status_invalid")
+    if (
+        ordinary_context
+        and acquisition.get("context_delivery_status") != "retained"
+    ):
+        return reject("ordinary_delivery_status_invalid")
     if not isinstance(acquisition.get("dsa_budget_truncation"), bool):
         return reject("dsa_budget_truncation_invalid")
     if not isinstance(acquisition.get("candidate_truncation"), bool):
@@ -1498,6 +1587,17 @@ def _diagnose_acquisition_history_projection(
         return reject("qualification_required_invalid")
     if not isinstance(sufficiency.get("additional_acquisition_required"), bool):
         return reject("additional_acquisition_required_invalid")
+    if ordinary_context and (
+        acquisition.get("dsa_outcome") != "success"
+        or acquisition.get("dsa_error_codes") != []
+        or acquisition.get("requirement_facts") != []
+        or acquisition_counts["prompt_retained_item_count"] == 0
+        or exact_attempt_count
+        or expansion_attempt_count
+        or attempted_count
+        or unsuccessful_count
+    ):
+        return reject("ordinary_acquisition_invalid")
     if strategy == "targeted_retrieval" and (
         exact_attempt_count or expansion_attempt_count
     ):
@@ -1512,6 +1612,14 @@ def _diagnose_acquisition_history_projection(
         return reject("hybrid_strategy_attempt_accounting_invalid")
 
     next_steps = manifest.get("next_steps")
+    if ordinary_context and next_steps is not None and next_steps != {
+        "selection_count": 0,
+        "selections": [],
+        "additional_acquisition_count": 0,
+        "initial_attempt": None,
+        "dependency_status": None,
+    }:
+        return reject("ordinary_next_steps_invalid")
     changed_follow_up = False
     final_next_step = None
     if next_steps is not None:
@@ -1697,7 +1805,7 @@ def _diagnose_acquisition_history_projection(
     history = AcquisitionHistory(
         task_shape=task_shape,
         strategy=strategy,
-        sufficiency_status=status,
+        sufficiency_status=("not_evaluated" if ordinary_context else status),
         inventory_status=inventory_status,
         counts=counts,
         limitation_codes=tuple(limitation_codes),
@@ -1851,7 +1959,27 @@ def _render_acquisition(
             "authorized changed-premise exact fetch."
         )
 
-    if history.task_shape == "targeted_lookup" and history.strategy == "targeted_retrieval":
+    if (
+        history.task_shape == "ordinary_context_augmentation"
+        and history.strategy == "context_augmentation"
+    ):
+        sentences.append(
+            "For that earlier answer, the retained record shows ordinary external "
+            f"context augmentation. It considered "
+            f"{_count_phrase(counts['sources_considered'], 'configured source')}, "
+            f"selected {counts['sources_selected']}, returned "
+            f"{_count_phrase(counts['references_returned'], 'item')}, and delivered "
+            f"{counts['references_retained']} to reasoning."
+        )
+        sufficient_scope = "the ordinary external-context request"
+        boundary = (
+            "This was not a governed exhaustive review, and evidence sufficiency "
+            "was not evaluated."
+        )
+    elif (
+        history.task_shape == "targeted_lookup"
+        and history.strategy == "targeted_retrieval"
+    ):
         sentences.append(
             "For that earlier answer, the retained record shows a targeted lookup. "
             f"It considered {_count_phrase(counts['sources_considered'], 'configured source')}, "
@@ -1919,7 +2047,9 @@ def _render_acquisition(
     else:
         raise ValueError("unsupported_acquisition_history_composition")
 
-    if history.sufficiency_status == "sufficient_for_declared_scope":
+    if history.sufficiency_status == "not_evaluated":
+        pass
+    elif history.sufficiency_status == "sufficient_for_declared_scope":
         sentences.append(f"The recorded evidence was sufficient for {sufficient_scope}.")
     elif history.sufficiency_status == "sufficient_with_limitations":
         sentences.append(

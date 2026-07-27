@@ -205,6 +205,62 @@ def _manifest(
     }
 
 
+def _ordinary_context_manifest():
+    manifest = _manifest()
+    manifest["status"] = "not_applicable"
+    manifest["shape"] = {
+        "derivation_status": "not_applicable",
+        "task_shape": None,
+        "candidate_count": 0,
+        "clarification_required": False,
+        "reason_codes": ["ordinary_chat_without_material_evidence_scope"],
+    }
+    manifest["inventory"] = {
+        "inventory_status": "unknown",
+        "inventory_source_count": 0,
+        "declared_source_count": 0,
+        "declared_category_count": 0,
+        "available_source_count": 0,
+        "unavailable_source_count": 0,
+        "disabled_source_count": 0,
+        "unknown_source_count": 0,
+    }
+    manifest["plan"] = {
+        "plan_id": None,
+        "plan_status": "not_compiled",
+        "completeness_expectation": None,
+        "contradiction_search_required": False,
+        "selected_strategies": [],
+        "material_requirement_count": 0,
+        "optional_requirement_count": 0,
+        "limitation_codes": [],
+    }
+    manifest["acquisition"]["strategy_attempted"] = None
+    manifest["acquisition"]["dsa_outcome"] = "success"
+    manifest["next_steps"] = {
+        "selection_count": 0,
+        "selections": [],
+        "additional_acquisition_count": 0,
+        "initial_attempt": None,
+        "dependency_status": None,
+    }
+    manifest["sufficiency"] = {
+        "evaluation_id": None,
+        "status": "not_evaluated",
+        "reason_codes": [],
+        "answer_constraints": [],
+        "qualification_required": False,
+        "additional_acquisition_required": False,
+    }
+    return manifest
+
+
+def _ordinary_context_manifest_without_next_steps():
+    manifest = _ordinary_context_manifest()
+    manifest.pop("next_steps")
+    return manifest
+
+
 def _hybrid_manifest(
     *,
     task_shape="cross_source_comparison",
@@ -393,6 +449,8 @@ def _set_path(value, path, replacement):
         _manifest(strategy="exact_fetch"),
         _hybrid_manifest(),
         _hybrid_manifest(task_shape="bounded_exhaustive_review"),
+        _ordinary_context_manifest(),
+        _ordinary_context_manifest_without_next_steps(),
         _suppressed_trace()["prompt"]["evidence_acquisition"],
     ],
 )
@@ -403,6 +461,131 @@ def test_diagnosed_projection_preserves_valid_manifest_acceptance(manifest):
     assert diagnosed.history is not None
     assert diagnosed.reason == "accepted"
     assert _project_acquisition_history(manifest) == diagnosed.history
+
+
+def test_ordinary_context_history_reports_checked_scope_without_claiming_sufficiency():
+    history = _project_acquisition_history(_ordinary_context_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, "checked")
+    assert "ordinary external context augmentation" in answer
+    assert "2 configured sources" in answer
+    assert "2 items" in answer
+    assert "evidence sufficiency was not evaluated" in answer
+    assert "sufficient for" not in answer
+    assert "recorded next step" not in answer
+
+
+@pytest.mark.parametrize(
+    (
+        "selected_next_step",
+        "conclusion_disposition",
+        "provider_disposition",
+        "reacquisition_guard",
+        "clarification_target",
+        "additional_acquisition_executed",
+    ),
+    [
+        (
+            "answer_within_declared_scope",
+            "bounded_conclusion_allowed",
+            "allowed",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "provide_qualified_partial_answer",
+            "qualified_partial_only",
+            "allowed",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "ask_narrow_clarification",
+            "requested_conclusion_withheld",
+            "blocked",
+            "not_applicable",
+            "question_scope",
+            False,
+        ),
+        (
+            "disclose_unexamined_scope",
+            "requested_conclusion_withheld",
+            "blocked",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "withhold_unsupported_conclusion",
+            "requested_conclusion_withheld",
+            "blocked",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "perform_additional_acquisition",
+            "requested_conclusion_withheld",
+            "blocked",
+            "changed_premise_allowed",
+            None,
+            True,
+        ),
+    ],
+)
+def test_ordinary_context_rejects_every_governed_next_step(
+    selected_next_step,
+    conclusion_disposition,
+    provider_disposition,
+    reacquisition_guard,
+    clarification_target,
+    additional_acquisition_executed,
+):
+    manifest = _ordinary_context_manifest()
+    manifest["next_steps"] = {
+        "selection_count": 1,
+        "selections": [
+            {
+                "selection_id": "ordinary-selection",
+                "evaluation_id": "ordinary-evaluation",
+                "evidence_plan_id": "ordinary-plan",
+                "acquisition_manifest_id": MANIFEST_ID,
+                "selected_next_step": selected_next_step,
+                "conclusion_disposition": conclusion_disposition,
+                "provider_disposition": provider_disposition,
+                "reacquisition_guard": reacquisition_guard,
+                "clarification_target": clarification_target,
+                "reason_codes": ["bounded_policy_result"],
+                "additional_acquisition_executed": additional_acquisition_executed,
+            }
+        ],
+        "additional_acquisition_count": (
+            1 if additional_acquisition_executed else 0
+        ),
+        "initial_attempt": (
+            _initial_attempt() if additional_acquisition_executed else None
+        ),
+        "dependency_status": None,
+    }
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "ordinary_next_steps_invalid"
+
+
+@pytest.mark.parametrize("delivery_status", ["filtered", "unknown"])
+def test_ordinary_context_requires_retained_delivery(delivery_status):
+    manifest = _ordinary_context_manifest()
+    manifest["acquisition"]["context_delivery_status"] = delivery_status
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "ordinary_delivery_status_invalid"
 
 
 def _history_with_truncation(*, task_shape="bounded_exhaustive_review"):
@@ -618,6 +801,41 @@ PROJECTION_REJECTION_CASES = [
     ),
     _case("response_digest_invalid", _change((("response_digest",), "invalid"))),
     _case("manifest_status_invalid", _change((("status",), "invalid"))),
+    _case(
+        "ordinary_plan_invalid",
+        _change((("plan", "plan_status"), "ready")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_sufficiency_invalid",
+        _change((("sufficiency", "status"), "unknown")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_shape_invalid",
+        _change((("shape", "clarification_required"), True)),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_strategy_invalid",
+        _change((("acquisition", "strategy_attempted"), "targeted_retrieval")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_acquisition_invalid",
+        _change((("acquisition", "dsa_outcome"), "failed")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_delivery_status_invalid",
+        _change((("acquisition", "context_delivery_status"), "unknown")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_next_steps_invalid",
+        _change((("next_steps", "selection_count"), 1)),
+        _ordinary_context_manifest,
+    ),
     _case("plan_missing", _change((("plan",), None))),
     _case("plan_status_invalid", _change((("plan", "plan_status"), "invalid"))),
     _case("sufficiency_missing", _change((("sufficiency",), None))),
@@ -976,8 +1194,8 @@ def test_projection_behavioral_registry_matches_safe_production_reason_inventory
     production_reasons = _production_projection_rejection_reasons()
     behavioral_reasons = {case.values[2] for case in PROJECTION_REJECTION_CASES}
 
-    assert len(PROJECTION_REJECTION_CASES) == 88
-    assert len(behavioral_reasons) == 88
+    assert len(PROJECTION_REJECTION_CASES) == 95
+    assert len(behavioral_reasons) == 95
     assert behavioral_reasons == production_reasons
     assert all(
         re.fullmatch(r"[a-z0-9_]{1,120}", reason)
