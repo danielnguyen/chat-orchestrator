@@ -978,6 +978,18 @@ def _bounded_count(value: Any, *, maximum: int = 10000) -> int | None:
     return value if 0 <= value <= maximum else None
 
 
+def _valid_source_reference(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 240
+        and value == value.strip()
+        and re.search(r"[\x00-\x1f\x7f]", value) is None
+        and "://" not in value
+        and "?" not in value
+    )
+
+
 def _identity_projection(
     acquisition: dict[str, Any],
     *,
@@ -1001,11 +1013,7 @@ def _identity_projection(
         not isinstance(value, str)
         or (
             references
-            and (
-                not value
-                or len(value) > 240
-                or re.search(r"\s|://|\?", value) is not None
-            )
+            and not _valid_source_reference(value)
         )
         or (not references and _SAFE_IDENTIFIER.fullmatch(value) is None)
         for value in values
@@ -1039,10 +1047,7 @@ def _exact_attempt_projection(
                 or set(attempt) != {"source_id", "source_ref", "outcome"}
                 or not isinstance(attempt.get("source_id"), str)
                 or _SAFE_IDENTIFIER.fullmatch(attempt["source_id"]) is None
-                or not isinstance(attempt.get("source_ref"), str)
-                or not attempt["source_ref"]
-                or len(attempt["source_ref"]) > 240
-                or re.search(r"\s|://|\?", attempt["source_ref"]) is not None
+                or not _valid_source_reference(attempt.get("source_ref"))
                 or attempt.get("outcome")
                 not in {"satisfied", "unknown", "failed", "filtered", "truncated"}
             ):
@@ -1137,12 +1142,7 @@ def _expansion_attempt_projection(
                 or _SAFE_IDENTIFIER.fullmatch(source_id) is None
                 or (
                     source_ref is not None
-                    and (
-                        not isinstance(source_ref, str)
-                        or not source_ref
-                        or len(source_ref) > 240
-                        or re.search(r"\s|://|\?", source_ref) is not None
-                    )
+                    and not _valid_source_reference(source_ref)
                 )
                 or (
                     mode is not None

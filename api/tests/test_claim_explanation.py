@@ -33,6 +33,11 @@ TARGETED_BOUNDARY = (
     "This reflects only the targeted sources checked, not a complete search of "
     "every possible source."
 )
+VALID_OPAQUE_SOURCE_REFERENCES = [
+    "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13",
+    "google_sheets:vehicle_log_primary:'Maintenance Log'!A1:Z99",
+    "google_sheets:vehicle_log_ev:FormResponses!A84:H84",
+]
 
 
 def _digest(value: str = ANCHOR) -> str:
@@ -461,6 +466,151 @@ def test_diagnosed_projection_preserves_valid_manifest_acceptance(manifest):
     assert diagnosed.history is not None
     assert diagnosed.reason == "accepted"
     assert _project_acquisition_history(manifest) == diagnosed.history
+
+
+def _set_ordinary_source_references(manifest, references):
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_returned"] = copy.deepcopy(references)
+    acquisition["source_references_retained"] = copy.deepcopy(references)
+    acquisition["item_count"] = len(references)
+    acquisition["usable_item_count"] = len(references)
+    acquisition["prompt_retained_item_count"] = len(references)
+
+
+def test_source_reference_contract_accepts_internal_spaces_without_mutation():
+    manifest = _ordinary_context_manifest()
+    _set_ordinary_source_references(manifest, VALID_OPAQUE_SOURCE_REFERENCES)
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is not None
+    assert diagnosed.reason == "accepted"
+    assert manifest["acquisition"]["source_references_returned"] == (
+        VALID_OPAQUE_SOURCE_REFERENCES
+    )
+    assert manifest["acquisition"]["source_references_retained"] == (
+        VALID_OPAQUE_SOURCE_REFERENCES
+    )
+
+
+def test_exact_attempt_accepts_same_opaque_source_reference_contract():
+    manifest = _exact_manifest()
+    references = VALID_OPAQUE_SOURCE_REFERENCES[:2]
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_returned"] = references.copy()
+    acquisition["source_references_retained"] = references.copy()
+    acquisition["source_references_attempted"] = references.copy()
+    for attempt, reference in zip(
+        acquisition["exact_reference_attempts"], references, strict=True
+    ):
+        attempt["source_ref"] = reference
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is not None
+    assert diagnosed.reason == "accepted"
+    assert [
+        attempt["source_ref"]
+        for attempt in acquisition["exact_reference_attempts"]
+    ] == references
+
+
+def test_expansion_attempt_accepts_same_opaque_source_reference_contract():
+    manifest = _hybrid_manifest()
+    references = VALID_OPAQUE_SOURCE_REFERENCES[:2]
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_attempted"] = references.copy()
+    for attempt, reference in zip(
+        acquisition["expansion_attempts"], references, strict=True
+    ):
+        attempt["seed_source_ref"] = reference
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is not None
+    assert diagnosed.reason == "accepted"
+    assert [
+        attempt["seed_source_ref"] for attempt in acquisition["expansion_attempts"]
+    ] == references
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "",
+        "x" * 241,
+        " google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13",
+        "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13 ",
+        "google_sheets:\tvehicle_log_primary:A13:I13",
+        "google_sheets:vehicle_log_primary:A13:I13\n",
+        "google_sheets:vehicle_log_primary:A13:I13\r",
+        "google_sheets:vehicle_log_primary:\x00A13:I13",
+        "google_sheets:vehicle_log_primary:\x1fA13:I13",
+        "google_sheets:vehicle_log_primary:\x7fA13:I13",
+        "https://example.invalid/source",
+        "google_sheets:source?row=13",
+        13,
+    ],
+)
+def test_source_reference_contract_rejects_unsafe_values(reference):
+    manifest = _ordinary_context_manifest()
+    _set_ordinary_source_references(manifest, [reference])
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == (
+        "identity_projection_invalid_source_references_returned"
+    )
+
+
+def test_source_reference_contract_rejects_duplicates():
+    manifest = _ordinary_context_manifest()
+    reference = VALID_OPAQUE_SOURCE_REFERENCES[0]
+    _set_ordinary_source_references(manifest, [reference, reference])
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == (
+        "identity_projection_invalid_source_references_returned"
+    )
+
+
+def test_retained_source_references_use_same_bounded_contract():
+    manifest = _ordinary_context_manifest()
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_returned"] = [
+        VALID_OPAQUE_SOURCE_REFERENCES[0]
+    ]
+    acquisition["source_references_retained"] = ["unsafe\tretained-reference"]
+    acquisition["item_count"] = 1
+    acquisition["usable_item_count"] = 1
+    acquisition["prompt_retained_item_count"] = 1
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == (
+        "identity_projection_invalid_source_references_retained"
+    )
+
+
+@pytest.mark.parametrize("attempt_kind", ["exact", "expansion"])
+def test_attempt_source_references_reject_unsafe_controls(attempt_kind):
+    manifest = _exact_manifest() if attempt_kind == "exact" else _hybrid_manifest()
+    acquisition = manifest["acquisition"]
+    if attempt_kind == "exact":
+        acquisition["exact_reference_attempts"][0]["source_ref"] = "unsafe\tref"
+        expected_reason = "exact_attempt_projection_invalid"
+    else:
+        acquisition["expansion_attempts"][0]["seed_source_ref"] = "unsafe\tref"
+        expected_reason = "expansion_attempt_projection_invalid"
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == expected_reason
 
 
 def test_ordinary_context_history_reports_checked_scope_without_claiming_sufficiency():
