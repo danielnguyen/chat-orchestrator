@@ -255,6 +255,12 @@ def _ordinary_context_manifest():
     return manifest
 
 
+def _ordinary_context_manifest_without_next_steps():
+    manifest = _ordinary_context_manifest()
+    manifest.pop("next_steps")
+    return manifest
+
+
 def _hybrid_manifest(
     *,
     task_shape="cross_source_comparison",
@@ -444,6 +450,7 @@ def _set_path(value, path, replacement):
         _hybrid_manifest(),
         _hybrid_manifest(task_shape="bounded_exhaustive_review"),
         _ordinary_context_manifest(),
+        _ordinary_context_manifest_without_next_steps(),
         _suppressed_trace()["prompt"]["evidence_acquisition"],
     ],
 )
@@ -466,6 +473,119 @@ def test_ordinary_context_history_reports_checked_scope_without_claiming_suffici
     assert "2 items" in answer
     assert "evidence sufficiency was not evaluated" in answer
     assert "sufficient for" not in answer
+    assert "recorded next step" not in answer
+
+
+@pytest.mark.parametrize(
+    (
+        "selected_next_step",
+        "conclusion_disposition",
+        "provider_disposition",
+        "reacquisition_guard",
+        "clarification_target",
+        "additional_acquisition_executed",
+    ),
+    [
+        (
+            "answer_within_declared_scope",
+            "bounded_conclusion_allowed",
+            "allowed",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "provide_qualified_partial_answer",
+            "qualified_partial_only",
+            "allowed",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "ask_narrow_clarification",
+            "requested_conclusion_withheld",
+            "blocked",
+            "not_applicable",
+            "question_scope",
+            False,
+        ),
+        (
+            "disclose_unexamined_scope",
+            "requested_conclusion_withheld",
+            "blocked",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "withhold_unsupported_conclusion",
+            "requested_conclusion_withheld",
+            "blocked",
+            "not_applicable",
+            None,
+            False,
+        ),
+        (
+            "perform_additional_acquisition",
+            "requested_conclusion_withheld",
+            "blocked",
+            "changed_premise_allowed",
+            None,
+            True,
+        ),
+    ],
+)
+def test_ordinary_context_rejects_every_governed_next_step(
+    selected_next_step,
+    conclusion_disposition,
+    provider_disposition,
+    reacquisition_guard,
+    clarification_target,
+    additional_acquisition_executed,
+):
+    manifest = _ordinary_context_manifest()
+    manifest["next_steps"] = {
+        "selection_count": 1,
+        "selections": [
+            {
+                "selection_id": "ordinary-selection",
+                "evaluation_id": "ordinary-evaluation",
+                "evidence_plan_id": "ordinary-plan",
+                "acquisition_manifest_id": MANIFEST_ID,
+                "selected_next_step": selected_next_step,
+                "conclusion_disposition": conclusion_disposition,
+                "provider_disposition": provider_disposition,
+                "reacquisition_guard": reacquisition_guard,
+                "clarification_target": clarification_target,
+                "reason_codes": ["bounded_policy_result"],
+                "additional_acquisition_executed": additional_acquisition_executed,
+            }
+        ],
+        "additional_acquisition_count": (
+            1 if additional_acquisition_executed else 0
+        ),
+        "initial_attempt": (
+            _initial_attempt() if additional_acquisition_executed else None
+        ),
+        "dependency_status": None,
+    }
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "ordinary_next_steps_invalid"
+
+
+@pytest.mark.parametrize("delivery_status", ["filtered", "unknown"])
+def test_ordinary_context_requires_retained_delivery(delivery_status):
+    manifest = _ordinary_context_manifest()
+    manifest["acquisition"]["context_delivery_status"] = delivery_status
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "ordinary_delivery_status_invalid"
 
 
 def _history_with_truncation(*, task_shape="bounded_exhaustive_review"):
@@ -704,6 +824,16 @@ PROJECTION_REJECTION_CASES = [
     _case(
         "ordinary_acquisition_invalid",
         _change((("acquisition", "dsa_outcome"), "failed")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_delivery_status_invalid",
+        _change((("acquisition", "context_delivery_status"), "unknown")),
+        _ordinary_context_manifest,
+    ),
+    _case(
+        "ordinary_next_steps_invalid",
+        _change((("next_steps", "selection_count"), 1)),
         _ordinary_context_manifest,
     ),
     _case("plan_missing", _change((("plan",), None))),
@@ -1064,8 +1194,8 @@ def test_projection_behavioral_registry_matches_safe_production_reason_inventory
     production_reasons = _production_projection_rejection_reasons()
     behavioral_reasons = {case.values[2] for case in PROJECTION_REJECTION_CASES}
 
-    assert len(PROJECTION_REJECTION_CASES) == 93
-    assert len(behavioral_reasons) == 93
+    assert len(PROJECTION_REJECTION_CASES) == 95
+    assert len(behavioral_reasons) == 95
     assert behavioral_reasons == production_reasons
     assert all(
         re.fullmatch(r"[a-z0-9_]{1,120}", reason)

@@ -1574,6 +1574,11 @@ def _diagnose_acquisition_history_projection(
         "unknown",
     }:
         return reject("context_delivery_status_invalid")
+    if (
+        ordinary_context
+        and acquisition.get("context_delivery_status") != "retained"
+    ):
+        return reject("ordinary_delivery_status_invalid")
     if not isinstance(acquisition.get("dsa_budget_truncation"), bool):
         return reject("dsa_budget_truncation_invalid")
     if not isinstance(acquisition.get("candidate_truncation"), bool):
@@ -1607,6 +1612,14 @@ def _diagnose_acquisition_history_projection(
         return reject("hybrid_strategy_attempt_accounting_invalid")
 
     next_steps = manifest.get("next_steps")
+    if ordinary_context and next_steps is not None and next_steps != {
+        "selection_count": 0,
+        "selections": [],
+        "additional_acquisition_count": 0,
+        "initial_attempt": None,
+        "dependency_status": None,
+    }:
+        return reject("ordinary_next_steps_invalid")
     changed_follow_up = False
     final_next_step = None
     if next_steps is not None:
