@@ -25475,13 +25475,20 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     }
     context_pack = _multi_source_governed_context_pack(question)
     context_pack["sources_used"][1] = "vehicle_log_ev"
+    context_pack["items"][0]["source_ref"] = (
+        "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13"
+    )
     context_pack["items"][1]["source_id"] = "vehicle_log_ev"
-    context_pack["items"][1]["source_ref"] = "vehicle_log_ev:record_2"
+    context_pack["items"][1]["source_ref"] = (
+        "google_sheets:vehicle_log_ev:FormResponses!A84:H84"
+    )
     context_pack["items"].append(
         {
             **copy.deepcopy(context_pack["items"][0]),
             "result_id": "result_3",
-            "source_ref": "vehicle_log_primary:record_3",
+            "source_ref": (
+                "google_sheets:vehicle_log_primary:'Form responses 1'!A8:I8"
+            ),
             "text": "The retained service record includes a power-steering flush.",
         }
     )
@@ -25549,6 +25556,17 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     assert manifest["sufficiency"]["status"] == "not_evaluated"
     assert manifest["acquisition"]["dsa_outcome"] == "success"
     assert manifest["acquisition"]["prompt_retained_item_count"] == 3
+    expected_source_references = [
+        "google_sheets:vehicle_log_ev:FormResponses!A84:H84",
+        "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13",
+        "google_sheets:vehicle_log_primary:'Form responses 1'!A8:I8",
+    ]
+    assert manifest["acquisition"]["source_references_returned"] == (
+        expected_source_references
+    )
+    assert manifest["acquisition"]["source_references_retained"] == (
+        expected_source_references
+    )
 
     follow_up = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -25591,6 +25609,9 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     assert follow_up_prompt_trace["claim_explanation"][
         "manifest_projection_status"
     ] == "accepted"
+    assert follow_up_prompt_trace["claim_explanation"][
+        "manifest_projection_reason"
+    ] != "identity_projection_invalid_source_references_returned"
     assert history_trace["fresh_verification_entry_status"] == "not_requested"
     assert history_trace["answer_provider_call_count"] == 0
 

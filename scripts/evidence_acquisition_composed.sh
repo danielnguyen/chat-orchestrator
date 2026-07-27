@@ -230,6 +230,14 @@ configure_source_fixture() {
   ' <<<"$response" >/dev/null
 }
 
+configure_google_sheet_worksheet() {
+  local source_id="$1" worksheet="$2"
+  sed -i -E \
+    "s|^  worksheet: .*$|  worksheet: $worksheet|" \
+    "$COMPOSED_SMOKE_TMP/config/sources/$source_id.yaml"
+  restart_dsa
+}
+
 queue_provider_answer() {
   local answer="$1"
   provider_post "/fixture/next-answer" \
@@ -4007,6 +4015,7 @@ Retained details:
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  configure_google_sheet_worksheet "records_primary" "Form responses 1"
   queue_provider_answer "$answer"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
@@ -4030,6 +4039,12 @@ Retained details:
     and .acquisition.dsa_outcome == "success"
     and .acquisition.item_count >= 2
     and .acquisition.prompt_retained_item_count >= 2
+    and .acquisition.source_references_returned == [
+      "google_sheets:records_primary:\u0027Form responses 1\u0027!A2:C2",
+      "google_sheets:records_primary:\u0027Form responses 1\u0027!A3:C3"
+    ]
+    and .acquisition.source_references_retained ==
+      .acquisition.source_references_returned
     and .sufficiency.status == "not_evaluated"
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
@@ -4045,6 +4060,7 @@ Retained details:
     and (.answer | contains("evidence sufficiency was not evaluated"))
     and (.answer | endswith("I did not perform a new verification for this explanation."))
   '
+  configure_google_sheet_worksheet "records_primary" "Records"
   echo "H1 ordinary DSA acquisition association regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
