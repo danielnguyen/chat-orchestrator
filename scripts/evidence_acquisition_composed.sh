@@ -3734,7 +3734,7 @@ acquisition_gaps asks what may have been missed.
 new_verification_request explicitly asks for a fresh check.
 ambiguous_history_followup is plausibly historical but its requested kind is unclear.
 not_history_followup is an ordinary question or instruction."
-readonly HISTORY_TRACE_KEYS='["answer_provider_call_count","bms_call_count","bms_reason_code","bms_resolution_status","candidate_intent","candidate_source","candidate_target_mode","clarification_required","classifier_call_count","classifier_eligibility","classifier_logical_route","classifier_status","confidence_band","cr_history_policy_call_count","cr_policy_status","deterministic_match_status","explicit_verification_requested","feature_enabled","fresh_verification_entry_status","history_lookup_allowed","render_status","resolved_record_kind","verification_after_history_allowed"]'
+readonly HISTORY_TRACE_KEYS='["answer_provider_call_count","bms_call_count","bms_reason_code","bms_resolution_status","candidate_intent","candidate_source","candidate_target_mode","clarification_required","classifier_call_count","classifier_eligibility","classifier_logical_route","classifier_status","confidence_band","cr_history_policy_call_count","cr_policy_status","deterministic_match_status","explicit_verification_requested","feature_enabled","fresh_verification_entry_status","history_lookup_allowed","lineage_dereference_count","lineage_result","render_status","resolution_source","resolved_record_kind","verification_after_history_allowed"]'
 
 restart_orchestrator_with_history_followup() {
   COMPOSED_HISTORY_FOLLOWUP_ENABLED="$1"
@@ -3887,6 +3887,7 @@ assert_classifier_request() {
     and all($classifier[] | .normalized_messages[] | .content;
       (contains("owner-") or contains("client-") or contains("conversation_id")
        or contains("claim_id") or contains("trace_id") or contains("manifest_id")
+       or contains("history_root_lineage") or contains("root_assistant_message_id")
        or contains("source_ref") or contains("records_primary") or contains("google_sheets:")) | not)
   ' --argjson expected "$expected_count" --arg system "$HISTORY_CLASSIFIER_SYSTEM_PROMPT" --arg question "$question"
 }
@@ -3894,7 +3895,8 @@ assert_classifier_request() {
 assert_pure_history_case() {
   local owner="$1" conversation_id="$2" response="$3" question="$4"
   local source="$5" intent="$6" kind="$7" classifier_calls="$8"
-  local request_id answer trace provider_calls diagnostics audit
+  local resolution_source="${9:-direct_record}" dereference_count="${10:-0}"
+  local request_id answer trace provider_calls diagnostics audit lineage root_message_id
   request_id="$(jq -er '.request_id' <<<"$response")"
   answer="$(jq -er '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -3913,6 +3915,9 @@ assert_pure_history_case() {
     and .prompt.history_followup.history_lookup_allowed == true
     and .prompt.history_followup.bms_call_count == 1
     and .prompt.history_followup.bms_resolution_status == "resolved"
+    and .prompt.history_followup.resolution_source == $resolution_source
+    and .prompt.history_followup.lineage_dereference_count == $dereference_count
+    and .prompt.history_followup.lineage_result == "accepted"
     and .prompt.history_followup.resolved_record_kind == $kind
     and .prompt.history_followup.render_status == "completed"
     and .prompt.history_followup.answer_provider_call_count == 0
@@ -3922,7 +3927,10 @@ assert_pure_history_case() {
     and .model_call.status == "not_called"
     and .model_calls == []
     and .references == []
-  ' --arg source "$source" --arg intent "$intent" --arg kind "$kind" --argjson classifier_calls "$classifier_calls"
+  ' --arg source "$source" --arg intent "$intent" --arg kind "$kind" \
+    --arg resolution_source "$resolution_source" \
+    --argjson dereference_count "$dereference_count" \
+    --argjson classifier_calls "$classifier_calls"
   assert_jq "history.pure.provider_count" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length) == $classifier_calls
   ' --argjson classifier_calls "$classifier_calls"
@@ -3960,8 +3968,24 @@ assert_pure_history_case() {
     echo "Assertion failed: history.pure.persistence_counts" >&2
     return 1
   fi
-  case "$(jq -c . <<<"$response")" in
-    *records_primary*|*google_sheets:*|*http://*|*claim_id*|*manifest_id*|*"The migration record confirms"*)
+  root_message_id="$(jq -er '.assistant_message_id' <<<"$HISTORY_ORIGINAL_MANIFEST")"
+  lineage="$(psql_exec -At -c "
+    SELECT metadata->'history_root_lineage'
+    FROM messages
+    WHERE conversation_id = '$conversation_id'
+      AND role = 'assistant'
+      AND metadata->>'request_id' = '$request_id'
+    ORDER BY created_at DESC
+    LIMIT 1;
+  ")"
+  assert_jq "history.pure.persisted_lineage" "$lineage" '
+    keys == ["record_kind","root_assistant_message_id","schema_version"]
+    and .schema_version == "history-root-lineage.v1"
+    and .root_assistant_message_id == $root
+    and .record_kind == $kind
+  ' --arg root "$root_message_id" --arg kind "$kind"
+  case "$(jq -c . <<<"$response")$(jq -c '.prompt.history_followup' <<<"$trace")" in
+    *"$root_message_id"*|*history-root-lineage*|*records_primary*|*google_sheets:*|*http://*|*claim_id*|*manifest_id*|*"The migration record confirms"*)
       echo "history answer exposed retained identifiers or source content" >&2
       return 1
       ;;
@@ -3969,18 +3993,168 @@ assert_pure_history_case() {
   HISTORY_RESPONSE="$response"
   HISTORY_TRACE="$trace"
   HISTORY_REQUEST_ID="$request_id"
+  HISTORY_PERSISTED_LINEAGE="$lineage"
+}
+
+run_invalid_stored_lineage_cases() {
+  local case_name expected_reason expected_dereference owner client conversation_id
+  local target_owner target_client target_conversation root_message_id lineage_sql
+  local response request_id trace calls audit explanation_id seed_request serialized
+  local case_index=20
+
+  while IFS='|' read -r case_name expected_reason expected_dereference; do
+    owner="owner-history-invalid-$case_name"
+    client="client-history-invalid-$case_name"
+    conversation_id="$(resolve_conversation "$owner" "$client" "history-invalid-$case_name")"
+    create_history_original "$owner" "$client" "$conversation_id" \
+      "Verify the migration record for invalid lineage $case_name."
+    root_message_id="$(jq -er '.assistant_message_id' <<<"$HISTORY_ORIGINAL_MANIFEST")"
+    target_owner="$owner"
+    target_client="$client"
+    target_conversation="$conversation_id"
+    lineage_sql="jsonb_build_object('schema_version','history-root-lineage.v1','root_assistant_message_id','$root_message_id','record_kind','support')"
+
+    case "$case_name" in
+      malformed)
+        lineage_sql="jsonb_build_object('schema_version','history-root-lineage.v1')"
+        ;;
+      unsupported_version)
+        lineage_sql="jsonb_build_object('schema_version','history-root-lineage.v9','root_assistant_message_id','$root_message_id','record_kind','support')"
+        ;;
+      wrong_kind)
+        lineage_sql="jsonb_build_object('schema_version','history-root-lineage.v1','root_assistant_message_id','$root_message_id','record_kind','acquisition')"
+        ;;
+      cross_owner)
+        target_owner="owner-history-invalid-cross-owner-target"
+        target_client="client-history-invalid-cross-owner-target"
+        target_conversation="$(resolve_conversation "$target_owner" "$target_client" "history-invalid-cross-owner-target")"
+        ;;
+      cross_conversation)
+        target_conversation="$(resolve_conversation "$owner" "$client" "history-invalid-cross-conversation-target")"
+        ;;
+      surface_mismatch)
+        psql_exec -c "UPDATE claim_records SET surface = 'node_red' WHERE assistant_message_id = '$root_message_id';" >/dev/null
+        ;;
+      missing_root)
+        lineage_sql="jsonb_build_object('schema_version','history-root-lineage.v1','root_assistant_message_id','00000000-0000-4000-8000-000000009999','record_kind','support')"
+        ;;
+      recursive_root)
+        psql_exec -c "
+          UPDATE messages
+          SET metadata = jsonb_set(
+            metadata,
+            '{history_root_lineage}',
+            jsonb_build_object(
+              'schema_version','history-root-lineage.v1',
+              'root_assistant_message_id','$root_message_id',
+              'record_kind','support'
+            )
+          )
+          WHERE id = '$root_message_id';
+        " >/dev/null
+        ;;
+      invalid_association)
+        psql_exec -c "UPDATE claim_records SET claim_anchor_digest = 'sha256:$(printf invalid | sha256sum | cut -d' ' -f1)' WHERE assistant_message_id = '$root_message_id';" >/dev/null
+        ;;
+    esac
+
+    explanation_id="00000000-0000-4000-8000-$(printf '%012d' "$case_index")"
+    seed_request="seeded-lineage-$case_name"
+    psql_exec -c "
+      INSERT INTO messages (
+        id, conversation_id, owner_id, role, content, metadata
+      ) VALUES (
+        '$explanation_id', '$target_conversation', '$target_owner', 'assistant',
+        'PRIVATE-STORED-LINEAGE-EXPLANATION-$case_name',
+        jsonb_build_object(
+          'request_id','$seed_request',
+          'history_root_lineage',$lineage_sql
+        )
+      );
+    " >/dev/null
+
+    provider_post "/fixture/reset" '{}'
+    reset_dsa_audit
+    response="$(run_history_current_turn "$target_owner" "$target_client" "$target_conversation" "How are you sure?")"
+    request_id="$(jq -er '.request_id' <<<"$response")"
+    trace="$(fetch_trace "$request_id")"
+    calls="$(fetch_provider_calls "$request_id")"
+    audit="$(fetch_dsa_audit)"
+    assert_jq "history.invalid_lineage.$case_name" "$trace" '
+      .prompt.history_followup.cr_history_policy_call_count == 1
+      and .prompt.history_followup.bms_call_count == 1
+      and .prompt.history_followup.bms_resolution_status == $status
+      and .prompt.history_followup.bms_reason_code == $reason
+      and .prompt.history_followup.resolution_source == "none"
+      and .prompt.history_followup.lineage_dereference_count == $dereference
+      and .prompt.history_followup.lineage_result == "rejected"
+      and .prompt.history_followup.answer_provider_call_count == 0
+      and .model_calls == []
+    ' --arg status "$(case "$expected_reason" in lineage_root_missing) printf no_record ;; *) printf invalid ;; esac)" \
+      --arg reason "$expected_reason" --argjson dereference "$expected_dereference"
+    jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$calls" >/dev/null
+    assert_dsa_operation_counts "$audit" 0 0 0
+    serialized="$(jq -c . <<<"$response")$(jq -c '.prompt.history_followup' <<<"$trace")"
+    case "$serialized" in
+      *"$root_message_id"*|*"$explanation_id"*|*"$seed_request"*|*PRIVATE-STORED-LINEAGE*|*history-root-lineage*)
+        echo "invalid stored lineage case $case_name exposed private state" >&2
+        return 1
+        ;;
+    esac
+    case_index=$((case_index + 1))
+  done <<'INVALID_LINEAGE_CASES'
+malformed|lineage_malformed|0
+unsupported_version|lineage_version_unsupported|0
+wrong_kind|lineage_record_kind_mismatch|0
+cross_owner|lineage_owner_mismatch|1
+cross_conversation|lineage_conversation_mismatch|1
+surface_mismatch|lineage_surface_mismatch|1
+missing_root|lineage_root_missing|1
+recursive_root|lineage_root_recursive|1
+invalid_association|lineage_root_association_invalid|1
+INVALID_LINEAGE_CASES
+  echo "Invalid stored lineage fail-closed matrix passed"
 }
 
 run_history_followup_composed_suite() {
   local owner client conversation_id response trace calls diagnostics audit request_id answer
   local external claims status_code unauthorized original_trace original_manifest final_manifest
   local intent question case_name assistant_message_id expected_digest
+  local first_history_request first_history_lineage root_message_id second_history_lineage
+  local v1_probe v2_probe probe_conversation
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
   restart_orchestrator_with_history_followup false
+
+  probe_conversation="$(resolve_conversation "owner-history-contract-probe" "client-history-contract-probe" "history-contract-probe")"
+  v1_probe="$(curl -fsS \
+    -X POST "http://127.0.0.1:14321/v1/internal/immediate-history/resolve" \
+    -H "X-API-Key: smoke-memory-key" \
+    -H "X-Request-ID: history-v1-contract-probe" \
+    -H "Content-Type: application/json" \
+    -d "{\"schema_version\":\"immediate-history-resolution.v1\",\"request_id\":\"history-v1-contract-probe\",\"owner_id\":\"owner-history-contract-probe\",\"conversation_id\":\"$probe_conversation\",\"surface\":\"chat\",\"explanation_kind\":\"support\"}")"
+  v2_probe="$(curl -fsS \
+    -X POST "http://127.0.0.1:14321/v1/internal/immediate-history/resolve" \
+    -H "X-API-Key: smoke-memory-key" \
+    -H "X-Request-ID: history-v2-contract-probe" \
+    -H "Content-Type: application/json" \
+    -d "{\"schema_version\":\"immediate-history-resolution.v2\",\"request_id\":\"history-v2-contract-probe\",\"owner_id\":\"owner-history-contract-probe\",\"conversation_id\":\"$probe_conversation\",\"surface\":\"chat\",\"explanation_kind\":\"support\"}")"
+  assert_jq "history.contract.v1" "$v1_probe" '
+    keys == ["conversation_id","explanation_kind","match_count","owner_id","reason_code","record","request_id","resolution_status","schema_version","surface"]
+    and .schema_version == "immediate-history-resolution.v1"
+    and .resolution_status == "no_record"
+  '
+  assert_jq "history.contract.v2" "$v2_probe" '
+    keys == ["conversation_id","explanation_kind","history_root_lineage","lineage_dereference_count","match_count","owner_id","reason_code","record","request_id","resolution_source","resolution_status","schema_version","surface"]
+    and .schema_version == "immediate-history-resolution.v2"
+    and .resolution_status == "no_record"
+    and .resolution_source == "none"
+    and .history_root_lineage == null
+  '
+  echo "BMS v1/v2 actual-service contract probes passed"
 
   # H1: the acquisition record remains durable while only CO is recreated.
   owner="owner-history-h1"
@@ -3998,7 +4172,21 @@ run_history_followup_composed_suite() {
     (.answer | contains("retained record shows a targeted lookup"))
     and (.answer | endswith("I did not perform a new verification for this explanation."))
   '
-  echo "H1 canonical acquisition after CO restart passed"
+  first_history_request="$HISTORY_REQUEST_ID"
+  first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  root_message_id="$(jq -er '.assistant_message_id' <<<"$HISTORY_ORIGINAL_MANIFEST")"
+  restart_orchestrator_with_history_followup true
+  provider_post "/fixture/reset" '{}'
+  reset_dsa_audit
+  response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What might you have missed?")"
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "What might you have missed?" deterministic acquisition_gaps acquisition 0 root_lineage 1
+  second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  test "$first_history_lineage" = "$second_history_lineage"
+  test "$(jq -r '.root_assistant_message_id' <<<"$first_history_lineage")" = "$root_message_id"
+  test "$(jq -r '.root_assistant_message_id' <<<"$second_history_lineage")" = "$root_message_id"
+  test "$(jq -r '.root_assistant_message_id' <<<"$second_history_lineage")" != \
+    "$(psql_exec -At -c "SELECT id FROM messages WHERE metadata->>'request_id' = '$first_history_request' LIMIT 1;")"
+  echo "H1 chained acquisition and CO restart durability passed"
 
   # Regression: an ordinary DSA-augmented answer has no governed plan or
   # sufficiency evaluation, but its exact retained acquisition remains explainable.
@@ -4051,6 +4239,7 @@ Retained details:
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
+  HISTORY_ORIGINAL_MANIFEST="$original_manifest"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
@@ -4078,7 +4267,18 @@ Retained details:
     and (.answer | test("with (low|medium|high) confidence and (weak|moderate|strong) support"))
     and (.answer | endswith("I did not perform a new verification for this explanation."))
   '
-  echo "H2 canonical support passed"
+  first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  provider_post "/fixture/reset" '{}'
+  reset_dsa_audit
+  question="Where did that conclusion come from?"
+  queue_history_classifier support_explanation 0.91 false
+  response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" classifier support_explanation support 1 root_lineage 1
+  calls="$(fetch_provider_calls "$HISTORY_REQUEST_ID")"
+  assert_classifier_request "$calls" "$question"
+  second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  test "$first_history_lineage" = "$second_history_lineage"
+  echo "H2 chained support lineage passed"
 
   # H3: each natural paraphrase uses one bounded classifier call and a fresh conversation.
   while IFS='|' read -r case_name question intent; do
@@ -4219,6 +4419,7 @@ MATRIX
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What is the weather?")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
   assert_jq "history.h6.newest_ordinary_response" "$response" '
     .status == "ok" and .selected_model != "not_called"
   '
@@ -4226,6 +4427,14 @@ MATRIX
   assert_jq "history.h6.newest_has_no_support_record" "$claims" '
     (.records | length) == 1
   '
+  test "$(psql_exec -At -c "
+    SELECT metadata ? 'history_root_lineage'
+    FROM messages
+    WHERE conversation_id = '$conversation_id'
+      AND role = 'assistant'
+      AND metadata->>'request_id' = '$request_id'
+    LIMIT 1;
+  ")" = "f"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   question="How are you sure?"
@@ -4240,6 +4449,9 @@ MATRIX
     and (.prompt.history_followup.bms_resolution_status == "no_record"
       or .prompt.history_followup.bms_resolution_status == "invalid")
     and .prompt.history_followup.resolved_record_kind == null
+    and .prompt.history_followup.resolution_source == "none"
+    and .prompt.history_followup.lineage_dereference_count == 0
+    and .prompt.history_followup.lineage_result == "absent"
     and .prompt.history_followup.answer_provider_call_count == 0
     and .model_calls == []
   '
@@ -4266,6 +4478,20 @@ MATRIX
   conversation_id="$(resolve_conversation "$owner" "$client" "history-h7")"
   create_history_original "$owner" "$client" "$conversation_id" "Verify the migration record for fresh support."
   original_manifest="$HISTORY_ORIGINAL_MANIFEST"
+  root_message_id="$(jq -er '.assistant_message_id' <<<"$original_manifest")"
+  provider_post "/fixture/reset" '{}'
+  reset_dsa_audit
+  response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What supported that?")"
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "What supported that?" deterministic support_explanation support 0 direct_record 0
+  first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  provider_post "/fixture/reset" '{}'
+  reset_dsa_audit
+  question="Where did that conclusion come from?"
+  queue_history_classifier support_explanation 0.91 false
+  response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" classifier support_explanation support 1 root_lineage 1
+  second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  test "$first_history_lineage" = "$second_history_lineage"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
@@ -4321,6 +4547,9 @@ MATRIX
     and .prompt.history_followup.cr_policy_status == "accepted"
     and .prompt.history_followup.bms_call_count == 1
     and .prompt.history_followup.bms_resolution_status == "resolved"
+    and .prompt.history_followup.resolution_source == "root_lineage"
+    and .prompt.history_followup.lineage_dereference_count == 1
+    and .prompt.history_followup.lineage_result == "accepted"
     and .prompt.history_followup.resolved_record_kind == "support"
     and .prompt.history_followup.explicit_verification_requested == true
     and .prompt.history_followup.verification_after_history_allowed == true
@@ -4338,31 +4567,74 @@ MATRIX
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$calls")$(jq -c . <<<"$diagnostics")$(jq -c . <<<"$audit")"
+  case "$serialized" in
+    *"$root_message_id"*|*history_root_lineage*|*root_assistant_message_id*)
+      echo "H7 exposed root lineage outside the BMS persistence boundary" >&2
+      return 1
+      ;;
+  esac
   test "$(jq -r '.response_digest' <<<"$final_manifest")" = \
     "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
   test "$(jq -r '.manifest_id' <<<"$final_manifest")" != \
     "$(jq -r '.manifest_id' <<<"$original_manifest")"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
-  echo "H7 explicit fresh verification passed"
+  test "$(psql_exec -At -c "
+    SELECT metadata ? 'history_root_lineage'
+    FROM messages
+    WHERE conversation_id = '$conversation_id'
+      AND role = 'assistant'
+      AND metadata->>'request_id' = '$request_id'
+    LIMIT 1;
+  ")" = "f"
 
-  # H8: the internal resolver remains API-key protected.
+  provider_post "/fixture/reset" '{}'
+  reset_dsa_audit
+  response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What supported that?")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "history.h7.later_targets_compound" "$trace" '
+    .prompt.history_followup.bms_call_count == 1
+    and .prompt.history_followup.bms_resolution_status == "no_record"
+    and .prompt.history_followup.bms_reason_code == "direct_record_absent_lineage_absent"
+    and .prompt.history_followup.resolution_source == "none"
+    and .prompt.history_followup.lineage_dereference_count == 0
+    and .prompt.history_followup.lineage_result == "absent"
+    and .prompt.history_followup.answer_provider_call_count == 0
+  '
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$calls" >/dev/null
+  assert_dsa_operation_counts "$audit" 0 0 0
+  case "$(jq -c . <<<"$response")$(jq -c '.prompt.history_followup' <<<"$trace")" in
+    *"$root_message_id"*|*history-root-lineage*)
+      echo "H7 later history exposed or reused old lineage" >&2
+      return 1
+      ;;
+  esac
+  echo "H7 support lineage bare verification and fresh-result targeting passed"
+
+  # H8: invalid private lineage fixtures fail closed without reconstruction.
+  run_invalid_stored_lineage_cases
+
+  # H9: the internal resolver remains API-key protected.
   status_code="$(curl -sS -o "$COMPOSED_SMOKE_TMP/unauthorized-history.json" -w '%{http_code}' \
     -X POST "http://127.0.0.1:14321/v1/internal/immediate-history/resolve" \
     -H "Content-Type: application/json" \
-    -d '{"schema_version":"immediate-history-resolution.v1","request_id":"unauthorized-history","owner_id":"owner-history-h8","conversation_id":"00000000-0000-4000-8000-000000000008","surface":"chat","explanation_kind":"support"}')"
+    -d '{"schema_version":"immediate-history-resolution.v2","request_id":"unauthorized-history","owner_id":"owner-history-h8","conversation_id":"00000000-0000-4000-8000-000000000008","surface":"chat","explanation_kind":"support"}')"
   test "$status_code" = "401"
   jq -e 'has("record") | not' "$COMPOSED_SMOKE_TMP/unauthorized-history.json" >/dev/null
   case "$(<"$COMPOSED_SMOKE_TMP/unauthorized-history.json")" in
     *claim*|*manifest*|*source_ref*|*excerpt*) echo "unauthorized BMS response exposed private data" >&2; return 1 ;;
   esac
-  echo "H8 BMS authorization boundary passed"
+  echo "H9 BMS authorization boundary passed"
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
   restart_orchestrator_with_history_followup false
-  echo "Server-owned history-followup composed proof passed: scenarios=H1,ordinary-dsa-association,H2,H3,H4,H5,H6,H7,H8"
+  echo "Server-owned history-followup composed proof passed: scenarios=chained-acquisition,restart-durability,ordinary-dsa-association,chained-support,classifier-boundaries,ordinary-answer-termination,support-bare-verification,invalid-lineage,H9-auth"
 }
 
 run_evidence_acquisition_composed_suite() {

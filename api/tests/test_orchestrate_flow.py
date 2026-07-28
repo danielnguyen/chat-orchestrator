@@ -25290,6 +25290,9 @@ class HistoryPolicyRuntime(FakeRuntime):
         }
 
 
+HISTORY_ROOT_MESSAGE_ID = "550e8400-e29b-41d4-a716-446655440011"
+
+
 def _history_support_record():
     anchor = "The retained record supports the conclusion."
     return {
@@ -25298,7 +25301,7 @@ def _history_support_record():
         "owner_id": "owner",
         "conversation_id": "conv-1",
         "request_id": "original-private-request",
-        "assistant_message_id": "assistant-private-message",
+        "assistant_message_id": HISTORY_ROOT_MESSAGE_ID,
         "surface": "node_red",
         "runtime_session_id": "runtime-private-session",
         "runtime_turn_id": "runtime-private-turn",
@@ -25330,11 +25333,20 @@ def _history_support_record():
 
 
 class ImmediateHistoryMemoryStore(FakeMemoryStore):
-    def __init__(self, *, resolve_support=True, routing_policy=None):
+    def __init__(
+        self,
+        *,
+        resolve_support=True,
+        routing_policy=None,
+        resolution_source="direct_record",
+        response_override=None,
+    ):
         super().__init__()
         self.immediate_history_calls = []
         self.resolve_support = resolve_support
         self.history_routing_policy = routing_policy
+        self.resolution_source = resolution_source
+        self.response_override = response_override
 
     async def resolve_profile(self, **kwargs):
         profile = await super().resolve_profile(**kwargs)
@@ -25344,34 +25356,57 @@ class ImmediateHistoryMemoryStore(FakeMemoryStore):
 
     async def resolve_immediate_history(self, **kwargs):
         self.immediate_history_calls.append(copy.deepcopy(kwargs))
+        if self.response_override is not None:
+            response = copy.deepcopy(self.response_override)
+            for key in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "explanation_kind",
+            ):
+                response[key] = kwargs[key]
+            return response
         kind = kwargs["explanation_kind"]
         response = {
-            "schema_version": "immediate-history-resolution.v1",
+            "schema_version": "immediate-history-resolution.v2",
             "request_id": kwargs["request_id"],
             "owner_id": kwargs["owner_id"],
             "conversation_id": kwargs["conversation_id"],
             "surface": kwargs["surface"],
             "explanation_kind": kind,
             "resolution_status": "no_record",
+            "resolution_source": "none",
+            "lineage_dereference_count": 0,
             "match_count": 0,
-            "reason_code": (
-                "support_record_not_found"
-                if kind == "support"
-                else "acquisition_record_not_found"
-            ),
+            "reason_code": "direct_record_absent_lineage_absent",
             "record": None,
+            "history_root_lineage": None,
         }
         if kind == "support" and self.resolve_support:
             response.update(
                 resolution_status="resolved",
+                resolution_source=self.resolution_source,
+                lineage_dereference_count=(
+                    1 if self.resolution_source == "root_lineage" else 0
+                ),
                 match_count=1,
-                reason_code="support_record_resolved",
+                reason_code=(
+                    "root_lineage_support_record_resolved"
+                    if self.resolution_source == "root_lineage"
+                    else "direct_support_record_resolved"
+                ),
                 record={
                     "record_kind": "support",
-                    "assistant_message_id": "assistant-private-message",
+                    "assistant_message_id": HISTORY_ROOT_MESSAGE_ID,
                     "original_request_id": "original-private-request",
                     "support_record": _history_support_record(),
                     "acquisition_record": None,
+                },
+                history_root_lineage={
+                    "schema_version": "history-root-lineage.v1",
+                    "root_assistant_message_id": HISTORY_ROOT_MESSAGE_ID,
+                    "record_kind": "support",
                 },
             )
         return response
@@ -25384,7 +25419,7 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
         self.persisted_traces = {}
 
     async def add_message(self, **kwargs):
-        message_id = f"message-{len(self.added_messages) + 1}"
+        message_id = f"00000000-0000-4000-8000-{len(self.added_messages) + 1:012d}"
         self.added_messages.append({**copy.deepcopy(kwargs), "message_id": message_id})
         return {"message_id": message_id}
 
@@ -25416,15 +25451,17 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
         assert trace["conversation_id"] == kwargs["conversation_id"]
         assert trace["surface"] == kwargs["surface"]
         return {
-            "schema_version": "immediate-history-resolution.v1",
+            "schema_version": "immediate-history-resolution.v2",
             "request_id": kwargs["request_id"],
             "owner_id": kwargs["owner_id"],
             "conversation_id": kwargs["conversation_id"],
             "surface": kwargs["surface"],
             "explanation_kind": "acquisition",
             "resolution_status": "resolved",
+            "resolution_source": "direct_record",
+            "lineage_dereference_count": 0,
             "match_count": 1,
-            "reason_code": "acquisition_record_resolved",
+            "reason_code": "direct_acquisition_record_resolved",
             "record": {
                 "record_kind": "acquisition",
                 "assistant_message_id": assistant["message_id"],
@@ -25439,6 +25476,11 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
                     "normalized_first_paragraph": assistant["content"].split("\n", 1)[0],
                     "acquisition_manifest": copy.deepcopy(manifest),
                 },
+            },
+            "history_root_lineage": {
+                "schema_version": "history-root-lineage.v1",
+                "root_assistant_message_id": assistant["message_id"],
+                "record_kind": "acquisition",
             },
         }
 
@@ -25614,6 +25656,21 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     ] != "identity_projection_invalid_source_references_returned"
     assert history_trace["fresh_verification_entry_status"] == "not_requested"
     assert history_trace["answer_provider_call_count"] == 0
+    follow_up_assistant = memory_store.added_messages[-1]
+    assert follow_up_assistant["history_root_lineage"] == {
+        "schema_version": "history-root-lineage.v1",
+        "root_assistant_message_id": persisted_assistant["message_id"],
+        "record_kind": "acquisition",
+    }
+    assert "history_root_lineage" not in follow_up_assistant["metadata"]
+    assert follow_up_assistant["metadata"] == {
+        "request_id": "request-ordinary-dsa-follow-up",
+        "selected_model": "not_called",
+        "response_kind": "claim_explanation",
+    }
+    assert history_trace["resolution_source"] == "direct_record"
+    assert history_trace["lineage_dereference_count"] == 0
+    assert history_trace["lineage_result"] == "accepted"
 
 
 async def _run_history_followup(
@@ -25627,13 +25684,16 @@ async def _run_history_followup(
     provider="cloud",
     routing_policy=None,
     litellm_override=None,
+    memory_store_override=None,
 ):
     rules, models = _write_history_route_files(
         tmp_path,
         model=model,
         provider=provider,
     )
-    memory_store = ImmediateHistoryMemoryStore(routing_policy=routing_policy)
+    memory_store = memory_store_override or ImmediateHistoryMemoryStore(
+        routing_policy=routing_policy
+    )
     runtime = HistoryPolicyRuntime(policy_status=policy_status)
     litellm = litellm_override or FakeLiteLLM(completion=completion)
     payload = _first_party_chat_payload(
@@ -25737,6 +25797,148 @@ async def test_canonical_history_uses_zero_classifier_and_one_immediate_lookup(
 
 
 @pytest.mark.asyncio
+async def test_successful_support_history_persists_exact_dedicated_lineage(tmp_path):
+    result, memory_store, runtime, litellm = await _run_history_followup(
+        tmp_path,
+        text="How are you sure?",
+    )
+    assistant = [
+        message for message in memory_store.added_messages if message["role"] == "assistant"
+    ][-1]
+    lineage = {
+        "schema_version": "history-root-lineage.v1",
+        "root_assistant_message_id": HISTORY_ROOT_MESSAGE_ID,
+        "record_kind": "support",
+    }
+
+    assert result["status"] == "ok"
+    assert assistant["history_root_lineage"] == lineage
+    assert "history_root_lineage" not in assistant["metadata"]
+    assert assistant["metadata"] == {
+        "request_id": "request-history-followup",
+        "selected_model": "not_called",
+        "response_kind": "claim_explanation",
+    }
+    assert litellm.calls == []
+    assert memory_store.retrieve_calls == []
+    assert len(runtime.interaction_governance_calls) == 2
+    assert len(memory_store.immediate_history_calls) == 1
+    assert HISTORY_ROOT_MESSAGE_ID not in json.dumps(result, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_root_support_history_transports_same_original_lineage(tmp_path):
+    store = ImmediateHistoryMemoryStore(resolution_source="root_lineage")
+    result, memory_store, _, litellm = await _run_history_followup(
+        tmp_path,
+        text="How are you sure?",
+        memory_store_override=store,
+    )
+    assistant = [
+        message for message in memory_store.added_messages if message["role"] == "assistant"
+    ][-1]
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+
+    assert result["status"] == "ok"
+    assert assistant["history_root_lineage"]["root_assistant_message_id"] == (
+        HISTORY_ROOT_MESSAGE_ID
+    )
+    assert trace["resolution_source"] == "root_lineage"
+    assert trace["lineage_dereference_count"] == 1
+    assert trace["lineage_result"] == "accepted"
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason", "match_count"),
+    [
+        ("no_record", "direct_record_absent_lineage_absent", 0),
+        ("invalid", "direct_support_record_invalid", 0),
+        ("ambiguous", "direct_support_record_ambiguous", 2),
+        ("unavailable", "history_store_unavailable", 0),
+    ],
+)
+async def test_degraded_history_persists_no_lineage(
+    tmp_path, status, reason, match_count
+):
+    response = {
+        "schema_version": "immediate-history-resolution.v2",
+        "request_id": "replaced",
+        "owner_id": "replaced",
+        "conversation_id": "replaced",
+        "surface": "replaced",
+        "explanation_kind": "support",
+        "resolution_status": status,
+        "resolution_source": "none",
+        "lineage_dereference_count": 0,
+        "match_count": match_count,
+        "reason_code": reason,
+        "record": None,
+        "history_root_lineage": None,
+    }
+    store = ImmediateHistoryMemoryStore(response_override=response)
+    result, memory_store, _, litellm = await _run_history_followup(
+        tmp_path,
+        text="How are you sure?",
+        memory_store_override=store,
+    )
+    assistant = [
+        message for message in memory_store.added_messages if message["role"] == "assistant"
+    ][-1]
+
+    assert result["status"] == "degraded"
+    assert "history_root_lineage" not in assistant
+    assert litellm.calls == []
+    assert memory_store.retrieve_calls == []
+
+
+class RejectingLineageMemoryStore(ImmediateHistoryMemoryStore):
+    def __init__(self):
+        super().__init__()
+        self.append_attempts = []
+
+    async def add_message(self, **kwargs):
+        self.append_attempts.append(copy.deepcopy(kwargs))
+        if kwargs.get("history_root_lineage") is not None:
+            raise RuntimeError(
+                "PRIVATE-LINEAGE-APPEND-ERROR " + HISTORY_ROOT_MESSAGE_ID
+            )
+        return await super().add_message(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_lineage_append_rejection_returns_bounded_nondurable_failure(tmp_path):
+    store = RejectingLineageMemoryStore()
+    result, memory_store, _, litellm = await _run_history_followup(
+        tmp_path,
+        text="How are you sure?",
+        memory_store_override=store,
+    )
+    assistant_attempts = [
+        message for message in memory_store.append_attempts if message["role"] == "assistant"
+    ]
+
+    assert result == {
+        "request_id": "request-history-followup",
+        "conversation_id": "conv-1",
+        "profile_name": "dev",
+        "selected_model": "not_called",
+        "answer": orchestrate_service._HISTORY_PERSISTENCE_UNAVAILABLE,
+        "status": "degraded",
+        "sources": [],
+    }
+    assert len(assistant_attempts) == 1
+    assert all(message["role"] != "assistant" for message in memory_store.added_messages)
+    assert memory_store.trace_calls == []
+    assert memory_store.retrieve_calls == []
+    assert litellm.calls == []
+    serialized = json.dumps(result, sort_keys=True)
+    assert HISTORY_ROOT_MESSAGE_ID not in serialized
+    assert "PRIVATE-LINEAGE-APPEND-ERROR" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record(tmp_path):
     text = "Where did that conclusion come from?"
     result, memory_store, runtime, litellm = await _run_history_followup(
@@ -25754,7 +25956,7 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
     serialized_classifier = json.dumps(classifier_call, sort_keys=True)
     for forbidden in (
         "PRIVATE RAW SUMMARY",
-        "assistant-private-message",
+        HISTORY_ROOT_MESSAGE_ID,
         "original-private-request",
         "private-source:record-1",
         "conv-1",
@@ -25797,16 +25999,22 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
         "verification_after_history_allowed",
         "bms_call_count",
         "bms_resolution_status",
-        "bms_reason_code",
+            "bms_reason_code",
+            "resolution_source",
+            "lineage_dereference_count",
+            "lineage_result",
         "resolved_record_kind",
         "render_status",
         "fresh_verification_entry_status",
         "answer_provider_call_count",
-    }
+        }
+    assert history_trace["resolution_source"] == "direct_record"
+    assert history_trace["lineage_dereference_count"] == 0
+    assert history_trace["lineage_result"] == "accepted"
     assert text not in protected
     for forbidden in (
         "PRIVATE RAW SUMMARY",
-        "assistant-private-message",
+        HISTORY_ROOT_MESSAGE_ID,
         "original-private-request",
         "private-source:record-1",
     ):
@@ -25862,6 +26070,11 @@ async def test_negative_controls_do_not_classify_or_lookup_immediate_history(tmp
     assert "response_format" not in litellm.calls[0]
     assert len(runtime.interaction_governance_calls) == 1
     assert memory_store.immediate_history_calls == []
+    assert all(
+        "history_root_lineage" not in message
+        for message in memory_store.added_messages
+        if message["role"] == "assistant"
+    )
 
 
 @pytest.mark.asyncio
@@ -25903,6 +26116,11 @@ async def test_classifier_failures_are_provider_free_clarifications(tmp_path, co
     assert memory_store.immediate_history_calls == []
     assert memory_store.retrieve_calls == []
     assert result["selected_model"] == "not_called"
+    assert all(
+        "history_root_lineage" not in message
+        for message in memory_store.added_messages
+        if message["role"] == "assistant"
+    )
 
 
 @pytest.mark.asyncio
@@ -26059,6 +26277,11 @@ async def test_cr_history_policy_dispositions_control_provider_free_handling(
     assert len(litellm.calls) == expected_calls
     assert len(runtime.interaction_governance_calls) == 2
     assert memory_store.immediate_history_calls == []
+    assert all(
+        "history_root_lineage" not in message
+        for message in memory_store.added_messages
+        if message["role"] == "assistant"
+    )
 
 
 @pytest.mark.asyncio
@@ -26192,6 +26415,64 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
     assert trace["prompt"]["claim_capture"]["reason_code"] == (
         "compound_verification_response"
     )
+    compound_assistant = [
+        message for message in memory_store.added_messages if message["role"] == "assistant"
+    ][-1]
+    assert "history_root_lineage" not in compound_assistant
+    boundary_payloads = json.dumps(
+        {
+            "provider": provider.calls,
+            "runtime": runtime.interaction_governance_calls,
+            "dsa": dsa.calls,
+            "public": result,
+            "trace": trace,
+        },
+        sort_keys=True,
+    )
+    assert HISTORY_ROOT_MESSAGE_ID not in boundary_payloads
+    assert "history_root_lineage" not in boundary_payloads
+    assert "root_assistant_message_id" not in boundary_payloads
+
+
+@pytest.mark.asyncio
+async def test_bare_verification_wrong_kind_lineage_is_not_retried_as_acquisition(
+    tmp_path,
+):
+    response = {
+        "schema_version": "immediate-history-resolution.v2",
+        "request_id": "replaced",
+        "owner_id": "replaced",
+        "conversation_id": "replaced",
+        "surface": "replaced",
+        "explanation_kind": "support",
+        "resolution_status": "invalid",
+        "resolution_source": "none",
+        "lineage_dereference_count": 0,
+        "match_count": 0,
+        "reason_code": "lineage_record_kind_mismatch",
+        "record": None,
+        "history_root_lineage": None,
+    }
+    store = ImmediateHistoryMemoryStore(response_override=response)
+    result, memory_store, _, provider = await _run_history_followup(
+        tmp_path,
+        text="Can you verify that again now?",
+        completion=_classifier_completion("new_verification_request", verify=True),
+        memory_store_override=store,
+    )
+
+    assert result["status"] == "degraded"
+    assert len(memory_store.immediate_history_calls) == 1
+    assert memory_store.immediate_history_calls[0]["explanation_kind"] == "support"
+    assert len(provider.calls) == 1
+    assert memory_store.retrieve_calls == []
+    assistant = [
+        message for message in memory_store.added_messages if message["role"] == "assistant"
+    ][-1]
+    assert "history_root_lineage" not in assistant
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+    assert trace["lineage_result"] == "rejected"
+    assert trace["lineage_dereference_count"] == 0
 
 
 async def _run_support_structured_verification_case(

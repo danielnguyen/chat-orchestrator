@@ -90,9 +90,9 @@ manifests, traces, or policy responses. Service authentication and normal
 owner/conversation scope remain enabled.
 
 The evidence topology requires the merged immediate-history foundations at or after
-Chat Orchestrator `6fec8fd9adc7671e99447470ab238b2d30259d51`, Cognitive Runtime
+Chat Orchestrator `19dfdd9b58fc7ce87152c0009143d23caea03b03`, Cognitive Runtime
 `f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67`, Basic Memory Store
-`af9420da0235c208bcf842a0ca81f88e537d93be`, and Data Source Aggregator
+`97877bd9da315af2a1cb5e9437ade13d3ee9d2e6`, and Data Source Aggregator
 `e23f582e4aac32a12c7ad3c71278fc21e5697ea4`. The disposable DSA configuration
 contains operator-owned material scope references for selected sources; those
 values are emitted by the real DSA inventory and are never manufactured by the
@@ -143,9 +143,16 @@ fixture—with history follow-ups disabled by default. It creates durable govern
 answers through the actual services, then recreates only the orchestrator with
 history enabled. PostgreSQL, BMS, CR, DSA, Qdrant, and the provider remain running,
 so successful current-turn-only follow-ups prove that neither a client cache nor
-orchestrator process state supplies the previous answer.
+orchestrator process state supplies the previous answer. The hosted workflow
+checks out BMS at `97877bd9da315af2a1cb5e9437ade13d3ee9d2e6`, builds that service,
+and first probes both the unchanged v1 and strict v2 internal response shapes.
 
-The scenarios cover canonical support and acquisition wording without a model,
+The scenarios cover chained acquisition explanations with the same private root,
+chained support explanations followed by one governed bare fresh verification,
+CO-only restart durability, ordinary-answer lineage termination, and malformed,
+unsupported, wrong-kind, cross-owner, cross-conversation, surface-mismatched,
+missing, recursive, and association-invalid stored lineage. They also retain
+canonical support and acquisition wording without a model,
 four natural paraphrases using one strict `intent_classifier` call to the configured
 `gpt-5-mini` route, CR policy, BMS newest-response resolution, provider-free
 historical rendering, classifier degradation and local-only denial, CR confidence
@@ -153,8 +160,12 @@ boundaries, no backward scan, one explicitly requested governed verification, an
 unauthenticated BMS rejection. Classifier calls are counted separately from answer
 provider calls: pure history has no answer-provider call, while explicit fresh
 verification has one classifier call and one governed answer call after successful
-history resolution. Provider diagnostics retain only bounded structural fields and
-the existing disposable normalized-message fixture data needed to prove the strict
+history resolution. Pure history proves exactly one CR history-policy call, one
+BMS v2 resolution call, zero answer-provider calls, and zero DSA calls. Traces
+retain only the closed resolution source, dereference count, and lineage result;
+public responses, provider prompts, CR and DSA payloads, and persisted traces
+contain no lineage or root identity. Provider diagnostics retain only bounded
+structural fields and the existing disposable normalized-message fixture data needed to prove the strict
 schema, token limit, zero tools, fixed instruction, current-user-only input, and
 absence of history or identifiers.
 
@@ -162,8 +173,8 @@ The focused mode and the complete regression both reset provider, DSA audit,
 external-source, feature-toggle, and disposable conversation state. This is
 deployment-equivalent composed proof for the repository contracts; it is not a
 reconstruction of the original Telegram deployment or evidence for its historical
-runtime state. Project checklist verdicts and deployment reconstruction remain a
-separate projects-side review.
+runtime state. Project checklist verdicts, production deployment, and Telegram
+production proof remain separate post-merge work.
 
 Normal pull-request validation uses `all`: it runs every established focused
 scenario, both final recovery families, and only then the complete composed-smoke

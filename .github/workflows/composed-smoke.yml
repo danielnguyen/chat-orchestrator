@@ -67,7 +67,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: af9420da0235c208bcf842a0ca81f88e537d93be
+          ref: 97877bd9da315af2a1cb5e9437ade13d3ee9d2e6
           path: basic-memory-store
           fetch-depth: 0
 
@@ -75,14 +75,18 @@ jobs:
         run: |
           git -C cognitive-runtime branch --force main f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67
           git -C data-source-aggregator branch --force main e23f582e4aac32a12c7ad3c71278fc21e5697ea4
-          git -C basic-memory-store branch --force main af9420da0235c208bcf842a0ca81f88e537d93be
-          git -C chat-orchestrator merge-base --is-ancestor 6fec8fd9adc7671e99447470ab238b2d30259d51 HEAD
+          git -C basic-memory-store branch --force main 97877bd9da315af2a1cb5e9437ade13d3ee9d2e6
+          git -C chat-orchestrator merge-base --is-ancestor 19dfdd9b58fc7ce87152c0009143d23caea03b03 HEAD
 
       - name: Validate Compose configuration
         working-directory: chat-orchestrator
         env:
           COMPOSED_SMOKE_TMP: /tmp/chat-orchestrator-composed-config
         run: docker compose -f docker-compose.composed-smoke.yml config >/dev/null
+
+      - name: Build Chat Orchestrator image
+        working-directory: chat-orchestrator
+        run: docker build -f api/Dockerfile -t chat-orchestrator:history-root-lineage-v2-test api
 
       - name: Run focused actual-service evidence proof
         working-directory: chat-orchestrator
