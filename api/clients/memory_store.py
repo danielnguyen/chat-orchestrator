@@ -64,6 +64,7 @@ class MemoryStoreClient:
         client_id: str | None,
         metadata: dict[str, Any] | None = None,
         policy_metadata: dict[str, Any] | None = None,
+        history_root_lineage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "owner_id": owner_id,
@@ -74,6 +75,8 @@ class MemoryStoreClient:
         }
         if policy_metadata is not None:
             payload["policy_metadata"] = policy_metadata
+        if history_root_lineage is not None:
+            payload["history_root_lineage"] = history_root_lineage
         return await self._post(
             f"/v1/conversations/{conversation_id}/messages",
             json=payload,
@@ -272,7 +275,7 @@ class MemoryStoreClient:
         explanation_kind: str,
     ) -> dict[str, Any]:
         payload = {
-            "schema_version": "immediate-history-resolution.v1",
+            "schema_version": "immediate-history-resolution.v2",
             "request_id": request_id,
             "owner_id": owner_id,
             "conversation_id": conversation_id,

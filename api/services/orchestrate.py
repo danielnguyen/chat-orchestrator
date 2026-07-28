@@ -126,6 +126,10 @@ _HISTORY_POLICY_UNAVAILABLE = (
     "I couldn’t safely determine whether this refers to the immediately previous "
     "answer. I did not perform a history lookup or a new verification."
 )
+_HISTORY_PERSISTENCE_UNAVAILABLE = (
+    "I couldn’t durably save that historical explanation, so I can’t report it as "
+    "completed. Please try again later."
+)
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
@@ -2653,7 +2657,10 @@ def _capability_registry_forced_response(trace: dict[str, Any]) -> str | None:
     authority_level = authority.get("authority_level")
     requires_confirmation = authority.get("requires_confirmation")
     if authority_level == "blocked":
-        return "That registered capability is not available for execution here. I did not execute it."
+        return (
+            "That registered capability is not available for execution here. "
+            "I did not execute it."
+        )
     if authority_level == "execute_after_confirmation" or requires_confirmation is True:
         return "That action requires explicit confirmation before I proceed. I did not execute it."
     if authority_level == "execute_low_risk":
@@ -6061,6 +6068,9 @@ def _history_trace(*, enabled: bool) -> dict[str, Any]:
         "bms_call_count": 0,
         "bms_resolution_status": "not_called",
         "bms_reason_code": "not_called",
+        "resolution_source": "none",
+        "lineage_dereference_count": 0,
+        "lineage_result": "absent",
         "resolved_record_kind": None,
         "render_status": "not_attempted",
         "fresh_verification_entry_status": "not_requested",
@@ -6928,6 +6938,17 @@ async def orchestrate_chat(
                             history_followup_trace["bms_reason_code"] = (
                                 claim_explanation.trace.get("reason_code")
                             )
+                            history_followup_trace["resolution_source"] = (
+                                claim_explanation.trace.get("resolution_source", "none")
+                            )
+                            history_followup_trace["lineage_dereference_count"] = (
+                                claim_explanation.trace.get(
+                                    "lineage_dereference_count", 0
+                                )
+                            )
+                            history_followup_trace["lineage_result"] = (
+                                claim_explanation.trace.get("lineage_result", "absent")
+                            )
                             history_followup_trace["resolved_record_kind"] = (
                                 claim_explanation.trace.get("resolved_record_kind")
                             )
@@ -7021,19 +7042,45 @@ async def orchestrate_chat(
                 request_id=request_id,
                 turn_status="responding",
             )
-            await memory_store.add_message(
-                conversation_id=conversation_id,
-                owner_id=payload["owner_id"],
-                role="assistant",
-                content=answer,
-                client_id=payload.get("client_id"),
-                metadata={
+            try:
+                assistant_append: dict[str, Any] = {
+                    "conversation_id": conversation_id,
+                    "owner_id": payload["owner_id"],
+                    "role": "assistant",
+                    "content": answer,
+                    "client_id": payload.get("client_id"),
+                    "metadata": {
+                        "request_id": request_id,
+                        "selected_model": "not_called",
+                        "response_kind": "claim_explanation",
+                    },
+                    "policy_metadata": turn_policy_metadata,
+                }
+                if claim_explanation.history_root_lineage is not None:
+                    assistant_append["history_root_lineage"] = (
+                        claim_explanation.history_root_lineage
+                    )
+                await memory_store.add_message(
+                    **assistant_append,
+                )
+            except Exception:
+                if claim_explanation.history_root_lineage is None:
+                    raise
+                await _complete_runtime_turn(
+                    runtime=runtime,
+                    turn_state_trace=turn_state_trace,
+                    request_id=request_id,
+                    turn_status="abandoned",
+                )
+                return {
                     "request_id": request_id,
+                    "conversation_id": conversation_id,
+                    "profile_name": profile["profile_name"],
                     "selected_model": "not_called",
-                    "response_kind": "claim_explanation",
-                },
-                policy_metadata=turn_policy_metadata,
-            )
+                    "answer": _HISTORY_PERSISTENCE_UNAVAILABLE,
+                    "status": "degraded",
+                    "sources": [],
+                }
             await _complete_runtime_turn(
                 runtime=runtime,
                 turn_state_trace=turn_state_trace,

@@ -586,12 +586,21 @@ receives clarification.
 
 Only an accepted immediate-previous policy with history lookup allowed makes one
 `POST /v1/internal/immediate-history/resolve` call. The request contains only the
-schema version, current request, owner, conversation, surface, and explanation
-kind. Basic Memory Store owns selection of the single newest durable assistant
-response and its exactly associated support or acquisition record. Chat
-Orchestrator does not send prior response bytes or record identifiers, call the
+v2 schema version, current request, owner, conversation, surface, and explanation
+kind. There is no automatic v1 fallback. Basic Memory Store owns selection of the
+single newest durable assistant response and its exactly associated support or
+acquisition record. Chat Orchestrator does not send prior response bytes or record identifiers, call the
 legacy acquisition resolver for this path, list claim records, fetch traces,
-search semantically, or scan backward after a missing or invalid newest record.
+search semantically, scan backward after a missing or invalid newest record, or
+retry with another explanation kind.
+
+The strict v2 response identifies whether the record was resolved directly or
+through one BMS-owned root-lineage dereference. Successful responses include only
+the minimal `history-root-lineage.v1` object: schema version, root assistant
+message UUID, and support or acquisition kind. Chat Orchestrator validates this
+envelope and its complete response invariants, but does not choose, construct,
+modify, or dereference a root. The explanation kind supplied by Cognitive Runtime
+remains authoritative.
 
 Resolved support records and acquisition manifests use the existing deterministic
 renderers. Support rendering accepts approved retained file, governed
@@ -601,8 +610,13 @@ strength, freshness, and bounded limitations. Acquisition rendering continues to
 use the strict manifest projection for checked, coverage, and gaps questions.
 Neither renderer exposes identifiers, URLs, excerpts, source names, raw summaries,
 provider prose, or hidden reasoning. Pure historical output is persisted exactly
-as returned with `selected_model = "not_called"` and states that no new verification
-was performed.
+as returned with `selected_model = "not_called"`, current request identity, and
+`response_kind = "claim_explanation"`. Only a successful pure history response
+passes the unchanged BMS lineage through the dedicated assistant-message append
+field. It is never placed in ordinary metadata or returned publicly. BMS stores
+and validates it privately. A rejected lineaged append is not retried without
+lineage and produces a bounded non-durable dependency response rather than a
+false persistence success.
 
 Fresh verification begins only when Cognitive Runtime explicitly permits it after
 one valid immediate record resolves and that record supplies an exact bounded
@@ -613,22 +627,30 @@ and the existing `New verification:`, `New verification attempt:`, and `New
 verification unavailable:` labels remain policy-owned. If the governed path is
 unavailable, the combined provider-free response says so rather than silently
 returning only history or pretending a new check occurred.
+Compound verification answers and ordinary answers never inherit an older root
+lineage. A later history request therefore addresses the compound or ordinary
+newest assistant response under BMS's direct-first, no-record-only rule. A bare
+fresh-verification request after an acquisition-history explanation remains out
+of scope because Cognitive Runtime classifies that wording as support; CO does
+not infer acquisition from stored lineage.
 
 When enabled, the request trace adds one bounded `history_followup` summary with
 feature, deterministic match, eligibility, logical route, classifier status and
 call count, closed candidate projection, confidence band, Cognitive Runtime
 policy status and call count, lookup and clarification permissions, explicit
 verification flags, Basic Memory Store status and call count, resolved record
-kind, render status, fresh-verification entry status, and historical-rendering
-answer-provider call count. It contains no turn text, prompts, raw classifier
-output, exact confidence reasoning, record or source identifiers, provider
+kind, closed resolution source, zero-or-one lineage dereference count, bounded
+lineage result, render status, fresh-verification entry status, and
+historical-rendering answer-provider call count. It contains no turn text, prompts, raw classifier
+output, lineage object, root assistant message ID, exact confidence reasoning,
+record or source identifiers, provider
 responses, or unrestricted exceptions. Classifier accounting is separate from
 answer-provider `model_calls`.
 
 This path does not implement vague arbitrary-history search, backward scanning,
 provider reconstruction of history, classifier-selected records, automatic
 verification, client-cache authority, or cross-device active-thread handoff.
-Actual-service composition and deployed client proof are separate validation work.
+Production deployment and deployed-client proof remain separate validation work.
 
 ## Integration boundaries
 

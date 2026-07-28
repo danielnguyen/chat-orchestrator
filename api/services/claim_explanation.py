@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -349,10 +351,27 @@ class ImmediateHistoryRecord(BaseModel):
         return self
 
 
+class HistoryRootLineage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["history-root-lineage.v1"]
+    root_assistant_message_id: Annotated[str, Field(min_length=36, max_length=36)]
+    record_kind: Literal["support", "acquisition"]
+
+    @field_validator("root_assistant_message_id")
+    @classmethod
+    def validate_root_message_id(cls, value: str) -> str:
+        try:
+            UUID(value)
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError("history_root_lineage_message_id_invalid") from None
+        return value
+
+
 class ImmediateHistoryResolveResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["immediate-history-resolution.v1"]
+    schema_version: Literal["immediate-history-resolution.v2"]
     request_id: Identifier
     owner_id: Identifier
     conversation_id: Identifier
@@ -361,66 +380,151 @@ class ImmediateHistoryResolveResponse(BaseModel):
     resolution_status: Literal[
         "resolved", "no_record", "ambiguous", "invalid", "unavailable"
     ]
+    resolution_source: Literal["direct_record", "root_lineage", "none"]
+    lineage_dereference_count: Literal[0, 1]
     match_count: int = Field(ge=0, le=2)
     reason_code: Literal[
-        "support_record_resolved",
-        "acquisition_record_resolved",
-        "immediate_response_not_found",
-        "immediate_response_invalid",
-        "support_record_not_found",
-        "support_record_ambiguous",
-        "support_record_invalid",
-        "acquisition_record_not_found",
-        "acquisition_record_invalid",
+        "direct_support_record_resolved",
+        "direct_acquisition_record_resolved",
+        "root_lineage_support_record_resolved",
+        "root_lineage_acquisition_record_resolved",
+        "direct_record_absent_lineage_absent",
+        "lineage_root_missing",
+        "lineage_root_unresolvable",
+        "lineage_root_not_direct_record_owner",
+        "direct_support_record_ambiguous",
+        "direct_response_invalid",
+        "direct_support_record_invalid",
+        "direct_acquisition_record_invalid",
+        "lineage_malformed",
+        "lineage_version_unsupported",
+        "lineage_record_kind_mismatch",
+        "lineage_owner_mismatch",
+        "lineage_conversation_mismatch",
+        "lineage_surface_mismatch",
+        "lineage_root_role_invalid",
+        "lineage_root_recursive",
+        "lineage_root_association_invalid",
         "history_store_unavailable",
     ]
     record: ImmediateHistoryRecord | None = None
+    history_root_lineage: HistoryRootLineage | None = None
 
     @model_validator(mode="after")
     def validate_resolution(self):
-        allowed_reasons = {
-            "resolved": {
-                "support": {"support_record_resolved"},
-                "acquisition": {"acquisition_record_resolved"},
-            },
-            "no_record": {
-                "support": {"immediate_response_not_found", "support_record_not_found"},
-                "acquisition": {
-                    "immediate_response_not_found",
-                    "acquisition_record_not_found",
-                },
-            },
-            "ambiguous": {
-                "support": {"support_record_ambiguous"},
-                "acquisition": set(),
-            },
-            "invalid": {
-                "support": {"immediate_response_invalid", "support_record_invalid"},
-                "acquisition": {
-                    "immediate_response_invalid",
-                    "acquisition_record_invalid",
-                },
-            },
-            "unavailable": {
-                "support": {"history_store_unavailable"},
-                "acquisition": {"history_store_unavailable"},
-            },
+        direct_reasons = {
+            "support": "direct_support_record_resolved",
+            "acquisition": "direct_acquisition_record_resolved",
         }
-        if self.reason_code not in allowed_reasons[self.resolution_status][
-            self.explanation_kind
-        ]:
-            raise ValueError("immediate_history_reason_inconsistent")
+        root_reasons = {
+            "support": "root_lineage_support_record_resolved",
+            "acquisition": "root_lineage_acquisition_record_resolved",
+        }
         if self.resolution_status == "resolved":
             if (
                 self.record is None
+                or self.history_root_lineage is None
                 or self.match_count != 1
                 or self.record.record_kind != self.explanation_kind
+                or self.history_root_lineage.record_kind != self.explanation_kind
+                or self.history_root_lineage.root_assistant_message_id
+                != self.record.assistant_message_id
             ):
-                raise ValueError("resolved_immediate_history_record_required")
-        elif self.record is not None:
-            raise ValueError("unresolved_immediate_history_record_forbidden")
-        if self.resolution_status == "ambiguous" and self.match_count != 2:
-            raise ValueError("ambiguous_immediate_history_match_count_invalid")
+                raise ValueError("resolved_immediate_history_v2_shape_invalid")
+            if self.resolution_source == "direct_record":
+                if (
+                    self.lineage_dereference_count != 0
+                    or self.reason_code != direct_reasons[self.explanation_kind]
+                ):
+                    raise ValueError("direct_immediate_history_v2_shape_invalid")
+            elif self.resolution_source == "root_lineage":
+                if (
+                    self.lineage_dereference_count != 1
+                    or self.reason_code != root_reasons[self.explanation_kind]
+                ):
+                    raise ValueError("root_immediate_history_v2_shape_invalid")
+            else:
+                raise ValueError("resolved_immediate_history_v2_source_invalid")
+            return self
+
+        if (
+            self.resolution_source != "none"
+            or self.record is not None
+            or self.history_root_lineage is not None
+        ):
+            raise ValueError("unresolved_immediate_history_v2_shape_invalid")
+        if self.resolution_status == "ambiguous":
+            if (
+                self.explanation_kind != "support"
+                or self.reason_code != "direct_support_record_ambiguous"
+                or self.lineage_dereference_count != 0
+                or self.match_count != 2
+            ):
+                raise ValueError("ambiguous_immediate_history_v2_shape_invalid")
+            return self
+        if self.match_count != 0:
+            raise ValueError("unresolved_immediate_history_v2_match_count_invalid")
+
+        no_record_reasons = {
+            "direct_record_absent_lineage_absent",
+            "lineage_root_missing",
+            "lineage_root_unresolvable",
+            "lineage_root_not_direct_record_owner",
+        }
+        invalid_reasons = {
+            "direct_response_invalid",
+            "direct_support_record_invalid",
+            "direct_acquisition_record_invalid",
+            "lineage_malformed",
+            "lineage_version_unsupported",
+            "lineage_record_kind_mismatch",
+            "lineage_owner_mismatch",
+            "lineage_conversation_mismatch",
+            "lineage_surface_mismatch",
+            "lineage_root_role_invalid",
+            "lineage_root_recursive",
+            "lineage_root_association_invalid",
+        }
+        if self.resolution_status == "no_record":
+            if self.reason_code not in no_record_reasons:
+                raise ValueError("no_record_immediate_history_v2_reason_invalid")
+        elif self.resolution_status == "invalid":
+            if self.reason_code not in invalid_reasons:
+                raise ValueError("invalid_immediate_history_v2_reason_invalid")
+        elif self.resolution_status == "unavailable":
+            if self.reason_code != "history_store_unavailable":
+                raise ValueError("unavailable_immediate_history_v2_reason_invalid")
+        else:
+            raise ValueError("immediate_history_v2_status_invalid")
+
+        if (
+            self.reason_code == "direct_support_record_invalid"
+            and self.explanation_kind != "support"
+        ):
+            raise ValueError("support_immediate_history_v2_reason_kind_invalid")
+        if (
+            self.reason_code == "direct_acquisition_record_invalid"
+            and self.explanation_kind != "acquisition"
+        ):
+            raise ValueError("acquisition_immediate_history_v2_reason_kind_invalid")
+
+        prelookup_reasons = {
+            "direct_record_absent_lineage_absent",
+            "direct_response_invalid",
+            "direct_support_record_invalid",
+            "direct_acquisition_record_invalid",
+            "lineage_malformed",
+            "lineage_version_unsupported",
+            "lineage_record_kind_mismatch",
+        }
+        if self.reason_code in prelookup_reasons and self.lineage_dereference_count != 0:
+            raise ValueError("prelookup_immediate_history_v2_dereference_invalid")
+        if (
+            self.reason_code not in prelookup_reasons
+            and self.reason_code != "history_store_unavailable"
+            and self.lineage_dereference_count != 1
+        ):
+            raise ValueError("root_immediate_history_v2_dereference_invalid")
         return self
 
 
@@ -441,6 +545,10 @@ class ClaimExplanationOutcome:
     trace: dict[str, Any]
     new_verification_requested: bool = False
     verification_target: str | None = None
+    history_root_lineage: dict[str, Any] | None = dataclass_field(
+        default=None,
+        repr=False,
+    )
 
 
 def normalize_text(value: str) -> str:
@@ -2333,6 +2441,9 @@ def _immediate_history_trace(
     resolution_status: str,
     reason_code: str,
     render_status: str,
+    resolution_source: str = "none",
+    lineage_dereference_count: int = 0,
+    lineage_result: str = "absent",
     resolved_record_kind: str | None = None,
     manifest_projection_status: str = "not_applicable",
     manifest_projection_reason: str = "not_applicable",
@@ -2345,6 +2456,9 @@ def _immediate_history_trace(
         "target_mode": "immediate_previous",
         "lookup_status": "completed",
         "resolution_status": resolution_status,
+        "resolution_source": resolution_source,
+        "lineage_dereference_count": lineage_dereference_count,
+        "lineage_result": lineage_result,
         "reason_code": reason_code,
         "render_status": render_status,
         "resolved_record_kind": resolved_record_kind,
@@ -2383,6 +2497,7 @@ async def resolve_immediate_claim_explanation(
 ) -> ClaimExplanationOutcome:
     explanation_kind = policy["explanation_kind"]
     acquisition_question = policy.get("acquisition_question")
+    payload: Any = None
     try:
         payload = await memory_store.resolve_immediate_history(
             request_id=request_id,
@@ -2412,10 +2527,19 @@ async def resolve_immediate_claim_explanation(
                 resolution_status="unavailable",
                 reason_code="history_store_unavailable",
                 render_status="not_attempted",
+                lineage_result=(
+                    "rejected"
+                    if isinstance(payload, dict)
+                    and payload.get("history_root_lineage") is not None
+                    else "absent"
+                ),
             ),
         )
 
     if response.resolution_status != "resolved":
+        lineage_result = (
+            "rejected" if response.reason_code.startswith("lineage_") else "absent"
+        )
         return ClaimExplanationOutcome(
             handled=True,
             answer=_immediate_history_fallback_answer(
@@ -2428,6 +2552,9 @@ async def resolve_immediate_claim_explanation(
                 resolution_status=response.resolution_status,
                 reason_code=response.reason_code,
                 render_status="not_attempted",
+                resolution_source=response.resolution_source,
+                lineage_dereference_count=response.lineage_dereference_count,
+                lineage_result=lineage_result,
             ),
         )
 
@@ -2489,9 +2616,9 @@ async def resolve_immediate_claim_explanation(
 
     if answer is None or target is None:
         reason_code = (
-            "support_record_invalid"
+            "direct_support_record_invalid"
             if explanation_kind == "support"
-            else "acquisition_record_invalid"
+            else "direct_acquisition_record_invalid"
         )
         return ClaimExplanationOutcome(
             handled=True,
@@ -2503,6 +2630,9 @@ async def resolve_immediate_claim_explanation(
                 resolution_status="invalid",
                 reason_code=reason_code,
                 render_status="rejected",
+                resolution_source=response.resolution_source,
+                lineage_dereference_count=response.lineage_dereference_count,
+                lineage_result="accepted",
                 manifest_projection_status=manifest_projection_status,
                 manifest_projection_reason=manifest_projection_reason,
             ),
@@ -2519,12 +2649,20 @@ async def resolve_immediate_claim_explanation(
             resolution_status="resolved",
             reason_code=response.reason_code,
             render_status="completed",
+            resolution_source=response.resolution_source,
+            lineage_dereference_count=response.lineage_dereference_count,
+            lineage_result="accepted",
             resolved_record_kind=record.record_kind,
             manifest_projection_status=manifest_projection_status,
             manifest_projection_reason=manifest_projection_reason,
         ),
         new_verification_requested=verification_requested,
         verification_target=target if verification_requested else None,
+        history_root_lineage=(
+            response.history_root_lineage.model_dump(mode="json")
+            if not verification_requested and response.history_root_lineage is not None
+            else None
+        ),
     )
 
 
