@@ -976,6 +976,9 @@ def _history_with_truncation(*, task_shape="bounded_exhaustive_review"):
 def test_bounded_exhaustive_history_distinguishes_seed_search_truncation():
     answer = _render_acquisition(_history_with_truncation(), "coverage")
 
+    assert answer.startswith(
+        "Yes—within the requested source set, but not beyond it."
+    )
     assert (
         "The preliminary search was truncated, but the complete requested-source "
         "check finished without truncation."

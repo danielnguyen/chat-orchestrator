@@ -2290,6 +2290,18 @@ def _count_phrase(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count} {singular if count == 1 else plural or singular + 's'}"
 
 
+def _requested_source_check_completed(history: AcquisitionHistory) -> bool:
+    counts = history.counts
+    return (
+        history.task_shape == "bounded_exhaustive_review"
+        and history.strategy == "hybrid"
+        and counts["expansion_attempts"] > 0
+        and counts["expansion_successful"] == counts["expansion_attempts"]
+        and counts["expansion_truncated"] == 0
+        and counts["references_retained"] > 0
+    )
+
+
 def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
     counts = history.counts
     sentences = []
@@ -2365,14 +2377,7 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
         sentences.append("It was not known whether the available source list was complete.")
     elif history.inventory_status == "unavailable":
         sentences.append("The source list was unavailable.")
-    configured_scope_expansion_completed = (
-        history.task_shape == "bounded_exhaustive_review"
-        and history.strategy == "hybrid"
-        and counts["expansion_attempts"] > 0
-        and counts["expansion_successful"] == counts["expansion_attempts"]
-        and counts["expansion_truncated"] == 0
-        and counts["references_retained"] > 0
-    )
+    configured_scope_expansion_completed = _requested_source_check_completed(history)
     if history.budget_truncated:
         sentences.append(
             "The preliminary search was truncated, but the complete requested-source "
@@ -2455,8 +2460,10 @@ def _render_acquisition(
     complete_scope = (
         exhaustive
         and history.sufficiency_status == "sufficient_for_declared_scope"
-        and not history.budget_truncated
-        and not history.candidate_truncated
+        and (
+            (not history.budget_truncated and not history.candidate_truncated)
+            or _requested_source_check_completed(history)
+        )
     )
     if question == "coverage":
         opening = (
