@@ -175,6 +175,8 @@ validated record saved with the original answer. Older records without source
 summaries use a deterministic bounded fallback, while privacy-suppressed or malformed
 metadata cannot expose source identifiers. These explanations do not run a fresh
 search or provider call and do not expose raw acquisition diagnostics.
+“What did you check?” lists only sources actually checked; coverage and gap answers
+show considered-only, unavailable, or disabled sources separately as not covered.
 
 Run only the distinct-client owner-memory proof with:
 

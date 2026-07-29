@@ -2302,7 +2302,11 @@ def _requested_source_check_completed(history: AcquisitionHistory) -> bool:
     )
 
 
-def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
+def _limitation_sentences(
+    history: AcquisitionHistory,
+    *,
+    include_unknown_inventory: bool = True,
+) -> list[str]:
     counts = history.counts
     sentences = []
     for field, singular in (
@@ -2373,7 +2377,7 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
             sentences.append(f"{_count_phrase(count, singular, plural)}.")
     if history.inventory_status == "partial":
         sentences.append("The available source list was incomplete.")
-    elif history.inventory_status == "unknown":
+    elif history.inventory_status == "unknown" and include_unknown_inventory:
         sentences.append("It was not known whether the available source list was complete.")
     elif history.inventory_status == "unavailable":
         sentences.append("The source list was unavailable.")
@@ -2399,19 +2403,25 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
     return sentences
 
 
+def _source_was_checked(source: SourceHistorySummary) -> bool:
+    reasons = set(source.contribution_reason_codes)
+    return bool(
+        source.selected
+        or source.used
+        or source.returned_reference_count
+        or source.retained_reference_count
+        or "exact_reference_retrieved" in reasons
+    )
+
+
 def _source_summary_lines(
     history: AcquisitionHistory,
     *,
-    gaps_only: bool = False,
+    view: Literal["checked", "not_covered", "gaps"],
 ) -> list[str]:
     lines = []
     for source in history.source_summaries:
-        location = (
-            f" — {'; '.join(source.safe_location_labels)}"
-            if source.safe_location_labels
-            else ""
-        )
-        details = []
+        checked = _source_was_checked(source)
         reasons = set(source.contribution_reason_codes)
         gap_reasons = {
             "returned_records_not_retained",
@@ -2420,9 +2430,24 @@ def _source_summary_lines(
             "source_unavailable",
             "source_disabled",
         }
-        if gaps_only and not reasons & gap_reasons:
+        not_covered_reasons = {
+            "considered_not_selected",
+            "source_unavailable",
+            "source_disabled",
+        }
+        if view == "checked" and not checked:
             continue
-        if source.retained_reference_count:
+        if view == "not_covered" and (checked or not reasons & not_covered_reasons):
+            continue
+        if view == "gaps" and not reasons & gap_reasons:
+            continue
+        location = (
+            f" — {'; '.join(source.safe_location_labels)}"
+            if view == "checked" and source.safe_location_labels
+            else ""
+        )
+        details = []
+        if view == "checked" and source.retained_reference_count:
             details.append(
                 f"contributed {_count_phrase(source.retained_reference_count, 'record')} "
                 "used in the earlier answer"
@@ -2437,14 +2462,18 @@ def _source_summary_lines(
             details.append("was checked but returned no records")
         if "considered_not_selected" in reasons:
             details.append("was considered but not selected for the lookup")
-        if "exact_reference_retrieved" in reasons:
+        if view == "checked" and "exact_reference_retrieved" in reasons:
             details.append("included the exact requested reference")
         if "source_unavailable" in reasons:
             details.append("was unavailable during the original lookup")
         if "source_disabled" in reasons:
             details.append("was disabled during the original lookup")
         if not details:
-            details.append("was part of the original source scope")
+            details.append(
+                "was checked during the original lookup"
+                if checked
+                else "was outside the sources checked in the original lookup"
+            )
         lines.append(f"- {source.display_name}{location}: {'; '.join(details)}.")
     return lines
 
@@ -2490,9 +2519,22 @@ def _render_acquisition(
                 f"{verb} used in the earlier answer."
             )
     else:
-        lines.extend(
-            _source_summary_lines(history, gaps_only=question == "gaps")
-        )
+        if question == "checked":
+            lines.extend(_source_summary_lines(history, view="checked"))
+        elif question == "coverage":
+            checked_lines = _source_summary_lines(history, view="checked")
+            if checked_lines:
+                lines.append("Checked:")
+                lines.extend(checked_lines)
+            not_covered_lines = _source_summary_lines(history, view="not_covered")
+            if not_covered_lines:
+                lines.append("Not covered:")
+                lines.extend(not_covered_lines)
+        else:
+            lines.extend(_source_summary_lines(history, view="gaps"))
+
+    if len(lines) > 1:
+        lines.append("")
 
     if history.task_shape == "ordinary_context_augmentation":
         boundary = (
@@ -2520,7 +2562,13 @@ def _render_acquisition(
     else:
         raise ValueError("unsupported_acquisition_history_composition")
 
-    limitations = _limitation_sentences(history)
+    limitations = _limitation_sentences(
+        history,
+        include_unknown_inventory=not (
+            question == "checked"
+            and history.task_shape == "ordinary_context_augmentation"
+        ),
+    )
     if question == "gaps" and not limitations:
         lines.append(f"- {boundary}")
     else:

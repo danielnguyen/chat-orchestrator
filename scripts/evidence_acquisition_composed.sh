@@ -4207,8 +4207,8 @@ run_history_followup_composed_suite() {
     and (.answer | contains("Migration Records"))
     and (.answer | contains("Google Sheets tab “Records” — A2:C2, A3:C3"))
     and (.answer | contains("contributed 2 records used in the earlier answer"))
-    and (.answer | contains("Optional Migration Notes"))
-    and (.answer | contains("was disabled during the original lookup"))
+    and ((.answer | contains("Optional Migration Notes")) | not)
+    and ((.answer | contains("was disabled during the original lookup")) | not)
     and (.answer | endswith("I didn’t run another search or verification for this explanation."))
     and ((.answer | contains("records_primary")) | not)
     and ((.answer | contains("google_sheets:records_primary")) | not)
@@ -4221,6 +4221,14 @@ run_history_followup_composed_suite() {
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What might you have missed?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What might you have missed?" deterministic acquisition_gaps acquisition 0 root_lineage 1
+  assert_jq "history.h1.gaps" "$response" '
+    (.answer | startswith("Known gaps from the original lookup:"))
+    and (.answer | contains("Optional Migration Notes"))
+    and (.answer | contains("was disabled during the original lookup"))
+    and ((.answer | contains("Migration Records")) | not)
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
+    and ((.answer | contains("records_optional")) | not)
+  '
   second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
   test "$first_history_lineage" = "$second_history_lineage"
   test "$(jq -r '.root_assistant_message_id' <<<"$first_history_lineage")" = "$root_message_id"

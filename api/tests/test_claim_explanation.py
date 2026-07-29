@@ -600,18 +600,23 @@ def test_jeep_legacy_manifest_renders_friendly_sources_and_grouped_locations():
 
     assert history is not None
     answer = _render_acquisition(history, "checked")
-    for expected in (
-        "I checked:",
-        "Primary vehicle maintenance log",
-        "EV maintenance log",
-        "Google Sheets tab “Form responses 1” — A13:I13, A8:I8",
-        "Google Sheets tab “FormResponses” — A84:H84",
-        "contributed 2 records used in the earlier answer",
-        "contributed 1 record used in the earlier answer",
-        "I didn’t run another search or verification",
-    ):
-        assert expected in answer
+    assert answer == (
+        "I checked:\n"
+        "- EV maintenance log — Google Sheets tab “FormResponses” — A84:H84: "
+        "contributed 1 record used in the earlier answer.\n"
+        "- Primary vehicle maintenance log — Google Sheets tab “Form responses 1” — "
+        "A13:I13, A8:I8: contributed 2 records used in the earlier answer.\n\n"
+        "This was a normal source lookup for the earlier answer, not a complete review "
+        "of every possible source.\n"
+        "I didn’t run another search or verification for this explanation."
+    )
     for prohibited in (
+        "Calendar family",
+        "Calendar holidays ca",
+        "Calendar personal",
+        "calendar_family",
+        "calendar_holidays_ca",
+        "calendar_personal",
         "ordinary external context augmentation",
         "delivered to reasoning",
         "configured source",
@@ -621,6 +626,37 @@ def test_jeep_legacy_manifest_renders_friendly_sources_and_grouped_locations():
         *VALID_OPAQUE_SOURCE_REFERENCES,
     ):
         assert prohibited not in answer
+
+
+@pytest.mark.parametrize("question", ["coverage", "gaps"])
+def test_jeep_legacy_manifest_keeps_considered_sources_out_of_checked_scope(question):
+    history = _project_acquisition_history(_jeep_legacy_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, question)
+    if question == "coverage":
+        assert "Not covered:" in answer
+    else:
+        assert answer.startswith("Known gaps from the original lookup:")
+    for display_name in (
+        "Calendar family",
+        "Calendar holidays ca",
+        "Calendar personal",
+    ):
+        assert display_name in answer
+        assert "was considered but not selected for the lookup" in answer
+    for raw_id in (
+        "calendar_family",
+        "calendar_holidays_ca",
+        "calendar_personal",
+    ):
+        assert raw_id not in answer
+    if question == "coverage":
+        assert answer.index("Checked:") < answer.index("EV maintenance log")
+        assert answer.index("Not covered:") < answer.index("Calendar family")
+    else:
+        assert "EV maintenance log" not in answer
+        assert "Primary vehicle maintenance log" not in answer
 
 
 def test_future_source_summaries_render_stably_without_provider_text():
@@ -634,9 +670,31 @@ def test_future_source_summaries_render_stably_without_provider_text():
     assert "Google Sheets tab “Current records” — A2:C3" in first
     assert "contributed 1 record used in the earlier answer" in first
     assert "returned 1 additional record that was not used" in first
-    assert "was unavailable during the original lookup" in first
+    assert "Supplemental inspection notes" not in first
+    assert "was unavailable during the original lookup" not in first
     assert "source-a" not in first
     assert "google_sheets:source-a" not in first
+
+
+@pytest.mark.parametrize("question", ["coverage", "gaps"])
+def test_future_source_summaries_separate_unchecked_and_unavailable_scope(question):
+    history = _project_acquisition_history(_future_source_summary_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, question)
+    assert "Supplemental inspection notes" in answer
+    assert "was considered but not selected for the lookup" in answer
+    assert "was unavailable during the original lookup" in answer
+    if question == "coverage":
+        assert answer.index("Not covered:") < answer.index(
+            "Supplemental inspection notes"
+        )
+        assert answer.index("Archive review log") < answer.index("Not covered:")
+        assert answer.index("Operations register") < answer.index("Not covered:")
+    else:
+        assert "Archive review log" in answer
+        assert "returned 1 additional record that was not used" in answer
+        assert "Operations register" not in answer
 
 
 def test_privacy_suppression_removes_future_source_names_and_locations():
