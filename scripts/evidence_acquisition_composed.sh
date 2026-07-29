@@ -1991,7 +1991,8 @@ run_evidence_history_exhaustive_scenario() {
     .assistant == "1" and .trace == "1" and .claims == "0"
   '
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "Did you look at everything relevant?" "Within the declared bounded scope, yes." \
+    "Did you look at everything relevant?" \
+    "Yes—within the requested source set, but not beyond it." \
     "history.exhaustive"
 }
 
