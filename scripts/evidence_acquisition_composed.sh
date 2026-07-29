@@ -2256,7 +2256,7 @@ run_evidence_privacy_history_scenario() {
     and .acquisition.source_references_returned == []
     and .acquisition.source_references_returned_count == 2
     and .acquisition.source_summaries == []
-    and .acquisition.source_summaries_count == 1
+    and .acquisition.source_summaries_count == 2
   ' <<<"$manifest" >/dev/null
   case "$(jq -c . <<<"$response")$(jq -c . <<<"$manifest")" in
     *records_primary*|*google_sheets:*|*PRIVATE\ SOURCE\ DETAIL*)
@@ -4166,20 +4166,36 @@ run_history_followup_composed_suite() {
   original_trace="$(fetch_trace "$HISTORY_ORIGINAL_REQUEST_ID")"
   jq -e '
     .prompt.evidence_acquisition.acquisition.item_count == 2
-    and .prompt.evidence_acquisition.acquisition.source_summaries == [{
-      source_id: "records_primary",
-      display_name: "Migration Records",
-      connector: "google_sheets",
-      authority_role: "authoritative",
-      domain_tags: ["migration", "records"],
-      considered: true,
-      selected: true,
-      used: true,
-      returned_reference_count: 2,
-      retained_reference_count: 2,
-      safe_location_labels: ["Google Sheets tab “Records” — A2:C2, A3:C3"],
-      contribution_reason_codes: ["retained_records_contributed"]
-    }]
+    and .prompt.evidence_acquisition.acquisition.source_summaries == [
+      {
+        source_id: "records_primary",
+        display_name: "Migration Records",
+        connector: "google_sheets",
+        authority_role: "authoritative",
+        domain_tags: ["migration", "records"],
+        considered: true,
+        selected: true,
+        used: true,
+        returned_reference_count: 2,
+        retained_reference_count: 2,
+        safe_location_labels: ["Google Sheets tab “Records” — A2:C2, A3:C3"],
+        contribution_reason_codes: ["retained_records_contributed"]
+      },
+      {
+        source_id: "records_optional",
+        display_name: "Optional Migration Notes",
+        connector: "google_sheets",
+        authority_role: "supplemental",
+        domain_tags: ["migration", "records"],
+        considered: false,
+        selected: false,
+        used: false,
+        returned_reference_count: 0,
+        retained_reference_count: 0,
+        safe_location_labels: [],
+        contribution_reason_codes: ["source_disabled"]
+      }
+    ]
   ' <<<"$original_trace" >/dev/null
   restart_orchestrator_with_history_followup true
   provider_post "/fixture/reset" '{}'
@@ -4191,6 +4207,8 @@ run_history_followup_composed_suite() {
     and (.answer | contains("Migration Records"))
     and (.answer | contains("Google Sheets tab “Records” — A2:C2, A3:C3"))
     and (.answer | contains("contributed 2 records used in the earlier answer"))
+    and (.answer | contains("Optional Migration Notes"))
+    and (.answer | contains("was disabled during the original lookup"))
     and (.answer | endswith("I didn’t run another search or verification for this explanation."))
     and ((.answer | contains("records_primary")) | not)
     and ((.answer | contains("google_sheets:records_primary")) | not)
@@ -4256,20 +4274,36 @@ Retained details:
     ]
     and .acquisition.source_references_retained ==
       .acquisition.source_references_returned
-    and .acquisition.source_summaries == [{
-      source_id: "records_primary",
-      display_name: "Migration Records",
-      connector: "google_sheets",
-      authority_role: "authoritative",
-      domain_tags: ["migration", "records"],
-      considered: true,
-      selected: true,
-      used: true,
-      returned_reference_count: 2,
-      retained_reference_count: 2,
-      safe_location_labels: ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"],
-      contribution_reason_codes: ["retained_records_contributed"]
-    }]
+    and .acquisition.source_summaries == [
+      {
+        source_id: "records_primary",
+        display_name: "Migration Records",
+        connector: "google_sheets",
+        authority_role: "authoritative",
+        domain_tags: ["migration", "records"],
+        considered: true,
+        selected: true,
+        used: true,
+        returned_reference_count: 2,
+        retained_reference_count: 2,
+        safe_location_labels: ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"],
+        contribution_reason_codes: ["retained_records_contributed"]
+      },
+      {
+        source_id: "records_optional",
+        display_name: "Optional Migration Notes",
+        connector: "google_sheets",
+        authority_role: "supplemental",
+        domain_tags: ["migration", "records"],
+        considered: false,
+        selected: false,
+        used: false,
+        returned_reference_count: 0,
+        retained_reference_count: 0,
+        safe_location_labels: [],
+        contribution_reason_codes: ["source_disabled"]
+      }
+    ]
     and .sufficiency.status == "not_evaluated"
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
@@ -4287,6 +4321,8 @@ Retained details:
     and (.answer | contains("Migration Records"))
     and (.answer | contains("Google Sheets tab “Form responses 1” — A2:C2, A3:C3"))
     and (.answer | contains("contributed 2 records used in the earlier answer"))
+    and (.answer | contains("Optional Migration Notes"))
+    and (.answer | contains("was disabled during the original lookup"))
     and (.answer | contains("not a complete review of every possible source"))
     and (.answer | endswith("I didn’t run another search or verification for this explanation."))
     and ((.answer | contains("ordinary external context augmentation")) | not)
