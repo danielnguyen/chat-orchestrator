@@ -565,7 +565,7 @@ readonly EVIDENCE_HYBRID_COMPARISON_QUESTION="Compare these two review calendar 
 readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory record in the register is reviewed."
 readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
-readonly EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
+readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
 
 run_evidence_targeted_scenario() {
   local owner client conversation_id question external response request_id answer
@@ -1591,20 +1591,19 @@ assert_pure_history() {
       history.exhaustive)
         echo "Exhaustive history safe state: lookup=$lookup_status resolution=$resolution_status manifest=$manifest_resolution_status reason=$reason_code projection_status=$projection_status projection_reason=$projection_reason selected_sources=$selected_source_count"
         disclosure_fields="$(jq -r '[
-          (.answer | contains("Acquisition was truncated by the retrieval budget.")),
-          (.answer | contains("Candidate selection was truncated.")),
-          (.answer | contains("The preliminary seed search was truncated, but the configured-scope expansion completed without truncation.")),
-          (.answer | contains("Preliminary seed candidate selection was truncated."))
+          (.answer | contains("The lookup was truncated by its result limit.")),
+          (.answer | contains("The candidate list was truncated.")),
+          (.answer | contains("The preliminary search was truncated, but the complete requested-source check finished without truncation.")),
+          (.answer | contains("The preliminary candidate list was truncated."))
         ] | @tsv' <<<"$response")"
         IFS=$'\t' read -r generic_budget generic_candidate staged_budget \
           staged_candidate \
           <<<"$disclosure_fields"
         echo "Exhaustive history truncation disclosure: generic_budget=$generic_budget generic_candidate=$generic_candidate staged_budget=$staged_budget staged_candidate=$staged_candidate"
         assert_jq "history.exhaustive.truncation_stage" "$response" '
-          (.answer | contains("The preliminary seed search was truncated, but the configured-scope expansion completed without truncation."))
-          and (.answer | contains("Preliminary seed candidate selection was truncated."))
-          and (.answer | contains("Acquisition was truncated by the retrieval budget.") | not)
-          and (.answer | contains("Candidate selection was truncated.") | not)
+          (.answer | contains("The preliminary search was truncated, but the complete requested-source check finished without truncation."))
+          and (.answer | contains("The preliminary candidate list was truncated."))
+          and (.answer | contains("The lookup was truncated by its result limit.") | not)
         '
         ;;
       history.unknown)
@@ -1616,7 +1615,7 @@ assert_pure_history() {
     '.answer | contains($fragment)' --arg fragment "$expected_fragment"
   assert_jq "${scenario_label}.response_suffix" "$response" '
     .answer
-    | endswith("I did not perform a new verification for this explanation.")
+    | endswith("I didn’t run another search or verification for this explanation.")
   '
   assert_jq "${scenario_label}.trace_target_mode" "$trace" '
     .prompt.claim_explanation.target_mode == "immediate_previous"
@@ -1776,7 +1775,7 @@ run_evidence_history_hybrid_scenario() {
     .assistant == "1" and .trace == "1" and .claims == "0"
   '
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you examine?" "bounded comparison across 2 selected configured sources" \
+    "What did you examine?" "comparison covered the selected sources only" \
     "history.hybrid"
 }
 
@@ -1992,7 +1991,8 @@ run_evidence_history_exhaustive_scenario() {
     .assistant == "1" and .trace == "1" and .claims == "0"
   '
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "Did you look at everything relevant?" "Within the declared bounded scope, yes." \
+    "Did you look at everything relevant?" \
+    "Yes—within the requested source set, but not beyond it." \
     "history.exhaustive"
 }
 
@@ -2146,7 +2146,7 @@ run_evidence_history_unknown_scenario() {
   '
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What did you not check?" \
-    "The record left evidence sufficiency unknown, so the requested conclusion was not established." \
+    "The original lookup did not establish the requested conclusion." \
     "history.unknown"
 }
 
@@ -2166,7 +2166,7 @@ run_evidence_history_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you check?" "retained record shows a targeted lookup" \
+    "What did you check?" "I checked:" \
     "history.targeted"
 
   owner="owner-history-exact"
@@ -2206,8 +2206,8 @@ run_evidence_history_scenarios() {
   trace="$(fetch_trace "$history_request")"
   jq -e '
     .status == "ok"
-    and (.answer | contains("an exact fetch for 1 specified reference."))
-    and (.answer | endswith("I did not perform a new verification for this explanation."))
+    and (.answer | contains("Only the specifically requested records were checked"))
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
   ' <<<"$history" >/dev/null
   jq -e '
     .prompt.claim_explanation.target_mode == "quoted_first_paragraph"
@@ -2227,7 +2227,7 @@ run_evidence_history_scenarios() {
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"allowed_sensitivity":"medium"}')"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What might you have missed?" "sufficient only with recorded limitations" \
+    "What might you have missed?" "usable only with those limits" \
     "history.limited"
 
   run_evidence_history_unknown_scenario
@@ -2255,6 +2255,8 @@ run_evidence_privacy_history_scenario() {
     and .acquisition.sources_considered_count == 1
     and .acquisition.source_references_returned == []
     and .acquisition.source_references_returned_count == 2
+    and .acquisition.source_summaries == []
+    and .acquisition.source_summaries_count == 2
   ' <<<"$manifest" >/dev/null
   case "$(jq -c . <<<"$response")$(jq -c . <<<"$manifest")" in
     *records_primary*|*google_sheets:*|*PRIVATE\ SOURCE\ DETAIL*)
@@ -2263,7 +2265,7 @@ run_evidence_privacy_history_scenario() {
       ;;
   esac
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you check?" "retained record shows a targeted lookup" \
+    "What did you check?" "does not include source names or locations" \
     "history.private"
   serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$manifest")$(jq -c . <<<"$trace")$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
   case "$serialized" in
@@ -2478,7 +2480,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.immediate.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "no_record"; then
     echo "Assertion failed: history.negatives.immediate.boundaries" >&2
@@ -2505,7 +2507,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.quoted_not_found.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "no_record"; then
     echo "Assertion failed: history.negatives.quoted_not_found.boundaries" >&2
@@ -2533,7 +2535,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE"
   assert_jq "history.negatives.ambiguous.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "ambiguous"; then
     echo "Assertion failed: history.negatives.ambiguous.boundaries" >&2
@@ -2583,7 +2585,7 @@ run_evidence_history_negative_scenarios() {
     '.answer | contains("association-corrupted") | not'
   assert_jq "history.negatives.corrupt.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "invalid"; then
     echo "Assertion failed: history.negatives.corrupt.boundaries" >&2
@@ -2636,7 +2638,7 @@ run_evidence_history_negative_scenarios() {
     '.answer | contains($sentinel) | not' --arg sentinel "$sentinel"
   assert_jq "history.negatives.privacy_invalid.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$trace")" in
     *PRIVATE-CREDENTIAL-SENTINEL*)
       echo "Assertion failed: history.negatives.privacy_invalid.trace_privacy" >&2
@@ -2664,7 +2666,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.owner_isolation.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$history")" in
     *owner-history-private-invalid*|*PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
       echo "Assertion failed: history.negatives.owner_isolation.privacy" >&2
@@ -2692,7 +2694,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.conversation_isolation.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$history")" in
     *PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
       echo "Assertion failed: history.negatives.conversation_isolation.privacy" >&2
@@ -2748,7 +2750,7 @@ run_evidence_compound_scenarios() {
     and (.answer | contains("Retained evidence excerpt 1:"))
     and (.answer | contains("conclusion_disposition") | not)'
   assert_jq "compound.verification.no_historical_suffix" "$response" \
-    '.answer | contains("I did not perform a new verification for this explanation.") | not'
+    '.answer | contains("I didn’t run another search or verification for this explanation.") | not'
   assert_jq "compound.verification.original_section_count" "$response" \
     '([.answer | scan("Original acquisition:")] | length) == 1'
   assert_jq "compound.verification.verification_section_count" "$response" \
@@ -3342,7 +3344,7 @@ run_evidence_scope_reference_scenarios() {
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you check?" "retained record shows a targeted lookup" \
+    "What did you check?" "I checked:" \
     "scope.malformed.history"
   serialized="$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
   case "$serialized" in
@@ -3448,7 +3450,7 @@ run_evidence_scope_reference_scenarios() {
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
-    "What did you check?" "retained record shows a targeted lookup" \
+    "What did you check?" "does not include source names or locations" \
     "scope.privacy.history"
   history="$HISTORY_RESPONSE"
   history_trace="$HISTORY_TRACE"
@@ -3694,7 +3696,7 @@ run_evidence_structured_answer_recovery_scenarios() {
   assert_pure_history \
     "$STRUCTURED_VALID_OWNER" "$STRUCTURED_VALID_CLIENT" \
     "$STRUCTURED_VALID_CONVERSATION" "$STRUCTURED_VALID_ANSWER" \
-    "What did you check?" "retained record shows a targeted lookup" \
+    "What did you check?" "I checked:" \
     "structured.history.valid"
   serialized="$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
   case "$serialized" in
@@ -3706,7 +3708,7 @@ run_evidence_structured_answer_recovery_scenarios() {
   assert_pure_history \
     "$STRUCTURED_MALFORMED_OWNER" "$STRUCTURED_MALFORMED_CLIENT" \
     "$STRUCTURED_MALFORMED_CONVERSATION" "$STRUCTURED_MALFORMED_ANSWER" \
-    "What did you check?" "retained record shows a targeted lookup" \
+    "What did you check?" "I checked:" \
     "structured.history.malformed"
   serialized="$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
   case "$serialized" in
@@ -4162,15 +4164,54 @@ run_history_followup_composed_suite() {
   conversation_id="$(resolve_conversation "$owner" "$client" "history-h1")"
   create_history_original "$owner" "$client" "$conversation_id" "Verify the migration record."
   original_trace="$(fetch_trace "$HISTORY_ORIGINAL_REQUEST_ID")"
-  jq -e '.prompt.evidence_acquisition.acquisition.item_count == 2' <<<"$original_trace" >/dev/null
+  jq -e '
+    .prompt.evidence_acquisition.acquisition.item_count == 2
+    and .prompt.evidence_acquisition.acquisition.source_summaries == [
+      {
+        source_id: "records_primary",
+        display_name: "Migration Records",
+        connector: "google_sheets",
+        authority_role: "authoritative",
+        domain_tags: ["migration", "records"],
+        considered: true,
+        selected: true,
+        used: true,
+        returned_reference_count: 2,
+        retained_reference_count: 2,
+        safe_location_labels: ["Google Sheets tab “Records” — A2:C2, A3:C3"],
+        contribution_reason_codes: ["retained_records_contributed"]
+      },
+      {
+        source_id: "records_optional",
+        display_name: "Optional Migration Notes",
+        connector: "google_sheets",
+        authority_role: "supplemental",
+        domain_tags: ["migration", "records"],
+        considered: false,
+        selected: false,
+        used: false,
+        returned_reference_count: 0,
+        retained_reference_count: 0,
+        safe_location_labels: [],
+        contribution_reason_codes: ["source_disabled"]
+      }
+    ]
+  ' <<<"$original_trace" >/dev/null
   restart_orchestrator_with_history_followup true
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
   assert_jq "history.h1.answer" "$response" '
-    (.answer | contains("retained record shows a targeted lookup"))
-    and (.answer | endswith("I did not perform a new verification for this explanation."))
+    (.answer | startswith("I checked:"))
+    and (.answer | contains("Migration Records"))
+    and (.answer | contains("Google Sheets tab “Records” — A2:C2, A3:C3"))
+    and (.answer | contains("contributed 2 records used in the earlier answer"))
+    and ((.answer | contains("Optional Migration Notes")) | not)
+    and ((.answer | contains("was disabled during the original lookup")) | not)
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
+    and ((.answer | contains("records_primary")) | not)
+    and ((.answer | contains("google_sheets:records_primary")) | not)
   '
   first_history_request="$HISTORY_REQUEST_ID"
   first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
@@ -4180,6 +4221,14 @@ run_history_followup_composed_suite() {
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What might you have missed?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What might you have missed?" deterministic acquisition_gaps acquisition 0 root_lineage 1
+  assert_jq "history.h1.gaps" "$response" '
+    (.answer | startswith("Known gaps from the original lookup:"))
+    and (.answer | contains("Optional Migration Notes"))
+    and (.answer | contains("was disabled during the original lookup"))
+    and ((.answer | contains("Migration Records")) | not)
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
+    and ((.answer | contains("records_optional")) | not)
+  '
   second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
   test "$first_history_lineage" = "$second_history_lineage"
   test "$(jq -r '.root_assistant_message_id' <<<"$first_history_lineage")" = "$root_message_id"
@@ -4237,17 +4286,53 @@ Retained details:
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
+  assert_jq "history.ordinary.summary_count" "$original_manifest" \
+    '.acquisition.source_summaries | length == 1'
+  assert_jq "history.ordinary.summary_source" "$original_manifest" \
+    '.acquisition.source_summaries[0].source_id == "records_primary"'
+  assert_jq "history.ordinary.summary_display_name" "$original_manifest" \
+    '.acquisition.source_summaries[0].display_name == "Migration Records"'
+  assert_jq "history.ordinary.summary_connector" "$original_manifest" \
+    '.acquisition.source_summaries[0].connector == "google_sheets"'
+  assert_jq "history.ordinary.summary_authority" "$original_manifest" '
+    .acquisition.source_summaries[0].authority_role == "unknown"
+    and .acquisition.source_summaries[0].domain_tags == []
+  '
+  assert_jq "history.ordinary.summary_association" "$original_manifest" '
+    .acquisition.source_summaries[0].considered == true
+    and .acquisition.source_summaries[0].selected == true
+    and .acquisition.source_summaries[0].used == true
+  '
+  assert_jq "history.ordinary.summary_counts" "$original_manifest" '
+    .acquisition.source_summaries[0].returned_reference_count == 2
+    and .acquisition.source_summaries[0].retained_reference_count == 2
+  '
+  assert_jq "history.ordinary.summary_location" "$original_manifest" '
+    .acquisition.source_summaries[0].safe_location_labels
+      == ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"]
+  '
+  assert_jq "history.ordinary.summary_reason" "$original_manifest" '
+    .acquisition.source_summaries[0].contribution_reason_codes
+      == ["retained_records_contributed"]
+  '
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
   HISTORY_ORIGINAL_MANIFEST="$original_manifest"
+  restart_orchestrator_with_history_followup true
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
   assert_jq "history.ordinary.follow_up" "$response" '
-    (.answer | contains("retained record shows ordinary external context augmentation"))
-    and (.answer | contains("evidence sufficiency was not evaluated"))
-    and (.answer | endswith("I did not perform a new verification for this explanation."))
+    (.answer | startswith("I checked:"))
+    and (.answer | contains("Migration Records"))
+    and (.answer | contains("Google Sheets tab “Form responses 1” — A2:C2, A3:C3"))
+    and (.answer | contains("contributed 2 records used in the earlier answer"))
+    and (.answer | contains("not a complete review of every possible source"))
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
+    and ((.answer | contains("ordinary external context augmentation")) | not)
+    and ((.answer | contains("delivered to reasoning")) | not)
+    and ((.answer | contains("configured source")) | not)
   '
   configure_google_sheet_worksheet "records_primary" "Records"
   echo "H1 ordinary DSA acquisition association regression passed"
@@ -4261,11 +4346,19 @@ Retained details:
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "How are you sure?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "How are you sure?" deterministic support_explanation support 0
-  assert_jq "history.h2.answer" "$response" '
-    (.answer | contains("governed external-source record"))
-    and (.answer | contains("source-backed fact"))
-    and (.answer | test("with (low|medium|high) confidence and (weak|moderate|strong) support"))
-    and (.answer | endswith("I did not perform a new verification for this explanation."))
+  assert_jq "history.h2.record_kind" "$response" \
+    '.answer | contains("governed external-source record")'
+  assert_jq "history.h2.directness" "$response" \
+    '.answer | contains("directly supported the answer")'
+  assert_jq "history.h2.source_name_boundary" "$response" \
+    '.answer | contains("do not include a safe source name")'
+  assert_jq "history.h2.no_new_verification" "$response" '
+    .answer
+    | endswith("I didn’t run another search or verification for this explanation.")
+  '
+  assert_jq "history.h2.internal_vocabulary" "$response" '
+    ((.answer | contains("source-backed fact")) | not)
+    and ((.answer | contains("evidence strength")) | not)
   '
   first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
   provider_post "/fixture/reset" '{}'

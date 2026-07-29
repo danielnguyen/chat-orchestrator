@@ -480,6 +480,284 @@ def _set_ordinary_source_references(manifest, references):
     acquisition["prompt_retained_item_count"] = len(references)
 
 
+def _jeep_legacy_manifest():
+    manifest = _ordinary_context_manifest()
+    acquisition = manifest["acquisition"]
+    acquisition.update(
+        {
+            "sources_considered": [
+                "calendar_family",
+                "calendar_holidays_ca",
+                "calendar_personal",
+                "vehicle_log_ev",
+                "vehicle_log_primary",
+            ],
+            "sources_selected": ["vehicle_log_ev", "vehicle_log_primary"],
+            "sources_used": ["vehicle_log_ev", "vehicle_log_primary"],
+        }
+    )
+    references = [
+        "google_sheets:vehicle_log_ev:FormResponses!A84:H84",
+        "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13",
+        "google_sheets:vehicle_log_primary:'Form responses 1'!A8:I8",
+    ]
+    _set_ordinary_source_references(manifest, references)
+    manifest["inventory"].update(
+        {
+            "inventory_source_count": 5,
+            "available_source_count": 5,
+        }
+    )
+    return manifest
+
+
+def _future_source_summary_manifest():
+    manifest = _manifest()
+    acquisition = manifest["acquisition"]
+    returned = [
+        "google_sheets:source-a:'Current records'!A2:C3",
+        "google_sheets:source-b:Archive!D4:F4",
+    ]
+    acquisition.update(
+        {
+            "sources_considered": ["source-a", "source-b", "source-c"],
+            "sources_selected": ["source-a", "source-b"],
+            "sources_used": ["source-a", "source-b"],
+            "source_references_returned": returned,
+            "source_references_retained": [returned[0]],
+            "source_references_filtered_or_omitted": [returned[1]],
+            "item_count": 2,
+            "usable_item_count": 2,
+            "prompt_retained_item_count": 1,
+            "unavailable_source_ids": ["source-c"],
+            "source_summaries": [
+                {
+                    "source_id": "source-b",
+                    "display_name": "Archive review log",
+                    "connector": "google_sheets",
+                    "authority_role": "supplemental",
+                    "domain_tags": ["records"],
+                    "considered": True,
+                    "selected": True,
+                    "used": True,
+                    "returned_reference_count": 1,
+                    "retained_reference_count": 0,
+                    "safe_location_labels": [],
+                    "contribution_reason_codes": [
+                        "returned_records_not_retained"
+                    ],
+                },
+                {
+                    "source_id": "source-a",
+                    "display_name": "Operations register",
+                    "connector": "google_sheets",
+                    "authority_role": "authoritative",
+                    "domain_tags": ["records"],
+                    "considered": True,
+                    "selected": True,
+                    "used": True,
+                    "returned_reference_count": 1,
+                    "retained_reference_count": 1,
+                    "safe_location_labels": [
+                        "Google Sheets tab “Current records” — A2:C3"
+                    ],
+                    "contribution_reason_codes": [
+                        "retained_records_contributed"
+                    ],
+                },
+                {
+                    "source_id": "source-c",
+                    "display_name": "Supplemental inspection notes",
+                    "connector": "google_sheets",
+                    "authority_role": "supplemental",
+                    "domain_tags": ["records"],
+                    "considered": True,
+                    "selected": False,
+                    "used": False,
+                    "returned_reference_count": 0,
+                    "retained_reference_count": 0,
+                    "safe_location_labels": [],
+                    "contribution_reason_codes": [
+                        "considered_not_selected",
+                        "source_unavailable",
+                    ],
+                },
+            ],
+        }
+    )
+    manifest["inventory"].update(
+        {
+            "inventory_source_count": 3,
+            "available_source_count": 2,
+            "unavailable_source_count": 1,
+        }
+    )
+    return manifest
+
+
+def test_jeep_legacy_manifest_renders_friendly_sources_and_grouped_locations():
+    history = _project_acquisition_history(_jeep_legacy_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, "checked")
+    assert answer == (
+        "I checked:\n"
+        "- EV maintenance log — Google Sheets tab “FormResponses” — A84:H84: "
+        "contributed 1 record used in the earlier answer.\n"
+        "- Primary vehicle maintenance log — Google Sheets tab “Form responses 1” — "
+        "A13:I13, A8:I8: contributed 2 records used in the earlier answer.\n\n"
+        "This was a normal source lookup for the earlier answer, not a complete review "
+        "of every possible source.\n"
+        "I didn’t run another search or verification for this explanation."
+    )
+    for prohibited in (
+        "Calendar family",
+        "Calendar holidays ca",
+        "Calendar personal",
+        "calendar_family",
+        "calendar_holidays_ca",
+        "calendar_personal",
+        "ordinary external context augmentation",
+        "delivered to reasoning",
+        "configured source",
+        "sufficiency status",
+        "vehicle_log_primary",
+        "vehicle_log_ev",
+        *VALID_OPAQUE_SOURCE_REFERENCES,
+    ):
+        assert prohibited not in answer
+
+
+@pytest.mark.parametrize("question", ["coverage", "gaps"])
+def test_jeep_legacy_manifest_keeps_considered_sources_out_of_checked_scope(question):
+    history = _project_acquisition_history(_jeep_legacy_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, question)
+    if question == "coverage":
+        assert "Not covered:" in answer
+    else:
+        assert answer.startswith("Known gaps from the original lookup:")
+    for display_name in (
+        "Calendar family",
+        "Calendar holidays ca",
+        "Calendar personal",
+    ):
+        assert display_name in answer
+        assert "was considered but not selected for the lookup" in answer
+    for raw_id in (
+        "calendar_family",
+        "calendar_holidays_ca",
+        "calendar_personal",
+    ):
+        assert raw_id not in answer
+    if question == "coverage":
+        assert answer.index("Checked:") < answer.index("EV maintenance log")
+        assert answer.index("Not covered:") < answer.index("Calendar family")
+    else:
+        assert "EV maintenance log" not in answer
+        assert "Primary vehicle maintenance log" not in answer
+
+
+def test_future_source_summaries_render_stably_without_provider_text():
+    history = _project_acquisition_history(_future_source_summary_manifest())
+
+    assert history is not None
+    first = _render_acquisition(history, "checked")
+    second = _render_acquisition(history, "checked")
+    assert first == second
+    assert first.index("Archive review log") < first.index("Operations register")
+    assert "Google Sheets tab “Current records” — A2:C3" in first
+    assert "contributed 1 record used in the earlier answer" in first
+    assert "returned 1 additional record that was not used" in first
+    assert "Supplemental inspection notes" not in first
+    assert "was unavailable during the original lookup" not in first
+    assert "source-a" not in first
+    assert "google_sheets:source-a" not in first
+
+
+@pytest.mark.parametrize("question", ["coverage", "gaps"])
+def test_future_source_summaries_separate_unchecked_and_unavailable_scope(question):
+    history = _project_acquisition_history(_future_source_summary_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, question)
+    assert "Supplemental inspection notes" in answer
+    assert "was considered but not selected for the lookup" in answer
+    assert "was unavailable during the original lookup" in answer
+    if question == "coverage":
+        assert answer.index("Not covered:") < answer.index(
+            "Supplemental inspection notes"
+        )
+        assert answer.index("Archive review log") < answer.index("Not covered:")
+        assert answer.index("Operations register") < answer.index("Not covered:")
+    else:
+        assert "Archive review log" in answer
+        assert "returned 1 additional record that was not used" in answer
+        assert "Operations register" not in answer
+
+
+def test_privacy_suppression_removes_future_source_names_and_locations():
+    manifest = _future_source_summary_manifest()
+    acquisition = manifest["acquisition"]
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_references_returned",
+        "source_references_retained",
+        "source_references_filtered_or_omitted",
+        "source_references_attempted",
+        "source_references_unsuccessful",
+        "exact_reference_attempts",
+        "expansion_attempts",
+        "unavailable_source_ids",
+        "failed_source_ids",
+        "source_summaries",
+    ):
+        acquisition[f"{field}_count"] = len(acquisition[field])
+        acquisition[field] = []
+    acquisition["source_identifiers_suppressed"] = True
+
+    history = _project_acquisition_history(manifest)
+
+    assert history is not None
+    answer = _render_acquisition(history, "checked")
+    assert "does not include source names or locations" in answer
+    for prohibited in (
+        "Archive review log",
+        "Operations register",
+        "Supplemental inspection notes",
+        "Current records",
+        "source-a",
+    ):
+        assert prohibited not in answer
+
+    malformed = _future_source_summary_manifest()
+    malformed["acquisition"]["source_identifiers_suppressed"] = True
+    assert _project_acquisition_history(malformed) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("display_name", "# Injected heading"),
+        ("display_name", "https://private.invalid/source"),
+        ("display_name", "/private/source"),
+        ("display_name", "Bearer token"),
+        ("safe_location_labels", ["[private](https://private.invalid)"]),
+    ],
+)
+def test_future_source_summaries_reject_unsafe_user_facing_metadata(field, value):
+    manifest = _future_source_summary_manifest()
+    manifest["acquisition"]["source_summaries"][0][field] = value
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "source_summaries_invalid"
+
+
 def test_source_reference_contract_accepts_internal_spaces_without_mutation():
     manifest = _ordinary_context_manifest()
     _set_ordinary_source_references(manifest, VALID_OPAQUE_SOURCE_REFERENCES)
@@ -621,12 +899,18 @@ def test_ordinary_context_history_reports_checked_scope_without_claiming_suffici
 
     assert history is not None
     answer = _render_acquisition(history, "checked")
-    assert "ordinary external context augmentation" in answer
-    assert "2 configured sources" in answer
-    assert "2 items" in answer
-    assert "evidence sufficiency was not evaluated" in answer
-    assert "sufficient for" not in answer
-    assert "recorded next step" not in answer
+    assert answer.startswith("I checked:")
+    assert "Source a" in answer
+    assert "Source b" in answer
+    assert "normal source lookup" in answer
+    for internal_term in (
+        "ordinary external context augmentation",
+        "configured source",
+        "delivered to reasoning",
+        "sufficiency",
+        "recorded next step",
+    ):
+        assert internal_term not in answer
 
 
 @pytest.mark.parametrize(
@@ -750,13 +1034,15 @@ def _history_with_truncation(*, task_shape="bounded_exhaustive_review"):
 def test_bounded_exhaustive_history_distinguishes_seed_search_truncation():
     answer = _render_acquisition(_history_with_truncation(), "coverage")
 
+    assert answer.startswith(
+        "Yes—within the requested source set, but not beyond it."
+    )
     assert (
-        "The preliminary seed search was truncated, but the configured-scope "
-        "expansion completed without truncation."
+        "The preliminary search was truncated, but the complete requested-source "
+        "check finished without truncation."
     ) in answer
-    assert "Preliminary seed candidate selection was truncated." in answer
-    assert "Acquisition was truncated by the retrieval budget." not in answer
-    assert "Candidate selection was truncated." not in answer
+    assert "The preliminary candidate list was truncated." in answer
+    assert "The lookup was truncated by its result limit." not in answer
 
 
 def test_non_exhaustive_history_preserves_generic_truncation_wording():
@@ -765,9 +1051,9 @@ def test_non_exhaustive_history_preserves_generic_truncation_wording():
         "coverage",
     )
 
-    assert "Acquisition was truncated by the retrieval budget." in answer
-    assert "Candidate selection was truncated." in answer
-    assert "configured-scope expansion completed without truncation" not in answer
+    assert "The lookup was truncated by its result limit." in answer
+    assert "The candidate list was truncated." in answer
+    assert "complete requested-source check finished without truncation" not in answer
 
 
 def test_material_exhaustive_truncation_preserves_generic_wording():
@@ -782,9 +1068,9 @@ def test_material_exhaustive_truncation_preserves_generic_wording():
     )
     answer = _render_acquisition(history, "coverage")
 
-    assert "Acquisition was truncated by the retrieval budget." in answer
-    assert "Candidate selection was truncated." in answer
-    assert "configured-scope expansion completed without truncation" not in answer
+    assert "The lookup was truncated by its result limit." in answer
+    assert "The candidate list was truncated." in answer
+    assert "complete requested-source check finished without truncation" not in answer
 
 
 def _replace_manifest(value):
@@ -1137,6 +1423,16 @@ PROJECTION_REJECTION_CASES = [
         ),
         _exact_manifest,
     ),
+    _case(
+        "source_summaries_invalid",
+        _change(
+            (
+                ("acquisition", "source_summaries", 0, "display_name"),
+                "https://private.invalid/source",
+            )
+        ),
+        _future_source_summary_manifest,
+    ),
     *[
         _case(
             f"acquisition_count_invalid_{field}",
@@ -1347,8 +1643,8 @@ def test_projection_behavioral_registry_matches_safe_production_reason_inventory
     production_reasons = _production_projection_rejection_reasons()
     behavioral_reasons = {case.values[2] for case in PROJECTION_REJECTION_CASES}
 
-    assert len(PROJECTION_REJECTION_CASES) == 95
-    assert len(behavioral_reasons) == 95
+    assert len(PROJECTION_REJECTION_CASES) == 96
+    assert len(behavioral_reasons) == 96
     assert behavioral_reasons == production_reasons
     assert all(
         re.fullmatch(r"[a-z0-9_]{1,120}", reason)
@@ -1949,12 +2245,12 @@ async def test_latest_exact_record_renders_only_bounded_stored_semantics():
     ]
     assert outcome.status == "ok"
     assert outcome.answer == (
-        "I based that earlier statement on one retained file excerpt from the original "
-        "retained record. The record classified it as a source-backed fact, with low "
-        "confidence and weak support. The evidence was marked current. Only one "
-        "supporting record was retained. The source was treated as user-provided "
-        "material rather than independently authoritative. I did not perform a new "
-        "verification for this explanation."
+        "That earlier answer was supported by one retained file excerpt. It directly "
+        "supported the answer. It was marked current when the answer was given. The "
+        "saved support details do not include a safe source name. Only one supporting "
+        "record was retained. The source was treated as user-provided material rather "
+        "than independently authoritative. I didn’t run another search or verification "
+        "for this explanation."
     )
     assert outcome.trace["reason_code"] == "latest_claim_record_resolved"
     serialized = repr((outcome.answer, outcome.trace))
@@ -1972,9 +2268,9 @@ async def test_linked_claim_keeps_support_explanation_without_trace_lookup():
     outcome = await _resolve(memory_store)
 
     assert outcome.status == "ok"
-    assert outcome.answer.startswith("I based that earlier statement on")
+    assert outcome.answer.startswith("That earlier answer was supported by")
     assert outcome.answer.endswith(
-        "I did not perform a new verification for this explanation."
+        "I didn’t run another search or verification for this explanation."
     )
     assert memory_store.trace_calls == []
 
@@ -1993,9 +2289,9 @@ async def test_latest_bounded_response_keeps_support_explanation_wording():
     )
 
     assert outcome.status == "ok"
-    assert outcome.answer.startswith("I based that earlier statement on")
+    assert outcome.answer.startswith("That earlier answer was supported by")
     assert outcome.answer.endswith(
-        "I did not perform a new verification for this explanation."
+        "I didn’t run another search or verification for this explanation."
     )
     assert memory_store.trace_calls == []
 
@@ -2012,12 +2308,13 @@ async def test_targeted_acquisition_explanation_is_exact_and_non_exhaustive():
     )
 
     assert outcome.status == "ok"
-    assert outcome.answer == (
-        "For that earlier answer, the retained record shows a targeted lookup. It "
-        "considered 2 configured sources, selected 2, returned 2 items, and delivered "
-        "2 to reasoning. The recorded evidence was sufficient for the declared "
-        "targeted scope. This was not an exhaustive review of every potentially "
-        "relevant source. I did not perform a new verification for this explanation."
+    assert outcome.answer.startswith("I checked:")
+    assert "Source a" in outcome.answer
+    assert "Source b" in outcome.answer
+    assert "contributed 1 record used in the earlier answer" in outcome.answer
+    assert "limited to the targeted sources" in outcome.answer
+    assert outcome.answer.endswith(
+        "I didn’t run another search or verification for this explanation."
     )
     assert memory_store.calls == []
     assert memory_store.trace_calls == []
@@ -2059,13 +2356,10 @@ async def test_latest_bounded_acquisition_response_validates_full_digest_and_cla
     )
 
     assert outcome.status == "ok"
-    assert outcome.answer == (
-        "For that earlier answer, the retained record shows a targeted lookup. It "
-        "considered 2 configured sources, selected 2, returned 2 items, and delivered "
-        "2 to reasoning. The recorded evidence was sufficient for the declared "
-        "targeted scope. This was not an exhaustive review of every potentially "
-        "relevant source. I did not perform a new verification for this explanation."
-    )
+    assert outcome.answer.startswith("I checked:")
+    assert "Source a" in outcome.answer
+    assert "Source b" in outcome.answer
+    assert "limited to the targeted sources" in outcome.answer
     assert manifest["response_digest"] == _response_digest(prior_response)
     assert manifest["response_digest"] != _digest(ANCHOR)
     assert memory_store.calls == []
@@ -2148,11 +2442,9 @@ async def test_prior_provider_text_cannot_select_manifest_or_rendered_history():
     )
 
     assert outcome.status == "ok"
-    assert outcome.answer.startswith(
-        "For that earlier answer, the retained record shows a targeted lookup."
-    )
-    assert "considered 2 configured sources" in outcome.answer
-    assert "not an exhaustive review" in outcome.answer
+    assert outcome.answer.startswith("I checked:")
+    assert "Source a" in outcome.answer
+    assert "limited to the targeted sources" in outcome.answer
     assert provider_selected_manifest not in repr(outcome)
 
 
@@ -2166,21 +2458,16 @@ async def test_exact_fetch_and_coverage_explanations_preserve_declared_boundarie
         exact_store,
         messages=_messages(follow_up="What did you examine?"),
     )
-    assert exact.answer == (
-        "For that earlier answer, the retained record shows exact fetches for 2 "
-        "specified references. 2 were retrieved and 2 were delivered to reasoning. "
-        "The recorded evidence was sufficient for that declared exact-reference "
-        "scope. Sources or references outside that supplied scope were not established "
-        "as examined. I did not perform a new verification for this explanation."
-    )
+    assert exact.answer.startswith("I checked:")
+    assert "Only the specifically requested records were checked" in exact.answer
+    assert "delivered to reasoning" not in exact.answer
 
     coverage = await _resolve(
         _MemoryStore(records=[_record(acquisition_manifest_id=MANIFEST_ID)]),
         messages=_messages(follow_up="Did you look at everything relevant?"),
     )
-    assert coverage.answer.startswith("No—not universally.")
-    assert "sufficient for the declared targeted scope" in coverage.answer
-    assert "not an exhaustive review" in coverage.answer
+    assert coverage.answer.startswith("No. The original lookup did not cover")
+    assert "limited to the targeted sources" in coverage.answer
     assert "everything relevant was checked" not in coverage.answer
 
 
@@ -2190,11 +2477,11 @@ async def test_exact_fetch_and_coverage_explanations_preserve_declared_boundarie
     [
         (
             "cross_source_comparison",
-            "bounded comparison across 2 selected configured sources",
+            "comparison covered the selected sources only",
         ),
         (
             "bounded_exhaustive_review",
-            "bounded exhaustive review of the declared configured scope",
+            "Coverage applies only to the requested source set",
         ),
     ],
 )
@@ -2212,7 +2499,7 @@ async def test_trace_first_history_renders_hybrid_and_exhaustive_without_claim(
     assert outcome.status == "ok"
     assert expected in outcome.answer
     assert outcome.answer.endswith(
-        "I did not perform a new verification for this explanation."
+        "I didn’t run another search or verification for this explanation."
     )
     assert store.calls == []
     assert store.trace_calls == []
@@ -2231,8 +2518,7 @@ async def test_bounded_exhaustive_coverage_is_declared_scope_only():
         messages=_messages(follow_up="Did you look at everything relevant?"),
     )
     assert outcome.answer.startswith(
-        "Within the declared bounded scope, yes. That does not establish universal "
-        "coverage beyond it."
+        "Yes—within the requested source set, but not beyond it."
     )
 
 
@@ -2240,9 +2526,9 @@ async def test_bounded_exhaustive_coverage_is_declared_scope_only():
 @pytest.mark.parametrize(
     ("status", "wording"),
     [
-        ("sufficient_with_limitations", "sufficient only with recorded limitations"),
-        ("insufficient", "marked the evidence insufficient"),
-        ("unknown", "left evidence sufficiency unknown"),
+        ("sufficient_with_limitations", "usable only with those limits"),
+        ("insufficient", "did not establish the requested conclusion"),
+        ("unknown", "did not establish the requested conclusion"),
     ],
 )
 async def test_history_renders_limited_insufficient_and_unknown(status, wording):
@@ -2252,9 +2538,7 @@ async def test_history_renders_limited_insufficient_and_unknown(status, wording)
     )
     assert outcome.status == "ok"
     assert wording in outcome.answer
-    assert "requested conclusion was not established" in outcome.answer or status == (
-        "sufficient_with_limitations"
-    )
+    assert "sufficiency" not in outcome.answer
 
 
 @pytest.mark.asyncio
@@ -2267,7 +2551,7 @@ async def test_older_manifest_without_next_steps_remains_compatible():
         messages=_messages(follow_up="What did you check?"),
     )
     assert outcome.status == "ok"
-    assert "bounded comparison" in outcome.answer
+    assert "comparison covered the selected sources only" in outcome.answer
 
 
 @pytest.mark.asyncio
@@ -2319,8 +2603,7 @@ async def test_changed_premise_targeted_to_exact_history_is_explicit():
     )
     assert outcome.status == "ok"
     assert (
-        "first performed a targeted lookup and then one authorized changed-premise "
-        "exact fetch" in outcome.answer
+        "included one additional exact check after its first lookup" in outcome.answer
     )
     assert "unbounded retry" not in outcome.answer
 
@@ -2357,21 +2640,18 @@ async def test_gap_and_limited_rendering_uses_only_retained_structural_limits():
     )
 
     assert outcome.status == "ok"
-    assert outcome.answer.startswith(
-        "The retained record cannot identify unknown evidence outside its declared "
-        "source scope."
-    )
+    assert outcome.answer.startswith("Known gaps from the original lookup:")
     for expected in (
-        "sufficient only with recorded limitations",
-        "1 configured source was unavailable",
-        "1 configured source was disabled",
-        "1 configured source had unknown availability",
-        "1 returned reference was filtered or omitted before reasoning",
-        "retained source inventory was partial",
-        "truncated by the retrieval budget",
-        "Candidate selection was truncated",
-        "not an exhaustive review",
-        "did not perform a new verification",
+        "usable only with those limits",
+        "1 source was unavailable",
+        "1 source was disabled",
+        "1 source had unknown availability",
+        "1 returned reference was not used in the earlier answer",
+        "available source list was incomplete",
+        "lookup was truncated by its result limit",
+        "candidate list was truncated",
+        "limited to the targeted sources",
+        "didn’t run another search or verification",
     ):
         assert expected in outcome.answer
     for prohibited in ("source-a", "source-b", "record-1", "record-2"):
@@ -2394,7 +2674,9 @@ async def test_privacy_suppressed_manifest_preserves_aggregate_explanation():
     )
 
     assert suppressed.status == "ok"
-    assert suppressed.answer == ordinary.answer
+    assert suppressed.answer != ordinary.answer
+    assert "does not include source names or locations" in suppressed.answer
+    assert "Source a" not in suppressed.answer
     serialized = repr(suppressed)
     assert "source-a" not in serialized
     assert "record-1" not in serialized
@@ -2433,7 +2715,7 @@ async def test_no_claim_link_resolves_and_resolver_dependency_failure_is_honest(
         messages=_messages(follow_up="What did you check?"),
     )
     assert no_link.status == "ok"
-    assert "retained record shows a targeted lookup" in no_link.answer
+    assert no_link.answer.startswith("I checked:")
     assert no_link_store.calls == []
     assert no_link_store.trace_calls == []
 
@@ -2536,9 +2818,9 @@ async def test_exact_fetch_limitations_render_failed_unknown_and_truncated_count
         messages=_messages(follow_up="What might you have missed?"),
     )
     assert outcome.status == "ok"
-    assert "1 exact fetch failed" in outcome.answer
-    assert "1 exact fetch was truncated" in outcome.answer
-    assert "sufficient only with recorded limitations" in outcome.answer
+    assert "1 requested item could not be retrieved" in outcome.answer
+    assert "1 requested item was truncated" in outcome.answer
+    assert "usable only with those limits" in outcome.answer
 
 
 @pytest.mark.asyncio
@@ -2558,13 +2840,13 @@ async def test_artifact_wording_freshness_and_limitations_are_deterministic():
     )
     outcome = await _resolve(_MemoryStore([record]))
     assert "one retained file record" in outcome.answer
-    assert "a verified fact, with medium confidence and moderate support" in outcome.answer
-    assert "The evidence freshness was unknown." in outcome.answer
+    assert "directly supported the answer" in outcome.answer
+    assert "Its age could not be confirmed." in outcome.answer
     assert outcome.answer.index("Only one supporting") < outcome.answer.index(
         "freshness could not be established"
     )
     assert outcome.answer.endswith(
-        "I did not perform a new verification for this explanation."
+        "I didn’t run another search or verification for this explanation."
     )
 
 
@@ -2646,7 +2928,7 @@ async def test_quoted_anchor_resolves_one_exact_older_record():
     assert "PRIVATE-OPAQUE-REFERENCE" not in repr(outcome)
     assert "PRIVATE-STORED-SUMMARY" not in repr(outcome)
     assert outcome.answer.endswith(
-        "I did not perform a new verification for this explanation."
+        "I didn’t run another search or verification for this explanation."
     )
 
 
@@ -3360,8 +3642,12 @@ async def test_immediate_support_uses_exact_record_and_suppresses_identifiers():
     )
 
     assert outcome.status == "ok"
-    assert outcome.answer.startswith("I based that earlier statement on one retained file excerpt")
-    assert outcome.answer.endswith("I did not perform a new verification for this explanation.")
+    assert outcome.answer.startswith(
+        "That earlier answer was supported by one retained file excerpt"
+    )
+    assert outcome.answer.endswith(
+        "I didn’t run another search or verification for this explanation."
+    )
     assert store.calls == [
         {
             "request_id": "request-history",
@@ -3425,9 +3711,9 @@ async def test_immediate_governed_external_support_renders_structural_facts_only
 @pytest.mark.parametrize(
     ("intent", "question", "expected"),
     [
-        ("acquisition_checked", "checked", "targeted lookup"),
-        ("acquisition_coverage", "coverage", "It considered 2 configured"),
-        ("acquisition_gaps", "gaps", "not an exhaustive review"),
+        ("acquisition_checked", "checked", "I checked:"),
+        ("acquisition_coverage", "coverage", "did not cover every possible source"),
+        ("acquisition_gaps", "gaps", "limited to the targeted sources"),
     ],
 )
 async def test_immediate_acquisition_reuses_strict_projection_and_renderer(

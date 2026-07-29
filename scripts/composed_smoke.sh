@@ -1028,14 +1028,18 @@ run_claim_traceability_scenario() {
     .status == "ok"
     and .selected_model == "not_called"
     and .sources == []
-    and (.answer | contains("one retained file excerpt"))
-    and (.answer | contains("a source-backed fact"))
-    and (.answer | contains("low confidence"))
-    and (.answer | contains("weak support"))
-    and (.answer | contains("The evidence was marked current."))
+    and (.answer | contains("That earlier answer was supported by one retained file excerpt."))
+    and (.answer | contains("It directly supported the answer."))
+    and (.answer | contains("It was marked current when the answer was given."))
+    and (.answer | contains("The saved support details do not include a safe source name."))
     and (.answer | contains("Only one supporting record was retained."))
     and (.answer | contains("user-provided material"))
-    and (.answer | endswith("I did not perform a new verification for this explanation."))
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
+    and ((.answer | contains("a source-backed fact")) | not)
+    and ((.answer | contains("low confidence")) | not)
+    and ((.answer | contains("weak support")) | not)
+    and ((.answer | contains("The evidence was marked current.")) | not)
+    and ((.answer | contains("I did not perform a new verification for this explanation.")) | not)
   ' <<<"$response_g2" >/dev/null
   case "$answer_g2" in
     *"$malicious_summary"*|*"$expected_answer"*|*"$claim_id"*|*"$assistant_message_id"*|*"$derived_id"*|*fixture-005.txt*)

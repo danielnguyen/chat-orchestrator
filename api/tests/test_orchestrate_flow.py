@@ -17286,23 +17286,18 @@ async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_
         )
     )
 
-    assert follow_up == {
-        "request_id": "request-acquisition-explanation",
-        "conversation_id": "conv-1",
-        "profile_name": "dev",
-        "selected_model": "not_called",
-        "answer": (
-            "For that earlier answer, the retained record shows a targeted lookup. It "
-            "considered 2 configured sources, selected 2, returned 2 items, and "
-            "delivered 2 to reasoning. The recorded evidence was sufficient for the "
-            "declared targeted scope. The completeness of the retained source "
-            "inventory was unknown. This was not an exhaustive review of every "
-            "potentially relevant source. I did not perform a new verification for "
-            "this explanation."
-        ),
-        "status": "ok",
-        "sources": [],
-    }
+    assert follow_up["request_id"] == "request-acquisition-explanation"
+    assert follow_up["selected_model"] == "not_called"
+    assert follow_up["status"] == "ok"
+    assert follow_up["sources"] == []
+    assert follow_up["answer"].startswith("I checked:")
+    assert "Vehicle Log" in follow_up["answer"]
+    assert "Secondary Vehicle Log" in follow_up["answer"]
+    assert "contributed 1 record used in the earlier answer" in follow_up["answer"]
+    assert "does not cover every possible source" not in follow_up["answer"]
+    assert follow_up["answer"].endswith(
+        "I didn’t run another search or verification for this explanation."
+    )
     assert memory_store.claim_record_list_calls == []
     assert memory_store.trace_get_calls == []
     assert len(memory_store.acquisition_history_calls) == 1
@@ -17361,7 +17356,8 @@ async def test_orchestrate_trace_first_history_needs_no_claim_record(tmp_path):
         claim_capture_enabled=False,
     )
     assert follow_up["status"] == "ok"
-    assert "retained record shows a targeted lookup" in follow_up["answer"]
+    assert follow_up["answer"].startswith("I checked:")
+    assert "Vehicle Log" in follow_up["answer"]
     assert memory_store.claim_record_list_calls == []
     assert memory_store.trace_get_calls == []
     assert len(memory_store.acquisition_history_calls) == 1
@@ -17390,8 +17386,10 @@ async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_f
         runtime=runtime,
         request_id="request-acquisition-coverage",
     )
-    assert coverage["answer"].startswith("No—not universally.")
-    assert "not an exhaustive review" in coverage["answer"]
+    assert coverage["answer"].startswith(
+        "No. The original lookup did not cover every possible source."
+    )
+    assert "limited to the targeted sources" in coverage["answer"]
     assert provider.calls == []
     assert dsa.list_calls == []
     assert dsa.calls == []
@@ -17413,9 +17411,8 @@ async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_f
         request_id="request-acquisition-quoted",
     )
     assert quoted["status"] == "ok"
-    assert quoted["answer"].startswith(
-        "For that earlier answer, the retained record shows a targeted lookup."
-    )
+    assert quoted["answer"].startswith("I checked:")
+    assert "Vehicle Log" in quoted["answer"]
     assert provider.calls == []
     assert dsa.list_calls == []
     assert dsa.calls == []
@@ -18108,22 +18105,18 @@ async def test_orchestrate_two_turn_claim_explanation_is_record_backed_and_provi
         request_id="request-claim-explanation",
     )
 
-    assert second == {
-        "request_id": "request-claim-explanation",
-        "conversation_id": "conv-1",
-        "profile_name": "dev",
-        "selected_model": "not_called",
-        "answer": (
-            "I based that earlier statement on one retained file excerpt from the original "
-            "retained record. The record classified it as a source-backed fact, with low "
-            "confidence and weak support. The evidence was marked current. Only one "
-            "supporting record was retained. The source was treated as user-provided "
-            "material rather than independently authoritative. I did not perform a new "
-            "verification for this explanation."
-        ),
-        "status": "ok",
-        "sources": [],
-    }
+    assert second["request_id"] == "request-claim-explanation"
+    assert second["selected_model"] == "not_called"
+    assert second["status"] == "ok"
+    assert second["sources"] == []
+    assert second["answer"].startswith(
+        "That earlier answer was supported by one retained file excerpt."
+    )
+    assert "directly supported the answer" in second["answer"]
+    assert "saved support details do not include a safe source name" in second["answer"]
+    assert second["answer"].endswith(
+        "I didn’t run another search or verification for this explanation."
+    )
     assert len(litellm.calls) == 1
     assert len(memory_store.retrieve_calls) == 1
     assert len(runtime.claim_calibration_calls) == 1
@@ -18201,8 +18194,8 @@ async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_pa
 
     assert follow_up["status"] == "ok"
     assert follow_up["selected_model"] == "not_called"
-    assert "a source-backed fact" in follow_up["answer"]
-    assert "The evidence was marked stale." in follow_up["answer"]
+    assert "directly supported the answer" in follow_up["answer"]
+    assert "It was marked stale" in follow_up["answer"]
     assert "The retained evidence was marked stale." in follow_up["answer"]
     assert first["answer"] not in follow_up["answer"]
     assert provider.calls == []
@@ -18255,8 +18248,8 @@ async def test_orchestrate_generic_follow_up_still_resolves_only_latest_claim(tm
         request_id="request-latest-after-two-claims",
     )
     assert result["status"] == "ok"
-    assert "a source-backed fact" in result["answer"]
-    assert "low confidence and weak support" in result["answer"]
+    assert "directly supported the answer" in result["answer"]
+    assert "directly supported the answer" in result["answer"]
     explanation = memory_store.trace_calls[-1]["payload"]["prompt"][
         "claim_explanation"
     ]
@@ -25520,7 +25513,9 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     context_pack["items"][0]["source_ref"] = (
         "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13"
     )
+    context_pack["items"][0]["source_name"] = "Primary vehicle maintenance log"
     context_pack["items"][1]["source_id"] = "vehicle_log_ev"
+    context_pack["items"][1]["source_name"] = "EV maintenance log"
     context_pack["items"][1]["source_ref"] = (
         "google_sheets:vehicle_log_ev:FormResponses!A84:H84"
     )
@@ -25556,7 +25551,43 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     )
     memory_store = PersistedOrdinaryAcquisitionMemoryStore()
     provider = FakeLiteLLM(content=answer_text)
-    dsa = FakeDSA(response=context_pack)
+    dsa = FakeDSA(
+        response=context_pack,
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "vehicle_log_primary",
+                    "display_name": "Primary vehicle maintenance log",
+                    "connector": "google_sheets",
+                    "domain_tags": ["vehicle", "maintenance"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "authority_role": "authoritative",
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                },
+                {
+                    "source_id": "vehicle_log_ev",
+                    "display_name": "EV maintenance log",
+                    "connector": "google_sheets",
+                    "domain_tags": ["vehicle", "maintenance"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "authority_role": "supplemental",
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                },
+            ],
+        },
+    )
 
     original = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -25609,6 +25640,10 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     assert manifest["acquisition"]["source_references_retained"] == (
         expected_source_references
     )
+    assert [
+        summary["display_name"]
+        for summary in manifest["acquisition"]["source_summaries"]
+    ] == ["EV maintenance log", "Primary vehicle maintenance log"]
 
     follow_up = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -25639,11 +25674,27 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     ]
     assert follow_up["status"] == "ok"
     assert follow_up["selected_model"] == "not_called"
-    assert "ordinary external context" in follow_up["answer"]
-    assert "3 items" in follow_up["answer"]
+    for expected in (
+        "EV maintenance log",
+        "Primary vehicle maintenance log",
+        "Google Sheets tab “FormResponses” — A84:H84",
+        "Google Sheets tab “Form responses 1” — A13:I13, A8:I8",
+        "contributed 2 records used in the earlier answer",
+    ):
+        assert expected in follow_up["answer"]
     assert follow_up["answer"].endswith(
-        "I did not perform a new verification for this explanation."
+        "I didn’t run another search or verification for this explanation."
     )
+    for prohibited in (
+        "ordinary external context augmentation",
+        "delivered to reasoning",
+        "configured source",
+        "sufficiency status",
+        "vehicle_log_primary",
+        "vehicle_log_ev",
+        *expected_source_references,
+    ):
+        assert prohibited not in follow_up["answer"]
     assert len(memory_store.immediate_history_calls) == 1
     assert len(candidate_calls) == 1
     assert len(provider.calls) == 1

@@ -450,7 +450,12 @@ class ExactSourceReference(StrictModel):
     @field_validator("source_ref")
     @classmethod
     def validate_opaque_source_ref(cls, value: str) -> str:
-        if re.search(r"\s|://|\?", value):
+        if (
+            value != value.strip()
+            or re.search(r"[\x00-\x1f\x7f]", value)
+            or "://" in value
+            or "?" in value
+        ):
             raise ValueError("unsafe_source_reference")
         return value
 
@@ -937,7 +942,12 @@ class DsaItem(StrictModel):
     @field_validator("source_ref")
     @classmethod
     def validate_opaque_source_ref(cls, value: str) -> str:
-        if re.search(r"\s|://|\?", value):
+        if (
+            value != value.strip()
+            or re.search(r"[\x00-\x1f\x7f]", value)
+            or "://" in value
+            or "?" in value
+        ):
             raise ValueError("unsafe_source_reference")
         return value
 
@@ -1021,7 +1031,12 @@ class DsaFetchItem(StrictModel):
     @field_validator("source_ref")
     @classmethod
     def validate_opaque_source_ref(cls, value: str) -> str:
-        if re.search(r"\s|://|\?", value):
+        if (
+            value != value.strip()
+            or re.search(r"[\x00-\x1f\x7f]", value)
+            or "://" in value
+            or "?" in value
+        ):
             raise ValueError("unsafe_source_reference")
         return value
 
@@ -4330,6 +4345,226 @@ def _inventory_summary(
     }
 
 
+_SOURCE_SUMMARY_REASON_CODES = {
+    "retained_records_contributed",
+    "returned_records_not_retained",
+    "selected_no_result",
+    "considered_not_selected",
+    "exact_reference_retrieved",
+    "source_unavailable",
+    "source_disabled",
+}
+_GOOGLE_SHEETS_SOURCE_REF = re.compile(
+    r"^google_sheets:(?P<source_id>[A-Za-z0-9][A-Za-z0-9_-]{0,119}):"
+    r"(?P<sheet>'(?:[^'\r\n]|'')+'|[A-Za-z0-9_]+)!"
+    r"(?P<range>[A-Z]+[1-9][0-9]*:[A-Z]+[1-9][0-9]*)$"
+)
+_SECRET_LIKE_TEXT = re.compile(
+    r"\b(?:api[ _-]?key|authorization|bearer|credential|password|passwd|"
+    r"private[ _-]?key|secret|session[ _-]?token|access[ _-]?token)\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_source_summary_text(value: Any, *, maximum: int = 160) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or re.search(r"[\x00-\x1f\x7f]", value)
+        or "://" in normalized
+        or "www." in normalized.casefold()
+        or "/" in normalized
+        or "\\" in normalized
+        or re.match(r"^[A-Za-z]:", normalized)
+        or re.match(r"^(?:#{1,6}|>|[-+*]|\d+[.)])\s", normalized)
+        or re.search(r"\[[^]]*\]\s*\(", normalized)
+        or _SECRET_LIKE_TEXT.search(normalized)
+    ):
+        return None
+    return normalized
+
+
+def _fallback_source_display_name(source_id: str) -> str:
+    aliases = {
+        "vehicle_log_primary": "Primary vehicle maintenance log",
+        "vehicle_log_ev": "EV maintenance log",
+    }
+    if source_id in aliases:
+        return aliases[source_id]
+    words = re.sub(r"[_-]+", " ", source_id).strip()
+    return words[:1].upper() + words[1:] if words else "Source"
+
+
+def _google_sheets_location_labels(
+    source_id: str,
+    references: set[str],
+) -> list[str]:
+    ranges_by_sheet: dict[str, set[str]] = {}
+    for reference in references:
+        match = _GOOGLE_SHEETS_SOURCE_REF.fullmatch(reference)
+        if match is None or match.group("source_id") != source_id:
+            continue
+        sheet = match.group("sheet")
+        if sheet.startswith("'"):
+            sheet = sheet[1:-1].replace("''", "'")
+        safe_sheet = _safe_source_summary_text(sheet, maximum=80)
+        if safe_sheet is None:
+            continue
+        ranges_by_sheet.setdefault(safe_sheet, set()).add(match.group("range"))
+    labels = []
+    for sheet in sorted(ranges_by_sheet, key=str.casefold):
+        ranges = sorted(ranges_by_sheet[sheet])[:8]
+        label = f"Google Sheets tab “{sheet}” — {', '.join(ranges)}"
+        if _safe_source_summary_text(label, maximum=240) is not None:
+            labels.append(label)
+    return labels[:8]
+
+
+def _source_id_from_reference(reference: str) -> str | None:
+    parts = reference.split(":", 2)
+    if len(parts) != 3 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}", parts[1]) is None:
+        return None
+    return parts[1]
+
+
+def _source_summaries(
+    *,
+    inventory: DsaSourceListResponse | None,
+    items: list[Any],
+    considered_sources: list[str],
+    selected_sources: list[str],
+    sources_used: list[str],
+    returned_refs: list[str],
+    retained_refs: list[str],
+    exact_attempts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    inventory_by_id = {
+        source.source_id: source for source in (inventory.sources if inventory else [])
+    }
+    item_by_source: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_id = item.get("source_id")
+        if not isinstance(source_id, str):
+            source_ref = item.get("source_ref")
+            source_id = (
+                _source_id_from_reference(source_ref)
+                if isinstance(source_ref, str)
+                else None
+            )
+        if isinstance(source_id, str):
+            item_by_source[source_id] = item
+    unavailable_ids = {
+        source.source_id
+        for source in (inventory.sources if inventory else [])
+        if not source.enabled or source.status in {"unavailable", "disabled", "unknown"}
+    }
+    source_ids = sorted(set(considered_sources) | unavailable_ids)
+    selected = set(selected_sources)
+    used = set(sources_used)
+    known_source_ids = set(source_ids) | selected | used
+    returned_by_source: dict[str, set[str]] = {}
+    retained_by_source: dict[str, set[str]] = {}
+    for reference in returned_refs:
+        source_id = next(
+            (
+                candidate
+                for candidate in sorted(known_source_ids, key=len, reverse=True)
+                if reference.startswith(f"{candidate}:")
+                or f":{candidate}:" in reference
+            ),
+            _source_id_from_reference(reference),
+        )
+        if source_id is not None:
+            returned_by_source.setdefault(source_id, set()).add(reference)
+    for reference in retained_refs:
+        source_id = next(
+            (
+                candidate
+                for candidate in sorted(known_source_ids, key=len, reverse=True)
+                if reference.startswith(f"{candidate}:")
+                or f":{candidate}:" in reference
+            ),
+            _source_id_from_reference(reference),
+        )
+        if source_id is not None:
+            retained_by_source.setdefault(source_id, set()).add(reference)
+    exact_successes = {
+        str(attempt.get("source_id"))
+        for attempt in exact_attempts
+        if attempt.get("outcome") == "satisfied"
+    }
+    summaries = []
+    for source_id in source_ids:
+        source = inventory_by_id.get(source_id)
+        result_item = item_by_source.get(source_id, {})
+        display_name_value = (
+            source.display_name if source is not None else result_item.get("source_name")
+        )
+        connector_value = (
+            source.connector if source is not None else result_item.get("source_type")
+        )
+        if connector_value is None:
+            result_ref = result_item.get("source_ref")
+            if isinstance(result_ref, str):
+                connector_value = result_ref.partition(":")[0]
+        safe_name = _safe_source_summary_text(display_name_value)
+        display_name = safe_name or _fallback_source_display_name(source_id)
+        connector = (
+            connector_value
+            if isinstance(connector_value, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", connector_value)
+            else "unknown"
+        )
+        returned = returned_by_source.get(source_id, set())
+        retained = retained_by_source.get(source_id, set())
+        reasons = []
+        if retained:
+            reasons.append("retained_records_contributed")
+        if returned - retained:
+            reasons.append("returned_records_not_retained")
+        if source_id in selected and not returned:
+            reasons.append("selected_no_result")
+        if source_id in considered_sources and source_id not in selected:
+            reasons.append("considered_not_selected")
+        if source_id in exact_successes:
+            reasons.append("exact_reference_retrieved")
+        if source is not None and (not source.enabled or source.status == "disabled"):
+            reasons.append("source_disabled")
+        elif source is not None and source.status in {"unavailable", "unknown"}:
+            reasons.append("source_unavailable")
+        reasons = [code for code in reasons if code in _SOURCE_SUMMARY_REASON_CODES]
+        summaries.append(
+            {
+                "source_id": source_id,
+                "display_name": display_name,
+                "connector": connector,
+                "authority_role": (
+                    source.authority_role if source is not None else "unknown"
+                ),
+                "domain_tags": sorted(source.domain_tags) if source is not None else [],
+                "considered": source_id in considered_sources,
+                "selected": source_id in selected,
+                "used": source_id in used,
+                "returned_reference_count": len(returned),
+                "retained_reference_count": len(retained),
+                "safe_location_labels": _google_sheets_location_labels(
+                    source_id,
+                    retained,
+                ),
+                "contribution_reason_codes": reasons,
+            }
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (str(item["display_name"]).casefold(), item["source_id"]),
+    )[:32]
+
+
 def build_manifest_trace(
     *,
     state: EvidenceAcquisitionState,
@@ -4482,6 +4717,16 @@ def build_manifest_trace(
             "sources_considered": considered_sources,
             "sources_selected": selected_sources,
             "sources_used": sources_used,
+            "source_summaries": _source_summaries(
+                inventory=state.inventory,
+                items=items,
+                considered_sources=considered_sources,
+                selected_sources=selected_sources,
+                sources_used=sources_used,
+                returned_refs=returned_refs,
+                retained_refs=retained_refs,
+                exact_attempts=exact_attempts,
+            ),
             "source_references_returned": returned_refs,
             "source_references_retained": retained_refs,
             "source_references_filtered_or_omitted": omitted_refs,
@@ -4671,6 +4916,7 @@ def suppress_manifest_identifiers(manifest: dict[str, Any]) -> dict[str, Any]:
         "expansion_attempts",
         "unavailable_source_ids",
         "failed_source_ids",
+        "source_summaries",
     )
     for field in identity_fields:
         values = acquisition.get(field)
