@@ -610,12 +610,18 @@ run_distinct_client_owner_memory_scenario() {
   jq -e '
       ([.calls[] | select(.kind == "chat")] | length) == 1
       and ([.calls[] | select(.kind == "chat")] | all(.status == "ok"))
-      and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.canonical == true))
+    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-provider-call"
+  jq -e '
+      ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.canonical == true))
       and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.blocked_decoy == false))
       and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.private_decoy == false))
-      and ([.calls[] | select(.kind == "chat") | .normalized_messages[] | select(.role == "user")] | length) == 1
+    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-provider-sentinels"
+  jq -e --arg question "$client_b_question" '
+      [.calls[] | select(.kind == "chat") | .normalized_messages[] | select(.role == "user") | .content] as $users
+      | ($users | length) >= 1
+      and ($users | all(. == $question))
       and ([.calls[] | select(.kind == "chat") | .sentinel_in_user_messages.canonical] | all(. == false))
-    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-provider-boundary"
+    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-current-turn-only"
 
   client_b_rows="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_b' AND client_id='$client_b' AND ((role='user' AND content='$client_b_question' AND metadata->>'surface'='$surface_b') OR (role='assistant' AND metadata->>'request_id'='$request_b'));")"
   [ "$client_b_rows" = "2" ] || distinct_client_memory_fail "client-B-message-provenance"
