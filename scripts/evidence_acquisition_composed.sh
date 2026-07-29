@@ -4338,12 +4338,18 @@ Retained details:
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "How are you sure?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "How are you sure?" deterministic support_explanation support 0
-  assert_jq "history.h2.answer" "$response" '
-    (.answer | contains("governed external-source record"))
-    and (.answer | contains("directly supported the answer"))
-    and (.answer | contains("does not include a safe source name"))
-    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
-    and ((.answer | contains("source-backed fact")) | not)
+  assert_jq "history.h2.record_kind" "$response" \
+    '.answer | contains("governed external-source record")'
+  assert_jq "history.h2.directness" "$response" \
+    '.answer | contains("directly supported the answer")'
+  assert_jq "history.h2.source_name_boundary" "$response" \
+    '.answer | contains("does not include a safe source name")'
+  assert_jq "history.h2.no_new_verification" "$response" '
+    .answer
+    | endswith("I didn’t run another search or verification for this explanation.")
+  '
+  assert_jq "history.h2.internal_vocabulary" "$response" '
+    ((.answer | contains("source-backed fact")) | not)
     and ((.answer | contains("evidence strength")) | not)
   '
   first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
