@@ -104,6 +104,14 @@ jobs:
           HISTORY_FOLLOWUP_ONLY: "1"
         run: make composed-smoke
 
+      - name: Run distinct-client owner-memory proof
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+          DISTINCT_CLIENT_MEMORY_ONLY: "1"
+        run: make composed-smoke
+
       - name: Run complete composed smoke regression
         if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
         working-directory: chat-orchestrator

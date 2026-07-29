@@ -51,6 +51,12 @@ COMPOSED_SMOKE_TMP="$(mktemp -d /tmp/chat-orchestrator-composed-smoke.XXXXXX)"
 export COMPOSED_SMOKE_TMP
 evidence_prepare_fixture_config
 
+if [ "${DISTINCT_CLIENT_MEMORY_ONLY:-}" = "1" ]; then
+  export COMPOSED_INDEX_USER_QUESTIONS=true
+  export COMPOSED_INDEX_ASSISTANT_MESSAGES=true
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true
+fi
+
 cleanup() {
   local status="$?"
   if [ "$status" -ne 0 ] && [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
@@ -334,6 +340,408 @@ fetch_trace() {
 fetch_provider_calls() {
   local request_id="$1"
   curl -fsS "http://127.0.0.1:14381/calls/$request_id"
+}
+
+run_distinct_client_chat() {
+  local owner="$1" client="$2" surface="$3" conversation_id="$4" question="$5"
+  co_post "$(jq -nc \
+    --arg owner "$owner" \
+    --arg client "$client" \
+    --arg surface "$surface" \
+    --arg conversation "$conversation_id" \
+    --arg question "$question" \
+    '{
+      owner_id:$owner,
+      client_id:$client,
+      conversation_id:$conversation,
+      surface:$surface,
+      messages:[{role:"user",content:$question}],
+      sensitivity:"private",
+      retrieval:{k:8,min_score:0,scope:"owner",time_window:"all",retrieval_mode:"balanced"}
+    }')"
+}
+
+install_disposable_surface_binding() {
+  local surface="$1"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$surface" <<'PY'
+from datetime import UTC, datetime
+import sys
+
+from services.companion_contracts import companion_contracts_repository
+
+surface = sys.argv[1]
+repository = companion_contracts_repository()
+if repository.persona_profile("personal_companion") is None:
+    raise SystemExit("personal companion fixture unavailable")
+now = datetime.now(UTC).isoformat()
+with repository._connect() as connection:
+    connection.execute(
+        """
+        INSERT INTO surface_bindings (
+            surface_id, surface_type, surface_display_name, default_persona_id,
+            allow_user_persona_override, response_length, default_mode,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+        ON CONFLICT(surface_id) DO UPDATE SET
+            surface_type = excluded.surface_type,
+            surface_display_name = excluded.surface_display_name,
+            default_persona_id = excluded.default_persona_id,
+            allow_user_persona_override = excluded.allow_user_persona_override,
+            response_length = excluded.response_length,
+            default_mode = excluded.default_mode,
+            updated_at = excluded.updated_at;
+        """,
+        (
+            surface,
+            "disposable_personal_surface",
+            "Disposable Personal Surface",
+            "personal_companion",
+            "concise",
+            "general",
+            now,
+            now,
+        ),
+    )
+PY
+}
+
+runtime_sqlite_match_count() {
+  local needle="$1"
+  docker compose -f "$COMPOSE" exec -T runtime python -c '
+import pathlib
+import sqlite3
+import sys
+
+needle = sys.argv[1]
+count = 0
+for path in pathlib.Path("/data").glob("*.sqlite3"):
+    connection = sqlite3.connect(path)
+    try:
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = ? AND name NOT LIKE ?",
+                ("table", "sqlite_%"),
+            )
+        ]
+        for table in tables:
+            columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+            if not columns:
+                continue
+            quoted_columns = ", ".join(
+                "\"" + column.replace("\"", "\"\"") + "\"" for column in columns
+            )
+            quoted_table = "\"" + table.replace("\"", "\"\"") + "\""
+            for row in connection.execute(f"SELECT {quoted_columns} FROM {quoted_table}"):
+                if any(value is not None and needle in str(value) for value in row):
+                    count += 1
+    finally:
+        connection.close()
+print(count)
+' "$needle"
+}
+
+bms_retrieval_access_count() {
+  local conversation_id="$1"
+  docker compose -f "$COMPOSE" logs --no-color bms 2>/dev/null \
+    | awk -v path="POST /v2/conversations/$conversation_id/retrieve" \
+      'index($0, path) { count += 1 } END { print count + 0 }'
+}
+
+distinct_client_memory_fail() {
+  echo "distinct-client owner-memory assertion failed: $1" >&2
+  exit 1
+}
+
+run_distinct_client_owner_memory_scenario() {
+  local scenario="distinct_client_owner_memory"
+  local owner="owner-distinct-memory-primary" other_owner="owner-distinct-memory-isolated"
+  local client_a="web:client-a" client_b="vscode:client-b" client_c="personal:client-c"
+  local other_client="vscode:isolated-client" surface_a="web" surface_b="vscode"
+  local surface_c="disposable-personal-memory" surface_other="vscode"
+  local conversation_a conversation_b conversation_c conversation_other
+  local canonical blocked_decoy private_decoy canonical_question blocked_question private_question
+  local client_b_question client_c_question other_question
+  local response_a request_a trace_a canonical_message_id canonical_count qdrant_payload
+  local response_b request_b trace_b provider_b retrieval_before retrieval_after
+  local response_c request_c trace_c provider_c response_other request_other trace_other provider_other
+  local client_b_rows client_c_rows other_rows runtime_copies persona_copies qdrant_copy_count
+  local poll_attempt
+
+  install_disposable_surface_binding "$surface_c" || distinct_client_memory_fail "surface-binding"
+
+  conversation_a="$(resolve_conversation "$owner" "$client_a" "client A project memory")"
+  conversation_b="$(resolve_conversation "$owner" "$client_b" "client B project retrieval")"
+  conversation_c="$(resolve_conversation "$owner" "$client_c" "client C contained retrieval")"
+  conversation_other="$(resolve_conversation "$other_owner" "$other_client" "isolated owner retrieval")"
+  if [ -z "$conversation_a" ] || [ -z "$conversation_b" ] || [ -z "$conversation_c" ]; then
+    distinct_client_memory_fail "conversation-identifiers-present"
+  fi
+  if [ "$conversation_a" = "$conversation_b" ] \
+    || [ "$conversation_a" = "$conversation_c" ] \
+    || [ "$conversation_b" = "$conversation_c" ]; then
+    distinct_client_memory_fail "conversation-identifiers-distinct"
+  fi
+  if [ "$client_a" = "$client_b" ] || [ "$client_a" = "$client_c" ] || [ "$client_b" = "$client_c" ]; then
+    distinct_client_memory_fail "client-identifiers-distinct"
+  fi
+  [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner' AND ((id='$conversation_a' AND client_id='$client_a') OR (id='$conversation_b' AND client_id='$client_b') OR (id='$conversation_c' AND client_id='$client_c'));")" = "3" ] \
+    || distinct_client_memory_fail "conversation-client-provenance"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE id='$conversation_other' AND owner_id='$other_owner' AND client_id='$other_client';")" = "1" ] \
+    || distinct_client_memory_fail "isolated-owner-conversation-provenance"
+
+  canonical="dcfact-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  blocked_decoy="dcblocked-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  private_decoy="dcprivate-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  canonical_question="Remember this project milestone fact for later: $canonical"
+  blocked_question="Remember this finance marker for later: $blocked_decoy"
+  private_question="Remember this personal marker for later: $private_decoy"
+  client_b_question="Bring in project context from memory. What is the saved milestone token?"
+  client_c_question="For personal planning, use memory to find the same saved project fact from earlier."
+  other_question="Bring in project context from memory. What is the saved milestone token?"
+
+  provider_post "/fixture/sentinels" "$(jq -nc \
+    --arg canonical "$canonical" \
+    --arg blocked "$blocked_decoy" \
+    --arg private "$private_decoy" \
+    '{sentinels:{canonical:$canonical,blocked_decoy:$blocked,private_decoy:$private}}')"
+
+  response_a="$(run_distinct_client_chat "$owner" "$client_a" "$surface_a" "$conversation_a" "$canonical_question")"
+  request_a="$(jq -r '.request_id // empty' <<<"$response_a")"
+  [ -n "$request_a" ] || distinct_client_memory_fail "client-A-request-id"
+  trace_a="$(fetch_trace "$request_a")"
+  jq -e \
+    --arg request "$request_a" \
+    --arg owner "$owner" \
+    --arg client "$client_a" \
+    --arg conversation "$conversation_a" \
+    --arg surface "$surface_a" '
+      .request_id == $request
+      and .owner_id == $owner
+      and .client_id == $client
+      and .conversation_id == $conversation
+      and .surface == $surface
+      and .retrieval.prompt_assembly.runtime_identity.active_persona_id == "general_assistant"
+      and .retrieval.prompt_assembly.runtime_identity.surface_id == $surface
+      and .retrieval.prompt_assembly.persona_containment.attempted == true
+      and .retrieval.prompt_assembly.persona_containment.status == "included"
+      and .retrieval.prompt_assembly.persona_containment.active_persona_id == "general_assistant"
+      and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains | index("project")) != null
+      and .retrieval.prompt_assembly.retrieval_dispatch.neutral_persistence_classification == "applied"
+      and .retrieval.prompt_assembly.retrieval_dispatch.policy_validation_status == "valid"
+    ' <<<"$trace_a" >/dev/null || distinct_client_memory_fail "client-A-trace-policy"
+
+  canonical_message_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_a' AND client_id='$client_a' AND role='user' AND content='$canonical_question' LIMIT 1;")"
+  [ -n "$canonical_message_id" ] || distinct_client_memory_fail "canonical-message-id"
+  canonical_count="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND position('$canonical' in content) > 0;")"
+  [ "$canonical_count" = "1" ] || distinct_client_memory_fail "canonical-message-count"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE id='$conversation_a' AND owner_id='$owner' AND client_id='$client_a';")" = "1" ] \
+    || distinct_client_memory_fail "client-A-conversation-provenance"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE id='$canonical_message_id' AND owner_id='$owner' AND conversation_id='$conversation_a' AND client_id='$client_a' AND metadata->>'surface'='$surface_a' AND policy_metadata->'memory_domains' ? 'project' AND policy_metadata->>'sensitivity' IN ('low','medium','high','restricted') AND policy_metadata::text !~* 'persona';")" = "1" ] \
+    || distinct_client_memory_fail "canonical-message-policy-provenance"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id IN ('$conversation_b','$conversation_c') AND position('$canonical' in content) > 0;")" = "0" ] \
+    || distinct_client_memory_fail "canonical-not-copied-before-retrieval"
+
+  qdrant_payload=""
+  for poll_attempt in $(seq 1 20); do
+    qdrant_payload="$(curl -fsS -X POST "http://127.0.0.1:14391/collections/messages/points/scroll" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -nc --arg id "$canonical_message_id" '{filter:{must:[{key:"message_id",match:{value:$id}}]},with_payload:true,with_vector:false,limit:8}')")"
+    if jq -e --arg id "$canonical_message_id" '.result.points | map(select(.payload.message_id == $id)) | length == 1' <<<"$qdrant_payload" >/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  jq -e \
+    --arg id "$canonical_message_id" \
+    --arg owner "$owner" \
+    --arg conversation "$conversation_a" \
+    --arg client "$client_a" '
+      .result.points
+      | map(select(
+          .payload.message_id == $id
+          and .payload.owner_id == $owner
+          and .payload.conversation_id == $conversation
+          and .payload.client_id == $client
+          and .payload.retrieval_policy_valid == true
+          and (.payload.memory_domains | index("project")) != null
+          and (.payload.sensitivity == "low" or .payload.sensitivity == "medium" or .payload.sensitivity == "high" or .payload.sensitivity == "restricted")
+          and ((.payload | tostring | test("persona"; "i")) | not)
+        ))
+      | length == 1
+    ' <<<"$qdrant_payload" >/dev/null || distinct_client_memory_fail "canonical-qdrant-point"
+
+  run_distinct_client_chat "$owner" "$client_a" "$surface_a" "$conversation_a" "$blocked_question" >/dev/null
+  run_distinct_client_chat "$owner" "$client_a" "$surface_a" "$conversation_a" "$private_question" >/dev/null
+
+  retrieval_before="$(bms_retrieval_access_count "$conversation_b")"
+  response_b="$(run_distinct_client_chat "$owner" "$client_b" "$surface_b" "$conversation_b" "$client_b_question")"
+  request_b="$(jq -r '.request_id // empty' <<<"$response_b")"
+  [ -n "$request_b" ] || distinct_client_memory_fail "client-B-request-id"
+  trace_b="$(fetch_trace "$request_b")"
+  provider_b="$(fetch_provider_calls "$request_b")"
+  retrieval_after="$(bms_retrieval_access_count "$conversation_b")"
+  [ "$((retrieval_after - retrieval_before))" = "1" ] || distinct_client_memory_fail "client-B-single-BMS-retrieval"
+  jq -e \
+    --arg request "$request_b" \
+    --arg owner "$owner" \
+    --arg client "$client_b" \
+    --arg conversation "$conversation_b" \
+    --arg surface "$surface_b" \
+    --arg source "$canonical_message_id" '
+      .request_id == $request
+      and .owner_id == $owner
+      and .client_id == $client
+      and .conversation_id == $conversation
+      and .surface == $surface
+      and .retrieval.prompt_assembly.runtime_identity.active_persona_id == "technical_architect"
+      and .retrieval.prompt_assembly.runtime_identity.surface_id == $surface
+      and .retrieval.prompt_assembly.persona_containment.active_persona_id == "technical_architect"
+      and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains | index("project")) != null
+      and .retrieval.prompt_assembly.persona_containment.cross_scope_access_allowed == true
+      and .retrieval.prompt_assembly.persona_containment.retrieval_scope_requested == "owner"
+      and .retrieval.prompt_assembly.persona_containment.retrieval_scope_used == "owner"
+      and .retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued == true
+      and .retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_suppressed == false
+      and ([.retrieval.bundle.semantic[]? | select(.message_id == $source)] | length) == 1
+      and ([.references[]? | select(.ref_type == "message" and .ref_id == $source)] | length) == 1
+      and .fallback.triggered == false
+    ' <<<"$trace_b" >/dev/null || distinct_client_memory_fail "client-B-authorized-retrieval"
+  jq -e '
+      ([.calls[] | select(.kind == "chat")] | length) == 1
+      and ([.calls[] | select(.kind == "chat")] | all(.status == "ok"))
+    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-provider-call"
+  jq -e '
+      ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.canonical == true))
+      and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.blocked_decoy == false))
+      and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.private_decoy == false))
+    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-provider-sentinels"
+  jq -e --arg question "$client_b_question" '
+      [.calls[] | select(.kind == "chat") | .normalized_messages[] | select(.role == "user") | .content] as $users
+      | ($users | length) >= 1
+      and ($users | last) == $question
+    ' <<<"$provider_b" >/dev/null || distinct_client_memory_fail "client-B-current-turn-only"
+
+  client_b_rows="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_b' AND client_id='$client_b' AND ((role='user' AND content='$client_b_question' AND metadata->>'surface'='$surface_b') OR (role='assistant' AND metadata->>'request_id'='$request_b'));")"
+  [ "$client_b_rows" = "2" ] || distinct_client_memory_fail "client-B-message-provenance"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation_b' AND position('$canonical' in content) > 0;")" = "0" ] \
+    || distinct_client_memory_fail "client-B-no-canonical-copy"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE id='$canonical_message_id' AND client_id='$client_a' AND conversation_id='$conversation_a' AND metadata->>'surface'='$surface_a';")" = "1" ] \
+    || distinct_client_memory_fail "source-provenance-remains-client-A"
+
+  response_c="$(run_distinct_client_chat "$owner" "$client_c" "$surface_c" "$conversation_c" "$client_c_question")"
+  request_c="$(jq -r '.request_id // empty' <<<"$response_c")"
+  [ -n "$request_c" ] || distinct_client_memory_fail "client-C-request-id"
+  trace_c="$(fetch_trace "$request_c")"
+  provider_c="$(fetch_provider_calls "$request_c")"
+  jq -e \
+    --arg request "$request_c" \
+    --arg owner "$owner" \
+    --arg client "$client_c" \
+    --arg conversation "$conversation_c" \
+    --arg surface "$surface_c" \
+    --arg source "$canonical_message_id" '
+      .request_id == $request
+      and .owner_id == $owner
+      and .client_id == $client
+      and .conversation_id == $conversation
+      and .surface == $surface
+      and .retrieval.prompt_assembly.runtime_identity.active_persona_id == "personal_companion"
+      and .retrieval.prompt_assembly.runtime_identity.surface_id == $surface
+      and .retrieval.prompt_assembly.persona_containment.active_persona_id == "personal_companion"
+      and .retrieval.prompt_assembly.persona_containment.capability_domain == "personal"
+      and (.retrieval.prompt_assembly.persona_containment.allowed_memory_domains | index("project")) == null
+      and (.retrieval.prompt_assembly.persona_containment.blocked_memory_domains | index("project")) != null
+      and .retrieval.prompt_assembly.persona_containment.cross_scope_access_allowed == false
+      and .retrieval.prompt_assembly.persona_containment.retrieval_scope_requested == "owner"
+      and .retrieval.prompt_assembly.persona_containment.retrieval_scope_used == "conversation"
+      and ([.retrieval.bundle.semantic[]? | select(.message_id == $source)] | length) == 0
+      and ([.references[]? | select(.ref_type == "message" and .ref_id == $source)] | length) == 0
+    ' <<<"$trace_c" >/dev/null || distinct_client_memory_fail "client-C-containment"
+  jq -e '
+      ([.calls[] | select(.kind == "chat")] | length) == 1
+      and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.canonical == false))
+      and ([.calls[] | select(.kind == "chat") | .normalized_messages[] | select(.role == "user") | .content | ascii_downcase | contains("memory") and contains("project fact")] | any)
+    ' <<<"$provider_c" >/dev/null || distinct_client_memory_fail "client-C-provider-boundary"
+  if [[ "$(jq -c . <<<"$response_c")$(jq -c . <<<"$provider_c")$(jq -c . <<<"$trace_c")" == *"$canonical"* ]] \
+    || [[ "$(jq -c . <<<"$response_c")$(jq -c . <<<"$provider_c")$(jq -c . <<<"$trace_c")" == *"$canonical_message_id"* ]]; then
+    distinct_client_memory_fail "client-C-private-source-leak"
+  fi
+  client_c_rows="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_c' AND client_id='$client_c' AND ((role='user' AND content='$client_c_question' AND metadata->>'surface'='$surface_c') OR (role='assistant' AND metadata->>'request_id'='$request_c'));")"
+  [ "$client_c_rows" = "2" ] || distinct_client_memory_fail "client-C-message-provenance"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation_c' AND position('$canonical' in content) > 0;")" = "0" ] \
+    || distinct_client_memory_fail "client-C-no-authorized-result-copy"
+
+  response_other="$(run_distinct_client_chat "$other_owner" "$other_client" "$surface_other" "$conversation_other" "$other_question")"
+  request_other="$(jq -r '.request_id // empty' <<<"$response_other")"
+  [ -n "$request_other" ] || distinct_client_memory_fail "isolated-owner-request-id"
+  trace_other="$(fetch_trace "$request_other")"
+  provider_other="$(fetch_provider_calls "$request_other")"
+  jq -e \
+    --arg request "$request_other" \
+    --arg owner "$other_owner" \
+    --arg client "$other_client" \
+    --arg conversation "$conversation_other" \
+    --arg source "$canonical_message_id" '
+      .request_id == $request
+      and .owner_id == $owner
+      and .client_id == $client
+      and .conversation_id == $conversation
+      and .surface == "vscode"
+      and .retrieval.prompt_assembly.persona_containment.retrieval_scope_requested == "owner"
+      and .retrieval.prompt_assembly.persona_containment.retrieval_scope_used == "owner"
+      and ([.retrieval.bundle.semantic[]? | select(.message_id == $source)] | length) == 0
+      and ([.references[]? | select(.ref_type == "message" and .ref_id == $source)] | length) == 0
+    ' <<<"$trace_other" >/dev/null || distinct_client_memory_fail "owner-isolation-trace"
+  jq -e '
+      ([.calls[] | select(.kind == "chat")] | length) == 1
+      and ([.calls[] | select(.kind == "chat")] | all(.sentinel_presence.canonical == false))
+    ' <<<"$provider_other" >/dev/null || distinct_client_memory_fail "owner-isolation-provider"
+  if [[ "$(jq -c . <<<"$response_other")$(jq -c . <<<"$provider_other")$(jq -c . <<<"$trace_other")" == *"$canonical"* ]] \
+    || [[ "$(jq -c . <<<"$response_other")$(jq -c . <<<"$provider_other")$(jq -c . <<<"$trace_other")" == *"$canonical_message_id"* ]]; then
+    distinct_client_memory_fail "owner-isolation-private-source-leak"
+  fi
+  other_rows="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$other_owner' AND conversation_id='$conversation_other' AND client_id='$other_client' AND ((role='user' AND content='$other_question' AND metadata->>'surface'='$surface_other') OR (role='assistant' AND metadata->>'request_id'='$request_other'));")"
+  [ "$other_rows" = "2" ] || distinct_client_memory_fail "isolated-owner-message-provenance"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$other_owner' AND position('$canonical' in content) > 0;")" = "0" ] \
+    || distinct_client_memory_fail "owner-isolation-message-copy"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM memory_items WHERE owner_id='$other_owner' AND position('$canonical' in summary) > 0;")" = "0" ] \
+    || distinct_client_memory_fail "owner-isolation-memory-copy"
+
+  canonical_count="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND position('$canonical' in content) > 0;")"
+  [ "$canonical_count" = "1" ] || distinct_client_memory_fail "final-canonical-message-count"
+  persona_copies="$(psql_exec -At -c "SELECT count(*) FROM persona_overlays WHERE owner_id='$owner' AND (position('$canonical' in persona_json::text) > 0 OR position('$canonical' in COALESCE(policy_metadata::text,'')) > 0);")"
+  [ "$persona_copies" = "0" ] || distinct_client_memory_fail "persona-overlay-copy"
+  runtime_copies="$(runtime_sqlite_match_count "$canonical")"
+  [ "$runtime_copies" = "0" ] || distinct_client_memory_fail "runtime-state-copy"
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id IN ('$conversation_b','$conversation_c','$conversation_other') AND position('$canonical' in content) > 0;")" = "0" ] \
+    || distinct_client_memory_fail "cross-conversation-copy"
+
+  qdrant_payload="$(curl -fsS -X POST "http://127.0.0.1:14391/collections/messages/points/scroll" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg owner "$owner" '{filter:{must:[{key:"owner_id",match:{value:$owner}},{key:"ref_type",match:{value:"message"}}]},with_payload:true,with_vector:false,limit:100}')")"
+  qdrant_copy_count="$(jq --arg id "$canonical_message_id" '[.result.points[]? | select(.payload.message_id == $id)] | length' <<<"$qdrant_payload")"
+  [ "$qdrant_copy_count" = "1" ] || distinct_client_memory_fail "final-canonical-qdrant-count"
+  jq -e \
+    --arg id "$canonical_message_id" \
+    --arg owner "$owner" \
+    --arg conversation "$conversation_a" \
+    --arg client "$client_a" '
+      [.result.points[]? | select(
+        .payload.message_id == $id
+        and .payload.owner_id == $owner
+        and .payload.conversation_id == $conversation
+        and .payload.client_id == $client
+      )] | length == 1
+    ' <<<"$qdrant_payload" >/dev/null || distinct_client_memory_fail "final-source-qdrant-provenance"
+  [ "$(curl -fsS -X POST "http://127.0.0.1:14391/collections/messages/points/scroll" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg owner "$other_owner" --arg id "$canonical_message_id" '{filter:{must:[{key:"owner_id",match:{value:$owner}},{key:"message_id",match:{value:$id}}]},with_payload:true,with_vector:false,limit:8}')" \
+    | jq '.result.points | length')" = "0" ] || distinct_client_memory_fail "owner-isolation-qdrant"
+
+  echo "Distinct client owner memory passed: scenario=$scenario clients=3 conversations=3 canonical_rows=1 canonical_points=1 authorized_retrievals=1 blocked_retrievals=1 owner_isolation=true"
+  echo "Distinct client provenance passed: client_A=true client_B=true client_C=true source_client_A=true source_conversation_A=true source_surface_A=true"
+  echo "Distinct client storage passed: persona_overlay_copies=0 runtime_state_copies=0 cross_conversation_copies=0"
 }
 
 assert_persisted_answer_matches() {
@@ -827,6 +1235,13 @@ if [ "${HISTORY_FOLLOWUP_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: history-followup-only"
   run_history_followup_composed_suite
   echo "Topology: thin CO client -> CR history policy -> BMS newest durable response; optional classifier/DSA/provider calls are asserted per scenario."
+  exit 0
+fi
+
+if [ "${DISTINCT_CLIENT_MEMORY_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: distinct-client-owner-memory-only"
+  run_distinct_client_owner_memory_scenario
+  echo "Distinct client owner memory scenario complete: assertions=true"
   exit 0
 fi
 
