@@ -4280,11 +4280,12 @@ Retained details:
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
   assert_jq "history.ordinary.summary_count" "$original_manifest" \
     '.acquisition.source_summaries | length == 1'
-  assert_jq "history.ordinary.summary_label" "$original_manifest" '
-    .acquisition.source_summaries[0].source_id == "records_primary"
-    and .acquisition.source_summaries[0].display_name == "Migration Records"
-    and .acquisition.source_summaries[0].connector == "google_sheets"
-  '
+  assert_jq "history.ordinary.summary_source" "$original_manifest" \
+    '.acquisition.source_summaries[0].source_id == "records_primary"'
+  assert_jq "history.ordinary.summary_display_name" "$original_manifest" \
+    '.acquisition.source_summaries[0].display_name == "Migration Records"'
+  assert_jq "history.ordinary.summary_connector" "$original_manifest" \
+    '.acquisition.source_summaries[0].connector == "google_sheets"'
   assert_jq "history.ordinary.summary_authority" "$original_manifest" '
     .acquisition.source_summaries[0].authority_role == "unknown"
     and .acquisition.source_summaries[0].domain_tags == []
