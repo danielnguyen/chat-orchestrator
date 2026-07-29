@@ -169,6 +169,24 @@ structural fields and the existing disposable normalized-message fixture data ne
 schema, token limit, zero tools, fixed instruction, current-user-only input, and
 absence of history or identifiers.
 
+Run only the distinct-client owner-memory proof with:
+
+```bash
+DISTINCT_CLIENT_MEMORY_ONLY=1 make composed-smoke
+```
+
+This mode uses three distinct clients under one owner in separate conversations. It
+proves owner-scoped authorized memory retrieval for an allowed persona, exclusion
+for a blocked persona, truthful current-client and source-client provenance, one
+canonical durable fact, no Cognitive Runtime or persona-overlay copy, and isolation
+from a different owner. Each request contains only its current turn and enters the
+normal Chat Orchestrator path, so no adapter synchronization or client cache supplies
+the shared memory.
+
+This proof does not establish live-thread continuation, automatic conversation
+selection, Telegram-to-Alexa handoff, timing, presence, pause/resume, contention, or
+Phase 6 completion.
+
 The focused mode and the complete regression both reset provider, DSA audit,
 external-source, feature-toggle, and disposable conversation state. This is
 deployment-equivalent composed proof for the repository contracts; it is not a
