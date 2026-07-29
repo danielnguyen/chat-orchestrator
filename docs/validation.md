@@ -185,7 +185,7 @@ the shared memory.
 
 This proof does not establish live-thread continuation, automatic conversation
 selection, Telegram-to-Alexa handoff, timing, presence, pause/resume, contention, or
-Phase 6 completion.
+completion of the next planned cross-surface implementation stage.
 
 The focused mode and the complete regression both reset provider, DSA audit,
 external-source, feature-toggle, and disposable conversation state. This is
