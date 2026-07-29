@@ -4444,11 +4444,20 @@ def _source_summaries(
     inventory_by_id = {
         source.source_id: source for source in (inventory.sources if inventory else [])
     }
-    item_by_source = {
-        str(item.get("source_id")): item
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("source_id"), str)
-    }
+    item_by_source: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_id = item.get("source_id")
+        if not isinstance(source_id, str):
+            source_ref = item.get("source_ref")
+            source_id = (
+                _source_id_from_reference(source_ref)
+                if isinstance(source_ref, str)
+                else None
+            )
+        if isinstance(source_id, str):
+            item_by_source[source_id] = item
     unavailable_ids = {
         source.source_id
         for source in (inventory.sources if inventory else [])
@@ -4499,6 +4508,10 @@ def _source_summaries(
         connector_value = (
             source.connector if source is not None else result_item.get("source_type")
         )
+        if connector_value is None:
+            result_ref = result_item.get("source_ref")
+            if isinstance(result_ref, str):
+                connector_value = result_ref.partition(":")[0]
         safe_name = _safe_source_summary_text(display_name_value)
         display_name = safe_name or _fallback_source_display_name(source_id)
         connector = (

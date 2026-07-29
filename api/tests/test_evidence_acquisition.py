@@ -31,6 +31,7 @@ from services.evidence_acquisition import (
     _expected_sufficiency_constraints,
     _manifest_id,
     _resolve_declared_scope,
+    _source_summaries,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_current_acquisition_premise,
@@ -5703,6 +5704,31 @@ async def test_manifest_retains_bounded_safe_source_summary_from_validated_dsa_f
     assert private["acquisition"]["source_summaries"] == []
     assert private["acquisition"]["source_summaries_count"] == 1
     assert "Migration records" not in json.dumps(private, sort_keys=True)
+
+
+def test_source_summary_uses_name_and_connector_from_ordinary_context_shape():
+    source_ref = "google_sheets:source_a:'Form responses 1'!A2:C3"
+
+    summaries = _source_summaries(
+        inventory=None,
+        items=[
+            {
+                "source_ref": source_ref,
+                "source_name": "Migration records",
+            }
+        ],
+        considered_sources=["source_a"],
+        selected_sources=["source_a"],
+        sources_used=["source_a"],
+        returned_refs=[source_ref],
+        retained_refs=[source_ref],
+        exact_attempts=[],
+    )
+
+    assert summaries[0]["display_name"] == "Migration records"
+    assert summaries[0]["connector"] == "google_sheets"
+    assert summaries[0]["authority_role"] == "unknown"
+    assert summaries[0]["domain_tags"] == []
 
 
 def _next_step_test_state(
