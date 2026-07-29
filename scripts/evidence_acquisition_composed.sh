@@ -4343,7 +4343,7 @@ Retained details:
   assert_jq "history.h2.directness" "$response" \
     '.answer | contains("directly supported the answer")'
   assert_jq "history.h2.source_name_boundary" "$response" \
-    '.answer | contains("does not include a safe source name")'
+    '.answer | contains("do not include a safe source name")'
   assert_jq "history.h2.no_new_verification" "$response" '
     .answer
     | endswith("I didn’t run another search or verification for this explanation.")
