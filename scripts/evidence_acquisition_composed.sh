@@ -4274,26 +4274,38 @@ Retained details:
     ]
     and .acquisition.source_references_retained ==
       .acquisition.source_references_returned
-    and .acquisition.source_summaries == [
-      {
-        source_id: "records_primary",
-        display_name: "Migration Records",
-        connector: "google_sheets",
-        authority_role: "unknown",
-        domain_tags: [],
-        considered: true,
-        selected: true,
-        used: true,
-        returned_reference_count: 2,
-        retained_reference_count: 2,
-        safe_location_labels: ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"],
-        contribution_reason_codes: ["retained_records_contributed"]
-      }
-    ]
     and .sufficiency.status == "not_evaluated"
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
+  assert_jq "history.ordinary.summary_count" "$original_manifest" \
+    '.acquisition.source_summaries | length == 1'
+  assert_jq "history.ordinary.summary_label" "$original_manifest" '
+    .acquisition.source_summaries[0].source_id == "records_primary"
+    and .acquisition.source_summaries[0].display_name == "Migration Records"
+    and .acquisition.source_summaries[0].connector == "google_sheets"
+  '
+  assert_jq "history.ordinary.summary_authority" "$original_manifest" '
+    .acquisition.source_summaries[0].authority_role == "unknown"
+    and .acquisition.source_summaries[0].domain_tags == []
+  '
+  assert_jq "history.ordinary.summary_association" "$original_manifest" '
+    .acquisition.source_summaries[0].considered == true
+    and .acquisition.source_summaries[0].selected == true
+    and .acquisition.source_summaries[0].used == true
+  '
+  assert_jq "history.ordinary.summary_counts" "$original_manifest" '
+    .acquisition.source_summaries[0].returned_reference_count == 2
+    and .acquisition.source_summaries[0].retained_reference_count == 2
+  '
+  assert_jq "history.ordinary.summary_location" "$original_manifest" '
+    .acquisition.source_summaries[0].safe_location_labels
+      == ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"]
+  '
+  assert_jq "history.ordinary.summary_reason" "$original_manifest" '
+    .acquisition.source_summaries[0].contribution_reason_codes
+      == ["retained_records_contributed"]
+  '
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
   HISTORY_ORIGINAL_MANIFEST="$original_manifest"
