@@ -565,7 +565,7 @@ readonly EVIDENCE_HYBRID_COMPARISON_QUESTION="Compare these two review calendar 
 readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory record in the register is reviewed."
 readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
-readonly EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE="I didn’t run another search or verification for this explanation."
+readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
 
 run_evidence_targeted_scenario() {
   local owner client conversation_id question external response request_id answer
@@ -2480,7 +2480,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.immediate.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "no_record"; then
     echo "Assertion failed: history.negatives.immediate.boundaries" >&2
@@ -2507,7 +2507,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.quoted_not_found.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "no_record"; then
     echo "Assertion failed: history.negatives.quoted_not_found.boundaries" >&2
@@ -2535,7 +2535,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE"
   assert_jq "history.negatives.ambiguous.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "ambiguous"; then
     echo "Assertion failed: history.negatives.ambiguous.boundaries" >&2
@@ -2585,7 +2585,7 @@ run_evidence_history_negative_scenarios() {
     '.answer | contains("association-corrupted") | not'
   assert_jq "history.negatives.corrupt.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   if ! assert_history_request_boundaries \
     "$conversation_id" "$history" "invalid"; then
     echo "Assertion failed: history.negatives.corrupt.boundaries" >&2
@@ -2638,7 +2638,7 @@ run_evidence_history_negative_scenarios() {
     '.answer | contains($sentinel) | not' --arg sentinel "$sentinel"
   assert_jq "history.negatives.privacy_invalid.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$trace")" in
     *PRIVATE-CREDENTIAL-SENTINEL*)
       echo "Assertion failed: history.negatives.privacy_invalid.trace_privacy" >&2
@@ -2666,7 +2666,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.owner_isolation.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$history")" in
     *owner-history-private-invalid*|*PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
       echo "Assertion failed: history.negatives.owner_isolation.privacy" >&2
@@ -2694,7 +2694,7 @@ run_evidence_history_negative_scenarios() {
     --arg expected "$EVIDENCE_HISTORY_NO_RECORD_SENTENCE"
   assert_jq "history.negatives.conversation_isolation.response_suffix" "$history" \
     '.answer | endswith($suffix)' \
-    --arg suffix "$EVIDENCE_HISTORY_NO_NEW_VERIFICATION_SENTENCE"
+    --arg suffix "$EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE"
   case "$(jq -c . <<<"$history")" in
     *PRIVATE-CREDENTIAL-SENTINEL*|*records_primary*)
       echo "Assertion failed: history.negatives.conversation_isolation.privacy" >&2
