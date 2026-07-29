@@ -5640,6 +5640,71 @@ async def test_manifest_association_and_privacy_exclude_raw_content():
     assert private["acquisition"]["source_references_retained_count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_manifest_retains_bounded_safe_source_summary_from_validated_dsa_fields():
+    source_ref = "google_sheets:source_a:'Form responses 1'!A2:C3"
+    runtime = FakeRuntime()
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source(
+                    "source_a",
+                    display_name="Migration records",
+                    connector="google_sheets",
+                    authority_role="authoritative",
+                    tags=["operations"],
+                )
+            ]
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+    context_raw = _context_pack()
+    context_raw["items"][0]["source_ref"] = source_ref
+    context = _validated_context_pack(context_raw)
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=context,
+        dsa_trace={"status": "success", "called": True, "raw_item_count": 1},
+        retained_source_refs={source_ref},
+        **SCOPE,
+    )
+
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=context,
+        dsa_trace={"status": "success", "called": True, "raw_item_count": 1},
+        retained_source_refs={source_ref},
+    )
+
+    assert manifest["acquisition"]["source_summaries"] == [
+        {
+            "source_id": "source_a",
+            "display_name": "Migration records",
+            "connector": "google_sheets",
+            "authority_role": "authoritative",
+            "domain_tags": ["operations"],
+            "considered": True,
+            "selected": True,
+            "used": True,
+            "returned_reference_count": 1,
+            "retained_reference_count": 1,
+            "safe_location_labels": [
+                "Google Sheets tab “Form responses 1” — A2:C3"
+            ],
+            "contribution_reason_codes": ["retained_records_contributed"],
+        }
+    ]
+    private = suppress_manifest_identifiers(manifest)
+    assert private["acquisition"]["source_summaries"] == []
+    assert private["acquisition"]["source_summaries_count"] == 1
+    assert "Migration records" not in json.dumps(private, sort_keys=True)
+
+
 def _next_step_test_state(
     *,
     sufficiency_status="insufficient",

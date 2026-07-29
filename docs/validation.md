@@ -169,6 +169,13 @@ structural fields and the existing disposable normalized-message fixture data ne
 schema, token limit, zero tools, fixed instruction, current-user-only input, and
 absence of history or identifiers.
 
+Historical support and acquisition follow-ups now render human-readable source
+names, safe connector locations, contributions, and practical limitations from the
+validated record saved with the original answer. Older records without source
+summaries use a deterministic bounded fallback, while privacy-suppressed or malformed
+metadata cannot expose source identifiers. These explanations do not run a fresh
+search or provider call and do not expose raw acquisition diagnostics.
+
 Run only the distinct-client owner-memory proof with:
 
 ```bash

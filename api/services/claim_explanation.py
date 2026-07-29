@@ -108,7 +108,7 @@ _INVALID_RECORD = (
     "unsupported, so I can’t safely explain its support. I did not perform a new "
     "verification."
 )
-_NO_NEW_VERIFICATION = "I did not perform a new verification for this explanation."
+_NO_NEW_VERIFICATION = "I didn’t run another search or verification for this explanation."
 _ACQUISITION_TARGET_UNAVAILABLE = (
     "I can’t safely identify which earlier answer you mean from the supplied "
     "conversation context, so I can’t say what was checked. I did not perform a new "
@@ -897,17 +897,23 @@ def _render(record: ClaimRecord) -> str:
         "tool_output": "one retained tool result",
         "integration_event": "one retained integration event",
     }[evidence_type]
-    sentences = [
-        (
-            f"I based that earlier statement on {evidence_wording} from the original "
-            f"retained record. The record classified it as "
-            f"{_CLAIM_CLASS_WORDING[record.claim_class]}, with {record.confidence} "
-            f"confidence and {_STRENGTH_WORDING[record.evidence_strength]}."
-        )
-    ]
-    freshness = _FRESHNESS_WORDING.get(record.freshness_summary)
-    if freshness:
+    direct = record.validated_evidence_references[0].support_kind == "direct"
+    sentences = [f"That earlier answer was supported by {evidence_wording}."]
+    sentences.append(
+        "It directly supported the answer."
+        if direct
+        else "It provided background rather than direct support."
+    )
+    freshness = {
+        "current": "It was marked current when the answer was given.",
+        "mixed": "Some of it may have been older than other parts.",
+        "stale": "It was marked stale, so the answer may no longer be current.",
+        "unknown": "Its age could not be confirmed.",
+        "not_applicable": "Its age was not relevant to that answer.",
+    }.get(record.freshness_summary)
+    if freshness is not None:
         sentences.append(freshness)
+    sentences.append("The saved support details do not include a safe source name.")
     limitations = set(record.limitation_codes)
     sentences.extend(
         _LIMITATION_WORDING[code] for code in _LIMITATION_ORDER if code in limitations
@@ -1020,6 +1026,23 @@ class AcquisitionHistory:
     identifiers_suppressed: bool
     changed_premise_exact_follow_up: bool
     final_next_step: str | None
+    source_summaries: tuple[SourceHistorySummary, ...]
+
+
+@dataclass(frozen=True)
+class SourceHistorySummary:
+    source_id: str
+    display_name: str
+    connector: str | None
+    authority_role: str
+    domain_tags: tuple[str, ...]
+    considered: bool
+    selected: bool
+    used: bool
+    returned_reference_count: int
+    retained_reference_count: int
+    safe_location_labels: tuple[str, ...]
+    contribution_reason_codes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1052,26 @@ class AcquisitionHistoryProjection:
 
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
+_SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$")
+_GOOGLE_SHEETS_SOURCE_REF = re.compile(
+    r"^google_sheets:(?P<source_id>[A-Za-z0-9][A-Za-z0-9_-]{0,119}):"
+    r"(?P<sheet>'(?:[^'\r\n]|'')+'|[A-Za-z0-9_]+)!"
+    r"(?P<range>[A-Z]+[1-9][0-9]*:[A-Z]+[1-9][0-9]*)$"
+)
+_SECRET_LIKE_TEXT = re.compile(
+    r"\b(?:api[ _-]?key|authorization|bearer|credential|password|passwd|"
+    r"private[ _-]?key|secret|session[ _-]?token|access[ _-]?token)\b",
+    re.IGNORECASE,
+)
+_SOURCE_SUMMARY_REASON_CODES = {
+    "retained_records_contributed",
+    "returned_records_not_retained",
+    "selected_no_result",
+    "considered_not_selected",
+    "exact_reference_retrieved",
+    "source_unavailable",
+    "source_disabled",
+}
 _MANIFEST_IDENTITY_FIELDS = (
     "sources_considered",
     "sources_selected",
@@ -1096,6 +1139,300 @@ def _valid_source_reference(value: Any) -> bool:
         and "://" not in value
         and "?" not in value
     )
+
+
+def _safe_source_summary_text(value: Any, *, maximum: int = 160) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or re.search(r"[\x00-\x1f\x7f]", value)
+        or "://" in normalized
+        or "www." in normalized.casefold()
+        or "/" in normalized
+        or "\\" in normalized
+        or re.match(r"^[A-Za-z]:", normalized)
+        or re.match(r"^(?:#{1,6}|>|[-+*]|\d+[.)])\s", normalized)
+        or re.search(r"\[[^]]*\]\s*\(", normalized)
+        or _SECRET_LIKE_TEXT.search(normalized)
+    ):
+        return None
+    return normalized
+
+
+def _fallback_source_display_name(source_id: str) -> str:
+    aliases = {
+        "vehicle_log_primary": "Primary vehicle maintenance log",
+        "vehicle_log_ev": "EV maintenance log",
+    }
+    if source_id in aliases:
+        return aliases[source_id]
+    words = re.sub(r"[_-]+", " ", source_id).strip()
+    return words[:1].upper() + words[1:] if words else "Source"
+
+
+def _source_id_from_reference(reference: str) -> str | None:
+    parts = reference.split(":", 2)
+    if len(parts) != 3 or _SAFE_SOURCE_ID.fullmatch(parts[1]) is None:
+        return None
+    return parts[1]
+
+
+def _google_sheets_location_labels(
+    source_id: str,
+    references: set[str],
+) -> tuple[str, ...]:
+    ranges_by_sheet: dict[str, set[str]] = {}
+    for reference in references:
+        match = _GOOGLE_SHEETS_SOURCE_REF.fullmatch(reference)
+        if match is None or match.group("source_id") != source_id:
+            continue
+        sheet = match.group("sheet")
+        if sheet.startswith("'"):
+            sheet = sheet[1:-1].replace("''", "'")
+        safe_sheet = _safe_source_summary_text(sheet, maximum=80)
+        if safe_sheet is None:
+            continue
+        ranges_by_sheet.setdefault(safe_sheet, set()).add(match.group("range"))
+    labels = []
+    for sheet in sorted(ranges_by_sheet, key=str.casefold):
+        ranges = sorted(ranges_by_sheet[sheet])[:8]
+        label = f"Google Sheets tab “{sheet}” — {', '.join(ranges)}"
+        if _safe_source_summary_text(label, maximum=240) is not None:
+            labels.append(label)
+    return tuple(labels[:8])
+
+
+def _references_by_source(
+    references: set[str],
+    *,
+    known_source_ids: set[str] | None = None,
+) -> dict[str, set[str]]:
+    grouped: dict[str, set[str]] = {}
+    for reference in references:
+        source_id = next(
+            (
+                candidate
+                for candidate in sorted(known_source_ids or set(), key=len, reverse=True)
+                if reference.startswith(f"{candidate}:")
+                or f":{candidate}:" in reference
+            ),
+            None,
+        )
+        if source_id is None:
+            source_id = _source_id_from_reference(reference)
+        if source_id is not None:
+            grouped.setdefault(source_id, set()).add(reference)
+    return grouped
+
+
+def _legacy_source_summaries(
+    *,
+    considered: set[str],
+    selected: set[str],
+    used: set[str],
+    returned: set[str],
+    retained: set[str],
+    unavailable: set[str],
+    failed: set[str],
+) -> tuple[SourceHistorySummary, ...]:
+    known_ids = considered | selected | used | unavailable | failed
+    returned_by_source = _references_by_source(returned, known_source_ids=known_ids)
+    retained_by_source = _references_by_source(retained, known_source_ids=known_ids)
+    source_ids = known_ids | set(returned_by_source) | set(retained_by_source)
+    summaries = []
+    for source_id in source_ids:
+        returned_refs = returned_by_source.get(source_id, set())
+        retained_refs = retained_by_source.get(source_id, set())
+        reasons = []
+        if retained_refs:
+            reasons.append("retained_records_contributed")
+        if returned_refs - retained_refs:
+            reasons.append("returned_records_not_retained")
+        if source_id in selected and not returned_refs:
+            reasons.append("selected_no_result")
+        if source_id in considered and source_id not in selected:
+            reasons.append("considered_not_selected")
+        if source_id in unavailable or source_id in failed:
+            reasons.append("source_unavailable")
+        references = returned_refs | retained_refs
+        connector = (
+            next(iter(references)).split(":", 1)[0] if references else None
+        )
+        summaries.append(
+            SourceHistorySummary(
+                source_id=source_id,
+                display_name=_fallback_source_display_name(source_id),
+                connector=connector,
+                authority_role="unknown",
+                domain_tags=(),
+                considered=source_id in considered,
+                selected=source_id in selected,
+                used=source_id in used,
+                returned_reference_count=len(returned_refs),
+                retained_reference_count=len(retained_refs),
+                safe_location_labels=_google_sheets_location_labels(
+                    source_id,
+                    retained_refs,
+                ),
+                contribution_reason_codes=tuple(reasons),
+            )
+        )
+    return tuple(
+        sorted(
+            summaries,
+            key=lambda item: (item.display_name.casefold(), item.source_id),
+        )[:32]
+    )
+
+
+def _project_source_summaries(
+    acquisition: dict[str, Any],
+    *,
+    suppressed: bool,
+    considered: set[str] | None,
+    selected: set[str] | None,
+    used: set[str] | None,
+    returned: set[str] | None,
+    retained: set[str] | None,
+    unavailable: set[str] | None,
+    failed: set[str] | None,
+) -> tuple[SourceHistorySummary, ...] | None:
+    raw = acquisition.get("source_summaries")
+    if raw is None:
+        if "source_summaries_count" in acquisition:
+            return None
+        if suppressed:
+            return ()
+        assert considered is not None
+        assert selected is not None
+        assert used is not None
+        assert returned is not None
+        assert retained is not None
+        assert unavailable is not None
+        assert failed is not None
+        return _legacy_source_summaries(
+            considered=considered,
+            selected=selected,
+            used=used,
+            returned=returned,
+            retained=retained,
+            unavailable=unavailable,
+            failed=failed,
+        )
+    if not isinstance(raw, list) or len(raw) > 32:
+        return None
+    if suppressed:
+        count = _bounded_count(acquisition.get("source_summaries_count"), maximum=32)
+        return () if raw == [] and count is not None else None
+    if "source_summaries_count" in acquisition:
+        return None
+    if any(value is None for value in (considered, selected, used, returned, retained)):
+        return None
+    expected_ids = set(considered or set()) | set(unavailable or set()) | set(failed or set())
+    returned_by_source = _references_by_source(
+        returned or set(),
+        known_source_ids=expected_ids,
+    )
+    retained_by_source = _references_by_source(
+        retained or set(),
+        known_source_ids=expected_ids,
+    )
+    summaries = []
+    observed_ids = set()
+    required_keys = {
+        "source_id",
+        "display_name",
+        "connector",
+        "authority_role",
+        "domain_tags",
+        "considered",
+        "selected",
+        "used",
+        "returned_reference_count",
+        "retained_reference_count",
+        "safe_location_labels",
+        "contribution_reason_codes",
+    }
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != required_keys:
+            return None
+        source_id = item.get("source_id")
+        display_name = _safe_source_summary_text(item.get("display_name"))
+        connector = item.get("connector")
+        authority_role = item.get("authority_role")
+        domain_tags = item.get("domain_tags")
+        locations = item.get("safe_location_labels")
+        reasons = item.get("contribution_reason_codes")
+        returned_count = _bounded_count(item.get("returned_reference_count"), maximum=1000)
+        retained_count = _bounded_count(item.get("retained_reference_count"), maximum=1000)
+        if (
+            not isinstance(source_id, str)
+            or _SAFE_SOURCE_ID.fullmatch(source_id) is None
+            or source_id in observed_ids
+            or display_name is None
+            or not isinstance(connector, str)
+            or _SAFE_IDENTIFIER.fullmatch(connector) is None
+            or authority_role not in {"authoritative", "supplemental", "unknown"}
+            or not isinstance(domain_tags, list)
+            or len(domain_tags) > 8
+            or any(
+                not isinstance(tag, str) or _SAFE_IDENTIFIER.fullmatch(tag) is None
+                for tag in domain_tags
+            )
+            or len(domain_tags) != len(set(domain_tags))
+            or any(
+                not isinstance(item.get(field), bool)
+                for field in ("considered", "selected", "used")
+            )
+            or returned_count is None
+            or retained_count is None
+            or retained_count > returned_count
+            or not isinstance(locations, list)
+            or len(locations) > 8
+            or any(_safe_source_summary_text(label, maximum=240) is None for label in locations)
+            or len(locations) != len(set(locations))
+            or not isinstance(reasons, list)
+            or len(reasons) > 7
+            or any(code not in _SOURCE_SUMMARY_REASON_CODES for code in reasons)
+            or len(reasons) != len(set(reasons))
+        ):
+            return None
+        returned_refs = returned_by_source.get(source_id, set())
+        retained_refs = retained_by_source.get(source_id, set())
+        if (
+            item["considered"] != (source_id in (considered or set()))
+            or item["selected"] != (source_id in (selected or set()))
+            or item["used"] != (source_id in (used or set()))
+            or returned_count != len(returned_refs)
+            or retained_count != len(retained_refs)
+            or tuple(locations) != _google_sheets_location_labels(source_id, retained_refs)
+        ):
+            return None
+        observed_ids.add(source_id)
+        summaries.append(
+            SourceHistorySummary(
+                source_id=source_id,
+                display_name=display_name,
+                connector=connector,
+                authority_role=authority_role,
+                domain_tags=tuple(domain_tags),
+                considered=item["considered"],
+                selected=item["selected"],
+                used=item["used"],
+                returned_reference_count=returned_count,
+                retained_reference_count=retained_count,
+                safe_location_labels=tuple(locations),
+                contribution_reason_codes=tuple(reasons),
+            )
+        )
+    if observed_ids != expected_ids:
+        return None
+    if raw != sorted(raw, key=lambda item: (item["display_name"].casefold(), item["source_id"])):
+        return None
+    return tuple(summaries)
 
 
 def _identity_projection(
@@ -1655,6 +1992,20 @@ def _diagnose_acquisition_history_projection(
     ):
         return reject("exact_unsuccessful_reference_set_mismatch")
 
+    source_summaries = _project_source_summaries(
+        acquisition,
+        suppressed=suppressed,
+        considered=considered_values,
+        selected=selected_values,
+        used=used_values,
+        returned=returned_values,
+        retained=retained_values,
+        unavailable=identity_values["unavailable_source_ids"][1],
+        failed=identity_values["failed_source_ids"][1],
+    )
+    if source_summaries is None:
+        return reject("source_summaries_invalid")
+
     acquisition_counts: dict[str, int] = {}
     for field in (
         "item_count",
@@ -1926,6 +2277,7 @@ def _diagnose_acquisition_history_projection(
         identifiers_suppressed=suppressed,
         changed_premise_exact_follow_up=changed_follow_up,
         final_next_step=final_next_step,
+        source_summaries=source_summaries,
     )
     return AcquisitionHistoryProjection(history=history, reason="accepted")
 
@@ -1942,9 +2294,9 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
     counts = history.counts
     sentences = []
     for field, singular in (
-        ("unavailable_source_count", "configured source was unavailable"),
-        ("disabled_source_count", "configured source was disabled"),
-        ("unknown_source_count", "configured source had unknown availability"),
+        ("unavailable_source_count", "source was unavailable"),
+        ("disabled_source_count", "source was disabled"),
+        ("unknown_source_count", "source had unknown availability"),
     ):
         count = counts[field]
         if count:
@@ -1959,54 +2311,60 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
             "returned reference was",
             "returned references were",
         )
-        sentences.append(
-            f"{omitted} filtered or omitted before reasoning."
-        )
+        sentences.append(f"{omitted} not used in the earlier answer.")
     for field, singular, plural in (
-        ("exact_failed", "exact fetch failed", "exact fetches failed"),
-        ("exact_unknown", "exact fetch returned no result", "exact fetches returned no result"),
+        (
+            "exact_failed",
+            "requested item could not be retrieved",
+            "requested items could not be retrieved",
+        ),
+        (
+            "exact_unknown",
+            "requested item returned no result",
+            "requested items returned no result",
+        ),
         (
             "exact_filtered",
-            "exact fetch response was filtered",
-            "exact fetch responses were filtered",
+            "requested item was not used",
+            "requested items were not used",
         ),
-        ("exact_truncated", "exact fetch was truncated", "exact fetches were truncated"),
+        ("exact_truncated", "requested item was truncated", "requested items were truncated"),
     ):
         count = counts[field]
         if count:
             sentences.append(f"{_count_phrase(count, singular, plural)}.")
     for field, singular, plural in (
-        ("expansion_failed", "context expansion failed", "context expansions failed"),
+        ("expansion_failed", "broader source check failed", "broader source checks failed"),
         (
             "expansion_unknown",
-            "context expansion had an unknown outcome",
-            "context expansions had unknown outcomes",
+            "broader source check had an unknown outcome",
+            "broader source checks had unknown outcomes",
         ),
         (
             "expansion_filtered",
-            "context expansion was filtered",
-            "context expansions were filtered",
+            "broader source check was not used",
+            "broader source checks were not used",
         ),
         (
             "expansion_truncated",
-            "context expansion was truncated",
-            "context expansions were truncated",
+            "broader source check was truncated",
+            "broader source checks were truncated",
         ),
         (
             "expansion_unsupported",
-            "context expansion was unsupported",
-            "context expansions were unsupported",
+            "broader source check was unavailable",
+            "broader source checks were unavailable",
         ),
     ):
         count = counts[field]
         if count:
             sentences.append(f"{_count_phrase(count, singular, plural)}.")
     if history.inventory_status == "partial":
-        sentences.append("The retained source inventory was partial.")
+        sentences.append("The available source list was incomplete.")
     elif history.inventory_status == "unknown":
-        sentences.append("The completeness of the retained source inventory was unknown.")
+        sentences.append("It was not known whether the available source list was complete.")
     elif history.inventory_status == "unavailable":
-        sentences.append("The retained source inventory was unavailable.")
+        sentences.append("The source list was unavailable.")
     configured_scope_expansion_completed = (
         history.task_shape == "bounded_exhaustive_review"
         and history.strategy == "hybrid"
@@ -2017,23 +2375,73 @@ def _limitation_sentences(history: AcquisitionHistory) -> list[str]:
     )
     if history.budget_truncated:
         sentences.append(
-            "The preliminary seed search was truncated, but the configured-scope "
-            "expansion completed without truncation."
+            "The preliminary search was truncated, but the complete requested-source "
+            "check finished without truncation."
             if configured_scope_expansion_completed
-            else "Acquisition was truncated by the retrieval budget."
+            else "The lookup was truncated by its result limit."
         )
     if history.candidate_truncated:
         sentences.append(
-            "Preliminary seed candidate selection was truncated."
+            "The preliminary candidate list was truncated."
             if configured_scope_expansion_completed
-            else "Candidate selection was truncated."
+            else "The candidate list was truncated."
         )
     if (
         "optional_source_unavailable" in history.limitation_codes
         and not counts["unavailable_source_count"]
     ):
-        sentences.append("Optional source scope was unavailable.")
+        sentences.append("An optional source was unavailable.")
     return sentences
+
+
+def _source_summary_lines(
+    history: AcquisitionHistory,
+    *,
+    gaps_only: bool = False,
+) -> list[str]:
+    lines = []
+    for source in history.source_summaries:
+        location = (
+            f" — {'; '.join(source.safe_location_labels)}"
+            if source.safe_location_labels
+            else ""
+        )
+        details = []
+        reasons = set(source.contribution_reason_codes)
+        gap_reasons = {
+            "returned_records_not_retained",
+            "selected_no_result",
+            "considered_not_selected",
+            "source_unavailable",
+            "source_disabled",
+        }
+        if gaps_only and not reasons & gap_reasons:
+            continue
+        if source.retained_reference_count:
+            details.append(
+                f"contributed {_count_phrase(source.retained_reference_count, 'record')} "
+                "used in the earlier answer"
+            )
+        if "returned_records_not_retained" in reasons:
+            omitted = source.returned_reference_count - source.retained_reference_count
+            if omitted:
+                details.append(
+                    f"returned {_count_phrase(omitted, 'additional record')} that was not used"
+                )
+        if "selected_no_result" in reasons:
+            details.append("was checked but returned no records")
+        if "considered_not_selected" in reasons:
+            details.append("was considered but not selected for the lookup")
+        if "exact_reference_retrieved" in reasons:
+            details.append("included the exact requested reference")
+        if "source_unavailable" in reasons:
+            details.append("was unavailable during the original lookup")
+        if "source_disabled" in reasons:
+            details.append("was disabled during the original lookup")
+        if not details:
+            details.append("was part of the original source scope")
+        lines.append(f"- {source.display_name}{location}: {'; '.join(details)}.")
+    return lines
 
 
 def _render_acquisition(
@@ -2043,149 +2451,85 @@ def _render_acquisition(
     include_no_new_verification: bool = True,
 ) -> str:
     counts = history.counts
-    sentences: list[str] = []
+    exhaustive = history.task_shape == "bounded_exhaustive_review"
+    complete_scope = (
+        exhaustive
+        and history.sufficiency_status == "sufficient_for_declared_scope"
+        and not history.budget_truncated
+        and not history.candidate_truncated
+    )
     if question == "coverage":
-        if (
-            history.task_shape == "bounded_exhaustive_review"
-            and history.sufficiency_status == "sufficient_for_declared_scope"
-        ):
-            sentences.append(
-                "Within the declared bounded scope, yes. That does not establish "
-                "universal coverage beyond it."
-            )
-        else:
-            sentences.append("No—not universally.")
+        opening = (
+            "Yes—within the requested source set, but not beyond it."
+            if complete_scope
+            else "No. The original lookup did not cover every possible source."
+        )
     elif question == "gaps":
-        sentences.append(
-            "The retained record cannot identify unknown evidence outside its declared "
-            "source scope."
+        opening = "Known gaps from the original lookup:"
+    else:
+        opening = "I checked:"
+
+    lines = [opening]
+    if history.identifiers_suppressed:
+        lines.append(
+            "The saved explanation covers "
+            f"{_count_phrase(counts['sources_considered'], 'source')}, "
+            "but it does not include source names or locations."
+        )
+        if counts["references_retained"]:
+            verb = "was" if counts["references_retained"] == 1 else "were"
+            lines.append(
+                f"{_count_phrase(counts['references_retained'], 'record')} "
+                f"{verb} used in the earlier answer."
+            )
+    else:
+        lines.extend(
+            _source_summary_lines(history, gaps_only=question == "gaps")
         )
 
-    if history.changed_premise_exact_follow_up:
-        sentences.append(
-            "The original turn first performed a targeted lookup and then one "
-            "authorized changed-premise exact fetch."
-        )
-
-    if (
-        history.task_shape == "ordinary_context_augmentation"
-        and history.strategy == "context_augmentation"
-    ):
-        sentences.append(
-            "For that earlier answer, the retained record shows ordinary external "
-            f"context augmentation. It considered "
-            f"{_count_phrase(counts['sources_considered'], 'configured source')}, "
-            f"selected {counts['sources_selected']}, returned "
-            f"{_count_phrase(counts['references_returned'], 'item')}, and delivered "
-            f"{counts['references_retained']} to reasoning."
-        )
-        sufficient_scope = "the ordinary external-context request"
+    if history.task_shape == "ordinary_context_augmentation":
         boundary = (
-            "This was not a governed exhaustive review, and evidence sufficiency "
-            "was not evaluated."
-        )
-    elif (
-        history.task_shape == "targeted_lookup"
-        and history.strategy == "targeted_retrieval"
-    ):
-        sentences.append(
-            "For that earlier answer, the retained record shows a targeted lookup. "
-            f"It considered {_count_phrase(counts['sources_considered'], 'configured source')}, "
-            f"selected {counts['sources_selected']}, returned "
-            f"{_count_phrase(counts['references_returned'], 'item')}, and delivered "
-            f"{counts['references_retained']} to reasoning."
-        )
-        sufficient_scope = "the declared targeted scope"
-        boundary = (
-            "This was not an exhaustive review of every potentially relevant source."
+            "This was a normal source lookup for the earlier answer, not a complete "
+            "review of every possible source."
         )
     elif history.task_shape == "targeted_lookup" and history.strategy == "exact_fetch":
-        attempt_count = counts["exact_attempts"]
-        sentences.append(
-            "For that earlier answer, the retained record shows "
-            + (
-                "an exact fetch for 1 specified reference."
-                if attempt_count == 1
-                else f"exact fetches for {attempt_count} specified references."
-            )
-            + " "
-            + (
-                "It was retrieved and delivered to reasoning."
-                if counts["exact_successful"] == 1
-                and counts["references_retained"] == 1
-                else (
-                    f"{counts['exact_successful']} were retrieved and "
-                    f"{counts['references_retained']} were delivered to reasoning."
-                )
-            )
-        )
-        sufficient_scope = "that declared exact-reference scope"
         boundary = (
-            "Sources or references outside that supplied scope were not established "
-            "as examined."
+            "Only the specifically requested records were checked; other sources were "
+            "outside the original request."
         )
-    elif history.task_shape == "cross_source_comparison" and history.strategy == "hybrid":
-        sentences.append(
-            "For that earlier answer, the retained record shows a bounded comparison "
-            f"across {counts['sources_selected']} selected configured sources from "
-            f"{counts['sources_considered']} considered. It attempted "
-            f"{_count_phrase(counts['expansion_attempts'], 'context expansion')}, "
-            f"returned {_count_phrase(counts['references_returned'], 'reference')}, "
-            f"and delivered {counts['references_retained']} to reasoning."
-        )
-        sufficient_scope = "the selected-source comparison scope"
+    elif history.task_shape == "targeted_lookup":
         boundary = (
-            "Only the selected sources and delivered bounded context were examined; "
-            "this was not a comparison of every possible source."
+            "This was limited to the targeted sources, not every potentially relevant "
+            "source."
         )
-    elif history.task_shape == "bounded_exhaustive_review" and history.strategy == "hybrid":
-        sentences.append(
-            "For that earlier answer, the retained record shows a bounded exhaustive "
-            f"review of the declared configured scope. It considered "
-            f"{_count_phrase(counts['sources_considered'], 'configured source')}, "
-            f"selected {counts['sources_selected']}, returned "
-            f"{_count_phrase(counts['references_returned'], 'reference')}, and "
-            f"delivered {counts['references_retained']} to reasoning."
-        )
-        sufficient_scope = "the declared bounded source scope"
+    elif history.task_shape == "cross_source_comparison":
         boundary = (
-            "Completeness applies only within that declared bounded scope, not to "
-            "sources outside it."
+            "The comparison covered the selected sources only, not every possible source."
+        )
+    elif exhaustive:
+        boundary = (
+            "Coverage applies only to the requested source set, not to sources outside it."
         )
     else:
         raise ValueError("unsupported_acquisition_history_composition")
 
-    if history.sufficiency_status == "not_evaluated":
-        pass
-    elif history.sufficiency_status == "sufficient_for_declared_scope":
-        sentences.append(f"The recorded evidence was sufficient for {sufficient_scope}.")
-    elif history.sufficiency_status == "sufficient_with_limitations":
-        sentences.append(
-            "The recorded evidence was sufficient only with recorded limitations."
-        )
-    elif history.sufficiency_status == "insufficient":
-        sentences.append(
-            "The record marked the evidence insufficient, so the requested conclusion "
-            "was not established."
-        )
+    limitations = _limitation_sentences(history)
+    if question == "gaps" and not limitations:
+        lines.append(f"- {boundary}")
     else:
-        sentences.append(
-            "The record left evidence sufficiency unknown, so the requested conclusion "
-            "was not established."
+        lines.extend(limitations)
+        lines.append(boundary)
+    if history.sufficiency_status == "sufficient_with_limitations":
+        lines.append("The earlier answer was usable only with those limits.")
+    elif history.sufficiency_status in {"insufficient", "unknown"}:
+        lines.append("The original lookup did not establish the requested conclusion.")
+    if history.changed_premise_exact_follow_up:
+        lines.append(
+            "The original request included one additional exact check after its first lookup."
         )
-    sentences.extend(_limitation_sentences(history))
-    if history.final_next_step == "ask_narrow_clarification":
-        sentences.append("The recorded next step was a narrow clarification.")
-    elif history.final_next_step == "disclose_unexamined_scope":
-        sentences.append("The recorded next step was to disclose unexamined scope.")
-    elif history.final_next_step == "withhold_unsupported_conclusion":
-        sentences.append("The recorded next step was to withhold the unsupported conclusion.")
-    elif history.final_next_step == "provide_qualified_partial_answer":
-        sentences.append("The recorded next step was a qualified partial response.")
-    sentences.append(boundary)
     if include_no_new_verification:
-        sentences.append(_NO_NEW_VERIFICATION)
-    return " ".join(sentences)
+        lines.append(_NO_NEW_VERIFICATION)
+    return "\n".join(lines)
 
 
 def _acquisition_resolution_trace(
