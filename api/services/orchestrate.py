@@ -6475,11 +6475,35 @@ async def orchestrate_chat(
             "sources": [],
         }
 
-    resolved = await memory_store.resolve_conversation(
-        owner_id=payload["owner_id"],
-        client_id=payload.get("client_id"),
-    )
-    conversation_id = payload.get("conversation_id") or resolved["conversation_id"]
+    supplied_conversation_id = payload.get("conversation_id")
+    if supplied_conversation_id is not None:
+        try:
+            conversation = await memory_store.get_conversation(
+                conversation_id=supplied_conversation_id,
+                owner_id=payload["owner_id"],
+            )
+            if conversation.get("lifecycle_state") != "open":
+                raise RuntimeError("conversation_not_open")
+        except Exception:
+            return {
+                "request_id": request_id,
+                "conversation_id": supplied_conversation_id,
+                "profile_name": "unresolved",
+                "selected_model": "not_called",
+                "answer": (
+                    "I could not continue that conversation safely. "
+                    "No retained conversation content was used."
+                ),
+                "status": "failed",
+                "sources": [],
+            }
+        conversation_id = supplied_conversation_id
+    else:
+        resolved = await memory_store.resolve_conversation(
+            owner_id=payload["owner_id"],
+            client_id=payload.get("client_id"),
+        )
+        conversation_id = resolved["conversation_id"]
 
     last_user_text = _extract_last_user_text(payload["messages"])
     recent_messages = _bounded_recent_messages(payload["messages"])

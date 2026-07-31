@@ -67,7 +67,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: 97877bd9da315af2a1cb5e9437ade13d3ee9d2e6
+          ref: e0a2f5294fd9ffd289dee002b68f7d0d4a41215f
           path: basic-memory-store
           fetch-depth: 0
 
@@ -75,7 +75,7 @@ jobs:
         run: |
           git -C cognitive-runtime branch --force main f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67
           git -C data-source-aggregator branch --force main e23f582e4aac32a12c7ad3c71278fc21e5697ea4
-          git -C basic-memory-store branch --force main 97877bd9da315af2a1cb5e9437ade13d3ee9d2e6
+          git -C basic-memory-store branch --force main e0a2f5294fd9ffd289dee002b68f7d0d4a41215f
           git -C chat-orchestrator merge-base --is-ancestor 19dfdd9b58fc7ce87152c0009143d23caea03b03 HEAD
 
       - name: Validate Compose configuration

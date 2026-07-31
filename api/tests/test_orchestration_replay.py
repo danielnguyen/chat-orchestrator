@@ -18,6 +18,164 @@ async def _snapshot_for_scenario(name: str):
     return await run_scenario(fixture)
 
 
+def _exact_conversation_projection(**overrides):
+    projection = {
+        "conversation_id": "00000000-0000-4000-8000-000000000001",
+        "owner_id": "owner",
+        "client_id": "origin-client",
+        "title": "Current conversation",
+        "lifecycle_state": "open",
+        "superseded_by_conversation_id": None,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-02T00:00:00+00:00",
+    }
+    projection.update(overrides)
+    return projection
+
+
+@pytest.mark.asyncio
+async def test_memory_store_client_gets_exact_owner_scoped_open_conversation():
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = {}
+    projection = _exact_conversation_projection()
+
+    async def fake_get(path, *, params=None):
+        captured.update({"path": path, "params": params})
+        return projection
+
+    client._get = fake_get  # type: ignore[method-assign]
+    result = await client.get_conversation(
+        conversation_id="00000000-0000-4000-8000-000000000001",
+        owner_id="owner",
+    )
+
+    assert captured == {
+        "path": "/v1/conversations/00000000-0000-4000-8000-000000000001",
+        "params": {"owner_id": "owner"},
+    }
+    assert result == projection
+
+
+@pytest.mark.asyncio
+async def test_memory_store_client_accepts_canonical_equivalent_conversation_id():
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_get(path, *, params=None):
+        return _exact_conversation_projection(
+            conversation_id="00000000-0000-4000-8000-00000000000a"
+        )
+
+    client._get = fake_get  # type: ignore[method-assign]
+    result = await client.get_conversation(
+        conversation_id="{00000000-0000-4000-8000-00000000000A}",
+        owner_id="owner",
+    )
+
+    assert result["conversation_id"] == "00000000-0000-4000-8000-00000000000a"
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        _exact_conversation_projection(conversation_id="other-conversation"),
+        _exact_conversation_projection(owner_id="other-owner"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_memory_store_client_rejects_exact_conversation_context_mismatch(projection):
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_get(path, *, params=None):
+        return projection
+
+    client._get = fake_get  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="^conversation_projection_context_mismatch$"):
+        await client.get_conversation(
+            conversation_id="00000000-0000-4000-8000-000000000001",
+            owner_id="owner",
+        )
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        "PRIVATE-CONVERSATION-PROJECTION-SENTINEL",
+        {},
+        _exact_conversation_projection(client_id=1),
+        _exact_conversation_projection(title=[]),
+        _exact_conversation_projection(created_at=None),
+        _exact_conversation_projection(updated_at={}),
+        _exact_conversation_projection(lifecycle_state="unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_memory_store_client_rejects_malformed_conversation_projection(projection):
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_get(path, *, params=None):
+        return projection
+
+    client._get = fake_get  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="^conversation_projection_invalid$"):
+        await client.get_conversation(
+            conversation_id="00000000-0000-4000-8000-000000000001",
+            owner_id="owner",
+        )
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        _exact_conversation_projection(
+            lifecycle_state="open",
+            superseded_by_conversation_id="replacement-conversation",
+        ),
+        _exact_conversation_projection(
+            lifecycle_state="closed",
+            superseded_by_conversation_id="replacement-conversation",
+        ),
+        _exact_conversation_projection(lifecycle_state="superseded"),
+        _exact_conversation_projection(
+            lifecycle_state="superseded",
+            superseded_by_conversation_id="",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_memory_store_client_rejects_incoherent_conversation_lifecycle(projection):
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_get(path, *, params=None):
+        return projection
+
+    client._get = fake_get  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="^conversation_projection_invalid$"):
+        await client.get_conversation(
+            conversation_id="00000000-0000-4000-8000-000000000001",
+            owner_id="owner",
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_store_client_exact_lookup_errors_do_not_copy_response_material():
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_get(path, *, params=None):
+        return _exact_conversation_projection(
+            client_id={"private": "PRIVATE-CONVERSATION-PROJECTION-SENTINEL"}
+        )
+
+    client._get = fake_get  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError) as exc:
+        await client.get_conversation(
+            conversation_id="00000000-0000-4000-8000-000000000001",
+            owner_id="owner",
+        )
+
+    assert str(exc.value) == "conversation_projection_invalid"
+    assert "PRIVATE-CONVERSATION-PROJECTION-SENTINEL" not in str(exc.value)
+
+
 @pytest.mark.asyncio
 async def test_memory_store_client_rejects_retrieval_request_id_mismatch():
     client = MemoryStoreClient("http://memory.local", "key")

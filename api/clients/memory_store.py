@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import httpx
 
@@ -53,6 +54,49 @@ class MemoryStoreClient:
             "/v1/conversations/resolve",
             json={"owner_id": owner_id, "client_id": client_id, "title": title},
         )
+
+    async def get_conversation(
+        self,
+        *,
+        conversation_id: str,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        response = await self._get(
+            f"/v1/conversations/{conversation_id}",
+            params={"owner_id": owner_id},
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("conversation_projection_invalid")
+
+        response_conversation_id = response.get("conversation_id")
+        response_owner_id = response.get("owner_id")
+        if not isinstance(response_conversation_id, str) or not isinstance(
+            response_owner_id, str
+        ):
+            raise RuntimeError("conversation_projection_invalid")
+        if not _conversation_ids_equivalent(response_conversation_id, conversation_id):
+            raise RuntimeError("conversation_projection_context_mismatch")
+        if response_owner_id != owner_id:
+            raise RuntimeError("conversation_projection_context_mismatch")
+
+        lifecycle_state = response.get("lifecycle_state")
+        if lifecycle_state not in {"open", "closed", "superseded"}:
+            raise RuntimeError("conversation_projection_invalid")
+        replacement = response.get("superseded_by_conversation_id")
+        if lifecycle_state == "superseded":
+            if not isinstance(replacement, str) or not replacement.strip():
+                raise RuntimeError("conversation_projection_invalid")
+        elif replacement is not None:
+            raise RuntimeError("conversation_projection_invalid")
+
+        for field in ("client_id", "title"):
+            if response.get(field) is not None and not isinstance(response.get(field), str):
+                raise RuntimeError("conversation_projection_invalid")
+        if not isinstance(response.get("created_at"), str) or not isinstance(
+            response.get("updated_at"), str
+        ):
+            raise RuntimeError("conversation_projection_invalid")
+        return response
 
     async def add_message(
         self,
@@ -292,3 +336,14 @@ class MemoryStoreClient:
         ):
             raise RuntimeError("immediate_history_response_context_mismatch")
         return response
+
+
+def _conversation_ids_equivalent(actual: Any, expected: str) -> bool:
+    if not isinstance(actual, str):
+        return False
+    if actual == expected:
+        return True
+    try:
+        return UUID(actual) == UUID(expected)
+    except (TypeError, ValueError):
+        return False

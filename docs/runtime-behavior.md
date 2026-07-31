@@ -6,7 +6,7 @@ This document describes the current `POST /v1/chat` orchestration path and its i
 
 For each chat request, Chat Orchestrator:
 
-1. resolves or creates a conversation through Basic Memory Store;
+1. validates a supplied conversation or resolves an omitted conversation through Basic Memory Store;
 2. resolves the active profile and retrieves bounded conversation context;
 3. optionally retrieves external read-only context from Data Source Aggregator;
 4. resolves enabled Cognitive Runtime context and policy decisions;
@@ -18,6 +18,27 @@ For each chat request, Chat Orchestrator:
 10. returns the answer, routing status, public sources, and any pending action.
 
 Optional integrations are non-authoritative unless their owning policy explicitly supplies a decision. Registration or availability alone does not grant an action permission.
+
+## Conversation resolution
+
+When a request supplies `conversation_id`, Chat Orchestrator performs one exact
+Basic Memory Store lookup scoped to the request owner. It does not first invoke
+the same-client resolver. Only an exact open conversation proceeds. Missing,
+owner-mismatched, closed, superseded, malformed, or unavailable targets return
+one bounded failure before message append, retrieval, profile resolution,
+Cognitive Runtime calls, provider calls, capability or connector work, and trace
+persistence. That response does not reveal whether the conversation exists, its
+lifecycle state, or retained conversation content, and a superseded replacement
+is not followed.
+
+The conversation's originating client may differ from the current request
+client. A valid continuation appends new messages with the current `client_id`
+and current surface metadata while leaving historical provenance unchanged.
+
+When `conversation_id` is omitted, Chat Orchestrator retains the existing
+same-owner, same-client rolling resolver for compatibility. Omitted-ID
+continuation selection is not part of the current behavior. Cognitive Runtime
+turn admission also retains its current position after user-message persistence.
 
 ## File-backed retrieval
 
