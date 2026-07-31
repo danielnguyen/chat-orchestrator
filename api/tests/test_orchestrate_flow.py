@@ -114,13 +114,42 @@ def _collect_keys(value):
 
 class FakeMemoryStore:
     def __init__(self):
+        self.resolve_conversation_calls = []
+        self.exact_conversation_calls = []
+        self.exact_conversation_response = None
+        self.exact_conversation_error = None
         self.added_messages = []
         self.retrieve_calls = []
+        self.profile_calls = []
         self.trace_calls = []
         self.claim_record_calls = []
 
     async def resolve_conversation(self, **kwargs):
+        self.resolve_conversation_calls.append(kwargs)
         return {"conversation_id": "conv-1", "reused": False}
+
+    async def get_conversation(self, **kwargs):
+        self.exact_conversation_calls.append(kwargs)
+        if self.exact_conversation_error is not None:
+            raise self.exact_conversation_error
+        if self.exact_conversation_response is not None:
+            response = copy.deepcopy(self.exact_conversation_response)
+            if isinstance(response, dict) and (
+                response.get("conversation_id") != kwargs["conversation_id"]
+                or response.get("owner_id") != kwargs["owner_id"]
+            ):
+                raise RuntimeError("conversation_projection_context_mismatch")
+            return response
+        return {
+            "conversation_id": kwargs["conversation_id"],
+            "owner_id": kwargs["owner_id"],
+            "client_id": "origin-client",
+            "title": None,
+            "lifecycle_state": "open",
+            "superseded_by_conversation_id": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
 
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
@@ -232,6 +261,7 @@ class FakeMemoryStore:
         }
 
     async def resolve_profile(self, **kwargs):
+        self.profile_calls.append(kwargs)
         return {
             "profile_name": "dev",
             "source": "global_default",
@@ -1914,6 +1944,273 @@ def _base_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _conversation_projection(
+    conversation_id="shared-conversation",
+    *,
+    owner_id="owner",
+    client_id="origin-client",
+    lifecycle_state="open",
+    superseded_by_conversation_id=None,
+):
+    return {
+        "conversation_id": conversation_id,
+        "owner_id": owner_id,
+        "client_id": client_id,
+        "title": None,
+        "lifecycle_state": lifecycle_state,
+        "superseded_by_conversation_id": superseded_by_conversation_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
+def _conversation_lookup_http_error(status_code):
+    request = httpx.Request(
+        "GET",
+        "http://memory.local/v1/conversations/shared-conversation",
+    )
+    response = httpx.Response(
+        status_code,
+        json={"detail": "PRIVATE-CONVERSATION-LOOKUP-SENTINEL"},
+        request=request,
+    )
+    return httpx.HTTPStatusError(
+        "PRIVATE-CONVERSATION-LOOKUP-SENTINEL",
+        request=request,
+        response=response,
+    )
+
+
+@pytest.mark.asyncio
+async def test_supplied_open_conversation_uses_exact_lookup_without_resolver(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection()
+    runtime = FakeRuntime()
+    provider = FakeLiteLLM(content="continued response")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="shared-conversation"),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-supplied-open",
+    )
+
+    assert result["status"] == "ok"
+    assert result["conversation_id"] == "shared-conversation"
+    assert memory_store.exact_conversation_calls == [
+        {"conversation_id": "shared-conversation", "owner_id": "owner"}
+    ]
+    assert memory_store.resolve_conversation_calls == []
+    assert {item["conversation_id"] for item in memory_store.added_messages} == {
+        "shared-conversation"
+    }
+    assert memory_store.retrieve_calls[0]["conversation_id"] == "shared-conversation"
+    assert runtime.turn_start_calls[0]["conversation_id"] == "shared-conversation"
+    assert len(provider.calls) == 1
+    assert memory_store.trace_calls[0]["payload"]["conversation_id"] == (
+        "shared-conversation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_supplied_open_conversation_keeps_current_client_and_surface(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        client_id="origin-client"
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            client_id="current-client",
+            surface="voice",
+            conversation_id="shared-conversation",
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(content="continued response"),
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-current-provenance",
+    )
+
+    assert result["status"] == "ok"
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.exact_conversation_calls == [
+        {"conversation_id": "shared-conversation", "owner_id": "owner"}
+    ]
+    assert all(message["client_id"] == "current-client" for message in memory_store.added_messages)
+    user_message = next(
+        message for message in memory_store.added_messages if message["role"] == "user"
+    )
+    assert user_message["conversation_id"] == "shared-conversation"
+    assert user_message["metadata"]["surface"] == "voice"
+
+
+@pytest.mark.asyncio
+async def test_omitted_conversation_keeps_same_client_resolution(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-omitted-conversation",
+    )
+
+    assert result["status"] == "ok"
+    assert result["conversation_id"] == "conv-1"
+    assert memory_store.exact_conversation_calls == []
+    assert memory_store.resolve_conversation_calls == [
+        {"owner_id": "owner", "client_id": "vscode"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_capability_validation_failure_remains_unchanged(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="shared-conversation",
+            capability_confirmation={"pending_action": {}, "confirmed": True},
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=FakeRuntime(),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-invalid-capability-confirmation",
+    )
+
+    assert result == {
+        "request_id": "request-invalid-capability-confirmation",
+        "conversation_id": "shared-conversation",
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": "I could not use that capability confirmation safely. No action was taken.",
+        "status": "failed",
+        "sources": [],
+    }
+    assert memory_store.exact_conversation_calls == []
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.added_messages == []
+
+
+@pytest.mark.parametrize(
+    ("exact_response", "exact_error"),
+    [
+        (
+            _conversation_projection(lifecycle_state="closed"),
+            None,
+        ),
+        (
+            _conversation_projection(
+                lifecycle_state="superseded",
+                superseded_by_conversation_id="replacement-conversation",
+            ),
+            None,
+        ),
+        (None, _conversation_lookup_http_error(404)),
+        (None, _conversation_lookup_http_error(422)),
+        (None, _conversation_lookup_http_error(503)),
+        (None, httpx.ReadTimeout("PRIVATE-CONVERSATION-LOOKUP-SENTINEL")),
+        ("PRIVATE-CONVERSATION-PROJECTION-SENTINEL", None),
+        (_conversation_projection(conversation_id="other-conversation"), None),
+        (_conversation_projection(owner_id="other-owner"), None),
+        (None, RuntimeError("PRIVATE-CONVERSATION-LOOKUP-SENTINEL")),
+        (
+            _conversation_projection(lifecycle_state="unknown"),
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_supplied_conversation_failures_share_bounded_side_effect_free_response(
+    tmp_path,
+    exact_response,
+    exact_error,
+):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = exact_response
+    memory_store.exact_conversation_error = exact_error
+    runtime = FakeRuntime()
+    provider = FakeLiteLLM(content="PRIVATE-RETAINED-CONTENT-SENTINEL")
+    dsa = FakeDSA(response={"items": [{"text": "PRIVATE-RETAINED-CONTENT-SENTINEL"}]})
+    operations = DisplaySettingOperations()
+    connector = DisplaySettingConnector(operations)
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="shared-conversation",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        capability_registry_enabled=True,
+        action_connector_registry=ActionConnectorRegistry((connector,)),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-supplied-unavailable",
+    )
+
+    assert result == {
+        "request_id": "request-supplied-unavailable",
+        "conversation_id": "shared-conversation",
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": (
+            "I could not continue that conversation safely. "
+            "No retained conversation content was used."
+        ),
+        "status": "failed",
+        "sources": [],
+    }
+    assert memory_store.exact_conversation_calls == [
+        {"conversation_id": "shared-conversation", "owner_id": "owner"}
+    ]
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.added_messages == []
+    assert memory_store.retrieve_calls == []
+    assert memory_store.profile_calls == []
+    assert memory_store.trace_calls == []
+    assert memory_store.claim_record_calls == []
+    assert runtime.call_order == []
+    assert provider.calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert operations.apply_inputs == []
+    assert connector.verify_inputs == []
+    serialized = json.dumps(result).lower()
+    assert "private-retained-content-sentinel" not in serialized
+    assert "private-conversation" not in serialized
+    assert "closed" not in serialized
+    assert "superseded" not in serialized
+    assert "missing" not in serialized
+    assert "owner mismatch" not in serialized
+    assert "replacement" not in serialized
 
 
 def _privacy_runtime_response(
