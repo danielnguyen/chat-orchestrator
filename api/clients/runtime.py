@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -36,6 +37,23 @@ _HISTORY_PROJECTION = {
     "acquisition_gaps": ("acquisition", "gaps"),
     "new_verification_request": ("support", None),
 }
+
+
+def _bounded_runtime_identifier(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and len(value) <= 120
+
+
+def _optional_uuid_ids_equivalent(actual: Any, expected: str | None) -> bool:
+    if expected is None:
+        return actual is None
+    if not isinstance(actual, str):
+        return False
+    if actual == expected:
+        return True
+    try:
+        return UUID(actual) == UUID(expected)
+    except (TypeError, ValueError):
+        return False
 
 
 class _HistoryFollowupPolicy(BaseModel):
@@ -468,7 +486,44 @@ class RuntimeClient:
             payload["input_message_id"] = input_message_id
         if intent_class is not None:
             payload["intent_class"] = intent_class
-        return await self._post("/v1/runtime/turns/start", json=payload)
+        response = await self._post("/v1/runtime/turns/start", json=payload)
+        if not isinstance(response, dict):
+            raise RuntimeError("runtime_turn_response_invalid")
+        session = response.get("runtime_session")
+        turn = response.get("runtime_turn")
+        if not isinstance(session, dict) or not isinstance(turn, dict):
+            raise RuntimeError("runtime_turn_response_invalid")
+
+        runtime_session_id = session.get("runtime_session_id")
+        runtime_turn_id = turn.get("runtime_turn_id")
+        if not _bounded_runtime_identifier(runtime_session_id) or not _bounded_runtime_identifier(
+            runtime_turn_id
+        ):
+            raise RuntimeError("runtime_turn_response_invalid")
+        if (
+            session.get("owner_id") != owner_id
+            or session.get("conversation_id") != conversation_id
+            or session.get("surface") != surface
+            or turn.get("runtime_session_id") != runtime_session_id
+            or not _optional_uuid_ids_equivalent(
+                turn.get("input_message_id"), input_message_id
+            )
+        ):
+            raise RuntimeError("runtime_turn_response_context_mismatch")
+        if turn.get("turn_status") not in {"received", "retrieving", "responding"}:
+            raise RuntimeError("runtime_turn_response_invalid")
+
+        event = response.get("event")
+        if event is not None:
+            if not isinstance(event, dict):
+                raise RuntimeError("runtime_turn_response_invalid")
+            if (
+                event.get("runtime_session_id") != runtime_session_id
+                or event.get("runtime_turn_id") != runtime_turn_id
+                or event.get("event_type") != "turn_started"
+            ):
+                raise RuntimeError("runtime_turn_response_context_mismatch")
+        return response
 
     async def update_turn(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -13,6 +14,7 @@ _calls: dict[str, list[dict[str, Any]]] = defaultdict(list)
 _fail_primary: set[str] = set()
 _primary_failed: set[str] = set()
 _fail_next_primary = False
+_next_primary_delay_ms = 0
 _watched_sentinels: dict[str, str] = {}
 _next_answers: list[str] = []
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -61,6 +63,11 @@ async def chat_completions(
     body: dict[str, Any],
     x_request_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    global _next_primary_delay_ms
+    delay_ms = _next_primary_delay_ms
+    _next_primary_delay_ms = 0
+    if delay_ms:
+        await asyncio.sleep(delay_ms / 1000)
     request_id = x_request_id or "unscoped"
     messages = body.get("messages")
     messages = messages if isinstance(messages, list) else []
@@ -256,7 +263,8 @@ async def calls(request_id: str) -> dict[str, Any]:
 
 @app.post("/fixture/reset")
 async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
-    global _fail_next_primary
+    global _fail_next_primary, _next_primary_delay_ms
+    _next_primary_delay_ms = 0
     request_id = (body or {}).get("request_id")
     if isinstance(request_id, str) and request_id:
         _calls.pop(request_id, None)
@@ -284,6 +292,18 @@ async def fixture_fail_next_primary() -> dict[str, str]:
     global _fail_next_primary
     _fail_next_primary = True
     return {"status": "ok"}
+
+
+@app.post("/fixture/delay-next-primary")
+async def fixture_delay_next_primary(body: dict[str, Any]) -> dict[str, Any]:
+    global _next_primary_delay_ms
+    delay_ms = body.get("delay_ms")
+    if isinstance(delay_ms, bool) or not isinstance(delay_ms, int):
+        raise HTTPException(status_code=422, detail="invalid fixture delay")
+    if not 1 <= delay_ms <= 5_000:
+        raise HTTPException(status_code=422, detail="invalid fixture delay")
+    _next_primary_delay_ms = delay_ms
+    return {"status": "ok", "delay_ms": delay_ms}
 
 
 @app.post("/fixture/sentinels")

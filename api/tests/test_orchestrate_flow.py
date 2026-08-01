@@ -112,6 +112,16 @@ def _collect_keys(value):
     return []
 
 
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://runtime.local/boundary")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        "PRIVATE-BOUNDARY-ERROR",
+        request=request,
+        response=response,
+    )
+
+
 class FakeMemoryStore:
     def __init__(self):
         self.resolve_conversation_calls = []
@@ -153,7 +163,7 @@ class FakeMemoryStore:
 
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
-        return {"message_id": "m-1"}
+        return {"message_id": kwargs.get("message_id", "m-1")}
 
     async def retrieve_bundle(self, **kwargs):
         self.retrieve_calls.append(kwargs)
@@ -847,7 +857,23 @@ class FakeRuntime:
         self.call_order.append("start_turn")
         if self.fail:
             raise RuntimeError("runtime unavailable")
-        return self.turn_response
+        response = copy.deepcopy(self.turn_response)
+        session = response.setdefault("runtime_session", {})
+        turn = response.setdefault("runtime_turn", {})
+        session.update(
+            {
+                "owner_id": kwargs["owner_id"],
+                "conversation_id": kwargs["conversation_id"],
+                "surface": kwargs["surface"],
+            }
+        )
+        turn.update(
+            {
+                "runtime_session_id": session.get("runtime_session_id"),
+                "input_message_id": kwargs.get("input_message_id"),
+            }
+        )
+        return response
 
     async def update_turn(self, **kwargs):
         self.turn_update_calls.append(kwargs)
@@ -5430,7 +5456,9 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tmp_path):
+async def test_orchestrate_runtime_admission_unavailable_stops_before_side_effects(
+    tmp_path,
+):
     rules = tmp_path / "rules.yaml"
     models = tmp_path / "models.yaml"
     rules.write_text(
@@ -5450,6 +5478,7 @@ async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tm
     )
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
+    runtime = FakeRuntime(fail=True)
 
     out = await orchestrate_chat(
         payload={
@@ -5462,7 +5491,7 @@ async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tm
         },
         memory_store=memory_store,
         litellm=litellm,
-        runtime=FakeRuntime(fail=True),
+        runtime=runtime,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -5470,12 +5499,402 @@ async def test_orchestrate_runtime_unavailable_is_trace_visible_and_non_fatal(tm
         request_id="rid-runtime-failed",
     )
 
+    assert out == {
+        "request_id": "rid-runtime-failed",
+        "conversation_id": "conv-1",
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": (
+            "I couldn’t safely start that turn, so I did not save or process the "
+            "message. Please try again."
+        ),
+        "status": "failed",
+        "sources": [],
+    }
+    assert len(runtime.turn_start_calls) == 1
+    assert memory_store.added_messages == []
+    assert memory_store.profile_calls == []
+    assert memory_store.retrieve_calls == []
+    assert memory_store.trace_calls == []
+    assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configured_runtime_admission_precedes_policy_persistence_and_downstream(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime = FakeRuntime()
+    runtime.restraint_response["result"].update(
+        {
+            "restraint_policy": "answer_normally",
+            "reason": "memory_request_allowed",
+            "reason_summary": ["memory_request_allowed"],
+            "retrieval_suppressed": False,
+            "personalization_suppressed": False,
+            "proactive_output_suppressed": False,
+            "brevity_preferred": False,
+        }
+    )
+
+    class OrderedMemoryStore(FakeMemoryStore):
+        async def add_message(self, **kwargs):
+            runtime.call_order.append(f"append:{kwargs['role']}")
+            return await super().add_message(**kwargs)
+
+        async def resolve_profile(self, **kwargs):
+            runtime.call_order.append("profile")
+            return await super().resolve_profile(**kwargs)
+
+        async def retrieve_bundle(self, **kwargs):
+            runtime.call_order.append("retrieval")
+            return await super().retrieve_bundle(**kwargs)
+
+        async def create_trace(self, **kwargs):
+            runtime.call_order.append("trace")
+            return await super().create_trace(**kwargs)
+
+    class OrderedProvider(FakeLiteLLM):
+        async def chat(self, **kwargs):
+            runtime.call_order.append("provider")
+            return await super().chat(**kwargs)
+
+    memory_store = OrderedMemoryStore()
+    provider = OrderedProvider()
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            surface="dev",
+            messages=[
+                {"role": "user", "content": "prior user context"},
+                {"role": "assistant", "content": "prior assistant context"},
+                {"role": "user", "content": "current user input"},
+            ],
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        persona_containment_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-admission-order",
+    )
+
     assert out["status"] == "ok"
-    runtime_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
-        "runtime"
+    user_messages = [
+        message for message in memory_store.added_messages if message["role"] == "user"
     ]
-    assert runtime_trace["status"] == "failed"
-    assert runtime_trace["error_type"] == "RuntimeError"
+    assert [message["content"] for message in user_messages] == ["current user input"]
+    admitted_id = runtime.turn_start_calls[0]["input_message_id"]
+    assert user_messages[0]["message_id"] == admitted_id
+    assert user_messages[0]["request_id"] == "rid-admission-order"
+    assert "prior user context" in str(provider.calls[0]["messages"])
+    for later in (
+        "interaction_governance",
+        "persona_containment",
+        "relationship_context",
+        "restraint",
+        "append:user",
+        "profile",
+        "retrieval",
+        "provider",
+        "trace",
+    ):
+        assert runtime.call_order.index("start_turn") < runtime.call_order.index(later)
+    assert runtime.session_calls == []
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_runtime_disabled_persists_only_current_user_turn(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    provider = FakeLiteLLM()
+
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[
+                {"role": "user", "content": "old context"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "current input"},
+            ]
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=None,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-runtime-disabled-current",
+    )
+
+    assert out["status"] == "ok"
+    user_messages = [
+        message for message in memory_store.added_messages if message["role"] == "user"
+    ]
+    assert [message["content"] for message in user_messages] == ["current input"]
+    assert user_messages[0]["message_id"]
+    assert "old context" in str(provider.calls[0]["messages"])
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["turn_state"]["admission_protected"] is False
+
+
+@pytest.mark.parametrize("status_code", [409, 422])
+@pytest.mark.asyncio
+async def test_nonretryable_runtime_admission_failure_has_no_side_effects(
+    tmp_path,
+    status_code,
+):
+    rules, models = _write_router_files(tmp_path)
+
+    class RejectingRuntime(FakeRuntime):
+        async def start_turn(self, **kwargs):
+            self.turn_start_calls.append(copy.deepcopy(kwargs))
+            self.call_order.append("start_turn")
+            raise _http_status_error(status_code)
+
+    runtime = RejectingRuntime()
+    memory_store = FakeMemoryStore()
+    provider = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-admission-{status_code}",
+    )
+
+    assert out["status"] == "failed"
+    assert out["selected_model"] == "not_called"
+    assert len(runtime.turn_start_calls) == 1
+    assert memory_store.added_messages == []
+    assert memory_store.profile_calls == []
+    assert memory_store.retrieve_calls == []
+    assert memory_store.trace_calls == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_admission_retry_reuses_request_and_message_identity(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+
+    class AmbiguousRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__()
+            self.admitted_turns = 0
+
+        async def start_turn(self, **kwargs):
+            if not self.turn_start_calls:
+                self.turn_start_calls.append(copy.deepcopy(kwargs))
+                self.call_order.append("start_turn")
+                self.admitted_turns = 1
+                raise httpx.ReadTimeout(
+                    "PRIVATE-ADMISSION-TIMEOUT",
+                    request=httpx.Request("POST", "http://runtime.local/turns"),
+                )
+            return await super().start_turn(**kwargs)
+
+    runtime = AmbiguousRuntime()
+    memory_store = FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-admission-retry",
+    )
+
+    assert out["status"] == "ok"
+    assert runtime.admitted_turns == 1
+    assert len(runtime.turn_start_calls) == 2
+    assert runtime.turn_start_calls[0] == runtime.turn_start_calls[1]
+    user_message = next(
+        message for message in memory_store.added_messages if message["role"] == "user"
+    )
+    assert user_message["message_id"] == runtime.turn_start_calls[0]["input_message_id"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_admission_response_is_not_retried_or_trusted(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+
+    class MismatchedRuntime(FakeRuntime):
+        async def start_turn(self, **kwargs):
+            response = await super().start_turn(**kwargs)
+            response["runtime_session"]["owner_id"] = "PRIVATE-OTHER-OWNER"
+            return response
+
+    runtime = MismatchedRuntime()
+    memory_store = FakeMemoryStore()
+    provider = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-admission-malformed",
+    )
+
+    assert out["status"] == "failed"
+    assert "PRIVATE" not in out["answer"]
+    assert len(runtime.turn_start_calls) == 1
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_user_append_retries_exact_payload_then_proceeds(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+
+    class AmbiguousAppendMemoryStore(FakeMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.user_attempts = []
+            self.durable_user_messages = {}
+
+        async def add_message(self, **kwargs):
+            if kwargs["role"] != "user":
+                return await super().add_message(**kwargs)
+            self.user_attempts.append(copy.deepcopy(kwargs))
+            message_id = kwargs["message_id"]
+            self.durable_user_messages.setdefault(message_id, copy.deepcopy(kwargs))
+            if len(self.user_attempts) == 1:
+                raise httpx.ReadTimeout(
+                    "PRIVATE-APPEND-TIMEOUT",
+                    request=httpx.Request("POST", "http://memory.local/messages"),
+                )
+            return {"message_id": message_id}
+
+    runtime = FakeRuntime()
+    memory_store = AmbiguousAppendMemoryStore()
+    provider = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-append-retry",
+    )
+
+    assert out["status"] == "ok"
+    assert len(memory_store.user_attempts) == 2
+    assert memory_store.user_attempts[0] == memory_store.user_attempts[1]
+    assert len(memory_store.durable_user_messages) == 1
+    assert provider.calls
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "append_failure",
+    [
+        _http_status_error(409),
+        RuntimeError("message_append_response_context_mismatch"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unconfirmed_user_append_abandons_and_stops_downstream(
+    tmp_path,
+    append_failure,
+):
+    rules, models = _write_router_files(tmp_path)
+
+    class RejectingMemoryStore(FakeMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.user_attempts = []
+
+        async def add_message(self, **kwargs):
+            if kwargs["role"] == "user":
+                self.user_attempts.append(copy.deepcopy(kwargs))
+                raise append_failure
+            return await super().add_message(**kwargs)
+
+    runtime = FakeRuntime()
+    memory_store = RejectingMemoryStore()
+    provider = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-append-rejected",
+    )
+
+    assert out["status"] == "failed"
+    assert out["answer"] == (
+        "I couldn’t durably save that message, so I stopped before generating a "
+        "response. Please try again."
+    )
+    assert len(memory_store.user_attempts) == 1
+    assert runtime.turn_complete_calls == [
+        {
+            "request_id": "rid-append-rejected",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "turn_status": "abandoned",
+        }
+    ]
+    assert memory_store.profile_calls == []
+    assert memory_store.retrieve_calls == []
+    assert memory_store.trace_calls == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_ambiguous_append_failures_abandon_once_and_do_not_continue(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+
+    class UnavailableMemoryStore(FakeMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.user_attempts = []
+
+        async def add_message(self, **kwargs):
+            if kwargs["role"] == "user":
+                self.user_attempts.append(copy.deepcopy(kwargs))
+                raise httpx.ReadTimeout(
+                    "PRIVATE-APPEND-TIMEOUT",
+                    request=httpx.Request("POST", "http://memory.local/messages"),
+                )
+            return await super().add_message(**kwargs)
+
+    runtime = FakeRuntime()
+    memory_store = UnavailableMemoryStore()
+    provider = FakeLiteLLM()
+    out = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-append-unavailable",
+    )
+
+    assert out["status"] == "failed"
+    assert len(memory_store.user_attempts) == 2
+    assert memory_store.user_attempts[0] == memory_store.user_attempts[1]
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == "abandoned"
+    assert provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -5968,7 +6387,8 @@ async def test_orchestrate_persona_containment_and_restraint_run_before_retrieva
         request_id="rid-policy-order",
     )
 
-    assert runtime.call_order.index("resolve_session") < runtime.call_order.index(
+    assert "resolve_session" not in runtime.call_order
+    assert runtime.call_order.index("start_turn") < runtime.call_order.index(
         "interaction_governance"
     )
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
@@ -5979,8 +6399,7 @@ async def test_orchestrate_persona_containment_and_restraint_run_before_retrieva
         "relationship_context"
     )
     assert runtime.call_order.index("relationship_context") < runtime.call_order.index("restraint")
-    assert runtime.call_order.index("restraint") < runtime.call_order.index("start_turn")
-    assert runtime.call_order.index("start_turn") < runtime.call_order.index("retrieval_bundle")
+    assert runtime.call_order.index("restraint") < runtime.call_order.index("retrieval_bundle")
     assert runtime.call_order.index("retrieval_bundle") < runtime.call_order.index(
         "companion_policy"
     )
@@ -8714,6 +9133,12 @@ async def test_orchestrate_interrupt_runtime_failure_is_non_fatal(tmp_path):
     )
     memory_store = FakeMemoryStore()
 
+    class InterruptUnavailableRuntime(FakeRuntime):
+        async def evaluate_interrupt(self, **kwargs):
+            self.interrupt_calls.append(kwargs)
+            self.call_order.append("interrupt")
+            raise RuntimeError("runtime unavailable")
+
     out = await orchestrate_chat(
         payload={
             "owner_id": "owner",
@@ -8725,7 +9150,7 @@ async def test_orchestrate_interrupt_runtime_failure_is_non_fatal(tmp_path):
         },
         memory_store=memory_store,
         litellm=FakeLiteLLM(),
-        runtime=FakeRuntime(fail=True),
+        runtime=InterruptUnavailableRuntime(),
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -16631,7 +17056,11 @@ class ClaimCaptureMemoryStore(FakeMemoryStore):
             if self.malformed_assistant_ack:
                 return {}
             return {"message_id": "00000000-0000-4000-8000-000000000002"}
-        return {"message_id": "00000000-0000-4000-8000-000000000001"}
+        return {
+            "message_id": kwargs.get(
+                "message_id", "00000000-0000-4000-8000-000000000001"
+            )
+        }
 
     async def create_trace(self, **kwargs):
         self.trace_calls.append(copy.deepcopy(kwargs))
@@ -21175,10 +21604,17 @@ class ComposedJellyfinRuntime(CapabilityRuntime):
         return {
             "runtime_session": {
                 "runtime_session_id": "rtsession_1",
+                "owner_id": kwargs["owner_id"],
+                "conversation_id": kwargs["conversation_id"],
                 "status": "active",
-                "surface": "dev",
+                "surface": kwargs["surface"],
             },
-            "runtime_turn": {"runtime_turn_id": turn_id, "turn_status": "received"},
+            "runtime_turn": {
+                "runtime_turn_id": turn_id,
+                "runtime_session_id": "rtsession_1",
+                "input_message_id": kwargs.get("input_message_id"),
+                "turn_status": "received",
+            },
         }
 
     async def action_authority(self, **kwargs):
@@ -23588,6 +24024,7 @@ async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
         allow_manual_override=True,
         request_id=f"rid-privacy-restrict-{surface_type}",
         privacy_context_enabled=True,
+        message_id_factory=lambda: "00000000-0000-4000-8000-000000000099",
     )
 
     serialized_provider_messages = json.dumps(litellm.calls, sort_keys=True)
@@ -25709,7 +26146,10 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
         self.persisted_traces = {}
 
     async def add_message(self, **kwargs):
-        message_id = f"00000000-0000-4000-8000-{len(self.added_messages) + 1:012d}"
+        message_id = kwargs.get(
+            "message_id",
+            f"00000000-0000-4000-8000-{len(self.added_messages) + 1:012d}",
+        )
         self.added_messages.append({**copy.deepcopy(kwargs), "message_id": message_id})
         return {"message_id": message_id}
 

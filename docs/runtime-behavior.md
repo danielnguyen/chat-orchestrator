@@ -7,15 +7,18 @@ This document describes the current `POST /v1/chat` orchestration path and its i
 For each chat request, Chat Orchestrator:
 
 1. validates a supplied conversation or resolves an omitted conversation through Basic Memory Store;
-2. resolves the active profile and retrieves bounded conversation context;
-3. optionally retrieves external read-only context from Data Source Aggregator;
-4. resolves enabled Cognitive Runtime context and policy decisions;
-5. assembles prompt layers within the configured budget;
-6. selects a model and provider through routing policy;
-7. invokes the provider or a policy-compatible fallback;
-8. executes an authorized connector action when the capability flow permits it;
-9. persists the assistant message and a bounded request trace; and
-10. returns the answer, routing status, public sources, and any pending action.
+2. identifies the final user-role entry as the current user turn;
+3. when Cognitive Runtime is configured, admits that turn before persistence or other turn-scoped work;
+4. resolves enabled turn-scoped policy from the admitted runtime session and turn;
+5. persists the current user turn under the same UUID admitted by Cognitive Runtime;
+6. resolves the active profile and retrieves bounded conversation context;
+7. optionally retrieves external read-only context from Data Source Aggregator;
+8. assembles prompt layers within the configured budget;
+9. selects a model and provider through routing policy;
+10. invokes the provider or a policy-compatible fallback;
+11. executes an authorized connector action when the capability flow permits it;
+12. persists the assistant message and a bounded request trace; and
+13. returns the answer, routing status, public sources, and any pending action.
 
 Optional integrations are non-authoritative unless their owning policy explicitly supplies a decision. Registration or availability alone does not grant an action permission.
 
@@ -37,8 +40,36 @@ and current surface metadata while leaving historical provenance unchanged.
 
 When `conversation_id` is omitted, Chat Orchestrator retains the existing
 same-owner, same-client rolling resolver for compatibility. Omitted-ID
-continuation selection is not part of the current behavior. Cognitive Runtime
-turn admission also retains its current position after user-message persistence.
+continuation selection is not part of the current behavior.
+
+## Turn admission and current-user persistence
+
+When Cognitive Runtime is configured, Chat Orchestrator allocates one durable
+message UUID for the final user-role entry and starts the runtime turn with that
+UUID before current-user persistence, profile resolution, retrieval, provider,
+capability, connector, action, claim, or trace work. Contended, unavailable, or
+malformed admission stops with one bounded response and performs none of those
+operations. A timeout, transport failure, or HTTP 502, 503, or 504 receives at
+most one exact admission retry with the same request and message identities.
+
+After admission, turn-scoped governance, persona containment, relationship
+policy, and restraint use the admitted runtime session and turn identifiers.
+Chat Orchestrator then appends only the final user-role entry; earlier user and
+assistant entries remain bounded request context and are not re-persisted. The
+Basic Memory Store append uses the admitted UUID. An ambiguous eligible append
+failure receives one exact retry with the same UUID and payload. If durability
+still cannot be confirmed, the runtime turn is abandoned best-effort and no
+retrieval, provider, capability, action, claim, or trace work proceeds.
+
+When Cognitive Runtime is not configured, the compatibility path still persists
+only the final user-role entry and continues without fabricating an admission.
+That path is not admission-protected. Assistant appends remain server-generated
+and are not silently retried.
+
+Each HTTP request still receives a fresh server-owned request ID. Completed
+response replay across a resend or orchestrator restart is not provided. A
+request without a user-role entry retains its existing compatibility behavior
+without an invented durable current-user identity.
 
 ## File-backed retrieval
 

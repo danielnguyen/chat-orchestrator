@@ -109,6 +109,8 @@ class MemoryStoreClient:
         metadata: dict[str, Any] | None = None,
         policy_metadata: dict[str, Any] | None = None,
         history_root_lineage: dict[str, Any] | None = None,
+        message_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "owner_id": owner_id,
@@ -121,10 +123,27 @@ class MemoryStoreClient:
             payload["policy_metadata"] = policy_metadata
         if history_root_lineage is not None:
             payload["history_root_lineage"] = history_root_lineage
-        return await self._post(
+        if message_id is not None:
+            payload["message_id"] = message_id
+        response = await self._post(
             f"/v1/conversations/{conversation_id}/messages",
+            request_id=request_id,
             json=payload,
         )
+        if not isinstance(response, dict):
+            raise RuntimeError("message_append_response_invalid")
+        response_message_id = response.get("message_id")
+        if (
+            not isinstance(response_message_id, str)
+            or not response_message_id
+            or len(response_message_id) > 120
+        ):
+            raise RuntimeError("message_append_response_invalid")
+        if message_id is not None and not _conversation_ids_equivalent(
+            response_message_id, message_id
+        ):
+            raise RuntimeError("message_append_response_context_mismatch")
+        return response
 
     async def retrieve_bundle(
         self,

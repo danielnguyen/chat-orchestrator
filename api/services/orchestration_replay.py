@@ -66,7 +66,9 @@ class ReplayMemoryStore:
             request_id,
             policy_metadata_present=kwargs.get("policy_metadata") is not None,
         )
-        return {"message_id": f"message-{self.message_ordinal}"}
+        return {
+            "message_id": kwargs.get("message_id", f"message-{self.message_ordinal}")
+        }
 
     async def resolve_profile(self, **kwargs: Any) -> dict[str, Any]:
         self._record("profile_resolution")
@@ -601,15 +603,18 @@ class ReplayRuntime:
 
     async def start_turn(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_turn_start", kwargs["request_id"])
-        self._maybe_fail()
         return {
             "runtime_session": {
                 "runtime_session_id": "runtime-session-1",
+                "owner_id": kwargs["owner_id"],
+                "conversation_id": kwargs["conversation_id"],
                 "status": "active",
                 "surface": kwargs["surface"],
             },
             "runtime_turn": {
                 "runtime_turn_id": "runtime-turn-1",
+                "runtime_session_id": "runtime-session-1",
+                "input_message_id": kwargs.get("input_message_id"),
                 "turn_status": "received",
             },
         }
@@ -624,13 +629,13 @@ class ReplayRuntime:
         return {"runtime_turn": {"turn_status": kwargs["turn_status"]}}
 
     async def complete_turn(self, **kwargs: Any) -> dict[str, Any]:
-        self.terminal_status = kwargs["turn_status"]
         self._record(
             "cr_turn_complete",
             kwargs["request_id"],
             turn_status=kwargs["turn_status"],
         )
         self._maybe_fail()
+        self.terminal_status = kwargs["turn_status"]
         return {"runtime_turn": {"turn_status": kwargs["turn_status"]}}
 
     async def resolve_identity(self, **kwargs: Any) -> dict[str, Any]:
@@ -1826,6 +1831,9 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                         "prompt_context_safety_margin",
                         0,
                     ),
+                    message_id_factory=lambda: (
+                        "00000000-0000-4000-8000-000000000099"
+                    ),
                 )
         else:
             result = await orchestrate_chat(
@@ -1857,6 +1865,7 @@ async def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
                     in {"revalidation", "revalidation_failed"}
                     else None
                 ),
+                message_id_factory=lambda: "00000000-0000-4000-8000-000000000099",
             )
     except Exception as exc:  # replay snapshots intentionally cover failures
         error = exc
