@@ -71,6 +71,28 @@ response replay across a resend or orchestrator restart is not provided. A
 request without a user-role entry retains its existing compatibility behavior
 without an invented durable current-user identity.
 
+## Cognitive Runtime transport lifecycle
+
+When Cognitive Runtime is configured, application startup opens one owned HTTP
+client with a bounded connection pool. All Cognitive Runtime requests reuse that
+client and its keep-alive connections. The default pool permits at most 20
+connections, retains at most 10 idle connections, and expires idle keep-alive
+connections after five seconds. Startup creates the client without making a
+Cognitive Runtime request, and application shutdown closes the pool.
+
+The generic transport sends each request once. A timeout or transport failure
+invalidates and closes the affected client without replaying that request. A
+later separate request may create one replacement client while the application
+is still running. HTTP status errors, malformed responses, and response-policy
+validation do not trigger transport replacement or replay. Exact retries owned
+by an orchestration operation remain outside the generic transport.
+
+When Cognitive Runtime is disabled, no Cognitive Runtime HTTP client is opened.
+Memory Store, Data Source Aggregator, provider, source, and health-check clients
+retain their existing transport behavior. Connection reuse alone does not
+establish an end-to-end latency guarantee, add concurrent policy evaluation, or
+authorize policy-result caching.
+
 ## File-backed retrieval
 
 Basic Memory Store owns file ingestion, object storage, derivation, and retrieval. Chat Orchestrator does not implement a separate ingestion pipeline.

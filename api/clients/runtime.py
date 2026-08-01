@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
@@ -200,20 +202,112 @@ def validate_history_followup_policy_response(
 
 
 class RuntimeClient:
-    def __init__(self, base_url: str, api_key: str | None, timeout_ms: int = 30000) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str | None,
+        timeout_ms: int = 30000,
+        *,
+        max_connections: int = 20,
+        max_keepalive_connections: int = 10,
+        keepalive_expiry: float = 5.0,
+        client_factory: Callable[..., httpx.AsyncClient] | None = None,
+    ) -> None:
+        if isinstance(max_connections, bool) or not isinstance(max_connections, int):
+            raise ValueError("runtime_client_max_connections_invalid")
+        if max_connections <= 0:
+            raise ValueError("runtime_client_max_connections_invalid")
+        if (
+            isinstance(max_keepalive_connections, bool)
+            or not isinstance(max_keepalive_connections, int)
+            or max_keepalive_connections < 0
+            or max_keepalive_connections > max_connections
+        ):
+            raise ValueError("runtime_client_max_keepalive_connections_invalid")
+        if (
+            isinstance(keepalive_expiry, bool)
+            or not isinstance(keepalive_expiry, (int, float))
+            or keepalive_expiry <= 0
+        ):
+            raise ValueError("runtime_client_keepalive_expiry_invalid")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout_ms / 1000
+        self.max_connections = max_connections
+        self.max_keepalive_connections = max_keepalive_connections
+        self.keepalive_expiry = float(keepalive_expiry)
         self.last_companion_compile_endpoint: str | None = None
+        self._client_factory = client_factory or httpx.AsyncClient
+        self._client: httpx.AsyncClient | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._started = False
+        self._closed = False
+
+    def _new_client(self) -> httpx.AsyncClient:
+        headers = {"X-API-Key": self.api_key} if self.api_key else None
+        return self._client_factory(
+            base_url=self.base_url,
+            headers=headers,
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=self.max_connections,
+                max_keepalive_connections=self.max_keepalive_connections,
+                keepalive_expiry=self.keepalive_expiry,
+            ),
+        )
+
+    async def open(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("runtime_client_closed")
+            if self._started:
+                return
+            if self._client is None:
+                self._client = self._new_client()
+            self._started = True
+
+    async def close(self) -> None:
+        client: httpx.AsyncClient | None = None
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+        if client is not None:
+            await client.aclose()
+
+    async def _client_for_request(self) -> httpx.AsyncClient:
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("runtime_client_closed")
+            if not self._started:
+                raise RuntimeError("runtime_client_not_started")
+            if self._client is None:
+                self._client = self._new_client()
+            return self._client
+
+    async def _invalidate_client(self, failed_client: httpx.AsyncClient) -> None:
+        should_close = False
+        async with self._lifecycle_lock:
+            if self._client is failed_client:
+                self._client = None
+                should_close = True
+        if should_close:
+            await failed_client.aclose()
 
     async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
-        headers = {}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(f"{self.base_url}{path}", headers=headers, json=json)
+        client = await self._client_for_request()
+        try:
+            resp = await client.post(path, json=json)
             resp.raise_for_status()
             return resp.json()
+        except httpx.TransportError:
+            try:
+                await self._invalidate_client(client)
+            except Exception:
+                pass
+            raise
 
     async def overlay(
         self,

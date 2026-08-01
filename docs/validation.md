@@ -73,6 +73,34 @@ cd api
 ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_prompt_budget_smoke.py
 ```
 
+## Cognitive Runtime transport checks
+
+Run the focused lifecycle and transport suite with:
+
+```bash
+cd api
+./.venv/bin/python -m pytest -q tests/test_runtime_client.py
+```
+
+The focused suite verifies explicit startup and shutdown, bounded pool
+configuration, repeated lifecycle calls, sequential and concurrent connection
+reuse, transport invalidation, one-client replacement for later requests, and
+the absence of transport-layer request replay. It also verifies that HTTP
+status errors, malformed responses, response-validation failures, and
+cancellation do not cause an unsafe retry or pool replacement.
+
+Run the complete suite and deterministic replay with:
+
+```bash
+make dev-test
+make replay-test
+```
+
+The pull-request composed smoke remains the actual-service compatibility check;
+this transport change adds no smoke mode. It does not introduce concurrent
+policy calls, a composite runtime endpoint, same-turn policy-result reuse,
+omitted-conversation selection, or an end-to-end latency-budget claim.
+
 ## Composed smoke check
 
 Run the disposable multi-service topology with:
