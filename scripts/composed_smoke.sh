@@ -1497,12 +1497,12 @@ run_omitted_continuation_scenario() {
   observed_thread=""
   for _ in $(seq 1 60); do
     observed_thread="$(runtime_thread_snapshot "$active_owner" "$active_conversation" 2>/dev/null || true)"
-    if [ "$(jq -r '.state // empty' <<<"${observed_thread:-{}}")" = "active" ]; then
+    if [ "$(jq -r '.state // empty' <<<"${observed_thread:-null}")" = "active" ]; then
       break
     fi
     sleep 0.1
   done
-  [ "$(jq -r '.state // empty' <<<"${observed_thread:-{}}")" = "active" ] || {
+  [ "$(jq -r '.state // empty' <<<"${observed_thread:-null}")" = "active" ] || {
     wait "$winner_pid" || true
     echo "omitted continuation did not observe active candidate" >&2
     exit 1
