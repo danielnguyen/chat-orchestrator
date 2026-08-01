@@ -1,8 +1,568 @@
 from __future__ import annotations
 
+import asyncio
+import importlib
+from typing import Any
+
 import httpx
 import pytest
 from clients.runtime import RuntimeClient
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        path: str,
+        payload: Any,
+        *,
+        status_code: int = 200,
+    ) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.request = httpx.Request("POST", f"http://runtime.local{path}")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            response = httpx.Response(self.status_code, request=self.request)
+            raise httpx.HTTPStatusError(
+                f"status {self.status_code}",
+                request=self.request,
+                response=response,
+            )
+
+    def json(self) -> Any:
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class _FakeAsyncClient:
+    def __init__(self, responses: list[Any] | None = None) -> None:
+        self.responses = list(responses or [])
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.close_calls = 0
+
+    async def post(self, path: str, *, json: dict[str, Any]) -> _FakeResponse:
+        self.posts.append((path, json))
+        item = self.responses.pop(0) if self.responses else {"ok": True}
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, _FakeResponse):
+            return item
+        if isinstance(item, tuple):
+            status_code, payload = item
+            return _FakeResponse(path, payload, status_code=status_code)
+        return _FakeResponse(path, item)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _ConcurrentAsyncClient(_FakeAsyncClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_requests = 0
+        self.maximum_active_requests = 0
+
+    async def post(self, path: str, *, json: dict[str, Any]) -> _FakeResponse:
+        self.active_requests += 1
+        self.maximum_active_requests = max(
+            self.maximum_active_requests,
+            self.active_requests,
+        )
+        try:
+            await asyncio.sleep(0)
+            return await super().post(path, json=json)
+        finally:
+            self.active_requests -= 1
+
+
+class _ClientFactory:
+    def __init__(self, clients: list[_FakeAsyncClient] | None = None) -> None:
+        self.pending_clients = list(clients or [])
+        self.clients: list[_FakeAsyncClient] = []
+        self.kwargs: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> _FakeAsyncClient:
+        self.kwargs.append(kwargs)
+        client = (
+            self.pending_clients.pop(0)
+            if self.pending_clients
+            else _FakeAsyncClient()
+        )
+        self.clients.append(client)
+        return client
+
+
+def _load_main(monkeypatch):
+    monkeypatch.setenv("ORCH_API_KEY", "orch-test")
+    monkeypatch.setenv("MEMORY_STORE_BASE_URL", "http://memory")
+    monkeypatch.setenv("MEMORY_STORE_API_KEY", "memory")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm")
+    monkeypatch.setenv("COGNITIVE_RUNTIME_BASE_URL", "http://runtime.local")
+
+    import settings
+
+    settings.get_settings.cache_clear()
+    import main
+
+    return importlib.reload(main)
+
+
+@pytest.mark.asyncio
+async def test_runtime_client_lifecycle_is_explicit_idempotent_and_final():
+    factory = _ClientFactory()
+    client = RuntimeClient(
+        "http://runtime.local/",
+        "runtime-key",
+        client_factory=factory,
+    )
+
+    with pytest.raises(RuntimeError, match="^runtime_client_not_started$"):
+        await client.overlay(
+            request_id="before-open",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+
+    await asyncio.gather(client.open(), client.open(), client.open())
+    assert len(factory.clients) == 1
+
+    await client.close()
+    await client.close()
+    assert factory.clients[0].close_calls == 1
+
+    with pytest.raises(RuntimeError, match="^runtime_client_closed$"):
+        await client.overlay(
+            request_id="after-close",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+    with pytest.raises(RuntimeError, match="^runtime_client_closed$"):
+        await client.open()
+    assert len(factory.clients) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_key", "expected_headers"),
+    [
+        ("runtime-key", {"X-API-Key": "runtime-key"}),
+        (None, None),
+    ],
+)
+async def test_runtime_client_builds_bounded_transport(api_key, expected_headers):
+    factory = _ClientFactory()
+    client = RuntimeClient(
+        "http://runtime.local/",
+        api_key,
+        timeout_ms=1500,
+        client_factory=factory,
+    )
+
+    await client.open()
+
+    assert len(factory.kwargs) == 1
+    created = factory.kwargs[0]
+    assert created["base_url"] == "http://runtime.local"
+    assert created["headers"] == expected_headers
+    assert created["timeout"] == 1.5
+    assert vars(created["limits"]) == {
+        "max_connections": 20,
+        "max_keepalive_connections": 10,
+        "keepalive_expiry": 5.0,
+    }
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_client_accepts_valid_pool_overrides():
+    factory = _ClientFactory()
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        max_connections=8,
+        max_keepalive_connections=3,
+        keepalive_expiry=2.5,
+        client_factory=factory,
+    )
+
+    await client.open()
+
+    assert vars(factory.kwargs[0]["limits"]) == {
+        "max_connections": 8,
+        "max_keepalive_connections": 3,
+        "keepalive_expiry": 2.5,
+    }
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"max_connections": 0}, "runtime_client_max_connections_invalid"),
+        ({"max_connections": True}, "runtime_client_max_connections_invalid"),
+        (
+            {"max_keepalive_connections": -1},
+            "runtime_client_max_keepalive_connections_invalid",
+        ),
+        (
+            {"max_connections": 4, "max_keepalive_connections": 5},
+            "runtime_client_max_keepalive_connections_invalid",
+        ),
+        ({"keepalive_expiry": 0}, "runtime_client_keepalive_expiry_invalid"),
+        ({"keepalive_expiry": True}, "runtime_client_keepalive_expiry_invalid"),
+    ],
+)
+def test_runtime_client_rejects_invalid_pool_bounds(overrides, error):
+    with pytest.raises(ValueError, match=f"^{error}$"):
+        RuntimeClient("http://runtime.local", None, **overrides)
+
+
+@pytest.mark.asyncio
+async def test_runtime_client_reuses_one_transport_for_sequential_operations():
+    factory = _ClientFactory()
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    for ordinal in range(3):
+        await client.overlay(
+            request_id=f"sequential-{ordinal}",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+
+    assert len(factory.clients) == 1
+    assert len(factory.clients[0].posts) == 3
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_client_reuses_one_transport_without_serializing_requests():
+    shared_client = _ConcurrentAsyncClient()
+    factory = _ClientFactory([shared_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await asyncio.gather(client.open(), client.open())
+
+    await asyncio.gather(
+        *(
+            client.overlay(
+                request_id=f"concurrent-{ordinal}",
+                owner_id="owner",
+                conversation_id="conversation",
+                surface="web",
+            )
+            for ordinal in range(8)
+        )
+    )
+
+    assert len(factory.clients) == 1
+    assert len(shared_client.posts) == 8
+    assert shared_client.maximum_active_requests > 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_not_replayed_and_later_call_replaces_client():
+    request = httpx.Request("POST", "http://runtime.local/v1/runtime/overlay")
+    failure = httpx.ConnectError("connection failed", request=request)
+    failed_client = _FakeAsyncClient([failure])
+    replacement_client = _FakeAsyncClient([{"ok": True}])
+    factory = _ClientFactory([failed_client, replacement_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(httpx.ConnectError) as exc:
+        await client.overlay(
+            request_id="failed-call",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+    assert exc.value is failure
+    assert len(failed_client.posts) == 1
+    assert failed_client.close_calls == 1
+    assert len(factory.clients) == 1
+    await client.open()
+    assert len(factory.clients) == 1
+
+    result = await client.overlay(
+        request_id="later-call",
+        owner_id="owner",
+        conversation_id="conversation",
+        surface="web",
+    )
+    assert result == {"ok": True}
+    assert len(factory.clients) == 2
+    assert len(replacement_client.posts) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_later_calls_share_one_replacement_transport():
+    request = httpx.Request("POST", "http://runtime.local/v1/runtime/overlay")
+    failed_client = _FakeAsyncClient(
+        [httpx.ConnectError("connection failed", request=request)]
+    )
+    replacement_client = _ConcurrentAsyncClient()
+    factory = _ClientFactory([failed_client, replacement_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(httpx.ConnectError):
+        await client.overlay(
+            request_id="failed-call",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+
+    await asyncio.gather(
+        *(
+            client.overlay(
+                request_id=f"replacement-{ordinal}",
+                owner_id="owner",
+                conversation_id="conversation",
+                surface="web",
+            )
+            for ordinal in range(6)
+        )
+    )
+    assert len(factory.clients) == 2
+    assert len(replacement_client.posts) == 6
+    assert replacement_client.maximum_active_requests > 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_transport_cleanup_does_not_mask_original_failure():
+    class CloseFailingClient(_FakeAsyncClient):
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("close_failed")
+
+    request = httpx.Request("POST", "http://runtime.local/v1/runtime/overlay")
+    failure = httpx.ReadTimeout("read timed out", request=request)
+    failed_client = CloseFailingClient([failure])
+    factory = _ClientFactory([failed_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(httpx.ReadTimeout) as exc:
+        await client.overlay(
+            request_id="failed-call",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+    assert exc.value is failure
+    assert failed_client.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [409, 503])
+async def test_http_failure_does_not_retry_or_invalidate_transport(status_code):
+    shared_client = _FakeAsyncClient(
+        [
+            (status_code, {"detail": "bounded"}),
+            {"ok": True},
+        ]
+    )
+    factory = _ClientFactory([shared_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        await client.overlay(
+            request_id="http-failure",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+    assert exc.value.response.status_code == status_code
+    assert len(shared_client.posts) == 1
+    assert shared_client.close_calls == 0
+
+    assert await client.overlay(
+        request_id="later-call",
+        owner_id="owner",
+        conversation_id="conversation",
+        surface="web",
+    ) == {"ok": True}
+    assert len(factory.clients) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_does_not_retry_or_invalidate_transport():
+    shared_client = _FakeAsyncClient(
+        [
+            _FakeResponse(
+                "/v1/runtime/overlay",
+                ValueError("invalid_json"),
+            ),
+            {"ok": True},
+        ]
+    )
+    factory = _ClientFactory([shared_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(ValueError, match="^invalid_json$"):
+        await client.overlay(
+            request_id="malformed-json",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+    assert shared_client.close_calls == 0
+    assert await client.overlay(
+        request_id="later-call",
+        owner_id="owner",
+        conversation_id="conversation",
+        surface="web",
+    ) == {"ok": True}
+    assert len(factory.clients) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_response_validator_failure_does_not_invalidate_transport():
+    shared_client = _FakeAsyncClient([{"ok": True}, {"ok": True}])
+    factory = _ClientFactory([shared_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(RuntimeError, match="^runtime_turn_response_invalid$"):
+        await client.start_turn(
+            request_id="invalid-start",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+            input_message_id=None,
+        )
+    assert shared_client.close_calls == 0
+    assert await client.overlay(
+        request_id="later-call",
+        owner_id="owner",
+        conversation_id="conversation",
+        surface="web",
+    ) == {"ok": True}
+    assert len(factory.clients) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_not_retried_or_converted():
+    shared_client = _FakeAsyncClient([asyncio.CancelledError(), {"ok": True}])
+    factory = _ClientFactory([shared_client])
+    client = RuntimeClient(
+        "http://runtime.local",
+        None,
+        client_factory=factory,
+    )
+    await client.open()
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.overlay(
+            request_id="cancelled",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+    assert shared_client.close_calls == 0
+    assert await client.overlay(
+        request_id="later-call",
+        owner_id="owner",
+        conversation_id="conversation",
+        surface="web",
+    ) == {"ok": True}
+    assert len(factory.clients) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_fastapi_lifespan_opens_and_closes_same_runtime_client(monkeypatch):
+    main = _load_main(monkeypatch)
+
+    class ManagedRuntime:
+        def __init__(self) -> None:
+            self.open_calls = 0
+            self.close_calls = 0
+
+        async def open(self) -> None:
+            self.open_calls += 1
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    configured = ManagedRuntime()
+    replacement = ManagedRuntime()
+    monkeypatch.setattr(main, "runtime", configured)
+
+    async with main.app.router.lifespan_context(main.app):
+        assert configured.open_calls == 1
+        assert configured.close_calls == 0
+        monkeypatch.setattr(main, "runtime", replacement)
+
+    assert configured.close_calls == 1
+    assert replacement.open_calls == 0
+    assert replacement.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_disabled_lifespan_does_not_manage_other_clients(monkeypatch):
+    main = _load_main(monkeypatch)
+
+    class UnexpectedLifecycle:
+        async def open(self) -> None:
+            raise AssertionError("unexpected open")
+
+        async def close(self) -> None:
+            raise AssertionError("unexpected close")
+
+    monkeypatch.setattr(main, "runtime", None)
+    monkeypatch.setattr(main, "memory_store", UnexpectedLifecycle())
+    monkeypatch.setattr(main, "litellm", UnexpectedLifecycle())
+    monkeypatch.setattr(main, "dsa", UnexpectedLifecycle())
+
+    async with main.app.router.lifespan_context(main.app):
+        pass
 
 
 def _history_policy(**overrides):

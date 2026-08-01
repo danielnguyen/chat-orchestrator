@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -17,7 +19,21 @@ from services.orchestrate import orchestrate_chat
 from settings import get_settings
 
 settings = get_settings()
-app = FastAPI(title="Chat Orchestrator", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    runtime_client = runtime
+    if runtime_client is not None:
+        await runtime_client.open()
+    try:
+        yield
+    finally:
+        if runtime_client is not None:
+            await runtime_client.close()
+
+
+app = FastAPI(title="Chat Orchestrator", version="0.1.0", lifespan=lifespan)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 memory_store = MemoryStoreClient(
