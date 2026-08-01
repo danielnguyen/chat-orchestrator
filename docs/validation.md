@@ -63,6 +63,16 @@ make replay-test
 
 The replay suite executes the real `orchestrate_chat` path against deterministic boundary adapters. It covers successful composition and bounded degradation without depending on live providers. Replay snapshots are structural and exclude full prompts, provider responses, file contents, credentials, and unrestricted exception text.
 
+Focused admission and durable-message checks are available with:
+
+```bash
+cd api
+./.venv/bin/python -m pytest -q tests/test_orchestrate_flow.py
+./.venv/bin/python -m pytest -q tests/test_orchestration_replay.py
+./.venv/bin/python -m pytest -q tests/test_offline_fallback.py
+./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_prompt_budget_smoke.py
+```
+
 ## Composed smoke check
 
 Run the disposable multi-service topology with:
@@ -91,8 +101,8 @@ owner/conversation scope remain enabled.
 
 The evidence topology requires the merged immediate-history foundations at or after
 Chat Orchestrator `19dfdd9b58fc7ce87152c0009143d23caea03b03`, Cognitive Runtime
-`f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67`, Basic Memory Store
-`97877bd9da315af2a1cb5e9437ade13d3ee9d2e6`, and Data Source Aggregator
+`2a63ca3c32010fe8dad727d62c2e6a7475cbb98c`, Basic Memory Store
+`1a8278278fcabd871f6235bc66acdfe80523c6f4`, and Data Source Aggregator
 `e23f582e4aac32a12c7ad3c71278fc21e5697ea4`. The disposable DSA configuration
 contains operator-owned material scope references for selected sources; those
 values are emitted by the real DSA inventory and are never manufactured by the
@@ -144,7 +154,7 @@ answers through the actual services, then recreates only the orchestrator with
 history enabled. PostgreSQL, BMS, CR, DSA, Qdrant, and the provider remain running,
 so successful current-turn-only follow-ups prove that neither a client cache nor
 orchestrator process state supplies the previous answer. The hosted workflow
-checks out BMS at `97877bd9da315af2a1cb5e9437ade13d3ee9d2e6`, builds that service,
+checks out BMS at `1a8278278fcabd871f6235bc66acdfe80523c6f4`, builds that service,
 and first probes both the unchanged v1 and strict v2 internal response shapes.
 
 The scenarios cover chained acquisition explanations with the same private root,
@@ -192,9 +202,30 @@ from a different owner. Each request contains only its current turn and enters t
 normal Chat Orchestrator path, so no adapter synchronization or client cache supplies
 the shared memory.
 
-This proof does not establish live-thread continuation, automatic conversation
-selection, Telegram-to-Alexa handoff, timing, presence, pause/resume, contention, or
-completion of the next planned cross-surface implementation stage.
+Run only the runtime admission composition proof with:
+
+```bash
+RUNTIME_ADMISSION_COMPOSITION_ONLY=1 make composed-smoke
+```
+
+This mode creates one fresh open conversation, delays the winning provider
+response once, and sends a distinct-client request while the first runtime turn
+is active. It verifies one provider-backed winner and one bounded loser, exactly
+one durable current-user message and one assistant response, equality between
+the admitted input UUID and durable user-message UUID, truthful winning client
+and surface provenance, no loser message, provider, claim, or action side
+effect, one conversation, and a final idle runtime thread at revision two.
+
+The proof uses Basic Memory Store at or after
+`1a8278278fcabd871f6235bc66acdfe80523c6f4` and Cognitive Runtime at or after
+`2a63ca3c32010fe8dad727d62c2e6a7475cbb98c`. It demonstrates overlap within the
+actual disposable services. It does not demonstrate completed-response replay
+across a fresh HTTP request or process restart, and it does not select a
+conversation when the identifier is omitted.
+
+The distinct-client owner-memory proof does not establish live-thread
+continuation, automatic conversation selection, Telegram-to-Alexa handoff,
+timing, presence, pause/resume, or contention.
 
 The focused mode and the complete regression both reset provider, DSA audit,
 external-source, feature-toggle, and disposable conversation state. This is

@@ -644,6 +644,26 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
 
     async def fake_post(path: str, *, json: dict[str, object]):
         calls.append((path, json))
+        if path == "/v1/runtime/turns/start":
+            return {
+                "runtime_session": {
+                    "runtime_session_id": "rtsession_1",
+                    "owner_id": json["owner_id"],
+                    "conversation_id": json["conversation_id"],
+                    "surface": json["surface"],
+                },
+                "runtime_turn": {
+                    "runtime_turn_id": "rtturn_1",
+                    "runtime_session_id": "rtsession_1",
+                    "input_message_id": json.get("input_message_id"),
+                    "turn_status": "received",
+                },
+                "event": {
+                    "runtime_session_id": "rtsession_1",
+                    "runtime_turn_id": "rtturn_1",
+                    "event_type": "turn_started",
+                },
+            }
         if path == "/v1/runtime/privacy-context/evaluate":
             return {
                 "result": {

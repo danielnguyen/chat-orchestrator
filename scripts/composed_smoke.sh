@@ -6,8 +6,8 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="e0a2f5294fd9ffd289dee002b68f7d0d4a41215f"
-CR_COMMIT="f04f5ec89b0a0fd6e0c39f53b4c30be66c3a7e67"
+BMS_COMMIT="1a8278278fcabd871f6235bc66acdfe80523c6f4"
+CR_COMMIT="2a63ca3c32010fe8dad727d62c2e6a7475cbb98c"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
 CO_COMMIT="19dfdd9b58fc7ce87152c0009143d23caea03b03"
 
@@ -1210,6 +1210,112 @@ run_claim_traceability_scenario() {
   provider_post "/fixture/reset" '{}'
 }
 
+run_runtime_admission_composition_scenario() {
+  local owner="owner-admission-composition"
+  local winner_client="client-admission-winner"
+  local loser_client="client-admission-loser"
+  local winner_surface="web"
+  local loser_surface="voice"
+  local winner_text="neutral winning input"
+  local loser_text="neutral competing input"
+  local conversation_id winner_payload loser_payload winner_file winner_pid
+  local thread active_session_id active_turn_id loser_response winner_response
+  local winner_request_id loser_request_id winner_provider_calls loser_provider_calls
+  local message_counts durable_user_message_id runtime_diagnostics admitted_input_message_id
+  local user_provenance conversation_count loser_rows claim_rows final_thread
+
+  conversation_id="$(resolve_conversation "$owner" "$winner_client" "admission-composition")"
+  provider_post "/fixture/delay-next-primary" '{"delay_ms":2500}'
+  winner_payload="$(jq -nc \
+    --arg owner "$owner" \
+    --arg client "$winner_client" \
+    --arg surface "$winner_surface" \
+    --arg conversation "$conversation_id" \
+    --arg content "$winner_text" \
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$content}],sensitivity:"private"}')"
+  loser_payload="$(jq -nc \
+    --arg owner "$owner" \
+    --arg client "$loser_client" \
+    --arg surface "$loser_surface" \
+    --arg conversation "$conversation_id" \
+    --arg content "$loser_text" \
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$content}],sensitivity:"private"}')"
+  winner_file="$COMPOSED_SMOKE_TMP/admission-winner.json"
+  co_post "$winner_payload" >"$winner_file" &
+  winner_pid="$!"
+
+  thread=""
+  for _ in $(seq 1 60); do
+    thread="$(curl -fsS -X POST "http://127.0.0.1:14371/v1/runtime/threads/resolve" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -nc --arg owner "$owner" --arg conversation "$conversation_id" '{request_id:"admission-smoke-observe",owner_id:$owner,conversation_id:$conversation}')")"
+    if [ "$(jq -r '.state' <<<"$thread")" = "active" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$(jq -r '.state' <<<"$thread")" = "active" ] || {
+    echo "runtime admission composition did not observe an active winning turn" >&2
+    wait "$winner_pid" || true
+    exit 1
+  }
+  active_session_id="$(jq -r '.active_runtime_session_id' <<<"$thread")"
+  active_turn_id="$(jq -r '.active_runtime_turn_id' <<<"$thread")"
+
+  loser_response="$(co_post "$loser_payload")"
+  wait "$winner_pid"
+  winner_response="$(cat "$winner_file")"
+  winner_request_id="$(jq -r '.request_id' <<<"$winner_response")"
+  loser_request_id="$(jq -r '.request_id' <<<"$loser_response")"
+
+  jq -e '.status == "ok" and .selected_model != "not_called"' \
+    <<<"$winner_response" >/dev/null
+  jq -e '
+    .status == "failed"
+    and .profile_name == "unresolved"
+    and .selected_model == "not_called"
+    and .sources == []
+    and (.pending_action == null)
+    and (.answer == "I couldn’t safely start that turn, so I did not save or process the message. Please try again.")
+  ' <<<"$loser_response" >/dev/null
+
+  winner_provider_calls="$(fetch_provider_calls "$winner_request_id")"
+  loser_provider_calls="$(fetch_provider_calls "$loser_request_id")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$winner_provider_calls")" = "1" ]
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$loser_provider_calls")" = "0" ]
+
+  message_counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant'), count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_id';")"
+  [ "$message_counts" = "1|1|2" ] || {
+    echo "runtime admission composition durable message counts were unexpected" >&2
+    exit 1
+  }
+  durable_user_message_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_id' AND role='user' AND content='$winner_text';")"
+  user_provenance="$(psql_exec -At -F '|' -c "SELECT client_id, metadata->>'surface' FROM messages WHERE id='$durable_user_message_id';")"
+  [ "$user_provenance" = "$winner_client|$winner_surface" ]
+  loser_rows="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_id' AND (client_id='$loser_client' OR content='$loser_text');")"
+  [ "$loser_rows" = "0" ]
+  claim_rows="$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE owner_id='$owner' AND request_id='$loser_request_id';")"
+  [ "$claim_rows" = "0" ]
+  conversation_count="$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner';")"
+  [ "$conversation_count" = "1" ]
+
+  runtime_diagnostics="$(fetch_runtime_diagnostics "$active_session_id")"
+  admitted_input_message_id="$(jq -r --arg turn "$active_turn_id" '
+    if .latest_turn.runtime_turn_id == $turn then .latest_turn.input_message_id
+    elif .active_turn.runtime_turn_id == $turn then .active_turn.input_message_id
+    else null end
+  ' <<<"$runtime_diagnostics")"
+  [ "$admitted_input_message_id" = "$durable_user_message_id" ]
+  final_thread="$(curl -fsS -X POST "http://127.0.0.1:14371/v1/runtime/threads/resolve" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg owner "$owner" --arg conversation "$conversation_id" '{request_id:"admission-smoke-final",owner_id:$owner,conversation_id:$conversation}')")"
+  jq -e '.state == "idle" and .revision == 2 and .active_runtime_turn_id == null' \
+    <<<"$final_thread" >/dev/null
+
+  echo "Runtime admission composition: winner_status=ok loser_status=failed winner_request_id=$winner_request_id loser_request_id=$loser_request_id winner_provider_calls=1 loser_provider_calls=0 conversations=$conversation_count durable_user_messages=1 durable_assistant_messages=1 admitted_input_message_id=$admitted_input_message_id durable_user_message_id=$durable_user_message_id current_client=$winner_client current_surface=$winner_surface thread_state=idle thread_revision=2 loser_side_effects=0"
+  provider_post "/fixture/reset" '{}'
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 
@@ -1246,6 +1352,13 @@ if [ "${DISTINCT_CLIENT_MEMORY_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: distinct-client-owner-memory-only"
   run_distinct_client_owner_memory_scenario
   echo "Distinct client owner memory scenario complete: assertions=true"
+  exit 0
+fi
+
+if [ "${RUNTIME_ADMISSION_COMPOSITION_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: runtime-admission-composition-only"
+  run_runtime_admission_composition_scenario
+  echo "Runtime admission composition scenario complete: assertions=true"
   exit 0
 fi
 

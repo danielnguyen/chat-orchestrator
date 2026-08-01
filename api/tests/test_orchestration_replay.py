@@ -2,6 +2,7 @@ import json
 
 import pytest
 from clients.memory_store import MemoryStoreClient
+from clients.runtime import RuntimeClient
 from services.orchestration_replay import (
     assert_snapshot_privacy_safe,
     compare_snapshot,
@@ -256,6 +257,208 @@ async def test_memory_store_client_serializes_policy_metadata_and_containment_po
 
 
 @pytest.mark.asyncio
+async def test_memory_store_client_supplied_message_identity_and_request_header():
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = {}
+    supplied = "{00000000-0000-4000-8000-00000000000A}"
+
+    async def fake_post(path, *, request_id=None, json):
+        captured.update({"path": path, "request_id": request_id, "json": json})
+        return {"message_id": "00000000-0000-4000-8000-00000000000a"}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.add_message(
+        conversation_id="conversation-1",
+        owner_id="owner",
+        role="user",
+        content="current input",
+        client_id="client",
+        message_id=supplied,
+        request_id="request-1",
+    )
+
+    assert response == {"message_id": "00000000-0000-4000-8000-00000000000a"}
+    assert captured["request_id"] == "request-1"
+    assert captured["json"]["message_id"] == supplied
+
+
+@pytest.mark.asyncio
+async def test_memory_store_client_omitted_message_identity_preserves_payload_shape():
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = {}
+
+    async def fake_post(path, *, request_id=None, json):
+        captured.update({"request_id": request_id, "json": json})
+        return {"message_id": "server-message"}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    await client.add_message(
+        conversation_id="conversation-1",
+        owner_id="owner",
+        role="assistant",
+        content="response",
+        client_id="client",
+    )
+
+    assert "message_id" not in captured["json"]
+    assert captured["request_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        ({}, "message_append_response_invalid"),
+        ("PRIVATE-APPEND-RESPONSE", "message_append_response_invalid"),
+        (
+            {"message_id": "00000000-0000-4000-8000-00000000000b"},
+            "message_append_response_context_mismatch",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_memory_store_client_rejects_malformed_or_mismatched_append_response(
+    response,
+    error,
+):
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_post(path, *, request_id=None, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=f"^{error}$") as exc:
+        await client.add_message(
+            conversation_id="conversation-1",
+            owner_id="owner",
+            role="user",
+            content="PRIVATE-APPEND-CONTENT",
+            client_id="client",
+            message_id="00000000-0000-4000-8000-00000000000a",
+        )
+    assert "PRIVATE-APPEND" not in str(exc.value)
+
+
+def _runtime_turn_response(**overrides):
+    response = {
+        "runtime_session": {
+            "runtime_session_id": "session-1",
+            "owner_id": "owner",
+            "conversation_id": "conversation-1",
+            "surface": "web",
+        },
+        "runtime_turn": {
+            "runtime_turn_id": "turn-1",
+            "runtime_session_id": "session-1",
+            "input_message_id": "00000000-0000-4000-8000-00000000000a",
+            "turn_status": "received",
+        },
+        "event": {
+            "runtime_session_id": "session-1",
+            "runtime_turn_id": "turn-1",
+            "event_type": "turn_started",
+        },
+    }
+    for key, value in overrides.items():
+        target, field = key.split("__", 1)
+        response[target][field] = value
+    return response
+
+
+@pytest.mark.asyncio
+async def test_runtime_client_start_turn_sends_and_validates_admitted_identity():
+    client = RuntimeClient("http://runtime.local", "key")
+    captured = {}
+
+    async def fake_post(path, *, json):
+        captured.update({"path": path, "json": json})
+        return _runtime_turn_response()
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.start_turn(
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="web",
+        input_message_id="00000000-0000-4000-8000-00000000000a",
+        intent_class="question",
+    )
+
+    assert response["runtime_turn"]["runtime_turn_id"] == "turn-1"
+    assert captured == {
+        "path": "/v1/runtime/turns/start",
+        "json": {
+            "request_id": "request-1",
+            "owner_id": "owner",
+            "conversation_id": "conversation-1",
+            "surface": "web",
+            "input_message_id": "00000000-0000-4000-8000-00000000000a",
+            "intent_class": "question",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "PRIVATE-RUNTIME-RESPONSE",
+        {},
+        _runtime_turn_response(runtime_turn__runtime_turn_id=""),
+        _runtime_turn_response(runtime_turn__turn_status="completed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_client_rejects_malformed_start_response(response):
+    client = RuntimeClient("http://runtime.local", "key")
+
+    async def fake_post(path, *, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="^runtime_turn_response_invalid$") as exc:
+        await client.start_turn(
+            request_id="request-1",
+            owner_id="owner",
+            conversation_id="conversation-1",
+            surface="web",
+            input_message_id="00000000-0000-4000-8000-00000000000a",
+        )
+    assert "PRIVATE-RUNTIME" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _runtime_turn_response(runtime_session__owner_id="other-owner"),
+        _runtime_turn_response(runtime_session__conversation_id="other-conversation"),
+        _runtime_turn_response(runtime_session__surface="voice"),
+        _runtime_turn_response(runtime_turn__runtime_session_id="other-session"),
+        _runtime_turn_response(
+            runtime_turn__input_message_id="00000000-0000-4000-8000-00000000000b"
+        ),
+        _runtime_turn_response(event__runtime_turn_id="other-turn"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_client_rejects_start_response_context_mismatch(response):
+    client = RuntimeClient("http://runtime.local", "key")
+
+    async def fake_post(path, *, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(
+        RuntimeError, match="^runtime_turn_response_context_mismatch$"
+    ):
+        await client.start_turn(
+            request_id="request-1",
+            owner_id="owner",
+            conversation_id="conversation-1",
+            surface="web",
+            input_message_id="00000000-0000-4000-8000-00000000000a",
+        )
+
+
+@pytest.mark.asyncio
 async def test_complete_persisted_orchestration_replay_corpus_passes_twice():
     for fixture in load_corpus():
         first = await run_scenario(fixture)
@@ -267,6 +470,33 @@ async def test_complete_persisted_orchestration_replay_corpus_passes_twice():
             project_snapshot(first, expected),
             fixture["scenario"],
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_unavailable_stops_at_admission_without_side_effects():
+    snapshot = await _snapshot_for_scenario("runtime-unavailable")
+
+    assert snapshot["outcome"] == {
+        "status": "failed",
+        "error_type": None,
+        "error_code": None,
+        "selected_model": "not_called",
+        "answer_category": "other",
+    }
+    assert snapshot["call_order"] == ["conversation_resolution", "cr_turn_start"]
+    assert snapshot["provider_attempt_count"] == 0
+    assert snapshot["trace"]["persisted"] is False
+    assert snapshot["runtime_terminal_status"] is None
+    assert {
+        "user_message_persistence",
+        "assistant_message_persistence",
+        "profile_resolution",
+        "bms_retrieval",
+        "provider_attempt",
+        "trace_persistence",
+        "cr_turn_complete",
+    }.isdisjoint(snapshot["call_order"])
+    assert_snapshot_privacy_safe(snapshot)
 
 
 def test_changed_expected_output_produces_readable_structural_diff():
@@ -377,8 +607,8 @@ async def test_request_id_and_boundary_call_order_are_deterministic():
     order = snapshot["call_order"]
     required = [
         "conversation_resolution",
-        "user_message_persistence",
         "cr_turn_start",
+        "user_message_persistence",
         "bms_retrieval",
         "cr_memory_hygiene",
         "cr_overlay",
@@ -594,5 +824,8 @@ async def test_failure_scenarios_do_not_claim_false_success():
     assert snapshots["bms_unavailable"]["trace"]["persisted"] is False
     assert snapshots["trace_persistence_failure"]["trace"]["persisted"] is False
     assert snapshots["trace_persistence_failure"]["runtime_terminal_status"] == "completed"
-    assert snapshots["runtime_unavailable"]["trace"]["persisted"] is True
-    assert snapshots["runtime_unavailable"]["trace"]["runtime_overlay"]["status"] == "failed"
+    assert snapshots["runtime_unavailable"]["trace"]["persisted"] is False
+    assert snapshots["runtime_unavailable"]["call_order"] == [
+        "conversation_resolution",
+        "cr_turn_start",
+    ]

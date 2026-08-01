@@ -30,7 +30,9 @@ class BudgetMemoryStore:
 
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
-        return {"message_id": f"message-{len(self.added_messages)}"}
+        return {
+            "message_id": kwargs.get("message_id", f"message-{len(self.added_messages)}")
+        }
 
     async def resolve_profile(self, **kwargs):
         return {
@@ -68,11 +70,15 @@ class BudgetRuntime:
         return {
             "runtime_session": {
                 "runtime_session_id": "session-budget",
+                "owner_id": kwargs["owner_id"],
+                "conversation_id": kwargs["conversation_id"],
                 "status": "active",
                 "surface": kwargs["surface"],
             },
             "runtime_turn": {
                 "runtime_turn_id": "turn-budget",
+                "runtime_session_id": "session-budget",
+                "input_message_id": kwargs.get("input_message_id"),
                 "turn_status": "received",
             },
         }

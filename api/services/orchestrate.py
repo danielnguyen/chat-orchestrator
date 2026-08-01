@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
+from uuid import UUID, uuid4
 
 import httpx
 import yaml
@@ -130,6 +131,14 @@ _HISTORY_PERSISTENCE_UNAVAILABLE = (
     "I couldn’t durably save that historical explanation, so I can’t report it as "
     "completed. Please try again later."
 )
+_RUNTIME_ADMISSION_UNAVAILABLE = (
+    "I couldn’t safely start that turn, so I did not save or process the message. "
+    "Please try again."
+)
+_MESSAGE_PERSISTENCE_UNAVAILABLE = (
+    "I couldn’t durably save that message, so I stopped before generating a response. "
+    "Please try again."
+)
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
@@ -174,6 +183,13 @@ def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
         if msg.get("role") == "user":
             return msg.get("content", "")
     return ""
+
+
+def _current_user_message(messages: list[dict[str, str]]) -> dict[str, str] | None:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return message
+    return None
 
 
 def _runtime_disabled_trace() -> dict[str, Any]:
@@ -4881,6 +4897,80 @@ def _runtime_session_trace_from_session(
     }
 
 
+def _retryable_cross_service_error(error: BaseException) -> bool:
+    if isinstance(error, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    return (
+        isinstance(error, httpx.HTTPStatusError)
+        and error.response is not None
+        and error.response.status_code in {502, 503, 504}
+    )
+
+
+def _bounded_runtime_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and len(value) <= 120
+
+
+def _message_ids_equivalent(actual: Any, expected: str) -> bool:
+    if not isinstance(actual, str):
+        return False
+    if actual == expected:
+        return True
+    try:
+        return UUID(actual) == UUID(expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_started_runtime_turn(
+    response: Any,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    input_message_id: str | None,
+) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        raise RuntimeError("runtime_turn_response_invalid")
+    session = response.get("runtime_session")
+    turn = response.get("runtime_turn")
+    if not isinstance(session, dict) or not isinstance(turn, dict):
+        raise RuntimeError("runtime_turn_response_invalid")
+    runtime_session_id = session.get("runtime_session_id")
+    runtime_turn_id = turn.get("runtime_turn_id")
+    if not _bounded_runtime_id(runtime_session_id) or not _bounded_runtime_id(
+        runtime_turn_id
+    ):
+        raise RuntimeError("runtime_turn_response_invalid")
+    returned_input_message_id = turn.get("input_message_id")
+    input_matches = (
+        returned_input_message_id is None
+        if input_message_id is None
+        else _message_ids_equivalent(returned_input_message_id, input_message_id)
+    )
+    if (
+        session.get("owner_id") != owner_id
+        or session.get("conversation_id") != conversation_id
+        or session.get("surface") != surface
+        or turn.get("runtime_session_id") != runtime_session_id
+        or not input_matches
+    ):
+        raise RuntimeError("runtime_turn_response_context_mismatch")
+    if turn.get("turn_status") not in {"received", "retrieving", "responding"}:
+        raise RuntimeError("runtime_turn_response_invalid")
+    event = response.get("event")
+    if event is not None:
+        if not isinstance(event, dict):
+            raise RuntimeError("runtime_turn_response_invalid")
+        if (
+            event.get("runtime_session_id") != runtime_session_id
+            or event.get("runtime_turn_id") != runtime_turn_id
+            or event.get("event_type") != "turn_started"
+        ):
+            raise RuntimeError("runtime_turn_response_context_mismatch")
+    return response
+
+
 async def _start_runtime_turn(
     *,
     runtime: Any | None,
@@ -4895,43 +4985,97 @@ async def _start_runtime_turn(
             "attempted": False,
             "status": "failed",
             "included": False,
+            "admission_protected": False,
             "error_type": "RuntimeClientNotConfigured",
             "omission_reason": "runtime_client_not_configured",
         }
-    try:
-        response = await runtime.start_turn(
-            request_id=request_id,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            surface=surface,
-            input_message_id=input_message_id,
-        )
-    except Exception as e:
-        return None, {
-            "attempted": True,
-            "status": "failed",
-            "included": False,
-            "error_type": type(e).__name__,
-            "omission_reason": "runtime_turn_unavailable",
-        }
-    turn = response.get("runtime_turn") if isinstance(response, dict) else None
-    session = response.get("runtime_session") if isinstance(response, dict) else None
-    if not isinstance(turn, dict) or not isinstance(session, dict):
-        return None, {
-            "attempted": True,
-            "status": "failed",
-            "included": False,
-            "error_type": type(response).__name__,
-            "omission_reason": "malformed_runtime_turn_response",
-        }
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        try:
+            response = await runtime.start_turn(
+                request_id=request_id,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface=surface,
+                input_message_id=input_message_id,
+            )
+            response = _validate_started_runtime_turn(
+                response,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface=surface,
+                input_message_id=input_message_id,
+            )
+            break
+        except Exception as error:
+            if attempts == 1 and _retryable_cross_service_error(error):
+                continue
+            return None, {
+                "attempted": True,
+                "attempt_count": attempts,
+                "status": "failed",
+                "included": False,
+                "admission_protected": False,
+                "error_type": type(error).__name__,
+                "omission_reason": "runtime_turn_unavailable",
+            }
+    turn = response["runtime_turn"]
+    session = response["runtime_session"]
     return response, {
         "attempted": True,
+        "attempt_count": attempts,
         "status": "included",
         "included": True,
+        "admission_protected": True,
         "runtime_session_id": session.get("runtime_session_id"),
         "runtime_turn_id": turn.get("runtime_turn_id"),
+        "input_message_id": turn.get("input_message_id"),
         "turn_status": turn.get("turn_status"),
     }
+
+
+async def _append_current_user_message(
+    *,
+    memory_store: Any,
+    request_id: str,
+    message_id: str,
+    conversation_id: str,
+    owner_id: str,
+    client_id: str | None,
+    content: str,
+    surface: str,
+    policy_metadata: dict[str, Any] | None,
+) -> str | None:
+    payload = {
+        "conversation_id": conversation_id,
+        "owner_id": owner_id,
+        "role": "user",
+        "content": content,
+        "client_id": client_id,
+        "metadata": {"surface": surface},
+        "policy_metadata": policy_metadata,
+        "message_id": message_id,
+        "request_id": request_id,
+    }
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        try:
+            response = await memory_store.add_message(**payload)
+            if not isinstance(response, dict):
+                raise RuntimeError("message_append_response_invalid")
+            returned_message_id = response.get("message_id")
+            if not isinstance(returned_message_id, str) or not returned_message_id:
+                raise RuntimeError("message_append_response_invalid")
+            if not _message_ids_equivalent(returned_message_id, message_id):
+                raise RuntimeError("message_append_response_context_mismatch")
+            return returned_message_id
+        except Exception as error:
+            if attempts == 1 and _retryable_cross_service_error(error):
+                continue
+            return None
+    return None
 
 
 async def _advance_runtime_turn(
@@ -6443,6 +6587,7 @@ async def orchestrate_chat(
     capability_revalidators: dict[str, Any] | None = None,
     jellyfin_operations: JellyfinOperations | None = None,
     action_connector_registry: ActionConnectorRegistry | None = None,
+    message_id_factory: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     surface = payload.get("surface", "unknown")
@@ -6505,6 +6650,7 @@ async def orchestrate_chat(
         )
         conversation_id = resolved["conversation_id"]
 
+    current_user_message = _current_user_message(payload["messages"])
     last_user_text = _extract_last_user_text(payload["messages"])
     recent_messages = _bounded_recent_messages(payload["messages"])
     surface_context = payload.get("surface_context")
@@ -6520,6 +6666,9 @@ async def orchestrate_chat(
         else None
     )
 
+    current_user_message_id = (
+        message_id_factory() if message_id_factory is not None else str(uuid4())
+    ) if current_user_message is not None else None
     last_user_message_id = None
     turn_response: dict[str, Any] | None = None
     turn_state_trace: dict[str, Any] = _turn_state_disabled_trace()
@@ -6555,55 +6704,79 @@ async def orchestrate_chat(
         "post_budget_survivor_filter_removed_sources": False,
     }
 
+    turn_response, turn_state_trace = await _start_runtime_turn(
+        runtime=runtime,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        input_message_id=current_user_message_id,
+    )
+    if runtime is not None and turn_response is None:
+        return {
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "profile_name": "unresolved",
+            "selected_model": "not_called",
+            "answer": _RUNTIME_ADMISSION_UNAVAILABLE,
+            "status": "failed",
+            "sources": [],
+        }
+
+    runtime_session = (
+        turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
+    )
+    runtime_session_trace = _runtime_session_trace_from_session(
+        runtime_session,
+        attempted=bool(turn_state_trace.get("attempted")),
+        omission_reason=turn_state_trace.get(
+            "omission_reason",
+            "runtime_session_missing_from_turn_response",
+        ),
+        error_type=turn_state_trace.get("error_type"),
+    )
+    (
+        interaction_governance,
+        interaction_governance_trace,
+    ) = await _resolve_interaction_governance(
+        runtime=runtime,
+        enabled=interaction_governance_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        surface_session_id=surface_session_id,
+        active_mode=active_mode,
+        current_user_text=last_user_text,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
+    )
+    persona_containment, persona_containment_trace = await _resolve_persona_containment(
+        runtime=runtime,
+        enabled=persona_containment_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        persona_scope_hint=(
+            interaction_governance.get("persona_scope_hint")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        interaction_kind=(
+            interaction_governance.get("interaction_kind")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        current_user_text=last_user_text,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
+    )
     if persona_containment_enabled:
-        runtime_session, runtime_session_trace = await _resolve_runtime_session(
-            runtime=runtime,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-        )
-        (
-            interaction_governance,
-            interaction_governance_trace,
-        ) = await _resolve_interaction_governance(
-            runtime=runtime,
-            enabled=interaction_governance_enabled,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=None,
-            surface_session_id=surface_session_id,
-            active_mode=active_mode,
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
-        )
-        persona_containment, persona_containment_trace = await _resolve_persona_containment(
-            runtime=runtime,
-            enabled=True,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=None,
-            persona_scope_hint=(
-                interaction_governance.get("persona_scope_hint")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            interaction_kind=(
-                interaction_governance.get("interaction_kind")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
-        )
         mandatory_policy = await _resolve_mandatory_retrieval_policy(
             runtime=runtime,
             request_id=request_id,
@@ -6614,39 +6787,40 @@ async def orchestrate_chat(
             persona_containment=persona_containment,
         )
         persona_containment_trace.update(mandatory_policy.validation_trace)
-        restraint, restraint_trace = await _resolve_restraint(
-            runtime=runtime,
-            enabled=restraint_enabled,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=None,
-            interaction_kind=(
-                interaction_governance.get("interaction_kind")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            response_posture=(
-                interaction_governance.get("response_posture")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            active_persona_id=(
-                persona_containment.get("active_persona_id")
-                if isinstance(persona_containment, dict)
-                else None
-            ),
-            capability_domain=(
-                persona_containment.get("capability_domain")
-                if isinstance(persona_containment, dict)
-                else None
-            ),
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
-        )
+    restraint, restraint_trace = await _resolve_restraint(
+        runtime=runtime,
+        enabled=restraint_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        interaction_kind=(
+            interaction_governance.get("interaction_kind")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        response_posture=(
+            interaction_governance.get("response_posture")
+            if isinstance(interaction_governance, dict)
+            else None
+        ),
+        active_persona_id=(
+            persona_containment.get("active_persona_id")
+            if isinstance(persona_containment, dict)
+            else None
+        ),
+        capability_domain=(
+            persona_containment.get("capability_domain")
+            if isinstance(persona_containment, dict)
+            else None
+        ),
+        current_user_text=last_user_text,
+        recent_messages=recent_messages,
+        surface_metadata_json=surface_metadata_json,
+    )
+    if persona_containment_enabled:
         relationship_projection = (
             mandatory_policy.containment_policy.get("relationship_scope_projection")
             if isinstance(mandatory_policy.containment_policy, dict)
@@ -6659,160 +6833,105 @@ async def orchestrate_chat(
             interaction_governance=interaction_governance,
         )
 
-    for msg in payload["messages"]:
-        if msg["role"] == "user":
-            saved = await memory_store.add_message(
-                conversation_id=conversation_id,
-                owner_id=payload["owner_id"],
-                role="user",
-                content=msg["content"],
-                client_id=payload.get("client_id"),
-                metadata={"surface": surface},
-                policy_metadata=turn_policy_metadata,
+    if current_user_message is not None and current_user_message_id is not None:
+        last_user_message_id = await _append_current_user_message(
+            memory_store=memory_store,
+            request_id=request_id,
+            message_id=current_user_message_id,
+            conversation_id=conversation_id,
+            owner_id=payload["owner_id"],
+            client_id=payload.get("client_id"),
+            content=current_user_message.get("content", ""),
+            surface=surface,
+            policy_metadata=turn_policy_metadata,
+        )
+        if last_user_message_id is None:
+            await _complete_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="abandoned",
             )
-            last_user_message_id = saved.get("message_id") if isinstance(saved, dict) else None
+            return {
+                "request_id": request_id,
+                "conversation_id": conversation_id,
+                "profile_name": "unresolved",
+                "selected_model": "not_called",
+                "answer": _MESSAGE_PERSISTENCE_UNAVAILABLE,
+                "status": "failed",
+                "sources": [],
+            }
 
-    turn_response, turn_state_trace = await _start_runtime_turn(
-        runtime=runtime,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        input_message_id=last_user_message_id,
-    )
-    if not persona_containment_enabled:
-        runtime_session = (
-            turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
-        )
-        runtime_session_trace = _runtime_session_trace_from_session(
-            runtime_session,
-            attempted=bool(turn_state_trace.get("attempted")),
-            omission_reason=turn_state_trace.get(
-                "omission_reason",
-                "runtime_session_missing_from_turn_response",
-            ),
-            error_type=turn_state_trace.get("error_type"),
-        )
-        (
-            interaction_governance,
-            interaction_governance_trace,
-        ) = await _resolve_interaction_governance(
-            runtime=runtime,
-            enabled=interaction_governance_enabled,
-            request_id=request_id,
+    try:
+        profile = await memory_store.resolve_profile(
             owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
             surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            surface_session_id=surface_session_id,
-            active_mode=active_mode,
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
+            requested_profile=payload.get("requested_profile"),
+            client_id=payload.get("client_id"),
         )
-        persona_containment, persona_containment_trace = await _resolve_persona_containment(
-            runtime=runtime,
-            enabled=False,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            persona_scope_hint=None,
-            interaction_kind=None,
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
+        effective_payload = apply_profile_to_request(profile, payload)
+        style_envelope, style_trace = resolve_style_envelope(effective_payload, profile)
+        style_guidance = build_style_guidance_block(style_envelope, style_trace)
+        response_shape, response_shape_trace = resolve_response_shape(
+            effective_payload,
+            style_envelope,
+            style_trace,
         )
-        restraint, restraint_trace = await _resolve_restraint(
-            runtime=runtime,
-            enabled=restraint_enabled,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            interaction_kind=(
-                interaction_governance.get("interaction_kind")
-                if isinstance(interaction_governance, dict)
+        response_shape_guidance = build_response_shape_guidance_block(
+            response_shape, response_shape_trace
+        )
+        surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
+        routing_policy = profile.get("routing_policy", {}) or {}
+        sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
+        profile_local_only = bool(routing_policy.get("local_only", False))
+        local_only = sensitivity_local_only or profile_local_only
+        cost_mode = routing_policy.get("cost_mode")
+        latency_mode = routing_policy.get("latency_mode")
+        retrieval_boundary = _apply_persona_containment_retrieval_boundary(
+            retrieval=(
+                effective_payload.get("retrieval")
+                if isinstance(effective_payload.get("retrieval"), dict)
                 else None
             ),
-            response_posture=(
-                interaction_governance.get("response_posture")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            active_persona_id=None,
-            capability_domain=None,
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
+            persona_containment=persona_containment,
+            persona_containment_trace=persona_containment_trace,
         )
-
-    profile = await memory_store.resolve_profile(
-        owner_id=payload["owner_id"],
-        surface=surface,
-        requested_profile=payload.get("requested_profile"),
-        client_id=payload.get("client_id"),
-    )
-
-    effective_payload = apply_profile_to_request(profile, payload)
-    style_envelope, style_trace = resolve_style_envelope(effective_payload, profile)
-    style_guidance = build_style_guidance_block(style_envelope, style_trace)
-    response_shape, response_shape_trace = resolve_response_shape(
-        effective_payload,
-        style_envelope,
-        style_trace,
-    )
-    response_shape_guidance = build_response_shape_guidance_block(
-        response_shape, response_shape_trace
-    )
-    surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
-    routing_policy = profile.get("routing_policy", {}) or {}
-    sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
-    profile_local_only = bool(routing_policy.get("local_only", False))
-    local_only = sensitivity_local_only or profile_local_only
-    cost_mode = routing_policy.get("cost_mode")
-    latency_mode = routing_policy.get("latency_mode")
-    retrieval_boundary = _apply_persona_containment_retrieval_boundary(
-        retrieval=(
-            effective_payload.get("retrieval")
-            if isinstance(effective_payload.get("retrieval"), dict)
+        external_context_request = effective_payload.get("external_context")
+        external_context_enabled = bool(
+            effective_payload.get("external_context_enabled", False)
+        ) or bool(
+            isinstance(external_context_request, dict)
+            and external_context_request.get("enabled") is True
+        )
+        normalized_external_config = _normalize_external_context_config(
+            external_context_request
+            if isinstance(external_context_request, dict)
             else None
-        ),
-        persona_containment=persona_containment,
-        persona_containment_trace=persona_containment_trace,
-    )
-    external_context_request = effective_payload.get("external_context")
-    external_context_enabled = bool(
-        effective_payload.get("external_context_enabled", False)
-    ) or bool(
-        isinstance(external_context_request, dict)
-        and external_context_request.get("enabled") is True
-    )
-    normalized_external_config = _normalize_external_context_config(
-        external_context_request
-        if isinstance(external_context_request, dict)
-        else None
-    )
-    exact_reference_request = bool(
-        normalized_external_config.get("exact_source_refs")
-    )
-    memory_hygiene_result = None
-    privacy_context = None
-    privacy_context_trace = _privacy_context_disabled_trace()
-    evidence_acquisition: EvidenceAcquisitionState | None = None
-    evidence_manifest: dict[str, Any] | None = None
-    evidence_path_deferred = False
-    compound_verification_requested = False
-    compound_history_answer = ""
-    compound_history_label = "Original acquisition"
-    compound_verification_target: str | None = None
-    evidence_task_text = last_user_text
-    history_followup_trace = _history_trace(enabled=history_followup_enabled)
+        )
+        exact_reference_request = bool(
+            normalized_external_config.get("exact_source_refs")
+        )
+        memory_hygiene_result = None
+        privacy_context = None
+        privacy_context_trace = _privacy_context_disabled_trace()
+        evidence_acquisition: EvidenceAcquisitionState | None = None
+        evidence_manifest: dict[str, Any] | None = None
+        evidence_path_deferred = False
+        compound_verification_requested = False
+        compound_history_answer = ""
+        compound_history_label = "Original acquisition"
+        compound_verification_target: str | None = None
+        evidence_task_text = last_user_text
+        history_followup_trace = _history_trace(enabled=history_followup_enabled)
+    except Exception:
+        if turn_state_trace.get("runtime_turn_id"):
+            await _complete_runtime_turn(
+                runtime=runtime,
+                turn_state_trace=turn_state_trace,
+                request_id=request_id,
+                turn_status="abandoned",
+            )
+        raise
 
     try:
         parsed_exact_intent = (
