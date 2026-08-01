@@ -471,6 +471,10 @@ for path in pathlib.Path("/data").glob("*.sqlite3"):
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
+        if connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversation_runtime_threads'"
+        ).fetchone()[0] == 0:
+            continue
         thread = connection.execute(
             "SELECT state, revision FROM conversation_runtime_threads WHERE owner_id = ? AND conversation_id = ?",
             (owner, conversation_id),
