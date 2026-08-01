@@ -472,6 +472,33 @@ async def test_complete_persisted_orchestration_replay_corpus_passes_twice():
         )
 
 
+@pytest.mark.asyncio
+async def test_runtime_unavailable_stops_at_admission_without_side_effects():
+    snapshot = await _snapshot_for_scenario("runtime-unavailable")
+
+    assert snapshot["outcome"] == {
+        "status": "failed",
+        "error_type": None,
+        "error_code": None,
+        "selected_model": "not_called",
+        "answer_category": "other",
+    }
+    assert snapshot["call_order"] == ["conversation_resolution", "cr_turn_start"]
+    assert snapshot["provider_attempt_count"] == 0
+    assert snapshot["trace"]["persisted"] is False
+    assert snapshot["runtime_terminal_status"] is None
+    assert {
+        "user_message_persistence",
+        "assistant_message_persistence",
+        "profile_resolution",
+        "bms_retrieval",
+        "provider_attempt",
+        "trace_persistence",
+        "cr_turn_complete",
+    }.isdisjoint(snapshot["call_order"])
+    assert_snapshot_privacy_safe(snapshot)
+
+
 def test_changed_expected_output_produces_readable_structural_diff():
     expected = {"trace": {"persisted": True}}
     actual = {"trace": {"persisted": False}}
@@ -797,5 +824,8 @@ async def test_failure_scenarios_do_not_claim_false_success():
     assert snapshots["bms_unavailable"]["trace"]["persisted"] is False
     assert snapshots["trace_persistence_failure"]["trace"]["persisted"] is False
     assert snapshots["trace_persistence_failure"]["runtime_terminal_status"] == "completed"
-    assert snapshots["runtime_unavailable"]["trace"]["persisted"] is True
-    assert snapshots["runtime_unavailable"]["trace"]["runtime_overlay"]["status"] == "failed"
+    assert snapshots["runtime_unavailable"]["trace"]["persisted"] is False
+    assert snapshots["runtime_unavailable"]["call_order"] == [
+        "conversation_resolution",
+        "cr_turn_start",
+    ]

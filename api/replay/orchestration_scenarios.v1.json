@@ -506,14 +506,19 @@
             "runtime": "unavailable",
             "expected": {
                 "outcome": {
-                    "status": "ok"
+                    "status": "failed",
+                    "error_type": null,
+                    "error_code": null,
+                    "selected_model": "not_called"
                 },
+                "call_order": [
+                    "conversation_resolution",
+                    "cr_turn_start"
+                ],
                 "trace": {
-                    "runtime_overlay": {
-                        "included": false,
-                        "status": "failed"
-                    }
+                    "persisted": false
                 },
+                "provider_attempt_count": 0,
                 "runtime_terminal_status": null
             }
         },

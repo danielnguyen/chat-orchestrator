@@ -603,6 +603,7 @@ class ReplayRuntime:
 
     async def start_turn(self, **kwargs: Any) -> dict[str, Any]:
         self._record("cr_turn_start", kwargs["request_id"])
+        self._maybe_fail()
         return {
             "runtime_session": {
                 "runtime_session_id": "runtime-session-1",
