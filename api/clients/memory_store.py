@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -96,6 +97,93 @@ class MemoryStoreClient:
             response.get("updated_at"), str
         ):
             raise RuntimeError("conversation_projection_invalid")
+        return response
+
+    async def list_open_conversations(
+        self,
+        *,
+        owner_id: str,
+        limit: int = 9,
+    ) -> dict[str, Any]:
+        response = await self._get(
+            "/v1/conversations",
+            params={
+                "owner_id": owner_id,
+                "lifecycle_state": "open",
+                "limit": limit,
+            },
+        )
+        if not isinstance(response, dict) or set(response) != {
+            "conversations",
+            "next_cursor",
+        }:
+            raise RuntimeError("conversation_list_response_invalid")
+        conversations = response.get("conversations")
+        next_cursor = response.get("next_cursor")
+        if (
+            not isinstance(conversations, list)
+            or len(conversations) > limit
+            or next_cursor is not None
+            and (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or len(next_cursor) > 2048
+            )
+        ):
+            raise RuntimeError("conversation_list_response_invalid")
+
+        seen: set[str] = set()
+        validated: list[dict[str, Any]] = []
+        for row in conversations:
+            if not isinstance(row, dict):
+                raise RuntimeError("conversation_list_response_invalid")
+            conversation_id = row.get("conversation_id")
+            try:
+                canonical_id = str(UUID(conversation_id))
+            except (TypeError, ValueError, AttributeError):
+                raise RuntimeError("conversation_list_response_invalid") from None
+            if conversation_id != canonical_id:
+                raise RuntimeError("conversation_list_response_invalid")
+            if canonical_id in seen:
+                raise RuntimeError("conversation_list_response_invalid")
+            seen.add(canonical_id)
+            if row.get("owner_id") != owner_id:
+                raise RuntimeError("conversation_list_response_context_mismatch")
+            if row.get("lifecycle_state") != "open":
+                raise RuntimeError("conversation_list_response_context_mismatch")
+            if row.get("superseded_by_conversation_id") is not None:
+                raise RuntimeError("conversation_list_response_invalid")
+            updated_at = row.get("updated_at")
+            if not isinstance(updated_at, str):
+                raise RuntimeError("conversation_list_response_invalid")
+            try:
+                parsed_updated_at = datetime.fromisoformat(updated_at)
+            except ValueError:
+                raise RuntimeError("conversation_list_response_invalid") from None
+            if parsed_updated_at.tzinfo is None or parsed_updated_at.utcoffset() is None:
+                raise RuntimeError("conversation_list_response_invalid")
+            validated.append(row)
+        return {"conversations": validated, "next_cursor": next_cursor}
+
+    async def create_conversation(
+        self,
+        *,
+        owner_id: str,
+        client_id: str | None,
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/v1/conversations",
+            json={"owner_id": owner_id, "client_id": client_id},
+        )
+        if not isinstance(response, dict) or set(response) != {"conversation_id"}:
+            raise RuntimeError("conversation_create_response_invalid")
+        conversation_id = response.get("conversation_id")
+        try:
+            canonical_id = str(UUID(conversation_id))
+        except (TypeError, ValueError, AttributeError):
+            raise RuntimeError("conversation_create_response_invalid") from None
+        if conversation_id != canonical_id:
+            raise RuntimeError("conversation_create_response_invalid")
         return response
 
     async def add_message(

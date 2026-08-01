@@ -7,9 +7,9 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="1a8278278fcabd871f6235bc66acdfe80523c6f4"
-CR_COMMIT="2a63ca3c32010fe8dad727d62c2e6a7475cbb98c"
+CR_COMMIT="f87a80f6d19cdb4ebcd01e6cc5c42af2a8ee1202"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="19dfdd9b58fc7ce87152c0009143d23caea03b03"
+CO_COMMIT="b8fb14e422bbf5f6fa60fbd1512afc10d0bc34a8"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -214,6 +214,13 @@ resolve_conversation() {
     | jq -r '.conversation_id'
 }
 
+create_conversation() {
+  local owner="$1" client="$2"
+  bms_post "/v1/conversations" \
+    "$(jq -nc --arg owner "$owner" --arg client "$client" '{owner_id:$owner, client_id:$client}')" \
+    | jq -r '.conversation_id'
+}
+
 add_message() {
   local conversation_id="$1" owner="$2" client="$3" role="$4" content="$5"
   bms_post "/v1/conversations/$conversation_id/messages" \
@@ -361,6 +368,16 @@ run_distinct_client_chat() {
     }')"
 }
 
+run_omitted_chat() {
+  local owner="$1" client="$2" surface="$3" question="$4"
+  co_post "$(jq -nc \
+    --arg owner "$owner" \
+    --arg client "$client" \
+    --arg surface "$surface" \
+    --arg question "$question" \
+    '{owner_id:$owner, client_id:$client, surface:$surface, messages:[{role:"user", content:$question}], sensitivity:"private"}')"
+}
+
 install_disposable_surface_binding() {
   local surface="$1"
   docker compose -f "$COMPOSE" exec -T runtime python - "$surface" <<'PY'
@@ -439,6 +456,86 @@ for path in pathlib.Path("/data").glob("*.sqlite3"):
         connection.close()
 print(count)
 ' "$needle"
+}
+
+runtime_thread_snapshot() {
+  local owner="$1" conversation_id="$2"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" "$conversation_id" <<'PY'
+import json
+import pathlib
+import sqlite3
+import sys
+
+owner, conversation_id = sys.argv[1:]
+for path in pathlib.Path("/data").glob("*.sqlite3"):
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        thread = connection.execute(
+            "SELECT state, revision FROM conversation_runtime_threads WHERE owner_id = ? AND conversation_id = ?",
+            (owner, conversation_id),
+        ).fetchone()
+        if thread is None:
+            continue
+        sessions = connection.execute(
+            "SELECT surface FROM conversation_runtime_sessions WHERE owner_id = ? AND conversation_id = ? ORDER BY surface",
+            (owner, conversation_id),
+        ).fetchall()
+        print(json.dumps({
+            "state": thread["state"],
+            "revision": thread["revision"],
+            "surfaces": [row["surface"] for row in sessions],
+            "session_count": len(sessions),
+        }, separators=(",", ":")))
+        raise SystemExit(0)
+    finally:
+        connection.close()
+raise SystemExit("runtime thread not found")
+PY
+}
+
+runtime_owner_counts() {
+  local owner="$1"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+owner = sys.argv[1]
+for path in pathlib.Path("/data").glob("*.sqlite3"):
+    connection = sqlite3.connect(path)
+    try:
+        if connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversation_runtime_threads'"
+        ).fetchone()[0] == 0:
+            continue
+        sessions = connection.execute(
+            "SELECT runtime_session_id FROM conversation_runtime_sessions WHERE owner_id = ?",
+            (owner,),
+        ).fetchall()
+        session_ids = [row[0] for row in sessions]
+        thread_count = connection.execute(
+            "SELECT count(*) FROM conversation_runtime_threads WHERE owner_id = ?",
+            (owner,),
+        ).fetchone()[0]
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
+            turn_count = connection.execute(
+                f"SELECT count(*) FROM conversation_runtime_turns WHERE runtime_session_id IN ({placeholders})",
+                session_ids,
+            ).fetchone()[0]
+            event_count = connection.execute(
+                f"SELECT count(*) FROM conversation_runtime_events WHERE runtime_session_id IN ({placeholders})",
+                session_ids,
+            ).fetchone()[0]
+        else:
+            turn_count = event_count = 0
+        print(f"{len(session_ids)}|{thread_count}|{turn_count}|{event_count}")
+        raise SystemExit(0)
+    finally:
+        connection.close()
+print("0|0|0|0")
+PY
 }
 
 bms_retrieval_access_count() {
@@ -1316,6 +1413,142 @@ run_runtime_admission_composition_scenario() {
   provider_post "/fixture/reset" '{}'
 }
 
+run_omitted_continuation_scenario() {
+  local other_owner="owner-omitted-isolated" other_client="client-isolated"
+  local zero_owner="owner-omitted-zero" zero_client="client-zero" zero_surface="surface-zero"
+  local other_conversation zero_response zero_conversation zero_request zero_provider zero_thread
+  local resume_owner="owner-omitted-resume" resume_conversation first_response second_response
+  local first_request second_request second_provider resume_counts resume_provenance resume_thread
+  local multiple_owner="owner-omitted-multiple" multiple_a multiple_b multiple_response multiple_request
+  local multiple_before multiple_after multiple_runtime_before multiple_runtime_after multiple_provider
+  local active_owner="owner-omitted-active" active_conversation initial_response winner_payload winner_file winner_pid
+  local observed_thread wait_response wait_request winner_response active_provider active_rows active_thread
+  local incomplete_owner="owner-omitted-incomplete" incomplete_response incomplete_request
+  local incomplete_before incomplete_after incomplete_runtime_before incomplete_runtime_after incomplete_provider
+
+  provider_post "/fixture/reset" '{}'
+
+  other_conversation="$(create_conversation "$other_owner" "$other_client")"
+  run_distinct_client_chat "$other_owner" "$other_client" "surface-isolated" "$other_conversation" "neutral isolated seed" >/dev/null
+  zero_response="$(run_omitted_chat "$zero_owner" "$zero_client" "$zero_surface" "neutral new conversation")"
+  zero_conversation="$(jq -r '.conversation_id' <<<"$zero_response")"
+  zero_request="$(jq -r '.request_id' <<<"$zero_response")"
+  jq -e --arg other "$other_conversation" '
+    .status == "ok" and (.conversation_id | type == "string") and .conversation_id != $other
+  ' <<<"$zero_response" >/dev/null
+  [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$zero_owner';")" = "1" ]
+  [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$zero_owner' AND conversation_id='$zero_conversation';")" = "1|1" ]
+  zero_provider="$(fetch_provider_calls "$zero_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$zero_provider")" = "1" ]
+  zero_thread="$(runtime_thread_snapshot "$zero_owner" "$zero_conversation")"
+  jq -e '.state == "idle" and .revision == 2 and .session_count == 1' <<<"$zero_thread" >/dev/null
+
+  provider_post "/fixture/reset" '{}'
+  resume_conversation="$(create_conversation "$resume_owner" "client-resume-a")"
+  first_response="$(run_distinct_client_chat "$resume_owner" "client-resume-a" "surface-resume-a" "$resume_conversation" "neutral first turn")"
+  first_request="$(jq -r '.request_id' <<<"$first_response")"
+  jq -e --arg conversation "$resume_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$first_response" >/dev/null
+  provider_post "/fixture/reset" '{}'
+  second_response="$(run_omitted_chat "$resume_owner" "client-resume-b" "surface-resume-b" "neutral resumed turn")"
+  second_request="$(jq -r '.request_id' <<<"$second_response")"
+  jq -e --arg conversation "$resume_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$second_response" >/dev/null
+  [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$resume_owner';")" = "1" ]
+  resume_counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$resume_owner' AND conversation_id='$resume_conversation';")"
+  [ "$resume_counts" = "2|2" ]
+  resume_provenance="$(psql_exec -At -F '|' -c "SELECT client_id, metadata->>'surface' FROM messages WHERE owner_id='$resume_owner' AND conversation_id='$resume_conversation' AND role='user' ORDER BY created_at;")"
+  [ "$resume_provenance" = $'client-resume-a|surface-resume-a\nclient-resume-b|surface-resume-b' ]
+  second_provider="$(fetch_provider_calls "$second_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$second_provider")" = "1" ]
+  resume_thread="$(runtime_thread_snapshot "$resume_owner" "$resume_conversation")"
+  jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and .surfaces == ["surface-resume-a", "surface-resume-b"]' <<<"$resume_thread" >/dev/null
+
+  provider_post "/fixture/reset" '{}'
+  multiple_a="$(create_conversation "$multiple_owner" "client-multiple-a")"
+  multiple_b="$(create_conversation "$multiple_owner" "client-multiple-b")"
+  run_distinct_client_chat "$multiple_owner" "client-multiple-a" "surface-multiple-a" "$multiple_a" "neutral candidate a" >/dev/null
+  run_distinct_client_chat "$multiple_owner" "client-multiple-b" "surface-multiple-b" "$multiple_b" "neutral candidate b" >/dev/null
+  provider_post "/fixture/reset" '{}'
+  multiple_before="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM messages WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM traces WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$multiple_owner');")"
+  multiple_runtime_before="$(runtime_owner_counts "$multiple_owner")"
+  multiple_response="$(run_omitted_chat "$multiple_owner" "client-multiple-c" "surface-multiple-c" "neutral ambiguous continuation")"
+  multiple_request="$(jq -r '.request_id' <<<"$multiple_response")"
+  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .sources == []' <<<"$multiple_response" >/dev/null
+  multiple_after="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM messages WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM traces WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$multiple_owner');")"
+  multiple_runtime_after="$(runtime_owner_counts "$multiple_owner")"
+  [ "$multiple_before" = "$multiple_after" ]
+  [ "$multiple_runtime_before" = "$multiple_runtime_after" ]
+  multiple_provider="$(fetch_provider_calls "$multiple_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$multiple_provider")" = "0" ]
+
+  provider_post "/fixture/reset" '{}'
+  active_conversation="$(create_conversation "$active_owner" "client-active-a")"
+  initial_response="$(run_distinct_client_chat "$active_owner" "client-active-a" "surface-active-a" "$active_conversation" "neutral active seed")"
+  jq -e '.status == "ok"' <<<"$initial_response" >/dev/null
+  provider_post "/fixture/reset" '{}'
+  provider_post "/fixture/delay-next-primary" '{"delay_ms":2500}'
+  winner_payload="$(jq -nc --arg owner "$active_owner" --arg client "client-active-b" --arg surface "surface-active-b" --arg conversation "$active_conversation" '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:"neutral active winner"}],sensitivity:"private"}')"
+  winner_file="$COMPOSED_SMOKE_TMP/omitted-active-winner.json"
+  co_post "$winner_payload" >"$winner_file" &
+  winner_pid="$!"
+  observed_thread=""
+  for _ in $(seq 1 60); do
+    observed_thread="$(runtime_thread_snapshot "$active_owner" "$active_conversation" 2>/dev/null || true)"
+    if [ "$(jq -r '.state // empty' <<<"${observed_thread:-{}}")" = "active" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$(jq -r '.state // empty' <<<"${observed_thread:-{}}")" = "active" ] || {
+    wait "$winner_pid" || true
+    echo "omitted continuation did not observe active candidate" >&2
+    exit 1
+  }
+  wait_response="$(run_omitted_chat "$active_owner" "client-active-c" "surface-active-c" "neutral waiting loser")"
+  wait_request="$(jq -r '.request_id' <<<"$wait_response")"
+  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .answer == "Another turn is still in progress. Please try again shortly."' <<<"$wait_response" >/dev/null
+  wait "$winner_pid"
+  winner_response="$(cat "$winner_file")"
+  jq -e '.status == "ok"' <<<"$winner_response" >/dev/null
+  active_provider="$(fetch_provider_calls "$wait_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$active_provider")" = "0" ]
+  active_rows="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$active_owner' AND (client_id='client-active-c' OR content='neutral waiting loser');")"
+  [ "$active_rows" = "0" ]
+  active_thread="$(runtime_thread_snapshot "$active_owner" "$active_conversation")"
+  jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and (.surfaces | index("surface-active-c") | not)' <<<"$active_thread" >/dev/null
+
+  provider_post "/fixture/reset" '{}'
+  for ordinal in $(seq 1 9); do
+    create_conversation "$incomplete_owner" "client-incomplete-$ordinal" >/dev/null
+  done
+  incomplete_before="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM messages WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM traces WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$incomplete_owner');")"
+  incomplete_runtime_before="$(runtime_owner_counts "$incomplete_owner")"
+  incomplete_response="$(run_omitted_chat "$incomplete_owner" "client-incomplete-request" "surface-incomplete" "neutral incomplete continuation")"
+  incomplete_request="$(jq -r '.request_id' <<<"$incomplete_response")"
+  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and (.answer | contains("provide the conversation"))' <<<"$incomplete_response" >/dev/null
+  incomplete_after="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM messages WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM traces WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$incomplete_owner');")"
+  incomplete_runtime_after="$(runtime_owner_counts "$incomplete_owner")"
+  [ "$incomplete_before" = "9|0|0|0" ]
+  [ "$incomplete_before" = "$incomplete_after" ]
+  [ "$incomplete_runtime_before" = "$incomplete_runtime_after" ]
+  incomplete_provider="$(fetch_provider_calls "$incomplete_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$incomplete_provider")" = "0" ]
+
+  case "$(jq -c . <<<"$multiple_response")$(jq -c . <<<"$wait_response")$(jq -c . <<<"$incomplete_response")" in
+    *"$other_conversation"*|*"client-multiple"*|*"surface-multiple"*)
+      echo "omitted continuation response disclosed candidate context" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "Omitted continuation zero: status=ok request_id=$zero_request conversation_id=$zero_conversation owner_conversations=1 user_messages=1 assistant_messages=1 provider_calls=1 thread_state=idle thread_revision=2 isolated_conversation_rejected=true"
+  echo "Omitted continuation resume: first_request_id=$first_request second_request_id=$second_request conversation_id=$resume_conversation user_messages=2 assistant_messages=2 provider_calls=1 session_surfaces=surface-resume-a,surface-resume-b thread_state=idle thread_revision=4 provenance_preserved=true"
+  echo "Omitted continuation multiple: status=degraded conversation_id=null provider_calls=0 durable_counts_unchanged=true runtime_counts_unchanged=true side_effects=0"
+  echo "Omitted continuation active: status=degraded conversation_id=null provider_calls=0 losing_messages=0 losing_sessions=0 thread_state=idle thread_revision=4"
+  echo "Omitted continuation incomplete: status=degraded conversation_id=null candidates=9 provider_calls=0 durable_counts=9,0,0,0 runtime_counts_unchanged=true side_effects=0"
+  echo "Omitted continuation isolation: other_owner_selected=false candidate_details_disclosed=false semantic_selector=false adapter_selector=false"
+  provider_post "/fixture/reset" '{}'
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 
@@ -1359,6 +1592,13 @@ if [ "${RUNTIME_ADMISSION_COMPOSITION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: runtime-admission-composition-only"
   run_runtime_admission_composition_scenario
   echo "Runtime admission composition scenario complete: assertions=true"
+  exit 0
+fi
+
+if [ "${OMITTED_CONTINUATION_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: omitted-continuation-only"
+  run_omitted_continuation_scenario
+  echo "Omitted conversation continuation scenario complete: assertions=true"
   exit 0
 fi
 

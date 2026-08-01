@@ -34,6 +34,148 @@ def _exact_conversation_projection(**overrides):
     return projection
 
 
+def _listed_conversation(ordinal=1, **overrides):
+    conversation_id = overrides.pop(
+        "conversation_id",
+        f"00000000-0000-4000-8000-{ordinal:012d}",
+    )
+    projection = _exact_conversation_projection(
+        conversation_id=conversation_id,
+        **overrides,
+    )
+    return projection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, 8, 9])
+async def test_memory_store_client_lists_one_bounded_owner_open_page(count):
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = []
+
+    async def fake_get(path, *, params=None):
+        captured.append((path, params))
+        return {
+            "conversations": [_listed_conversation(index + 1) for index in range(count)],
+            "next_cursor": "bounded-cursor" if count else None,
+        }
+
+    client._get = fake_get  # type: ignore[method-assign]
+    response = await client.list_open_conversations(owner_id="owner", limit=9)
+
+    assert len(response["conversations"]) == count
+    assert captured == [
+        (
+            "/v1/conversations",
+            {"owner_id": "owner", "lifecycle_state": "open", "limit": 9},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        [],
+        {},
+        {"conversations": "invalid", "next_cursor": None},
+        {"conversations": [_listed_conversation()] * 2, "next_cursor": None},
+        {
+            "conversations": [_listed_conversation(owner_id="other-owner")],
+            "next_cursor": None,
+        },
+        {
+            "conversations": [_listed_conversation(lifecycle_state="closed")],
+            "next_cursor": None,
+        },
+        {
+            "conversations": [_listed_conversation(conversation_id="not-a-uuid")],
+            "next_cursor": None,
+        },
+        {
+            "conversations": [_listed_conversation(updated_at="2026-01-02T00:00:00")],
+            "next_cursor": None,
+        },
+        {
+            "conversations": [_listed_conversation(updated_at="not-a-time")],
+            "next_cursor": None,
+        },
+        {
+            "conversations": [
+                _listed_conversation(
+                    superseded_by_conversation_id="00000000-0000-4000-8000-000000000099"
+                )
+            ],
+            "next_cursor": None,
+        },
+        {"conversations": [], "next_cursor": "x" * 2049},
+        {
+            "conversations": [_listed_conversation(index + 1) for index in range(10)],
+            "next_cursor": None,
+        },
+    ],
+)
+async def test_memory_store_client_rejects_invalid_open_conversation_pages(response):
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_get(path, *, params=None):
+        return response
+
+    client._get = fake_get  # type: ignore[method-assign]
+    with pytest.raises(
+        RuntimeError,
+        match="^conversation_list_response_(?:invalid|context_mismatch)$",
+    ):
+        await client.list_open_conversations(owner_id="owner", limit=9)
+
+
+@pytest.mark.asyncio
+async def test_memory_store_client_creates_conversation_with_exact_payload():
+    client = MemoryStoreClient("http://memory.local", "key")
+    captured = []
+
+    async def fake_post(path, *, request_id=None, json):
+        captured.append((path, request_id, json))
+        return {"conversation_id": "00000000-0000-4000-8000-000000000001"}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.create_conversation(
+        owner_id="owner",
+        client_id="current-client",
+    )
+
+    assert response == {"conversation_id": "00000000-0000-4000-8000-000000000001"}
+    assert captured == [
+        (
+            "/v1/conversations",
+            None,
+            {"owner_id": "owner", "client_id": "current-client"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"conversation_id": "not-a-uuid"},
+        {
+            "conversation_id": "00000000-0000-4000-8000-000000000001",
+            "extra": True,
+        },
+    ],
+)
+async def test_memory_store_client_rejects_invalid_create_response(response):
+    client = MemoryStoreClient("http://memory.local", "key")
+
+    async def fake_post(path, *, request_id=None, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="^conversation_create_response_invalid$"):
+        await client.create_conversation(owner_id="owner", client_id=None)
+
+
 @pytest.mark.asyncio
 async def test_memory_store_client_gets_exact_owner_scoped_open_conversation():
     client = MemoryStoreClient("http://memory.local", "key")

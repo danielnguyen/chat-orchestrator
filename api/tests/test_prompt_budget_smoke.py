@@ -28,6 +28,12 @@ class BudgetMemoryStore:
     async def resolve_conversation(self, **kwargs):
         return {"conversation_id": "conv-budget", "reused": False}
 
+    async def list_open_conversations(self, **kwargs):
+        return {"conversations": [], "next_cursor": None}
+
+    async def create_conversation(self, **kwargs):
+        return {"conversation_id": "conv-budget"}
+
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
         return {
@@ -65,6 +71,24 @@ class BudgetRuntime:
     def __init__(self, *, overlay_content: str | None = None):
         self.overlay_content = overlay_content
         self.terminal_status = None
+
+    async def select_continuation(self, **kwargs):
+        return {
+            "schema_version": "runtime-continuation-selection.v1",
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "surface": kwargs["surface"],
+            "result": {
+                "outcome": "create_new",
+                "timing_policy": "answer_now",
+                "selected_conversation_id": None,
+                "selected_thread_revision": None,
+                "candidate_count": len(kwargs["candidates"]),
+                "eligible_candidate_count": 0,
+                "reason_codes": ["no_candidates"],
+                "policy_version": "continuation-selection.v1",
+            },
+        }
 
     async def start_turn(self, **kwargs):
         return {

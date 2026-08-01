@@ -38,9 +38,35 @@ The conversation's originating client may differ from the current request
 client. A valid continuation appends new messages with the current `client_id`
 and current surface metadata while leaving historical provenance unchanged.
 
-When `conversation_id` is omitted, Chat Orchestrator retains the existing
-same-owner, same-client rolling resolver for compatibility. Omitted-ID
-continuation selection is not part of the current behavior.
+When `conversation_id` is omitted and Cognitive Runtime is configured, Chat
+Orchestrator makes one owner-wide Basic Memory Store request for open
+conversations with a limit of nine. Cognitive Runtime accepts at most eight
+candidates, so zero through eight returned rows form a complete bounded set;
+nine rows make the submitted first eight explicitly incomplete. The Basic
+Memory Store cursor is validated but is not used as completeness evidence, and
+Chat Orchestrator does not paginate or select by result order.
+
+Each candidate sent to Cognitive Runtime contains only its durable conversation
+ID, open lifecycle state, and durable update time. Cognitive Runtime combines
+those facts with its existing thread state and returns `resume`, `create_new`,
+`clarify`, `wait`, or `decline`. A resume uses the exact selected conversation
+and binds the returned thread revision into atomic turn admission. Create-new
+makes one direct durable conversation creation request and then admits without a
+selected revision. Clarification, wait, decline, and mandatory dependency
+failures return a null conversation ID before admission, message persistence,
+profile or retrieval work, providers, capabilities, actions, claims, or traces.
+Adapters store and reuse only non-null conversation IDs.
+
+Selection does not use semantic retrieval, a provider or model, durable row
+order, raw recency alone, titles, content, originating or current client,
+current surface, message counts, embeddings, or adapter state. The surface is
+selection context only and is not treated as a permission signal. The fixed
+1,800-second freshness interval preserves the bounded compatibility horizon; it
+does not establish a general presence policy.
+
+When Cognitive Runtime is not configured, omitted IDs retain the same-owner,
+same-client rolling resolver as explicit compatibility behavior. That path is
+not cross-surface selection-protected. Supplied-ID validation remains unchanged.
 
 ## Turn admission and current-user persistence
 
