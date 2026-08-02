@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -107,6 +108,54 @@ def _load_main(monkeypatch):
     import main
 
     return importlib.reload(main)
+
+
+def _continuation_response(outcome: str = "resume") -> dict[str, Any]:
+    timing = {
+        "resume": "resume_previous_thread",
+        "create_new": "answer_now",
+        "clarify": "ask_clarifying_question",
+        "wait": "pause_or_wait",
+        "decline": "close_turn",
+    }[outcome]
+    reasons = {
+        "resume": ["one_eligible_candidate"],
+        "create_new": ["no_eligible_candidates"],
+        "clarify": ["multiple_eligible_candidates"],
+        "wait": ["active_thread_present"],
+        "decline": ["unavailable_thread_present"],
+    }[outcome]
+    return {
+        "schema_version": "runtime-continuation-selection.v1",
+        "request_id": "selection-request",
+        "owner_id": "owner",
+        "surface": "voice",
+        "result": {
+            "outcome": outcome,
+            "timing_policy": timing,
+            "selected_conversation_id": (
+                "00000000-0000-4000-8000-000000000001"
+                if outcome == "resume"
+                else None
+            ),
+            "selected_thread_revision": 7 if outcome == "resume" else None,
+            "candidate_count": 1,
+            "eligible_candidate_count": 1 if outcome in {"resume", "clarify"} else 0,
+            "reason_codes": reasons,
+            "policy_version": "continuation-selection.v1",
+        },
+    }
+
+
+def _continuation_candidates(count: int) -> list[dict[str, str]]:
+    return [
+        {
+            "conversation_id": f"00000000-0000-4000-8000-{index:012d}",
+            "lifecycle_state": "open",
+            "durable_updated_at": "2026-08-01T00:00:00+00:00",
+        }
+        for index in range(1, count + 1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -514,6 +563,458 @@ async def test_cancellation_is_not_retried_or_converted():
     ) == {"ok": True}
     assert len(factory.clients) == 1
     await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["resume", "create_new", "clarify", "wait", "decline"])
+async def test_runtime_client_accepts_coherent_continuation_outcomes(outcome):
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+    candidates = [
+        {
+            "conversation_id": "00000000-0000-4000-8000-000000000001",
+            "lifecycle_state": "open",
+            "durable_updated_at": "2026-08-01T00:00:00+00:00",
+        }
+    ]
+    response = _continuation_response(outcome)
+    if outcome == "clarify":
+        candidates.append(
+            {
+                "conversation_id": "00000000-0000-4000-8000-000000000002",
+                "lifecycle_state": "open",
+                "durable_updated_at": "2026-08-01T00:00:00+00:00",
+            }
+        )
+        response["result"]["candidate_count"] = 2
+        response["result"]["eligible_candidate_count"] = 2
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    actual = await client.select_continuation(
+        request_id="selection-request",
+        owner_id="owner",
+        surface="voice",
+        candidate_set_complete=True,
+        stale_after_seconds=1800,
+        candidates=candidates,
+    )
+
+    assert actual == response
+    assert calls == [
+        (
+            "/v1/runtime/continuations/select",
+            {
+                "request_id": "selection-request",
+                "owner_id": "owner",
+                "surface": "voice",
+                "candidate_set_complete": True,
+                "stale_after_seconds": 1800,
+                "candidates": candidates,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "candidate_count", "eligible_count", "reason_codes"),
+    [
+        ("create_new", 0, 0, ["no_candidates"]),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "candidate_not_open"],
+        ),
+        (
+            "create_new",
+            4,
+            0,
+            [
+                "no_eligible_candidates",
+                "candidate_not_open",
+                "runtime_state_missing",
+                "runtime_session_missing",
+                "candidate_stale",
+            ],
+        ),
+        ("clarify", 1, 0, ["candidate_set_incomplete"]),
+        ("clarify", 2, 2, ["multiple_eligible_candidates"]),
+        ("wait", 1, 0, ["active_thread_present"]),
+        ("wait", 2, 1, ["active_thread_present"]),
+        ("decline", 1, 0, ["contended_thread_present"]),
+        ("decline", 1, 0, ["unavailable_thread_present"]),
+        ("decline", 1, 0, ["runtime_state_inconsistent"]),
+        (
+            "decline",
+            1,
+            0,
+            [
+                "contended_thread_present",
+                "unavailable_thread_present",
+                "runtime_state_inconsistent",
+            ],
+        ),
+    ],
+)
+async def test_runtime_client_accepts_coherent_continuation_reason_shapes(
+    outcome,
+    candidate_count,
+    eligible_count,
+    reason_codes,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    candidates = _continuation_candidates(candidate_count)
+    response = _continuation_response(outcome)
+    response["result"].update(
+        candidate_count=candidate_count,
+        eligible_candidate_count=eligible_count,
+        reason_codes=reason_codes,
+    )
+    calls = []
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    actual = await client.select_continuation(
+        request_id="selection-request",
+        owner_id="owner",
+        surface="voice",
+        candidate_set_complete=reason_codes != ["candidate_set_incomplete"],
+        stale_after_seconds=1800,
+        candidates=candidates,
+    )
+
+    assert actual == response
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "candidate_count", "eligible_count", "reason_codes"),
+    [
+        (
+            "resume",
+            1,
+            1,
+            ["one_eligible_candidate", "candidate_stale"],
+        ),
+        ("resume", 1, 0, ["one_eligible_candidate"]),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "active_thread_present"],
+        ),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "contended_thread_present"],
+        ),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "unavailable_thread_present"],
+        ),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "runtime_state_inconsistent"],
+        ),
+        ("create_new", 1, 0, ["no_candidates"]),
+        ("create_new", 0, 0, ["no_eligible_candidates"]),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_candidates", "no_eligible_candidates"],
+        ),
+        ("create_new", 1, 1, ["no_eligible_candidates"]),
+        (
+            "create_new",
+            2,
+            0,
+            [
+                "no_eligible_candidates",
+                "runtime_state_missing",
+                "candidate_not_open",
+            ],
+        ),
+        (
+            "clarify",
+            2,
+            2,
+            ["multiple_eligible_candidates", "unavailable_thread_present"],
+        ),
+        (
+            "clarify",
+            1,
+            0,
+            ["candidate_set_incomplete", "active_thread_present"],
+        ),
+        ("clarify", 1, 1, ["candidate_set_incomplete"]),
+        ("clarify", 2, 0, ["multiple_eligible_candidates"]),
+        ("clarify", 2, 1, ["multiple_eligible_candidates"]),
+        (
+            "clarify",
+            2,
+            2,
+            ["candidate_set_incomplete", "multiple_eligible_candidates"],
+        ),
+        (
+            "wait",
+            1,
+            0,
+            ["active_thread_present", "runtime_state_inconsistent"],
+        ),
+        (
+            "wait",
+            1,
+            0,
+            ["active_thread_present", "unavailable_thread_present"],
+        ),
+        (
+            "wait",
+            1,
+            0,
+            ["active_thread_present", "multiple_eligible_candidates"],
+        ),
+        ("wait", 1, 0, ["candidate_stale"]),
+        (
+            "decline",
+            1,
+            0,
+            ["contended_thread_present", "active_thread_present"],
+        ),
+        (
+            "decline",
+            1,
+            0,
+            ["contended_thread_present", "candidate_stale"],
+        ),
+        (
+            "decline",
+            1,
+            0,
+            ["contended_thread_present", "multiple_eligible_candidates"],
+        ),
+        ("decline", 1, 0, ["active_thread_present"]),
+        (
+            "decline",
+            1,
+            0,
+            ["runtime_state_inconsistent", "contended_thread_present"],
+        ),
+    ],
+)
+async def test_runtime_client_rejects_contradictory_continuation_reason_shapes(
+    outcome,
+    candidate_count,
+    eligible_count,
+    reason_codes,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    candidates = _continuation_candidates(candidate_count)
+    response = _continuation_response(outcome)
+    response["result"].update(
+        candidate_count=candidate_count,
+        eligible_candidate_count=eligible_count,
+        reason_codes=reason_codes,
+    )
+    original_response = deepcopy(response)
+    calls = []
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(
+        RuntimeError,
+        match="^continuation_selection_response_invalid$",
+    ):
+        await client.select_continuation(
+            request_id="selection-request",
+            owner_id="owner",
+            surface="voice",
+            candidate_set_complete=reason_codes != ["candidate_set_incomplete"],
+            stale_after_seconds=1800,
+            candidates=candidates,
+        )
+
+    assert len(calls) == 1
+    assert response == original_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate,expected_error",
+    [
+        (lambda response: response.update(schema_version="wrong"), "context_mismatch"),
+        (lambda response: response.update(request_id="other"), "context_mismatch"),
+        (
+            lambda response: response["result"].update(timing_policy="answer_now"),
+            "invalid",
+        ),
+        (lambda response: response["result"].update(candidate_count=2), "invalid"),
+        (lambda response: response["result"].update(eligible_candidate_count=True), "invalid"),
+        (lambda response: response["result"].update(reason_codes=["unknown"]), "invalid"),
+        (lambda response: response["result"].update(policy_version="wrong"), "invalid"),
+        (
+            lambda response: response["result"].update(
+                selected_conversation_id="00000000-0000-4000-8000-000000000099"
+            ),
+            "context_mismatch",
+        ),
+        (
+            lambda response: response["result"].update(selected_thread_revision=-1),
+            "context_mismatch",
+        ),
+        (lambda response: response.update(extra=True), "invalid"),
+        (lambda response: response["result"].update(extra=True), "invalid"),
+    ],
+)
+async def test_runtime_client_rejects_invalid_continuation_responses(
+    mutate,
+    expected_error,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    response = _continuation_response()
+    mutate(response)
+
+    async def fake_post(path, *, json):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(
+        RuntimeError,
+        match=f"^continuation_selection_response_{expected_error}$",
+    ):
+        await client.select_continuation(
+            request_id="selection-request",
+            owner_id="owner",
+            surface="voice",
+            candidate_set_complete=True,
+            stale_after_seconds=1800,
+            candidates=[
+                {
+                    "conversation_id": "00000000-0000-4000-8000-000000000001",
+                    "lifecycle_state": "open",
+                    "durable_updated_at": "2026-08-01T00:00:00+00:00",
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"candidate_set_complete": 1},
+        {"stale_after_seconds": True},
+        {"stale_after_seconds": 59},
+        {
+            "candidates": [
+                {
+                    "conversation_id": "not-a-uuid",
+                    "lifecycle_state": "open",
+                    "durable_updated_at": "2026-08-01T00:00:00+00:00",
+                }
+            ]
+        },
+        {
+            "candidates": [
+                {
+                    "conversation_id": "00000000-0000-4000-8000-000000000001",
+                    "lifecycle_state": "open",
+                    "durable_updated_at": "2026-08-01T00:00:00",
+                }
+            ]
+        },
+        {
+            "candidates": [
+                {
+                    "conversation_id": "00000000-0000-4000-8000-000000000001",
+                    "lifecycle_state": "open",
+                    "durable_updated_at": "2026-08-01T00:00:00+00:00",
+                    "title": "forbidden",
+                }
+            ]
+        },
+    ],
+)
+async def test_runtime_client_rejects_invalid_selection_request_before_transport(
+    overrides,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    called = False
+
+    async def fake_post(path, *, json):
+        nonlocal called
+        called = True
+        return _continuation_response()
+
+    client._post = fake_post  # type: ignore[method-assign]
+    arguments = {
+        "request_id": "selection-request",
+        "owner_id": "owner",
+        "surface": "voice",
+        "candidate_set_complete": True,
+        "stale_after_seconds": 1800,
+        "candidates": [],
+    }
+    arguments.update(overrides)
+    with pytest.raises(ValueError, match="^continuation_selection_request_invalid$"):
+        await client.select_continuation(**arguments)
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_client_sends_expected_revision_only_when_supplied():
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+
+    async def fake_post(path, *, json):
+        calls.append(json)
+        return {
+            "runtime_session": {
+                "runtime_session_id": "session",
+                "owner_id": json["owner_id"],
+                "conversation_id": json["conversation_id"],
+                "surface": json["surface"],
+            },
+            "runtime_turn": {
+                "runtime_turn_id": "turn",
+                "runtime_session_id": "session",
+                "input_message_id": json.get("input_message_id"),
+                "turn_status": "received",
+            },
+        }
+
+    client._post = fake_post  # type: ignore[method-assign]
+    common = {
+        "request_id": "request",
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "surface": "web",
+    }
+    await client.start_turn(**common)
+    await client.start_turn(**common, expected_thread_revision=7)
+
+    assert "expected_thread_revision" not in calls[0]
+    assert calls[1]["expected_thread_revision"] == 7
+    with pytest.raises(ValueError, match="^expected_thread_revision_invalid$"):
+        await client.start_turn(**common, expected_thread_revision=True)
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

@@ -245,7 +245,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     request_id: str
-    conversation_id: str
+    conversation_id: Optional[str] = None
     profile_name: str
     selected_model: str
     answer: str

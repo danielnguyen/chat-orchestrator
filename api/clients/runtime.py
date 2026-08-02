@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -39,6 +40,79 @@ _HISTORY_PROJECTION = {
     "acquisition_gaps": ("acquisition", "gaps"),
     "new_verification_request": ("support", None),
 }
+
+_CONTINUATION_TIMING = {
+    "resume": "resume_previous_thread",
+    "create_new": "answer_now",
+    "clarify": "ask_clarifying_question",
+    "wait": "pause_or_wait",
+    "decline": "close_turn",
+}
+_CONTINUATION_REASONS = {
+    "candidate_set_incomplete",
+    "no_candidates",
+    "one_eligible_candidate",
+    "multiple_eligible_candidates",
+    "active_thread_present",
+    "contended_thread_present",
+    "unavailable_thread_present",
+    "runtime_state_missing",
+    "runtime_state_inconsistent",
+    "runtime_session_missing",
+    "candidate_stale",
+    "candidate_not_open",
+    "no_eligible_candidates",
+}
+_CONTINUATION_CREATE_NEW_REASONS = (
+    "candidate_not_open",
+    "runtime_state_missing",
+    "runtime_session_missing",
+    "candidate_stale",
+)
+_CONTINUATION_DECLINE_REASONS = (
+    "contended_thread_present",
+    "unavailable_thread_present",
+    "runtime_state_inconsistent",
+)
+
+
+def _continuation_outcome_is_coherent(
+    *,
+    outcome: str,
+    candidate_count: int,
+    eligible_count: int,
+    reason_codes: list[str],
+) -> bool:
+    if outcome == "resume":
+        return eligible_count == 1 and reason_codes == ["one_eligible_candidate"]
+    if outcome == "create_new":
+        if eligible_count != 0:
+            return False
+        if candidate_count == 0:
+            return reason_codes == ["no_candidates"]
+        if reason_codes[0] != "no_eligible_candidates":
+            return False
+        detail_reasons = reason_codes[1:]
+        return detail_reasons == [
+            reason
+            for reason in _CONTINUATION_CREATE_NEW_REASONS
+            if reason in detail_reasons
+        ]
+    if outcome == "clarify":
+        return (
+            eligible_count == 0
+            and reason_codes == ["candidate_set_incomplete"]
+        ) or (
+            eligible_count >= 2
+            and reason_codes == ["multiple_eligible_candidates"]
+        )
+    if outcome == "wait":
+        return reason_codes == ["active_thread_present"]
+    if outcome == "decline":
+        return reason_codes == [
+            reason for reason in _CONTINUATION_DECLINE_REASONS if reason in reason_codes
+        ]
+    return False
 
 
 def _bounded_runtime_identifier(value: Any) -> bool:
@@ -569,6 +643,7 @@ class RuntimeClient:
         surface: str,
         input_message_id: str | None = None,
         intent_class: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -580,6 +655,14 @@ class RuntimeClient:
             payload["input_message_id"] = input_message_id
         if intent_class is not None:
             payload["intent_class"] = intent_class
+        if expected_thread_revision is not None:
+            if (
+                isinstance(expected_thread_revision, bool)
+                or not isinstance(expected_thread_revision, int)
+                or expected_thread_revision < 0
+            ):
+                raise ValueError("expected_thread_revision_invalid")
+            payload["expected_thread_revision"] = expected_thread_revision
         response = await self._post("/v1/runtime/turns/start", json=payload)
         if not isinstance(response, dict):
             raise RuntimeError("runtime_turn_response_invalid")
@@ -617,6 +700,138 @@ class RuntimeClient:
                 or event.get("event_type") != "turn_started"
             ):
                 raise RuntimeError("runtime_turn_response_context_mismatch")
+        return response
+
+    async def select_continuation(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        surface: str,
+        candidate_set_complete: bool,
+        stale_after_seconds: int,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if type(candidate_set_complete) is not bool:
+            raise ValueError("continuation_selection_request_invalid")
+        if (
+            isinstance(stale_after_seconds, bool)
+            or not isinstance(stale_after_seconds, int)
+            or not 60 <= stale_after_seconds <= 86400
+            or len(candidates) > 8
+        ):
+            raise ValueError("continuation_selection_request_invalid")
+        candidate_ids: set[str] = set()
+        candidate_payloads: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or set(candidate) != {
+                "conversation_id",
+                "lifecycle_state",
+                "durable_updated_at",
+            }:
+                raise ValueError("continuation_selection_request_invalid")
+            conversation_id = candidate.get("conversation_id")
+            lifecycle_state = candidate.get("lifecycle_state")
+            durable_updated_at = candidate.get("durable_updated_at")
+            try:
+                canonical_id = str(UUID(conversation_id))
+                parsed_updated_at = datetime.fromisoformat(durable_updated_at)
+            except (TypeError, ValueError, AttributeError):
+                raise ValueError("continuation_selection_request_invalid") from None
+            if (
+                not _bounded_runtime_identifier(conversation_id)
+                or conversation_id != canonical_id
+                or lifecycle_state not in {"open", "closed", "superseded"}
+                or not isinstance(durable_updated_at, str)
+                or not durable_updated_at
+                or parsed_updated_at.tzinfo is None
+                or parsed_updated_at.utcoffset() is None
+                or conversation_id in candidate_ids
+            ):
+                raise ValueError("continuation_selection_request_invalid")
+            candidate_ids.add(conversation_id)
+            candidate_payloads.append(dict(candidate))
+
+        response = await self._post(
+            "/v1/runtime/continuations/select",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "surface": surface,
+                "candidate_set_complete": candidate_set_complete,
+                "stale_after_seconds": stale_after_seconds,
+                "candidates": candidate_payloads,
+            },
+        )
+        if not isinstance(response, dict) or set(response) != {
+            "schema_version",
+            "request_id",
+            "owner_id",
+            "surface",
+            "result",
+        }:
+            raise RuntimeError("continuation_selection_response_invalid")
+        if (
+            response.get("schema_version") != "runtime-continuation-selection.v1"
+            or response.get("request_id") != request_id
+            or response.get("owner_id") != owner_id
+            or response.get("surface") != surface
+        ):
+            raise RuntimeError("continuation_selection_response_context_mismatch")
+        result = response.get("result")
+        if not isinstance(result, dict) or set(result) != {
+            "outcome",
+            "timing_policy",
+            "selected_conversation_id",
+            "selected_thread_revision",
+            "candidate_count",
+            "eligible_candidate_count",
+            "reason_codes",
+            "policy_version",
+        }:
+            raise RuntimeError("continuation_selection_response_invalid")
+        outcome = result.get("outcome")
+        reason_codes = result.get("reason_codes")
+        candidate_count = result.get("candidate_count")
+        eligible_count = result.get("eligible_candidate_count")
+        revision = result.get("selected_thread_revision")
+        selected_id = result.get("selected_conversation_id")
+        if (
+            outcome not in _CONTINUATION_TIMING
+            or result.get("timing_policy") != _CONTINUATION_TIMING[outcome]
+            or result.get("policy_version") != "continuation-selection.v1"
+            or isinstance(candidate_count, bool)
+            or not isinstance(candidate_count, int)
+            or candidate_count != len(candidates)
+            or isinstance(eligible_count, bool)
+            or not isinstance(eligible_count, int)
+            or not 0 <= eligible_count <= candidate_count
+            or not isinstance(reason_codes, list)
+            or not 1 <= len(reason_codes) <= 8
+            or any(
+                not isinstance(reason, str) or reason not in _CONTINUATION_REASONS
+                for reason in reason_codes
+            )
+            or len(reason_codes) != len(set(reason_codes))
+        ):
+            raise RuntimeError("continuation_selection_response_invalid")
+        if not _continuation_outcome_is_coherent(
+            outcome=outcome,
+            candidate_count=candidate_count,
+            eligible_count=eligible_count,
+            reason_codes=reason_codes,
+        ):
+            raise RuntimeError("continuation_selection_response_invalid")
+        if outcome == "resume":
+            if (
+                selected_id not in candidate_ids
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+            ):
+                raise RuntimeError("continuation_selection_response_context_mismatch")
+        elif selected_id is not None or revision is not None:
+            raise RuntimeError("continuation_selection_response_context_mismatch")
         return response
 
     async def update_turn(

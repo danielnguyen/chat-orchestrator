@@ -57,6 +57,13 @@ class ReplayMemoryStore:
         self._record("conversation_resolution")
         return {"conversation_id": "00000000-0000-0000-0000-000000000001", "reused": False}
 
+    async def list_open_conversations(self, **kwargs: Any) -> dict[str, Any]:
+        return {"conversations": [], "next_cursor": None}
+
+    async def create_conversation(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("conversation_resolution")
+        return {"conversation_id": "00000000-0000-0000-0000-000000000001"}
+
     async def add_message(self, **kwargs: Any) -> dict[str, Any]:
         self.message_ordinal += 1
         role = kwargs["role"]
@@ -599,6 +606,26 @@ class ReplayRuntime:
                 "status": "active",
                 "surface": kwargs["surface"],
             }
+        }
+
+    async def select_continuation(self, **kwargs: Any) -> dict[str, Any]:
+        if self.scenario.get("continuation_selection") == "unavailable":
+            raise BoundaryFailure("continuation_selection_unavailable")
+        return {
+            "schema_version": "runtime-continuation-selection.v1",
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "surface": kwargs["surface"],
+            "result": {
+                "outcome": "create_new",
+                "timing_policy": "answer_now",
+                "selected_conversation_id": None,
+                "selected_thread_revision": None,
+                "candidate_count": len(kwargs["candidates"]),
+                "eligible_candidate_count": 0,
+                "reason_codes": ["no_candidates"],
+                "policy_version": "continuation-selection.v1",
+            },
         }
 
     async def start_turn(self, **kwargs: Any) -> dict[str, Any]:

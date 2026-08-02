@@ -73,6 +73,14 @@ cd api
 ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_prompt_budget_smoke.py
 ```
 
+These suites also cover omitted-conversation acquisition and enforcement:
+zero, eight, and nine-row Basic Memory Store pages; cursor-independent
+completeness; all five Cognitive Runtime outcomes; nullable no-selection
+responses; direct creation; selected-revision admission and retry; dependency
+and revision-conflict barriers; supplied-ID isolation; runtime-disabled rolling
+compatibility; and absence of candidate material from prompts and replay
+snapshots. Run the replay corpus twice when checking determinism.
+
 ## Cognitive Runtime transport checks
 
 Run the focused lifecycle and transport suite with:
@@ -96,10 +104,9 @@ make dev-test
 make replay-test
 ```
 
-The pull-request composed smoke remains the actual-service compatibility check;
-this transport change adds no smoke mode. It does not introduce concurrent
-policy calls, a composite runtime endpoint, same-turn policy-result reuse,
-omitted-conversation selection, or an end-to-end latency-budget claim.
+The pull-request composed smoke remains the actual-service compatibility check.
+Transport reuse does not introduce concurrent policy calls, a composite runtime
+endpoint, same-turn policy-result reuse, or an end-to-end latency-budget claim.
 
 ## Composed smoke check
 
@@ -246,14 +253,40 @@ effect, one conversation, and a final idle runtime thread at revision two.
 
 The proof uses Basic Memory Store at or after
 `1a8278278fcabd871f6235bc66acdfe80523c6f4` and Cognitive Runtime at or after
-`2a63ca3c32010fe8dad727d62c2e6a7475cbb98c`. It demonstrates overlap within the
+`f87a80f6d19cdb4ebcd01e6cc5c42af2a8ee1202`. It demonstrates overlap within the
 actual disposable services. It does not demonstrate completed-response replay
-across a fresh HTTP request or process restart, and it does not select a
-conversation when the identifier is omitted.
+across a fresh HTTP request or process restart.
 
-The distinct-client owner-memory proof does not establish live-thread
+Run only the omitted-conversation continuation proof with:
+
+```bash
+OMITTED_CONTINUATION_ONLY=1 make composed-smoke
+```
+
+This mode verifies six actual-service boundaries. A fresh owner with zero
+candidates creates one real conversation without selecting another owner's
+eligible thread. One idle candidate resumes across a distinct current client
+and surface while preserving historical provenance and returning the shared
+thread to idle at revision four. Two eligible candidates clarify with a null
+conversation ID and no new durable or runtime state. An active candidate waits
+without creating a losing session, message, provider call, action, claim, or
+trace. Nine open conversations produce an incomplete bounded set and clarify
+without pagination or side effects. Non-resume responses disclose no candidate
+identity, client, surface, or timestamp.
+
+The proof checks PostgreSQL conversation, message, trace, and claim counts;
+Cognitive Runtime SQLite session, turn, event, surface, state, and revision
+facts; request-scoped provider counts; current client and surface provenance;
+and owner isolation. The workflow and local guard require Cognitive Runtime at
+`f87a80f6d19cdb4ebcd01e6cc5c42af2a8ee1202`, Basic Memory Store at
+`1a8278278fcabd871f6235bc66acdfe80523c6f4`, and Chat Orchestrator at
+`b8fb14e422bbf5f6fa60fbd1512afc10d0bc34a8`.
+
+The distinct-client owner-memory proof does not by itself establish live-thread
 continuation, automatic conversation selection, Telegram-to-Alexa handoff,
-timing, presence, pause/resume, or contention.
+timing, presence, pause/resume, or contention. The omitted-conversation proof
+does not establish a multi-page snapshot, universal presence permission,
+replacement traversal, or completed-response replay across restart.
 
 The focused mode and the complete regression both reset provider, DSA audit,
 external-source, feature-toggle, and disposable conversation state. This is

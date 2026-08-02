@@ -10,6 +10,7 @@ import pytest
 import services.capabilities as capability_service
 import services.orchestrate as orchestrate_service
 from clients.runtime import RuntimeClient
+from models import ChatResponse
 from services.action_connectors import (
     ActionConnectorRegistry,
     ConnectorArguments,
@@ -126,6 +127,12 @@ class FakeMemoryStore:
     def __init__(self):
         self.resolve_conversation_calls = []
         self.exact_conversation_calls = []
+        self.list_conversation_calls = []
+        self.create_conversation_calls = []
+        self.list_conversation_response = {"conversations": [], "next_cursor": None}
+        self.list_conversation_error = None
+        self.create_conversation_response = {"conversation_id": "conv-1"}
+        self.create_conversation_error = None
         self.exact_conversation_response = None
         self.exact_conversation_error = None
         self.added_messages = []
@@ -160,6 +167,18 @@ class FakeMemoryStore:
             "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-01T00:00:00+00:00",
         }
+
+    async def list_open_conversations(self, **kwargs):
+        self.list_conversation_calls.append(kwargs)
+        if self.list_conversation_error is not None:
+            raise self.list_conversation_error
+        return copy.deepcopy(self.list_conversation_response)
+
+    async def create_conversation(self, **kwargs):
+        self.create_conversation_calls.append(kwargs)
+        if self.create_conversation_error is not None:
+            raise self.create_conversation_error
+        return copy.deepcopy(self.create_conversation_response)
 
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
@@ -453,12 +472,15 @@ class FakeRuntime:
         evidence_plan_error: Exception | None = None,
         evidence_sufficiency_error: Exception | None = None,
         evidence_next_step_error: Exception | None = None,
+        continuation_selection_response=None,
+        continuation_selection_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
         self.session_calls = []
         self.companion_calls = []
         self.turn_start_calls = []
+        self.continuation_selection_calls = []
         self.turn_update_calls = []
         self.turn_complete_calls = []
         self.identity_calls = []
@@ -826,6 +848,8 @@ class FakeRuntime:
         self.evidence_plan_error = evidence_plan_error
         self.evidence_sufficiency_error = evidence_sufficiency_error
         self.evidence_next_step_error = evidence_next_step_error
+        self.continuation_selection_response = continuation_selection_response
+        self.continuation_selection_error = continuation_selection_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -851,6 +875,32 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.session_response
+
+    async def select_continuation(self, **kwargs):
+        self.continuation_selection_calls.append(copy.deepcopy(kwargs))
+        self.call_order.append("select_continuation")
+        if self.continuation_selection_error is not None:
+            raise self.continuation_selection_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        if self.continuation_selection_response is not None:
+            return copy.deepcopy(self.continuation_selection_response)
+        return {
+            "schema_version": "runtime-continuation-selection.v1",
+            "request_id": kwargs["request_id"],
+            "owner_id": kwargs["owner_id"],
+            "surface": kwargs["surface"],
+            "result": {
+                "outcome": "create_new",
+                "timing_policy": "answer_now",
+                "selected_conversation_id": None,
+                "selected_thread_revision": None,
+                "candidate_count": len(kwargs["candidates"]),
+                "eligible_candidate_count": 0,
+                "reason_codes": ["no_candidates"],
+                "policy_version": "continuation-selection.v1",
+            },
+        }
 
     async def start_turn(self, **kwargs):
         self.turn_start_calls.append(kwargs)
@@ -1992,6 +2042,58 @@ def _conversation_projection(
     }
 
 
+def _open_candidate(ordinal=1):
+    return _conversation_projection(
+        conversation_id=f"00000000-0000-4000-8000-{ordinal:012d}",
+    )
+
+
+def _selection_response(
+    outcome,
+    *,
+    request_id,
+    surface="vscode",
+    selected_conversation_id=None,
+    selected_thread_revision=None,
+    candidate_count=0,
+    eligible_candidate_count=0,
+):
+    timing = {
+        "resume": "resume_previous_thread",
+        "create_new": "answer_now",
+        "clarify": "ask_clarifying_question",
+        "wait": "pause_or_wait",
+        "decline": "close_turn",
+    }[outcome]
+    reasons = {
+        "resume": ["one_eligible_candidate"],
+        "create_new": ["no_candidates" if candidate_count == 0 else "no_eligible_candidates"],
+        "clarify": [
+            "candidate_set_incomplete"
+            if candidate_count == 8 and eligible_candidate_count == 0
+            else "multiple_eligible_candidates"
+        ],
+        "wait": ["active_thread_present"],
+        "decline": ["unavailable_thread_present"],
+    }[outcome]
+    return {
+        "schema_version": "runtime-continuation-selection.v1",
+        "request_id": request_id,
+        "owner_id": "owner",
+        "surface": surface,
+        "result": {
+            "outcome": outcome,
+            "timing_policy": timing,
+            "selected_conversation_id": selected_conversation_id,
+            "selected_thread_revision": selected_thread_revision,
+            "candidate_count": candidate_count,
+            "eligible_candidate_count": eligible_candidate_count,
+            "reason_codes": reasons,
+            "policy_version": "continuation-selection.v1",
+        },
+    }
+
+
 def _conversation_lookup_http_error(status_code):
     request = httpx.Request(
         "GET",
@@ -2034,11 +2136,15 @@ async def test_supplied_open_conversation_uses_exact_lookup_without_resolver(tmp
         {"conversation_id": "shared-conversation", "owner_id": "owner"}
     ]
     assert memory_store.resolve_conversation_calls == []
+    assert memory_store.list_conversation_calls == []
+    assert memory_store.create_conversation_calls == []
     assert {item["conversation_id"] for item in memory_store.added_messages} == {
         "shared-conversation"
     }
     assert memory_store.retrieve_calls[0]["conversation_id"] == "shared-conversation"
     assert runtime.turn_start_calls[0]["conversation_id"] == "shared-conversation"
+    assert runtime.continuation_selection_calls == []
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] is None
     assert len(provider.calls) == 1
     assert memory_store.trace_calls[0]["payload"]["conversation_id"] == (
         "shared-conversation"
@@ -2082,15 +2188,18 @@ async def test_supplied_open_conversation_keeps_current_client_and_surface(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_omitted_conversation_keeps_same_client_resolution(tmp_path):
+async def test_omitted_conversation_uses_runtime_create_new_without_rolling_resolution(
+    tmp_path,
+):
     rules, models = _write_router_files(tmp_path)
     memory_store = FakeMemoryStore()
+    runtime = FakeRuntime()
 
     result = await orchestrate_chat(
         payload=_base_payload(),
         memory_store=memory_store,
         litellm=FakeLiteLLM(),
-        runtime=FakeRuntime(),
+        runtime=runtime,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -2100,9 +2209,341 @@ async def test_omitted_conversation_keeps_same_client_resolution(tmp_path):
     assert result["status"] == "ok"
     assert result["conversation_id"] == "conv-1"
     assert memory_store.exact_conversation_calls == []
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.list_conversation_calls == [
+        {"owner_id": "owner", "limit": 9}
+    ]
+    assert memory_store.create_conversation_calls == [
+        {"owner_id": "owner", "client_id": "vscode"}
+    ]
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] is None
+
+
+def test_chat_response_serializes_truthful_nullable_conversation_identity():
+    base = {
+        "request_id": "request",
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": "bounded",
+        "status": "failed",
+        "sources": [],
+    }
+
+    assert ChatResponse(**base).model_dump()["conversation_id"] is None
+    assert ChatResponse(
+        **base,
+        conversation_id="00000000-0000-4000-8000-000000000001",
+    ).model_dump()["conversation_id"] == "00000000-0000-4000-8000-000000000001"
+
+
+@pytest.mark.asyncio
+async def test_omitted_resume_binds_selected_revision_without_resolution_or_creation(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    selected = _open_candidate()
+    memory_store.list_conversation_response = {
+        "conversations": [selected],
+        "next_cursor": "short-page-cursor",
+    }
+    runtime = FakeRuntime(
+        continuation_selection_response=_selection_response(
+            "resume",
+            request_id="request-resume",
+            selected_conversation_id=selected["conversation_id"],
+            selected_thread_revision=7,
+            candidate_count=1,
+            eligible_candidate_count=1,
+        )
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(client_id="current-client", surface="voice"),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-resume",
+    )
+
+    assert result["status"] == "ok"
+    assert result["conversation_id"] == selected["conversation_id"]
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.exact_conversation_calls == []
+    assert memory_store.create_conversation_calls == []
+    assert runtime.continuation_selection_calls[0] == {
+        "request_id": "request-resume",
+        "owner_id": "owner",
+        "surface": "voice",
+        "candidate_set_complete": True,
+        "stale_after_seconds": 1800,
+        "candidates": [
+            {
+                "conversation_id": selected["conversation_id"],
+                "lifecycle_state": "open",
+                "durable_updated_at": selected["updated_at"],
+            }
+        ],
+    }
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] == 7
+    assert all(
+        message["conversation_id"] == selected["conversation_id"]
+        and message["client_id"] == "current-client"
+        for message in memory_store.added_messages
+    )
+    user_message = next(
+        message for message in memory_store.added_messages if message["role"] == "user"
+    )
+    assert user_message["metadata"]["surface"] == "voice"
+    resolution_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["turn_state"]["conversation_resolution"]
+    assert resolution_trace == {
+        "mode": "runtime_selected",
+        "candidate_count": 1,
+        "candidate_set_complete": True,
+        "outcome": "resume",
+        "timing_policy": "resume_previous_thread",
+        "policy_version": "continuation-selection.v1",
+        "reason_codes": ["one_eligible_candidate"],
+        "selected_thread_revision": 7,
+    }
+    assert selected["conversation_id"] not in json.dumps(resolution_trace)
+
+
+@pytest.mark.asyncio
+async def test_nine_omitted_candidates_are_sent_as_incomplete_bounded_set(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    memory_store.list_conversation_response = {
+        "conversations": [_open_candidate(index + 1) for index in range(9)],
+        "next_cursor": "cursor-is-not-completeness",
+    }
+    runtime = FakeRuntime(
+        continuation_selection_response=_selection_response(
+            "clarify",
+            request_id="request-incomplete",
+            candidate_count=8,
+        )
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-incomplete",
+    )
+
+    selection_call = runtime.continuation_selection_calls[0]
+    assert selection_call["candidate_set_complete"] is False
+    assert len(selection_call["candidates"]) == 8
+    assert all(set(candidate) == {
+        "conversation_id",
+        "lifecycle_state",
+        "durable_updated_at",
+    } for candidate in selection_call["candidates"])
+    assert result["status"] == "degraded"
+    assert result["conversation_id"] is None
+    assert memory_store.create_conversation_calls == []
+    assert runtime.turn_start_calls == []
+
+
+@pytest.mark.asyncio
+async def test_eight_omitted_candidates_are_a_complete_bounded_set(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    memory_store.list_conversation_response = {
+        "conversations": [_open_candidate(index + 1) for index in range(8)],
+        "next_cursor": "cursor-does-not-hide-a-ninth-row",
+    }
+    runtime = FakeRuntime(
+        continuation_selection_response=_selection_response(
+            "clarify",
+            request_id="request-eight",
+            candidate_count=8,
+            eligible_candidate_count=2,
+        )
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-eight",
+    )
+
+    selection_call = runtime.continuation_selection_calls[0]
+    assert selection_call["candidate_set_complete"] is True
+    assert len(selection_call["candidates"]) == 8
+    assert result["conversation_id"] is None
+    assert result["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "status", "answer"),
+    [
+        (
+            "clarify",
+            "degraded",
+            "I couldn’t safely determine which conversation to continue. "
+            "Please provide the conversation you want to resume.",
+        ),
+        (
+            "wait",
+            "degraded",
+            "Another turn is still in progress. Please try again shortly.",
+        ),
+        (
+            "decline",
+            "failed",
+            "I couldn’t safely continue a prior conversation. "
+            "No retained conversation content was used.",
+        ),
+    ],
+)
+async def test_omitted_nonresume_outcomes_have_null_identity_and_no_side_effects(
+    tmp_path,
+    outcome,
+    status,
+    answer,
+):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    candidate_count = 2 if outcome == "clarify" else 1
+    eligible_count = 2 if outcome == "clarify" else 0
+    memory_store.list_conversation_response = {
+        "conversations": [_open_candidate(index + 1) for index in range(candidate_count)],
+        "next_cursor": "bounded",
+    }
+    runtime = FakeRuntime(
+        continuation_selection_response=_selection_response(
+            outcome,
+            request_id=f"request-{outcome}",
+            candidate_count=candidate_count,
+            eligible_candidate_count=eligible_count,
+        )
+    )
+    provider = FakeLiteLLM(content="PRIVATE-CANDIDATE-SENTINEL")
+    operations = DisplaySettingOperations()
+    connector = DisplaySettingConnector(operations)
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        capability_registry_enabled=True,
+        action_connector_registry=ActionConnectorRegistry((connector,)),
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"request-{outcome}",
+    )
+
+    assert result == {
+        "request_id": f"request-{outcome}",
+        "conversation_id": None,
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": answer,
+        "status": status,
+        "sources": [],
+    }
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.create_conversation_calls == []
+    assert memory_store.added_messages == []
+    assert memory_store.profile_calls == []
+    assert memory_store.retrieve_calls == []
+    assert memory_store.trace_calls == []
+    assert memory_store.claim_record_calls == []
+    assert runtime.turn_start_calls == []
+    assert provider.calls == []
+    assert operations.apply_inputs == []
+    assert connector.verify_inputs == []
+    assert "PRIVATE" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["list", "selection", "create"])
+async def test_omitted_dependency_failures_stop_without_conversation_or_side_effects(
+    tmp_path,
+    boundary,
+):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime()
+    if boundary == "list":
+        memory_store.list_conversation_error = RuntimeError("PRIVATE-LIST")
+    elif boundary == "selection":
+        runtime.continuation_selection_error = RuntimeError("PRIVATE-SELECTION")
+    else:
+        memory_store.create_conversation_error = httpx.ReadTimeout("PRIVATE-CREATE")
+    provider = FakeLiteLLM(content="PRIVATE-PROVIDER")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"request-{boundary}-failure",
+    )
+
+    assert result["conversation_id"] is None
+    assert result["status"] == "failed"
+    assert result["selected_model"] == "not_called"
+    assert len(memory_store.create_conversation_calls) == (1 if boundary == "create" else 0)
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.added_messages == []
+    assert memory_store.profile_calls == []
+    assert memory_store.retrieve_calls == []
+    assert memory_store.trace_calls == []
+    assert runtime.turn_start_calls == []
+    assert provider.calls == []
+    assert "PRIVATE" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_runtime_disabled_omitted_conversation_keeps_rolling_compatibility(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=None,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-compatibility",
+    )
+
+    assert result["status"] == "ok"
+    assert result["conversation_id"] == "conv-1"
     assert memory_store.resolve_conversation_calls == [
         {"owner_id": "owner", "client_id": "vscode"}
     ]
+    assert memory_store.list_conversation_calls == []
+    assert memory_store.create_conversation_calls == []
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["turn_state"]["conversation_resolution"] == {
+        "mode": "compatibility"
+    }
 
 
 @pytest.mark.asyncio
@@ -2136,6 +2577,33 @@ async def test_pending_capability_validation_failure_remains_unchanged(tmp_path)
     assert memory_store.exact_conversation_calls == []
     assert memory_store.resolve_conversation_calls == []
     assert memory_store.added_messages == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_omitted_confirmation_returns_null_before_selection(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime()
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            capability_confirmation={"pending_action": {}, "confirmed": True},
+        ),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-invalid-omitted-confirmation",
+    )
+
+    assert result["conversation_id"] is None
+    assert result["status"] == "failed"
+    assert memory_store.list_conversation_calls == []
+    assert memory_store.create_conversation_calls == []
+    assert runtime.continuation_selection_calls == []
+    assert runtime.turn_start_calls == []
 
 
 @pytest.mark.parametrize(
@@ -5485,6 +5953,7 @@ async def test_orchestrate_runtime_admission_unavailable_stops_before_side_effec
             "owner_id": "owner",
             "client_id": "dev",
             "surface": "dev",
+            "conversation_id": "conv-1",
             "messages": [{"role": "user", "content": "hi"}],
             "sensitivity": "private",
             "model_override": None,
@@ -5657,6 +6126,19 @@ async def test_nonretryable_runtime_admission_failure_has_no_side_effects(
 
     runtime = RejectingRuntime()
     memory_store = FakeMemoryStore()
+    candidate = _open_candidate()
+    memory_store.list_conversation_response = {
+        "conversations": [candidate],
+        "next_cursor": "bounded",
+    }
+    runtime.continuation_selection_response = _selection_response(
+        "resume",
+        request_id=f"rid-admission-{status_code}",
+        selected_conversation_id=candidate["conversation_id"],
+        selected_thread_revision=13,
+        candidate_count=1,
+        eligible_candidate_count=1,
+    )
     provider = FakeLiteLLM()
     out = await orchestrate_chat(
         payload=_base_payload(),
@@ -5672,6 +6154,7 @@ async def test_nonretryable_runtime_admission_failure_has_no_side_effects(
     assert out["status"] == "failed"
     assert out["selected_model"] == "not_called"
     assert len(runtime.turn_start_calls) == 1
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] == 13
     assert memory_store.added_messages == []
     assert memory_store.profile_calls == []
     assert memory_store.retrieve_calls == []
@@ -5701,6 +6184,19 @@ async def test_ambiguous_admission_retry_reuses_request_and_message_identity(tmp
 
     runtime = AmbiguousRuntime()
     memory_store = FakeMemoryStore()
+    candidate = _open_candidate()
+    memory_store.list_conversation_response = {
+        "conversations": [candidate],
+        "next_cursor": "bounded",
+    }
+    runtime.continuation_selection_response = _selection_response(
+        "resume",
+        request_id="rid-admission-retry",
+        selected_conversation_id=candidate["conversation_id"],
+        selected_thread_revision=11,
+        candidate_count=1,
+        eligible_candidate_count=1,
+    )
     out = await orchestrate_chat(
         payload=_base_payload(),
         memory_store=memory_store,
@@ -5716,6 +6212,7 @@ async def test_ambiguous_admission_retry_reuses_request_and_message_identity(tmp
     assert runtime.admitted_turns == 1
     assert len(runtime.turn_start_calls) == 2
     assert runtime.turn_start_calls[0] == runtime.turn_start_calls[1]
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] == 11
     user_message = next(
         message for message in memory_store.added_messages if message["role"] == "user"
     )

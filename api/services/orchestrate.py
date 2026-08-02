@@ -139,6 +139,22 @@ _MESSAGE_PERSISTENCE_UNAVAILABLE = (
     "I couldn’t durably save that message, so I stopped before generating a response. "
     "Please try again."
 )
+_CONTINUATION_DEPENDENCY_UNAVAILABLE = (
+    "I couldn’t safely determine which conversation to continue. "
+    "No retained conversation content was used. Please try again."
+)
+_CONTINUATION_CLARIFICATION = (
+    "I couldn’t safely determine which conversation to continue. "
+    "Please provide the conversation you want to resume."
+)
+_CONTINUATION_WAIT = "Another turn is still in progress. Please try again shortly."
+_CONTINUATION_DECLINE = (
+    "I couldn’t safely continue a prior conversation. "
+    "No retained conversation content was used."
+)
+_MAX_CONTINUATION_CANDIDATES = 8
+_CONTINUATION_OVERFETCH_LIMIT = 9
+_CONTINUATION_STALE_AFTER_SECONDS = 1800
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
@@ -4979,6 +4995,7 @@ async def _start_runtime_turn(
     conversation_id: str,
     surface: str,
     input_message_id: str | None,
+    expected_thread_revision: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if runtime is None:
         return None, {
@@ -4999,6 +5016,7 @@ async def _start_runtime_turn(
                 conversation_id=conversation_id,
                 surface=surface,
                 input_message_id=input_message_id,
+                expected_thread_revision=expected_thread_revision,
             )
             response = _validate_started_runtime_turn(
                 response,
@@ -5022,7 +5040,7 @@ async def _start_runtime_turn(
             }
     turn = response["runtime_turn"]
     session = response["runtime_session"]
-    return response, {
+    trace = {
         "attempted": True,
         "attempt_count": attempts,
         "status": "included",
@@ -5033,6 +5051,9 @@ async def _start_runtime_turn(
         "input_message_id": turn.get("input_message_id"),
         "turn_status": turn.get("turn_status"),
     }
+    if expected_thread_revision is not None:
+        trace["expected_thread_revision"] = expected_thread_revision
+    return response, trace
 
 
 async def _append_current_user_message(
@@ -6612,7 +6633,7 @@ async def orchestrate_chat(
     if pending_error is not None:
         return {
             "request_id": request_id,
-            "conversation_id": payload.get("conversation_id") or "unresolved",
+            "conversation_id": payload.get("conversation_id"),
             "profile_name": "unresolved",
             "selected_model": "not_called",
             "answer": "I could not use that capability confirmation safely. No action was taken.",
@@ -6621,6 +6642,8 @@ async def orchestrate_chat(
         }
 
     supplied_conversation_id = payload.get("conversation_id")
+    expected_thread_revision: int | None = None
+    conversation_resolution_trace: dict[str, Any]
     if supplied_conversation_id is not None:
         try:
             conversation = await memory_store.get_conversation(
@@ -6643,12 +6666,100 @@ async def orchestrate_chat(
                 "sources": [],
             }
         conversation_id = supplied_conversation_id
-    else:
+        conversation_resolution_trace = {"mode": "supplied"}
+    elif runtime is None:
         resolved = await memory_store.resolve_conversation(
             owner_id=payload["owner_id"],
             client_id=payload.get("client_id"),
         )
         conversation_id = resolved["conversation_id"]
+        conversation_resolution_trace = {"mode": "compatibility"}
+    else:
+        try:
+            listed = await memory_store.list_open_conversations(
+                owner_id=payload["owner_id"],
+                limit=_CONTINUATION_OVERFETCH_LIMIT,
+            )
+            rows = listed["conversations"]
+            candidate_set_complete = len(rows) <= _MAX_CONTINUATION_CANDIDATES
+            candidates = [
+                {
+                    "conversation_id": row["conversation_id"],
+                    "lifecycle_state": row["lifecycle_state"],
+                    "durable_updated_at": row["updated_at"],
+                }
+                for row in rows[:_MAX_CONTINUATION_CANDIDATES]
+            ]
+            selection_response = await runtime.select_continuation(
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                surface=surface,
+                candidate_set_complete=candidate_set_complete,
+                stale_after_seconds=_CONTINUATION_STALE_AFTER_SECONDS,
+                candidates=candidates,
+            )
+            selection = selection_response["result"]
+        except Exception:
+            return {
+                "request_id": request_id,
+                "conversation_id": None,
+                "profile_name": "unresolved",
+                "selected_model": "not_called",
+                "answer": _CONTINUATION_DEPENDENCY_UNAVAILABLE,
+                "status": "failed",
+                "sources": [],
+            }
+
+        conversation_resolution_trace = {
+            "candidate_count": len(rows),
+            "candidate_set_complete": candidate_set_complete,
+            "outcome": selection["outcome"],
+            "timing_policy": selection["timing_policy"],
+            "policy_version": selection["policy_version"],
+            "reason_codes": selection["reason_codes"],
+        }
+        if selection["outcome"] == "resume":
+            conversation_id = selection["selected_conversation_id"]
+            expected_thread_revision = selection["selected_thread_revision"]
+            conversation_resolution_trace.update(
+                {
+                    "mode": "runtime_selected",
+                    "selected_thread_revision": expected_thread_revision,
+                }
+            )
+        elif selection["outcome"] == "create_new":
+            try:
+                created = await memory_store.create_conversation(
+                    owner_id=payload["owner_id"],
+                    client_id=payload.get("client_id"),
+                )
+                conversation_id = created["conversation_id"]
+            except Exception:
+                return {
+                    "request_id": request_id,
+                    "conversation_id": None,
+                    "profile_name": "unresolved",
+                    "selected_model": "not_called",
+                    "answer": _CONTINUATION_DEPENDENCY_UNAVAILABLE,
+                    "status": "failed",
+                    "sources": [],
+                }
+            conversation_resolution_trace["mode"] = "runtime_created"
+        else:
+            answer, status = {
+                "clarify": (_CONTINUATION_CLARIFICATION, "degraded"),
+                "wait": (_CONTINUATION_WAIT, "degraded"),
+                "decline": (_CONTINUATION_DECLINE, "failed"),
+            }[selection["outcome"]]
+            return {
+                "request_id": request_id,
+                "conversation_id": None,
+                "profile_name": "unresolved",
+                "selected_model": "not_called",
+                "answer": answer,
+                "status": status,
+                "sources": [],
+            }
 
     current_user_message = _current_user_message(payload["messages"])
     last_user_text = _extract_last_user_text(payload["messages"])
@@ -6711,6 +6822,7 @@ async def orchestrate_chat(
         conversation_id=conversation_id,
         surface=surface,
         input_message_id=current_user_message_id,
+        expected_thread_revision=expected_thread_revision,
     )
     if runtime is not None and turn_response is None:
         return {
@@ -6722,6 +6834,7 @@ async def orchestrate_chat(
             "status": "failed",
             "sources": [],
         }
+    turn_state_trace["conversation_resolution"] = conversation_resolution_trace
 
     runtime_session = (
         turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
