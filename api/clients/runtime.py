@@ -63,6 +63,56 @@ _CONTINUATION_REASONS = {
     "candidate_not_open",
     "no_eligible_candidates",
 }
+_CONTINUATION_CREATE_NEW_REASONS = (
+    "candidate_not_open",
+    "runtime_state_missing",
+    "runtime_session_missing",
+    "candidate_stale",
+)
+_CONTINUATION_DECLINE_REASONS = (
+    "contended_thread_present",
+    "unavailable_thread_present",
+    "runtime_state_inconsistent",
+)
+
+
+def _continuation_outcome_is_coherent(
+    *,
+    outcome: str,
+    candidate_count: int,
+    eligible_count: int,
+    reason_codes: list[str],
+) -> bool:
+    if outcome == "resume":
+        return eligible_count == 1 and reason_codes == ["one_eligible_candidate"]
+    if outcome == "create_new":
+        if eligible_count != 0:
+            return False
+        if candidate_count == 0:
+            return reason_codes == ["no_candidates"]
+        if reason_codes[0] != "no_eligible_candidates":
+            return False
+        detail_reasons = reason_codes[1:]
+        return detail_reasons == [
+            reason
+            for reason in _CONTINUATION_CREATE_NEW_REASONS
+            if reason in detail_reasons
+        ]
+    if outcome == "clarify":
+        return (
+            eligible_count == 0
+            and reason_codes == ["candidate_set_incomplete"]
+        ) or (
+            eligible_count >= 2
+            and reason_codes == ["multiple_eligible_candidates"]
+        )
+    if outcome == "wait":
+        return reason_codes == ["active_thread_present"]
+    if outcome == "decline":
+        return reason_codes == [
+            reason for reason in _CONTINUATION_DECLINE_REASONS if reason in reason_codes
+        ]
+    return False
 
 
 def _bounded_runtime_identifier(value: Any) -> bool:
@@ -765,36 +815,23 @@ class RuntimeClient:
             or len(reason_codes) != len(set(reason_codes))
         ):
             raise RuntimeError("continuation_selection_response_invalid")
+        if not _continuation_outcome_is_coherent(
+            outcome=outcome,
+            candidate_count=candidate_count,
+            eligible_count=eligible_count,
+            reason_codes=reason_codes,
+        ):
+            raise RuntimeError("continuation_selection_response_invalid")
         if outcome == "resume":
             if (
-                eligible_count != 1
-                or selected_id not in candidate_ids
+                selected_id not in candidate_ids
                 or isinstance(revision, bool)
                 or not isinstance(revision, int)
                 or revision < 0
-                or reason_codes != ["one_eligible_candidate"]
             ):
                 raise RuntimeError("continuation_selection_response_context_mismatch")
         elif selected_id is not None or revision is not None:
             raise RuntimeError("continuation_selection_response_context_mismatch")
-        elif outcome == "create_new" and (
-            eligible_count != 0
-            or not {"no_candidates", "no_eligible_candidates"}.intersection(reason_codes)
-        ):
-            raise RuntimeError("continuation_selection_response_invalid")
-        elif outcome == "clarify" and not {
-            "candidate_set_incomplete",
-            "multiple_eligible_candidates",
-        }.intersection(reason_codes):
-            raise RuntimeError("continuation_selection_response_invalid")
-        elif outcome == "wait" and "active_thread_present" not in reason_codes:
-            raise RuntimeError("continuation_selection_response_invalid")
-        elif outcome == "decline" and not {
-            "contended_thread_present",
-            "unavailable_thread_present",
-            "runtime_state_inconsistent",
-        }.intersection(reason_codes):
-            raise RuntimeError("continuation_selection_response_invalid")
         return response
 
     async def update_turn(

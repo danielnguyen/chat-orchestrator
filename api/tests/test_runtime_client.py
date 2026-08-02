@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -144,6 +145,17 @@ def _continuation_response(outcome: str = "resume") -> dict[str, Any]:
             "policy_version": "continuation-selection.v1",
         },
     }
+
+
+def _continuation_candidates(count: int) -> list[dict[str, str]]:
+    return [
+        {
+            "conversation_id": f"00000000-0000-4000-8000-{index:012d}",
+            "lifecycle_state": "open",
+            "durable_updated_at": "2026-08-01T00:00:00+00:00",
+        }
+        for index in range(1, count + 1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -605,6 +617,242 @@ async def test_runtime_client_accepts_coherent_continuation_outcomes(outcome):
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "candidate_count", "eligible_count", "reason_codes"),
+    [
+        ("create_new", 0, 0, ["no_candidates"]),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "candidate_not_open"],
+        ),
+        (
+            "create_new",
+            4,
+            0,
+            [
+                "no_eligible_candidates",
+                "candidate_not_open",
+                "runtime_state_missing",
+                "runtime_session_missing",
+                "candidate_stale",
+            ],
+        ),
+        ("clarify", 1, 0, ["candidate_set_incomplete"]),
+        ("clarify", 2, 2, ["multiple_eligible_candidates"]),
+        ("wait", 1, 0, ["active_thread_present"]),
+        ("wait", 2, 1, ["active_thread_present"]),
+        ("decline", 1, 0, ["contended_thread_present"]),
+        ("decline", 1, 0, ["unavailable_thread_present"]),
+        ("decline", 1, 0, ["runtime_state_inconsistent"]),
+        (
+            "decline",
+            1,
+            0,
+            [
+                "contended_thread_present",
+                "unavailable_thread_present",
+                "runtime_state_inconsistent",
+            ],
+        ),
+    ],
+)
+async def test_runtime_client_accepts_coherent_continuation_reason_shapes(
+    outcome,
+    candidate_count,
+    eligible_count,
+    reason_codes,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    candidates = _continuation_candidates(candidate_count)
+    response = _continuation_response(outcome)
+    response["result"].update(
+        candidate_count=candidate_count,
+        eligible_candidate_count=eligible_count,
+        reason_codes=reason_codes,
+    )
+    calls = []
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    actual = await client.select_continuation(
+        request_id="selection-request",
+        owner_id="owner",
+        surface="voice",
+        candidate_set_complete=reason_codes != ["candidate_set_incomplete"],
+        stale_after_seconds=1800,
+        candidates=candidates,
+    )
+
+    assert actual == response
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "candidate_count", "eligible_count", "reason_codes"),
+    [
+        (
+            "resume",
+            1,
+            1,
+            ["one_eligible_candidate", "candidate_stale"],
+        ),
+        ("resume", 1, 0, ["one_eligible_candidate"]),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "active_thread_present"],
+        ),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "contended_thread_present"],
+        ),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "unavailable_thread_present"],
+        ),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_eligible_candidates", "runtime_state_inconsistent"],
+        ),
+        ("create_new", 1, 0, ["no_candidates"]),
+        ("create_new", 0, 0, ["no_eligible_candidates"]),
+        (
+            "create_new",
+            1,
+            0,
+            ["no_candidates", "no_eligible_candidates"],
+        ),
+        ("create_new", 1, 1, ["no_eligible_candidates"]),
+        (
+            "create_new",
+            2,
+            0,
+            [
+                "no_eligible_candidates",
+                "runtime_state_missing",
+                "candidate_not_open",
+            ],
+        ),
+        (
+            "clarify",
+            2,
+            2,
+            ["multiple_eligible_candidates", "unavailable_thread_present"],
+        ),
+        (
+            "clarify",
+            1,
+            0,
+            ["candidate_set_incomplete", "active_thread_present"],
+        ),
+        ("clarify", 1, 1, ["candidate_set_incomplete"]),
+        ("clarify", 2, 0, ["multiple_eligible_candidates"]),
+        ("clarify", 2, 1, ["multiple_eligible_candidates"]),
+        (
+            "clarify",
+            2,
+            2,
+            ["candidate_set_incomplete", "multiple_eligible_candidates"],
+        ),
+        (
+            "wait",
+            1,
+            0,
+            ["active_thread_present", "runtime_state_inconsistent"],
+        ),
+        (
+            "wait",
+            1,
+            0,
+            ["active_thread_present", "unavailable_thread_present"],
+        ),
+        (
+            "wait",
+            1,
+            0,
+            ["active_thread_present", "multiple_eligible_candidates"],
+        ),
+        ("wait", 1, 0, ["candidate_stale"]),
+        (
+            "decline",
+            1,
+            0,
+            ["contended_thread_present", "active_thread_present"],
+        ),
+        (
+            "decline",
+            1,
+            0,
+            ["contended_thread_present", "candidate_stale"],
+        ),
+        (
+            "decline",
+            1,
+            0,
+            ["contended_thread_present", "multiple_eligible_candidates"],
+        ),
+        ("decline", 1, 0, ["active_thread_present"]),
+        (
+            "decline",
+            1,
+            0,
+            ["runtime_state_inconsistent", "contended_thread_present"],
+        ),
+    ],
+)
+async def test_runtime_client_rejects_contradictory_continuation_reason_shapes(
+    outcome,
+    candidate_count,
+    eligible_count,
+    reason_codes,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    candidates = _continuation_candidates(candidate_count)
+    response = _continuation_response(outcome)
+    response["result"].update(
+        candidate_count=candidate_count,
+        eligible_candidate_count=eligible_count,
+        reason_codes=reason_codes,
+    )
+    original_response = deepcopy(response)
+    calls = []
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(
+        RuntimeError,
+        match="^continuation_selection_response_invalid$",
+    ):
+        await client.select_continuation(
+            request_id="selection-request",
+            owner_id="owner",
+            surface="voice",
+            candidate_set_complete=reason_codes != ["candidate_set_incomplete"],
+            stale_after_seconds=1800,
+            candidates=candidates,
+        )
+
+    assert len(calls) == 1
+    assert response == original_response
 
 
 @pytest.mark.asyncio
