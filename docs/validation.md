@@ -333,10 +333,11 @@ cd api
 ```
 
 The tests cover conservative surface derivation, exact compact runtime payloads,
-strict anti-loosening response validation, suppression-only fallback, post-profile
-style clamping, mandatory prompt ordering and budget survival, evidence rebuild,
-and identical primary/fallback messages with one policy call. The persisted replay
-corpus remains unchanged and is run twice to prove deterministic output.
+strict branch, posture, gate, confidence, and reason coherence validation;
+suppression-only fallback; monotonic post-profile style clamping that preserves
+stricter resolved values; mandatory prompt ordering and budget survival; evidence
+rebuild; and identical primary/fallback messages with one policy call. The persisted
+replay corpus remains unchanged and is run twice to prove deterministic output.
 
 Run only the actual-service situated-presence proof with:
 

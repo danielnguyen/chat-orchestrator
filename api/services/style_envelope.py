@@ -153,14 +153,11 @@ def clamp_style_envelope(
         updates["challenge_sharpness"] = "soft"
     elif challenge == "low" and envelope.challenge_sharpness == "direct":
         updates["challenge_sharpness"] = "balanced"
-    elif challenge == "medium":
-        updates["challenge_sharpness"] = "direct"
 
     posture = situated_presence.get("response_posture")
     if posture == "tactical":
         updates.update(
             {
-                "directness": "high",
                 "sentence_length": "short",
                 "analogy_density": "none",
                 "playfulness_budget": "none",
@@ -170,8 +167,6 @@ def clamp_style_envelope(
         updates.update({"sentence_length": "short", "analogy_density": "none"})
         if not humor_allowed:
             updates["playfulness_budget"] = "none"
-    elif posture == "direct":
-        updates["directness"] = "high"
 
     resolved = envelope.model_copy(update=updates)
     after = resolved.model_dump()

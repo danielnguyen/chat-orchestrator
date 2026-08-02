@@ -760,18 +760,20 @@ When Cognitive Runtime, interaction governance, and restraint are all enabled,
 Chat Orchestrator evaluates situated presence once for the admitted current turn.
 It derives visibility and constraint only from the request's typed surface context,
 sends compact governance and restraint projections without message text, and
-strictly validates the `situated-presence.v1` response. Private desktop, mobile,
-Telegram, and voice categories may be normal. Shared, public, preview, active-task,
-no-expansion, missing, malformed, and unknown context is treated conservatively.
-Spoken output alone is not a constraint.
+strictly validates the complete deterministic `situated-presence.v1` result against
+the request projections, including branch gates, posture, confidence, and ordered
+reasons. Private desktop, mobile, Telegram, and voice categories may be normal.
+Shared, public, preview, active-task, no-expansion, missing, malformed, and unknown
+context is treated conservatively. Spoken output alone is not a constraint.
 
-The result is applied after profile and request style resolution. It can only
-clamp playfulness, challenge, directness, sentence length, and analogy use; it
-does not change technical density or force a warmth value. A mandatory `Situated
-presence guidance:` prompt layer follows restraint and precedes privacy guidance.
-That layer survives optional prompt-budget reductions and evidence prompt rebuilds.
-If mandatory prompt content cannot fit, the existing bounded prompt-budget failure
-is used instead of dropping the policy.
+The result is applied after profile and request style resolution. It monotonically
+caps playfulness and challenge without raising either value, and preserves resolved
+directness, warmth, and technical density. Tactical, brief, and minimal postures may
+shorten sentences or remove analogies as suppression-oriented constraints. A
+mandatory `Situated presence guidance:` prompt layer follows restraint and precedes
+privacy guidance. That layer survives optional prompt-budget reductions and evidence
+prompt rebuilds. If mandatory prompt content cannot fit, the existing bounded
+prompt-budget failure is used instead of dropping the policy.
 
 The provider remains responsible for natural wording. Allowed playfulness is
 optional and current-turn-grounded, and brief attunement permits only a generic

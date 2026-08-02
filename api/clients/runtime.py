@@ -158,6 +158,250 @@ def _strict_situated_projection(
     return dict(value)
 
 
+def _ordered_situated_reasons(reasons: set[str]) -> list[str]:
+    if not reasons:
+        reasons.add("ambiguous_context")
+    return [reason for reason in _SITUATED_REASON_ORDER if reason in reasons][:8]
+
+
+def _situated_context_reasons(
+    *,
+    surface_context: dict[str, str],
+    governance: dict[str, Any],
+    restraint: dict[str, Any],
+) -> set[str]:
+    reasons: set[str] = set()
+    visibility_reason = {
+        "public": "surface_public",
+        "shared": "surface_shared",
+        "unknown": "surface_visibility_unknown",
+    }
+    constraint_reason = {
+        "constrained": "surface_constrained",
+        "unknown": "surface_constraint_unknown",
+    }
+    if reason := visibility_reason.get(surface_context["visibility"]):
+        reasons.add(reason)
+    if reason := constraint_reason.get(surface_context["constraint"]):
+        reasons.add(reason)
+    if not governance["commentary_allowed"]:
+        reasons.add("upstream_commentary_suppressed")
+    if not governance["humor_allowed"]:
+        reasons.add("upstream_humor_suppressed")
+    if governance["privacy_sensitivity_hint"] != "normal":
+        reasons.add("privacy_sensitive")
+    if governance["requires_confirmation"]:
+        reasons.add("confirmation_required")
+    if restraint["proactive_output_suppressed"]:
+        reasons.add("proactive_output_suppressed")
+    if restraint["personalization_suppressed"]:
+        reasons.add("personalization_suppressed")
+    if restraint["brevity_preferred"]:
+        reasons.add("brevity_preferred")
+    if restraint["clarification_preferred"]:
+        reasons.add("clarification_preferred")
+    return reasons
+
+
+def _situated_brief_or_upstream_posture(
+    *, governance: dict[str, Any], restraint: dict[str, Any]
+) -> str:
+    posture = governance["response_posture"]
+    if restraint["brevity_preferred"] and posture not in {"direct", "tactical"}:
+        return "brief"
+    return posture
+
+
+def _situated_presence_v1_result_is_coherent(
+    *,
+    result: dict[str, Any],
+    surface_context: dict[str, str],
+    governance: dict[str, Any],
+    restraint: dict[str, Any],
+) -> bool:
+    """Compare a response with the pinned contract without producing a substitute."""
+    surface_allows = (
+        surface_context["visibility"] == "private"
+        and surface_context["constraint"] == "normal"
+    )
+    common = {
+        "surface_allows_commentary": surface_allows,
+        "action_implication_allowed": False,
+        "policy_version": "situated-presence.v1",
+    }
+    if min(governance["confidence"], restraint["confidence"]) < 0.60:
+        return result == {
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "none",
+            "silence_preferred": True,
+            **common,
+            "response_posture": "silent_or_minimal",
+            "reason_summary": ["upstream_confidence_insufficient"],
+        }
+
+    reasons = _situated_context_reasons(
+        surface_context=surface_context,
+        governance=governance,
+        restraint=restraint,
+    )
+    kind = governance["interaction_kind"]
+    commentary = (
+        governance["commentary_allowed"]
+        and surface_allows
+        and governance["tension_level"] == "low"
+        and kind not in {"tense_debugging", "high_impact_decision", "ambiguous"}
+        and governance["privacy_sensitivity_hint"] == "normal"
+        and not governance["requires_confirmation"]
+        and not restraint["clarification_preferred"]
+    )
+
+    if kind == "tense_debugging" or governance["tension_level"] == "high":
+        reasons.update({"tense_context", "tactical_response_required"})
+        return result == {
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": (
+                "minimal"
+                if governance["privacy_sensitivity_hint"] == "normal"
+                and not restraint["personalization_suppressed"]
+                else "none"
+            ),
+            "challenge_allowed": "medium",
+            "silence_preferred": False,
+            **common,
+            "response_posture": "tactical",
+            "reason_summary": _ordered_situated_reasons(reasons),
+        }
+
+    if kind == "high_impact_decision":
+        reasons.add("high_impact_context")
+        return result == {
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": (
+                "minimal"
+                if governance["privacy_sensitivity_hint"] == "normal"
+                and not restraint["personalization_suppressed"]
+                else "none"
+            ),
+            "challenge_allowed": "low",
+            "silence_preferred": False,
+            **common,
+            "response_posture": (
+                "brief"
+                if restraint["brevity_preferred"]
+                or governance["response_posture"] in {"brief", "silent_or_minimal"}
+                else "direct"
+            ),
+            "reason_summary": _ordered_situated_reasons(reasons),
+        }
+
+    if kind in {"vent_or_expression", "mistake_or_failure_report"}:
+        attunement_allowed = (
+            surface_allows
+            and governance["privacy_sensitivity_hint"] in {"normal", "private"}
+            and not restraint["clarification_preferred"]
+        )
+        if attunement_allowed:
+            attunement = "brief"
+            reasons.add("brief_steadying_allowed")
+        elif (
+            governance["privacy_sensitivity_hint"] == "sensitive"
+            or restraint["clarification_preferred"]
+        ):
+            attunement = "none"
+        else:
+            attunement = "minimal"
+        return result == {
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": attunement,
+            "challenge_allowed": (
+                "low" if kind == "mistake_or_failure_report" else "none"
+            ),
+            "silence_preferred": False,
+            **common,
+            "response_posture": (
+                "brief"
+                if restraint["brevity_preferred"]
+                or restraint["personalization_suppressed"]
+                or restraint["proactive_output_suppressed"]
+                or governance["privacy_sensitivity_hint"] != "normal"
+                or not surface_allows
+                else "supportive"
+            ),
+            "reason_summary": _ordered_situated_reasons(reasons),
+        }
+
+    if kind == "joke_or_playful":
+        humor = commentary and governance["humor_allowed"]
+        if humor:
+            reasons.add("light_commentary_allowed")
+        elif commentary:
+            reasons.add("low_risk_commentary_allowed")
+        silence = not commentary and (
+            restraint["clarification_preferred"] or not surface_allows
+        )
+        return result == {
+            "commentary_allowed": commentary,
+            "humor_allowed": humor,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "low" if commentary else "none",
+            "silence_preferred": silence,
+            **common,
+            "response_posture": (
+                "brief"
+                if commentary and restraint["brevity_preferred"]
+                else "playful"
+                if commentary
+                else "silent_or_minimal"
+                if silence
+                else _situated_brief_or_upstream_posture(
+                    governance=governance, restraint=restraint
+                )
+            ),
+            "reason_summary": _ordered_situated_reasons(reasons),
+        }
+
+    if kind == "ambiguous":
+        reasons.add("ambiguous_context")
+        return result == {
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "none",
+            "silence_preferred": True,
+            **common,
+            "response_posture": "silent_or_minimal",
+            "reason_summary": _ordered_situated_reasons(reasons),
+        }
+
+    if commentary:
+        reasons.add("low_risk_commentary_allowed")
+    silence = (
+        restraint["proactive_output_suppressed"]
+        and governance["response_posture"] == "silent_or_minimal"
+    )
+    return result == {
+        "commentary_allowed": commentary,
+        "humor_allowed": False,
+        "emotional_attunement_allowed": "none",
+        "challenge_allowed": "low" if kind == "brainstorm" else "none",
+        "silence_preferred": silence,
+        **common,
+        "response_posture": (
+            "silent_or_minimal"
+            if silence
+            else _situated_brief_or_upstream_posture(
+                governance=governance, restraint=restraint
+            )
+        ),
+        "reason_summary": _ordered_situated_reasons(reasons),
+    }
+
+
 def _validate_situated_presence_response(
     response: Any,
     *,
@@ -216,53 +460,11 @@ def _validate_situated_presence_response(
     ):
         raise RuntimeError("situated_presence_response_invalid")
 
-    surface_allows = (
-        surface_context["visibility"] == "private"
-        and surface_context["constraint"] == "normal"
-    )
-    commentary = result["commentary_allowed"]
-    humor = result["humor_allowed"]
-    attunement = result["emotional_attunement_allowed"]
-    if result["surface_allows_commentary"] is not surface_allows:
-        raise RuntimeError("situated_presence_response_invalid")
-    if commentary and not surface_allows:
-        raise RuntimeError("situated_presence_response_invalid")
-    if humor and (not commentary or not surface_allows):
-        raise RuntimeError("situated_presence_response_invalid")
-    if result["silence_preferred"] and (commentary or humor):
-        raise RuntimeError("situated_presence_response_invalid")
-    if commentary and not governance["commentary_allowed"]:
-        raise RuntimeError("situated_presence_response_invalid")
-    if humor and not governance["humor_allowed"]:
-        raise RuntimeError("situated_presence_response_invalid")
-    if governance["privacy_sensitivity_hint"] == "sensitive" and (
-        commentary or attunement == "brief"
-    ):
-        raise RuntimeError("situated_presence_response_invalid")
-    if restraint["clarification_preferred"] and (
-        commentary or humor or attunement == "brief"
-    ):
-        raise RuntimeError("situated_presence_response_invalid")
-    if (
-        governance["interaction_kind"] == "tense_debugging"
-        or governance["tension_level"] == "high"
-    ) and (
-        commentary
-        or humor
-        or result["response_posture"] != "tactical"
-    ):
-        raise RuntimeError("situated_presence_response_invalid")
-    if governance["interaction_kind"] == "high_impact_decision" and (
-        commentary or humor
-    ):
-        raise RuntimeError("situated_presence_response_invalid")
-    if min(governance["confidence"], restraint["confidence"]) < 0.60 and (
-        commentary
-        or humor
-        or attunement != "none"
-        or result["challenge_allowed"] != "none"
-        or result["silence_preferred"] is not True
-        or result["response_posture"] != "silent_or_minimal"
+    if not _situated_presence_v1_result_is_coherent(
+        result=result,
+        surface_context=surface_context,
+        governance=governance,
+        restraint=restraint,
     ):
         raise RuntimeError("situated_presence_response_invalid")
     return response

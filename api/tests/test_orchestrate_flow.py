@@ -28131,6 +28131,81 @@ async def test_situated_presence_is_called_once_and_shapes_prompt_after_style_re
 
 
 @pytest.mark.asyncio
+async def test_situated_presence_post_profile_clamp_preserves_stricter_style(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime(
+        situated_presence_response=_situated_runtime_response(
+            commentary=False,
+            humor=False,
+            attunement="minimal",
+            challenge="medium",
+            posture="tactical",
+            reason="tense_context",
+        ),
+    )
+    runtime.interaction_governance_response["result"].update(
+        {
+            "interaction_kind": "tense_debugging",
+            "tension_level": "high",
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "response_posture": "tactical",
+            "confidence": 0.9,
+        }
+    )
+    runtime.restraint_response["result"].update(
+        {
+            "restraint_policy": "answer_normally",
+            "confidence": 0.9,
+            "brevity_preferred": False,
+            "clarification_preferred": False,
+        }
+    )
+    provider = FakeLiteLLM(content="A direct useful answer.")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            surface_context={
+                "surface_category": "desktop_private",
+                "style_envelope": {
+                    "directness": "low",
+                    "warmth": "high",
+                    "playfulness_budget": "none",
+                    "challenge_sharpness": "soft",
+                    "technical_density": "high",
+                },
+            },
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-situated-stricter-style",
+    )
+
+    assert result["answer"] == "A direct useful answer."
+    trace = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    resolved = trace["style"]["resolved_envelope"]
+    assert resolved["directness"] == "low"
+    assert resolved["warmth"] == "high"
+    assert resolved["playfulness_budget"] == "none"
+    assert resolved["challenge_sharpness"] == "soft"
+    assert resolved["technical_density"] == "high"
+    assert resolved["sentence_length"] == "short"
+    assert resolved["analogy_density"] == "none"
+    changed = trace["style"]["situated_presence_clamp"]["changed_fields"]
+    assert "directness" not in changed
+    assert "challenge_sharpness" not in changed
+    assert len(runtime.situated_presence_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_situated_presence_failure_uses_suppression_guidance_and_chat_continues(
     tmp_path,
 ):
