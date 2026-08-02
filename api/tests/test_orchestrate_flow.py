@@ -443,6 +443,7 @@ class FakeRuntime:
         persona_containment_response=None,
         relationship_response=None,
         restraint_response=None,
+        situated_presence_response=None,
         memory_hygiene_response=None,
         privacy_context_response=None,
         capability_match_response=None,
@@ -460,6 +461,7 @@ class FakeRuntime:
         interaction_governance_error: Exception | None = None,
         persona_containment_error: Exception | None = None,
         restraint_error: Exception | None = None,
+        situated_presence_error: Exception | None = None,
         memory_hygiene_error: Exception | None = None,
         privacy_context_error: Exception | None = None,
         capability_match_error: Exception | None = None,
@@ -490,6 +492,7 @@ class FakeRuntime:
         self.interaction_governance_calls = []
         self.persona_containment_calls = []
         self.restraint_calls = []
+        self.situated_presence_calls = []
         self.memory_hygiene_calls = []
         self.privacy_context_calls = []
         self.capability_match_calls = []
@@ -714,6 +717,7 @@ class FakeRuntime:
                 "clarification_preferred": False,
             },
         }
+        self.situated_presence_response = situated_presence_response
         self.interrupt_response = {
             "request_id": "rid-interrupt",
             "owner_id": "owner",
@@ -836,6 +840,7 @@ class FakeRuntime:
         self.interaction_governance_error = interaction_governance_error
         self.persona_containment_error = persona_containment_error
         self.restraint_error = restraint_error
+        self.situated_presence_error = situated_presence_error
         self.memory_hygiene_error = memory_hygiene_error
         self.privacy_context_error = privacy_context_error
         self.capability_match_error = capability_match_error
@@ -1346,6 +1351,46 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.restraint_response
+
+    async def evaluate_situated_presence(self, **kwargs):
+        self.situated_presence_calls.append(kwargs)
+        self.call_order.append("situated_presence")
+        if self.situated_presence_error is not None:
+            raise self.situated_presence_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        if self.situated_presence_response is not None:
+            return self.situated_presence_response
+        private_normal = kwargs["surface_context"] == {
+            "visibility": "private",
+            "constraint": "normal",
+        }
+        return {
+            "schema_version": "situated-presence.v1",
+            **{
+                field: kwargs[field]
+                for field in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                )
+            },
+            "result": {
+                "commentary_allowed": False,
+                "humor_allowed": False,
+                "emotional_attunement_allowed": "none",
+                "challenge_allowed": "none",
+                "silence_preferred": True,
+                "surface_allows_commentary": private_normal,
+                "response_posture": "silent_or_minimal",
+                "action_implication_allowed": False,
+                "reason_summary": ["upstream_commentary_suppressed"],
+                "policy_version": "situated-presence.v1",
+            },
+        }
 
     async def evaluate_memory_hygiene(self, **kwargs):
         self.memory_hygiene_calls.append(kwargs)
@@ -27970,3 +28015,203 @@ async def test_unavailable_fresh_path_keeps_history_and_calls_no_provider_or_ret
     assert trace["fresh_verification_entry_status"] == (
         "unavailable_after_history_resolution"
     )
+
+
+def _situated_runtime_response(
+    *,
+    commentary=True,
+    humor=True,
+    attunement="none",
+    challenge="low",
+    silence=False,
+    posture="playful",
+    reason="light_commentary_allowed",
+):
+    return {
+        "schema_version": "situated-presence.v1",
+        "request_id": "ignored-by-fake",
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "vscode",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "result": {
+            "commentary_allowed": commentary,
+            "humor_allowed": humor,
+            "emotional_attunement_allowed": attunement,
+            "challenge_allowed": challenge,
+            "silence_preferred": silence,
+            "surface_allows_commentary": True,
+            "response_posture": posture,
+            "action_implication_allowed": False,
+            "reason_summary": [reason],
+            "policy_version": "situated-presence.v1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_situated_presence_is_called_once_and_shapes_prompt_after_style_resolution(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime(
+        situated_presence_response=_situated_runtime_response(),
+    )
+    runtime.interaction_governance_response["result"].update(
+        {
+            "interaction_kind": "joke_or_playful",
+            "commentary_allowed": True,
+            "humor_allowed": True,
+            "response_posture": "playful",
+            "confidence": 0.9,
+        }
+    )
+    runtime.restraint_response["result"].update(
+        {
+            "restraint_policy": "answer_normally",
+            "confidence": 0.9,
+            "brevity_preferred": False,
+            "clarification_preferred": False,
+        }
+    )
+    provider = FakeLiteLLM(content="A naturally playful answer.")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            surface_context={
+                "surface_category": "desktop_private",
+                "style_envelope": {"playfulness_budget": "medium"},
+            },
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-situated-playful",
+    )
+
+    assert result["answer"] == "A naturally playful answer."
+    assert len(runtime.situated_presence_calls) == 1
+    call = runtime.situated_presence_calls[0]
+    assert call["surface_context"] == {"visibility": "private", "constraint": "normal"}
+    assert set(call["interaction_governance"]) == {
+        "interaction_kind",
+        "tension_level",
+        "commentary_allowed",
+        "humor_allowed",
+        "action_allowed",
+        "requires_confirmation",
+        "privacy_sensitivity_hint",
+        "response_posture",
+        "confidence",
+    }
+    assert "current_user_text" not in str(call)
+    prompt = provider.calls[0]["messages"]
+    guidance = next(
+        item["content"]
+        for item in prompt
+        if item["content"].startswith("Situated presence guidance:")
+    )
+    assert "do not force a joke" in guidance
+    trace = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["situated_presence"]["humor_allowed"] is True
+    assert trace["style"]["resolved_envelope"]["playfulness_budget"] == "low"
+    assert "hi" not in str(trace["situated_presence"])
+    assert runtime.call_order.index("restraint") < runtime.call_order.index(
+        "situated_presence"
+    )
+    assert memory_store.added_messages[0]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_situated_presence_failure_uses_suppression_guidance_and_chat_continues(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime(situated_presence_error=RuntimeError("private dependency detail"))
+    provider = FakeLiteLLM(content="Useful answer.")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            surface_context={"surface_category": "desktop_private"},
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-situated-fallback",
+    )
+
+    assert result["status"] == "ok"
+    assert result["answer"] == "Useful answer."
+    guidance = "\n".join(item["content"] for item in provider.calls[0]["messages"])
+    assert "Situated presence guidance:" in guidance
+    assert "Do not add jokes" in guidance
+    assert "private dependency detail" not in guidance
+    trace = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["situated_presence"]["fallback_status"] == "suppression_only"
+    assert trace["situated_presence"]["failure_category"] == "response_invalid"
+
+
+@pytest.mark.asyncio
+async def test_provider_fallback_reuses_identical_situated_presence_messages(tmp_path):
+    rules = tmp_path / "rules.yaml"
+    models = tmp_path / "models.yaml"
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: gpt-4o-mini\n"
+        "          provider: cloud\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime(situated_presence_response=_situated_runtime_response())
+    provider = FakeLiteLLM(fail_first=True, content="Fallback-owned answer.")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            conversation_id="conv-1",
+            surface_context={"surface_category": "desktop_private"},
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+        request_id="rid-situated-provider-fallback",
+    )
+
+    assert result["answer"] == "Fallback-owned answer."
+    assert result["status"] == "degraded"
+    assert len(runtime.situated_presence_calls) == 1
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["messages"] == provider.calls[1]["messages"]

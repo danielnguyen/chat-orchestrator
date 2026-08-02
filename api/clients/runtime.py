@@ -75,6 +75,198 @@ _CONTINUATION_DECLINE_REASONS = (
     "runtime_state_inconsistent",
 )
 
+_SITUATED_VISIBILITY = {"private", "shared", "public", "unknown"}
+_SITUATED_CONSTRAINT = {"normal", "constrained", "unknown"}
+_SITUATED_INTERACTION_KINDS = {
+    "command",
+    "question",
+    "brainstorm",
+    "joke_or_playful",
+    "vent_or_expression",
+    "mistake_or_failure_report",
+    "tense_debugging",
+    "high_impact_decision",
+    "ambiguous",
+}
+_SITUATED_TENSION_LEVELS = {"low", "medium", "high"}
+_SITUATED_PRIVACY_HINTS = {"normal", "private", "sensitive"}
+_SITUATED_RESPONSE_POSTURES = {
+    "direct",
+    "supportive",
+    "tactical",
+    "brief",
+    "reflective",
+    "playful",
+    "silent_or_minimal",
+}
+_SITUATED_RESTRAINT_POLICIES = {
+    "answer_normally",
+    "short_answer",
+    "defer_expansion",
+    "ask_clarifying_question",
+    "do_not_retrieve",
+    "do_not_personalize",
+    "suppress_proactive_output",
+}
+_SITUATED_ATTUNEMENT = {"none", "minimal", "brief"}
+_SITUATED_CHALLENGE = {"none", "low", "medium"}
+_SITUATED_REASON_ORDER = (
+    "upstream_confidence_insufficient",
+    "tense_context",
+    "tactical_response_required",
+    "high_impact_context",
+    "brief_steadying_allowed",
+    "light_commentary_allowed",
+    "low_risk_commentary_allowed",
+    "ambiguous_context",
+    "surface_public",
+    "surface_shared",
+    "surface_visibility_unknown",
+    "surface_constrained",
+    "surface_constraint_unknown",
+    "privacy_sensitive",
+    "proactive_output_suppressed",
+    "personalization_suppressed",
+    "confirmation_required",
+    "upstream_commentary_suppressed",
+    "upstream_humor_suppressed",
+    "brevity_preferred",
+    "clarification_preferred",
+)
+
+
+def _strict_situated_projection(
+    value: Any,
+    *,
+    expected_keys: set[str],
+    labels: dict[str, set[str]],
+    booleans: set[str],
+    confidence: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("situated_presence_request_invalid")
+    for field, allowed in labels.items():
+        if not isinstance(value.get(field), str) or value[field] not in allowed:
+            raise ValueError("situated_presence_request_invalid")
+    if any(type(value.get(field)) is not bool for field in booleans):
+        raise ValueError("situated_presence_request_invalid")
+    if confidence and (
+        not isinstance(value.get("confidence"), float)
+        or not 0.0 <= value["confidence"] <= 1.0
+    ):
+        raise ValueError("situated_presence_request_invalid")
+    return dict(value)
+
+
+def _validate_situated_presence_response(
+    response: Any,
+    *,
+    scope: dict[str, str],
+    surface_context: dict[str, str],
+    governance: dict[str, Any],
+    restraint: dict[str, Any],
+) -> dict[str, Any]:
+    expected_top = {"schema_version", *scope, "result"}
+    if not isinstance(response, dict) or set(response) != expected_top:
+        raise RuntimeError("situated_presence_response_invalid")
+    if response.get("schema_version") != "situated-presence.v1":
+        raise RuntimeError("situated_presence_response_invalid")
+    if any(response.get(field) != value for field, value in scope.items()):
+        raise RuntimeError("situated_presence_response_context_mismatch")
+
+    result = response.get("result")
+    expected_result = {
+        "commentary_allowed",
+        "humor_allowed",
+        "emotional_attunement_allowed",
+        "challenge_allowed",
+        "silence_preferred",
+        "surface_allows_commentary",
+        "response_posture",
+        "action_implication_allowed",
+        "reason_summary",
+        "policy_version",
+    }
+    if not isinstance(result, dict) or set(result) != expected_result:
+        raise RuntimeError("situated_presence_response_invalid")
+    bool_fields = (
+        "commentary_allowed",
+        "humor_allowed",
+        "silence_preferred",
+        "surface_allows_commentary",
+        "action_implication_allowed",
+    )
+    if any(type(result.get(field)) is not bool for field in bool_fields):
+        raise RuntimeError("situated_presence_response_invalid")
+    if (
+        result.get("emotional_attunement_allowed") not in _SITUATED_ATTUNEMENT
+        or result.get("challenge_allowed") not in _SITUATED_CHALLENGE
+        or result.get("response_posture") not in _SITUATED_RESPONSE_POSTURES
+        or result.get("policy_version") != "situated-presence.v1"
+        or result.get("action_implication_allowed") is not False
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+    reasons = result.get("reason_summary")
+    if (
+        not isinstance(reasons, list)
+        or not 1 <= len(reasons) <= 8
+        or any(not isinstance(reason, str) for reason in reasons)
+        or len(reasons) != len(set(reasons))
+        or reasons != [reason for reason in _SITUATED_REASON_ORDER if reason in reasons]
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+
+    surface_allows = (
+        surface_context["visibility"] == "private"
+        and surface_context["constraint"] == "normal"
+    )
+    commentary = result["commentary_allowed"]
+    humor = result["humor_allowed"]
+    attunement = result["emotional_attunement_allowed"]
+    if result["surface_allows_commentary"] is not surface_allows:
+        raise RuntimeError("situated_presence_response_invalid")
+    if commentary and not surface_allows:
+        raise RuntimeError("situated_presence_response_invalid")
+    if humor and (not commentary or not surface_allows):
+        raise RuntimeError("situated_presence_response_invalid")
+    if result["silence_preferred"] and (commentary or humor):
+        raise RuntimeError("situated_presence_response_invalid")
+    if commentary and not governance["commentary_allowed"]:
+        raise RuntimeError("situated_presence_response_invalid")
+    if humor and not governance["humor_allowed"]:
+        raise RuntimeError("situated_presence_response_invalid")
+    if governance["privacy_sensitivity_hint"] == "sensitive" and (
+        commentary or attunement == "brief"
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+    if restraint["clarification_preferred"] and (
+        commentary or humor or attunement == "brief"
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+    if (
+        governance["interaction_kind"] == "tense_debugging"
+        or governance["tension_level"] == "high"
+    ) and (
+        commentary
+        or humor
+        or result["response_posture"] != "tactical"
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+    if governance["interaction_kind"] == "high_impact_decision" and (
+        commentary or humor
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+    if min(governance["confidence"], restraint["confidence"]) < 0.60 and (
+        commentary
+        or humor
+        or attunement != "none"
+        or result["challenge_allowed"] != "none"
+        or result["silence_preferred"] is not True
+        or result["response_posture"] != "silent_or_minimal"
+    ):
+        raise RuntimeError("situated_presence_response_invalid")
+    return response
+
 
 def _continuation_outcome_is_coherent(
     *,
@@ -1444,6 +1636,105 @@ class RuntimeClient:
         if surface_metadata_json is not None:
             payload["surface_metadata_json"] = surface_metadata_json
         return await self._post("/v1/runtime/restraint/evaluate", json=payload)
+
+    async def evaluate_situated_presence(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        surface_context: dict[str, Any],
+        interaction_governance: dict[str, Any],
+        restraint: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+        if (
+            any(not _bounded_runtime_identifier(value) for value in scope.values())
+            or len(surface) > 64
+        ):
+            raise ValueError("situated_presence_request_invalid")
+        surface_projection = _strict_situated_projection(
+            surface_context,
+            expected_keys={"visibility", "constraint"},
+            labels={
+                "visibility": _SITUATED_VISIBILITY,
+                "constraint": _SITUATED_CONSTRAINT,
+            },
+            booleans=set(),
+            confidence=False,
+        )
+        governance_projection = _strict_situated_projection(
+            interaction_governance,
+            expected_keys={
+                "interaction_kind",
+                "tension_level",
+                "commentary_allowed",
+                "humor_allowed",
+                "action_allowed",
+                "requires_confirmation",
+                "privacy_sensitivity_hint",
+                "response_posture",
+                "confidence",
+            },
+            labels={
+                "interaction_kind": _SITUATED_INTERACTION_KINDS,
+                "tension_level": _SITUATED_TENSION_LEVELS,
+                "privacy_sensitivity_hint": _SITUATED_PRIVACY_HINTS,
+                "response_posture": _SITUATED_RESPONSE_POSTURES,
+            },
+            booleans={
+                "commentary_allowed",
+                "humor_allowed",
+                "action_allowed",
+                "requires_confirmation",
+            },
+            confidence=True,
+        )
+        restraint_projection = _strict_situated_projection(
+            restraint,
+            expected_keys={
+                "restraint_policy",
+                "proactive_output_suppressed",
+                "personalization_suppressed",
+                "brevity_preferred",
+                "clarification_preferred",
+                "confidence",
+            },
+            labels={"restraint_policy": _SITUATED_RESTRAINT_POLICIES},
+            booleans={
+                "proactive_output_suppressed",
+                "personalization_suppressed",
+                "brevity_preferred",
+                "clarification_preferred",
+            },
+            confidence=True,
+        )
+        response = await self._post(
+            "/v1/runtime/situated-presence/evaluate",
+            json={
+                **scope,
+                "surface_context": surface_projection,
+                "interaction_governance": governance_projection,
+                "restraint": restraint_projection,
+            },
+        )
+        return _validate_situated_presence_response(
+            response,
+            scope=scope,
+            surface_context=surface_projection,
+            governance=governance_projection,
+            restraint=restraint_projection,
+        )
 
     async def evaluate_memory_hygiene(
         self,

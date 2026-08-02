@@ -1705,9 +1705,13 @@ def test_promoted_memory_included_and_low_value_memory_suppressed():
 
 def test_stale_memory_qualified_or_suppressed():
     out = compose_memory_recall_context(
-        retrieval_bundle=_recall_bundle(_memory_item("mem-stale", "historical fact", state="stale")),
+        retrieval_bundle=_recall_bundle(
+            _memory_item("mem-stale", "historical fact", state="stale")
+        ),
         recall_response=_recall_response(
-            _recall_decision("mem-stale", "implicit", decision="implicit_only", prompt_eligible=False)
+            _recall_decision(
+                "mem-stale", "implicit", decision="implicit_only", prompt_eligible=False
+            )
         ),
         episode_response=None,
     )
@@ -1760,7 +1764,9 @@ def test_scene_inappropriate_episode_callback_suppressed():
     out = compose_memory_recall_context(
         retrieval_bundle=_recall_bundle(),
         recall_response=None,
-        episode_response=_episode_response(_episode_decision("ep-scene", eligible=False, reason="scene_mismatch")),
+        episode_response=_episode_response(
+            _episode_decision("ep-scene", eligible=False, reason="scene_mismatch")
+        ),
     )
 
     assert out.prompt_messages == []
@@ -1771,7 +1777,9 @@ def test_recall_implicit_used_without_explicit_mention():
     out = compose_memory_recall_context(
         retrieval_bundle=_recall_bundle(_memory_item("mem-implicit", "implicit context")),
         recall_response=_recall_response(
-            _recall_decision("mem-implicit", "implicit", decision="implicit_only", prompt_eligible=False)
+            _recall_decision(
+                "mem-implicit", "implicit", decision="implicit_only", prompt_eligible=False
+            )
         ),
         episode_response=None,
     )
@@ -1835,3 +1843,98 @@ def test_provider_fallback_preserves_suppressed_context_boundary():
 
     assert first_attempt == second_attempt
     assert all("fallback must not restore" not in content for content in second_attempt)
+
+
+def test_situated_presence_guidance_is_mandatory_bounded_and_ordered():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hello"}],
+        restraint={
+            "restraint_policy": "answer_normally",
+            "domains": [],
+            "reason": "none",
+            "prompt_overlay": "Answer normally.",
+            "retrieval_suppressed": False,
+            "personalization_suppressed": True,
+            "proactive_output_suppressed": True,
+            "brevity_preferred": False,
+        },
+        situated_presence={
+            "commentary_allowed": True,
+            "humor_allowed": True,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "low",
+            "silence_preferred": False,
+            "surface_allows_commentary": True,
+            "response_posture": "playful",
+            "action_implication_allowed": False,
+            "reason_summary": ["light_commentary_allowed"],
+            "policy_version": "situated-presence.v1",
+        },
+        situated_presence_trace_data={
+            "activated": True,
+            "attempted": True,
+            "status": "included",
+            "included": True,
+            "runtime_call_status": "included",
+            "schema_version": "situated-presence.v1",
+            "policy_version": "situated-presence.v1",
+            "surface_context": {
+                "visibility": "private",
+                "constraint": "normal",
+                "source_fields": ["surface_context.surface_category"],
+                "reason": "recognized_surface_context",
+            },
+            "commentary_allowed": True,
+            "humor_allowed": True,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "low",
+            "silence_preferred": False,
+            "surface_allows_commentary": True,
+            "response_posture": "playful",
+            "reason_summary": ["light_commentary_allowed"],
+            "fallback_status": "not_used",
+        },
+        privacy_context={
+            "surface_type": "desktop_private",
+            "privacy_zone": "private",
+            "sensitivity_level": "normal",
+            "sensitive_detail_allowed": True,
+            "notification_detail_allowed": False,
+            "voice_detail_allowed": False,
+            "screen_detail_allowed": True,
+            "redaction_required": False,
+            "safe_summary_required": False,
+            "reason_codes": ["private_surface"],
+        },
+    )
+
+    names = [layer["name"] for layer in out.trace["layers"]]
+    assert names.index("restraint") < names.index("situated_presence")
+    assert names.index("situated_presence") < names.index("privacy_context")
+    guidance = next(
+        item["content"]
+        for item in out.messages
+        if item["content"].startswith("Situated presence guidance:")
+    )
+    assert "do not force a joke" in guidance
+    assert "never authorizes an action" in guidance
+    assert "light_commentary_allowed" not in guidance
+    assert "hello" not in guidance
+
+
+def test_disabled_situated_presence_does_not_change_prompt_layers():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "hello"}],
+        situated_presence=None,
+        situated_presence_trace_data={
+            "activated": False,
+            "status": "disabled",
+            "included": False,
+        },
+    )
+    assert "situated_presence" not in [layer["name"] for layer in out.trace["layers"]]
+    assert out.messages == [{"role": "user", "content": "hello"}]

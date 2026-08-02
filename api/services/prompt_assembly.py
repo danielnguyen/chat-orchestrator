@@ -21,6 +21,7 @@ from services.prompt_budget import (
     prompt_budget_trace,
     validate_budget_contract,
 )
+from services.situated_presence import build_situated_presence_guidance
 
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 VALID_GOVERNANCE_RESPONSE_POSTURES = {
@@ -369,6 +370,7 @@ def _apply_prompt_budget(
     interaction_governance_messages: list[dict[str, str]],
     persona_containment_messages: list[dict[str, str]],
     restraint_messages: list[dict[str, str]],
+    situated_presence_messages: list[dict[str, str]],
     privacy_context_messages: list[dict[str, str]],
     runtime_identity_messages: list[dict[str, str]],
     world_state_messages: list[dict[str, str]],
@@ -410,6 +412,10 @@ def _apply_prompt_budget(
             ("persona_containment", persona_containment_messages, {}),
             ("restraint", restraint_messages, {}),
         ]
+        if situated_presence_messages:
+            ordered.append(
+                ("situated_presence", situated_presence_messages, {})
+            )
         if privacy_context_messages:
             ordered.append(("privacy_context", privacy_context_messages, {}))
         ordered.extend(
@@ -1128,6 +1134,8 @@ def assemble_prompt(
     persona_containment_trace_data: dict[str, Any] | None = None,
     restraint: dict[str, Any] | None = None,
     restraint_trace_data: dict[str, Any] | None = None,
+    situated_presence: dict[str, Any] | None = None,
+    situated_presence_trace_data: dict[str, Any] | None = None,
     memory_hygiene_trace_data: dict[str, Any] | None = None,
     privacy_context: dict[str, Any] | None = None,
     privacy_context_trace_data: dict[str, Any] | None = None,
@@ -1454,6 +1462,69 @@ def assemble_prompt(
         )
     )
 
+    situated_presence_trace_out = dict(situated_presence_trace_data or {})
+    situated_presence_guidance = build_situated_presence_guidance(
+        situated_presence
+    )
+    situated_presence_messages = (
+        [{"role": "system", "content": situated_presence_guidance}]
+        if situated_presence_guidance
+        else []
+    )
+    if situated_presence_messages:
+        messages.extend(situated_presence_messages)
+        layers.append(
+            _layer_trace(
+                "situated_presence",
+                situated_presence_messages,
+                metadata={
+                    "activated": situated_presence_trace_out.get("activated"),
+                    "runtime_call_status": situated_presence_trace_out.get(
+                        "runtime_call_status"
+                    ),
+                    "schema_version": situated_presence_trace_out.get(
+                        "schema_version"
+                    ),
+                    "policy_version": situated_presence_trace_out.get(
+                        "policy_version"
+                    ),
+                    "surface_context": situated_presence_trace_out.get(
+                        "surface_context"
+                    ),
+                    "commentary_allowed": situated_presence_trace_out.get(
+                        "commentary_allowed"
+                    ),
+                    "humor_allowed": situated_presence_trace_out.get(
+                        "humor_allowed"
+                    ),
+                    "emotional_attunement_allowed": situated_presence_trace_out.get(
+                        "emotional_attunement_allowed"
+                    ),
+                    "challenge_allowed": situated_presence_trace_out.get(
+                        "challenge_allowed"
+                    ),
+                    "silence_preferred": situated_presence_trace_out.get(
+                        "silence_preferred"
+                    ),
+                    "surface_allows_commentary": situated_presence_trace_out.get(
+                        "surface_allows_commentary"
+                    ),
+                    "response_posture": situated_presence_trace_out.get(
+                        "response_posture"
+                    ),
+                    "reason_summary": situated_presence_trace_out.get(
+                        "reason_summary", []
+                    ),
+                    "fallback_status": situated_presence_trace_out.get(
+                        "fallback_status"
+                    ),
+                    "failure_category": situated_presence_trace_out.get(
+                        "failure_category"
+                    ),
+                },
+            )
+        )
+
     privacy_context_messages = build_privacy_context_messages(privacy_context)
     privacy_context_trace_out = privacy_context_trace(privacy_context_trace_data)
     if privacy_context_messages:
@@ -1693,6 +1764,7 @@ def assemble_prompt(
                 interaction_governance_messages=interaction_governance_messages,
                 persona_containment_messages=persona_containment_messages,
                 restraint_messages=restraint_messages,
+                situated_presence_messages=situated_presence_messages,
                 privacy_context_messages=privacy_context_messages,
                 runtime_identity_messages=runtime_identity_messages,
                 world_state_messages=world_state_messages,
@@ -1751,6 +1823,8 @@ def assemble_prompt(
         "persona_containment": persona_containment_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "restraint": restraint_trace_out
+        or {"attempted": False, "status": "not_requested", "included": False},
+        "situated_presence": situated_presence_trace_out
         or {"attempted": False, "status": "not_requested", "included": False},
         "memory_hygiene": memory_hygiene_trace_data
         or {"attempted": False, "status": "not_requested", "included": False},

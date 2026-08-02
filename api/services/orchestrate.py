@@ -116,7 +116,15 @@ from services.response_shape import (
     resolve_response_shape,
 )
 from services.routing_contract import routing_trace_metadata
-from services.style_envelope import build_style_guidance_block, resolve_style_envelope
+from services.situated_presence import (
+    resolve_situated_presence,
+    situated_presence_disabled_trace,
+)
+from services.style_envelope import (
+    build_style_guidance_block,
+    clamp_style_envelope,
+    resolve_style_envelope,
+)
 from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
 
 _HISTORY_CLARIFICATION = (
@@ -6790,6 +6798,12 @@ async def orchestrate_chat(
     persona_containment_trace: dict[str, Any] = _persona_containment_disabled_trace()
     restraint: dict[str, Any] | None = None
     restraint_trace: dict[str, Any] = _restraint_disabled_trace()
+    situated_presence: dict[str, Any] | None = None
+    situated_presence_trace: dict[str, Any] = situated_presence_disabled_trace(
+        runtime_configured=runtime is not None,
+        interaction_governance_enabled=interaction_governance_enabled,
+        restraint_enabled=restraint_enabled,
+    )
     capability_registry_messages: list[dict[str, str]] = []
     capability_registry_trace: dict[str, Any] = _capability_registry_disabled_trace()
     mandatory_policy = MandatoryRetrievalPolicy(
@@ -6933,6 +6947,20 @@ async def orchestrate_chat(
         recent_messages=recent_messages,
         surface_metadata_json=surface_metadata_json,
     )
+    situated_presence, situated_presence_trace = await resolve_situated_presence(
+        runtime=runtime,
+        interaction_governance_enabled=interaction_governance_enabled,
+        restraint_enabled=restraint_enabled,
+        request_id=request_id,
+        owner_id=payload["owner_id"],
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+        payload=payload,
+        interaction_governance=interaction_governance,
+        restraint=restraint,
+    )
     if persona_containment_enabled:
         relationship_projection = (
             mandatory_policy.containment_policy.get("relationship_scope_projection")
@@ -6984,6 +7012,12 @@ async def orchestrate_chat(
         )
         effective_payload = apply_profile_to_request(profile, payload)
         style_envelope, style_trace = resolve_style_envelope(effective_payload, profile)
+        style_envelope, style_trace = clamp_style_envelope(
+            style_envelope,
+            style_trace,
+            situated_presence,
+            situated_presence_trace,
+        )
         style_guidance = build_style_guidance_block(style_envelope, style_trace)
         response_shape, response_shape_trace = resolve_response_shape(
             effective_payload,
@@ -8098,6 +8132,7 @@ async def orchestrate_chat(
                         "interaction_governance": interaction_governance_trace,
                         "persona_containment": persona_containment_trace,
                         "restraint": restraint_trace,
+                        "situated_presence": situated_presence_trace,
                         "retrieval_dispatch": retrieval_dispatch_trace,
                         "memory_hygiene": (
                             memory_hygiene_result.trace
@@ -8251,6 +8286,8 @@ async def orchestrate_chat(
                 persona_containment_trace_data=persona_containment_trace,
                 restraint=restraint,
                 restraint_trace_data=restraint_trace,
+                situated_presence=situated_presence,
+                situated_presence_trace_data=situated_presence_trace,
                 memory_hygiene_trace_data=(
                     memory_hygiene_result.trace
                     if memory_hygiene_result is not None
@@ -8310,6 +8347,7 @@ async def orchestrate_chat(
                 "persona_containment": persona_containment_trace,
                 "result_boundary": result_boundary_trace,
                 "restraint": restraint_trace,
+                "situated_presence": situated_presence_trace,
                 "retrieval_dispatch": retrieval_dispatch_trace,
                 "memory_hygiene": (
                     memory_hygiene_result.trace
@@ -8551,6 +8589,8 @@ async def orchestrate_chat(
                             ),
                             restraint=restraint,
                             restraint_trace_data=restraint_trace,
+                            situated_presence=situated_presence,
+                            situated_presence_trace_data=situated_presence_trace,
                             memory_hygiene_trace_data=(
                                 memory_hygiene_result.trace
                                 if memory_hygiene_result is not None

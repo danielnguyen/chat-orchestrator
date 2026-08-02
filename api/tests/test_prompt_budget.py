@@ -221,6 +221,77 @@ def test_whole_optional_layers_reduce_after_retrieval_layers():
     assert "response_shape" not in omitted
 
 
+def _situated_budget_inputs():
+    return {
+        "situated_presence": {
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "none",
+            "silence_preferred": True,
+            "surface_allows_commentary": False,
+            "response_posture": "silent_or_minimal",
+            "action_implication_allowed": False,
+            "reason_summary": ["surface_public"],
+            "policy_version": "situated-presence.v1",
+        },
+        "situated_presence_trace_data": {
+            "activated": True,
+            "status": "included",
+            "included": True,
+            "runtime_call_status": "included",
+            "schema_version": "situated-presence.v1",
+            "policy_version": "situated-presence.v1",
+            "surface_context": {"visibility": "public", "constraint": "normal"},
+            "commentary_allowed": False,
+            "humor_allowed": False,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "none",
+            "silence_preferred": True,
+            "surface_allows_commentary": False,
+            "response_posture": "silent_or_minimal",
+            "reason_summary": ["surface_public"],
+            "fallback_status": "not_used",
+        },
+    }
+
+
+def test_situated_presence_layer_survives_optional_budget_reduction():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "final question"}],
+        style_guidance="optional style " * 100,
+        world_state={"prompt_content": "optional world " * 100},
+        prompt_budget_contract=_contract(260),
+        **_situated_budget_inputs(),
+    )
+    prompt_text = "\n".join(message["content"] for message in out.messages)
+    assert "Situated presence guidance:" in prompt_text
+    assert "optional style" not in prompt_text
+    assert "optional world" not in prompt_text
+    situated_layer = next(
+        layer
+        for layer in out.trace["prompt_budget"]["per_layer"]
+        if layer["name"] == "situated_presence"
+    )
+    assert situated_layer["after_estimated_tokens"] > 0
+
+
+def test_situated_presence_layer_is_not_silently_dropped_when_budget_is_impossible():
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(
+            profile={"prompt_overlay": ""},
+            retrieval_bundle={
+                "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+            },
+            current_messages=[{"role": "user", "content": "final question"}],
+            prompt_budget_contract=_contract(20),
+            **_situated_budget_inputs(),
+        )
+    assert exc.value.reason == "required_prompt_content_exceeds_budget"
+
+
 @pytest.mark.parametrize("limit", [0, -1, True])
 def test_invalid_model_context_limit_blocks_budgeting(limit):
     with pytest.raises(PromptBudgetError) as exc:

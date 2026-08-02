@@ -2302,3 +2302,201 @@ async def test_confirm_capability_posts_expected_structural_payload():
             },
         )
     ]
+
+
+def _situated_request() -> dict[str, Any]:
+    return {
+        "request_id": "rid:situated",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "telegram",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+        "surface_context": {"visibility": "private", "constraint": "normal"},
+        "interaction_governance": {
+            "interaction_kind": "joke_or_playful",
+            "tension_level": "low",
+            "commentary_allowed": True,
+            "humor_allowed": True,
+            "action_allowed": False,
+            "requires_confirmation": False,
+            "privacy_sensitivity_hint": "normal",
+            "response_posture": "playful",
+            "confidence": 0.9,
+        },
+        "restraint": {
+            "restraint_policy": "answer_normally",
+            "proactive_output_suppressed": True,
+            "personalization_suppressed": True,
+            "brevity_preferred": False,
+            "clarification_preferred": False,
+            "confidence": 0.9,
+        },
+    }
+
+
+def _situated_response(request: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "situated-presence.v1",
+        **{
+            field: request[field]
+            for field in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "runtime_session_id",
+                "runtime_turn_id",
+            )
+        },
+        "result": {
+            "commentary_allowed": True,
+            "humor_allowed": True,
+            "emotional_attunement_allowed": "none",
+            "challenge_allowed": "low",
+            "silence_preferred": False,
+            "surface_allows_commentary": True,
+            "response_posture": "playful",
+            "action_implication_allowed": False,
+            "reason_summary": [
+                "light_commentary_allowed",
+                "proactive_output_suppressed",
+                "personalization_suppressed",
+            ],
+            "policy_version": "situated-presence.v1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_situated_presence_posts_compact_projection_and_accepts_valid_result():
+    client = RuntimeClient("http://runtime.local", None)
+    request = _situated_request()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        calls.append((path, json))
+        return _situated_response(request)
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.evaluate_situated_presence(**request)
+
+    assert response["result"]["humor_allowed"] is True
+    assert calls == [("/v1/runtime/situated-presence/evaluate", request)]
+    assert "current_user_text" not in str(calls)
+    assert "recent_messages" not in str(calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda response: response.update(schema_version="wrong"),
+        lambda response: response.update(owner_id="other"),
+        lambda response: response["result"].update(extra=True),
+        lambda response: response["result"].update(action_implication_allowed=True),
+        lambda response: response["result"].update(commentary_allowed=False),
+        lambda response: response["result"].update(silence_preferred=True),
+        lambda response: response["result"].update(
+            reason_summary=[
+                "personalization_suppressed",
+                "light_commentary_allowed",
+            ]
+        ),
+    ],
+)
+async def test_situated_presence_rejects_malformed_or_loosening_results(mutate):
+    client = RuntimeClient("http://runtime.local", None)
+    request = _situated_request()
+    response = _situated_response(request)
+    mutate(response)
+    calls = 0
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        nonlocal calls
+        calls += 1
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    expected = (
+        "situated_presence_response_context_mismatch"
+        if response.get("owner_id") == "other"
+        else "situated_presence_response_invalid"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        await client.evaluate_situated_presence(**request)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_situated_presence_rejects_non_strict_request_before_transport():
+    client = RuntimeClient("http://runtime.local", None)
+    request = _situated_request()
+    request["interaction_governance"] = {
+        **request["interaction_governance"],
+        "commentary_allowed": 1,
+    }
+    calls = 0
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        nonlocal calls
+        calls += 1
+        return {}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="situated_presence_request_invalid"):
+        await client.evaluate_situated_presence(**request)
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "public_surface",
+        "upstream_commentary_false",
+        "upstream_humor_false",
+        "sensitive_privacy",
+        "clarification_preferred",
+        "tense_context",
+        "high_impact",
+        "low_confidence",
+    ],
+)
+async def test_situated_presence_rejects_authority_loosening_combinations(case):
+    client = RuntimeClient("http://runtime.local", None)
+    request = _situated_request()
+    response = _situated_response(request)
+    if case == "public_surface":
+        request["surface_context"] = {"visibility": "public", "constraint": "normal"}
+        response["result"]["surface_allows_commentary"] = False
+    elif case == "upstream_commentary_false":
+        request["interaction_governance"]["commentary_allowed"] = False
+    elif case == "upstream_humor_false":
+        request["interaction_governance"]["humor_allowed"] = False
+    elif case == "sensitive_privacy":
+        request["interaction_governance"]["privacy_sensitivity_hint"] = "sensitive"
+        response["result"]["commentary_allowed"] = False
+        response["result"]["humor_allowed"] = False
+        response["result"]["emotional_attunement_allowed"] = "brief"
+    elif case == "clarification_preferred":
+        request["restraint"]["clarification_preferred"] = True
+    elif case == "tense_context":
+        request["interaction_governance"]["interaction_kind"] = "tense_debugging"
+        request["interaction_governance"]["tension_level"] = "high"
+    elif case == "high_impact":
+        request["interaction_governance"]["interaction_kind"] = "high_impact_decision"
+    else:
+        request["interaction_governance"]["confidence"] = 0.59
+
+    calls = 0
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        nonlocal calls
+        calls += 1
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="situated_presence_response_invalid"):
+        await client.evaluate_situated_presence(**request)
+    assert calls == 1

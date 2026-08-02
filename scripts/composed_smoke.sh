@@ -7,9 +7,9 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="1a8278278fcabd871f6235bc66acdfe80523c6f4"
-CR_COMMIT="f87a80f6d19cdb4ebcd01e6cc5c42af2a8ee1202"
+CR_COMMIT="92a8600f2cb99ed98d10721d23c8b65f3903a857"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="b8fb14e422bbf5f6fa60fbd1512afc10d0bc34a8"
+CO_COMMIT="f79034e32bfe6081de1af915779bc0cd157a781a"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -1553,6 +1553,124 @@ run_omitted_continuation_scenario() {
   provider_post "/fixture/reset" '{}'
 }
 
+run_situated_presence_case() {
+  local tag="$1" text="$2" expected_answer="$3" category="$4"
+  local active_task="$5" allows_expansion="$6" expected_kind="$7"
+  local expected_commentary="$8" expected_humor="$9" expected_attunement="${10}"
+  local expected_challenge="${11}" expected_posture="${12}" fail_primary="${13:-false}"
+  local owner="owner-situated-$tag" client="client-situated-$tag" surface="surface-situated-$tag"
+  local conversation response request_id trace provider_calls session_id diagnostics thread counts
+
+  conversation="$(create_conversation "$owner" "$client")"
+  queue_provider_answer "$expected_answer" >/dev/null
+  if [ "$fail_primary" = "true" ]; then
+    provider_post "/fixture/fail-next-primary" '{}' >/dev/null
+  fi
+  response="$(co_post "$(jq -nc \
+    --arg owner "$owner" \
+    --arg client "$client" \
+    --arg surface "$surface" \
+    --arg conversation "$conversation" \
+    --arg text "$text" \
+    --arg category "$category" \
+    --argjson active_task "$active_task" \
+    --argjson allows_expansion "$allows_expansion" \
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private",surface_context:{surface_category:$category,active_task_mode:$active_task,allows_expansion:$allows_expansion}}')")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  jq -e --arg answer "$expected_answer" --arg expected_status "$([ "$fail_primary" = true ] && echo degraded || echo ok)" '
+    .answer == $answer and .status == $expected_status and .selected_model != "not_called"
+  ' <<<"$response" >/dev/null
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  jq -e \
+    --arg kind "$expected_kind" \
+    --argjson commentary "$expected_commentary" \
+    --argjson humor "$expected_humor" \
+    --arg attunement "$expected_attunement" \
+    --arg challenge "$expected_challenge" \
+    --arg posture "$expected_posture" '
+      .retrieval.prompt_assembly.interaction_governance.interaction_kind == $kind
+      and .retrieval.prompt_assembly.situated_presence.activated == true
+      and .retrieval.prompt_assembly.situated_presence.runtime_call_status == "included"
+      and .retrieval.prompt_assembly.situated_presence.commentary_allowed == $commentary
+      and .retrieval.prompt_assembly.situated_presence.humor_allowed == $humor
+      and .retrieval.prompt_assembly.situated_presence.emotional_attunement_allowed == $attunement
+      and .retrieval.prompt_assembly.situated_presence.challenge_allowed == $challenge
+      and .retrieval.prompt_assembly.situated_presence.response_posture == $posture
+      and .retrieval.prompt_assembly.situated_presence.action_implication_allowed == false
+      and (.retrieval.prompt_assembly.layers | map(.name) | index("situated_presence"))
+        > (.retrieval.prompt_assembly.layers | map(.name) | index("restraint"))
+      and (.retrieval.prompt_assembly.layers | map(.name) | index("situated_presence"))
+        < (.retrieval.prompt_assembly.layers | map(.name) | index("privacy_context") // 999)
+    ' <<<"$trace" >/dev/null
+  jq -e \
+    --argjson expected_calls "$([ "$fail_primary" = true ] && echo 2 || echo 1)" '
+      ([.calls[] | select(.kind == "chat")] | length) == $expected_calls
+      and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+        | select(.role == "system" and (.content | startswith("Situated presence guidance:")))] | length)
+        == $expected_calls
+      and ([.calls[] | select(.kind == "chat") | .normalized_messages[] | .content]
+        | all(contains("light_commentary_allowed") | not))
+    ' <<<"$provider_calls" >/dev/null
+  if [ "$fail_primary" = "true" ]; then
+    jq -e '
+      [.calls[] | select(.kind == "chat") | .prompt_fingerprint] as $fingerprints
+      | ($fingerprints | length) == 2 and $fingerprints[0] == $fingerprints[1]
+    ' <<<"$provider_calls" >/dev/null
+  fi
+  counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant'), count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")"
+  [ "$counts" = "1|1|2" ]
+  session_id="$(jq -r '.retrieval.prompt_assembly.runtime_session.runtime_session_id // empty' <<<"$trace")"
+  test -n "$session_id"
+  diagnostics="$(fetch_runtime_diagnostics "$session_id")"
+  jq -e '
+    .latest_turn.turn_status == "completed"
+    and ([.events[] | select(.event_type == "situated_presence_evaluated")] | length) == 1
+    and ([.events[] | select(.event_type == "situated_presence_evaluated")
+      | .event_payload_json
+      | has("commentary_allowed") and has("humor_allowed") and has("response_posture")
+        and has("policy_version") and has("reason_summary")]
+      | all(. == true))
+  ' <<<"$diagnostics" >/dev/null
+  case "$(jq -c '.retrieval.prompt_assembly.situated_presence' <<<"$trace")" in
+    *"$text"*)
+      echo "situated presence trace exposed current turn text" >&2
+      exit 1
+      ;;
+  esac
+  thread="$(curl -fsS -X POST "http://127.0.0.1:14371/v1/runtime/threads/resolve" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{request_id:"situated-smoke-final",owner_id:$owner,conversation_id:$conversation}')")"
+  jq -e '.state == "idle" and .revision == 2 and .active_runtime_turn_id == null' <<<"$thread" >/dev/null
+  echo "Situated presence $tag: status=$(jq -r '.status' <<<"$response") request_id=$request_id conversation_id=$conversation governance=$expected_kind commentary=$expected_commentary humor=$expected_humor attunement=$expected_attunement challenge=$expected_challenge posture=$expected_posture provider_calls=$([ "$fail_primary" = true ] && echo 2 || echo 1) situated_events=1 durable_user_messages=1 durable_assistant_messages=1 thread_state=idle thread_revision=2 unintended_actions=0"
+}
+
+run_situated_presence_scenario() {
+  provider_post "/fixture/reset" '{}' >/dev/null
+  run_situated_presence_case playful "lol roast my tiny todo list" \
+    "Tiny list, big ambitions—three tasks and it already has a management layer." \
+    telegram_private false true joke_or_playful true true none low playful false
+  run_situated_presence_case question "What does this function do?" \
+    "It validates the input and returns the normalized result." \
+    desktop_private false true question false false none none direct false
+  run_situated_presence_case tense "I think I broke the server and prod is failing" \
+    "Check the latest deploy, inspect error rates, and roll back if the failure started there." \
+    desktop_private false true tense_debugging false false none medium tactical false
+  run_situated_presence_case emotional "Ugh, this sucks and I'm upset." \
+    "That is rough. Let’s keep the next step small and concrete." \
+    mobile_private false true vent_or_expression false false brief none brief false
+  run_situated_presence_case public "lol roast my tiny todo list" \
+    "Your todo list has three items." \
+    glasses_public_or_semi_public false true joke_or_playful false false none none silent_or_minimal false
+  run_situated_presence_case constrained "lol roast my tiny todo list" \
+    "Your todo list has three items." \
+    notification_preview true false joke_or_playful false false none none silent_or_minimal false
+  run_situated_presence_case fallback "What does this function do?" \
+    "It validates the input and returns the normalized result." \
+    desktop_private false true question false false none none direct true
+  provider_post "/fixture/reset" '{}' >/dev/null
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 
@@ -1603,6 +1721,13 @@ if [ "${OMITTED_CONTINUATION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: omitted-continuation-only"
   run_omitted_continuation_scenario
   echo "Omitted conversation continuation scenario complete: assertions=true"
+  exit 0
+fi
+
+if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: situated-presence-only"
+  run_situated_presence_scenario
+  echo "Situated presence composition scenario complete: assertions=true"
   exit 0
 fi
 
