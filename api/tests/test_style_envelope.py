@@ -1,5 +1,11 @@
+import pytest
 from models import ChatRequest
-from services.style_envelope import build_style_guidance_block, resolve_style_envelope
+from services.situated_presence import derive_situated_surface_context
+from services.style_envelope import (
+    build_style_guidance_block,
+    clamp_style_envelope,
+    resolve_style_envelope,
+)
 
 BANNED_TOKENS = ["R27", "Cluster11", "11B"]
 
@@ -195,3 +201,170 @@ def test_style_trace_keys_do_not_use_banned_identifiers():
     assert keys
     for token in BANNED_TOKENS:
         assert all(token not in key for key in keys)
+
+
+def test_situated_surface_context_is_conservative_and_uses_typed_facts_only():
+    private, _ = derive_situated_surface_context(
+        {"surface_context": {"surface_category": "telegram_private"}}
+    )
+    shared, _ = derive_situated_surface_context(
+        {"surface_context": {"surface_category": "car_voice_possible_passenger"}}
+    )
+    public, _ = derive_situated_surface_context(
+        {"surface_context": {"surface_category": "glasses_public_or_semi_public"}}
+    )
+    preview, _ = derive_situated_surface_context(
+        {"surface_context": {"surface_category": "notification_preview"}}
+    )
+    task, _ = derive_situated_surface_context(
+        {
+            "surface_context": {
+                "surface_category": "desktop_private",
+                "active_task_mode": True,
+            }
+        }
+    )
+    no_expansion, _ = derive_situated_surface_context(
+        {
+            "surface_context": {
+                "surface_category": "voice_private",
+                "spoken_output": True,
+                "allows_expansion": False,
+            }
+        }
+    )
+    unknown, trace = derive_situated_surface_context(
+        {"surface": "telegram", "client_id": "telegram"}
+    )
+
+    assert private == {"visibility": "private", "constraint": "normal"}
+    assert shared == {"visibility": "shared", "constraint": "normal"}
+    assert public == {"visibility": "public", "constraint": "normal"}
+    assert preview == {"visibility": "public", "constraint": "constrained"}
+    assert task == {"visibility": "private", "constraint": "constrained"}
+    assert no_expansion == {"visibility": "private", "constraint": "constrained"}
+    assert unknown == {"visibility": "unknown", "constraint": "unknown"}
+    assert trace["source_fields"] == []
+
+
+def test_spoken_output_alone_does_not_make_private_surface_constrained():
+    projection, _ = derive_situated_surface_context(
+        {
+            "surface_context": {
+                "surface_category": "voice_private",
+                "spoken_output": True,
+            }
+        }
+    )
+    assert projection == {"visibility": "private", "constraint": "normal"}
+
+
+@pytest.mark.parametrize(
+    ("resolved", "permission", "expected"),
+    [
+        ("soft", "medium", "soft"),
+        ("balanced", "medium", "balanced"),
+        ("direct", "medium", "direct"),
+        ("soft", "low", "soft"),
+        ("direct", "low", "balanced"),
+        ("balanced", "none", "soft"),
+    ],
+)
+def test_situated_challenge_clamp_never_raises_resolved_style(
+    resolved,
+    permission,
+    expected,
+):
+    envelope, trace = resolve_style_envelope(
+        {"surface_context": {"style_envelope": {"challenge_sharpness": resolved}}},
+        {},
+    )
+    clamped, _ = clamp_style_envelope(
+        envelope,
+        trace,
+        {
+            "humor_allowed": True,
+            "challenge_allowed": permission,
+            "response_posture": "direct",
+        },
+        {"status": "included"},
+    )
+    assert clamped.challenge_sharpness == expected
+
+
+@pytest.mark.parametrize(
+    ("resolved", "humor_allowed", "expected"),
+    [
+        ("none", True, "none"),
+        ("low", True, "low"),
+        ("medium", True, "low"),
+        ("none", False, "none"),
+        ("low", False, "none"),
+        ("medium", False, "none"),
+    ],
+)
+def test_situated_playfulness_clamp_never_raises_resolved_style(
+    resolved,
+    humor_allowed,
+    expected,
+):
+    envelope, trace = resolve_style_envelope(
+        {"surface_context": {"style_envelope": {"playfulness_budget": resolved}}},
+        {},
+    )
+    clamped, _ = clamp_style_envelope(
+        envelope,
+        trace,
+        {
+            "humor_allowed": humor_allowed,
+            "challenge_allowed": "medium",
+            "response_posture": "playful",
+        },
+        {"status": "included"},
+    )
+    assert clamped.playfulness_budget == expected
+
+
+@pytest.mark.parametrize("posture", ["tactical", "direct"])
+def test_situated_posture_does_not_raise_directness_or_other_resolved_style(posture):
+    envelope, trace = resolve_style_envelope(
+        {
+            "surface_context": {
+                "style_envelope": {
+                    "directness": "low",
+                    "warmth": "high",
+                    "technical_density": "high",
+                    "playfulness_budget": "medium",
+                    "challenge_sharpness": "soft",
+                }
+            }
+        },
+        {},
+    )
+    clamped, clamped_trace = clamp_style_envelope(
+        envelope,
+        trace,
+        {
+            "humor_allowed": False,
+            "challenge_allowed": "medium",
+            "response_posture": posture,
+        },
+        {"status": "included", "fallback_status": "not_used"},
+    )
+
+    assert clamped.playfulness_budget == "none"
+    assert clamped.challenge_sharpness == "soft"
+    assert clamped.directness == "low"
+    if posture == "tactical":
+        assert clamped.sentence_length == "short"
+        assert clamped.analogy_density == "none"
+    assert clamped.warmth == "high"
+    assert clamped.technical_density == "high"
+    assert clamped_trace["situated_presence_clamp"]["before"] == envelope.model_dump()
+    assert clamped_trace["situated_presence_clamp"]["after"] == clamped.model_dump()
+    assert "directness" not in clamped_trace["situated_presence_clamp"][
+        "changed_fields"
+    ]
+    assert "challenge_sharpness" not in clamped_trace["situated_presence_clamp"][
+        "changed_fields"
+    ]

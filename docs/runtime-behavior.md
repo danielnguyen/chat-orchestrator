@@ -754,6 +754,50 @@ Production deployment and deployed-client proof remain separate validation work.
 
 ## Integration boundaries
 
+## Situated presence during response assembly
+
+When Cognitive Runtime, interaction governance, and restraint are all enabled,
+Chat Orchestrator evaluates situated presence once for the admitted current turn.
+It derives visibility and constraint only from the request's typed surface context,
+sends compact governance and restraint projections without message text, and
+strictly validates the complete deterministic `situated-presence.v1` result against
+the request projections, including branch gates, posture, confidence, and ordered
+reasons. Private desktop, mobile, Telegram, and voice categories may be normal.
+Shared, public, preview, active-task, no-expansion, missing, malformed, and unknown
+context is treated conservatively. Spoken output alone is not a constraint.
+
+The result is applied after profile and request style resolution. It monotonically
+caps playfulness and challenge without raising either value, and preserves resolved
+directness, warmth, and technical density. Tactical, brief, and minimal postures may
+shorten sentences or remove analogies as suppression-oriented constraints. A
+mandatory `Situated presence guidance:` prompt layer follows restraint and precedes
+privacy guidance. That layer survives optional prompt-budget reductions and evidence
+prompt rebuilds. If mandatory prompt content cannot fit, the existing bounded
+prompt-budget failure is used instead of dropping the policy.
+
+The provider remains responsible for natural wording. Allowed playfulness is
+optional and current-turn-grounded, and brief attunement permits only a generic
+steadying acknowledgment. Tactical, humorless, minimal, and silence-preferred
+results remain response-shaping constraints rather than canned responses. No
+final-answer classifier, deterministic rewrite, joke, sympathy phrase, or second
+provider call is added. Provider fallback reuses the identical assembled messages
+and does not reevaluate situated presence.
+
+If the mandatory situated-presence inputs or runtime response are unavailable or
+malformed, CO uses a local suppression-only envelope: no commentary, humor,
+attunement, or optional challenge, with a minimal posture. This fallback cannot
+grant a positive permission. Runtime-disabled requests, or requests without both
+upstream policies enabled, retain existing behavior and make no situated-presence
+call. Existing evidence, privacy, capability, confirmation, action, claim, and
+dependency-owned forced response content remains authoritative.
+
+Trace evidence records activation, conservative surface classification, bounded
+gates and posture, policy versions, fallback status, and pre/post style clamp
+fields. It contains no user text or provider response. Transport reuse does not by
+itself prove semantic compliance for arbitrary provider prose, and this slice does
+not add persistent presence state, a complete timing policy, tuning, watches, or
+anti-annoyance scheduling.
+
 ### Basic Memory Store
 
 Basic Memory Store owns:

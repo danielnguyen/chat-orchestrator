@@ -130,6 +130,64 @@ def resolve_style_envelope(
     return resolved, trace
 
 
+def clamp_style_envelope(
+    envelope: StyleEnvelope,
+    trace: dict[str, Any],
+    situated_presence: dict[str, Any] | None,
+    situated_trace: dict[str, Any] | None,
+) -> tuple[StyleEnvelope, dict[str, Any]]:
+    if not isinstance(situated_presence, dict):
+        return envelope, trace
+
+    before = envelope.model_dump()
+    updates: dict[str, Any] = {}
+    humor_allowed = situated_presence.get("humor_allowed") is True
+    playfulness = envelope.playfulness_budget
+    if not humor_allowed:
+        updates["playfulness_budget"] = "none"
+    elif playfulness == "medium":
+        updates["playfulness_budget"] = "low"
+
+    challenge = situated_presence.get("challenge_allowed")
+    if challenge == "none":
+        updates["challenge_sharpness"] = "soft"
+    elif challenge == "low" and envelope.challenge_sharpness == "direct":
+        updates["challenge_sharpness"] = "balanced"
+
+    posture = situated_presence.get("response_posture")
+    if posture == "tactical":
+        updates.update(
+            {
+                "sentence_length": "short",
+                "analogy_density": "none",
+                "playfulness_budget": "none",
+            }
+        )
+    elif posture in {"brief", "silent_or_minimal"}:
+        updates.update({"sentence_length": "short", "analogy_density": "none"})
+        if not humor_allowed:
+            updates["playfulness_budget"] = "none"
+
+    resolved = envelope.model_copy(update=updates)
+    after = resolved.model_dump()
+    trace_out = dict(trace)
+    trace_out["resolved_envelope"] = after
+    trace_out["included"] = True
+    trace_out["status"] = "included"
+    trace_out["omission_reason"] = None
+    trace_out["situated_presence_clamp"] = {
+        "applied": True,
+        "policy_status": (situated_trace or {}).get("status"),
+        "fallback_status": (situated_trace or {}).get("fallback_status"),
+        "before": before,
+        "after": after,
+        "changed_fields": sorted(
+            field for field, value in after.items() if before.get(field) != value
+        ),
+    }
+    return resolved, trace_out
+
+
 def build_style_guidance_block(envelope: StyleEnvelope, trace: dict[str, Any]) -> str:
     if not trace.get("included"):
         return ""

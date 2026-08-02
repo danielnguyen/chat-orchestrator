@@ -316,6 +316,49 @@ review process.
 
 ## Artifact composed smoke check
 
+## Situated presence checks
+
+Run the focused client, surface/style, prompt, budget, orchestration, replay, and
+fallback coverage with:
+
+```bash
+cd api
+./.venv/bin/python -m pytest -q tests/test_runtime_client.py
+./.venv/bin/python -m pytest -q tests/test_style_envelope.py
+./.venv/bin/python -m pytest -q tests/test_prompt_assembly.py
+./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_prompt_budget_smoke.py
+./.venv/bin/python -m pytest -q tests/test_orchestrate_flow.py
+./.venv/bin/python -m pytest -q tests/test_orchestration_replay.py
+./.venv/bin/python -m pytest -q tests/test_offline_fallback.py
+```
+
+The tests cover conservative surface derivation, exact compact runtime payloads,
+strict branch, posture, gate, confidence, and reason coherence validation;
+suppression-only fallback; monotonic post-profile style clamping that preserves
+stricter resolved values; mandatory prompt ordering and budget survival; evidence
+rebuild; and identical primary/fallback messages with one policy call. The persisted
+replay corpus remains unchanged and is run twice to prove deterministic output.
+
+Run only the actual-service situated-presence proof with:
+
+```bash
+SITUATED_PRESENCE_ONLY=1 COMPOSED_RESTRAINT_ENABLED=true make composed-smoke
+```
+
+The proof uses Cognitive Runtime at or after
+`92a8600f2cb99ed98d10721d23c8b65f3903a857` and Chat Orchestrator at or after
+`f79034e32bfe6081de1af915779bc0cd157a781a`. It verifies private playful,
+ordinary-question, tense tactical, generic steadying, public/constrained, and
+provider-fallback cases against actual services. Assertions include governance,
+restraint, and situated policy events; prompt-layer delivery; bounded style;
+identical fallback fingerprints; durable trace and message counts; final idle
+thread revision; and no unintended action authority.
+
+This validation proves delivery and compliant fixture outcomes, not universal
+semantic detection of arbitrary provider prose. It adds no concurrent runtime
+policy calls, persistent presence state, complete timing decision, tunable behavior,
+watch delivery, or proactive silence scheduling.
+
 Run the file-ingestion and retrieval topology with:
 
 ```bash
