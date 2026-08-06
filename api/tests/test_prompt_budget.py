@@ -1,5 +1,5 @@
 import pytest
-from services.prompt_assembly import assemble_prompt
+from services.prompt_assembly import EVIDENCE_ADVISORY_GUIDANCE, assemble_prompt
 from services.prompt_budget import (
     ESTIMATOR_ID,
     PromptBudgetContract,
@@ -288,6 +288,45 @@ def test_situated_presence_layer_is_not_silently_dropped_when_budget_is_impossib
             current_messages=[{"role": "user", "content": "final question"}],
             prompt_budget_contract=_contract(20),
             **_situated_budget_inputs(),
+        )
+    assert exc.value.reason == "required_prompt_content_exceeds_budget"
+
+
+def test_advisory_guidance_survives_optional_reduction_and_remains_mandatory():
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={
+            "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+        },
+        current_messages=[{"role": "user", "content": "Will this part fit?"}],
+        style_guidance="optional style " * 100,
+        world_state={"prompt_content": "optional world " * 100},
+        evidence_advisory_guidance=True,
+        prompt_budget_contract=_contract(300),
+    )
+
+    assert EVIDENCE_ADVISORY_GUIDANCE in [
+        message["content"] for message in out.messages
+    ]
+    assert "optional style" not in "\n".join(
+        message["content"] for message in out.messages
+    )
+    advisory_layer = next(
+        layer
+        for layer in out.trace["prompt_budget"]["per_layer"]
+        if layer["name"] == "evidence_advisory_guidance"
+    )
+    assert advisory_layer["after_estimated_tokens"] > 0
+
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(
+            profile={"prompt_overlay": ""},
+            retrieval_bundle={
+                "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+            },
+            current_messages=[{"role": "user", "content": "Will this part fit?"}],
+            evidence_advisory_guidance=True,
+            prompt_budget_contract=_contract(20),
         )
     assert exc.value.reason == "required_prompt_content_exceeds_budget"
 

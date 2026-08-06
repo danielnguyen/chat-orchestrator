@@ -1,7 +1,12 @@
+import pytest
 from services.assistant_handoff import build_assistant_handoff
 from services.companion_presentation import build_companion_presentation
 from services.memory_recall_composition import compose_memory_recall_context
-from services.prompt_assembly import EVIDENCE_RESPONSE_CONTRACT, assemble_prompt
+from services.prompt_assembly import (
+    EVIDENCE_ADVISORY_GUIDANCE,
+    EVIDENCE_RESPONSE_CONTRACT,
+    assemble_prompt,
+)
 
 
 def _build_handoff(**overrides):
@@ -348,6 +353,52 @@ def test_governed_evidence_contract_is_required_before_external_evidence():
         },
     }
     assert evidence_text not in str(contract_layer)
+
+
+def test_advisory_guidance_is_mandatory_natural_language_and_mutually_exclusive():
+    out = assemble_prompt(
+        profile={"prompt_overlay": "profile text"},
+        retrieval_bundle={
+            "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+        },
+        current_messages=[{"role": "user", "content": "Will this part fit?"}],
+        evidence_advisory_guidance=True,
+    )
+
+    assert EVIDENCE_ADVISORY_GUIDANCE in [
+        message["content"] for message in out.messages
+    ]
+    assert EVIDENCE_RESPONSE_CONTRACT not in [
+        message["content"] for message in out.messages
+    ]
+    assert "evidence_advisory_guidance" in out.trace["included_layers"]
+    assert "evidence_response_contract" not in out.trace["included_layers"]
+    layer = next(
+        layer
+        for layer in out.trace["layers"]
+        if layer["name"] == "evidence_advisory_guidance"
+    )
+    assert layer == {
+        "name": "evidence_advisory_guidance",
+        "included": True,
+        "message_count": 1,
+        "metadata": {
+            "contract_active": True,
+            "schema_version": "evidence-advisory-guidance.v1",
+        },
+    }
+    assert "Will this part fit?" not in str(layer)
+
+    with pytest.raises(ValueError, match="conflicting_evidence_provider_contracts"):
+        assemble_prompt(
+            profile={"prompt_overlay": ""},
+            retrieval_bundle={
+                "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+            },
+            current_messages=[{"role": "user", "content": "question"}],
+            evidence_response_contract=True,
+            evidence_advisory_guidance=True,
+        )
 
 
 def test_assemble_prompt_includes_surface_presence_in_top_level_trace_only():

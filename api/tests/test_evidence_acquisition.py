@@ -32,6 +32,7 @@ from services.evidence_acquisition import (
     _manifest_id,
     _resolve_declared_scope,
     _source_summaries,
+    advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_current_acquisition_premise,
@@ -6137,6 +6138,70 @@ async def test_next_step_selection_associates_result_and_blocks_provider():
         for evaluation in state.sufficiency.evaluated_requirements
     ]
     assert len(state.next_step_history) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sufficiency_status", ["insufficient", "unknown"])
+async def test_exact_targeted_advisory_result_clears_only_generic_withholding_barrier(
+    sufficiency_status,
+):
+    state = _next_step_test_state(sufficiency_status=sufficiency_status)
+
+    class Runtime:
+        async def select_evidence_next_step(self, **kwargs):
+            return {
+                **SCOPE,
+                "result": _next_step_result_payload(
+                    state,
+                    selected_next_step="withhold_unsupported_conclusion",
+                    conclusion_disposition="requested_conclusion_withheld",
+                    provider_disposition="allowed",
+                ),
+            }
+
+    result = await select_evidence_next_step(
+        state=state,
+        runtime=Runtime(),
+        **SCOPE,
+    )
+
+    assert result is not None
+    assert result.selected_next_step == "withhold_unsupported_conclusion"
+    assert result.conclusion_disposition == "requested_conclusion_withheld"
+    assert result.provider_disposition == "allowed"
+    assert result.reason_codes == ["unsupported_conclusion_withheld"]
+    assert state.forced_answer is None
+    assert advisory_provider_allowed(state) is True
+    assert provider_allowed(state) is True
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"task_shape": "bounded_exhaustive_review"},
+        {"task_shape": "absence_or_coverage_check"},
+        {"task_shape": "contradiction_review"},
+        {"task_shape": "historical_reconstruction"},
+        {"task_shape": "recommendation_or_decision_support"},
+        {"selected_next_step": "ask_narrow_clarification"},
+        {"selected_next_step": "perform_additional_acquisition"},
+        {"selected_next_step": "disclose_unexamined_scope"},
+        {"reason_codes": ["unexamined_material_scope"]},
+        {"unexpected_policy_authority": True},
+    ],
+)
+def test_strict_next_step_model_rejects_broader_advisory_authority(updates):
+    state = _next_step_test_state()
+    payload = _next_step_result_payload(
+        state,
+        selected_next_step="withhold_unsupported_conclusion",
+        conclusion_disposition="requested_conclusion_withheld",
+        provider_disposition="allowed",
+    )
+    payload.update(updates)
+
+    with pytest.raises(ValidationError):
+        NextStepResult.model_validate(payload)
 
 
 @pytest.mark.parametrize(

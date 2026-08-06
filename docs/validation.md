@@ -73,6 +73,24 @@ cd api
 ./.venv/bin/python -m pytest -q tests/test_prompt_budget.py tests/test_prompt_budget_smoke.py
 ```
 
+Run the evidence admission, local contract, advisory prompt, prompt-budget, and
+orchestration regressions together with:
+
+```bash
+cd api
+./.venv/bin/python -m pytest -q \
+  tests/test_evidence_acquisition.py \
+  tests/test_prompt_assembly.py \
+  tests/test_prompt_budget.py \
+  tests/test_orchestrate_flow.py
+```
+
+These tests prove CR shape admission without client opt-in, zero DSA operations
+for not-applicable turns, strict local advisory-result validation, mutually
+exclusive grounded and advisory prompt contracts, mandatory advisory-layer
+budget survival, fixed wrapping and persistence, fallback prompt parity, and no
+advisory tools, actions, claims, callbacks, or supported sources.
+
 These suites also cover omitted-conversation acquisition and enforcement:
 zero, eight, and nine-row Basic Memory Store pages; cursor-independent
 completeness; all five Cognitive Runtime outcomes; nullable no-selection
@@ -134,9 +152,10 @@ connector; it does not produce DSA envelopes, plans, sufficiency decisions,
 manifests, traces, or policy responses. Service authentication and normal
 owner/conversation scope remain enabled.
 
-The evidence topology requires the merged immediate-history foundations at or after
-Chat Orchestrator `19dfdd9b58fc7ce87152c0009143d23caea03b03`, Cognitive Runtime
-`2a63ca3c32010fe8dad727d62c2e6a7475cbb98c`, Basic Memory Store
+The evidence topology requires Chat Orchestrator current main at or after
+`a0375065bbf764758192b6f67deac77c0ec1eb70`, the Cognitive Runtime verification
+admission and advisory authority at
+`0c3954df95b2d4d958e14acc7011a11cf445356a`, Basic Memory Store
 `1a8278278fcabd871f6235bc66acdfe80523c6f4`, and Data Source Aggregator
 `e23f582e4aac32a12c7ad3c71278fc21e5697ea4`. The disposable DSA configuration
 contains operator-owned material scope references for selected sources; those
@@ -158,6 +177,24 @@ acquisition history, privacy suppression, isolation, and compound new verificati
 Positive records are created through the normal CO and BMS lifecycle. SQL reads are
 used only to confirm durability; the two fail-closed history cases corrupt an
 already-valid retained trace after that lifecycle has completed.
+
+Run only the server-owned admission and advisory composition proof with:
+
+```bash
+EVIDENCE_ADVISORY_ONLY=1 make composed-smoke
+```
+
+This mode pins Cognitive Runtime to
+`0c3954df95b2d4d958e14acc7011a11cf445356a` and uses actual CO, CR, BMS, DSA,
+PostgreSQL, Qdrant, provider, and source-fixture services. It proves an ordinary
+not-applicable request makes one shape call and zero DSA calls; a
+verification-dependent request enters acquisition without client opt-in and
+returns a persisted, source-free advisory wrapper with zero tools, actions, or
+claims; high-impact governance remains provider-blocked; primary failure and
+fallback success share exact messages and fingerprints; and the established
+grounded structured-evidence scenario remains unchanged. The pull-request
+workflow runs this mode before the complete composed regression and records the
+exact checked-out PR head.
 
 Two focused final selectors are also available:
 

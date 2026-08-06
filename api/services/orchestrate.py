@@ -63,6 +63,7 @@ from services.companion_presentation import build_companion_presentation
 from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     EvidenceAcquisitionState,
+    advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
     build_manifest_trace,
@@ -75,6 +76,7 @@ from services.evidence_acquisition import (
     execute_exact_fetches,
     execute_hybrid_comparison,
     governed_evidence_claim_anchor,
+    grounded_provider_allowed,
     ineligible_exact_evidence_state,
     promote_exact_fetch_proposal,
     provider_allowed,
@@ -146,6 +148,16 @@ _RUNTIME_ADMISSION_UNAVAILABLE = (
 _MESSAGE_PERSISTENCE_UNAVAILABLE = (
     "I couldn’t durably save that message, so I stopped before generating a response. "
     "Please try again."
+)
+_ADVISORY_EMPTY_BODY = (
+    "The next useful step is to compare the exact identifier, version, or "
+    "authoritative implementation record that controls the requested conclusion."
+)
+_ADVISORY_OPENING = (
+    "I couldn’t verify the requested conclusion from the available evidence."
+)
+_ADVISORY_CLOSING = (
+    "Treat this as a working direction, not a confirmed result."
 )
 _CONTINUATION_DEPENDENCY_UNAVAILABLE = (
     "I couldn’t safely determine which conversation to continue. "
@@ -4130,6 +4142,7 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         },
         "prompt_budget": prompt_budget,
         "claim_capture": trace.get("claim_capture", {}),
+        "evidence_provider_mode": trace.get("evidence_provider_mode", {}),
     }
     if isinstance(trace.get("evidence_acquisition"), dict):
         summary["evidence_acquisition"] = trace["evidence_acquisition"]
@@ -4156,6 +4169,15 @@ def _prompt_fingerprint(messages: list[dict[str, str]]) -> dict[str, Any]:
         "message_count": len(normalized),
         "role_sequence": [item["role"] for item in normalized],
     }
+
+
+def _render_advisory_answer(provider_body: str) -> str:
+    body = provider_body.strip() or _ADVISORY_EMPTY_BODY
+    return (
+        f"{_ADVISORY_OPENING}\n\n"
+        f"Unverified guidance:\n{body}\n\n"
+        f"{_ADVISORY_CLOSING}"
+    )
 
 
 def _public_answer_sources(sources: Any) -> list[dict[str, Any]]:
@@ -4388,10 +4410,18 @@ def _build_dsa_trace_base(
     external_context_config: dict[str, Any],
     allowed_sensitivity: str,
     max_results: int | None,
+    activation_source: str = "not_requested",
 ) -> dict[str, Any]:
+    if activation_source not in {
+        "client_request",
+        "evidence_policy",
+        "not_requested",
+    }:
+        activation_source = "not_requested"
     return {
         "capability_enabled": capability_enabled,
         "enabled": request_enabled,
+        "activation_source": activation_source,
         "called": False,
         "requested_source_ids": _sanitize_trace_string_list(
             external_context_config.get("source_ids"),
@@ -4578,6 +4608,7 @@ async def _resolve_external_context(
     response_validator: Any | None = None,
     preserve_available_context: bool = False,
     preserve_source_association: bool = False,
+    activation_source: str = "not_requested",
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     external_context_config = _normalize_external_context_config(external_context)
     allowed_sensitivity = external_context_config.get("allowed_sensitivity", "medium")
@@ -4588,6 +4619,7 @@ async def _resolve_external_context(
         external_context_config=external_context_config,
         allowed_sensitivity=allowed_sensitivity,
         max_results=max_results,
+        activation_source=activation_source,
     )
     if not dsa_enabled:
         return None, {
@@ -7050,6 +7082,11 @@ async def orchestrate_chat(
             isinstance(external_context_request, dict)
             and external_context_request.get("enabled") is True
         )
+        external_context_activation_source = (
+            "client_request"
+            if external_context_enabled
+            else "evidence_policy"
+        )
         normalized_external_config = _normalize_external_context_config(
             external_context_request
             if isinstance(external_context_request, dict)
@@ -7294,10 +7331,13 @@ async def orchestrate_chat(
             and dsa_enabled
             and dsa is not None
             and runtime is not None
-            and external_context_enabled
             and not local_only
+            and effective_payload.get("response_mode", "normal") == "normal"
+            and pending_continuation is None
+            and _restraint_suppression_reason(restraint) is None
             and runtime_session_trace.get("runtime_session_id")
             and turn_state_trace.get("runtime_turn_id")
+            and interaction_governance_trace.get("included") is True
         )
         if (
             history_followup_enabled
@@ -7621,10 +7661,11 @@ async def orchestrate_chat(
         governed_evidence_eligible = bool(
             evidence_acquisition_enabled
             and dsa_enabled
-            and external_context_enabled
             and not local_only
             and effective_payload.get("response_mode", "normal") == "normal"
             and pending_continuation is None
+            and suppression_reason is None
+            and dependency_failure_reason is None
             and runtime is not None
             and dsa is not None
             and isinstance(runtime_session_id, str)
@@ -7647,6 +7688,7 @@ async def orchestrate_chat(
                         "medium",
                     ),
                     max_results=normalized_external_config.get("max_results"),
+                    activation_source=external_context_activation_source,
                 ),
                 "status": "deferred_for_evidence_governance",
                 "reason": "evidence_policy_pending",
@@ -7663,6 +7705,11 @@ async def orchestrate_chat(
                 ),
                 external_calls_allowed=not local_only,
                 query=last_user_text,
+                activation_source=(
+                    "client_request"
+                    if external_context_enabled
+                    else "not_requested"
+                ),
             )
         companion_overlays, companion_trace = await _resolve_companion_policy(
             runtime=runtime,
@@ -7855,6 +7902,11 @@ async def orchestrate_chat(
                     external_context=external_config,
                     external_calls_allowed=not local_only,
                     query=last_user_text,
+                    activation_source=(
+                        "client_request"
+                        if external_context_enabled
+                        else "not_requested"
+                    ),
                 )
             else:
                 evidence_acquisition = await begin_evidence_acquisition(
@@ -7870,10 +7922,15 @@ async def orchestrate_chat(
                     interaction_kind=interaction_governance["interaction_kind"],
                     external_context=external_config,
                 )
-                if (
-                    evidence_acquisition.follow_existing_path
-                    or evidence_acquisition.supported_governed_path
-                ):
+                if evidence_acquisition.follow_existing_path:
+                    external_context_pack = None
+                    dsa_trace = {
+                        **dsa_trace,
+                        "called": False,
+                        "status": "not_called",
+                        "reason": evidence_acquisition.status,
+                    }
+                elif evidence_acquisition.supported_governed_path:
                     if evidence_acquisition.supported_exact_path:
                         external_context_pack, dsa_trace = await execute_exact_fetches(
                             state=evidence_acquisition,
@@ -7895,7 +7952,7 @@ async def orchestrate_chat(
                             await _resolve_external_context(
                                 dsa=dsa,
                                 dsa_enabled=dsa_enabled,
-                                external_context_enabled=external_context_enabled,
+                                external_context_enabled=True,
                                 external_context=exhaustive_external_config,
                                 external_calls_allowed=not local_only,
                                 query=governed_plan.question_anchor,
@@ -7913,6 +7970,9 @@ async def orchestrate_chat(
                                     )
                                 ),
                                 preserve_available_context=True,
+                                activation_source=(
+                                    external_context_activation_source
+                                ),
                             )
                         )
                         external_context_pack, dsa_trace = (
@@ -7940,7 +8000,7 @@ async def orchestrate_chat(
                             await _resolve_external_context(
                                 dsa=dsa,
                                 dsa_enabled=dsa_enabled,
-                                external_context_enabled=external_context_enabled,
+                                external_context_enabled=True,
                                 external_context=hybrid_external_config,
                                 external_calls_allowed=not local_only,
                                 query=governed_plan.question_anchor,
@@ -7956,6 +8016,9 @@ async def orchestrate_chat(
                                     )
                                 ),
                                 preserve_available_context=True,
+                                activation_source=(
+                                    external_context_activation_source
+                                ),
                             )
                         )
                         if external_context_pack is not None:
@@ -7994,7 +8057,7 @@ async def orchestrate_chat(
                         external_context_pack, dsa_trace = await _resolve_external_context(
                             dsa=dsa,
                             dsa_enabled=dsa_enabled,
-                            external_context_enabled=external_context_enabled,
+                            external_context_enabled=True,
                             external_context=targeted_external_config,
                             external_calls_allowed=not local_only,
                             query=acquisition_query,
@@ -8013,6 +8076,9 @@ async def orchestrate_chat(
                             ),
                             preserve_source_association=(
                                 governed_plan is not None
+                            ),
+                            activation_source=(
+                                external_context_activation_source
                             ),
                         )
                 else:
@@ -8739,6 +8805,151 @@ async def orchestrate_chat(
                             )
                         ),
                     )
+            if advisory_provider_allowed(evidence_acquisition):
+                capability_descriptors = []
+                capability_exposure_trace = {
+                    "schema_version": "capability-exposure.v1",
+                    "status": "not_requested",
+                    "reason": "evidence_advisory_response",
+                    "descriptor_count": 0,
+                    "descriptor_fingerprint": None,
+                    "exposed_capability_ids": [],
+                    "blocked_capability_ids": [],
+                    "blocked_reasons": {},
+                }
+                try:
+                    prompt = assemble_prompt(
+                        profile=profile,
+                        retrieval_bundle=provider_retrieval_bundle,
+                        current_messages=effective_payload["messages"],
+                        handoff=handoff,
+                        presentation=presentation,
+                        style_guidance=style_guidance,
+                        style_trace=style_trace,
+                        response_shape_guidance=response_shape_guidance,
+                        response_shape_trace=response_shape_trace,
+                        surface_presence_trace=surface_presence_trace,
+                        companion_overlays=companion_overlays,
+                        companion_trace=companion_trace,
+                        interaction_governance=interaction_governance,
+                        interaction_governance_trace_data=(
+                            interaction_governance_trace
+                        ),
+                        persona_containment=persona_containment,
+                        persona_containment_trace_data=(
+                            persona_containment_trace
+                        ),
+                        restraint=restraint,
+                        restraint_trace_data=restraint_trace,
+                        situated_presence=situated_presence,
+                        situated_presence_trace_data=situated_presence_trace,
+                        memory_hygiene_trace_data=(
+                            memory_hygiene_result.trace
+                            if memory_hygiene_result is not None
+                            else disabled_memory_hygiene_trace(retrieval_bundle)
+                        ),
+                        privacy_context=privacy_context,
+                        privacy_context_trace_data=privacy_context_trace,
+                        runtime_identity=runtime_identity,
+                        runtime_identity_trace=runtime_identity_trace,
+                        world_state=world_state,
+                        world_state_trace=world_state_trace,
+                        relationship_context=relationship_context,
+                        relationship_context_trace=relationship_context_trace,
+                        runtime_overlay=runtime_overlay,
+                        runtime_trace=runtime_trace,
+                        interrupt_trace=interrupt_trace,
+                        external_context_pack=None,
+                        evidence_advisory_guidance=True,
+                        dsa_trace=dsa_trace,
+                        memory_recall_messages=[],
+                        memory_recall_trace={
+                            "status": "not_requested",
+                            "reason": "evidence_advisory_response",
+                        },
+                        prompt_budget_contract=PromptBudgetContract(
+                            attempts=provider_attempt_plan,
+                            output_token_reserve=prompt_output_token_reserve,
+                            context_safety_margin=prompt_context_safety_margin,
+                            profile_prompt_budget=(
+                                profile.get("prompt_budget")
+                                if isinstance(profile, dict)
+                                else None
+                            ),
+                        ),
+                    )
+                    _preserve_interaction_governance_trace_inputs(
+                        prompt.trace,
+                        interaction_governance_trace,
+                    )
+                except PromptBudgetError as budget_error:
+                    evidence_acquisition.next_step = None
+                    evidence_acquisition.next_step_failure = "dependency_failure"
+                    evidence_acquisition.status = "advisory_prompt_dependency_failed"
+                    evidence_acquisition.forced_answer = NEXT_STEP_DEPENDENCY_ANSWER
+                    prompt = PromptAssembly(
+                        messages=[],
+                        trace={
+                            "prompt_budget": budget_error.trace,
+                            "truncation": {
+                                "applied": bool(
+                                    budget_error.trace.get(
+                                        "omission_or_truncation_occurred"
+                                    )
+                                ),
+                                "reason": budget_error.trace.get(
+                                    "failure_reason"
+                                ),
+                            },
+                            "privacy_context": privacy_context_trace,
+                            "runtime": runtime_trace,
+                            "dsa": dsa_trace,
+                            "message_count": 0,
+                            "evidence_provider_mode": {
+                                "mode": "blocked",
+                                "advisory_rebuild_count": 1,
+                                "reason": "prompt_budget_failure",
+                            },
+                        },
+                    )
+                messages = prompt.messages
+                prompt.trace["capability_registry"] = capability_registry_trace
+                prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
+                prompt.trace["result_boundary"] = result_boundary_trace
+                _apply_post_budget_survivor_trace(
+                    result_boundary_trace=result_boundary_trace,
+                    retrieval_bundle=retrieval_bundle,
+                    prompt_trace=prompt.trace,
+                )
+                prompt_fingerprint = _prompt_fingerprint(messages)
+                prompt.trace["provider_prompt"] = {
+                    **prompt_fingerprint,
+                    "rebuilt_between_attempts": True,
+                }
+                prompt.trace.setdefault(
+                    "evidence_provider_mode",
+                    {
+                        "mode": "advisory",
+                        "advisory_rebuild_count": 1,
+                        "reason": "runtime_policy_permission",
+                    },
+                )
+                prompt.trace["capabilities"] = {
+                    "exposure": capability_exposure_trace,
+                    "validation": {
+                        "validation_status": "not_requested",
+                        "reason_code": "evidence_advisory_response",
+                    },
+                    "action_summary": _action_summary_empty_trace(),
+                    "follow_up": _capability_follow_up_empty_trace(),
+                    "fallback": _capability_fallback_trace(
+                        descriptor_fingerprint_value=None
+                    ),
+                    "dispatch_completed": False,
+                    "executor_call_count": 0,
+                    "provider_call_count": 0,
+                }
+                retained_external_refs = set()
             evidence_manifest = build_manifest_trace(
                 state=evidence_acquisition,
                 context_pack=external_context_pack,
@@ -8775,30 +8986,63 @@ async def orchestrate_chat(
                 or compound_governed_acquisition_established
             )
         )
-        governed_evidence_provider_call = bool(
+        grounded_evidence_provider_call = bool(
             evidence_provider_allowed
             and evidence_acquisition is not None
             and not evidence_acquisition.follow_existing_path
             and evidence_acquisition.supported_governed_path
+            and grounded_provider_allowed(evidence_acquisition)
         )
+        advisory_evidence_provider_call = bool(
+            evidence_provider_allowed
+            and evidence_acquisition is not None
+            and not evidence_acquisition.follow_existing_path
+            and evidence_acquisition.supported_governed_path
+            and advisory_provider_allowed(evidence_acquisition)
+        )
+        evidence_provider_call = bool(
+            grounded_evidence_provider_call
+            or advisory_evidence_provider_call
+        )
+        prompt.trace["evidence_provider_mode"] = {
+            "mode": (
+                "grounded"
+                if grounded_evidence_provider_call
+                else "advisory"
+                if advisory_evidence_provider_call
+                else "ordinary"
+                if evidence_provider_allowed
+                else "blocked"
+            ),
+            "advisory_rebuild_count": (
+                1 if advisory_evidence_provider_call else 0
+            ),
+            "reason": (
+                "runtime_policy_permission"
+                if advisory_evidence_provider_call
+                else "not_applicable"
+            ),
+        }
+        if advisory_evidence_provider_call:
+            status = "degraded"
         provider_tools = (
-            [] if governed_evidence_provider_call else capability_descriptors
+            [] if evidence_provider_call else capability_descriptors
         )
         provider_descriptor_fingerprint = (
             None
-            if governed_evidence_provider_call
+            if evidence_provider_call
             else capability_exposure_trace.get("descriptor_fingerprint")
         )
         provider_descriptor_count = (
             0
-            if governed_evidence_provider_call
+            if evidence_provider_call
             else capability_exposure_trace.get("descriptor_count")
         )
         governed_validation = None
         validated_governed_excerpts = ()
         capability_dispatch_blocked_by_evidence = bool(
-            exact_reference_request
-            and evidence_acquisition is not None
+            evidence_acquisition is not None
+            and not evidence_acquisition.follow_existing_path
             and not evidence_provider_allowed
         )
         try:
@@ -8990,7 +9234,7 @@ async def orchestrate_chat(
                 raise
 
         prompt.trace["capabilities"]["provider_call_count"] = len(model_calls)
-        if governed_evidence_provider_call and evidence_acquisition is not None:
+        if grounded_evidence_provider_call and evidence_acquisition is not None:
             governed_validation, validated_governed_excerpts = (
                 validate_evidence_response_candidate(
                     provider_text(completion),
@@ -9014,6 +9258,14 @@ async def orchestrate_chat(
             }
             if governed_validation.validation_status == "invalid":
                 status = "degraded"
+        elif advisory_evidence_provider_call:
+            raw_answer = provider_text(completion)
+            prompt.trace["evidence_response"] = {
+                "contract_active": False,
+                "advisory_guidance_active": True,
+                "provider_tool_count": 0,
+                "conclusion_authority": "withheld",
+            }
         else:
             raw_answer = (
                 evidence_acquisition.forced_answer
@@ -9030,7 +9282,7 @@ async def orchestrate_chat(
             capability_request = (
                 None
                 if (
-                    governed_evidence_provider_call
+                    evidence_provider_call
                     or capability_dispatch_blocked_by_evidence
                 )
                 else (
@@ -9039,16 +9291,16 @@ async def orchestrate_chat(
                     else parse_provider_capability_request(completion)
                 )
             )
-            if governed_evidence_provider_call:
+            if evidence_provider_call:
                 prompt.trace["capabilities"]["validation"] = {
                     "validation_status": "not_requested",
-                    "reason_code": "governed_evidence_response",
+                    "reason_code": "evidence_provider_response",
                 }
                 prompt.trace["capabilities"]["execution"] = {
                     "executor_called": False,
                     "executor_call_count": 0,
                     "executor_result_status": "not_called",
-                    "failure_reason_code": "governed_evidence_response",
+                    "failure_reason_code": "evidence_provider_response",
                     "response_status": "not_executed",
                 }
                 prompt.trace["capabilities"]["follow_up"] = (
@@ -9188,7 +9440,7 @@ async def orchestrate_chat(
             prompt.trace["capabilities"]["dispatch_completed"] = False
             prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
-        if governed_evidence_provider_call or capability_dispatch_blocked_by_evidence:
+        if evidence_provider_call or capability_dispatch_blocked_by_evidence:
             action_summary_trace, action_summary_answer = (
                 _action_summary_empty_trace(),
                 None,
@@ -9219,14 +9471,14 @@ async def orchestrate_chat(
             and evidence_acquisition.forced_answer is not None
         ):
             raw_answer = evidence_acquisition.forced_answer
-        if governed_evidence_provider_call:
+        if evidence_provider_call:
             prompt.trace["response_review"] = {
                 "status": "not_requested",
-                "reason": "governed_evidence_response",
+                "reason": "evidence_provider_response",
             }
             prompt.trace["response_action"] = {
                 "status": "not_requested",
-                "reason": "governed_evidence_response",
+                "reason": "evidence_provider_response",
             }
             candidate_answer = raw_answer
         else:
@@ -9249,7 +9501,7 @@ async def orchestrate_chat(
             prompt.trace["response_action"] = response_action.to_trace()
             candidate_answer = response_action.candidate_text
         if (
-            not governed_evidence_provider_call
+            not evidence_provider_call
             and memory_recall_composition.explicit_callbacks
             and not privacy_prompt_suppressed
         ):
@@ -9262,7 +9514,7 @@ async def orchestrate_chat(
         answer = candidate_answer
         brief_metadata = {"enabled": False}
         if (
-            not governed_evidence_provider_call
+            not evidence_provider_call
             and effective_payload.get("response_mode") == "brief"
         ):
             brief_grounding = _merge_brief_grounding(
@@ -9307,6 +9559,9 @@ async def orchestrate_chat(
         ):
             artifact_refs_for_sources = []
         answer_sources = _public_answer_sources(artifact_refs_for_sources)
+        if advisory_evidence_provider_call:
+            artifact_refs_for_sources = []
+            answer_sources = []
         if privacy_context_enabled and privacy_context is not None:
             privacy_boundary = apply_privacy_boundary(
                 policy=privacy_context,
@@ -9359,6 +9614,7 @@ async def orchestrate_chat(
                 )
         claim_capture_trace_enabled = (
             claim_record_capture_enabled
+            and not advisory_evidence_provider_call
             and (
                 evidence_provider_allowed
                 or compound_verification_requested
@@ -9375,7 +9631,7 @@ async def orchestrate_chat(
             is_brief=brief_metadata.get("enabled") is True,
             pending_action_present=pending_action is not None,
             capability_requested=(
-                not governed_evidence_provider_call
+                not evidence_provider_call
                 and (
                     capability_request is not None
                     or isinstance(
@@ -9425,9 +9681,13 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
             runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
         )
-        answer = enforce_final_answer(
-            claim_candidate_answer,
-            evidence_acquisition,
+        answer = (
+            _render_advisory_answer(claim_candidate_answer)
+            if advisory_evidence_provider_call
+            else enforce_final_answer(
+                claim_candidate_answer,
+                evidence_acquisition,
+            )
         )
         if compound_verification_requested:
             if history_followup_enabled:
@@ -9456,6 +9716,7 @@ async def orchestrate_chat(
             elif (
                 compound_governed_acquisition_established
                 and sufficiency_status in {"insufficient", "unknown"}
+                and advisory_evidence_provider_call
             ):
                 verification_label = "New verification attempt"
                 verification_answer = answer

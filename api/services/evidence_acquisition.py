@@ -797,14 +797,25 @@ class NextStepResult(StrictModel):
             or self.provider_disposition != "allowed"
         ):
             raise ValueError("invalid_partial_answer_next_step")
-        if self.selected_next_step in {
-            "disclose_unexamined_scope",
-            "withhold_unsupported_conclusion",
-        } and (
+        if self.selected_next_step == "disclose_unexamined_scope" and (
             self.conclusion_disposition != "requested_conclusion_withheld"
             or self.provider_disposition != "blocked"
         ):
             raise ValueError("invalid_blocked_next_step")
+        if self.selected_next_step == "withhold_unsupported_conclusion":
+            if (
+                self.conclusion_disposition
+                != "requested_conclusion_withheld"
+                or "unsupported_conclusion_withheld" not in self.reason_codes
+            ):
+                raise ValueError("invalid_withheld_next_step")
+            if self.provider_disposition == "allowed" and (
+                self.task_shape != "targeted_lookup"
+                or self.sufficiency_status not in {"insufficient", "unknown"}
+            ):
+                raise ValueError("invalid_advisory_provider_permission")
+            if self.provider_disposition not in {"allowed", "blocked"}:
+                raise ValueError("invalid_withheld_provider_disposition")
         if self.selected_next_step == "perform_additional_acquisition":
             if (
                 self.sufficiency_status not in {"insufficient", "unknown"}
@@ -2094,6 +2105,8 @@ async def select_evidence_next_step(
                 "additional_acquisition_executed": False,
             },
         ]
+        if _advisory_provider_allowed(state):
+            state.forced_answer = None
         return result
     except Exception:
         state.next_step = None
@@ -3789,10 +3802,42 @@ async def evaluate_acquisition_sufficiency(
         state.forced_answer = WITHHELD_ANSWER
 
 
-def provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
-    if state is None or state.follow_existing_path:
-        return True
-    if state.forced_answer is not None:
+def _advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
+    return bool(
+        state is not None
+        and not state.follow_existing_path
+        and state.plan is not None
+        and state.plan.task_shape == "targeted_lookup"
+        and state.sufficiency is not None
+        and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
+        and state.next_step is not None
+        and state.next_step.task_shape == "targeted_lookup"
+        and state.next_step.sufficiency_status
+        == state.sufficiency.sufficiency_status
+        and state.next_step.selected_next_step
+        == "withhold_unsupported_conclusion"
+        and state.next_step.conclusion_disposition
+        == "requested_conclusion_withheld"
+        and state.next_step.provider_disposition == "allowed"
+        and "unsupported_conclusion_withheld" in state.next_step.reason_codes
+    )
+
+
+def advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
+    return bool(
+        state is not None
+        and state.forced_answer is None
+        and state.next_step_selection_attempted
+        and _advisory_provider_allowed(state)
+    )
+
+
+def grounded_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
+    if (
+        state is None
+        or state.follow_existing_path
+        or state.forced_answer is not None
+    ):
         return False
     if state.next_step_selection_attempted:
         if state.next_step is None or state.sufficiency is None:
@@ -3818,6 +3863,16 @@ def provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
         state.sufficiency
         and state.sufficiency.sufficiency_status
         in {"sufficient_for_declared_scope", "sufficient_with_limitations"}
+    )
+
+
+def provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
+    if state is None or state.follow_existing_path:
+        return True
+    if state.forced_answer is not None:
+        return False
+    return bool(
+        grounded_provider_allowed(state) or advisory_provider_allowed(state)
     )
 
 

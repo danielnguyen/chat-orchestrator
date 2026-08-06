@@ -7,9 +7,9 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="1a8278278fcabd871f6235bc66acdfe80523c6f4"
-CR_COMMIT="92a8600f2cb99ed98d10721d23c8b65f3903a857"
+CR_COMMIT="0c3954df95b2d4d958e14acc7011a11cf445356a"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="f79034e32bfe6081de1af915779bc0cd157a781a"
+CO_COMMIT="a0375065bbf764758192b6f67deac77c0ec1eb70"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -908,6 +908,172 @@ assert_common_trace() {
   ' <<<"$trace" >/dev/null
 }
 
+run_policy_admitted_chat() {
+  local owner="$1" client="$2" conversation_id="$3" question="$4"
+  co_post "$(jq -nc \
+    --arg owner "$owner" \
+    --arg client "$client" \
+    --arg conversation "$conversation_id" \
+    --arg question "$question" \
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private"}')"
+}
+
+assert_advisory_service_case() {
+  local tag="$1" fail_primary="$2"
+  local owner="owner-evidence-advisory-$tag" client="client-evidence-advisory-$tag"
+  local question="Will this part fit?"
+  local guidance="Compare the exact identifier and version against the authoritative compatibility record."
+  local expected conversation response request_id trace provider_calls diagnostics audit counts
+  expected="I couldn’t verify the requested conclusion from the available evidence.
+
+Unverified guidance:
+$guidance
+
+Treat this as a working direction, not a confirmed result."
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_provider_answer "$guidance" >/dev/null
+  if [ "$fail_primary" = "true" ]; then
+    provider_post "/fixture/fail-next-primary" '{}' >/dev/null
+  fi
+  conversation="$(resolve_conversation "$owner" "$client" "evidence advisory $tag")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+
+  jq -e --arg expected "$expected" '
+    .status == "degraded"
+    and .answer == $expected
+    and .selected_model != "not_called"
+    and .sources == []
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .dsa.activation_source == "evidence_policy"
+    and .retrieval.prompt_assembly.evidence_provider_mode.mode == "advisory"
+    and .retrieval.prompt_assembly.evidence_provider_mode.advisory_rebuild_count == 1
+    and (.retrieval.prompt_assembly.included_layers | map(select(. == "evidence_advisory_guidance")) | length) == 1
+    and (.retrieval.prompt_assembly.included_layers | index("evidence_response_contract")) == null
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+    and .retrieval.prompt_assembly.claim_capture.enabled == false
+    and .prompt.evidence_acquisition.next_steps.selections[-1].selected_next_step == "withhold_unsupported_conclusion"
+    and .prompt.evidence_acquisition.next_steps.selections[-1].conclusion_disposition == "requested_conclusion_withheld"
+    and .prompt.evidence_acquisition.next_steps.selections[-1].provider_disposition == "allowed"
+    and .prompt.evidence_acquisition.acquisition.source_references_retained == []
+    and (.prompt.evidence_acquisition.assistant_message_id | type == "string")
+    and (.prompt.evidence_acquisition.response_digest | startswith("sha256:"))
+  ' <<<"$trace" >/dev/null
+  jq -e --argjson expected_calls "$([ "$fail_primary" = true ] && echo 2 || echo 1)" '
+    ([.calls[] | select(.kind == "chat")] | length) == $expected_calls
+    and ([.calls[] | select(.kind == "chat")] | all(.tool_count == 0))
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.role == "system" and (.content | startswith("Evidence advisory guidance:")))] | length) == $expected_calls
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | startswith("Governed evidence response contract:"))] | length) == 0
+  ' <<<"$provider_calls" >/dev/null
+  if [ "$fail_primary" = "true" ]; then
+    jq -e '
+      [.calls[] | select(.kind == "chat")] as $calls
+      | ($calls | length) == 2
+      and $calls[0].status == "failed"
+      and $calls[1].status == "ok"
+      and $calls[0].normalized_messages == $calls[1].normalized_messages
+      and $calls[0].prompt_fingerprint == $calls[1].prompt_fingerprint
+    ' <<<"$provider_calls" >/dev/null
+  fi
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_persisted_answer_matches "$conversation" "$request_id" "$expected"
+  assert_request_persistence_counts "$conversation" "$request_id" 0
+  counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant'), count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")"
+  [ "$counts" = "1|1|2" ]
+  echo "Evidence advisory $tag: policy_activation=true provider_calls=$([ "$fail_primary" = true ] && echo 2 || echo 1) tools=0 claims=0 wrapper=persisted"
+}
+
+run_evidence_advisory_scenario() {
+  local owner client conversation question response request_id trace provider_calls diagnostics audit counts
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-evidence-advisory-ordinary"
+  client="client-evidence-advisory-ordinary"
+  question="Explain how a climate control module works."
+  queue_provider_answer "A climate control module regulates temperature and airflow." >/dev/null
+  conversation="$(resolve_conversation "$owner" "$client" "evidence ordinary bypass")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  jq -e '
+    .status == "ok"
+    and .answer == "A climate control module regulates temperature and airflow."
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .retrieval.prompt_assembly.evidence_provider_mode.mode == "ordinary"
+    and .prompt.evidence_acquisition.shape.derivation_status == "not_applicable"
+    and .dsa.called == false
+    and .dsa.activation_source == "evidence_policy"
+    and (.retrieval.prompt_assembly.included_layers | index("evidence_advisory_guidance")) == null
+    and (.retrieval.prompt_assembly.included_layers | index("evidence_response_contract")) == null
+  ' <<<"$trace" >/dev/null
+  jq -e '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")] | all(.tool_count >= 0))
+  ' <<<"$provider_calls" >/dev/null
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_persisted_answer_matches "$conversation" "$request_id" "A climate control module regulates temperature and airflow."
+  assert_request_persistence_counts "$conversation" "$request_id" 0
+  counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant'), count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")"
+  [ "$counts" = "1|1|2" ]
+  echo "Evidence ordinary bypass: shape=not_applicable dsa_calls=0 provider_calls=1 durable_messages=2"
+
+  assert_advisory_service_case primary false
+  assert_advisory_service_case fallback true
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-evidence-advisory-high-impact"
+  client="client-evidence-advisory-high-impact"
+  question="Should I change payroll taxes based on whether this package version supports Python 3.14?"
+  conversation="$(resolve_conversation "$owner" "$client" "evidence high impact block")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  jq -e '
+    .status == "degraded"
+    and .selected_model == "not_called"
+    and .sources == []
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .retrieval.prompt_assembly.interaction_governance.interaction_kind == "high_impact_decision"
+    and .retrieval.prompt_assembly.evidence_provider_mode.mode == "blocked"
+    and (.retrieval.prompt_assembly.included_layers | index("evidence_advisory_guidance")) == null
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+  ' <<<"$trace" >/dev/null
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_request_persistence_counts "$conversation" "$request_id" 0
+  echo "Evidence high-impact block: governance=high_impact_decision provider_calls=0 advisory_layer=0 claims=0"
+
+  run_evidence_targeted_scenario
+  echo "Evidence grounded compatibility: grounded_contract=true advisory_layer=false"
+}
+
 run_wave2e_retrieval_scenario() {
   local owner client conversation_id response request_id answer trace provider_calls trace_text
   owner="owner-smoke-wave2e"
@@ -1693,6 +1859,13 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: evidence-acquisition-only"
   run_evidence_acquisition_composed_suite
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
+  exit 0
+fi
+
+if [ "${EVIDENCE_ADVISORY_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: evidence-advisory-only"
+  run_evidence_advisory_scenario
+  echo "Topology: policy-admitted CO HTTP -> CR HTTP + DSA HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16."
   exit 0
 fi
 
