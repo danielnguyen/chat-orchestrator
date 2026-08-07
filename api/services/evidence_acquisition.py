@@ -781,28 +781,21 @@ class NextStepResult(StrictModel):
             or self.clarification_target is not None
         ):
             raise ValueError("terminal_next_step_has_follow_up")
-        if self.selected_next_step == "ask_narrow_clarification":
-            if (
-                self.clarification_target is None
-                or self.provider_disposition != "blocked"
-                or self.conclusion_disposition != "requested_conclusion_withheld"
-                or self.reacquisition_guard != "not_applicable"
-            ):
-                raise ValueError("invalid_clarification_next_step")
-        elif self.clarification_target is not None:
-            raise ValueError("unexpected_clarification_target")
 
-        if self.selected_next_step == "provide_qualified_partial_answer" and (
-            self.conclusion_disposition != "qualified_partial_only"
-            or self.provider_disposition != "allowed"
-        ):
-            raise ValueError("invalid_partial_answer_next_step")
-        if self.selected_next_step == "disclose_unexamined_scope" and (
-            self.conclusion_disposition != "requested_conclusion_withheld"
-            or self.provider_disposition != "blocked"
-        ):
-            raise ValueError("invalid_blocked_next_step")
-        if self.selected_next_step == "withhold_unsupported_conclusion":
+        if self.selected_next_step == "provide_qualified_partial_answer":
+            if (
+                self.conclusion_disposition != "qualified_partial_only"
+                or self.provider_disposition != "allowed"
+            ):
+                raise ValueError("invalid_partial_answer_next_step")
+            required_reason = (
+                "optional_limitations_remain"
+                if self.sufficiency_status == "sufficient_with_limitations"
+                else "substantive_partial_evidence_available"
+            )
+            if required_reason not in self.reason_codes:
+                raise ValueError("qualified_partial_reason_required")
+        elif self.selected_next_step == "withhold_unsupported_conclusion":
             if (
                 self.conclusion_disposition
                 != "requested_conclusion_withheld"
@@ -816,28 +809,55 @@ class NextStepResult(StrictModel):
                 raise ValueError("invalid_advisory_provider_permission")
             if self.provider_disposition not in {"allowed", "blocked"}:
                 raise ValueError("invalid_withheld_provider_disposition")
-        if self.selected_next_step == "perform_additional_acquisition":
-            if (
-                self.sufficiency_status not in {"insufficient", "unknown"}
-                or self.reacquisition_guard != "changed_premise_allowed"
-                or self.proposed_premise_digest is None
-                or self.provider_disposition != "blocked"
-                or self.conclusion_disposition != "requested_conclusion_withheld"
-            ):
-                raise ValueError("invalid_additional_acquisition_next_step")
-        elif self.reacquisition_guard == "changed_premise_allowed":
-            raise ValueError("unexpected_changed_premise_guard")
-        if (
-            self.reacquisition_guard
-            in {"unchanged_premise_blocked", "premise_already_attempted"}
+        elif self.selected_next_step != "answer_within_declared_scope" and (
+            self.conclusion_disposition != "requested_conclusion_withheld"
+            or self.provider_disposition != "blocked"
         ):
+            raise ValueError("invalid_blocked_next_step")
+
+        required_step_reason = {
+            "answer_within_declared_scope": "declared_scope_sufficient",
+            "perform_additional_acquisition": (
+                "changed_acquisition_premise_available"
+            ),
+            "ask_narrow_clarification": (
+                "material_uncertainty_requires_clarification"
+            ),
+            "disclose_unexamined_scope": "unexamined_material_scope",
+        }.get(self.selected_next_step)
+        if (
+            required_step_reason is not None
+            and required_step_reason not in self.reason_codes
+        ):
+            raise ValueError("selected_next_step_reason_required")
+
+        if self.selected_next_step == "ask_narrow_clarification":
+            if self.clarification_target is None:
+                raise ValueError("clarification_target_required")
+        elif self.clarification_target is not None:
+            raise ValueError("clarification_target_not_allowed")
+
+        if self.reacquisition_guard == "not_applicable":
+            if self.proposed_premise_digest is not None:
+                raise ValueError("proposed_premise_not_allowed")
+        elif self.proposed_premise_digest is None:
+            raise ValueError("proposed_premise_required")
+        elif self.reacquisition_guard == "changed_premise_allowed":
             if (
-                self.sufficiency_status not in {"insufficient", "unknown"}
-                or self.proposed_premise_digest is None
-                or self.selected_next_step
-                == "perform_additional_acquisition"
+                self.selected_next_step != "perform_additional_acquisition"
+                or self.proposed_premise_digest == self.current_premise_digest
             ):
-                raise ValueError("invalid_blocked_reacquisition")
+                raise ValueError("incoherent_changed_premise")
+        elif self.reacquisition_guard == "unchanged_premise_blocked" and (
+            self.proposed_premise_digest != self.current_premise_digest
+        ):
+            raise ValueError("incoherent_unchanged_premise")
+
+        if (
+            self.selected_next_step == "perform_additional_acquisition"
+            and self.reacquisition_guard != "changed_premise_allowed"
+        ):
+            raise ValueError("changed_premise_guard_required")
         return self
 
 
@@ -3820,6 +3840,23 @@ def _advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
         == "requested_conclusion_withheld"
         and state.next_step.provider_disposition == "allowed"
         and "unsupported_conclusion_withheld" in state.next_step.reason_codes
+        and (
+            (
+                state.next_step.reacquisition_guard == "not_applicable"
+                and state.next_step.proposed_premise_digest is None
+            )
+            or (
+                state.next_step.reacquisition_guard
+                == "unchanged_premise_blocked"
+                and state.next_step.proposed_premise_digest
+                == state.next_step.current_premise_digest
+            )
+            or (
+                state.next_step.reacquisition_guard
+                == "premise_already_attempted"
+                and state.next_step.proposed_premise_digest is not None
+            )
+        )
     )
 
 

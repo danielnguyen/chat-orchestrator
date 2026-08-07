@@ -12,6 +12,7 @@ from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     CONFIGURED_WORKSHEET_CONTEXT_MODE,
     MALFORMED_EVIDENCE_RESPONSE,
+    NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
     WITHHELD_ANSWER,
     DsaItem,
@@ -19,6 +20,7 @@ from services.evidence_acquisition import (
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
     EvidenceCandidateValidation,
+    ExactFetchProposal,
     NextStepResult,
     PlanResult,
     RequirementEvaluation,
@@ -6251,18 +6253,133 @@ def test_strict_next_step_model_rejects_contradictory_results(updates):
 
 
 @pytest.mark.parametrize(
+    "case",
+    [
+        "not_applicable_with_proposed_premise",
+        "guard_without_proposed_premise",
+        "changed_guard_without_additional_acquisition",
+        "changed_guard_with_unchanged_premise",
+        "unchanged_guard_with_changed_premise",
+        "additional_acquisition_without_changed_guard",
+        "answer_without_required_reason",
+        "clarification_without_required_reason",
+        "additional_acquisition_without_required_reason",
+        "disclosure_without_required_reason",
+        "qualified_partial_without_required_reason",
+        "withheld_conclusion_without_required_reason",
+        "clarification_target_on_non_clarification_step",
+    ],
+)
+def test_strict_next_step_model_matches_runtime_structural_invariants(case):
+    state = _next_step_test_state()
+    current_digest = _acquisition_premise_digest(
+        build_current_acquisition_premise(state)
+    )
+    changed_digest = "sha256:" + ("1" * 64)
+    payload = _next_step_result_payload(
+        state,
+        selected_next_step="withhold_unsupported_conclusion",
+        conclusion_disposition="requested_conclusion_withheld",
+        provider_disposition="allowed",
+    )
+
+    if case == "not_applicable_with_proposed_premise":
+        payload["proposed_premise_digest"] = changed_digest
+    elif case == "guard_without_proposed_premise":
+        payload["reacquisition_guard"] = "premise_already_attempted"
+    elif case == "changed_guard_without_additional_acquisition":
+        payload.update(
+            reacquisition_guard="changed_premise_allowed",
+            proposed_premise_digest=changed_digest,
+        )
+    elif case == "changed_guard_with_unchanged_premise":
+        payload.update(
+            selected_next_step="perform_additional_acquisition",
+            provider_disposition="blocked",
+            reacquisition_guard="changed_premise_allowed",
+            proposed_premise_digest=current_digest,
+            reason_codes=["changed_acquisition_premise_available"],
+        )
+    elif case == "unchanged_guard_with_changed_premise":
+        payload.update(
+            provider_disposition="blocked",
+            reacquisition_guard="unchanged_premise_blocked",
+            proposed_premise_digest=changed_digest,
+        )
+    elif case == "additional_acquisition_without_changed_guard":
+        payload.update(
+            selected_next_step="perform_additional_acquisition",
+            provider_disposition="blocked",
+            reacquisition_guard="premise_already_attempted",
+            proposed_premise_digest=changed_digest,
+            reason_codes=["changed_acquisition_premise_available"],
+        )
+    elif case == "answer_without_required_reason":
+        payload.update(
+            sufficiency_status="sufficient_for_declared_scope",
+            selected_next_step="answer_within_declared_scope",
+            conclusion_disposition="bounded_conclusion_allowed",
+            provider_disposition="allowed",
+            unresolved_material_requirement_ids=[],
+            reason_codes=[],
+        )
+    elif case == "clarification_without_required_reason":
+        payload.update(
+            selected_next_step="ask_narrow_clarification",
+            provider_disposition="blocked",
+            clarification_target="source_scope",
+            reason_codes=[],
+        )
+    elif case == "additional_acquisition_without_required_reason":
+        payload.update(
+            selected_next_step="perform_additional_acquisition",
+            provider_disposition="blocked",
+            reacquisition_guard="changed_premise_allowed",
+            proposed_premise_digest=changed_digest,
+            reason_codes=[],
+        )
+    elif case == "disclosure_without_required_reason":
+        payload.update(
+            selected_next_step="disclose_unexamined_scope",
+            provider_disposition="blocked",
+            reason_codes=[],
+        )
+    elif case == "qualified_partial_without_required_reason":
+        payload.update(
+            selected_next_step="provide_qualified_partial_answer",
+            conclusion_disposition="qualified_partial_only",
+            provider_disposition="allowed",
+            reason_codes=[],
+        )
+    elif case == "withheld_conclusion_without_required_reason":
+        payload["reason_codes"] = []
+    elif case == "clarification_target_on_non_clarification_step":
+        payload["clarification_target"] = "source_scope"
+    else:  # pragma: no cover - the parameter list is closed above
+        raise AssertionError("unsupported structural case")
+
+    with pytest.raises(ValidationError):
+        NextStepResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
     "guard",
     ["unchanged_premise_blocked", "premise_already_attempted"],
 )
 def test_guarded_qualified_partial_next_step_is_valid(guard):
     state = _next_step_test_state()
+    proposed_digest = (
+        _acquisition_premise_digest(build_current_acquisition_premise(state))
+        if guard == "unchanged_premise_blocked"
+        else "sha256:" + ("1" * 64)
+    )
     payload = _next_step_result_payload(
         state,
         selected_next_step="provide_qualified_partial_answer",
         conclusion_disposition="qualified_partial_only",
         provider_disposition="allowed",
         reacquisition_guard=guard,
-        proposed_premise_digest="sha256:" + ("1" * 64),
+        proposed_premise_digest=proposed_digest,
     )
     payload["reason_codes"] = [
         (
@@ -6299,13 +6416,18 @@ def test_blocked_reacquisition_guards_reject_invalid_acquisition_state(
     updates,
 ):
     state = _next_step_test_state()
+    proposed_digest = (
+        _acquisition_premise_digest(build_current_acquisition_premise(state))
+        if guard == "unchanged_premise_blocked"
+        else "sha256:" + ("1" * 64)
+    )
     payload = _next_step_result_payload(
         state,
         selected_next_step="provide_qualified_partial_answer",
         conclusion_disposition="qualified_partial_only",
         provider_disposition="allowed",
         reacquisition_guard=guard,
-        proposed_premise_digest="sha256:" + ("1" * 64),
+        proposed_premise_digest=proposed_digest,
     )
     payload.update(updates)
 
@@ -6345,7 +6467,9 @@ def test_guarded_fallback_keeps_step_specific_disposition_validation(
         conclusion_disposition=conclusion_disposition,
         provider_disposition=provider_disposition,
         reacquisition_guard="unchanged_premise_blocked",
-        proposed_premise_digest="sha256:" + ("1" * 64),
+        proposed_premise_digest=_acquisition_premise_digest(
+            build_current_acquisition_premise(state)
+        ),
     )
 
     with pytest.raises(ValidationError):
@@ -6411,6 +6535,13 @@ async def test_guarded_partial_selection_is_recorded_and_provider_free(
         **SCOPE,
     )
     assert proposal is not None
+    if guard == "unchanged_premise_blocked":
+        proposal = ExactFetchProposal(
+            plan=proposal.plan,
+            declared_scope=proposal.declared_scope,
+            exact_reference=proposal.exact_reference,
+            premise=build_current_acquisition_premise(state),
+        )
 
     class SelectionRuntime:
         async def select_evidence_next_step(self, **kwargs):
@@ -6449,6 +6580,118 @@ async def test_guarded_partial_selection_is_recorded_and_provider_free(
     )
     assert "PRIVATE PROVIDER ANSWER" not in answer
     assert answer.endswith("I’m withholding the requested conclusion.")
+
+
+@pytest.mark.asyncio
+async def test_malformed_advisory_cannot_bypass_changed_premise_precedence():
+    state = _next_step_test_state()
+
+    class ProposalRuntime:
+        async def compile_evidence_plan(self, **kwargs):
+            return _exact_plan_response()
+
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=ProposalRuntime(),
+        context_pack={
+            "items": [
+                {
+                    "source_id": "source_a",
+                    "source_ref": "source_a:record_1",
+                }
+            ]
+        },
+        **SCOPE,
+    )
+    assert proposal is not None
+
+    class SelectionRuntime:
+        async def select_evidence_next_step(self, **kwargs):
+            return {
+                **SCOPE,
+                "result": _next_step_result_payload(
+                    state,
+                    selected_next_step="withhold_unsupported_conclusion",
+                    conclusion_disposition="requested_conclusion_withheld",
+                    provider_disposition="allowed",
+                    reacquisition_guard="not_applicable",
+                    proposed_premise_digest=_acquisition_premise_digest(
+                        proposal.premise
+                    ),
+                ),
+            }
+
+    result = await select_evidence_next_step(
+        state=state,
+        runtime=SelectionRuntime(),
+        proposal=proposal,
+        **SCOPE,
+    )
+
+    assert result is None
+    assert state.next_step is None
+    assert state.next_step_history is None
+    assert state.status == "next_step_dependency_failed"
+    assert state.next_step_failure == "dependency_failure"
+    assert state.forced_answer == NEXT_STEP_DEPENDENCY_ANSWER
+    assert advisory_provider_allowed(state) is False
+    assert provider_allowed(state) is False
+
+
+@pytest.mark.asyncio
+async def test_valid_exhausted_premise_advisory_remains_allowed():
+    state = _next_step_test_state()
+
+    class ProposalRuntime:
+        async def compile_evidence_plan(self, **kwargs):
+            return _exact_plan_response()
+
+    proposal = await compile_safe_exact_fetch_proposal(
+        state=state,
+        runtime=ProposalRuntime(),
+        context_pack={
+            "items": [
+                {
+                    "source_id": "source_a",
+                    "source_ref": "source_a:record_1",
+                }
+            ]
+        },
+        **SCOPE,
+    )
+    assert proposal is not None
+
+    class SelectionRuntime:
+        async def select_evidence_next_step(self, **kwargs):
+            result = _next_step_result_payload(
+                state,
+                selected_next_step="withhold_unsupported_conclusion",
+                conclusion_disposition="requested_conclusion_withheld",
+                provider_disposition="allowed",
+                reacquisition_guard="premise_already_attempted",
+                proposed_premise_digest=_acquisition_premise_digest(
+                    proposal.premise
+                ),
+            )
+            result["reason_codes"] = [
+                "acquisition_premise_already_selected",
+                "unsupported_conclusion_withheld",
+            ]
+            return {**SCOPE, "result": result}
+
+    result = await select_evidence_next_step(
+        state=state,
+        runtime=SelectionRuntime(),
+        proposal=proposal,
+        **SCOPE,
+    )
+
+    assert result is not None
+    assert result.reacquisition_guard == "premise_already_attempted"
+    assert state.forced_answer is None
+    assert len(state.next_step_history or []) == 1
+    assert advisory_provider_allowed(state) is True
+    assert provider_allowed(state) is True
 
 
 @pytest.mark.asyncio

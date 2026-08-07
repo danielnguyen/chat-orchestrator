@@ -36,6 +36,7 @@ from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
     MALFORMED_EVIDENCE_RESPONSE,
+    NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
     EvidenceAcquisitionPremise,
     _acquisition_premise_digest,
@@ -14779,28 +14780,28 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
 
 
 @pytest.mark.asyncio
-async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
+async def test_evidence_next_step_already_attempted_guard_prevents_exact_fetch(
     tmp_path,
     monkeypatch,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
 
-    def unchanged_guard(call):
+    def exhausted_guard(call):
         return _next_step_response_from_call(
             call,
             status="insufficient",
             selected_next_step="withhold_unsupported_conclusion",
             conclusion_disposition="requested_conclusion_withheld",
             provider_disposition="blocked",
-            reacquisition_guard="unchanged_premise_blocked",
+            reacquisition_guard="premise_already_attempted",
             reason_codes=[
-                "unchanged_acquisition_premise",
+                "acquisition_premise_already_selected",
                 "unsupported_conclusion_withheld",
             ],
         )
 
-    runtime = FakeRuntime(evidence_next_step_response=unchanged_guard)
+    runtime = FakeRuntime(evidence_next_step_response=exhausted_guard)
     dsa = FakeDSA(
         response=_governed_context_pack(question),
         fetch_responses=[
@@ -14855,7 +14856,7 @@ async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-evidence-next-step-unchanged",
+        request_id="rid-evidence-next-step-already-attempted",
     )
 
     _assert_material_gap_answer(
@@ -14871,24 +14872,14 @@ async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "guard,reason_code",
-    [
-        ("unchanged_premise_blocked", "unchanged_acquisition_premise"),
-        (
-            "premise_already_attempted",
-            "acquisition_premise_already_selected",
-        ),
-    ],
-)
 async def test_evidence_next_step_guarded_partial_is_provider_and_fetch_free(
     tmp_path,
     monkeypatch,
-    guard,
-    reason_code,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
+    guard = "premise_already_attempted"
+    reason_code = "acquisition_premise_already_selected"
 
     def guarded_partial(call):
         return _next_step_response_from_call(
@@ -17760,8 +17751,16 @@ async def _run_advisory_evidence_case(
     sufficiency_status: str,
     provider_content: str,
     fail_first: bool = False,
+    fail_advisory_prompt: bool = False,
 ):
-    request_id = f"rid-advisory-{sufficiency_status}-{'fallback' if fail_first else 'primary'}"
+    attempt_kind = (
+        "prompt-budget"
+        if fail_advisory_prompt
+        else "fallback"
+        if fail_first
+        else "primary"
+    )
+    request_id = f"rid-advisory-{sufficiency_status}-{attempt_kind}"
     question = "Will this part fit?"
     rules, models = (
         _route_files_with_fallback(tmp_path)
@@ -17805,6 +17804,28 @@ async def _run_advisory_evidence_case(
         )
     else:
         raise AssertionError("unsupported advisory fixture status")
+
+    if fail_advisory_prompt:
+        original_assemble_prompt = orchestrate_service.assemble_prompt
+
+        def reject_advisory_prompt(**kwargs):
+            if kwargs.get("evidence_advisory_guidance") is True:
+                raise orchestrate_service.PromptBudgetError(
+                    "required_prompt_content_exceeds_budget",
+                    {
+                        "failure_reason": (
+                            "required_prompt_content_exceeds_budget"
+                        ),
+                        "omission_or_truncation_occurred": True,
+                    },
+                )
+            return original_assemble_prompt(**kwargs)
+
+        monkeypatch.setattr(
+            orchestrate_service,
+            "assemble_prompt",
+            reject_advisory_prompt,
+        )
 
     def advisory_next_step(call):
         return _next_step_response_from_call(
@@ -18006,6 +18027,60 @@ async def test_advisory_fallback_reuses_identical_prompt_and_zero_tools(
             if message["role"] == "assistant"
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_advisory_prompt_budget_failure_preserves_authoritative_trace(
+    tmp_path,
+    monkeypatch,
+):
+    result, memory_store, _, provider, _ = await _run_advisory_evidence_case(
+        tmp_path,
+        monkeypatch,
+        sufficiency_status="unknown",
+        provider_content="PROVIDER MUST NOT BE CALLED",
+        fail_advisory_prompt=True,
+    )
+
+    assert result == {
+        "request_id": "rid-advisory-unknown-prompt-budget",
+        "conversation_id": "conv-1",
+        "profile_name": "dev",
+        "selected_model": "not_called",
+        "answer": NEXT_STEP_DEPENDENCY_ANSWER,
+        "status": "degraded",
+        "sources": [],
+    }
+    assert provider.calls == []
+    assert "Unverified guidance:" not in result["answer"]
+    assistant_messages = [
+        message
+        for message in memory_store.added_messages
+        if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == NEXT_STEP_DEPENDENCY_ANSWER
+    assert memory_store.claim_record_calls == []
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    assert trace["model_calls"] == []
+    assert prompt_trace["evidence_provider_mode"] == {
+        "mode": "blocked",
+        "advisory_rebuild_count": 1,
+        "reason": "prompt_budget_failure",
+    }
+    assert prompt_trace["provider_prompt"]["message_count"] == 0
+    assert prompt_trace["capabilities"]["executor_call_count"] == 0
+    assert prompt_trace["capabilities"]["dispatch_completed"] is False
+    assert prompt_trace["capabilities"]["follow_up"]["call_count"] == 0
+    assert prompt_trace["capabilities"]["action_summary"]["attempted"] is False
+    assert prompt_trace["claim_capture"]["enabled"] is False
+    manifest = prompt_trace["evidence_acquisition"]
+    assert manifest["response_digest"] == (
+        "sha256:"
+        + hashlib.sha256(NEXT_STEP_DEPENDENCY_ANSWER.encode()).hexdigest()
+    )
 
 
 @pytest.mark.asyncio

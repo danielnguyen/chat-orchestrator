@@ -8904,6 +8904,12 @@ async def orchestrate_chat(
                             "privacy_context": privacy_context_trace,
                             "runtime": runtime_trace,
                             "dsa": dsa_trace,
+                            "memory_episode_recall_composition": (
+                                prompt.trace.get(
+                                    "memory_episode_recall_composition",
+                                    {"status": "not_requested"},
+                                )
+                            ),
                             "message_count": 0,
                             "evidence_provider_mode": {
                                 "mode": "blocked",
@@ -9004,25 +9010,28 @@ async def orchestrate_chat(
             grounded_evidence_provider_call
             or advisory_evidence_provider_call
         )
-        prompt.trace["evidence_provider_mode"] = {
-            "mode": (
-                "grounded"
-                if grounded_evidence_provider_call
-                else "advisory"
-                if advisory_evidence_provider_call
-                else "ordinary"
-                if evidence_provider_allowed
-                else "blocked"
-            ),
-            "advisory_rebuild_count": (
-                1 if advisory_evidence_provider_call else 0
-            ),
-            "reason": (
-                "runtime_policy_permission"
-                if advisory_evidence_provider_call
-                else "not_applicable"
-            ),
-        }
+        prompt.trace.setdefault(
+            "evidence_provider_mode",
+            {
+                "mode": (
+                    "grounded"
+                    if grounded_evidence_provider_call
+                    else "advisory"
+                    if advisory_evidence_provider_call
+                    else "ordinary"
+                    if evidence_provider_allowed
+                    else "blocked"
+                ),
+                "advisory_rebuild_count": (
+                    1 if advisory_evidence_provider_call else 0
+                ),
+                "reason": (
+                    "runtime_policy_permission"
+                    if advisory_evidence_provider_call
+                    else "not_applicable"
+                ),
+            },
+        )
         if advisory_evidence_provider_call:
             status = "degraded"
         provider_tools = (
