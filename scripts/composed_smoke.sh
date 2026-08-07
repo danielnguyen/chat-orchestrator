@@ -1070,10 +1070,10 @@ Treat this as a working direction, not a confirmed result."
     "$tag" "empty_public_sources" "$response" '.sources == []'
   assert_evidence_advisory_equal \
     "$tag" "dsa_activation_source" "evidence_policy" \
-    "$(jq -r '.dsa.activation_source // "missing"' <<<"$trace")"
+    "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "$tag" "dsa_called" "true" \
-    "$(jq -r 'if .dsa.called == true then "true" elif .dsa.called == false then "false" else "missing" end' <<<"$trace")"
+    "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
   assert_evidence_advisory_equal \
     "$tag" "provider_mode" "advisory" \
     "$(jq -r '.retrieval.prompt_assembly.evidence_provider_mode.mode // "missing"' <<<"$trace")"
@@ -1211,10 +1211,10 @@ run_evidence_advisory_scenario() {
     "$(jq -r '.prompt.evidence_acquisition.sufficiency.status // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "ordinary" "dsa_called" "false" \
-    "$(jq -r 'if .dsa.called == true then "true" elif .dsa.called == false then "false" else "missing" end' <<<"$trace")"
+    "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
   assert_evidence_advisory_equal \
     "ordinary" "dsa_activation_source" "evidence_policy" \
-    "$(jq -r '.dsa.activation_source // "missing"' <<<"$trace")"
+    "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "ordinary" "advisory_layer_count" "0" \
     "$(jq -r '[.retrieval.prompt_assembly.included_layers[]? | select(. == "evidence_advisory_guidance")] | length' <<<"$trace")"
@@ -1288,7 +1288,10 @@ run_evidence_advisory_scenario() {
     "$(jq -r '.retrieval.prompt_assembly.evidence_provider_mode.advisory_rebuild_count // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "high_impact" "dsa_called" "true" \
-    "$(jq -r 'if .dsa.called == true then "true" elif .dsa.called == false then "false" else "missing" end' <<<"$trace")"
+    "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
+  assert_evidence_advisory_equal \
+    "high_impact" "dsa_activation_source" "evidence_policy" \
+    "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "high_impact" "provider_chat_count" "0" \
     "$(jq -r '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_calls")"
