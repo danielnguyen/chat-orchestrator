@@ -993,12 +993,14 @@ def _record_matches_scope(
 @dataclass(frozen=True)
 class AcquisitionHistory:
     task_shape: Literal[
+        "no_acquisition",
         "ordinary_context_augmentation",
         "targeted_lookup",
         "cross_source_comparison",
         "bounded_exhaustive_review",
     ]
     strategy: Literal[
+        "none",
         "context_augmentation",
         "targeted_retrieval",
         "exact_fetch",
@@ -2065,6 +2067,7 @@ def _diagnose_acquisition_history_projection(
         return reject("context_delivery_status_invalid")
     if (
         ordinary_context
+        and acquisition.get("dsa_outcome") != "not_called"
         and acquisition.get("context_delivery_status") != "retained"
     ):
         return reject("ordinary_delivery_status_invalid")
@@ -2076,10 +2079,31 @@ def _diagnose_acquisition_history_projection(
         return reject("qualification_required_invalid")
     if not isinstance(sufficiency.get("additional_acquisition_required"), bool):
         return reject("additional_acquisition_required_invalid")
-    if ordinary_context and (
+    no_acquisition = bool(
+        ordinary_context and acquisition.get("dsa_outcome") == "not_called"
+    )
+    if no_acquisition:
+        if (
+            inventory_status != "unknown"
+            or any(inventory_counts.values())
+            or suppressed
+            or any(acquisition_counts.values())
+            or any(count for count, _ in identity_values.values())
+            or source_summaries
+            or acquisition.get("dsa_error_codes") != []
+            or acquisition.get("requirement_facts") != []
+            or acquisition.get("context_delivery_status") != "unknown"
+            or acquisition.get("dsa_budget_truncation") is not False
+            or acquisition.get("candidate_truncation") is not False
+            or exact_attempt_count
+            or expansion_attempt_count
+        ):
+            return reject("ordinary_acquisition_invalid")
+    elif ordinary_context and (
         acquisition.get("dsa_outcome") != "success"
         or acquisition.get("dsa_error_codes") != []
         or acquisition.get("requirement_facts") != []
+        or acquisition.get("context_delivery_status") != "retained"
         or acquisition_counts["prompt_retained_item_count"] == 0
         or exact_attempt_count
         or expansion_attempt_count
@@ -2295,6 +2319,9 @@ def _diagnose_acquisition_history_projection(
         "failed_sources": identity_values["failed_source_ids"][0],
         **acquisition_counts,
     }
+    if no_acquisition:
+        task_shape = "no_acquisition"
+        strategy = "none"
     history = AcquisitionHistory(
         task_shape=task_shape,
         strategy=strategy,
@@ -2518,6 +2545,24 @@ def _render_acquisition(
     *,
     include_no_new_verification: bool = True,
 ) -> str:
+    if history.task_shape == "no_acquisition":
+        opening = {
+            "checked": "I didn’t run an evidence acquisition for the original answer.",
+            "coverage": (
+                "No evidence acquisition was run for the original answer, so there "
+                "is no checked source scope to describe as complete."
+            ),
+            "gaps": (
+                "No evidence acquisition was run for the original answer, so there "
+                "is no checked source set whose gaps I can enumerate."
+            ),
+        }[question]
+        return (
+            f"{opening}\n\n{_NO_NEW_VERIFICATION}"
+            if include_no_new_verification
+            else opening
+        )
+
     counts = history.counts
     exhaustive = history.task_shape == "bounded_exhaustive_review"
     complete_scope = (

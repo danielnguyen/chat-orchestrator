@@ -270,6 +270,35 @@ def _ordinary_context_manifest_without_next_steps():
     return manifest
 
 
+def _no_acquisition_manifest():
+    manifest = _ordinary_context_manifest()
+    acquisition = manifest["acquisition"]
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_references_returned",
+        "source_references_retained",
+        "source_references_filtered_or_omitted",
+        "source_references_attempted",
+        "source_references_unsuccessful",
+        "unavailable_source_ids",
+        "failed_source_ids",
+    ):
+        acquisition[field] = []
+    acquisition.update(
+        {
+            "source_summaries": [],
+            "item_count": 0,
+            "usable_item_count": 0,
+            "prompt_retained_item_count": 0,
+            "dsa_outcome": "not_called",
+            "context_delivery_status": "unknown",
+        }
+    )
+    return manifest
+
+
 def _hybrid_manifest(
     *,
     task_shape="cross_source_comparison",
@@ -465,6 +494,7 @@ def _set_path(value, path, replacement):
         ),
         _ordinary_context_manifest(),
         _ordinary_context_manifest_without_next_steps(),
+        _no_acquisition_manifest(),
         _suppressed_trace()["prompt"]["evidence_acquisition"],
     ],
 )
@@ -917,6 +947,150 @@ def test_ordinary_context_history_reports_checked_scope_without_claiming_suffici
         "recorded next step",
     ):
         assert internal_term not in answer
+
+
+def test_no_acquisition_manifest_projects_as_distinct_valid_history():
+    diagnosed = _diagnose_acquisition_history_projection(
+        _no_acquisition_manifest()
+    )
+
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history is not None
+    assert diagnosed.history.task_shape == "no_acquisition"
+    assert diagnosed.history.strategy == "none"
+    assert diagnosed.history.sufficiency_status == "not_evaluated"
+    assert diagnosed.history.source_summaries == ()
+    assert diagnosed.history.counts["sources_considered"] == 0
+    assert diagnosed.history.counts["references_retained"] == 0
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        (
+            "checked",
+            "I didn’t run an evidence acquisition for the original answer.\n\n"
+            "I didn’t run another search or verification for this explanation.",
+        ),
+        (
+            "coverage",
+            "No evidence acquisition was run for the original answer, so there is "
+            "no checked source scope to describe as complete.\n\n"
+            "I didn’t run another search or verification for this explanation.",
+        ),
+        (
+            "gaps",
+            "No evidence acquisition was run for the original answer, so there is "
+            "no checked source set whose gaps I can enumerate.\n\n"
+            "I didn’t run another search or verification for this explanation.",
+        ),
+    ],
+)
+def test_no_acquisition_history_renders_bounded_explanation(question, expected):
+    history = _project_acquisition_history(_no_acquisition_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, question)
+
+    assert answer == expected
+    for prohibited in (
+        ADVISORY_PROVIDER_SENTINEL,
+        "Unverified guidance:",
+        "source-a",
+        "provider_disposition",
+    ):
+        assert prohibited not in answer
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        (
+            lambda manifest: manifest["acquisition"][
+                "source_references_retained"
+            ].append("source-a:record-1"),
+            "retained_count_exceeds_returned",
+        ),
+        (
+            lambda manifest: manifest["acquisition"].update(
+                {"prompt_retained_item_count": 1}
+            ),
+            "prompt_retained_count_exceeds_usable_count",
+        ),
+        (
+            lambda manifest: manifest["acquisition"]["source_summaries"].append(
+                {
+                    "source_id": "source-a",
+                    "display_name": "Source a",
+                    "connector": "unknown",
+                    "authority_role": "unknown",
+                    "domain_tags": [],
+                    "considered": False,
+                    "selected": False,
+                    "used": False,
+                    "returned_reference_count": 0,
+                    "retained_reference_count": 0,
+                    "safe_location_labels": [],
+                    "contribution_reason_codes": [],
+                }
+            ),
+            "source_summaries_invalid",
+        ),
+        (
+            lambda manifest: manifest["plan"].update(
+                {"plan_id": "plan-1", "plan_status": "ready"}
+            ),
+            "ordinary_plan_invalid",
+        ),
+        (
+            lambda manifest: manifest["sufficiency"].update(
+                {
+                    "evaluation_id": "evaluation-1",
+                    "status": "unknown",
+                }
+            ),
+            "ordinary_sufficiency_invalid",
+        ),
+        (
+            lambda manifest: manifest["next_steps"].update(
+                {
+                    "selection_count": 1,
+                    "selections": [{"selected_next_step": "answer_within_declared_scope"}],
+                }
+            ),
+            "ordinary_next_steps_invalid",
+        ),
+        (
+            lambda manifest: (
+                manifest["acquisition"].update(
+                    {
+                        "sources_considered": [],
+                        "sources_selected": [],
+                        "sources_used": [],
+                        "source_references_returned": [],
+                        "source_references_retained": [],
+                        "item_count": 0,
+                        "usable_item_count": 0,
+                        "prompt_retained_item_count": 0,
+                    }
+                )
+            ),
+            "ordinary_acquisition_invalid",
+        ),
+    ],
+)
+def test_mixed_ordinary_history_forms_are_rejected(mutation, expected_reason):
+    manifest = (
+        _ordinary_context_manifest()
+        if expected_reason == "ordinary_acquisition_invalid"
+        else _no_acquisition_manifest()
+    )
+    mutation(manifest)
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -3962,6 +4136,59 @@ async def test_immediate_acquisition_reuses_strict_projection_and_renderer(
     assert outcome.status == "ok"
     assert expected in outcome.answer
     assert outcome.trace["manifest_projection_status"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_immediate_no_acquisition_record_is_accepted_without_provider_replay():
+    digest = _response_digest("full assistant response")
+    manifest = _no_acquisition_manifest()
+    manifest["assistant_message_id"] = ROOT_MESSAGE_ID
+    manifest["response_digest"] = digest
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            kind="acquisition",
+            record={
+                "record_kind": "acquisition",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": None,
+                "acquisition_record": {
+                    "original_request_id": "original-request",
+                    "assistant_message_id": ROOT_MESSAGE_ID,
+                    "surface": "vscode",
+                    "trace_status": "ok",
+                    "response_digest": digest,
+                    "normalized_first_paragraph": ADVISORY_PROVIDER_SENTINEL,
+                    "acquisition_manifest": manifest,
+                },
+            },
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(
+            intent="acquisition_checked",
+            explanation_kind="acquisition",
+            acquisition_question="checked",
+        ),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.handled is True
+    assert outcome.status == "ok"
+    assert outcome.answer == (
+        "I didn’t run an evidence acquisition for the original answer.\n\n"
+        "I didn’t run another search or verification for this explanation."
+    )
+    assert outcome.trace["manifest_projection_status"] == "accepted"
+    assert outcome.trace["manifest_projection_reason"] == "accepted"
+    assert outcome.trace["provider_call_count"] == 0
+    assert ADVISORY_PROVIDER_SENTINEL not in outcome.answer
+    assert len(store.calls) == 1
 
 
 @pytest.mark.asyncio

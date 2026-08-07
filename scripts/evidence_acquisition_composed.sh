@@ -4341,26 +4341,23 @@ run_history_followup_composed_suite() {
     "$(psql_exec -At -c "SELECT id FROM messages WHERE metadata->>'request_id' = '$first_history_request' LIMIT 1;")"
   echo "H1 chained acquisition and CO restart durability passed"
 
-  # Regression: an ordinary DSA-augmented answer has no governed plan or
-  # sufficiency evaluation, but its exact retained acquisition remains explainable.
-  owner="owner-history-ordinary-dsa"
-  client="client-history-ordinary-dsa"
-  conversation_id="$(resolve_conversation "$owner" "$client" "history-ordinary-dsa")"
+  # Regression: a policy-not-applicable ordinary answer performs no evidence
+  # acquisition and later history explains that no evidence was checked.
+  owner="owner-history-no-acquisition"
+  client="client-history-no-acquisition"
+  conversation_id="$(resolve_conversation "$owner" "$client" "history-no-acquisition")"
   question="What is the migration setting?"
-  answer='Migration: ready
-Setting: bounded
-Cost note: \$1 145.25
-Retained details:
-- Primary migration row
-- Follow-up migration row'
+  answer="The migration setting is ready."
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  configure_google_sheet_worksheet "records_primary" "Form responses 1"
   queue_provider_answer "$answer"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
+  calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
   original_manifest="$(jq -ec '.prompt.evidence_acquisition' <<<"$trace")"
   assistant_message_id="$(
     psql_exec -At -c "SELECT id FROM messages WHERE conversation_id = '$conversation_id' AND role = 'assistant' AND metadata->>'request_id' = '$request_id' ORDER BY created_at DESC LIMIT 1;"
@@ -4369,6 +4366,7 @@ Retained details:
   assert_jq "history.ordinary.original" "$response" '
     .status == "ok"
     and .answer == $answer
+    and ((.answer | contains("Unverified guidance:")) | not)
   ' --arg answer "$answer"
   assert_jq "history.ordinary.manifest" "$original_manifest" '
     .status == "not_applicable"
@@ -4376,49 +4374,48 @@ Retained details:
     and .shape.task_shape == null
     and .plan.plan_status == "not_compiled"
     and .plan.selected_strategies == []
+    and .plan.material_requirement_count == 0
+    and .plan.optional_requirement_count == 0
+    and .plan.limitation_codes == []
     and .acquisition.strategy_attempted == null
-    and .acquisition.dsa_outcome == "success"
-    and .acquisition.item_count >= 2
-    and .acquisition.prompt_retained_item_count >= 2
-    and .acquisition.source_references_returned == [
-      "google_sheets:records_primary:\u0027Form responses 1\u0027!A2:C2",
-      "google_sheets:records_primary:\u0027Form responses 1\u0027!A3:C3"
-    ]
-    and .acquisition.source_references_retained ==
-      .acquisition.source_references_returned
+    and .acquisition.dsa_outcome == "not_called"
+    and .acquisition.dsa_error_codes == []
+    and .acquisition.item_count == 0
+    and .acquisition.usable_item_count == 0
+    and .acquisition.prompt_retained_item_count == 0
+    and .acquisition.sources_considered == []
+    and .acquisition.sources_selected == []
+    and .acquisition.sources_used == []
+    and .acquisition.source_references_returned == []
+    and .acquisition.source_references_retained == []
+    and .acquisition.source_references_attempted == []
+    and .acquisition.source_references_unsuccessful == []
+    and .acquisition.exact_reference_attempt_count == 0
+    and .acquisition.expansion_attempt_count == 0
+    and .acquisition.source_summaries == []
+    and .acquisition.requirement_facts == []
+    and .acquisition.context_delivery_status == "unknown"
+    and .acquisition.dsa_budget_truncation == false
+    and .acquisition.candidate_truncation == false
     and .sufficiency.status == "not_evaluated"
+    and .sufficiency.evaluation_id == null
+    and .sufficiency.reason_codes == []
+    and .sufficiency.answer_constraints == []
+    and .sufficiency.qualification_required == false
+    and .sufficiency.additional_acquisition_required == false
+    and .next_steps.selection_count == 0
+    and .next_steps.selections == []
+    and .next_steps.additional_acquisition_count == 0
+    and .next_steps.initial_attempt == null
+    and .next_steps.dependency_status == null
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
-  assert_jq "history.ordinary.summary_count" "$original_manifest" \
-    '.acquisition.source_summaries | length == 1'
-  assert_jq "history.ordinary.summary_source" "$original_manifest" \
-    '.acquisition.source_summaries[0].source_id == "records_primary"'
-  assert_jq "history.ordinary.summary_display_name" "$original_manifest" \
-    '.acquisition.source_summaries[0].display_name == "Migration Records"'
-  assert_jq "history.ordinary.summary_connector" "$original_manifest" \
-    '.acquisition.source_summaries[0].connector == "google_sheets"'
-  assert_jq "history.ordinary.summary_authority" "$original_manifest" '
-    .acquisition.source_summaries[0].authority_role == "unknown"
-    and .acquisition.source_summaries[0].domain_tags == []
+  assert_jq "history.ordinary.provider" "$calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
   '
-  assert_jq "history.ordinary.summary_association" "$original_manifest" '
-    .acquisition.source_summaries[0].considered == true
-    and .acquisition.source_summaries[0].selected == true
-    and .acquisition.source_summaries[0].used == true
-  '
-  assert_jq "history.ordinary.summary_counts" "$original_manifest" '
-    .acquisition.source_summaries[0].returned_reference_count == 2
-    and .acquisition.source_summaries[0].retained_reference_count == 2
-  '
-  assert_jq "history.ordinary.summary_location" "$original_manifest" '
-    .acquisition.source_summaries[0].safe_location_labels
-      == ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"]
-  '
-  assert_jq "history.ordinary.summary_reason" "$original_manifest" '
-    .acquisition.source_summaries[0].contribution_reason_codes
-      == ["retained_records_contributed"]
-  '
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_dsa_operation_counts "$audit" 0 0 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
   HISTORY_ORIGINAL_MANIFEST="$original_manifest"
@@ -4428,18 +4425,20 @@ Retained details:
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
   assert_jq "history.ordinary.follow_up" "$response" '
-    (.answer | startswith("I checked:"))
-    and (.answer | contains("Migration Records"))
-    and (.answer | contains("Google Sheets tab “Form responses 1” — A2:C2, A3:C3"))
-    and (.answer | contains("contributed 2 records used in the earlier answer"))
-    and (.answer | contains("not a complete review of every possible source"))
+    .answer == "I didn’t run an evidence acquisition for the original answer.\n\nI didn’t run another search or verification for this explanation."
     and (.answer | endswith("I didn’t run another search or verification for this explanation."))
-    and ((.answer | contains("ordinary external context augmentation")) | not)
-    and ((.answer | contains("delivered to reasoning")) | not)
-    and ((.answer | contains("configured source")) | not)
+    and ((.answer | contains("Migration Records")) | not)
+    and ((.answer | contains("Google Sheets")) | not)
+    and ((.answer | contains("Form responses 1")) | not)
+    and ((.answer | contains("I checked:")) | not)
+    and ((.answer | ascii_downcase | contains("invalid")) | not)
+    and ((.answer | contains("Unverified guidance:")) | not)
   '
-  configure_google_sheet_worksheet "records_primary" "Records"
-  echo "H1 ordinary DSA acquisition association regression passed"
+  assert_jq "history.ordinary.projection" "$HISTORY_TRACE" '
+    .prompt.history_followup.manifest_projection_status == "accepted"
+    and .prompt.history_followup.manifest_projection_reason == "accepted"
+  '
+  echo "H1 ordinary no-acquisition history regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
   owner="owner-history-h2"
