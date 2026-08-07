@@ -1242,7 +1242,7 @@ run_evidence_advisory_scenario() {
   reset_dsa_audit
   owner="owner-evidence-advisory-high-impact"
   client="client-evidence-advisory-high-impact"
-  question="Should I change payroll taxes based on whether this package version supports Python 3.14?"
+  question="Does this payroll module support version 3.14?"
   conversation="$(resolve_conversation "$owner" "$client" "evidence high impact block")"
   response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
   request_id="$(jq -r '.request_id' <<<"$response")"
