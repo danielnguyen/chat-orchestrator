@@ -4435,8 +4435,8 @@ run_history_followup_composed_suite() {
     and ((.answer | contains("Unverified guidance:")) | not)
   '
   assert_jq "history.ordinary.projection" "$HISTORY_TRACE" '
-    .prompt.history_followup.manifest_projection_status == "accepted"
-    and .prompt.history_followup.manifest_projection_reason == "accepted"
+    .prompt.claim_explanation.manifest_projection_status == "accepted"
+    and .prompt.claim_explanation.manifest_projection_reason == "accepted"
   '
   echo "H1 ordinary no-acquisition history regression passed"
 
