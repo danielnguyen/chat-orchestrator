@@ -1168,7 +1168,8 @@ Treat this as a working direction, not a confirmed result."
 
 run_evidence_advisory_scenario() {
   local owner client conversation question response request_id trace provider_calls diagnostics audit
-  local ordinary_answer high_impact_answer grounded_request_id grounded_trace grounded_provider_calls
+  local ordinary_answer high_impact_answer source_calls private_projection
+  local grounded_request_id grounded_trace grounded_provider_calls
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
@@ -1240,6 +1241,7 @@ run_evidence_advisory_scenario() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  configure_source_fixture "targeted-sheet" "malformed"
   owner="owner-evidence-advisory-high-impact"
   client="client-evidence-advisory-high-impact"
   question="Does this payroll module support version 3.14?"
@@ -1250,6 +1252,7 @@ run_evidence_advisory_scenario() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
+  source_calls="$(fetch_source_fixture_calls)"
   high_impact_answer="$(jq -r '.answer' <<<"$response")"
   assert_evidence_advisory_equal \
     "high_impact" "response_status" "degraded" \
@@ -1262,6 +1265,21 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_equal \
     "high_impact" "governance_kind" "high_impact_decision" \
     "$(jq -r '.retrieval.prompt_assembly.interaction_governance.interaction_kind // "missing"' <<<"$trace")"
+  assert_evidence_advisory_equal \
+    "high_impact" "task_shape" "targeted_lookup" \
+    "$(jq -r '.prompt.evidence_acquisition.shape.task_shape // "missing"' <<<"$trace")"
+  assert_evidence_advisory_jq \
+    "high_impact" "nonterminal_sufficiency" "$trace" \
+    '(.prompt.evidence_acquisition.sufficiency.status == "insufficient" or .prompt.evidence_acquisition.sufficiency.status == "unknown")'
+  assert_evidence_advisory_jq \
+    "high_impact" "terminal_sufficiency_absent" "$trace" \
+    '(.prompt.evidence_acquisition.sufficiency.status != "sufficient_for_declared_scope" and .prompt.evidence_acquisition.sufficiency.status != "sufficient_with_limitations")'
+  assert_evidence_advisory_equal \
+    "high_impact" "selected_next_step" "withhold_unsupported_conclusion" \
+    "$(jq -r '.prompt.evidence_acquisition.next_steps.selections[-1].selected_next_step // "missing"' <<<"$trace")"
+  assert_evidence_advisory_equal \
+    "high_impact" "conclusion_disposition" "requested_conclusion_withheld" \
+    "$(jq -r '.prompt.evidence_acquisition.next_steps.selections[-1].conclusion_disposition // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "high_impact" "provider_mode" "blocked" \
     "$(jq -r '.retrieval.prompt_assembly.evidence_provider_mode.mode // "missing"' <<<"$trace")"
@@ -1293,16 +1311,37 @@ run_evidence_advisory_scenario() {
     "high_impact" "dsa_activation_source" "evidence_policy" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
+    "high_impact" "dsa_status" "error" \
+    "$(jq -r '.retrieval.prompt_assembly.dsa.status // "missing"' <<<"$trace")"
+  assert_evidence_advisory_equal \
+    "high_impact" "dsa_error_code" "http_500" \
+    "$(jq -r '.retrieval.prompt_assembly.dsa.error_code // "missing"' <<<"$trace")"
+  assert_evidence_advisory_jq \
+    "high_impact" "acquisition_failure_recorded" "$trace" \
+    '(.prompt.evidence_acquisition.acquisition.dsa_error_codes | length) > 0'
+  assert_evidence_advisory_equal \
     "high_impact" "provider_chat_count" "0" \
     "$(jq -r '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_calls")"
   assert_evidence_advisory_runtime_events \
     "high_impact" "$diagnostics" "$request_id" 1 1 1 1
-  assert_evidence_advisory_dsa_counts "high_impact" "$audit" 1 0 0
+  assert_evidence_advisory_dsa_counts "high_impact" "$audit" 0 0 0
+  assert_evidence_advisory_equal \
+    "high_impact" "targeted_source_attempt_count" "1" \
+    "$(jq -r '[.calls[] | select(.source == "targeted-sheet" and .operation == "google_values")] | length' <<<"$source_calls")"
   assert_evidence_advisory_equal \
     "high_impact" "claim_calibration_event_count" "0" \
     "$(jq -r --arg request_id "$request_id" '[.events[] | select(.event_payload_json.request_id == $request_id and .event_type == "claim_calibration_evaluated")] | length' <<<"$diagnostics")"
+  private_projection="$(jq -cn \
+    --arg response "$(jq -c . <<<"$response")" \
+    --arg trace "$(jq -c . <<<"$trace")" \
+    --arg provider "$(jq -c . <<<"$provider_calls")" \
+    '$response + $trace + $provider')"
+  assert_evidence_advisory_jq \
+    "high_impact" "malformed_private_content_absent" "$private_projection" \
+    'contains("PRIVATE MALFORMED CELL SENTINEL") | not'
   assert_evidence_advisory_persistence \
     "high_impact" "$owner" "$conversation" "$request_id" "$high_impact_answer" 0
+  configure_source_fixture "targeted-sheet" "ready"
   echo "Evidence high-impact block: governance=high_impact_decision provider_calls=0 advisory_layer=0 claims=0"
 
   run_evidence_targeted_scenario
