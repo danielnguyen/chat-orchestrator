@@ -1642,7 +1642,12 @@ def _expansion_attempt_projection(
     return attempt_count, {key: int(value) for key, value in declared_outcomes.items()}
 
 
-def _next_step_selection_is_consistent(selection: dict[str, Any]) -> bool:
+def _next_step_selection_is_consistent(
+    selection: dict[str, Any],
+    *,
+    task_shape: str,
+    sufficiency_status: str,
+) -> bool:
     step = selection["selected_next_step"]
     conclusion = selection["conclusion_disposition"]
     provider = selection["provider_disposition"]
@@ -1684,12 +1689,37 @@ def _next_step_selection_is_consistent(selection: dict[str, Any]) -> bool:
             and guard == "not_applicable"
             and target is not None
         )
+    if step == "disclose_unexamined_scope":
+        return (
+            conclusion == "requested_conclusion_withheld"
+            and provider == "blocked"
+            and (guard == "not_applicable" or blocked_guard)
+            and target is None
+        )
+    if step != "withhold_unsupported_conclusion":
+        return False
+    if (
+        conclusion != "requested_conclusion_withheld"
+        or target is not None
+        or (guard != "not_applicable" and not blocked_guard)
+    ):
+        return False
+    if provider == "blocked":
+        return True
+    reason_codes = selection["reason_codes"]
     return (
-        step in {"disclose_unexamined_scope", "withhold_unsupported_conclusion"}
-        and conclusion == "requested_conclusion_withheld"
-        and provider == "blocked"
-        and (guard == "not_applicable" or blocked_guard)
-        and target is None
+        provider == "allowed"
+        and task_shape == "targeted_lookup"
+        and sufficiency_status in {"insufficient", "unknown"}
+        and "unsupported_conclusion_withheld" in reason_codes
+        and (
+            guard != "unchanged_premise_blocked"
+            or "unchanged_acquisition_premise" in reason_codes
+        )
+        and (
+            guard != "premise_already_attempted"
+            or "acquisition_premise_already_selected" in reason_codes
+        )
     )
 
 
@@ -2185,7 +2215,11 @@ def _diagnose_acquisition_history_projection(
                 selection.get("additional_acquisition_executed"), bool
             ):
                 return reject("next_step_selection_enum_invalid")
-            if not _next_step_selection_is_consistent(selection):
+            if not _next_step_selection_is_consistent(
+                selection,
+                task_shape=task_shape,
+                sufficiency_status=sufficiency["status"],
+            ):
                 return reject("next_step_selection_consistency_invalid")
         final_next_step = (
             selections[-1]["selected_next_step"] if selections else None
