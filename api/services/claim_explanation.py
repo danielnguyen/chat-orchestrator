@@ -993,12 +993,14 @@ def _record_matches_scope(
 @dataclass(frozen=True)
 class AcquisitionHistory:
     task_shape: Literal[
+        "no_acquisition",
         "ordinary_context_augmentation",
         "targeted_lookup",
         "cross_source_comparison",
         "bounded_exhaustive_review",
     ]
     strategy: Literal[
+        "none",
         "context_augmentation",
         "targeted_retrieval",
         "exact_fetch",
@@ -1642,7 +1644,12 @@ def _expansion_attempt_projection(
     return attempt_count, {key: int(value) for key, value in declared_outcomes.items()}
 
 
-def _next_step_selection_is_consistent(selection: dict[str, Any]) -> bool:
+def _next_step_selection_is_consistent(
+    selection: dict[str, Any],
+    *,
+    task_shape: str,
+    sufficiency_status: str,
+) -> bool:
     step = selection["selected_next_step"]
     conclusion = selection["conclusion_disposition"]
     provider = selection["provider_disposition"]
@@ -1684,12 +1691,37 @@ def _next_step_selection_is_consistent(selection: dict[str, Any]) -> bool:
             and guard == "not_applicable"
             and target is not None
         )
+    if step == "disclose_unexamined_scope":
+        return (
+            conclusion == "requested_conclusion_withheld"
+            and provider == "blocked"
+            and (guard == "not_applicable" or blocked_guard)
+            and target is None
+        )
+    if step != "withhold_unsupported_conclusion":
+        return False
+    if (
+        conclusion != "requested_conclusion_withheld"
+        or target is not None
+        or (guard != "not_applicable" and not blocked_guard)
+    ):
+        return False
+    if provider == "blocked":
+        return True
+    reason_codes = selection["reason_codes"]
     return (
-        step in {"disclose_unexamined_scope", "withhold_unsupported_conclusion"}
-        and conclusion == "requested_conclusion_withheld"
-        and provider == "blocked"
-        and (guard == "not_applicable" or blocked_guard)
-        and target is None
+        provider == "allowed"
+        and task_shape == "targeted_lookup"
+        and sufficiency_status in {"insufficient", "unknown"}
+        and "unsupported_conclusion_withheld" in reason_codes
+        and (
+            guard != "unchanged_premise_blocked"
+            or "unchanged_acquisition_premise" in reason_codes
+        )
+        and (
+            guard != "premise_already_attempted"
+            or "acquisition_premise_already_selected" in reason_codes
+        )
     )
 
 
@@ -2035,6 +2067,7 @@ def _diagnose_acquisition_history_projection(
         return reject("context_delivery_status_invalid")
     if (
         ordinary_context
+        and acquisition.get("dsa_outcome") != "not_called"
         and acquisition.get("context_delivery_status") != "retained"
     ):
         return reject("ordinary_delivery_status_invalid")
@@ -2046,10 +2079,31 @@ def _diagnose_acquisition_history_projection(
         return reject("qualification_required_invalid")
     if not isinstance(sufficiency.get("additional_acquisition_required"), bool):
         return reject("additional_acquisition_required_invalid")
-    if ordinary_context and (
+    no_acquisition = bool(
+        ordinary_context and acquisition.get("dsa_outcome") == "not_called"
+    )
+    if no_acquisition:
+        if (
+            inventory_status != "unknown"
+            or any(inventory_counts.values())
+            or suppressed
+            or any(acquisition_counts.values())
+            or any(count for count, _ in identity_values.values())
+            or source_summaries
+            or acquisition.get("dsa_error_codes") != []
+            or acquisition.get("requirement_facts") != []
+            or acquisition.get("context_delivery_status") != "unknown"
+            or acquisition.get("dsa_budget_truncation") is not False
+            or acquisition.get("candidate_truncation") is not False
+            or exact_attempt_count
+            or expansion_attempt_count
+        ):
+            return reject("ordinary_acquisition_invalid")
+    elif ordinary_context and (
         acquisition.get("dsa_outcome") != "success"
         or acquisition.get("dsa_error_codes") != []
         or acquisition.get("requirement_facts") != []
+        or acquisition.get("context_delivery_status") != "retained"
         or acquisition_counts["prompt_retained_item_count"] == 0
         or exact_attempt_count
         or expansion_attempt_count
@@ -2185,7 +2239,11 @@ def _diagnose_acquisition_history_projection(
                 selection.get("additional_acquisition_executed"), bool
             ):
                 return reject("next_step_selection_enum_invalid")
-            if not _next_step_selection_is_consistent(selection):
+            if not _next_step_selection_is_consistent(
+                selection,
+                task_shape=task_shape,
+                sufficiency_status=sufficiency["status"],
+            ):
                 return reject("next_step_selection_consistency_invalid")
         final_next_step = (
             selections[-1]["selected_next_step"] if selections else None
@@ -2261,6 +2319,9 @@ def _diagnose_acquisition_history_projection(
         "failed_sources": identity_values["failed_source_ids"][0],
         **acquisition_counts,
     }
+    if no_acquisition:
+        task_shape = "no_acquisition"
+        strategy = "none"
     history = AcquisitionHistory(
         task_shape=task_shape,
         strategy=strategy,
@@ -2484,6 +2545,24 @@ def _render_acquisition(
     *,
     include_no_new_verification: bool = True,
 ) -> str:
+    if history.task_shape == "no_acquisition":
+        opening = {
+            "checked": "I didn’t run an evidence acquisition for the original answer.",
+            "coverage": (
+                "No evidence acquisition was run for the original answer, so there "
+                "is no checked source scope to describe as complete."
+            ),
+            "gaps": (
+                "No evidence acquisition was run for the original answer, so there "
+                "is no checked source set whose gaps I can enumerate."
+            ),
+        }[question]
+        return (
+            f"{opening}\n\n{_NO_NEW_VERIFICATION}"
+            if include_no_new_verification
+            else opening
+        )
+
     counts = history.counts
     exhaustive = history.task_shape == "bounded_exhaustive_review"
     complete_scope = (

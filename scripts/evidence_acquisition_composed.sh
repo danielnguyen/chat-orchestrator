@@ -531,6 +531,82 @@ assert_provider_free_trace() {
   ' <<<"$trace" >/dev/null
 }
 
+assert_advisory_response_boundary() {
+  local response="$1" guidance="$2"
+  jq -e --arg guidance "$guidance" '
+    .status == "degraded"
+    and .sources == []
+    and .pending_action == null
+    and (.answer | startswith(
+      "I couldn’t verify the requested conclusion from the available evidence.\n\n"
+    ))
+    and ([.answer | scan("Unverified guidance:")] | length) == 1
+    and (.answer | contains("Unverified guidance:\n" + $guidance))
+    and (.answer | endswith(
+      "Treat this as a working direction, not a confirmed result."
+    ))
+  ' <<<"$response" >/dev/null
+}
+
+assert_advisory_manifest() {
+  local manifest="$1" sufficiency_status="$2" reacquisition_guard="$3"
+  jq -e \
+    --arg sufficiency_status "$sufficiency_status" \
+    --arg reacquisition_guard "$reacquisition_guard" '
+      .shape.task_shape == "targeted_lookup"
+      and .sufficiency.status == $sufficiency_status
+      and .next_steps.selections[-1].selected_next_step
+        == "withhold_unsupported_conclusion"
+      and .next_steps.selections[-1].conclusion_disposition
+        == "requested_conclusion_withheld"
+      and .next_steps.selections[-1].provider_disposition == "allowed"
+      and .next_steps.selections[-1].reacquisition_guard == $reacquisition_guard
+      and (.next_steps.selections[-1].reason_codes
+        | index("unsupported_conclusion_withheld")) != null
+      and .acquisition.source_references_retained == []
+    ' <<<"$manifest" >/dev/null
+}
+
+assert_advisory_trace() {
+  local trace="$1" answer="$2" response_digest
+  response_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
+  jq -e --arg response_digest "$response_digest" '
+    .router_decision.selected_model != "not_called"
+    and .router_decision.provider != "none"
+    and .model_call.status == "ok"
+    and (.model_calls | length) == 1
+    and .fallback.triggered == false
+    and .retrieval.prompt_assembly.evidence_provider_mode.mode == "advisory"
+    and .retrieval.prompt_assembly.evidence_provider_mode.advisory_rebuild_count == 1
+    and (.retrieval.prompt_assembly.included_layers
+      | map(select(. == "evidence_advisory_guidance")) | length) == 1
+    and (.retrieval.prompt_assembly.included_layers
+      | index("evidence_response_contract")) == null
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.follow_up.call_count == 0
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+    and .retrieval.prompt_assembly.memory_episode_recall_composition.final_callback_applied == false
+    and .retrieval.prompt_assembly.claim_capture.enabled == false
+    and .prompt.evidence_acquisition.response_digest == $response_digest
+  ' <<<"$trace" >/dev/null
+}
+
+assert_advisory_provider_calls() {
+  local provider_calls="$1" expected_count="${2:-1}"
+  jq -e --argjson expected_count "$expected_count" '
+    ([.calls[] | select(.kind == "chat")] | length) == $expected_count
+    and ([.calls[] | select(.kind == "chat")] | all(.tool_count == 0))
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.role == "system"
+        and (.content | startswith("Evidence advisory guidance:")))]
+      | length) == $expected_count
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | startswith("Governed evidence response contract:"))]
+      | length) == 0
+  ' <<<"$provider_calls" >/dev/null
+}
+
 assert_history_request_boundaries() {
   local conversation_id="$1" response="$2" expected_resolution="$3"
   local request_id trace provider_calls diagnostics audit
@@ -849,7 +925,7 @@ run_evidence_exhaustive_scenarios() {
 
 run_evidence_limitation_and_failure_scenarios() {
   local owner client conversation_id question external response request_id trace
-  local provider_calls manifest diagnostics audit source_calls answer
+  local provider_calls manifest diagnostics audit source_calls answer guidance
 
   owner="owner-evidence-limited"
   client="client-evidence-limited"
@@ -893,7 +969,8 @@ run_evidence_limitation_and_failure_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_provider_answer "PRIVATE PROVIDER SILENCE OVERCLAIM"
+  guidance="Compare the exact artifact identifier with the authoritative record that controls compatibility."
+  queue_provider_answer "$guidance"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-empty")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -904,21 +981,16 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  jq -e '
-    .status == "degraded"
-    and (.answer | contains("requested targeted evidence"))
-    and (.answer | contains("PRIVATE PROVIDER") | not)
-    and (.answer | contains("withholding the requested conclusion"))
-  ' <<<"$response" >/dev/null
+  assert_advisory_response_boundary "$response" "$guidance"
   jq -e '
     .sufficiency.status == "unknown"
     and .acquisition.sources_considered == ["records_primary"]
     and .acquisition.sources_selected == ["records_primary"]
     and .acquisition.item_count == 0
-    and .next_steps.selections[0].selected_next_step == "withhold_unsupported_conclusion"
   ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  assert_provider_free_trace "$trace"
+  assert_advisory_manifest "$manifest" "unknown" "not_applicable"
+  assert_advisory_trace "$trace" "$answer"
+  assert_advisory_provider_calls "$provider_calls"
   assert_dsa_operation_counts "$audit" 1 0 0
   jq -e '
     ([.calls[] | select(
@@ -938,6 +1010,8 @@ run_evidence_limitation_and_failure_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "calendar-alpha" "unavailable"
+  guidance="Compare the exact record identifier with the authoritative record that controls the requested conclusion."
+  queue_provider_answer "$guidance"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-failure")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -948,13 +1022,10 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  jq -e '
-    .status == "degraded"
-    and (.answer | contains("acquisition failed"))
-  ' <<<"$response" >/dev/null
-  jq -e '.sufficiency.status == "insufficient"' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  assert_provider_free_trace "$trace"
+  assert_advisory_response_boundary "$response" "$guidance"
+  assert_advisory_manifest "$manifest" "insufficient" "not_applicable"
+  assert_advisory_trace "$trace" "$answer"
+  assert_advisory_provider_calls "$provider_calls"
   assert_dsa_operation_counts "$audit" 0 0 0
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
@@ -970,7 +1041,7 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
-  case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")" in
+  case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c '[.calls[] | select(.kind == "chat") | .normalized_messages]' <<<"$provider_calls")" in
     *PRIVATE*|*fixture-source-failure*|*credentials*|*Traceback*)
       echo "unavailable source diagnostics exposed private dependency data" >&2
       return 1
@@ -986,6 +1057,8 @@ run_evidence_limitation_and_failure_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "targeted-sheet" "malformed"
+  guidance="Compare the exact record identifier with the authoritative record that controls the requested conclusion."
+  queue_provider_answer "$guidance"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-malformed")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -996,16 +1069,13 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
+  assert_advisory_response_boundary "$response" "$guidance"
   jq -e '
-    .status == "degraded"
-    and (.answer | contains("PRIVATE MALFORMED CELL SENTINEL") | not)
-  ' <<<"$response" >/dev/null
-  jq -e '
-    .sufficiency.status == "insufficient"
-    and (.acquisition.dsa_error_codes | length) > 0
+    (.acquisition.dsa_error_codes | length) > 0
   ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  assert_provider_free_trace "$trace"
+  assert_advisory_manifest "$manifest" "insufficient" "not_applicable"
+  assert_advisory_trace "$trace" "$answer"
+  assert_advisory_provider_calls "$provider_calls"
   assert_dsa_operation_counts "$audit" 0 0 0
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
@@ -1021,7 +1091,7 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
-  case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")" in
+  case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c '[.calls[] | select(.kind == "chat") | .normalized_messages]' <<<"$provider_calls")" in
     *PRIVATE\ MALFORMED\ CELL\ SENTINEL*|*credentials*|*Traceback*)
       echo "malformed source diagnostics exposed private dependency data" >&2
       return 1
@@ -1035,7 +1105,7 @@ run_evidence_limitation_and_failure_scenarios() {
   test "$unauthorized_status" = "401"
   jq -e '.error.code == "unauthorized"' "$unauthorized_response" >/dev/null
   rm -f "$unauthorized_response"
-  echo "Evidence outcomes: limited_provider=1 unknown_provider=0 failed_provider=0 malformed_provider=0 fallback=0 dsa_unauthorized=401"
+  echo "Evidence outcomes: limited_provider=1 unknown_provider=1 failed_provider=1 malformed_provider=1 fallback=0 dsa_unauthorized=401"
 }
 
 run_evidence_clarification_scenario() {
@@ -1086,7 +1156,7 @@ run_evidence_clarification_scenario() {
 
 run_evidence_changed_premise_scenarios() {
   local owner client conversation_id question external response request_id trace
-  local manifest provider_calls diagnostics audit source_calls
+  local manifest provider_calls diagnostics audit source_calls guidance answer
   owner="owner-evidence-followup"
   client="client-evidence-followup"
   question="Verify the follow-up records."
@@ -1172,8 +1242,11 @@ run_evidence_changed_premise_scenarios() {
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
 
   reset_dsa_audit
+  guidance="Compare the exact record identifier and version with the authoritative record that controls the requested conclusion."
+  queue_provider_answer "$guidance"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
   request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
@@ -1181,10 +1254,10 @@ run_evidence_changed_premise_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   jq -e '
-    .router_decision.selected_model == "not_called"
-    and .router_decision.provider == "none"
-    and .router_decision.routing_contract.selected_model == "not_called"
-    and .router_decision.routing_contract.selected_provider == "none"
+    .router_decision.selected_model == "chat_local_fast"
+    and .router_decision.provider == "local"
+    and .router_decision.routing_contract.selected_model == "chat_local_fast"
+    and .router_decision.routing_contract.selected_provider == "local"
     and .router_decision.routing_contract.manual_override_requested == "chat_local_fast"
     and .router_decision.routing_contract.manual_override_applied == true
     and .router_decision.routing_contract.manual_override_rejection_reason == null
@@ -1201,23 +1274,22 @@ run_evidence_changed_premise_scenarios() {
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].provider == "local"
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].max_context_tokens == 16000
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].role == "primary"
-    and .model_call.status == "not_called"
-    and .model_calls == []
+    and .model_call.status == "ok"
+    and (.model_calls | length) == 1
     and .fallback.triggered == false
   ' <<<"$trace" >/dev/null
-  jq -e '
-    .status == "degraded"
-    and (.answer | contains("requested conclusion"))
-    and (.answer | contains("exact follow-up record confirms") | not)
-  ' <<<"$response" >/dev/null
+  assert_advisory_response_boundary "$response" "$guidance"
+  jq -e '(.answer | contains("exact follow-up record confirms") | not)' \
+    <<<"$response" >/dev/null
   jq -e '
     .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
     and .next_steps.selection_count == 1
     and .next_steps.selections[0].reacquisition_guard == "premise_already_attempted"
-    and .next_steps.selections[0].selected_next_step != "perform_additional_acquisition"
     and .next_steps.selections[0].additional_acquisition_executed == false
   ' <<<"$manifest" >/dev/null
+  assert_advisory_manifest "$manifest" "insufficient" "premise_already_attempted"
+  assert_advisory_trace "$trace" "$answer"
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
     echo "Assertion failed: changed_premise.repeated.dsa" >&2
     return 1
@@ -1235,9 +1307,10 @@ run_evidence_changed_premise_scenarios() {
     and ($calls[0].returned_cell_character_count
       == $calls[2].returned_cell_character_count)
   ' <<<"$source_calls" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  assert_advisory_provider_calls "$provider_calls"
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 1 1
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   configure_source_fixture "followup-sheet" "ready"
   restart_orchestrator_with_reserve 2048
@@ -1245,7 +1318,7 @@ run_evidence_changed_premise_scenarios() {
     test "$ALLOW_MANUAL_OVERRIDE" = "false"
     test "$PROMPT_OUTPUT_TOKEN_RESERVE" = "2048"
   '
-  echo "Evidence changed premise: model=chat_local_fast effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=0"
+  echo "Evidence changed premise: model=chat_local_fast effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=1"
 }
 
 run_evidence_adversarial_provider_scenario() {
@@ -2003,12 +2076,15 @@ run_evidence_history_unknown_scenario() {
   local selection_count next_step model_status persistence_counts
   local assistant_count trace_count claim_count
   local sufficiency_flags qualification_required additional_acquisition_required
+  local guidance
   owner="owner-history-unknown"
   client="client-history-unknown"
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  guidance="Compare the exact artifact identifier with the authoritative record that controls compatibility."
+  queue_provider_answer "$guidance"
   conversation_id="$(resolve_conversation "$owner" "$client" "history-unknown")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the zephyr artifact." "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2069,6 +2145,7 @@ run_evidence_history_unknown_scenario() {
 
   assert_jq "history.unknown.original.response_status" "$response" \
     '.status == "degraded"'
+  assert_advisory_response_boundary "$response" "$guidance"
   assert_jq "history.unknown.original.manifest_status" "$manifest" \
     '.status == "unknown"'
   assert_jq "history.unknown.original.shape" "$manifest" '
@@ -2100,16 +2177,21 @@ run_evidence_history_unknown_scenario() {
     and .next_steps.dependency_status == null
     and .next_steps.selections[0].selected_next_step
       == "withhold_unsupported_conclusion"
-    and .next_steps.selections[0].provider_disposition == "blocked"
+    and .next_steps.selections[0].conclusion_disposition
+      == "requested_conclusion_withheld"
+    and .next_steps.selections[0].provider_disposition == "allowed"
     and .next_steps.selections[0].additional_acquisition_executed == false
   '
+  assert_advisory_manifest "$manifest" "unknown" "not_applicable"
   assert_jq "history.unknown.original.provider" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 0'
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_advisory_provider_calls "$provider_calls"
   assert_jq "history.unknown.original.model" "$trace" '
-    .model_call.status == "not_called"
-    and .model_calls == []
+    .model_call.status == "ok"
+    and (.model_calls | length) == 1
     and .fallback.triggered == false
   '
+  assert_advisory_trace "$trace" "$answer"
   assert_jq "history.unknown.original.runtime" "$diagnostics" '
     ([.events[] | select(
       .event_payload_json.request_id == $request_id
@@ -2144,6 +2226,7 @@ run_evidence_history_unknown_scenario() {
   assert_jq "history.unknown.original.persistence" "$persistence_counts" '
     .assistant == "1" and .trace == "1" and .claims == "0"
   '
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What did you not check?" \
     "The original lookup did not establish the requested conclusion." \
@@ -2714,6 +2797,7 @@ run_evidence_compound_scenarios() {
   local owner client conversation_id external original original_request original_answer
   local messages response request_id answer trace manifest original_manifest provider_calls
   local diagnostics audit replacement verification_target expected_task expected_digest
+  local original_guidance guidance expected_advisory
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
 
   owner="owner-evidence-compound"
@@ -2947,12 +3031,16 @@ run_evidence_compound_scenarios() {
   client="client-evidence-compound-attempt"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
+  original_guidance="Compare the exact artifact identifier with the authoritative record that controls compatibility."
+  queue_provider_answer "$original_guidance"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-compound-attempt")"
   original="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the zephyr artifact." "$external")"
   original_answer="$(jq -r '.answer' <<<"$original")"
   messages="$(jq -nc --arg answer "$original_answer" '[{role:"assistant",content:$answer},{role:"user",content:"What did you check? Check again."}]')"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
+  guidance="Compare the exact identifier and authoritative record controlling the requested conclusion."
+  queue_provider_answer "$guidance"
   response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
@@ -2961,24 +3049,34 @@ run_evidence_compound_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
+  expected_advisory="I couldn’t verify the requested conclusion from the available evidence.
+
+Unverified guidance:
+$guidance
+
+Treat this as a working direction, not a confirmed result."
   assert_jq "compound.attempt.response_status" "$response" \
-    '.status == "degraded"'
+    '.status == "degraded" and .sources == [] and .pending_action == null'
   assert_jq "compound.attempt.original_section" "$response" \
     '.answer | startswith("Original acquisition:\n")'
   assert_jq "compound.attempt.attempt_section" "$response" \
     '.answer | contains("\n\nNew verification attempt:\n")'
-  assert_jq "compound.attempt.withheld_conclusion" "$response" \
-    '.answer | contains("requested conclusion")'
+  assert_jq "compound.attempt.advisory_boundary" "$response" '
+    .answer | contains("\n\nNew verification attempt:\n" + $expected)
+  ' --arg expected "$expected_advisory"
   assert_jq "compound.attempt.original_section_count" "$response" \
     '([.answer | scan("Original acquisition:")] | length) == 1'
   assert_jq "compound.attempt.attempt_section_count" "$response" \
     '([.answer | scan("New verification attempt:")] | length) == 1'
   assert_jq "compound.attempt.no_verification_section" "$response" \
     '.answer | contains("\n\nNew verification:\n") | not'
+  assert_jq "compound.attempt.no_unavailable_section" "$response" \
+    '.answer | contains("\n\nNew verification unavailable:\n") | not'
   assert_jq "compound.attempt.sufficiency" "$manifest" \
     '.sufficiency.status == "unknown"'
   assert_jq "compound.attempt.no_additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
+  assert_advisory_manifest "$manifest" "unknown" "not_applicable"
   assert_jq "compound.attempt.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 6
@@ -2990,23 +3088,24 @@ run_evidence_compound_scenarios() {
     '.prompt.claim_explanation.manifest_resolution_status == "resolved"'
   print_compound_claim_capture_state "attempt" "$trace"
   assert_jq "compound.attempt.claim_capture_enabled" "$trace" \
-    '.prompt.claim_capture.enabled == true'
+    '.prompt.claim_capture.enabled == false'
   assert_jq "compound.attempt.claim_capture_status" "$trace" \
     '.prompt.claim_capture.eligibility_status == "ineligible"'
   assert_jq "compound.attempt.claim_capture_reason" "$trace" \
-    '.prompt.claim_capture.reason_code == "compound_verification_response"'
+    '.prompt.claim_capture.reason_code == "disabled"'
   assert_jq "compound.attempt.claim_capture_calls" "$trace" '
     .prompt.claim_capture.runtime_call_count == 0
     and .prompt.claim_capture.storage_call_count == 0
     and .prompt.claim_capture.calibration_status == "not_attempted"
     and .prompt.claim_capture.persistence_status == "not_attempted"
   '
-  if ! assert_provider_free_trace "$trace" >/dev/null 2>&1; then
-    echo "Assertion failed: compound.attempt.provider_free_trace" >&2
+  if ! assert_advisory_trace "$trace" "$answer" >/dev/null 2>&1; then
+    echo "Assertion failed: compound.attempt.advisory_trace" >&2
     return 1
   fi
   assert_jq "compound.attempt.provider_calls" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 0'
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_advisory_provider_calls "$provider_calls"
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
     echo "Assertion failed: compound.attempt.dsa" >&2
     return 1
@@ -3021,6 +3120,11 @@ run_evidence_compound_scenarios() {
     echo "Assertion failed: compound.attempt.claim_calibration" >&2
     return 1
   fi
+  if ! test "$(jq -r '.response_digest' <<<"$manifest")" = \
+    "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"; then
+    echo "Assertion failed: compound.attempt.response_digest" >&2
+    return 1
+  fi
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
     echo "Assertion failed: compound.attempt.answer_persistence" >&2
@@ -3032,7 +3136,7 @@ run_evidence_compound_scenarios() {
     return 1
   fi
   echo "Compound case passed: attempt"
-  echo "Evidence compound: history_resolver=1 fresh_cr_shape=1 fresh_plan=1 fresh_dsa=1 fresh_sufficiency=1 fresh_next_step=1 provider=1 manifest_distinct=1 label_conflict_retry=0 insufficient_provider=0 claims=0"
+  echo "Evidence compound: history_resolver=1 fresh_cr_shape=1 fresh_plan=1 fresh_dsa=1 fresh_sufficiency=1 fresh_next_step=1 provider=1 manifest_distinct=1 label_conflict_retry=0 insufficient_provider=1 claims=0"
 }
 
 run_evidence_scope_reference_scenarios() {
@@ -4237,26 +4341,23 @@ run_history_followup_composed_suite() {
     "$(psql_exec -At -c "SELECT id FROM messages WHERE metadata->>'request_id' = '$first_history_request' LIMIT 1;")"
   echo "H1 chained acquisition and CO restart durability passed"
 
-  # Regression: an ordinary DSA-augmented answer has no governed plan or
-  # sufficiency evaluation, but its exact retained acquisition remains explainable.
-  owner="owner-history-ordinary-dsa"
-  client="client-history-ordinary-dsa"
-  conversation_id="$(resolve_conversation "$owner" "$client" "history-ordinary-dsa")"
+  # Regression: a policy-not-applicable ordinary answer performs no evidence
+  # acquisition and later history explains that no evidence was checked.
+  owner="owner-history-no-acquisition"
+  client="client-history-no-acquisition"
+  conversation_id="$(resolve_conversation "$owner" "$client" "history-no-acquisition")"
   question="What is the migration setting?"
-  answer='Migration: ready
-Setting: bounded
-Cost note: \$1 145.25
-Retained details:
-- Primary migration row
-- Follow-up migration row'
+  answer="The migration setting is ready."
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  configure_google_sheet_worksheet "records_primary" "Form responses 1"
   queue_provider_answer "$answer"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
+  calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
   original_manifest="$(jq -ec '.prompt.evidence_acquisition' <<<"$trace")"
   assistant_message_id="$(
     psql_exec -At -c "SELECT id FROM messages WHERE conversation_id = '$conversation_id' AND role = 'assistant' AND metadata->>'request_id' = '$request_id' ORDER BY created_at DESC LIMIT 1;"
@@ -4265,6 +4366,7 @@ Retained details:
   assert_jq "history.ordinary.original" "$response" '
     .status == "ok"
     and .answer == $answer
+    and ((.answer | contains("Unverified guidance:")) | not)
   ' --arg answer "$answer"
   assert_jq "history.ordinary.manifest" "$original_manifest" '
     .status == "not_applicable"
@@ -4272,49 +4374,48 @@ Retained details:
     and .shape.task_shape == null
     and .plan.plan_status == "not_compiled"
     and .plan.selected_strategies == []
+    and .plan.material_requirement_count == 0
+    and .plan.optional_requirement_count == 0
+    and .plan.limitation_codes == []
     and .acquisition.strategy_attempted == null
-    and .acquisition.dsa_outcome == "success"
-    and .acquisition.item_count >= 2
-    and .acquisition.prompt_retained_item_count >= 2
-    and .acquisition.source_references_returned == [
-      "google_sheets:records_primary:\u0027Form responses 1\u0027!A2:C2",
-      "google_sheets:records_primary:\u0027Form responses 1\u0027!A3:C3"
-    ]
-    and .acquisition.source_references_retained ==
-      .acquisition.source_references_returned
+    and .acquisition.dsa_outcome == "not_called"
+    and .acquisition.dsa_error_codes == []
+    and .acquisition.item_count == 0
+    and .acquisition.usable_item_count == 0
+    and .acquisition.prompt_retained_item_count == 0
+    and .acquisition.sources_considered == []
+    and .acquisition.sources_selected == []
+    and .acquisition.sources_used == []
+    and .acquisition.source_references_returned == []
+    and .acquisition.source_references_retained == []
+    and .acquisition.source_references_attempted == []
+    and .acquisition.source_references_unsuccessful == []
+    and .acquisition.exact_reference_attempt_count == 0
+    and .acquisition.expansion_attempt_count == 0
+    and .acquisition.source_summaries == []
+    and .acquisition.requirement_facts == []
+    and .acquisition.context_delivery_status == "unknown"
+    and .acquisition.dsa_budget_truncation == false
+    and .acquisition.candidate_truncation == false
     and .sufficiency.status == "not_evaluated"
+    and .sufficiency.evaluation_id == null
+    and .sufficiency.reason_codes == []
+    and .sufficiency.answer_constraints == []
+    and .sufficiency.qualification_required == false
+    and .sufficiency.additional_acquisition_required == false
+    and .next_steps.selection_count == 0
+    and .next_steps.selections == []
+    and .next_steps.additional_acquisition_count == 0
+    and .next_steps.initial_attempt == null
+    and .next_steps.dependency_status == null
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
-  assert_jq "history.ordinary.summary_count" "$original_manifest" \
-    '.acquisition.source_summaries | length == 1'
-  assert_jq "history.ordinary.summary_source" "$original_manifest" \
-    '.acquisition.source_summaries[0].source_id == "records_primary"'
-  assert_jq "history.ordinary.summary_display_name" "$original_manifest" \
-    '.acquisition.source_summaries[0].display_name == "Migration Records"'
-  assert_jq "history.ordinary.summary_connector" "$original_manifest" \
-    '.acquisition.source_summaries[0].connector == "google_sheets"'
-  assert_jq "history.ordinary.summary_authority" "$original_manifest" '
-    .acquisition.source_summaries[0].authority_role == "unknown"
-    and .acquisition.source_summaries[0].domain_tags == []
+  assert_jq "history.ordinary.provider" "$calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
   '
-  assert_jq "history.ordinary.summary_association" "$original_manifest" '
-    .acquisition.source_summaries[0].considered == true
-    and .acquisition.source_summaries[0].selected == true
-    and .acquisition.source_summaries[0].used == true
-  '
-  assert_jq "history.ordinary.summary_counts" "$original_manifest" '
-    .acquisition.source_summaries[0].returned_reference_count == 2
-    and .acquisition.source_summaries[0].retained_reference_count == 2
-  '
-  assert_jq "history.ordinary.summary_location" "$original_manifest" '
-    .acquisition.source_summaries[0].safe_location_labels
-      == ["Google Sheets tab “Form responses 1” — A2:C2, A3:C3"]
-  '
-  assert_jq "history.ordinary.summary_reason" "$original_manifest" '
-    .acquisition.source_summaries[0].contribution_reason_codes
-      == ["retained_records_contributed"]
-  '
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_dsa_operation_counts "$audit" 0 0 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
   HISTORY_ORIGINAL_MANIFEST="$original_manifest"
@@ -4324,18 +4425,20 @@ Retained details:
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
   assert_jq "history.ordinary.follow_up" "$response" '
-    (.answer | startswith("I checked:"))
-    and (.answer | contains("Migration Records"))
-    and (.answer | contains("Google Sheets tab “Form responses 1” — A2:C2, A3:C3"))
-    and (.answer | contains("contributed 2 records used in the earlier answer"))
-    and (.answer | contains("not a complete review of every possible source"))
+    .answer == "I didn’t run an evidence acquisition for the original answer.\n\nI didn’t run another search or verification for this explanation."
     and (.answer | endswith("I didn’t run another search or verification for this explanation."))
-    and ((.answer | contains("ordinary external context augmentation")) | not)
-    and ((.answer | contains("delivered to reasoning")) | not)
-    and ((.answer | contains("configured source")) | not)
+    and ((.answer | contains("Migration Records")) | not)
+    and ((.answer | contains("Google Sheets")) | not)
+    and ((.answer | contains("Form responses 1")) | not)
+    and ((.answer | contains("I checked:")) | not)
+    and ((.answer | ascii_downcase | contains("invalid")) | not)
+    and ((.answer | contains("Unverified guidance:")) | not)
   '
-  configure_google_sheet_worksheet "records_primary" "Records"
-  echo "H1 ordinary DSA acquisition association regression passed"
+  assert_jq "history.ordinary.projection" "$HISTORY_TRACE" '
+    .prompt.claim_explanation.manifest_projection_status == "accepted"
+    and .prompt.claim_explanation.manifest_projection_reason == "accepted"
+  '
+  echo "H1 ordinary no-acquisition history regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
   owner="owner-history-h2"

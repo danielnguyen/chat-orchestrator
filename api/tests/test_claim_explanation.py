@@ -41,6 +41,7 @@ VALID_OPAQUE_SOURCE_REFERENCES = [
 ]
 ROOT_MESSAGE_ID = "550e8400-e29b-41d4-a716-446655440001"
 OTHER_ROOT_MESSAGE_ID = "550e8400-e29b-41d4-a716-446655440002"
+ADVISORY_PROVIDER_SENTINEL = "PRIVATE ORIGINAL ADVISORY BODY"
 
 
 def _digest(value: str = ANCHOR) -> str:
@@ -269,6 +270,35 @@ def _ordinary_context_manifest_without_next_steps():
     return manifest
 
 
+def _no_acquisition_manifest():
+    manifest = _ordinary_context_manifest()
+    acquisition = manifest["acquisition"]
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_references_returned",
+        "source_references_retained",
+        "source_references_filtered_or_omitted",
+        "source_references_attempted",
+        "source_references_unsuccessful",
+        "unavailable_source_ids",
+        "failed_source_ids",
+    ):
+        acquisition[field] = []
+    acquisition.update(
+        {
+            "source_summaries": [],
+            "item_count": 0,
+            "usable_item_count": 0,
+            "prompt_retained_item_count": 0,
+            "dsa_outcome": "not_called",
+            "context_delivery_status": "unknown",
+        }
+    )
+    return manifest
+
+
 def _hybrid_manifest(
     *,
     task_shape="cross_source_comparison",
@@ -457,8 +487,14 @@ def _set_path(value, path, replacement):
         _manifest(strategy="exact_fetch"),
         _hybrid_manifest(),
         _hybrid_manifest(task_shape="bounded_exhaustive_review"),
+        _hybrid_manifest(status="insufficient"),
+        _hybrid_manifest(
+            task_shape="bounded_exhaustive_review",
+            status="unknown",
+        ),
         _ordinary_context_manifest(),
         _ordinary_context_manifest_without_next_steps(),
+        _no_acquisition_manifest(),
         _suppressed_trace()["prompt"]["evidence_acquisition"],
     ],
 )
@@ -913,6 +949,150 @@ def test_ordinary_context_history_reports_checked_scope_without_claiming_suffici
         assert internal_term not in answer
 
 
+def test_no_acquisition_manifest_projects_as_distinct_valid_history():
+    diagnosed = _diagnose_acquisition_history_projection(
+        _no_acquisition_manifest()
+    )
+
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history is not None
+    assert diagnosed.history.task_shape == "no_acquisition"
+    assert diagnosed.history.strategy == "none"
+    assert diagnosed.history.sufficiency_status == "not_evaluated"
+    assert diagnosed.history.source_summaries == ()
+    assert diagnosed.history.counts["sources_considered"] == 0
+    assert diagnosed.history.counts["references_retained"] == 0
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        (
+            "checked",
+            "I didn’t run an evidence acquisition for the original answer.\n\n"
+            "I didn’t run another search or verification for this explanation.",
+        ),
+        (
+            "coverage",
+            "No evidence acquisition was run for the original answer, so there is "
+            "no checked source scope to describe as complete.\n\n"
+            "I didn’t run another search or verification for this explanation.",
+        ),
+        (
+            "gaps",
+            "No evidence acquisition was run for the original answer, so there is "
+            "no checked source set whose gaps I can enumerate.\n\n"
+            "I didn’t run another search or verification for this explanation.",
+        ),
+    ],
+)
+def test_no_acquisition_history_renders_bounded_explanation(question, expected):
+    history = _project_acquisition_history(_no_acquisition_manifest())
+
+    assert history is not None
+    answer = _render_acquisition(history, question)
+
+    assert answer == expected
+    for prohibited in (
+        ADVISORY_PROVIDER_SENTINEL,
+        "Unverified guidance:",
+        "source-a",
+        "provider_disposition",
+    ):
+        assert prohibited not in answer
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        (
+            lambda manifest: manifest["acquisition"][
+                "source_references_retained"
+            ].append("source-a:record-1"),
+            "retained_count_exceeds_returned",
+        ),
+        (
+            lambda manifest: manifest["acquisition"].update(
+                {"prompt_retained_item_count": 1}
+            ),
+            "prompt_retained_count_exceeds_usable_count",
+        ),
+        (
+            lambda manifest: manifest["acquisition"]["source_summaries"].append(
+                {
+                    "source_id": "source-a",
+                    "display_name": "Source a",
+                    "connector": "unknown",
+                    "authority_role": "unknown",
+                    "domain_tags": [],
+                    "considered": False,
+                    "selected": False,
+                    "used": False,
+                    "returned_reference_count": 0,
+                    "retained_reference_count": 0,
+                    "safe_location_labels": [],
+                    "contribution_reason_codes": [],
+                }
+            ),
+            "source_summaries_invalid",
+        ),
+        (
+            lambda manifest: manifest["plan"].update(
+                {"plan_id": "plan-1", "plan_status": "ready"}
+            ),
+            "ordinary_plan_invalid",
+        ),
+        (
+            lambda manifest: manifest["sufficiency"].update(
+                {
+                    "evaluation_id": "evaluation-1",
+                    "status": "unknown",
+                }
+            ),
+            "ordinary_sufficiency_invalid",
+        ),
+        (
+            lambda manifest: manifest["next_steps"].update(
+                {
+                    "selection_count": 1,
+                    "selections": [{"selected_next_step": "answer_within_declared_scope"}],
+                }
+            ),
+            "ordinary_next_steps_invalid",
+        ),
+        (
+            lambda manifest: (
+                manifest["acquisition"].update(
+                    {
+                        "sources_considered": [],
+                        "sources_selected": [],
+                        "sources_used": [],
+                        "source_references_returned": [],
+                        "source_references_retained": [],
+                        "item_count": 0,
+                        "usable_item_count": 0,
+                        "prompt_retained_item_count": 0,
+                    }
+                )
+            ),
+            "ordinary_acquisition_invalid",
+        ),
+    ],
+)
+def test_mixed_ordinary_history_forms_are_rejected(mutation, expected_reason):
+    manifest = (
+        _ordinary_context_manifest()
+        if expected_reason == "ordinary_acquisition_invalid"
+        else _no_acquisition_manifest()
+    )
+    mutation(manifest)
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == expected_reason
+
+
 @pytest.mark.parametrize(
     (
         "selected_next_step",
@@ -1170,6 +1350,203 @@ def _additional_acquisition_selection():
 
 def _answer_selection():
     return copy.deepcopy(_hybrid_manifest()["next_steps"]["selections"][0])
+
+
+def _advisory_manifest(
+    *,
+    status="unknown",
+    task_shape="targeted_lookup",
+    selected_next_step="withhold_unsupported_conclusion",
+    provider_disposition="allowed",
+    reacquisition_guard="not_applicable",
+    clarification_target=None,
+    reason_codes=None,
+    additional_acquisition_executed=False,
+):
+    if task_shape == "targeted_lookup":
+        manifest = _manifest(
+            status=status,
+            response_digest=_response_digest(ADVISORY_PROVIDER_SENTINEL),
+        )
+        if status in {"insufficient", "unknown"}:
+            acquisition = manifest["acquisition"]
+            acquisition.update(
+                {
+                    "sources_used": [],
+                    "source_references_returned": [],
+                    "source_references_retained": [],
+                    "source_references_filtered_or_omitted": [],
+                    "item_count": 0,
+                    "usable_item_count": 0,
+                    "prompt_retained_item_count": 0,
+                    "context_delivery_status": "unknown",
+                }
+            )
+    else:
+        manifest = _hybrid_manifest(task_shape=task_shape, status=status)
+        manifest["response_digest"] = _response_digest(ADVISORY_PROVIDER_SENTINEL)
+
+    manifest["sufficiency"].update(
+        {
+            "qualification_required": status in {"insufficient", "unknown"},
+            "additional_acquisition_required": status in {"insufficient", "unknown"},
+        }
+    )
+    manifest["next_steps"] = {
+        "selection_count": 1,
+        "selections": [
+            {
+                "selection_id": "selection-advisory",
+                "evaluation_id": "evaluation-advisory",
+                "evidence_plan_id": "plan-advisory",
+                "acquisition_manifest_id": "manifest-advisory",
+                "selected_next_step": selected_next_step,
+                "conclusion_disposition": "requested_conclusion_withheld",
+                "provider_disposition": provider_disposition,
+                "reacquisition_guard": reacquisition_guard,
+                "clarification_target": clarification_target,
+                "reason_codes": sorted(
+                    reason_codes
+                    if reason_codes is not None
+                    else ["unsupported_conclusion_withheld"]
+                ),
+                "additional_acquisition_executed": (
+                    additional_acquisition_executed
+                ),
+            }
+        ],
+        "additional_acquisition_count": int(additional_acquisition_executed),
+        "initial_attempt": (
+            _initial_attempt() if additional_acquisition_executed else None
+        ),
+        "dependency_status": None,
+    }
+    return manifest
+
+
+@pytest.mark.parametrize("status", ["unknown", "insufficient"])
+def test_targeted_advisory_manifest_projects_for_nonterminal_sufficiency(status):
+    diagnosed = _diagnose_acquisition_history_projection(
+        _advisory_manifest(status=status)
+    )
+
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history is not None
+    assert diagnosed.history.task_shape == "targeted_lookup"
+    assert diagnosed.history.sufficiency_status == status
+    assert diagnosed.history.final_next_step == "withhold_unsupported_conclusion"
+
+
+def test_targeted_blocked_withheld_manifest_remains_accepted():
+    diagnosed = _diagnose_acquisition_history_projection(
+        _advisory_manifest(
+            provider_disposition="blocked",
+            reason_codes=["bounded_policy_result"],
+        )
+    )
+
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history is not None
+    assert diagnosed.history.final_next_step == "withhold_unsupported_conclusion"
+
+
+@pytest.mark.parametrize(
+    ("reacquisition_guard", "reason_codes"),
+    [
+        (
+            "unchanged_premise_blocked",
+            [
+                "unchanged_acquisition_premise",
+                "unsupported_conclusion_withheld",
+            ],
+        ),
+        (
+            "premise_already_attempted",
+            [
+                "acquisition_premise_already_selected",
+                "unsupported_conclusion_withheld",
+            ],
+        ),
+    ],
+)
+def test_targeted_advisory_manifest_projects_for_exhausted_premise(
+    reacquisition_guard,
+    reason_codes,
+):
+    diagnosed = _diagnose_acquisition_history_projection(
+        _advisory_manifest(
+            status="insufficient",
+            reacquisition_guard=reacquisition_guard,
+            reason_codes=reason_codes,
+        )
+    )
+
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history is not None
+    assert diagnosed.history.task_shape == "targeted_lookup"
+    assert diagnosed.history.sufficiency_status == "insufficient"
+    assert diagnosed.history.final_next_step == "withhold_unsupported_conclusion"
+
+
+def test_targeted_advisory_history_renders_limitation_without_provider_guidance():
+    first = _diagnose_acquisition_history_projection(_advisory_manifest())
+    second = _diagnose_acquisition_history_projection(_advisory_manifest())
+
+    assert first.reason == second.reason == "accepted"
+    assert first.history == second.history
+    assert first.history is not None
+    answer = _render_acquisition(first.history, "checked")
+    assert "The original lookup did not establish the requested conclusion." in answer
+    assert "I didn’t run another search or verification for this explanation." in answer
+    assert "Unverified guidance:" not in answer
+    assert ADVISORY_PROVIDER_SENTINEL not in answer
+    assert "provider disposition" not in answer.lower()
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        _advisory_manifest(task_shape="cross_source_comparison"),
+        _advisory_manifest(task_shape="bounded_exhaustive_review"),
+        _advisory_manifest(status="sufficient_for_declared_scope"),
+        _advisory_manifest(status="sufficient_with_limitations"),
+        _advisory_manifest(
+            status="insufficient",
+            selected_next_step="disclose_unexamined_scope",
+            reason_codes=["unexamined_material_scope"],
+        ),
+        _advisory_manifest(clarification_target="question_scope"),
+        _advisory_manifest(reacquisition_guard="changed_premise_allowed"),
+        _advisory_manifest(additional_acquisition_executed=True),
+        _advisory_manifest(reason_codes=[]),
+        _advisory_manifest(
+            reacquisition_guard="unchanged_premise_blocked",
+            reason_codes=["unsupported_conclusion_withheld"],
+        ),
+        _advisory_manifest(
+            reacquisition_guard="premise_already_attempted",
+            reason_codes=["unsupported_conclusion_withheld"],
+        ),
+    ],
+    ids=[
+        "cross-source-comparison",
+        "bounded-exhaustive-review",
+        "sufficient",
+        "sufficient-with-limitations",
+        "unexamined-scope-disclosure",
+        "clarification-target",
+        "changed-premise-pending",
+        "additional-acquisition-executed",
+        "missing-withheld-reason",
+        "unchanged-premise-missing-reason",
+        "already-attempted-missing-reason",
+    ],
+)
+def test_advisory_history_projection_rejects_broadened_authority(manifest):
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "next_step_selection_consistency_invalid"
 
 
 def _changed_followup_manifest():
@@ -3759,6 +4136,59 @@ async def test_immediate_acquisition_reuses_strict_projection_and_renderer(
     assert outcome.status == "ok"
     assert expected in outcome.answer
     assert outcome.trace["manifest_projection_status"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_immediate_no_acquisition_record_is_accepted_without_provider_replay():
+    digest = _response_digest("full assistant response")
+    manifest = _no_acquisition_manifest()
+    manifest["assistant_message_id"] = ROOT_MESSAGE_ID
+    manifest["response_digest"] = digest
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            kind="acquisition",
+            record={
+                "record_kind": "acquisition",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": None,
+                "acquisition_record": {
+                    "original_request_id": "original-request",
+                    "assistant_message_id": ROOT_MESSAGE_ID,
+                    "surface": "vscode",
+                    "trace_status": "ok",
+                    "response_digest": digest,
+                    "normalized_first_paragraph": ADVISORY_PROVIDER_SENTINEL,
+                    "acquisition_manifest": manifest,
+                },
+            },
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(
+            intent="acquisition_checked",
+            explanation_kind="acquisition",
+            acquisition_question="checked",
+        ),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.handled is True
+    assert outcome.status == "ok"
+    assert outcome.answer == (
+        "I didn’t run an evidence acquisition for the original answer.\n\n"
+        "I didn’t run another search or verification for this explanation."
+    )
+    assert outcome.trace["manifest_projection_status"] == "accepted"
+    assert outcome.trace["manifest_projection_reason"] == "accepted"
+    assert outcome.trace["provider_call_count"] == 0
+    assert ADVISORY_PROVIDER_SENTINEL not in outcome.answer
+    assert len(store.calls) == 1
 
 
 @pytest.mark.asyncio

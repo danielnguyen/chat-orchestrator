@@ -36,6 +36,7 @@ from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
     MALFORMED_EVIDENCE_RESPONSE,
+    NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
     EvidenceAcquisitionPremise,
     _acquisition_premise_digest,
@@ -1006,7 +1007,11 @@ class FakeRuntime:
         if self.evidence_shape_error is not None:
             raise self.evidence_shape_error
         if self.evidence_shape_response is not None:
-            return self.evidence_shape_response
+            return (
+                self.evidence_shape_response(kwargs)
+                if callable(self.evidence_shape_response)
+                else self.evidence_shape_response
+            )
         question = " ".join(kwargs["task_text"].split())
         digest = f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
         return {
@@ -13414,6 +13419,39 @@ def _derived_shape_response(
     }
 
 
+def _not_applicable_shape_response(call) -> dict[str, object]:
+    question = " ".join(call["task_text"].split())
+    return {
+        **{
+            key: call[key]
+            for key in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "runtime_session_id",
+                "runtime_turn_id",
+            )
+        },
+        "result": {
+            "derivation_id": "evidence_shape_ordinary",
+            "question_anchor": question,
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
+            "derivation_status": "not_applicable",
+            "task_shape": None,
+            "candidate_task_shapes": [],
+            "evidence_scope_material": False,
+            "clarification_required": False,
+            "reason_codes": [
+                "ordinary_chat_without_material_evidence_scope"
+            ],
+            "user_safe_summary": "Evidence acquisition is not required.",
+        },
+    }
+
+
 async def _run_governed_context_case(
     *,
     tmp_path,
@@ -14742,25 +14780,28 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
 
 
 @pytest.mark.asyncio
-async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
+async def test_evidence_next_step_already_attempted_guard_prevents_exact_fetch(
     tmp_path,
     monkeypatch,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
 
-    def unchanged_guard(call):
+    def exhausted_guard(call):
         return _next_step_response_from_call(
             call,
             status="insufficient",
             selected_next_step="withhold_unsupported_conclusion",
             conclusion_disposition="requested_conclusion_withheld",
             provider_disposition="blocked",
-            reacquisition_guard="unchanged_premise_blocked",
-            reason_codes=["unchanged_acquisition_premise"],
+            reacquisition_guard="premise_already_attempted",
+            reason_codes=[
+                "acquisition_premise_already_selected",
+                "unsupported_conclusion_withheld",
+            ],
         )
 
-    runtime = FakeRuntime(evidence_next_step_response=unchanged_guard)
+    runtime = FakeRuntime(evidence_next_step_response=exhausted_guard)
     dsa = FakeDSA(
         response=_governed_context_pack(question),
         fetch_responses=[
@@ -14815,7 +14856,7 @@ async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id="rid-evidence-next-step-unchanged",
+        request_id="rid-evidence-next-step-already-attempted",
     )
 
     _assert_material_gap_answer(
@@ -14831,24 +14872,14 @@ async def test_evidence_next_step_unchanged_guard_prevents_exact_fetch(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "guard,reason_code",
-    [
-        ("unchanged_premise_blocked", "unchanged_acquisition_premise"),
-        (
-            "premise_already_attempted",
-            "acquisition_premise_already_selected",
-        ),
-    ],
-)
 async def test_evidence_next_step_guarded_partial_is_provider_and_fetch_free(
     tmp_path,
     monkeypatch,
-    guard,
-    reason_code,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
+    guard = "premise_already_attempted"
+    reason_code = "acquisition_premise_already_selected"
 
     def guarded_partial(call):
         return _next_step_response_from_call(
@@ -16743,7 +16774,7 @@ async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_deli
 
 
 @pytest.mark.asyncio
-async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_provider_path(
+async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordinary_provider_path(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -16795,13 +16826,14 @@ async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_pr
 
     assert out["answer"] == "A bounded joke."
     assert dsa.list_calls == []
-    assert len(dsa.calls) == 1
+    assert dsa.calls == []
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert len(litellm.calls) == 1
     provider_prompt = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
-    assert "External source context:" in provider_prompt
-    assert "The maintenance record lists 2025-07-12." in provider_prompt
+    assert "External source context:" not in provider_prompt
+    assert "Governed evidence response contract:" not in provider_prompt
+    assert "Unverified guidance" not in provider_prompt
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
     ]
@@ -16815,10 +16847,8 @@ async def test_evidence_acquisition_not_applicable_preserves_existing_dsa_and_pr
     }
     assert manifest["plan"]["plan_status"] == "not_compiled"
     assert manifest["sufficiency"]["status"] == "not_evaluated"
-    assert manifest["acquisition"]["dsa_outcome"] == "success"
-    assert manifest["acquisition"]["source_references_retained"] == [
-        "vehicle_log_primary:record_1"
-    ]
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+    assert manifest["acquisition"]["source_references_retained"] == []
     assert "The maintenance record lists" not in json.dumps(
         manifest,
         sort_keys=True,
@@ -17512,16 +17542,42 @@ async def test_evidence_acquisition_exact_fetch_plan_without_references_fails_cl
 
 
 @pytest.mark.asyncio
-async def test_evidence_acquisition_request_without_external_opt_in_is_ineligible(
+async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_policy(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
-    runtime = FakeRuntime()
+    question = "Explain the maintenance schedule."
+    runtime = FakeRuntime(
+        evidence_shape_response={
+            "request_id": "rid-evidence-not-opted-in",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "node_red",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "result": {
+                "derivation_id": "evidence_shape_ordinary",
+                "question_anchor": question,
+                "question_anchor_digest": (
+                    f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+                ),
+                "derivation_status": "not_applicable",
+                "task_shape": None,
+                "candidate_task_shapes": [],
+                "evidence_scope_material": False,
+                "clarification_required": False,
+                "reason_codes": [
+                    "ordinary_chat_without_material_evidence_scope"
+                ],
+                "user_safe_summary": "Evidence acquisition is not required.",
+            },
+        }
+    )
     dsa = FakeDSA()
     litellm = FakeLiteLLM(content="Ordinary answer.")
 
     out = await orchestrate_chat(
-        payload=_first_party_chat_payload("Explain the maintenance schedule."),
+        payload=_first_party_chat_payload(question),
         memory_store=FakeMemoryStore(),
         litellm=litellm,
         runtime=runtime,
@@ -17536,12 +17592,69 @@ async def test_evidence_acquisition_request_without_external_opt_in_is_ineligibl
     )
 
     assert out["answer"] == "Ordinary answer."
-    assert runtime.evidence_shape_calls == []
+    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_shape_calls[0]["task_text"] == question
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert dsa.list_calls == []
     assert dsa.calls == []
     assert len(litellm.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Explain how a climate control module works.",
+        "Write a compatibility checklist.",
+        "Tell me a joke about incompatible components.",
+    ],
+)
+async def test_ordinary_turns_use_shape_gate_and_never_call_dsa_without_opt_in(
+    tmp_path,
+    question,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime(
+        evidence_shape_response=_not_applicable_shape_response
+    )
+    dsa = FakeDSA()
+    provider = FakeLiteLLM(content="Ordinary answer.")
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(question),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-ordinary-shape-gate",
+    )
+
+    assert result["answer"] == "Ordinary answer."
+    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert runtime.evidence_next_step_calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert len(provider.calls) == 1
+    prompt_text = "\n".join(
+        message["content"] for message in provider.calls[0]["messages"]
+    )
+    assert "Evidence advisory guidance:" not in prompt_text
+    assert "Governed evidence response contract:" not in prompt_text
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["dsa"]["activation_source"] == "evidence_policy"
+    assert trace["dsa"]["called"] is False
 
 
 def _route_files_with_fallback(tmp_path):
@@ -17575,6 +17688,447 @@ def _route_files_with_fallback(tmp_path):
 
 def _text_completion(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"content": content}}]}
+
+
+@pytest.mark.asyncio
+async def test_verification_dependent_request_without_opt_in_uses_grounded_path(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Is this capability implemented in the current code?"
+    context_pack = _governed_context_pack(question)
+    excerpt = context_pack["items"][0]["text"]
+    provider = FakeLiteLLM(
+        content=_evidence_candidate(
+            ("vehicle_log_primary:record_1", excerpt)
+        )
+    )
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=context_pack)
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(question),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-grounded-policy-admission",
+    )
+
+    assert result["status"] == "ok"
+    assert result["answer"] == _rendered_evidence_answer(excerpt)
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert len(dsa.list_calls) == 1
+    assert len(dsa.calls) == 1
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] == []
+    prompt_text = "\n".join(
+        message["content"] for message in provider.calls[0]["messages"]
+    )
+    assert "Governed evidence response contract:" in prompt_text
+    assert "Evidence advisory guidance:" not in prompt_text
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["dsa"]["activation_source"] == "evidence_policy"
+    assert trace["retrieval"]["prompt_assembly"]["evidence_provider_mode"][
+        "mode"
+    ] == "grounded"
+
+
+async def _run_advisory_evidence_case(
+    tmp_path,
+    monkeypatch,
+    *,
+    sufficiency_status: str,
+    provider_content: str,
+    fail_first: bool = False,
+    fail_advisory_prompt: bool = False,
+):
+    attempt_kind = (
+        "prompt-budget"
+        if fail_advisory_prompt
+        else "fallback"
+        if fail_first
+        else "primary"
+    )
+    request_id = f"rid-advisory-{sufficiency_status}-{attempt_kind}"
+    question = "Will this part fit?"
+    rules, models = (
+        _route_files_with_fallback(tmp_path)
+        if fail_first
+        else _write_default_route_files(tmp_path)
+    )
+    context_pack = _governed_context_pack(question)
+    if sufficiency_status == "unknown":
+        context_pack["items"] = []
+        context_pack["sources_used"] = []
+        context_pack["budget"]["returned_results"] = 0
+        context_pack["diagnostics"]["selected_source_ids"] = []
+        context_pack["diagnostics"]["candidate_counts_by_source"] = {}
+    elif sufficiency_status == "insufficient":
+        original_assemble_prompt = orchestrate_service.assemble_prompt
+
+        def omit_external_evidence(**kwargs):
+            prompt = original_assemble_prompt(**kwargs)
+            if not kwargs.get("evidence_response_contract"):
+                return prompt
+            trace = copy.deepcopy(prompt.trace)
+            for layer in trace["layers"]:
+                if layer.get("name") == "external_source_context":
+                    layer["included"] = False
+                    layer["message_count"] = 0
+                    layer["metadata"]["source_refs"] = []
+            return replace(
+                prompt,
+                messages=[
+                    message
+                    for message in prompt.messages
+                    if "External source context:" not in message["content"]
+                ],
+                trace=trace,
+            )
+
+        monkeypatch.setattr(
+            orchestrate_service,
+            "assemble_prompt",
+            omit_external_evidence,
+        )
+    else:
+        raise AssertionError("unsupported advisory fixture status")
+
+    if fail_advisory_prompt:
+        original_assemble_prompt = orchestrate_service.assemble_prompt
+
+        def reject_advisory_prompt(**kwargs):
+            if kwargs.get("evidence_advisory_guidance") is True:
+                raise orchestrate_service.PromptBudgetError(
+                    "required_prompt_content_exceeds_budget",
+                    {
+                        "failure_reason": (
+                            "required_prompt_content_exceeds_budget"
+                        ),
+                        "omission_or_truncation_occurred": True,
+                    },
+                )
+            return original_assemble_prompt(**kwargs)
+
+        monkeypatch.setattr(
+            orchestrate_service,
+            "assemble_prompt",
+            reject_advisory_prompt,
+        )
+
+    def advisory_next_step(call):
+        return _next_step_response_from_call(
+            call,
+            status=sufficiency_status,
+            selected_next_step="withhold_unsupported_conclusion",
+            conclusion_disposition="requested_conclusion_withheld",
+            provider_disposition="allowed",
+            reason_codes=["unsupported_conclusion_withheld"],
+        )
+
+    runtime = FakeRuntime(evidence_next_step_response=advisory_next_step)
+    dsa = FakeDSA(response=context_pack)
+    memory_store = FakeMemoryStore()
+    provider = FakeLiteLLM(
+        fail_first=fail_first,
+        content=provider_content,
+    )
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(question),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return result, memory_store, runtime, provider, dsa
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sufficiency_status", "provider_content"),
+    [
+        (
+            "insufficient",
+            "Compare the exact identifiers and the controlling compatibility record.",
+        ),
+        ("unknown", "It is definitely compatible and confirmed."),
+    ],
+)
+async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_useful(
+    tmp_path,
+    monkeypatch,
+    sufficiency_status,
+    provider_content,
+):
+    result, memory_store, runtime, provider, dsa = (
+        await _run_advisory_evidence_case(
+            tmp_path,
+            monkeypatch,
+            sufficiency_status=sufficiency_status,
+            provider_content=provider_content,
+        )
+    )
+    expected = (
+        "I couldn’t verify the requested conclusion from the available evidence.\n\n"
+        f"Unverified guidance:\n{provider_content}\n\n"
+        "Treat this as a working direction, not a confirmed result."
+    )
+
+    assert result == {
+        "request_id": f"rid-advisory-{sufficiency_status}-primary",
+        "conversation_id": "conv-1",
+        "profile_name": "dev",
+        "selected_model": "gpt-4o-mini",
+        "answer": expected,
+        "status": "degraded",
+        "sources": [],
+    }
+    assert len(runtime.interaction_governance_calls) == 1
+    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_shape_calls[0]["interaction_kind"] == "question"
+    assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
+        "evidence_shape"
+    )
+    assert runtime.call_order.index("evidence_shape") < runtime.call_order.index(
+        "evidence_plan"
+    )
+    assert runtime.call_order.index("evidence_plan") < runtime.call_order.index(
+        "evidence_sufficiency"
+    )
+    assert runtime.call_order.index("evidence_sufficiency") < runtime.call_order.index(
+        "evidence_next_step"
+    )
+    assert len(dsa.list_calls) == 1
+    assert len(dsa.calls) == 1
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] == []
+    prompt_text = "\n".join(
+        message["content"] for message in provider.calls[0]["messages"]
+    )
+    assert prompt_text.count("Evidence advisory guidance:") == 1
+    assert "Governed evidence response contract:" not in prompt_text
+    assert "External source context:" not in prompt_text
+    assistant_messages = [
+        message
+        for message in memory_store.added_messages
+        if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == expected
+    assert memory_store.claim_record_calls == []
+    assert runtime.claim_calibration_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    manifest = prompt_trace["evidence_acquisition"]
+    assert trace["dsa"]["activation_source"] == "evidence_policy"
+    assert prompt_trace["evidence_provider_mode"] == {
+        "mode": "advisory",
+        "advisory_rebuild_count": 1,
+        "reason": "runtime_policy_permission",
+    }
+    assert prompt_trace["included_layers"].count(
+        "evidence_advisory_guidance"
+    ) == 1
+    assert "evidence_response_contract" not in prompt_trace["included_layers"]
+    assert prompt_trace["capabilities"]["executor_call_count"] == 0
+    assert prompt_trace["capabilities"]["dispatch_completed"] is False
+    assert prompt_trace["capabilities"]["action_summary"]["attempted"] is False
+    assert prompt_trace["memory_episode_recall_composition"][
+        "final_callback_applied"
+    ] is False
+    assert prompt_trace["claim_capture"]["enabled"] is False
+    assert manifest["acquisition"]["source_references_retained"] == []
+    assert manifest["next_steps"]["selections"][-1][
+        "provider_disposition"
+    ] == "allowed"
+    assert manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(expected.encode()).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_advisory_empty_provider_body_uses_deterministic_guidance(
+    tmp_path,
+    monkeypatch,
+):
+    result, _, _, provider, _ = await _run_advisory_evidence_case(
+        tmp_path,
+        monkeypatch,
+        sufficiency_status="unknown",
+        provider_content="   ",
+    )
+
+    assert len(provider.calls) == 1
+    assert "Unverified guidance:\nThe next useful step is to compare the exact " in result[
+        "answer"
+    ]
+    assert result["answer"].endswith(
+        "Treat this as a working direction, not a confirmed result."
+    )
+
+
+@pytest.mark.asyncio
+async def test_advisory_fallback_reuses_identical_prompt_and_zero_tools(
+    tmp_path,
+    monkeypatch,
+):
+    body = "Compare the exact version facts before relying on the result."
+    result, memory_store, _, provider, _ = await _run_advisory_evidence_case(
+        tmp_path,
+        monkeypatch,
+        sufficiency_status="unknown",
+        provider_content=body,
+        fail_first=True,
+    )
+
+    assert result["status"] == "degraded"
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["messages"] == provider.calls[1]["messages"]
+    assert provider.calls[0]["tools"] == provider.calls[1]["tools"] == []
+    assert result["answer"] == (
+        "I couldn’t verify the requested conclusion from the available evidence.\n\n"
+        f"Unverified guidance:\n{body}\n\n"
+        "Treat this as a working direction, not a confirmed result."
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    assert prompt_trace["provider_fallback_context"][
+        "same_sanitized_messages_reused"
+    ] is True
+    assert prompt_trace["provider_fallback_context"]["prompt_fingerprint"] == (
+        prompt_trace["provider_prompt"]["fingerprint"]
+    )
+    assert trace["model_calls"][0]["prompt_fingerprint"] == trace["model_calls"][1][
+        "prompt_fingerprint"
+    ]
+    assert len(
+        [
+            message
+            for message in memory_store.added_messages
+            if message["role"] == "assistant"
+        ]
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_advisory_prompt_budget_failure_preserves_authoritative_trace(
+    tmp_path,
+    monkeypatch,
+):
+    result, memory_store, _, provider, _ = await _run_advisory_evidence_case(
+        tmp_path,
+        monkeypatch,
+        sufficiency_status="unknown",
+        provider_content="PROVIDER MUST NOT BE CALLED",
+        fail_advisory_prompt=True,
+    )
+
+    assert result == {
+        "request_id": "rid-advisory-unknown-prompt-budget",
+        "conversation_id": "conv-1",
+        "profile_name": "dev",
+        "selected_model": "not_called",
+        "answer": NEXT_STEP_DEPENDENCY_ANSWER,
+        "status": "degraded",
+        "sources": [],
+    }
+    assert provider.calls == []
+    assert "Unverified guidance:" not in result["answer"]
+    assistant_messages = [
+        message
+        for message in memory_store.added_messages
+        if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == NEXT_STEP_DEPENDENCY_ANSWER
+    assert memory_store.claim_record_calls == []
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    assert trace["model_calls"] == []
+    assert prompt_trace["evidence_provider_mode"] == {
+        "mode": "blocked",
+        "advisory_rebuild_count": 1,
+        "reason": "prompt_budget_failure",
+    }
+    assert prompt_trace["provider_prompt"]["message_count"] == 0
+    assert prompt_trace["capabilities"]["executor_call_count"] == 0
+    assert prompt_trace["capabilities"]["dispatch_completed"] is False
+    assert prompt_trace["capabilities"]["follow_up"]["call_count"] == 0
+    assert prompt_trace["capabilities"]["action_summary"]["attempted"] is False
+    assert prompt_trace["claim_capture"]["enabled"] is False
+    manifest = prompt_trace["evidence_acquisition"]
+    assert manifest["response_digest"] == (
+        "sha256:"
+        + hashlib.sha256(NEXT_STEP_DEPENDENCY_ANSWER.encode()).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_impact_targeted_verification_remains_provider_blocked(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime()
+    runtime.interaction_governance_response["result"][
+        "interaction_kind"
+    ] = "high_impact_decision"
+    context_pack = _governed_context_pack("Will this part fit?")
+    context_pack["items"] = []
+    context_pack["sources_used"] = []
+    context_pack["budget"]["returned_results"] = 0
+    context_pack["diagnostics"]["selected_source_ids"] = []
+    context_pack["diagnostics"]["candidate_counts_by_source"] = {}
+    provider = FailingLiteLLM()
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload("Will this part fit?"),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=FakeDSA(response=context_pack),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-high-impact-advisory-blocked",
+    )
+
+    assert result["status"] == "degraded"
+    assert provider.calls == []
+    assert runtime.evidence_shape_calls[0]["interaction_kind"] == (
+        "high_impact_decision"
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    prompt_trace = trace["retrieval"]["prompt_assembly"]
+    assert prompt_trace["evidence_provider_mode"]["mode"] == "blocked"
+    assert "evidence_advisory_guidance" not in prompt_trace.get(
+        "included_layers", []
+    )
+    assert prompt_trace["capabilities"]["executor_call_count"] == 0
+    assert memory_store.claim_record_calls == []
 
 
 class ClaimCaptureMemoryStore(FakeMemoryStore):
@@ -18052,6 +18606,116 @@ async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(t
         calibration_call["evidence_references"]
     )
     assert "claim_capture" not in result
+
+
+@pytest.mark.asyncio
+async def test_not_applicable_evidence_history_preserves_ordinary_claim_persistence(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    request_id = "request-not-applicable-claim-capture"
+    question = "Is the setting active?"
+    runtime = FakeRuntime(evidence_shape_response=_not_applicable_shape_response)
+    memory_store = ClaimCaptureMemoryStore()
+    dsa = FakeDSA()
+    litellm = FakeLiteLLM(
+        content="The retained file reports that the setting is active."
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": question}]),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+
+    assert result["answer"] == (
+        "The retained file reports that the setting is active."
+    )
+    assert len(result["sources"]) == 1
+    assert result["sources"][0]["source_ref"] == {
+        "ref_type": "derived_text",
+        "ref_id": "derived-text-1",
+    }
+    assert len(litellm.calls) == 1
+    provider_prompt = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "Evidence advisory guidance:" not in provider_prompt
+    assert "Governed evidence response contract:" not in provider_prompt
+
+    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert runtime.evidence_next_step_calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+
+    assert len(runtime.claim_calibration_calls) == 1
+    assert runtime.claim_calibration_calls[0]["evidence_references"] == [
+        {
+            "ref_type": "derived_text",
+            "ref_id": "derived-text-1",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "support_kind": "direct",
+            "authority": "user_report",
+            "freshness_state": "active",
+        }
+    ]
+    assert len(memory_store.claim_record_calls) == 1
+    claim_payload = memory_store.claim_record_calls[0]["payload"]
+    assert claim_payload["request_id"] == request_id
+    assert claim_payload["owner_id"] == "owner"
+    assert claim_payload["conversation_id"] == "conv-1"
+    assert claim_payload["assistant_message_id"] == (
+        "00000000-0000-4000-8000-000000000002"
+    )
+    assert claim_payload["calibration_result"][
+        "validated_evidence_references"
+    ] == runtime.claim_calibration_calls[0]["evidence_references"]
+    assert "acquisition_manifest_id" not in claim_payload
+
+    initial_trace = memory_store.trace_calls[0]["payload"]
+    final_trace = memory_store.trace_calls[-1]["payload"]
+    manifest = initial_trace["prompt"]["evidence_acquisition"]
+    assert manifest["status"] == "not_applicable"
+    assert manifest["shape"]["derivation_status"] == "not_applicable"
+    assert manifest["shape"]["task_shape"] is None
+    assert manifest["plan"]["plan_status"] == "not_compiled"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["next_steps"]["selections"] == []
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+    assert initial_trace["dsa"]["called"] is False
+    assert initial_trace["retrieval"]["prompt_assembly"][
+        "evidence_provider_mode"
+    ]["mode"] == "ordinary"
+    assert final_trace["prompt"]["evidence_acquisition"] == manifest
+    assert final_trace["prompt"]["claim_capture"] == {
+        "enabled": True,
+        "eligibility_status": "eligible",
+        "calibration_status": "completed",
+        "persistence_status": "persisted",
+        "reason_code": "single_claim_single_file_source",
+        "runtime_call_count": 1,
+        "storage_call_count": 1,
+        "evidence_count": 1,
+        "claim_id": "claim-capture-1",
+        "claim_anchor_digest": claim_payload["calibration_result"][
+            "claim_anchor_digest"
+        ],
+        "acquisition_manifest_status": "not_applicable",
+        "acquisition_manifest_linked": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -19069,7 +19733,6 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
                 {"role": "assistant", "content": first["answer"]},
                 {"role": "user", "content": f"What did you check? {recheck}"},
             ],
-            external_context_enabled=True,
         ),
         memory_store=memory_store,
         litellm=provider,
@@ -19176,7 +19839,9 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_path):
+async def test_orchestrate_compound_insufficiency_uses_advisory_attempt_without_opt_in(
+    tmp_path,
+):
     memory_store = ClaimExplanationMemoryStore()
     first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
         tmp_path,
@@ -19195,7 +19860,19 @@ async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_p
     failed_response["diagnostics"]["candidate_counts_by_source"] = {
         "vehicle_log_primary": 0
     }
-    provider = FailingLiteLLM()
+    def advisory_next_step(call):
+        return _next_step_response_from_call(
+            call,
+            status="insufficient",
+            selected_next_step="withhold_unsupported_conclusion",
+            conclusion_disposition="requested_conclusion_withheld",
+            provider_disposition="allowed",
+            reason_codes=["unsupported_conclusion_withheld"],
+        )
+
+    runtime.evidence_next_step_response = advisory_next_step
+    guidance = "Compare the exact controlling record before relying on the result."
+    provider = FakeLiteLLM(content=guidance)
     rules, models = _write_default_route_files(tmp_path)
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -19205,7 +19882,6 @@ async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_p
                 {"role": "assistant", "content": first["answer"]},
                 {"role": "user", "content": "What did you check? Check again."},
             ],
-            external_context_enabled=True,
         ),
         memory_store=memory_store,
         litellm=provider,
@@ -19222,11 +19898,25 @@ async def test_orchestrate_compound_insufficiency_is_provider_free_attempt(tmp_p
     )
     assert result["answer"].startswith("Original acquisition:\n")
     assert "\n\nNew verification attempt:\n" in result["answer"]
-    assert provider.calls == []
+    assert (
+        "I couldn’t verify the requested conclusion from the available evidence."
+        in result["answer"]
+    )
+    assert f"Unverified guidance:\n{guidance}" in result["answer"]
+    assert result["answer"].endswith(
+        "Treat this as a working direction, not a confirmed result."
+    )
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] == []
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
     trace = memory_store.trace_calls[-1]["payload"]
-    _assert_compound_claim_capture_excluded(trace)
+    assert trace["prompt"]["claim_capture"]["enabled"] is False
+    assert trace["prompt"]["claim_capture"]["eligibility_status"] == (
+        "ineligible"
+    )
+    assert trace["dsa"]["activation_source"] == "evidence_policy"
+    assert trace["prompt"]["claim_explanation"]["compound_mode"] is True
 
 
 @pytest.mark.asyncio
@@ -21728,6 +22418,7 @@ async def test_orchestrate_dsa_disabled_skips_external_context_call(tmp_path):
     assert trace["dsa"] == {
         "capability_enabled": False,
         "enabled": True,
+        "activation_source": "client_request",
         "called": False,
         "status": "disabled_by_service",
         "reason": "deployment_capability_disabled",
@@ -23448,6 +24139,7 @@ async def test_orchestrate_dsa_missing_request_opt_in_skips_call_with_explicit_t
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": False,
+        "activation_source": "not_requested",
         "called": False,
         "status": "disabled_by_request",
         "reason": "request_opt_in_absent",
@@ -23518,6 +24210,7 @@ async def test_orchestrate_dsa_top_level_opt_in_calls_client_and_includes_prompt
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": True,
         "status": "success",
         "reason": "items_included",
@@ -23594,6 +24287,7 @@ async def test_orchestrate_dsa_missing_client_configuration_is_non_fatal(tmp_pat
     assert trace == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": False,
         "status": "error",
         "reason": "client_not_configured",
@@ -23692,6 +24386,7 @@ async def test_orchestrate_dsa_passes_request_targeting_and_budget(tmp_path):
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": True,
         "status": "success",
         "reason": "items_included",
@@ -23809,6 +24504,7 @@ async def test_orchestrate_dsa_timeout_degrades_gracefully_without_external_cont
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": True,
         "status": "error",
         "reason": "timeout",
@@ -23861,6 +24557,7 @@ async def test_orchestrate_dsa_401_degrades_gracefully_without_leaking_key(tmp_p
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": True,
         "status": "error",
         "reason": "http_failure",
@@ -24062,6 +24759,7 @@ async def test_orchestrate_dsa_request_local_only_skips_external_call(tmp_path):
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": False,
         "status": "skipped_local_only",
         "reason": "local_only_policy",
@@ -24132,6 +24830,7 @@ async def test_orchestrate_dsa_profile_local_only_skips_external_call(tmp_path):
     assert trace["dsa"] == {
         "capability_enabled": True,
         "enabled": True,
+        "activation_source": "client_request",
         "called": False,
         "status": "skipped_local_only",
         "reason": "local_only_policy",
@@ -26765,28 +27464,16 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     original_request_id = "request-ordinary-dsa-original"
     question = "What service was performed on the Jeep?"
     runtime = HistoryPolicyRuntime()
-    runtime.evidence_shape_response = {
-        "request_id": original_request_id,
-        "owner_id": "owner",
-        "conversation_id": "conv-1",
-        "surface": "node_red",
-        "runtime_session_id": "rtsession_1",
-        "runtime_turn_id": "rtturn_1",
-        "result": {
-            "derivation_id": "evidence_shape_ordinary_dsa",
-            "question_anchor": question,
-            "question_anchor_digest": (
-                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
-            ),
-            "derivation_status": "not_applicable",
-            "task_shape": None,
-            "candidate_task_shapes": [],
-            "evidence_scope_material": False,
-            "clarification_required": False,
-            "reason_codes": ["non_evidence_interaction"],
-            "user_safe_summary": "Evidence planning does not apply.",
-        },
-    }
+    runtime.evidence_shape_response = _derived_shape_response(
+        request_id=original_request_id,
+        question=question,
+        task_shape="targeted_lookup",
+    )
+    runtime.evidence_plan_response = _targeted_plan_response(
+        request_id=original_request_id,
+        question=question,
+        eligible_source_ids=["vehicle_log_primary", "vehicle_log_ev"],
+    )
     context_pack = _multi_source_governed_context_pack(question)
     context_pack["sources_used"][1] = "vehicle_log_ev"
     context_pack["items"][0]["source_ref"] = (
@@ -26817,19 +27504,20 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         "vehicle_log_primary",
         "vehicle_log_ev",
     ]
-    answer_text = (
-        "Date: 09/03/2026\n"
-        "Odometer: 83 061 km\n"
-        "Shop: Jeep Woodbine\n"
-        "Cost: \\$1 145.25\n"
-        "Services performed:\n"
-        "- Engine oil change\n"
-        "- Transfer-case & 4×4 axle fluid refill\n"
-        "- Power-steering flush\n"
-        "- Suspension lubrication (addressed creak noise)"
+    context_pack["diagnostics"]["candidate_counts_by_source"] = {
+        "vehicle_log_primary": 2,
+        "vehicle_log_ev": 1,
+    }
+    retained_excerpts = tuple(item["text"] for item in context_pack["items"])
+    answer_text = _rendered_evidence_answer(*retained_excerpts)
+    provider_candidate = _evidence_candidate(
+        *(
+            (item["source_ref"], item["text"])
+            for item in context_pack["items"]
+        )
     )
     memory_store = PersistedOrdinaryAcquisitionMemoryStore()
-    provider = FakeLiteLLM(content=answer_text)
+    provider = FakeLiteLLM(content=provider_candidate)
     dsa = FakeDSA(
         response=context_pack,
         source_response={
@@ -26872,7 +27560,6 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         payload=_first_party_chat_payload(
             question,
             conversation_id="conv-1",
-            external_context_enabled=True,
             messages=[{"role": "user", "content": question}],
         ),
         memory_store=memory_store,
@@ -26903,9 +27590,9 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     assert manifest["response_digest"] == (
         "sha256:" + hashlib.sha256(original["answer"].encode()).hexdigest()
     )
-    assert manifest["status"] == "not_applicable"
-    assert manifest["plan"]["plan_status"] == "not_compiled"
-    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert manifest["plan"]["plan_status"] == "ready"
+    assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
     assert manifest["acquisition"]["dsa_outcome"] == "success"
     assert manifest["acquisition"]["prompt_retained_item_count"] == 3
     expected_source_references = [
@@ -27707,7 +28394,6 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
         payload=_first_party_chat_payload(
             "Can you verify that again now?",
             conversation_id="conv-1",
-            external_context_enabled=True,
             messages=[
                 {"role": "user", "content": "Can you verify that again now?"}
             ],
@@ -27851,7 +28537,6 @@ async def _run_support_structured_verification_case(
         payload=_first_party_chat_payload(
             "Can you verify that again now?",
             conversation_id="conv-1",
-            external_context_enabled=True,
             messages=[
                 {"role": "user", "content": "Can you verify that again now?"}
             ],

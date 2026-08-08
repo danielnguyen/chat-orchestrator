@@ -72,6 +72,22 @@ EVIDENCE_RESPONSE_CONTRACT = (
     "wording, or scope claims.\n"
     "- Do not use Markdown fences or request tools."
 )
+EVIDENCE_ADVISORY_GUIDANCE = (
+    "Evidence advisory guidance:\n"
+    "- The requested factual conclusion was not verified.\n"
+    "- Do not present the conclusion as confirmed, established, proven, compatible, "
+    "implemented, deployed, reviewed, tested, or otherwise verified.\n"
+    "- Do not claim that a source, catalog, repository, record, test, or tool was checked "
+    "unless that fact is present in supplied context.\n"
+    "- Provide useful working guidance only. Prefer explicitly provisional considerations, "
+    "discriminating checks, exact identifiers, version facts, measurements, or records the "
+    "user should compare, and the safest highest-value next verification step.\n"
+    "- Do not invent part numbers, model identifiers, versions, measurements, percentages, "
+    "probabilities, source names, implementation state, or performed validation.\n"
+    "- Do not request tools or imply that an external action occurred.\n"
+    "- Return natural user-facing prose, not JSON.\n"
+    "- Do not add a verified or unverified wrapper; the system owns that boundary."
+)
 
 
 @dataclass(frozen=True)
@@ -377,6 +393,7 @@ def _apply_prompt_budget(
     relationship_context_messages: list[dict[str, str]],
     runtime_messages: list[dict[str, str]],
     evidence_response_contract_messages: list[dict[str, str]],
+    evidence_advisory_guidance_messages: list[dict[str, str]],
     retrieval_bundle: dict[str, Any],
     external_context_pack: dict[str, Any] | None,
     memory_recall_messages: list[dict[str, str]],
@@ -449,6 +466,16 @@ def _apply_prompt_budget(
                     },
                 ),
                 (
+                    "evidence_advisory_guidance",
+                    evidence_advisory_guidance_messages,
+                    {
+                        "contract_active": bool(
+                            evidence_advisory_guidance_messages
+                        ),
+                        "schema_version": "evidence-advisory-guidance.v1",
+                    },
+                ),
+                (
                     "external_source_context",
                     build_external_context_messages(working_external),
                     external_context_trace(working_external),
@@ -472,7 +499,10 @@ def _apply_prompt_budget(
         messages_out: list[dict[str, str]] = []
         layers_out: list[dict[str, Any]] = []
         for name, layer_messages, metadata in ordered:
-            if name == "evidence_response_contract" and not layer_messages:
+            if name in {
+                "evidence_response_contract",
+                "evidence_advisory_guidance",
+            } and not layer_messages:
                 continue
             base_layer = base_by_name.get(name, {})
             layer = _layer_trace(
@@ -1142,11 +1172,14 @@ def assemble_prompt(
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     evidence_response_contract: bool = False,
+    evidence_advisory_guidance: bool = False,
     dsa_trace: dict[str, Any] | None = None,
     memory_recall_messages: list[dict[str, str]] | None = None,
     memory_recall_trace: dict[str, Any] | None = None,
     prompt_budget_contract: PromptBudgetContract | None = None,
 ) -> PromptAssembly:
+    if evidence_response_contract and evidence_advisory_guidance:
+        raise ValueError("conflicting_evidence_provider_contracts")
     messages: list[dict[str, str]] = []
     layers: list[dict[str, Any]] = []
 
@@ -1706,6 +1739,24 @@ def assemble_prompt(
             )
         )
 
+    evidence_advisory_guidance_messages = (
+        [{"role": "system", "content": EVIDENCE_ADVISORY_GUIDANCE}]
+        if evidence_advisory_guidance
+        else []
+    )
+    if evidence_advisory_guidance_messages:
+        messages.extend(evidence_advisory_guidance_messages)
+        layers.append(
+            _layer_trace(
+                "evidence_advisory_guidance",
+                evidence_advisory_guidance_messages,
+                metadata={
+                    "contract_active": True,
+                    "schema_version": "evidence-advisory-guidance.v1",
+                },
+            )
+        )
+
     external_context_messages = build_external_context_messages(external_context_pack)
     messages.extend(external_context_messages)
     layers.append(
@@ -1772,6 +1823,9 @@ def assemble_prompt(
                 runtime_messages=runtime_messages,
                 evidence_response_contract_messages=(
                     evidence_response_contract_messages
+                ),
+                evidence_advisory_guidance_messages=(
+                    evidence_advisory_guidance_messages
                 ),
                 retrieval_bundle=retrieval_bundle,
                 external_context_pack=external_context_pack,

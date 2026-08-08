@@ -146,7 +146,13 @@ Service configuration uses:
 
 The current defaults are documented in [`api/.env.example`](../api/.env.example). When `DSA_API_KEY` is set, Chat Orchestrator sends it in the DSA `X-API-Key` header and does not include it in traces.
 
-Both service-level enablement and request-level opt-in are needed. A request may use the simple `external_context_enabled` flag or the structured `external_context` object. If both are present, either one set to true opts in. An effective `local_only` policy always suppresses the external call.
+When governed evidence acquisition is disabled, the compatibility path still
+requires request-level opt-in through `external_context_enabled` or an enabled
+`external_context` object. When governed evidence acquisition is enabled and
+its server dependencies are available, Cognitive Runtime owns admission: the
+client fields supply optional source, scope, sensitivity, exact-reference, and
+result-bound inputs, but do not decide whether evidence governance applies. An
+effective `local_only` policy always suppresses the external call.
 
 Explicit `source_ids` are optional. Source selection remains owned by Data Source Aggregator; use `source_ids` only when the caller truly needs a bounded source subset.
 
@@ -215,16 +221,23 @@ For a manual integration check, start DSA at the configured base URL, enable it 
 The first governed evidence-acquisition path is disabled by default with
 `EVIDENCE_ACQUISITION_ENABLED=false`. Enabling it also requires a configured
 Cognitive Runtime, enabled interaction governance, and `DSA_ENABLED=true`. It
-does not opt requests into external context: the request-level flag or structured
-object is still required, and an effective `local_only` policy always wins.
+does not make evidence planning universal. For an eligible admitted normal turn,
+Chat Orchestrator asks Cognitive Runtime for the evidence shape even when the
+client supplied no external-context opt-in. An effective `local_only` policy,
+pending capability continuation, matched capability path, or retrieval
+suppression still prevents entry.
 
 For an eligible normal chat request, Chat Orchestrator uses the existing
-interaction-governance result, asks Cognitive Runtime to derive a broad evidence
-shape, reads the governed DSA source inventory, adapts the neutral source
-capabilities, and asks Cognitive Runtime to compile an evidence plan. Governed
-execution proceeds for a derived `targeted_lookup` whose ready plan selects only
-`targeted_retrieval` or `exact_fetch`, and for the bounded hybrid comparison
-and bounded exhaustive-review contracts described below.
+interaction-governance result and first asks Cognitive Runtime to derive a broad
+evidence shape. A `not_applicable` result returns to ordinary answering without
+listing, searching, fetching, or expanding DSA sources. A derived result then
+reads the governed DSA source inventory, adapts the neutral source capabilities,
+and asks Cognitive Runtime to compile an evidence plan. Governed execution
+proceeds for a derived `targeted_lookup` whose ready plan selects only
+`targeted_retrieval` or `exact_fetch`, and for the bounded hybrid comparison and
+bounded exhaustive-review contracts described below. Bounded trace metadata
+distinguishes `client_request`, `evidence_policy`, and `not_requested` activation
+without storing the task text.
 
 Source IDs narrow semantic retrieval to governed source registries. They do not
 identify exact items and continue to use one DSA context-pack call. The optional
@@ -283,15 +296,15 @@ For exact fetch, every declared reference must return a valid untruncated result
 and every returned reference must survive in the final provider prompt. Partial,
 missing, malformed, failed, truncated, or prompt-filtered exact coverage cannot
 authorize a provider conclusion.
-Cognitive Runtime evaluates those facts. An insufficient or unknown result
-withholds an unsupported conclusion without calling the provider. The
-provider-free response names a bounded set of the actual material requirement
-gaps and distinguishes failed, filtered, truncated, unsupported, unavailable,
-unknown, missing, partial, excluded, not-attempted, and unresolved-contradiction
-outcomes. It also states which class of conclusion is being withheld. Provider
-text and provider fallback are not consulted for that rendering.
+Cognitive Runtime evaluates those facts. An insufficient or unknown result never
+authorizes the requested factual conclusion. Most unsupported, exhaustive,
+absence-sensitive, contradiction-sensitive, historical, decision-support,
+clarification, malformed, or dependency-failed paths remain provider-free. Their
+bounded response names actual material requirement gaps and distinguishes failed,
+filtered, truncated, unsupported, unavailable, unknown, missing, partial,
+excluded, not-attempted, and unresolved-contradiction outcomes.
 
-A sufficient result permits one governed provider call with no capability
+A sufficient result enters grounded evidence mode and permits one governed provider call with no capability
 tools. That call receives a required prompt-budgeted response contract and must
 return only a strict JSON object containing a closed conclusion disposition and
 one to eight distinct source references with exact extractive excerpts. Each
@@ -327,6 +340,26 @@ The provider candidate cannot select or upgrade the plan, acquisition facts,
 sufficiency status, limitation disclosure, answer constraints, source authority,
 or scope boundary. Reapplying the final-answer policy does not duplicate or
 cross-apply policy-owned paragraphs.
+
+For the exact Cognitive Runtime combination `targeted_lookup`, insufficient or
+unknown evidence, unsupported conclusion withheld, and provider allowed, Chat
+Orchestrator instead enters advisory evidence mode. Provider permission is not
+conclusion permission. CO rebuilds the prompt once with mandatory advisory
+guidance, removes the grounded JSON contract and external evidence context, and
+makes one natural-language provider attempt with no tools. A transport fallback
+receives the identical messages and prompt fingerprint, also with no tools.
+
+After privacy enforcement, CO places the provider body between fixed statements
+that verification was not established and that the body is only working
+direction. An empty body receives a neutral next-verification suggestion. The
+exact wrapped answer is degraded, source-free, bound to the acquisition manifest,
+and persisted. Advisory mode exposes no capability descriptors to the provider,
+parses or executes no capability request, creates no pending action or trusted
+claim, appends no memory callback, and runs no claim capture or response-action
+rewrite. The prompt trace retains only bounded mode, layer, tool, rebuild, and
+fingerprint facts—not provider prose. CR, DSA, and next-step dependency failures
+cannot be converted locally into advisory permission. Only configured DSA sources
+can be acquired; this mode adds no connector or verification guarantee.
 
 The bounded exhaustive executor accepts only a ready
 `bounded_exhaustive_review` plan with no limitations, no exact references, the
@@ -439,7 +472,8 @@ provider used, or treat every acquired item as claim support.
 
 Ambiguous evidence tasks and unsupported plans or strategies return bounded,
 provider-free responses. A `not_applicable` result continues through the existing
-chat and optional DSA behavior. Briefs, capability and action flows, pending-action
+ordinary chat path without DSA acquisition when governed admission owns the turn.
+Briefs, capability and action flows, pending-action
 continuations, and claim-explanation follow-ups remain outside governed execution;
 an exact-reference request at one of those boundaries fails closed instead of
 entering a legacy path. Bounded full context, structured queries, hybrid
@@ -504,7 +538,9 @@ unresolved gaps; unrestricted provider prose is not invoked and the requested
 conclusion remains withheld. Narrow clarification renders exactly one
 policy-owned question. Unexamined-scope disclosure and unsupported-conclusion
 withholding use the existing privacy-safe material-gap renderer. Provider and
-fallback calls remain zero for those deterministic responses.
+fallback calls remain zero for those deterministic responses. The one exception
+is the exact low-risk targeted advisory combination described above: the
+conclusion remains withheld while bounded provider guidance is allowed.
 
 The final manifest remains bound to the final active plan, prompt-retained
 evidence, assistant message, and complete response digest. It also retains at
@@ -635,7 +671,8 @@ The ordinary governed acquisition, prompt-budget, sufficiency, next-step, privac
 and answer-boundary controls then apply to the new check. Historical evidence is
 not reused as fresh evidence. A successful or limited result is labelled `Original
 acquisition:` and `New verification:`; an insufficient or unknown result uses `New
-verification attempt:` and remains provider-free; a check that cannot establish a
+verification attempt:` when Cognitive Runtime grants advisory guidance, retaining
+the fixed unverified wrapper; a check that cannot establish a
 governed acquisition result uses `New verification unavailable:`. Compound labels
 are policy-owned, the combined response is claim-capture-ineligible, and the
 existing one-additional-acquisition maximum is unchanged. Provider candidate
@@ -720,7 +757,8 @@ false persistence success.
 
 Fresh verification begins only when Cognitive Runtime explicitly permits it after
 one valid immediate record resolves and that record supplies an exact bounded
-target paragraph. The existing governed evidence path then runs once; historical
+target paragraph. Entry does not require client external-context opt-in. The
+existing governed evidence path then runs once; historical
 evidence is not reused as fresh evidence. Support-backed compounds use
 `Original support:`. Acquisition-backed compounds retain `Original acquisition:`,
 and the existing `New verification:`, `New verification attempt:`, and `New
