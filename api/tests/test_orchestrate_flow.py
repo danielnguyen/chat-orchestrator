@@ -18609,6 +18609,116 @@ async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(t
 
 
 @pytest.mark.asyncio
+async def test_not_applicable_evidence_history_preserves_ordinary_claim_persistence(
+    tmp_path,
+):
+    rules, models = _write_router_files(tmp_path)
+    request_id = "request-not-applicable-claim-capture"
+    question = "Is the setting active?"
+    runtime = FakeRuntime(evidence_shape_response=_not_applicable_shape_response)
+    memory_store = ClaimCaptureMemoryStore()
+    dsa = FakeDSA()
+    litellm = FakeLiteLLM(
+        content="The retained file reports that the setting is active."
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(messages=[{"role": "user", "content": question}]),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id=request_id,
+    )
+
+    assert result["answer"] == (
+        "The retained file reports that the setting is active."
+    )
+    assert len(result["sources"]) == 1
+    assert result["sources"][0]["source_ref"] == {
+        "ref_type": "derived_text",
+        "ref_id": "derived-text-1",
+    }
+    assert len(litellm.calls) == 1
+    provider_prompt = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "Evidence advisory guidance:" not in provider_prompt
+    assert "Governed evidence response contract:" not in provider_prompt
+
+    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert runtime.evidence_next_step_calls == []
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+
+    assert len(runtime.claim_calibration_calls) == 1
+    assert runtime.claim_calibration_calls[0]["evidence_references"] == [
+        {
+            "ref_type": "derived_text",
+            "ref_id": "derived-text-1",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "support_kind": "direct",
+            "authority": "user_report",
+            "freshness_state": "active",
+        }
+    ]
+    assert len(memory_store.claim_record_calls) == 1
+    claim_payload = memory_store.claim_record_calls[0]["payload"]
+    assert claim_payload["request_id"] == request_id
+    assert claim_payload["owner_id"] == "owner"
+    assert claim_payload["conversation_id"] == "conv-1"
+    assert claim_payload["assistant_message_id"] == (
+        "00000000-0000-4000-8000-000000000002"
+    )
+    assert claim_payload["calibration_result"][
+        "validated_evidence_references"
+    ] == runtime.claim_calibration_calls[0]["evidence_references"]
+    assert "acquisition_manifest_id" not in claim_payload
+
+    initial_trace = memory_store.trace_calls[0]["payload"]
+    final_trace = memory_store.trace_calls[-1]["payload"]
+    manifest = initial_trace["prompt"]["evidence_acquisition"]
+    assert manifest["status"] == "not_applicable"
+    assert manifest["shape"]["derivation_status"] == "not_applicable"
+    assert manifest["shape"]["task_shape"] is None
+    assert manifest["plan"]["plan_status"] == "not_compiled"
+    assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert manifest["next_steps"]["selections"] == []
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+    assert initial_trace["dsa"]["called"] is False
+    assert initial_trace["retrieval"]["prompt_assembly"][
+        "evidence_provider_mode"
+    ]["mode"] == "ordinary"
+    assert final_trace["prompt"]["evidence_acquisition"] == manifest
+    assert final_trace["prompt"]["claim_capture"] == {
+        "enabled": True,
+        "eligibility_status": "eligible",
+        "calibration_status": "completed",
+        "persistence_status": "persisted",
+        "reason_code": "single_claim_single_file_source",
+        "runtime_call_count": 1,
+        "storage_call_count": 1,
+        "evidence_count": 1,
+        "claim_id": "claim-capture-1",
+        "claim_anchor_digest": claim_payload["calibration_result"][
+            "claim_anchor_digest"
+        ],
+        "acquisition_manifest_status": "not_applicable",
+        "acquisition_manifest_linked": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_governed_evidence_claim_links_bound_manifest_without_copying_acquisition(
     tmp_path,
 ):

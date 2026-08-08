@@ -9757,9 +9757,12 @@ async def orchestrate_chat(
             )
             prompt.trace["evidence_acquisition"] = evidence_manifest
         claim_capture = bind_assistant_message(claim_capture, assistant_message_ack)
+        claim_acquisition_manifest = (
+            evidence_manifest if grounded_evidence_provider_call else None
+        )
         claim_capture = bind_acquisition_manifest(
             claim_capture,
-            evidence_manifest,
+            claim_acquisition_manifest,
             final_answer=answer,
         )
         prompt.trace["claim_capture"] = claim_capture.trace
