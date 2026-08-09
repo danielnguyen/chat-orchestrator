@@ -88,6 +88,13 @@ jobs:
         working-directory: chat-orchestrator
         run: docker build -f api/Dockerfile -t chat-orchestrator:history-root-lineage-v2-test api
 
+      - name: Run Chat Orchestrator tests
+        working-directory: chat-orchestrator
+        run: >-
+          docker run --rm
+          --mount type=bind,source="$PWD/scripts",target=/scripts,readonly
+          chat-orchestrator:history-root-lineage-v2-test python -m pytest -q
+
       - name: Run focused actual-service evidence proof
         working-directory: chat-orchestrator
         env:
