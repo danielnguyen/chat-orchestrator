@@ -4,11 +4,13 @@ import inspect
 import json
 import re
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 import services.capabilities as capability_service
 import services.orchestrate as orchestrate_service
+from clients.memory_store import MemoryStoreClient
 from clients.runtime import RuntimeClient
 from models import ChatResponse
 from services.action_connectors import (
@@ -2240,7 +2242,17 @@ async def test_supplied_open_conversation_keeps_current_client_and_surface(tmp_p
 @pytest.mark.asyncio
 async def test_omitted_conversation_uses_runtime_create_new_without_rolling_resolution(
     tmp_path,
+    monkeypatch,
 ):
+    fixed_now = datetime(2026, 8, 9, 12, 30, tzinfo=UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return fixed_now
+
+    monkeypatch.setattr(orchestrate_service, "datetime", FixedDatetime)
     rules, models = _write_router_files(tmp_path)
     memory_store = FakeMemoryStore()
     runtime = FakeRuntime()
@@ -2261,12 +2273,77 @@ async def test_omitted_conversation_uses_runtime_create_new_without_rolling_reso
     assert memory_store.exact_conversation_calls == []
     assert memory_store.resolve_conversation_calls == []
     assert memory_store.list_conversation_calls == [
-        {"owner_id": "owner", "limit": 9}
+        {
+            "owner_id": "owner",
+            "updated_since": fixed_now
+            - timedelta(
+                seconds=orchestrate_service._CONTINUATION_STALE_AFTER_SECONDS
+            ),
+            "limit": 9,
+        }
     ]
+    assert memory_store.list_conversation_calls[0]["updated_since"].tzinfo is UTC
     assert memory_store.create_conversation_calls == [
         {"owner_id": "owner", "client_id": "vscode"}
     ]
     assert runtime.turn_start_calls[0]["expected_thread_revision"] is None
+
+
+@pytest.mark.asyncio
+async def test_memory_store_open_list_serializes_aware_activity_cutoff(monkeypatch):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = []
+
+    async def fake_get(path, *, params=None):
+        calls.append({"path": path, "params": params})
+        return {"conversations": [], "next_cursor": None}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    cutoff = datetime.fromisoformat("2026-08-09T18:00:00+05:30")
+
+    response = await client.list_open_conversations(
+        owner_id="owner",
+        updated_since=cutoff,
+        limit=9,
+    )
+
+    assert response == {"conversations": [], "next_cursor": None}
+    assert calls == [
+        {
+            "path": "/v1/conversations",
+            "params": {
+                "owner_id": "owner",
+                "lifecycle_state": "open",
+                "updated_since": cutoff.isoformat(),
+                "limit": 9,
+            },
+        }
+    ]
+    serialized_cutoff = calls[0]["params"]["updated_since"]
+    parsed_cutoff = datetime.fromisoformat(serialized_cutoff)
+    assert parsed_cutoff == cutoff
+    assert parsed_cutoff.utcoffset() == timedelta(hours=5, minutes=30)
+
+
+@pytest.mark.asyncio
+async def test_memory_store_open_list_rejects_naive_cutoff_before_request(monkeypatch):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = []
+
+    async def fake_get(path, *, params=None):
+        calls.append({"path": path, "params": params})
+        return {"conversations": [], "next_cursor": None}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    with pytest.raises(ValueError, match="^updated_since_timezone_required$"):
+        await client.list_open_conversations(
+            owner_id="owner",
+            updated_since=datetime(2026, 8, 9, 12, 30),
+            limit=9,
+        )
+
+    assert calls == []
 
 
 def test_chat_response_serializes_truthful_nullable_conversation_identity():

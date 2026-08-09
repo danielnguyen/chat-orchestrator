@@ -39,12 +39,15 @@ client. A valid continuation appends new messages with the current `client_id`
 and current surface metadata while leaving historical provenance unchanged.
 
 When `conversation_id` is omitted and Cognitive Runtime is configured, Chat
-Orchestrator makes one owner-wide Basic Memory Store request for open
-conversations with a limit of nine. Cognitive Runtime accepts at most eight
-candidates, so zero through eight returned rows form a complete bounded set;
-nine rows make the submitted first eight explicitly incomplete. The Basic
-Memory Store cursor is validated but is not used as completeness evidence, and
-Chat Orchestrator does not paginate or select by result order.
+Orchestrator derives a timezone-aware UTC activity cutoff from its existing
+1,800-second freshness horizon. It makes one owner-wide Basic Memory Store
+request for open conversations updated at or after that cutoff, with a limit of
+nine. Basic Memory Store applies this mechanical durable-activity filter before
+the limit. Cognitive Runtime accepts at most eight candidates, so zero through
+eight rows in the filtered population form a complete bounded set; nine rows
+make the submitted first eight explicitly incomplete. The Basic Memory Store
+cursor is validated but is not used as completeness evidence, and Chat
+Orchestrator does not paginate or select by result order.
 
 Each candidate sent to Cognitive Runtime contains only its durable conversation
 ID, open lifecycle state, and durable update time. Cognitive Runtime combines
@@ -60,9 +63,12 @@ Adapters store and reuse only non-null conversation IDs.
 Selection does not use semantic retrieval, a provider or model, durable row
 order, raw recency alone, titles, content, originating or current client,
 current surface, message counts, embeddings, or adapter state. The surface is
-selection context only and is not treated as a permission signal. The fixed
-1,800-second freshness interval preserves the bounded compatibility horizon; it
-does not establish a general presence policy.
+selection context only and is not treated as a permission signal. Filtering the
+candidate population by durable activity is candidate-set hygiene, not a
+selection decision: Cognitive Runtime still evaluates eligibility and
+staleness independently, and raw recency cannot choose a conversation. The
+fixed 1,800-second freshness interval preserves the bounded compatibility
+horizon; it does not establish a general presence policy.
 
 When Cognitive Runtime is not configured, omitted IDs retain the same-owner,
 same-client rolling resolver as explicit compatibility behavior. That path is

@@ -103,15 +103,21 @@ class MemoryStoreClient:
         self,
         *,
         owner_id: str,
+        updated_since: datetime | None = None,
         limit: int = 9,
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "owner_id": owner_id,
+            "lifecycle_state": "open",
+            "limit": limit,
+        }
+        if updated_since is not None:
+            if updated_since.tzinfo is None or updated_since.utcoffset() is None:
+                raise ValueError("updated_since_timezone_required")
+            params["updated_since"] = updated_since.isoformat()
         response = await self._get(
             "/v1/conversations",
-            params={
-                "owner_id": owner_id,
-                "lifecycle_state": "open",
-                "limit": limit,
-            },
+            params=params,
         )
         if not isinstance(response, dict) or set(response) != {
             "conversations",
