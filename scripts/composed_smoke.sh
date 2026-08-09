@@ -6,10 +6,10 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="ea49890e2ca318a5a76a26e2ee45bdbd2f94b307"
-CR_COMMIT="0c3954df95b2d4d958e14acc7011a11cf445356a"
+BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
+CR_COMMIT="a61beb574a49f2d83f70008596c1183532b78f40"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="a0375065bbf764758192b6f67deac77c0ec1eb70"
+CO_COMMIT="3802c3d30e9bb580a2d9597f521af52b7d6dc8dc"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -92,6 +92,19 @@ bms_post() {
     -H "X-API-Key: smoke-memory-key" \
     -H "Content-Type: application/json" \
     -d "$2"
+}
+
+cr_post() {
+  curl -fsS -X POST "http://127.0.0.1:14371$1" \
+    -H "Content-Type: application/json" \
+    -d "$2"
+}
+
+bms_conversation() {
+  local owner="$1" conversation_id="$2"
+  curl -fsS -G "http://127.0.0.1:14321/v1/conversations/$conversation_id" \
+    -H "X-API-Key: smoke-memory-key" \
+    --data-urlencode "owner_id=$owner"
 }
 
 co_post() {
@@ -476,7 +489,7 @@ for path in pathlib.Path("/data").glob("*.sqlite3"):
         ).fetchone()[0] == 0:
             continue
         thread = connection.execute(
-            "SELECT state, revision FROM conversation_runtime_threads WHERE owner_id = ? AND conversation_id = ?",
+            "SELECT state, revision, last_activity_at, active_runtime_session_id, active_runtime_turn_id FROM conversation_runtime_threads WHERE owner_id = ? AND conversation_id = ?",
             (owner, conversation_id),
         ).fetchone()
         if thread is None:
@@ -485,16 +498,85 @@ for path in pathlib.Path("/data").glob("*.sqlite3"):
             "SELECT surface FROM conversation_runtime_sessions WHERE owner_id = ? AND conversation_id = ? ORDER BY surface",
             (owner, conversation_id),
         ).fetchall()
+        reservations = connection.execute(
+            "SELECT count(*) FROM conversation_runtime_retirement_reservations WHERE owner_id = ? AND conversation_id = ?",
+            (owner, conversation_id),
+        ).fetchone()[0]
         print(json.dumps({
             "state": thread["state"],
             "revision": thread["revision"],
+            "last_activity_at": thread["last_activity_at"],
+            "active_runtime_session_id": thread["active_runtime_session_id"],
+            "active_runtime_turn_id": thread["active_runtime_turn_id"],
             "surfaces": [row["surface"] for row in sessions],
             "session_count": len(sessions),
+            "reservation_count": reservations,
         }, separators=(",", ":")))
         raise SystemExit(0)
     finally:
         connection.close()
 raise SystemExit("runtime thread not found")
+PY
+}
+
+runtime_backdate_thread() {
+  local owner="$1" conversation_id="$2" activity_at="$3"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" "$conversation_id" "$activity_at" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+owner, conversation_id, activity_at = sys.argv[1:]
+for path in pathlib.Path("/data").glob("*.sqlite3"):
+    connection = sqlite3.connect(path)
+    try:
+        changed = connection.execute(
+            "UPDATE conversation_runtime_threads SET last_activity_at = ? WHERE owner_id = ? AND conversation_id = ?",
+            (activity_at, owner, conversation_id),
+        ).rowcount
+        if changed:
+            connection.commit()
+            raise SystemExit(0)
+    finally:
+        connection.close()
+raise SystemExit("runtime thread not found for backdate")
+PY
+}
+
+runtime_set_thread_projection() {
+  local owner="$1" conversation_id="$2" state="$3" inconsistent="${4:-false}"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" "$conversation_id" "$state" "$inconsistent" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+owner, conversation_id, state, inconsistent = sys.argv[1:]
+for path in pathlib.Path("/data").glob("*.sqlite3"):
+    connection = sqlite3.connect(path)
+    try:
+        changed = connection.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET state = ?,
+                active_runtime_session_id = NULL,
+                active_runtime_turn_id = NULL,
+                active_surface = ?,
+                active_request_id = NULL
+            WHERE owner_id = ? AND conversation_id = ?
+            """,
+            (
+                state,
+                "private-inconsistent-surface" if inconsistent == "true" else None,
+                owner,
+                conversation_id,
+            ),
+        ).rowcount
+        if changed:
+            connection.commit()
+            raise SystemExit(0)
+    finally:
+        connection.close()
+raise SystemExit("runtime thread not found for projection update")
 PY
 }
 
@@ -2113,6 +2195,240 @@ run_omitted_continuation_scenario() {
   provider_post "/fixture/reset" '{}'
 }
 
+run_conversation_retirement_scenario() {
+  local old_two_days old_eight_days
+  old_two_days="$(python3 -c 'from datetime import UTC, datetime, timedelta; print((datetime.now(UTC)-timedelta(days=2)).isoformat())')"
+  old_eight_days="$(python3 -c 'from datetime import UTC, datetime, timedelta; print((datetime.now(UTC)-timedelta(days=8)).isoformat())')"
+
+  local owner_a="owner-retirement-grace" client_a="client-retirement-grace"
+  local surface_a="surface-retirement-grace" conversation_a seed_a response_a request_a
+  local before_a after_a counts_a provider_a thread_a_before thread_a_after
+  provider_post "/fixture/reset" '{}'
+  conversation_a="$(create_conversation "$owner_a" "$client_a")"
+  seed_a="$(run_distinct_client_chat "$owner_a" "$client_a" "$surface_a" "$conversation_a" "neutral grace seed")"
+  jq -e --arg conversation "$conversation_a" '.status == "ok" and .conversation_id == $conversation' <<<"$seed_a" >/dev/null
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '2 days' WHERE owner_id='$owner_a' AND id='$conversation_a';" >/dev/null
+  runtime_backdate_thread "$owner_a" "$conversation_a" "$old_two_days"
+  before_a="$(psql_exec -At -F '|' -c "SELECT lifecycle_state, count(*) FROM conversations c JOIN messages m ON m.conversation_id=c.id AND m.owner_id=c.owner_id WHERE c.owner_id='$owner_a' AND c.id='$conversation_a' GROUP BY lifecycle_state;")"
+  thread_a_before="$(runtime_thread_snapshot "$owner_a" "$conversation_a")"
+  provider_post "/fixture/reset" '{}'
+  response_a="$(run_distinct_client_chat "$owner_a" "client-retirement-grace-current" "surface-retirement-grace-current" "$conversation_a" "neutral grace continuation")"
+  request_a="$(jq -r '.request_id' <<<"$response_a")"
+  jq -e --arg conversation "$conversation_a" '.status == "ok" and .conversation_id == $conversation and (has("conversation_disposition") | not)' <<<"$response_a" >/dev/null
+  after_a="$(psql_exec -At -F '|' -c "SELECT lifecycle_state, (updated_at > now() - interval '5 minutes') FROM conversations WHERE owner_id='$owner_a' AND id='$conversation_a';")"
+  counts_a="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner_a' AND conversation_id='$conversation_a';")"
+  provider_a="$(fetch_provider_calls "$request_a")"
+  thread_a_after="$(runtime_thread_snapshot "$owner_a" "$conversation_a")"
+  [ "$before_a" = "open|2" ]
+  [ "$after_a" = "open|t" ]
+  [ "$counts_a" = "2|2" ]
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_a")" = "1" ]
+  [ "$(jq -r '.revision' <<<"$thread_a_after")" = "$(( $(jq -r '.revision' <<<"$thread_a_before") + 2 ))" ]
+
+  local owner_b="owner-retirement-safe" client_b="client-retirement-safe"
+  local surface_b="surface-retirement-safe" conversation_b seed_b response_b request_b
+  local before_b_revision after_b_thread provider_b history_b lifecycle_b conversation_count_b
+  provider_post "/fixture/reset" '{}'
+  conversation_b="$(create_conversation "$owner_b" "$client_b")"
+  seed_b="$(run_distinct_client_chat "$owner_b" "$client_b" "$surface_b" "$conversation_b" "neutral safe retirement seed")"
+  jq -e '.status == "ok"' <<<"$seed_b" >/dev/null
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_b' AND id='$conversation_b';" >/dev/null
+  runtime_backdate_thread "$owner_b" "$conversation_b" "$old_eight_days"
+  before_b_revision="$(runtime_thread_snapshot "$owner_b" "$conversation_b" | jq -r '.revision')"
+  provider_post "/fixture/reset" '{}'
+  response_b="$(run_distinct_client_chat "$owner_b" "client-retirement-safe-current" "surface-retirement-safe-current" "$conversation_b" "PRIVATE-RETIREMENT-LOSING-MESSAGE")"
+  request_b="$(jq -r '.request_id' <<<"$response_b")"
+  jq -e --arg conversation "$conversation_b" '.status == "failed" and .conversation_id == $conversation and .conversation_disposition == "non_current" and .selected_model == "not_called"' <<<"$response_b" >/dev/null
+  lifecycle_b="$(psql_exec -At -F '|' -c "SELECT lifecycle_state, superseded_by_conversation_id IS NULL FROM conversations WHERE owner_id='$owner_b' AND id='$conversation_b';")"
+  history_b="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant'), count(*) FILTER (WHERE content='PRIVATE-RETIREMENT-LOSING-MESSAGE') FROM messages WHERE owner_id='$owner_b' AND conversation_id='$conversation_b';")"
+  conversation_count_b="$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner_b';")"
+  after_b_thread="$(runtime_thread_snapshot "$owner_b" "$conversation_b")"
+  provider_b="$(fetch_provider_calls "$request_b")"
+  [ "$lifecycle_b" = "closed|t" ]
+  [ "$history_b" = "1|1|0" ]
+  [ "$conversation_count_b" = "1" ]
+  jq -e --argjson previous "$before_b_revision" '.state == "idle" and .revision == ($previous + 1) and .reservation_count == 0' <<<"$after_b_thread" >/dev/null
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_b")" = "0" ]
+
+  local owner_c="owner-retirement-active" client_c="client-retirement-active"
+  local surface_c="surface-retirement-active" conversation_c seed_c active_c session_c turn_c
+  local response_c request_c provider_c counts_c state_c
+  provider_post "/fixture/reset" '{}'
+  conversation_c="$(create_conversation "$owner_c" "$client_c")"
+  seed_c="$(run_distinct_client_chat "$owner_c" "$client_c" "$surface_c" "$conversation_c" "neutral active retirement seed")"
+  jq -e '.status == "ok"' <<<"$seed_c" >/dev/null
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_c' AND id='$conversation_c';" >/dev/null
+  runtime_backdate_thread "$owner_c" "$conversation_c" "$old_eight_days"
+  active_c="$(cr_post "/v1/runtime/turns/start" "$(jq -nc --arg owner "$owner_c" --arg conversation "$conversation_c" --arg surface "$surface_c" '{request_id:"retirement-active-winner",owner_id:$owner,conversation_id:$conversation,surface:$surface,expected_thread_revision:2}')")"
+  session_c="$(jq -r '.runtime_session.runtime_session_id' <<<"$active_c")"
+  turn_c="$(jq -r '.runtime_turn.runtime_turn_id' <<<"$active_c")"
+  provider_post "/fixture/reset" '{}'
+  response_c="$(run_distinct_client_chat "$owner_c" "client-retirement-active-loser" "surface-retirement-active-loser" "$conversation_c" "PRIVATE-ACTIVE-LOSER")"
+  request_c="$(jq -r '.request_id' <<<"$response_c")"
+  jq -e '.status == "degraded" and (has("conversation_disposition") | not) and .selected_model == "not_called"' <<<"$response_c" >/dev/null
+  [ "$(psql_exec -At -c "SELECT lifecycle_state FROM conversations WHERE owner_id='$owner_c' AND id='$conversation_c';")" = "open" ]
+  counts_c="$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner_c' AND conversation_id='$conversation_c' AND content='PRIVATE-ACTIVE-LOSER';")"
+  [ "$counts_c" = "0" ]
+  provider_c="$(fetch_provider_calls "$request_c")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_c")" = "0" ]
+  state_c="$(runtime_thread_snapshot "$owner_c" "$conversation_c")"
+  jq -e --arg turn "$turn_c" '.state == "active" and .active_runtime_turn_id == $turn and .reservation_count == 0' <<<"$state_c" >/dev/null
+  cr_post "/v1/runtime/turns/complete" "$(jq -nc --arg session "$session_c" --arg turn "$turn_c" '{request_id:"retirement-active-cleanup",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"abandoned"}')" >/dev/null
+
+  local state_tag owner_state client_state surface_state conversation_state seed_state response_state request_state provider_state inconsistent
+  for state_tag in contended unavailable inconsistent; do
+    owner_state="owner-retirement-$state_tag"
+    client_state="client-retirement-$state_tag"
+    surface_state="surface-retirement-$state_tag"
+    conversation_state="$(create_conversation "$owner_state" "$client_state")"
+    provider_post "/fixture/reset" '{}'
+    seed_state="$(run_distinct_client_chat "$owner_state" "$client_state" "$surface_state" "$conversation_state" "neutral $state_tag retirement seed")"
+    jq -e '.status == "ok"' <<<"$seed_state" >/dev/null
+    psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_state' AND id='$conversation_state';" >/dev/null
+    runtime_backdate_thread "$owner_state" "$conversation_state" "$old_eight_days"
+    inconsistent=false
+    [ "$state_tag" = "inconsistent" ] && inconsistent=true
+    runtime_set_thread_projection "$owner_state" "$conversation_state" "$([ "$state_tag" = "inconsistent" ] && echo idle || echo "$state_tag")" "$inconsistent"
+    provider_post "/fixture/reset" '{}'
+    response_state="$(run_distinct_client_chat "$owner_state" "client-retirement-$state_tag-loser" "surface-retirement-$state_tag-loser" "$conversation_state" "PRIVATE-$state_tag-LOSER")"
+    request_state="$(jq -r '.request_id' <<<"$response_state")"
+    jq -e '.status == "failed" and (has("conversation_disposition") | not) and .selected_model == "not_called"' <<<"$response_state" >/dev/null
+    [ "$(psql_exec -At -c "SELECT lifecycle_state FROM conversations WHERE owner_id='$owner_state' AND id='$conversation_state';")" = "open" ]
+    [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner_state' AND conversation_id='$conversation_state' AND content LIKE 'PRIVATE-%-LOSER';")" = "0" ]
+    provider_state="$(fetch_provider_calls "$request_state")"
+    [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_state")" = "0" ]
+    [ "$(runtime_thread_snapshot "$owner_state" "$conversation_state" | jq -r '.reservation_count')" = "0" ]
+    case "$(jq -c . <<<"$response_state")" in
+      *private-inconsistent-surface*|*runtime_session*|*runtime_turn*)
+        echo "retirement conservative response disclosed private runtime state" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  local owner_g="owner-retirement-cas" client_g="client-retirement-cas"
+  local conversation_g seed_g durable_g thread_g reserve_g reservation_g reserved_revision_g
+  local race_message_g close_body_g close_file_g close_status_g after_g cancel_g
+  provider_post "/fixture/reset" '{}'
+  conversation_g="$(create_conversation "$owner_g" "$client_g")"
+  seed_g="$(run_distinct_client_chat "$owner_g" "$client_g" "surface-retirement-cas" "$conversation_g" "neutral cas retirement seed")"
+  jq -e '.status == "ok"' <<<"$seed_g" >/dev/null
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_g' AND id='$conversation_g';" >/dev/null
+  runtime_backdate_thread "$owner_g" "$conversation_g" "$old_eight_days"
+  durable_g="$(bms_conversation "$owner_g" "$conversation_g")"
+  thread_g="$(runtime_thread_snapshot "$owner_g" "$conversation_g")"
+  reserve_g="$(cr_post "/v1/runtime/retirements/reserve" "$(jq -nc --arg owner "$owner_g" --arg conversation "$conversation_g" --arg updated "$(jq -r '.updated_at' <<<"$durable_g")" --arg cutoff "$(python3 -c 'from datetime import UTC, datetime, timedelta; print((datetime.now(UTC)-timedelta(days=7)).isoformat())')" '{request_id:"retirement-cas-reserve",owner_id:$owner,conversation_id:$conversation,lifecycle_state:"open",durable_updated_at:$updated,retirement_before:$cutoff}')")"
+  reservation_g="$(jq -r '.result.reservation_id' <<<"$reserve_g")"
+  reserved_revision_g="$(jq -r '.result.reserved_thread_revision' <<<"$reserve_g")"
+  race_message_g="$(add_message "$conversation_g" "$owner_g" "$client_g" "assistant" "durable activity won the race")"
+  test -n "$race_message_g"
+  close_file_g="$COMPOSED_SMOKE_TMP/retirement-cas-close.json"
+  close_body_g="$(jq -nc --arg owner "$owner_g" --arg expected "$(jq -r '.result.reserved_durable_updated_at' <<<"$reserve_g")" '{owner_id:$owner,lifecycle_state:"closed",expected_updated_at:$expected}')"
+  close_status_g="$(curl -sS -o "$close_file_g" -w '%{http_code}' -X POST "http://127.0.0.1:14321/v1/conversations/$conversation_g/lifecycle" -H "X-API-Key: smoke-memory-key" -H "Content-Type: application/json" -d "$close_body_g")"
+  [ "$close_status_g" = "409" ]
+  jq -e '.detail == "conversation_lifecycle_conflict"' "$close_file_g" >/dev/null
+  after_g="$(bms_conversation "$owner_g" "$conversation_g")"
+  jq -e '.lifecycle_state == "open"' <<<"$after_g" >/dev/null
+  cancel_g="$(cr_post "/v1/runtime/retirements/cancel" "$(jq -nc --arg owner "$owner_g" --arg conversation "$conversation_g" --arg reservation "$reservation_g" --argjson revision "$reserved_revision_g" '{request_id:"retirement-cas-cancel",owner_id:$owner,conversation_id:$conversation,reservation_id:$reservation,reserved_thread_revision:$revision}')")"
+  jq -e --argjson revision "$reserved_revision_g" '.outcome == "cancelled" and .thread_revision == $revision' <<<"$cancel_g" >/dev/null
+  jq -e --argjson revision "$reserved_revision_g" '.state == "idle" and .revision == $revision and .reservation_count == 0' <<<"$(runtime_thread_snapshot "$owner_g" "$conversation_g")" >/dev/null
+
+  local owner_h="owner-retirement-restart" client_h="client-retirement-restart"
+  local conversation_h seed_h durable_h thread_h reserve_h response_h request_h provider_h
+  provider_post "/fixture/reset" '{}'
+  conversation_h="$(create_conversation "$owner_h" "$client_h")"
+  seed_h="$(run_distinct_client_chat "$owner_h" "$client_h" "surface-retirement-restart" "$conversation_h" "neutral restart retirement seed")"
+  jq -e '.status == "ok"' <<<"$seed_h" >/dev/null
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_h' AND id='$conversation_h';" >/dev/null
+  runtime_backdate_thread "$owner_h" "$conversation_h" "$old_eight_days"
+  durable_h="$(bms_conversation "$owner_h" "$conversation_h")"
+  thread_h="$(runtime_thread_snapshot "$owner_h" "$conversation_h")"
+  reserve_h="$(cr_post "/v1/runtime/retirements/reserve" "$(jq -nc --arg owner "$owner_h" --arg conversation "$conversation_h" --arg updated "$(jq -r '.updated_at' <<<"$durable_h")" --arg cutoff "$(python3 -c 'from datetime import UTC, datetime, timedelta; print((datetime.now(UTC)-timedelta(days=7)).isoformat())')" '{request_id:"retirement-restart-reserve",owner_id:$owner,conversation_id:$conversation,lifecycle_state:"open",durable_updated_at:$updated,retirement_before:$cutoff}')")"
+  jq -e '.result.outcome == "reserved"' <<<"$reserve_h" >/dev/null
+  docker compose -f "$COMPOSE" restart runtime >/dev/null
+  docker compose -f "$COMPOSE" up -d --wait runtime >/dev/null
+  [ "$(runtime_thread_snapshot "$owner_h" "$conversation_h" | jq -r '.reservation_count')" = "1" ]
+  provider_post "/fixture/reset" '{}'
+  response_h="$(run_distinct_client_chat "$owner_h" "client-retirement-restart-current" "surface-retirement-restart-current" "$conversation_h" "PRIVATE-RESTART-LOSER")"
+  request_h="$(jq -r '.request_id' <<<"$response_h")"
+  jq -e '.conversation_disposition == "non_current" and .selected_model == "not_called"' <<<"$response_h" >/dev/null
+  jq -e --argjson previous "$(jq -r '.revision' <<<"$thread_h")" '.state == "idle" and .revision == ($previous + 1) and .reservation_count == 0' <<<"$(runtime_thread_snapshot "$owner_h" "$conversation_h")" >/dev/null
+  [ "$(psql_exec -At -c "SELECT lifecycle_state FROM conversations WHERE owner_id='$owner_h' AND id='$conversation_h';")" = "closed" ]
+  provider_h="$(fetch_provider_calls "$request_h")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_h")" = "0" ]
+
+  local owner_i="owner-retirement-isolated-a" conversation_i seed_i response_i request_i provider_i
+  provider_post "/fixture/reset" '{}'
+  conversation_i="$(create_conversation "$owner_i" "client-retirement-isolated-a")"
+  seed_i="$(run_distinct_client_chat "$owner_i" "client-retirement-isolated-a" "surface-retirement-isolated-a" "$conversation_i" "neutral isolation retirement seed")"
+  jq -e '.status == "ok"' <<<"$seed_i" >/dev/null
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_i' AND id='$conversation_i';" >/dev/null
+  runtime_backdate_thread "$owner_i" "$conversation_i" "$old_eight_days"
+  provider_post "/fixture/reset" '{}'
+  response_i="$(run_distinct_client_chat "owner-retirement-isolated-b" "client-retirement-isolated-b" "surface-retirement-isolated-b" "$conversation_i" "PRIVATE-ISOLATION-LOSER")"
+  request_i="$(jq -r '.request_id' <<<"$response_i")"
+  jq -e '.status == "failed" and (has("conversation_disposition") | not) and .selected_model == "not_called"' <<<"$response_i" >/dev/null
+  [ "$(psql_exec -At -c "SELECT lifecycle_state FROM conversations WHERE owner_id='$owner_i' AND id='$conversation_i';")" = "open" ]
+  jq -e '.reservation_count == 0' <<<"$(runtime_thread_snapshot "$owner_i" "$conversation_i")" >/dev/null
+  provider_i="$(fetch_provider_calls "$request_i")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_i")" = "0" ]
+  case "$(jq -c . <<<"$response_i")" in
+    *neutral\ isolation\ retirement\ seed*|*owner-retirement-isolated-a*)
+      echo "retirement owner-isolation response disclosed retained owner context" >&2
+      exit 1
+      ;;
+  esac
+
+  local owner_j="owner-retirement-cleanup" current_j response_j request_j provider_j
+  local closed_j open_j total_j first_j closed_conversation_j closed_history_j fenced_j=0
+  local ordinal conversation_j snapshot_j
+  local -a old_conversations_j=()
+  provider_post "/fixture/reset" '{}'
+  for ordinal in $(seq 1 5); do
+    conversation_j="$(create_conversation "$owner_j" "client-retirement-cleanup-$ordinal")"
+    old_conversations_j+=("$conversation_j")
+    run_distinct_client_chat "$owner_j" "client-retirement-cleanup-$ordinal" "surface-retirement-cleanup-$ordinal" "$conversation_j" "neutral cleanup seed $ordinal" >/dev/null
+    psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days $ordinal minutes' WHERE owner_id='$owner_j' AND id='$conversation_j';" >/dev/null
+    runtime_backdate_thread "$owner_j" "$conversation_j" "$old_eight_days"
+  done
+  first_j="${old_conversations_j[0]}"
+  runtime_set_thread_projection "$owner_j" "$first_j" "unavailable"
+  provider_post "/fixture/reset" '{}'
+  response_j="$(run_omitted_chat "$owner_j" "client-retirement-cleanup-current" "surface-retirement-cleanup-current" "neutral create after cleanup")"
+  request_j="$(jq -r '.request_id' <<<"$response_j")"
+  current_j="$(jq -r '.conversation_id' <<<"$response_j")"
+  jq -e '.status == "ok" and (has("conversation_disposition") | not)' <<<"$response_j" >/dev/null
+  closed_j="$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner_j' AND lifecycle_state='closed';")"
+  open_j="$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner_j' AND lifecycle_state='open' AND id != '$current_j';")"
+  total_j="$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner_j';")"
+  [ "$closed_j" = "1" ]
+  [ "$open_j" = "4" ]
+  [ "$total_j" = "6" ]
+  [ "$(psql_exec -At -c "SELECT lifecycle_state FROM conversations WHERE owner_id='$owner_j' AND id='$first_j';")" = "open" ]
+  closed_conversation_j="$(psql_exec -At -c "SELECT id FROM conversations WHERE owner_id='$owner_j' AND lifecycle_state='closed';")"
+  closed_history_j="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner_j' AND conversation_id='$closed_conversation_j';")"
+  [ "$closed_history_j" = "1|1" ]
+  for conversation_j in "${old_conversations_j[@]}"; do
+    snapshot_j="$(runtime_thread_snapshot "$owner_j" "$conversation_j")"
+    if [ "$(jq -r '.revision' <<<"$snapshot_j")" = "3" ]; then
+      fenced_j=$((fenced_j + 1))
+    fi
+  done
+  [ "$fenced_j" = "1" ]
+  provider_j="$(fetch_provider_calls "$request_j")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_j")" = "1" ]
+
+  echo "Conversation retirement grace: status=ok conversation=$conversation_a lifecycle=open provider_calls=1 messages=2,2 revision_advanced=2"
+  echo "Conversation retirement safe idle: disposition=non_current lifecycle=closed provider_calls=0 losing_messages=0 revision_fence=1 reservation_count=0 history_preserved=true"
+  echo "Conversation retirement active: lifecycle=open disposition=omitted provider_calls=0 losing_messages=0 winner_preserved=true"
+  echo "Conversation retirement conservative states: contended=open unavailable=open inconsistent=open disposition=omitted provider_calls=0 private_state_disclosed=false"
+  echo "Conversation retirement durable CAS: close_status=409 lifecycle=open append_preserved=true cancellation_revision_unchanged=true reservation_count=0"
+  echo "Conversation retirement restart: reservation_survived=true lifecycle=closed disposition=non_current provider_calls=0 reservation_count=0"
+  echo "Conversation retirement isolation: owner_b_non_current=false owner_a_lifecycle=open reservation_count=0 disclosure=false"
+  echo "Conversation retirement cleanup: scanned_limit=4 first_ineligible_remained_open=true closed=1 open_historical=4 new_conversation=$current_j provider_calls=1 history_preserved=true"
+  provider_post "/fixture/reset" '{}'
+}
+
 run_situated_presence_case() {
   local tag="$1" text="$2" expected_answer="$3" category="$4"
   local active_task="$5" allows_expansion="$6" expected_kind="$7"
@@ -2281,6 +2597,13 @@ if [ "${RUNTIME_ADMISSION_COMPOSITION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: runtime-admission-composition-only"
   run_runtime_admission_composition_scenario
   echo "Runtime admission composition scenario complete: assertions=true"
+  exit 0
+fi
+
+if [ "${RETIREMENT_ONLY:-}" = "1" ]; then
+  echo "Composed smoke mode: conversation-retirement-only"
+  run_conversation_retirement_scenario
+  echo "Conversation retirement composition scenario complete: assertions=true"
   exit 0
 fi
 

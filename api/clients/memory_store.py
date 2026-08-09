@@ -66,44 +66,18 @@ class MemoryStoreClient:
             f"/v1/conversations/{conversation_id}",
             params={"owner_id": owner_id},
         )
-        if not isinstance(response, dict):
-            raise RuntimeError("conversation_projection_invalid")
-
-        response_conversation_id = response.get("conversation_id")
-        response_owner_id = response.get("owner_id")
-        if not isinstance(response_conversation_id, str) or not isinstance(
-            response_owner_id, str
-        ):
-            raise RuntimeError("conversation_projection_invalid")
-        if not _conversation_ids_equivalent(response_conversation_id, conversation_id):
-            raise RuntimeError("conversation_projection_context_mismatch")
-        if response_owner_id != owner_id:
-            raise RuntimeError("conversation_projection_context_mismatch")
-
-        lifecycle_state = response.get("lifecycle_state")
-        if lifecycle_state not in {"open", "closed", "superseded"}:
-            raise RuntimeError("conversation_projection_invalid")
-        replacement = response.get("superseded_by_conversation_id")
-        if lifecycle_state == "superseded":
-            if not isinstance(replacement, str) or not replacement.strip():
-                raise RuntimeError("conversation_projection_invalid")
-        elif replacement is not None:
-            raise RuntimeError("conversation_projection_invalid")
-
-        for field in ("client_id", "title"):
-            if response.get(field) is not None and not isinstance(response.get(field), str):
-                raise RuntimeError("conversation_projection_invalid")
-        if not isinstance(response.get("created_at"), str) or not isinstance(
-            response.get("updated_at"), str
-        ):
-            raise RuntimeError("conversation_projection_invalid")
-        return response
+        return _validate_conversation_projection(
+            response,
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+        )
 
     async def list_open_conversations(
         self,
         *,
         owner_id: str,
         updated_since: datetime | None = None,
+        updated_before: datetime | None = None,
         limit: int = 9,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -112,9 +86,11 @@ class MemoryStoreClient:
             "limit": limit,
         }
         if updated_since is not None:
-            if updated_since.tzinfo is None or updated_since.utcoffset() is None:
-                raise ValueError("updated_since_timezone_required")
+            _require_aware_datetime(updated_since, "updated_since")
             params["updated_since"] = updated_since.isoformat()
+        if updated_before is not None:
+            _require_aware_datetime(updated_before, "updated_before")
+            params["updated_before"] = updated_before.isoformat()
         response = await self._get(
             "/v1/conversations",
             params=params,
@@ -170,6 +146,34 @@ class MemoryStoreClient:
                 raise RuntimeError("conversation_list_response_invalid")
             validated.append(row)
         return {"conversations": validated, "next_cursor": next_cursor}
+
+    async def close_conversation(
+        self,
+        *,
+        conversation_id: str,
+        owner_id: str,
+        expected_updated_at: datetime,
+    ) -> dict[str, Any]:
+        _require_aware_datetime(expected_updated_at, "expected_updated_at")
+        response = await self._post(
+            f"/v1/conversations/{conversation_id}/lifecycle",
+            json={
+                "owner_id": owner_id,
+                "lifecycle_state": "closed",
+                "expected_updated_at": expected_updated_at.isoformat(),
+            },
+        )
+        projection = _validate_conversation_projection(
+            response,
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+        )
+        if (
+            projection["lifecycle_state"] != "closed"
+            or projection["superseded_by_conversation_id"] is not None
+        ):
+            raise RuntimeError("conversation_lifecycle_response_invalid")
+        return projection
 
     async def create_conversation(
         self,
@@ -460,3 +464,68 @@ def _conversation_ids_equivalent(actual: Any, expected: str) -> bool:
         return UUID(actual) == UUID(expected)
     except (TypeError, ValueError):
         return False
+
+
+def _require_aware_datetime(value: datetime, field: str) -> None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field}_timezone_required")
+
+
+def _parse_aware_projection_datetime(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise RuntimeError("conversation_projection_invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise RuntimeError("conversation_projection_invalid") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RuntimeError("conversation_projection_invalid")
+    return parsed
+
+
+def _validate_conversation_projection(
+    response: Any,
+    *,
+    conversation_id: str,
+    owner_id: str,
+) -> dict[str, Any]:
+    expected_fields = {
+        "conversation_id",
+        "owner_id",
+        "client_id",
+        "title",
+        "lifecycle_state",
+        "superseded_by_conversation_id",
+        "created_at",
+        "updated_at",
+    }
+    if not isinstance(response, dict) or set(response) != expected_fields:
+        raise RuntimeError("conversation_projection_invalid")
+    response_conversation_id = response.get("conversation_id")
+    response_owner_id = response.get("owner_id")
+    if not isinstance(response_conversation_id, str) or not isinstance(
+        response_owner_id, str
+    ):
+        raise RuntimeError("conversation_projection_invalid")
+    if (
+        not _conversation_ids_equivalent(response_conversation_id, conversation_id)
+        or response_owner_id != owner_id
+    ):
+        raise RuntimeError("conversation_projection_context_mismatch")
+
+    lifecycle_state = response.get("lifecycle_state")
+    if lifecycle_state not in {"open", "closed", "superseded"}:
+        raise RuntimeError("conversation_projection_invalid")
+    replacement = response.get("superseded_by_conversation_id")
+    if lifecycle_state == "superseded":
+        if not isinstance(replacement, str) or not replacement.strip():
+            raise RuntimeError("conversation_projection_invalid")
+    elif replacement is not None:
+        raise RuntimeError("conversation_projection_invalid")
+
+    for field in ("client_id", "title"):
+        if response.get(field) is not None and not isinstance(response.get(field), str):
+            raise RuntimeError("conversation_projection_invalid")
+    _parse_aware_projection_datetime(response.get("created_at"))
+    _parse_aware_projection_datetime(response.get("updated_at"))
+    return response

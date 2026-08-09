@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 from copy import deepcopy
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -93,6 +94,49 @@ class _ClientFactory:
         )
         self.clients.append(client)
         return client
+
+
+def _runtime_thread_projection() -> dict[str, Any]:
+    return {
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "state": "idle",
+        "revision": 7,
+        "active_runtime_session_id": None,
+        "active_runtime_turn_id": None,
+        "active_surface": None,
+        "participating_surfaces": ["voice", "web"],
+        "participating_session_count": 2,
+        "last_activity_at": "2026-08-01T07:00:00-05:00",
+        "created_at": "2026-07-01T12:00:00+00:00",
+        "updated_at": "2026-08-01T12:00:00+00:00",
+    }
+
+
+def _retirement_reservation_response(outcome: str) -> dict[str, Any]:
+    reason = {
+        "reserved": "safe_idle_retirement_reserved",
+        "wait": "runtime_thread_active",
+        "decline": "runtime_state_missing",
+    }[outcome]
+    result: dict[str, Any] = {
+        "outcome": outcome,
+        "reason_codes": [reason],
+        "policy_version": "conversation-retirement-safety.v1",
+    }
+    if outcome == "reserved":
+        result.update(
+            reservation_id="retirement-reservation",
+            reserved_thread_revision=7,
+            reserved_durable_updated_at="2026-08-01T07:00:00-05:00",
+        )
+    return {
+        "schema_version": "runtime-retirement-reservation.v1",
+        "request_id": "retirement-request",
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "result": result,
+    }
 
 
 def _load_main(monkeypatch):
@@ -2744,3 +2788,278 @@ async def test_situated_presence_rejects_pinned_contract_contradictions(case):
     assert calls == 1
     assert request == original_request
     assert response == original_response
+
+
+@pytest.mark.asyncio
+async def test_runtime_thread_resolution_posts_exact_scope_and_validates_projection():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        calls.append((path, json))
+        return _runtime_thread_projection()
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.resolve_thread(
+        request_id="thread-request",
+        owner_id="owner",
+        conversation_id="conversation",
+    )
+
+    assert response == _runtime_thread_projection()
+    assert calls == [
+        (
+            "/v1/runtime/threads/resolve",
+            {
+                "request_id": "thread-request",
+                "owner_id": "owner",
+                "conversation_id": "conversation",
+            },
+        )
+    ]
+    assert datetime.fromisoformat(response["last_activity_at"]).utcoffset() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda response: response.update(extra=True),
+        lambda response: response.update(owner_id="other"),
+        lambda response: response.update(state="unknown"),
+        lambda response: response.update(revision=True),
+        lambda response: response.update(participating_session_count=1),
+        lambda response: response.update(last_activity_at="2026-08-01T12:00:00"),
+        lambda response: response.update(updated_at="malformed"),
+        lambda response: response.update(
+            state="active",
+            active_runtime_session_id=None,
+            active_runtime_turn_id="turn",
+            active_surface="voice",
+        ),
+    ],
+)
+async def test_runtime_thread_resolution_rejects_malformed_or_mismatched_projection(
+    mutation,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    response = _runtime_thread_projection()
+    mutation(response)
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="runtime_thread_response"):
+        await client.resolve_thread(
+            request_id="thread-request",
+            owner_id="owner",
+            conversation_id="conversation",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["reserved", "wait", "decline"])
+async def test_runtime_retirement_reserve_posts_exact_aware_facts_and_validates_result(
+    outcome,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    durable_updated_at = datetime.fromisoformat("2026-08-01T07:00:00-05:00")
+    retirement_before = datetime.fromisoformat("2026-08-02T12:00:00+00:00")
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        calls.append((path, json))
+        return _retirement_reservation_response(outcome)
+
+    client._post = fake_post  # type: ignore[method-assign]
+    response = await client.reserve_retirement(
+        request_id="retirement-request",
+        owner_id="owner",
+        conversation_id="conversation",
+        lifecycle_state="open",
+        durable_updated_at=durable_updated_at,
+        retirement_before=retirement_before,
+    )
+
+    assert response == _retirement_reservation_response(outcome)
+    assert calls == [
+        (
+            "/v1/runtime/retirements/reserve",
+            {
+                "request_id": "retirement-request",
+                "owner_id": "owner",
+                "conversation_id": "conversation",
+                "lifecycle_state": "open",
+                "durable_updated_at": durable_updated_at.isoformat(),
+                "retirement_before": retirement_before.isoformat(),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_retirement_reserve_rejects_naive_time_before_transport():
+    client = RuntimeClient("http://runtime.local", None)
+    calls = 0
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        nonlocal calls
+        calls += 1
+        return {}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="runtime_timestamp_timezone_required"):
+        await client.reserve_retirement(
+            request_id="retirement-request",
+            owner_id="owner",
+            conversation_id="conversation",
+            lifecycle_state="open",
+            durable_updated_at=datetime(2026, 8, 1, 12),
+            retirement_before=datetime.fromisoformat("2026-08-02T12:00:00+00:00"),
+        )
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda response: response.update(extra=True),
+        lambda response: response.update(owner_id="other"),
+        lambda response: response["result"].update(extra=True),
+        lambda response: response["result"].update(policy_version="wrong"),
+        lambda response: response["result"].update(reserved_thread_revision=True),
+        lambda response: response["result"].update(
+            reserved_durable_updated_at="2026-08-01T12:00:00"
+        ),
+        lambda response: response["result"].update(
+            outcome="wait", reason_codes=["safe_idle_retirement_reserved"]
+        ),
+    ],
+)
+async def test_runtime_retirement_reserve_rejects_malformed_or_loosening_result(
+    mutation,
+):
+    client = RuntimeClient("http://runtime.local", None)
+    response = _retirement_reservation_response("reserved")
+    mutation(response)
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="retirement_reservation_response"):
+        await client.reserve_retirement(
+            request_id="retirement-request",
+            owner_id="owner",
+            conversation_id="conversation",
+            lifecycle_state="open",
+            durable_updated_at=datetime.fromisoformat("2026-08-01T12:00:00+00:00"),
+            retirement_before=datetime.fromisoformat("2026-08-02T12:00:00+00:00"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_retirement_cancel_and_finalize_validate_identity_and_revision():
+    client = RuntimeClient("http://runtime.local", None)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    common = {
+        "request_id": "retirement-request",
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "reservation_id": "retirement-reservation",
+        "reserved_thread_revision": 7,
+    }
+    responses = [
+        {
+            "schema_version": "runtime-retirement-cancellation.v1",
+            "request_id": "retirement-request",
+            "owner_id": "owner",
+            "conversation_id": "conversation",
+            "reservation_id": "retirement-reservation",
+            "thread_revision": 7,
+            "outcome": "cancelled",
+        },
+        {
+            "schema_version": "runtime-retirement-finalization.v1",
+            "request_id": "retirement-request",
+            "owner_id": "owner",
+            "conversation_id": "conversation",
+            "reservation_id": "retirement-reservation",
+            "previous_thread_revision": 7,
+            "fenced_thread_revision": 8,
+            "outcome": "finalized",
+        },
+    ]
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        calls.append((path, json))
+        return responses.pop(0)
+
+    client._post = fake_post  # type: ignore[method-assign]
+    cancelled = await client.cancel_retirement(**common)
+    finalized = await client.finalize_retirement(**common)
+
+    assert cancelled["thread_revision"] == 7
+    assert finalized["previous_thread_revision"] == 7
+    assert finalized["fenced_thread_revision"] == 8
+    expected_payload = {
+        **{key: value for key, value in common.items() if key != "reserved_thread_revision"},
+        "reserved_thread_revision": 7,
+    }
+    assert calls == [
+        ("/v1/runtime/retirements/cancel", expected_payload),
+        ("/v1/runtime/retirements/finalize", expected_payload),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "response"),
+    [
+        (
+            "cancel_retirement",
+            {
+                "schema_version": "runtime-retirement-cancellation.v1",
+                "request_id": "retirement-request",
+                "owner_id": "owner",
+                "conversation_id": "conversation",
+                "reservation_id": "wrong",
+                "thread_revision": 7,
+                "outcome": "cancelled",
+            },
+        ),
+        (
+            "finalize_retirement",
+            {
+                "schema_version": "runtime-retirement-finalization.v1",
+                "request_id": "retirement-request",
+                "owner_id": "owner",
+                "conversation_id": "conversation",
+                "reservation_id": "retirement-reservation",
+                "previous_thread_revision": 7,
+                "fenced_thread_revision": 9,
+                "outcome": "finalized",
+            },
+        ),
+    ],
+)
+async def test_runtime_retirement_mutations_reject_mismatched_or_invalid_result(
+    operation,
+    response,
+):
+    client = RuntimeClient("http://runtime.local", None)
+
+    async def fake_post(path: str, *, json: dict[str, Any]):
+        return response
+
+    client._post = fake_post  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="retirement_"):
+        await getattr(client, operation)(
+            request_id="retirement-request",
+            owner_id="owner",
+            conversation_id="conversation",
+            reservation_id="retirement-reservation",
+            reserved_thread_revision=7,
+        )

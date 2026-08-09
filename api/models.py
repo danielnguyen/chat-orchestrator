@@ -252,12 +252,15 @@ class ChatResponse(BaseModel):
     status: Literal["ok", "degraded", "failed"]
     sources: List[Dict[str, Any]] = Field(default_factory=list)
     pending_action: Optional[PendingActionEnvelope] = None
+    conversation_disposition: Optional[Literal["non_current"]] = None
 
     @model_serializer(mode="wrap")
-    def _omit_empty_pending_action(self, handler):
+    def _omit_empty_optional_fields(self, handler):
         serialized = handler(self)
         if self.pending_action is None:
             serialized.pop("pending_action", None)
+        if self.conversation_disposition is None:
+            serialized.pop("conversation_disposition", None)
         return serialized
 
 
