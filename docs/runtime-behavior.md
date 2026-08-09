@@ -24,15 +24,51 @@ Optional integrations are non-authoritative unless their owning policy explicitl
 
 ## Conversation resolution
 
-When a request supplies `conversation_id`, Chat Orchestrator performs one exact
+When a request supplies `conversation_id`, Chat Orchestrator performs an exact
 Basic Memory Store lookup scoped to the request owner. It does not first invoke
-the same-client resolver. Only an exact open conversation proceeds. Missing,
-owner-mismatched, closed, superseded, malformed, or unavailable targets return
-one bounded failure before message append, retrieval, profile resolution,
-Cognitive Runtime calls, provider calls, capability or connector work, and trace
-persistence. That response does not reveal whether the conversation exists, its
-lifecycle state, or retained conversation content, and a superseded replacement
-is not followed.
+the same-client resolver. Missing, owner-mismatched, malformed, or unavailable
+targets return one bounded generic failure before message append, retrieval,
+profile resolution, provider calls, capability or connector work, and trace
+persistence. The failure does not reveal whether the conversation exists or
+expose retained conversation content.
+
+An exact open conversation remains explicitly resumable after the 1,800-second
+omitted-ID freshness interval while it is inside the seven-day durable
+retirement horizon. With Cognitive Runtime enabled, Chat Orchestrator resolves
+the exact runtime thread revision, repeats the owner-scoped Basic Memory Store
+authorization read, and admits the turn only against that captured revision.
+The second durable read prevents a lifecycle transition that occurred during
+runtime inspection from being bypassed. A lifecycle change after the second read
+is still fenced by either the Cognitive Runtime reservation/revision boundary or
+Basic Memory Store's open-state message-append enforcement.
+
+An exact open conversation whose durable activity is strictly older than the
+seven-day cutoff must pass retirement evaluation before it can continue.
+Chat Orchestrator sends the same absolute timezone-aware UTC cutoff and exact
+durable activity fact to Cognitive Runtime. Cognitive Runtime may reserve only a
+consistent idle thread whose runtime activity is also strictly older than the
+cutoff. Active threads wait; contended, unavailable, inconsistent, and missing
+runtime state decline conservatively. Equality with the cutoff remains inside
+the grace boundary.
+
+For a reserved thread, Chat Orchestrator asks Basic Memory Store to transition
+the exact owner-scoped conversation from `open` to `closed` using Cognitive
+Runtime's captured durable activity as `expected_updated_at`. A confirmed close
+is finalized once in Cognitive Runtime, advancing its thread revision and
+removing the persistent reservation. If the durable close is ambiguous or
+fails, Chat Orchestrator performs one exact durable reread: confirmed `open`
+allows one reservation-cancel attempt, confirmed `closed` is finalized without
+cancellation, and confirmed `superseded` is not substituted or cancelled.
+Failed reconciliation leaves the reservation conservatively fenced. Lifecycle
+POSTs, cancellation, and finalization are not generically replayed.
+
+A supplied conversation authoritatively observed as `closed` or `superseded`,
+or durably confirmed closed by this request, returns the supplied identifier
+with `conversation_disposition="non_current"`. No replacement is selected and
+no retained content or internal reservation/revision detail is exposed. Generic
+missing, owner, transport, malformed-response, policy, admission, or provider
+failures omit this disposition and therefore do not authorize a client to
+discard a cached identifier.
 
 The conversation's originating client may differ from the current request
 client. A valid continuation appends new messages with the current `client_id`
@@ -54,8 +90,14 @@ ID, open lifecycle state, and durable update time. Cognitive Runtime combines
 those facts with its existing thread state and returns `resume`, `create_new`,
 `clarify`, `wait`, or `decline`. A resume uses the exact selected conversation
 and binds the returned thread revision into atomic turn admission. Create-new
-makes one direct durable conversation creation request and then admits without a
-selected revision. Clarification, wait, decline, and mandatory dependency
+first makes one bounded best-effort cleanup attempt, then makes one direct
+durable conversation creation request and admits without a selected revision.
+Cleanup lists at most four owner-scoped open conversations strictly older than
+the same seven-day cutoff, asks Cognitive Runtime to evaluate each, and closes
+at most one confirmed-safe thread. It does not paginate or use Basic Memory
+Store ordering as retirement authority. Cleanup wait, decline, conflict, or
+dependency failure cannot prevent the already-authorized new conversation.
+Clarification, wait, decline, and mandatory dependency
 failures return a null conversation ID before admission, message persistence,
 profile or retrieval work, providers, capabilities, actions, claims, or traces.
 Adapters store and reuse only non-null conversation IDs.
@@ -71,8 +113,12 @@ fixed 1,800-second freshness interval preserves the bounded compatibility
 horizon; it does not establish a general presence policy.
 
 When Cognitive Runtime is not configured, omitted IDs retain the same-owner,
-same-client rolling resolver as explicit compatibility behavior. That path is
-not cross-surface selection-protected. Supplied-ID validation remains unchanged.
+same-client rolling resolver as explicit compatibility behavior and do not run
+opportunistic retirement. Exact supplied IDs inside the seven-day grace boundary
+retain their compatibility behavior. An exact over-horizon open conversation
+cannot continue because runtime retirement safety cannot be established; it
+remains durably open and returns a bounded generic failure without a
+`non_current` disposition.
 
 ## Turn admission and current-user persistence
 

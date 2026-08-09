@@ -175,6 +175,18 @@ _CONTINUATION_DECLINE = (
 _MAX_CONTINUATION_CANDIDATES = 8
 _CONTINUATION_OVERFETCH_LIMIT = 9
 _CONTINUATION_STALE_AFTER_SECONDS = 1800
+_CONVERSATION_RETIREMENT_AFTER_SECONDS = 7 * 24 * 60 * 60
+_RETIREMENT_SCAN_LIMIT = 4
+_RETIREMENT_CLOSE_LIMIT = 1
+_CONVERSATION_NON_CURRENT = (
+    "That conversation is no longer current. I did not use its retained content. "
+    "Retry without that conversation reference to let the server resolve a current "
+    "thread."
+)
+_RETIREMENT_POLICY_UNAVAILABLE = (
+    "I couldn’t safely determine whether that conversation can continue. "
+    "No retained conversation content was used. Please try again."
+)
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
@@ -6617,6 +6629,227 @@ async def _create_error_trace(
     )
 
 
+def _aware_conversation_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            raise RuntimeError("conversation_projection_invalid") from None
+    else:
+        raise RuntimeError("conversation_projection_invalid")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RuntimeError("conversation_projection_invalid")
+    return parsed
+
+
+def _supplied_conversation_failure(
+    *,
+    request_id: str,
+    conversation_id: str,
+    answer: str | None = None,
+    status: str = "failed",
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": answer
+        or (
+            "I could not continue that conversation safely. "
+            "No retained conversation content was used."
+        ),
+        "status": status,
+        "sources": [],
+    }
+
+
+def _non_current_conversation_response(
+    *,
+    request_id: str,
+    conversation_id: str,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "conversation_disposition": "non_current",
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": _CONVERSATION_NON_CURRENT,
+        "status": "failed",
+        "sources": [],
+    }
+
+
+def _supplied_retirement_outcome_response(
+    *,
+    outcome: str,
+    request_id: str,
+    conversation_id: str,
+) -> dict[str, Any]:
+    if outcome == "retired":
+        return _non_current_conversation_response(
+            request_id=request_id,
+            conversation_id=conversation_id,
+        )
+    if outcome == "wait":
+        return _supplied_conversation_failure(
+            request_id=request_id,
+            conversation_id=conversation_id,
+            answer=_CONTINUATION_WAIT,
+            status="degraded",
+        )
+    return _supplied_conversation_failure(
+        request_id=request_id,
+        conversation_id=conversation_id,
+        answer=_RETIREMENT_POLICY_UNAVAILABLE,
+    )
+
+
+async def _attempt_conversation_retirement(
+    *,
+    owner_id: str,
+    conversation_id: str,
+    lifecycle_state: str,
+    durable_updated_at: datetime,
+    retirement_before: datetime,
+    memory_store: Any,
+    runtime: Any,
+    request_id: str,
+) -> str:
+    try:
+        reservation_response = await runtime.reserve_retirement(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            lifecycle_state=lifecycle_state,
+            durable_updated_at=durable_updated_at,
+            retirement_before=retirement_before,
+        )
+        reservation = reservation_response["result"]
+        outcome = reservation["outcome"]
+    except Exception:
+        return "ambiguous"
+
+    if outcome == "wait":
+        return "wait"
+    if outcome == "decline":
+        return "declined"
+    if outcome != "reserved":
+        return "ambiguous"
+
+    try:
+        reservation_id = reservation["reservation_id"]
+        reserved_thread_revision = reservation["reserved_thread_revision"]
+        reserved_durable_updated_at = _aware_conversation_timestamp(
+            reservation["reserved_durable_updated_at"]
+        )
+    except Exception:
+        return "ambiguous"
+
+    try:
+        closed = await memory_store.close_conversation(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+            expected_updated_at=reserved_durable_updated_at,
+        )
+        if closed.get("lifecycle_state") != "closed":
+            raise RuntimeError("conversation_lifecycle_response_invalid")
+    except Exception:
+        try:
+            reconciled = await memory_store.get_conversation(
+                conversation_id=conversation_id,
+                owner_id=owner_id,
+            )
+            reconciled_state = reconciled["lifecycle_state"]
+        except Exception:
+            return "ambiguous"
+
+        if reconciled_state == "open":
+            try:
+                await runtime.cancel_retirement(
+                    request_id=request_id,
+                    owner_id=owner_id,
+                    conversation_id=conversation_id,
+                    reservation_id=reservation_id,
+                    reserved_thread_revision=reserved_thread_revision,
+                )
+            except Exception:
+                return "ambiguous"
+            return "still_open"
+        if reconciled_state == "closed":
+            try:
+                await runtime.finalize_retirement(
+                    request_id=request_id,
+                    owner_id=owner_id,
+                    conversation_id=conversation_id,
+                    reservation_id=reservation_id,
+                    reserved_thread_revision=reserved_thread_revision,
+                )
+            except Exception:
+                pass
+            return "retired"
+        if reconciled_state == "superseded":
+            return "retired"
+        return "ambiguous"
+
+    try:
+        await runtime.finalize_retirement(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            reservation_id=reservation_id,
+            reserved_thread_revision=reserved_thread_revision,
+        )
+    except Exception:
+        pass
+    return "retired"
+
+
+async def _opportunistic_retirement_cleanup(
+    *,
+    owner_id: str,
+    retirement_before: datetime,
+    memory_store: Any,
+    runtime: Any,
+    request_id: str,
+) -> None:
+    try:
+        listed = await memory_store.list_open_conversations(
+            owner_id=owner_id,
+            updated_before=retirement_before,
+            limit=_RETIREMENT_SCAN_LIMIT,
+        )
+        rows = listed["conversations"]
+    except Exception:
+        return
+
+    retired = 0
+    for row in rows:
+        try:
+            durable_updated_at = _aware_conversation_timestamp(row["updated_at"])
+            outcome = await _attempt_conversation_retirement(
+                owner_id=owner_id,
+                conversation_id=row["conversation_id"],
+                lifecycle_state=row["lifecycle_state"],
+                durable_updated_at=durable_updated_at,
+                retirement_before=retirement_before,
+                memory_store=memory_store,
+                runtime=runtime,
+                request_id=request_id,
+            )
+        except Exception:
+            return
+        if outcome == "retired":
+            retired += 1
+            if retired >= _RETIREMENT_CLOSE_LIMIT:
+                return
+        elif outcome == "ambiguous":
+            return
+
+
 async def orchestrate_chat(
     *,
     payload: dict[str, Any],
@@ -6651,6 +6884,10 @@ async def orchestrate_chat(
     message_id_factory: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
+    evaluated_at = datetime.now(UTC)
+    retirement_before = evaluated_at - timedelta(
+        seconds=_CONVERSATION_RETIREMENT_AFTER_SECONDS
+    )
     surface = payload.get("surface", "unknown")
     connector_registry = (
         action_connector_registry
@@ -6690,21 +6927,125 @@ async def orchestrate_chat(
                 conversation_id=supplied_conversation_id,
                 owner_id=payload["owner_id"],
             )
-            if conversation.get("lifecycle_state") != "open":
-                raise RuntimeError("conversation_not_open")
         except Exception:
-            return {
-                "request_id": request_id,
-                "conversation_id": supplied_conversation_id,
-                "profile_name": "unresolved",
-                "selected_model": "not_called",
-                "answer": (
-                    "I could not continue that conversation safely. "
-                    "No retained conversation content was used."
-                ),
-                "status": "failed",
-                "sources": [],
-            }
+            return _supplied_conversation_failure(
+                request_id=request_id,
+                conversation_id=supplied_conversation_id,
+            )
+        if not isinstance(conversation, dict):
+            return _supplied_conversation_failure(
+                request_id=request_id,
+                conversation_id=supplied_conversation_id,
+            )
+        lifecycle_state = conversation.get("lifecycle_state")
+        if lifecycle_state in {"closed", "superseded"}:
+            return _non_current_conversation_response(
+                request_id=request_id,
+                conversation_id=supplied_conversation_id,
+            )
+        if lifecycle_state != "open":
+            return _supplied_conversation_failure(
+                request_id=request_id,
+                conversation_id=supplied_conversation_id,
+            )
+        try:
+            durable_updated_at = _aware_conversation_timestamp(
+                conversation.get("updated_at")
+            )
+        except Exception:
+            return _supplied_conversation_failure(
+                request_id=request_id,
+                conversation_id=supplied_conversation_id,
+            )
+
+        if durable_updated_at < retirement_before:
+            if runtime is None:
+                return _supplied_conversation_failure(
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                    answer=_RETIREMENT_POLICY_UNAVAILABLE,
+                )
+            outcome = await _attempt_conversation_retirement(
+                owner_id=payload["owner_id"],
+                conversation_id=supplied_conversation_id,
+                lifecycle_state=lifecycle_state,
+                durable_updated_at=durable_updated_at,
+                retirement_before=retirement_before,
+                memory_store=memory_store,
+                runtime=runtime,
+                request_id=request_id,
+            )
+            return _supplied_retirement_outcome_response(
+                outcome=outcome,
+                request_id=request_id,
+                conversation_id=supplied_conversation_id,
+            )
+
+        if runtime is not None:
+            try:
+                thread = await runtime.resolve_thread(
+                    request_id=request_id,
+                    owner_id=payload["owner_id"],
+                    conversation_id=supplied_conversation_id,
+                )
+                revision = thread["revision"]
+                if (
+                    isinstance(revision, bool)
+                    or not isinstance(revision, int)
+                    or revision < 0
+                ):
+                    raise RuntimeError("runtime_thread_response_invalid")
+                refreshed = await memory_store.get_conversation(
+                    conversation_id=supplied_conversation_id,
+                    owner_id=payload["owner_id"],
+                )
+            except Exception:
+                return _supplied_conversation_failure(
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                )
+            if not isinstance(refreshed, dict):
+                return _supplied_conversation_failure(
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                )
+            refreshed_state = refreshed.get("lifecycle_state")
+            if refreshed_state in {"closed", "superseded"}:
+                return _non_current_conversation_response(
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                )
+            if refreshed_state != "open":
+                return _supplied_conversation_failure(
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                )
+            try:
+                refreshed_updated_at = _aware_conversation_timestamp(
+                    refreshed.get("updated_at")
+                )
+            except Exception:
+                return _supplied_conversation_failure(
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                )
+            if refreshed_updated_at < retirement_before:
+                outcome = await _attempt_conversation_retirement(
+                    owner_id=payload["owner_id"],
+                    conversation_id=supplied_conversation_id,
+                    lifecycle_state=refreshed_state,
+                    durable_updated_at=refreshed_updated_at,
+                    retirement_before=retirement_before,
+                    memory_store=memory_store,
+                    runtime=runtime,
+                    request_id=request_id,
+                )
+                return _supplied_retirement_outcome_response(
+                    outcome=outcome,
+                    request_id=request_id,
+                    conversation_id=supplied_conversation_id,
+                )
+            expected_thread_revision = revision
         conversation_id = supplied_conversation_id
         conversation_resolution_trace = {"mode": "supplied"}
     elif runtime is None:
@@ -6716,7 +7057,7 @@ async def orchestrate_chat(
         conversation_resolution_trace = {"mode": "compatibility"}
     else:
         try:
-            updated_since = datetime.now(UTC) - timedelta(
+            updated_since = evaluated_at - timedelta(
                 seconds=_CONTINUATION_STALE_AFTER_SECONDS
             )
             listed = await memory_store.list_open_conversations(
@@ -6772,6 +7113,13 @@ async def orchestrate_chat(
                 }
             )
         elif selection["outcome"] == "create_new":
+            await _opportunistic_retirement_cleanup(
+                owner_id=payload["owner_id"],
+                retirement_before=retirement_before,
+                memory_store=memory_store,
+                runtime=runtime,
+                request_id=request_id,
+            )
             try:
                 created = await memory_store.create_conversation(
                     owner_id=payload["owner_id"],

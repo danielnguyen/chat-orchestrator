@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: 0c3954df95b2d4d958e14acc7011a11cf445356a
+          ref: a61beb574a49f2d83f70008596c1183532b78f40
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -67,16 +67,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: ea49890e2ca318a5a76a26e2ee45bdbd2f94b307
+          ref: e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553
           path: basic-memory-store
           fetch-depth: 0
 
       - name: Establish pinned local main refs
         run: |
-          git -C cognitive-runtime branch --force main 0c3954df95b2d4d958e14acc7011a11cf445356a
+          git -C cognitive-runtime branch --force main a61beb574a49f2d83f70008596c1183532b78f40
           git -C data-source-aggregator branch --force main e23f582e4aac32a12c7ad3c71278fc21e5697ea4
-          git -C basic-memory-store branch --force main ea49890e2ca318a5a76a26e2ee45bdbd2f94b307
-          git -C chat-orchestrator merge-base --is-ancestor a0375065bbf764758192b6f67deac77c0ec1eb70 HEAD
+          git -C basic-memory-store branch --force main e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553
+          git -C chat-orchestrator merge-base --is-ancestor 3802c3d30e9bb580a2d9597f521af52b7d6dc8dc HEAD
 
       - name: Validate Compose configuration
         working-directory: chat-orchestrator
@@ -150,6 +150,14 @@ jobs:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
           SITUATED_PRESENCE_ONLY: "1"
           COMPOSED_RESTRAINT_ENABLED: "true"
+        run: make composed-smoke
+
+      - name: Run conversation retirement composition proof
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+          RETIREMENT_ONLY: "1"
         run: make composed-smoke
 
       - name: Run complete composed smoke regression

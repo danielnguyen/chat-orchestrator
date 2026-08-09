@@ -134,10 +134,16 @@ class FakeMemoryStore:
         self.create_conversation_calls = []
         self.list_conversation_response = {"conversations": [], "next_cursor": None}
         self.list_conversation_error = None
+        self.list_conversation_effects = []
         self.create_conversation_response = {"conversation_id": "conv-1"}
         self.create_conversation_error = None
         self.exact_conversation_response = None
         self.exact_conversation_error = None
+        self.exact_conversation_effects = []
+        self.close_conversation_calls = []
+        self.close_conversation_response = None
+        self.close_conversation_error = None
+        self.close_conversation_effects = []
         self.added_messages = []
         self.retrieve_calls = []
         self.profile_calls = []
@@ -150,6 +156,11 @@ class FakeMemoryStore:
 
     async def get_conversation(self, **kwargs):
         self.exact_conversation_calls.append(kwargs)
+        if self.exact_conversation_effects:
+            effect = self.exact_conversation_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            return copy.deepcopy(effect)
         if self.exact_conversation_error is not None:
             raise self.exact_conversation_error
         if self.exact_conversation_response is not None:
@@ -167,12 +178,17 @@ class FakeMemoryStore:
             "title": None,
             "lifecycle_state": "open",
             "superseded_by_conversation_id": None,
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "updated_at": "2026-01-01T00:00:00+00:00",
+            "created_at": "2099-01-01T00:00:00+00:00",
+            "updated_at": "2099-01-01T00:00:00+00:00",
         }
 
     async def list_open_conversations(self, **kwargs):
         self.list_conversation_calls.append(kwargs)
+        if self.list_conversation_effects:
+            effect = self.list_conversation_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            return copy.deepcopy(effect)
         if self.list_conversation_error is not None:
             raise self.list_conversation_error
         return copy.deepcopy(self.list_conversation_response)
@@ -182,6 +198,28 @@ class FakeMemoryStore:
         if self.create_conversation_error is not None:
             raise self.create_conversation_error
         return copy.deepcopy(self.create_conversation_response)
+
+    async def close_conversation(self, **kwargs):
+        self.close_conversation_calls.append(kwargs)
+        if self.close_conversation_effects:
+            effect = self.close_conversation_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            return copy.deepcopy(effect)
+        if self.close_conversation_error is not None:
+            raise self.close_conversation_error
+        if self.close_conversation_response is not None:
+            return copy.deepcopy(self.close_conversation_response)
+        return {
+            "conversation_id": kwargs["conversation_id"],
+            "owner_id": kwargs["owner_id"],
+            "client_id": "origin-client",
+            "title": None,
+            "lifecycle_state": "closed",
+            "superseded_by_conversation_id": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-08-09T00:00:00+00:00",
+        }
 
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
@@ -479,6 +517,13 @@ class FakeRuntime:
         evidence_next_step_error: Exception | None = None,
         continuation_selection_response=None,
         continuation_selection_error: Exception | None = None,
+        thread_response=None,
+        thread_error: Exception | None = None,
+        retirement_reservation_response=None,
+        retirement_reservation_error: Exception | None = None,
+        retirement_cancel_error: Exception | None = None,
+        retirement_finalize_error: Exception | None = None,
+        turn_start_error: Exception | None = None,
         companion_endpoint: str = "/v1/companion/profile/compile",
     ):
         self.calls = []
@@ -486,6 +531,10 @@ class FakeRuntime:
         self.companion_calls = []
         self.turn_start_calls = []
         self.continuation_selection_calls = []
+        self.thread_resolve_calls = []
+        self.retirement_reservation_calls = []
+        self.retirement_cancel_calls = []
+        self.retirement_finalize_calls = []
         self.turn_update_calls = []
         self.turn_complete_calls = []
         self.identity_calls = []
@@ -858,6 +907,14 @@ class FakeRuntime:
         self.evidence_next_step_error = evidence_next_step_error
         self.continuation_selection_response = continuation_selection_response
         self.continuation_selection_error = continuation_selection_error
+        self.thread_response = thread_response
+        self.thread_error = thread_error
+        self.retirement_reservation_response = retirement_reservation_response
+        self.retirement_reservation_effects = []
+        self.retirement_reservation_error = retirement_reservation_error
+        self.retirement_cancel_error = retirement_cancel_error
+        self.retirement_finalize_error = retirement_finalize_error
+        self.turn_start_error = turn_start_error
         self.companion_endpoint = companion_endpoint
 
     async def compile_companion_policy(self, **kwargs):
@@ -910,9 +967,71 @@ class FakeRuntime:
             },
         }
 
+    async def resolve_thread(self, **kwargs):
+        self.thread_resolve_calls.append(copy.deepcopy(kwargs))
+        self.call_order.append("resolve_thread")
+        if self.thread_error is not None:
+            raise self.thread_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        if self.thread_response is not None:
+            return copy.deepcopy(self.thread_response)
+        return {
+            "owner_id": kwargs["owner_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "state": "idle",
+            "revision": 0,
+            "active_runtime_session_id": None,
+            "active_runtime_turn_id": None,
+            "active_surface": None,
+            "participating_surfaces": [],
+            "participating_session_count": 0,
+            "last_activity_at": "2026-08-09T00:00:00+00:00",
+            "created_at": "2026-08-09T00:00:00+00:00",
+            "updated_at": "2026-08-09T00:00:00+00:00",
+        }
+
+    async def reserve_retirement(self, **kwargs):
+        self.retirement_reservation_calls.append(copy.deepcopy(kwargs))
+        self.call_order.append("reserve_retirement")
+        if self.retirement_reservation_effects:
+            effect = self.retirement_reservation_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            return copy.deepcopy(effect)
+        if self.retirement_reservation_error is not None:
+            raise self.retirement_reservation_error
+        if self.retirement_reservation_response is not None:
+            return copy.deepcopy(self.retirement_reservation_response)
+        return {
+            "result": {
+                "outcome": "decline",
+                "reservation_id": None,
+                "reserved_thread_revision": None,
+                "reserved_durable_updated_at": None,
+                "reason_codes": ["runtime_state_missing"],
+            }
+        }
+
+    async def cancel_retirement(self, **kwargs):
+        self.retirement_cancel_calls.append(copy.deepcopy(kwargs))
+        self.call_order.append("cancel_retirement")
+        if self.retirement_cancel_error is not None:
+            raise self.retirement_cancel_error
+        return {"outcome": "cancelled"}
+
+    async def finalize_retirement(self, **kwargs):
+        self.retirement_finalize_calls.append(copy.deepcopy(kwargs))
+        self.call_order.append("finalize_retirement")
+        if self.retirement_finalize_error is not None:
+            raise self.retirement_finalize_error
+        return {"outcome": "finalized"}
+
     async def start_turn(self, **kwargs):
         self.turn_start_calls.append(kwargs)
         self.call_order.append("start_turn")
+        if self.turn_start_error is not None:
+            raise self.turn_start_error
         if self.fail:
             raise RuntimeError("runtime unavailable")
         response = copy.deepcopy(self.turn_response)
@@ -2081,6 +2200,8 @@ def _conversation_projection(
     client_id="origin-client",
     lifecycle_state="open",
     superseded_by_conversation_id=None,
+    created_at="2099-01-01T00:00:00+00:00",
+    updated_at="2099-01-01T00:00:00+00:00",
 ):
     return {
         "conversation_id": conversation_id,
@@ -2089,8 +2210,8 @@ def _conversation_projection(
         "title": None,
         "lifecycle_state": lifecycle_state,
         "superseded_by_conversation_id": superseded_by_conversation_id,
-        "created_at": "2026-01-01T00:00:00+00:00",
-        "updated_at": "2026-01-01T00:00:00+00:00",
+        "created_at": created_at,
+        "updated_at": updated_at,
     }
 
 
@@ -2146,6 +2267,90 @@ def _selection_response(
     }
 
 
+def _retirement_response(
+    outcome,
+    *,
+    durable_updated_at="2026-08-01T12:00:00+00:00",
+    revision=7,
+    reason=None,
+):
+    reason = reason or {
+        "reserved": "safe_idle_retirement_reserved",
+        "wait": "runtime_thread_active",
+        "decline": "runtime_state_missing",
+    }[outcome]
+    result = {
+        "outcome": outcome,
+        "reservation_id": None,
+        "reserved_thread_revision": None,
+        "reserved_durable_updated_at": None,
+        "reason_codes": [reason],
+    }
+    if outcome == "reserved":
+        result.update(
+            reservation_id="reservation-1",
+            reserved_thread_revision=revision,
+            reserved_durable_updated_at=durable_updated_at,
+        )
+    return {"result": result}
+
+
+def _thread_projection(
+    *,
+    conversation_id="shared-conversation",
+    owner_id="owner",
+    revision=7,
+):
+    return {
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "state": "idle",
+        "revision": revision,
+        "active_runtime_session_id": None,
+        "active_runtime_turn_id": None,
+        "active_surface": None,
+        "participating_surfaces": ["vscode"],
+        "participating_session_count": 1,
+        "last_activity_at": "2026-08-09T12:00:00+00:00",
+        "created_at": "2026-08-01T12:00:00+00:00",
+        "updated_at": "2026-08-09T12:00:00+00:00",
+    }
+
+
+def _freeze_orchestration_time(monkeypatch, fixed_now):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return fixed_now
+
+    monkeypatch.setattr(orchestrate_service, "datetime", FixedDatetime)
+
+
+async def _run_retirement_chat(
+    tmp_path,
+    *,
+    memory_store,
+    runtime,
+    request_id,
+    conversation_id="shared-conversation",
+    provider=None,
+):
+    rules, models = _write_router_files(tmp_path)
+    selected_provider = provider or FakeLiteLLM(content="continued response")
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id=conversation_id),
+        memory_store=memory_store,
+        litellm=selected_provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return result, selected_provider
+
+
 def _conversation_lookup_http_error(status_code):
     request = httpx.Request(
         "GET",
@@ -2184,7 +2389,7 @@ async def test_supplied_open_conversation_uses_exact_lookup_without_resolver(tmp
 
     assert result["status"] == "ok"
     assert result["conversation_id"] == "shared-conversation"
-    assert memory_store.exact_conversation_calls == [
+    assert memory_store.exact_conversation_calls == 2 * [
         {"conversation_id": "shared-conversation", "owner_id": "owner"}
     ]
     assert memory_store.resolve_conversation_calls == []
@@ -2195,8 +2400,15 @@ async def test_supplied_open_conversation_uses_exact_lookup_without_resolver(tmp
     }
     assert memory_store.retrieve_calls[0]["conversation_id"] == "shared-conversation"
     assert runtime.turn_start_calls[0]["conversation_id"] == "shared-conversation"
+    assert runtime.thread_resolve_calls == [
+        {
+            "request_id": "request-supplied-open",
+            "owner_id": "owner",
+            "conversation_id": "shared-conversation",
+        }
+    ]
     assert runtime.continuation_selection_calls == []
-    assert runtime.turn_start_calls[0]["expected_thread_revision"] is None
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] == 0
     assert len(provider.calls) == 1
     assert memory_store.trace_calls[0]["payload"]["conversation_id"] == (
         "shared-conversation"
@@ -2228,7 +2440,7 @@ async def test_supplied_open_conversation_keeps_current_client_and_surface(tmp_p
 
     assert result["status"] == "ok"
     assert memory_store.resolve_conversation_calls == []
-    assert memory_store.exact_conversation_calls == [
+    assert memory_store.exact_conversation_calls == 2 * [
         {"conversation_id": "shared-conversation", "owner_id": "owner"}
     ]
     assert all(message["client_id"] == "current-client" for message in memory_store.added_messages)
@@ -2280,7 +2492,15 @@ async def test_omitted_conversation_uses_runtime_create_new_without_rolling_reso
                 seconds=orchestrate_service._CONTINUATION_STALE_AFTER_SECONDS
             ),
             "limit": 9,
-        }
+        },
+        {
+            "owner_id": "owner",
+            "updated_before": fixed_now
+            - timedelta(
+                seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS
+            ),
+            "limit": orchestrate_service._RETIREMENT_SCAN_LIMIT,
+        },
     ]
     assert memory_store.list_conversation_calls[0]["updated_since"].tzinfo is UTC
     assert memory_store.create_conversation_calls == [
@@ -2346,6 +2566,201 @@ async def test_memory_store_open_list_rejects_naive_cutoff_before_request(monkey
     assert calls == []
 
 
+@pytest.mark.asyncio
+async def test_memory_store_open_list_serializes_aware_updated_before_without_selectors(
+    monkeypatch,
+):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = []
+
+    async def fake_get(path, *, params=None):
+        calls.append({"path": path, "params": params})
+        return {"conversations": [], "next_cursor": None}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    cutoff = datetime.fromisoformat("2026-08-09T18:00:00+05:30")
+
+    await client.list_open_conversations(
+        owner_id="owner",
+        updated_before=cutoff,
+        limit=4,
+    )
+
+    assert calls == [
+        {
+            "path": "/v1/conversations",
+            "params": {
+                "owner_id": "owner",
+                "lifecycle_state": "open",
+                "updated_before": cutoff.isoformat(),
+                "limit": 4,
+            },
+        }
+    ]
+    serialized = calls[0]["params"]["updated_before"]
+    assert datetime.fromisoformat(serialized) == cutoff
+    assert datetime.fromisoformat(serialized).utcoffset() == timedelta(
+        hours=5,
+        minutes=30,
+    )
+    assert "client_id" not in calls[0]["params"]
+    assert "surface" not in calls[0]["params"]
+
+
+@pytest.mark.asyncio
+async def test_memory_store_open_list_rejects_naive_updated_before_before_request(
+    monkeypatch,
+):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = 0
+
+    async def fake_get(path, *, params=None):
+        nonlocal calls
+        calls += 1
+        return {"conversations": [], "next_cursor": None}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    with pytest.raises(ValueError, match="^updated_before_timezone_required$"):
+        await client.list_open_conversations(
+            owner_id="owner",
+            updated_before=datetime(2026, 8, 9, 12, 30),
+            limit=4,
+        )
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "updated_at",
+    ["malformed", "2026-08-09T12:30:00"],
+)
+async def test_memory_store_exact_projection_rejects_invalid_or_naive_activity(
+    monkeypatch,
+    updated_at,
+):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    projection = _conversation_projection(
+        conversation_id="shared-conversation",
+        updated_at=updated_at,
+    )
+
+    async def fake_get(path, *, params=None):
+        return projection
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    with pytest.raises(RuntimeError, match="conversation_projection_invalid"):
+        await client.get_conversation(
+            conversation_id="shared-conversation",
+            owner_id="owner",
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_store_exact_projection_accepts_non_utc_activity_offset(monkeypatch):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    projection = _conversation_projection(
+        conversation_id="shared-conversation",
+        updated_at="2026-08-09T18:00:00+05:30",
+    )
+
+    async def fake_get(path, *, params=None):
+        return projection
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    assert await client.get_conversation(
+        conversation_id="shared-conversation",
+        owner_id="owner",
+    ) == projection
+
+
+@pytest.mark.asyncio
+async def test_memory_store_close_posts_exact_cas_and_validates_closed_projection(
+    monkeypatch,
+):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = []
+    expected_updated_at = datetime.fromisoformat("2026-08-01T07:00:00-05:00")
+    closed = _conversation_projection(
+        conversation_id="shared-conversation",
+        lifecycle_state="closed",
+    )
+
+    async def fake_post(path, *, request_id=None, json):
+        calls.append({"path": path, "request_id": request_id, "json": json})
+        return closed
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    assert await client.close_conversation(
+        conversation_id="shared-conversation",
+        owner_id="owner",
+        expected_updated_at=expected_updated_at,
+    ) == closed
+    assert calls == [
+        {
+            "path": "/v1/conversations/shared-conversation/lifecycle",
+            "request_id": None,
+            "json": {
+                "owner_id": "owner",
+                "lifecycle_state": "closed",
+                "expected_updated_at": expected_updated_at.isoformat(),
+            },
+        }
+    ]
+    assert "superseded_by_conversation_id" not in calls[0]["json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        "malformed",
+        _conversation_projection(conversation_id="other"),
+        _conversation_projection(owner_id="other"),
+        _conversation_projection(lifecycle_state="open"),
+    ],
+)
+async def test_memory_store_close_rejects_malformed_mismatched_or_nonclosed_result(
+    monkeypatch,
+    response,
+):
+    client = MemoryStoreClient("http://memory.local", "secret")
+
+    async def fake_post(path, *, request_id=None, json):
+        return response
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    with pytest.raises(RuntimeError, match="conversation_"):
+        await client.close_conversation(
+            conversation_id="shared-conversation",
+            owner_id="owner",
+            expected_updated_at=datetime.fromisoformat(
+                "2026-08-01T12:00:00+00:00"
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_store_close_rejects_naive_expected_activity_before_request(
+    monkeypatch,
+):
+    client = MemoryStoreClient("http://memory.local", "secret")
+    calls = 0
+
+    async def fake_post(path, *, request_id=None, json):
+        nonlocal calls
+        calls += 1
+        return _conversation_projection(lifecycle_state="closed")
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    with pytest.raises(ValueError, match="^expected_updated_at_timezone_required$"):
+        await client.close_conversation(
+            conversation_id="shared-conversation",
+            owner_id="owner",
+            expected_updated_at=datetime(2026, 8, 1, 12),
+        )
+    assert calls == 0
+
+
 def test_chat_response_serializes_truthful_nullable_conversation_identity():
     base = {
         "request_id": "request",
@@ -2356,11 +2771,22 @@ def test_chat_response_serializes_truthful_nullable_conversation_identity():
         "sources": [],
     }
 
-    assert ChatResponse(**base).model_dump()["conversation_id"] is None
+    ordinary = ChatResponse(**base).model_dump()
+    assert ordinary["conversation_id"] is None
+    assert "conversation_disposition" not in ordinary
+    assert "pending_action" not in ordinary
     assert ChatResponse(
         **base,
         conversation_id="00000000-0000-4000-8000-000000000001",
     ).model_dump()["conversation_id"] == "00000000-0000-4000-8000-000000000001"
+    disposition = ChatResponse(
+        **base,
+        conversation_id="00000000-0000-4000-8000-000000000001",
+        conversation_disposition="non_current",
+    ).model_dump()
+    assert disposition["conversation_disposition"] == "non_current"
+    with pytest.raises(ValueError):
+        ChatResponse(**base, conversation_disposition="retired")
 
 
 @pytest.mark.asyncio
@@ -2736,17 +3162,6 @@ async def test_invalid_omitted_confirmation_returns_null_before_selection(tmp_pa
 @pytest.mark.parametrize(
     ("exact_response", "exact_error"),
     [
-        (
-            _conversation_projection(lifecycle_state="closed"),
-            None,
-        ),
-        (
-            _conversation_projection(
-                lifecycle_state="superseded",
-                superseded_by_conversation_id="replacement-conversation",
-            ),
-            None,
-        ),
         (None, _conversation_lookup_http_error(404)),
         (None, _conversation_lookup_http_error(422)),
         (None, _conversation_lookup_http_error(503)),
@@ -2832,6 +3247,689 @@ async def test_supplied_conversation_failures_share_bounded_side_effect_free_res
     assert "missing" not in serialized
     assert "owner mismatch" not in serialized
     assert "replacement" not in serialized
+
+
+@pytest.mark.parametrize("lifecycle_state", ["closed", "superseded"])
+@pytest.mark.asyncio
+async def test_supplied_durable_non_current_returns_authoritative_disposition(
+    tmp_path,
+    lifecycle_state,
+):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        lifecycle_state=lifecycle_state,
+        superseded_by_conversation_id=(
+            "replacement-conversation" if lifecycle_state == "superseded" else None
+        ),
+    )
+    runtime = FakeRuntime()
+    provider = FakeLiteLLM(content="PRIVATE-RETAINED-CONTENT-SENTINEL")
+
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="shared-conversation"),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"request-supplied-{lifecycle_state}",
+    )
+
+    assert result == {
+        "request_id": f"request-supplied-{lifecycle_state}",
+        "conversation_id": "shared-conversation",
+        "conversation_disposition": "non_current",
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": orchestrate_service._CONVERSATION_NON_CURRENT,
+        "status": "failed",
+        "sources": [],
+    }
+    assert len(memory_store.exact_conversation_calls) == 1
+    assert memory_store.added_messages == []
+    assert memory_store.create_conversation_calls == []
+    assert runtime.call_order == []
+    assert provider.calls == []
+    serialized = json.dumps(result)
+    assert "replacement-conversation" not in serialized
+    assert "PRIVATE-RETAINED-CONTENT-SENTINEL" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_supplied_grace_path_orders_two_bms_reads_around_revision_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=2)).isoformat()
+    )
+    runtime = FakeRuntime(thread_response=_thread_projection(revision=11))
+    operations = []
+    original_get = memory_store.get_conversation
+    original_resolve = runtime.resolve_thread
+    original_start = runtime.start_turn
+
+    async def ordered_get(**kwargs):
+        operations.append("bms_exact")
+        return await original_get(**kwargs)
+
+    async def ordered_resolve(**kwargs):
+        operations.append("cr_resolve_thread")
+        return await original_resolve(**kwargs)
+
+    async def ordered_start(**kwargs):
+        operations.append("cr_start_turn")
+        return await original_start(**kwargs)
+
+    memory_store.get_conversation = ordered_get
+    runtime.resolve_thread = ordered_resolve
+    runtime.start_turn = ordered_start
+
+    result, _ = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-two-read-order",
+    )
+
+    assert result["status"] == "ok"
+    assert operations[:4] == [
+        "bms_exact",
+        "cr_resolve_thread",
+        "bms_exact",
+        "cr_start_turn",
+    ]
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] == 11
+    assert runtime.retirement_reservation_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_state", ["closed", "superseded"])
+async def test_second_durable_read_catches_authoritative_non_current_before_start(
+    tmp_path,
+    monkeypatch,
+    final_state,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_effects = [
+        _conversation_projection(updated_at=(fixed_now - timedelta(days=2)).isoformat()),
+        _conversation_projection(
+            lifecycle_state=final_state,
+            superseded_by_conversation_id=(
+                "replacement-conversation" if final_state == "superseded" else None
+            ),
+            updated_at=(fixed_now - timedelta(days=2)).isoformat(),
+        ),
+    ]
+    runtime = FakeRuntime(thread_response=_thread_projection(revision=4))
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id=f"request-second-read-{final_state}",
+    )
+
+    assert result["conversation_disposition"] == "non_current"
+    assert result["conversation_id"] == "shared-conversation"
+    assert len(memory_store.exact_conversation_calls) == 2
+    assert runtime.turn_start_calls == []
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_second_durable_read_failure_fails_closed_without_disposition(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_effects = [
+        _conversation_projection(updated_at=(fixed_now - timedelta(days=2)).isoformat()),
+        httpx.ReadTimeout("PRIVATE-SECOND-READ-SENTINEL"),
+    ]
+    runtime = FakeRuntime(thread_response=_thread_projection(revision=4))
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-second-read-failed",
+    )
+
+    assert result["status"] == "failed"
+    assert "conversation_disposition" not in result
+    assert "PRIVATE" not in json.dumps(result)
+    assert len(memory_store.exact_conversation_calls) == 2
+    assert runtime.turn_start_calls == []
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age", [timedelta(days=2), timedelta(days=7)])
+async def test_supplied_stale_but_inside_retirement_grace_continues_revision_bound(
+    tmp_path,
+    monkeypatch,
+    age,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        updated_at=(fixed_now - age).isoformat()
+    )
+    runtime = FakeRuntime(thread_response=_thread_projection(revision=5))
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id=f"request-grace-{age.days}",
+    )
+
+    assert result["status"] == "ok"
+    assert "conversation_disposition" not in result
+    assert runtime.retirement_reservation_calls == []
+    assert runtime.turn_start_calls[0]["expected_thread_revision"] == 5
+    assert len(memory_store.added_messages) == 2
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_disabled_supplied_over_horizon_fails_without_retirement_or_disposition(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=8)).isoformat()
+    )
+    rules, models = _write_router_files(tmp_path)
+    provider = FakeLiteLLM()
+
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="shared-conversation"),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=None,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-runtime-disabled-old",
+    )
+
+    assert result["status"] == "failed"
+    assert result["conversation_id"] == "shared-conversation"
+    assert "conversation_disposition" not in result
+    assert memory_store.close_conversation_calls == []
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mandatory_safe_retirement_uses_cr_captured_activity_and_finalizes(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    old_activity = datetime.fromisoformat("2026-08-01T07:00:00-05:00")
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        updated_at="2026-08-01T12:00:00+00:00"
+    )
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(
+            "reserved",
+            durable_updated_at=old_activity.isoformat(),
+            revision=7,
+        )
+    )
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-safe-retirement",
+    )
+
+    expected_cutoff = fixed_now - timedelta(
+        seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS
+    )
+    assert runtime.retirement_reservation_calls == [
+        {
+            "request_id": "request-safe-retirement",
+            "owner_id": "owner",
+            "conversation_id": "shared-conversation",
+            "lifecycle_state": "open",
+            "durable_updated_at": datetime.fromisoformat(
+                "2026-08-01T12:00:00+00:00"
+            ),
+            "retirement_before": expected_cutoff,
+        }
+    ]
+    assert memory_store.close_conversation_calls == [
+        {
+            "conversation_id": "shared-conversation",
+            "owner_id": "owner",
+            "expected_updated_at": old_activity,
+        }
+    ]
+    assert runtime.retirement_finalize_calls == [
+        {
+            "request_id": "request-safe-retirement",
+            "owner_id": "owner",
+            "conversation_id": "shared-conversation",
+            "reservation_id": "reservation-1",
+            "reserved_thread_revision": 7,
+        }
+    ]
+    assert runtime.retirement_cancel_calls == []
+    assert runtime.turn_start_calls == []
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+    assert result["conversation_disposition"] == "non_current"
+    assert "reservation-1" not in json.dumps(result)
+    assert "replacement" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [("wait", "degraded"), ("decline", "failed")],
+)
+async def test_mandatory_retirement_wait_or_decline_never_closes_or_admits(
+    tmp_path,
+    monkeypatch,
+    outcome,
+    expected_status,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=8)).isoformat()
+    )
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(outcome)
+    )
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id=f"request-retirement-{outcome}",
+    )
+
+    assert result["status"] == expected_status
+    assert "conversation_disposition" not in result
+    assert memory_store.close_conversation_calls == []
+    assert runtime.turn_start_calls == []
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_fails", [False, True])
+async def test_close_failure_reread_open_cancels_once_without_retry_or_disposition(
+    tmp_path,
+    monkeypatch,
+    cancel_fails,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    old = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=8)).isoformat()
+    )
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_effects = [old, old]
+    memory_store.close_conversation_error = _http_status_error(409)
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(
+            "reserved", durable_updated_at=old["updated_at"]
+        ),
+        retirement_cancel_error=(
+            httpx.ReadTimeout("PRIVATE-CANCEL-SENTINEL") if cancel_fails else None
+        ),
+    )
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-close-conflict-open",
+    )
+
+    assert len(memory_store.close_conversation_calls) == 1
+    assert len(memory_store.exact_conversation_calls) == 2
+    assert len(runtime.retirement_cancel_calls) == 1
+    assert runtime.retirement_finalize_calls == []
+    assert runtime.turn_start_calls == []
+    assert "conversation_disposition" not in result
+    assert memory_store.added_messages == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reconciled_state", ["closed", "superseded"])
+async def test_close_failure_reconciles_authoritative_non_current_without_cancel(
+    tmp_path,
+    monkeypatch,
+    reconciled_state,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    old = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=8)).isoformat()
+    )
+    reconciled = _conversation_projection(
+        lifecycle_state=reconciled_state,
+        superseded_by_conversation_id=(
+            "replacement-conversation" if reconciled_state == "superseded" else None
+        ),
+        updated_at=old["updated_at"],
+    )
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_effects = [old, reconciled]
+    memory_store.close_conversation_error = _http_status_error(503)
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(
+            "reserved", durable_updated_at=old["updated_at"]
+        )
+    )
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id=f"request-reconcile-{reconciled_state}",
+    )
+
+    assert len(memory_store.close_conversation_calls) == 1
+    assert len(memory_store.exact_conversation_calls) == 2
+    assert runtime.retirement_cancel_calls == []
+    assert len(runtime.retirement_finalize_calls) == (
+        1 if reconciled_state == "closed" else 0
+    )
+    assert result["conversation_disposition"] == "non_current"
+    assert "replacement-conversation" not in json.dumps(result)
+    assert runtime.turn_start_calls == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_close_failure_and_failed_reread_keeps_reservation_without_disposition(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    old = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=8)).isoformat()
+    )
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_effects = [
+        old,
+        httpx.ReadTimeout("PRIVATE-RECONCILIATION-SENTINEL"),
+    ]
+    memory_store.close_conversation_error = _http_status_error(500)
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(
+            "reserved", durable_updated_at=old["updated_at"]
+        )
+    )
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-reconcile-failed",
+    )
+
+    assert len(memory_store.close_conversation_calls) == 1
+    assert len(memory_store.exact_conversation_calls) == 2
+    assert runtime.retirement_cancel_calls == []
+    assert runtime.retirement_finalize_calls == []
+    assert "conversation_disposition" not in result
+    assert "PRIVATE" not in json.dumps(result)
+    assert runtime.turn_start_calls == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_close_finalize_failure_remains_non_current_and_never_cancels(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    old = _conversation_projection(
+        updated_at=(fixed_now - timedelta(days=8)).isoformat()
+    )
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    memory_store.exact_conversation_response = old
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(
+            "reserved", durable_updated_at=old["updated_at"]
+        ),
+        retirement_finalize_error=httpx.ReadTimeout("PRIVATE-FINALIZE-SENTINEL"),
+    )
+
+    result, provider = await _run_retirement_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-finalize-failed",
+    )
+
+    assert result["conversation_disposition"] == "non_current"
+    assert len(runtime.retirement_finalize_calls) == 1
+    assert runtime.retirement_cancel_calls == []
+    assert runtime.turn_start_calls == []
+    assert provider.calls == []
+    assert "PRIVATE" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_create_new_runs_bounded_old_open_cleanup_before_durable_creation(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    memory_store = FakeMemoryStore()
+    old_rows = [
+        _open_candidate(index)
+        | {"updated_at": (fixed_now - timedelta(days=8, minutes=index)).isoformat()}
+        for index in range(1, 5)
+    ]
+    memory_store.list_conversation_effects = [
+        {"conversations": [], "next_cursor": None},
+        {"conversations": old_rows, "next_cursor": "bounded-cursor"},
+    ]
+    runtime = FakeRuntime(
+        retirement_reservation_response=_retirement_response(
+            "reserved", durable_updated_at=old_rows[0]["updated_at"]
+        )
+    )
+    operations = []
+    original_close = memory_store.close_conversation
+    original_create = memory_store.create_conversation
+
+    async def ordered_close(**kwargs):
+        operations.append("close_old")
+        return await original_close(**kwargs)
+
+    async def ordered_create(**kwargs):
+        operations.append("create_new")
+        return await original_create(**kwargs)
+
+    memory_store.close_conversation = ordered_close
+    memory_store.create_conversation = ordered_create
+    rules, models = _write_router_files(tmp_path)
+    provider = FakeLiteLLM()
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-cleanup-create",
+    )
+
+    assert result["status"] == "ok"
+    assert memory_store.list_conversation_calls[1] == {
+        "owner_id": "owner",
+        "updated_before": fixed_now
+        - timedelta(
+            seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS
+        ),
+        "limit": orchestrate_service._RETIREMENT_SCAN_LIMIT,
+    }
+    assert len(memory_store.list_conversation_effects) == 0
+    assert len(runtime.retirement_reservation_calls) == 1
+    assert len(memory_store.close_conversation_calls) == 1
+    assert len(runtime.retirement_finalize_calls) == 1
+    assert operations[:2] == ["close_old", "create_new"]
+    assert memory_store.create_conversation_calls == [
+        {"owner_id": "owner", "client_id": "vscode"}
+    ]
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cleanup_outcome",
+    ["wait", "decline", "ambiguous", "close_conflict"],
+)
+async def test_cleanup_negative_or_ambiguous_outcome_never_blocks_create_new(
+    tmp_path,
+    monkeypatch,
+    cleanup_outcome,
+):
+    fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
+    _freeze_orchestration_time(monkeypatch, fixed_now)
+    old = _open_candidate() | {
+        "updated_at": (fixed_now - timedelta(days=8)).isoformat()
+    }
+    memory_store = FakeMemoryStore()
+    memory_store.list_conversation_effects = [
+        {"conversations": [], "next_cursor": None},
+        {"conversations": [old], "next_cursor": None},
+    ]
+    runtime = FakeRuntime()
+    if cleanup_outcome == "ambiguous":
+        runtime.retirement_reservation_error = httpx.ReadTimeout(
+            "PRIVATE-CLEANUP-SENTINEL"
+        )
+    elif cleanup_outcome == "close_conflict":
+        runtime.retirement_reservation_response = _retirement_response(
+            "reserved", durable_updated_at=old["updated_at"]
+        )
+        memory_store.close_conversation_error = _http_status_error(409)
+        memory_store.exact_conversation_response = old
+    else:
+        runtime.retirement_reservation_response = _retirement_response(cleanup_outcome)
+    rules, models = _write_router_files(tmp_path)
+    provider = FakeLiteLLM()
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"request-cleanup-{cleanup_outcome}",
+    )
+
+    assert result["status"] == "ok"
+    assert len(memory_store.create_conversation_calls) == 1
+    assert len(memory_store.close_conversation_calls) == (
+        1 if cleanup_outcome == "close_conflict" else 0
+    )
+    assert len(runtime.retirement_cancel_calls) == (
+        1 if cleanup_outcome == "close_conflict" else 0
+    )
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_resume_does_not_run_opportunistic_retirement_cleanup(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    memory_store = FakeMemoryStore()
+    selected = _open_candidate()
+    memory_store.list_conversation_response = {
+        "conversations": [selected],
+        "next_cursor": None,
+    }
+    runtime = FakeRuntime(
+        continuation_selection_response=_selection_response(
+            "resume",
+            request_id="request-no-cleanup-resume",
+            selected_conversation_id=selected["conversation_id"],
+            selected_thread_revision=3,
+            candidate_count=1,
+            eligible_candidate_count=1,
+        )
+    )
+
+    result = await orchestrate_chat(
+        payload=_base_payload(),
+        memory_store=memory_store,
+        litellm=FakeLiteLLM(),
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="request-no-cleanup-resume",
+    )
+
+    assert result["status"] == "ok"
+    assert len(memory_store.list_conversation_calls) == 1
+    assert runtime.retirement_reservation_calls == []
+    assert memory_store.close_conversation_calls == []
+
+
+def test_retirement_helper_accepts_only_structural_coordination_inputs():
+    parameters = set(
+        inspect.signature(orchestrate_service._attempt_conversation_retirement).parameters
+    )
+    assert parameters == {
+        "owner_id",
+        "conversation_id",
+        "lifecycle_state",
+        "durable_updated_at",
+        "retirement_before",
+        "memory_store",
+        "runtime",
+        "request_id",
+    }
+    assert not parameters & {
+        "messages",
+        "content",
+        "title",
+        "model",
+        "provider",
+        "retrieval",
+        "client_id",
+        "surface",
+    }
 
 
 def _privacy_runtime_response(
@@ -6073,7 +7171,7 @@ async def test_orchestrate_runtime_admission_unavailable_stops_before_side_effec
     )
     memory_store = FakeMemoryStore()
     litellm = FakeLiteLLM()
-    runtime = FakeRuntime(fail=True)
+    runtime = FakeRuntime(turn_start_error=RuntimeError("runtime unavailable"))
 
     out = await orchestrate_chat(
         payload={

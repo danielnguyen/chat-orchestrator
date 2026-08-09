@@ -99,6 +99,13 @@ and revision-conflict barriers; supplied-ID isolation; runtime-disabled rolling
 compatibility; and absence of candidate material from prompts and replay
 snapshots. Run the replay corpus twice when checking determinism.
 
+They also cover exact supplied-conversation retirement composition: the two
+owner-scoped durable authorization reads around a Cognitive Runtime revision
+snapshot, revision-bound admission inside the seven-day grace boundary,
+strict over-horizon retirement, durable activity compare-and-set, close-result
+reconciliation, persistent reservation cancellation and finalization rules,
+the authoritative `non_current` disposition, and bounded create-new cleanup.
+
 ## Cognitive Runtime transport checks
 
 Run the focused lifecycle and transport suite with:
@@ -153,10 +160,9 @@ manifests, traces, or policy responses. Service authentication and normal
 owner/conversation scope remain enabled.
 
 The evidence topology requires Chat Orchestrator current main at or after
-`a0375065bbf764758192b6f67deac77c0ec1eb70`, the Cognitive Runtime verification
-admission and advisory authority at
-`0c3954df95b2d4d958e14acc7011a11cf445356a`, Basic Memory Store
-`1a8278278fcabd871f6235bc66acdfe80523c6f4`, and Data Source Aggregator
+`3802c3d30e9bb580a2d9597f521af52b7d6dc8dc`, Cognitive Runtime
+`a61beb574a49f2d83f70008596c1183532b78f40`, Basic Memory Store
+`e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553`, and Data Source Aggregator
 `e23f582e4aac32a12c7ad3c71278fc21e5697ea4`. The disposable DSA configuration
 contains operator-owned material scope references for selected sources; those
 values are emitted by the real DSA inventory and are never manufactured by the
@@ -185,7 +191,7 @@ EVIDENCE_ADVISORY_ONLY=1 make composed-smoke
 ```
 
 This mode pins Cognitive Runtime to
-`0c3954df95b2d4d958e14acc7011a11cf445356a` and uses actual CO, CR, BMS, DSA,
+`a61beb574a49f2d83f70008596c1183532b78f40` and uses actual CO, CR, BMS, DSA,
 PostgreSQL, Qdrant, provider, and source-fixture services. It proves an ordinary
 not-applicable request makes one shape call and zero DSA calls; a
 verification-dependent request enters acquisition without client opt-in and
@@ -195,6 +201,22 @@ fallback success share exact messages and fingerprints; and the established
 grounded structured-evidence scenario remains unchanged. The pull-request
 workflow runs this mode before the complete composed regression and records the
 exact checked-out PR head.
+
+Run only the conversation retirement composition proof with:
+
+```bash
+RETIREMENT_ONLY=1 make composed-smoke
+```
+
+This mode proves exact continuation inside the seven-day grace boundary; safe
+idle durable closure and runtime revision fencing; conservative active,
+contended, unavailable, and inconsistent outcomes; durable activity CAS after a
+normal message append; reservation survival across Cognitive Runtime restart;
+owner isolation; and bounded opportunistic cleanup that inspects no more than
+four old open rows and closes no more than one before creating the current
+conversation. It inspects disposable PostgreSQL and SQLite state to confirm
+history retention, lifecycle, revision, and reservation outcomes. Direct
+backdating and projection shaping exist only in the disposable harness.
 
 Two focused final selectors are also available:
 
@@ -226,7 +248,7 @@ answers through the actual services, then recreates only the orchestrator with
 history enabled. PostgreSQL, BMS, CR, DSA, Qdrant, and the provider remain running,
 so successful current-turn-only follow-ups prove that neither a client cache nor
 orchestrator process state supplies the previous answer. The hosted workflow
-checks out BMS at `1a8278278fcabd871f6235bc66acdfe80523c6f4`, builds that service,
+checks out BMS at `e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553`, builds that service,
 and first probes both the unchanged v1 and strict v2 internal response shapes.
 
 The scenarios cover chained acquisition explanations with the same private root,
@@ -289,8 +311,8 @@ and surface provenance, no loser message, provider, claim, or action side
 effect, one conversation, and a final idle runtime thread at revision two.
 
 The proof uses Basic Memory Store at or after
-`1a8278278fcabd871f6235bc66acdfe80523c6f4` and Cognitive Runtime at or after
-`f87a80f6d19cdb4ebcd01e6cc5c42af2a8ee1202`. It demonstrates overlap within the
+`e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553` and Cognitive Runtime at or after
+`a61beb574a49f2d83f70008596c1183532b78f40`. It demonstrates overlap within the
 actual disposable services. It does not demonstrate completed-response replay
 across a fresh HTTP request or process restart.
 
@@ -315,9 +337,9 @@ The proof checks PostgreSQL conversation, message, trace, and claim counts;
 Cognitive Runtime SQLite session, turn, event, surface, state, and revision
 facts; request-scoped provider counts; current client and surface provenance;
 and owner isolation. The workflow and local guard require Cognitive Runtime at
-`f87a80f6d19cdb4ebcd01e6cc5c42af2a8ee1202`, Basic Memory Store at
-`1a8278278fcabd871f6235bc66acdfe80523c6f4`, and Chat Orchestrator at
-`b8fb14e422bbf5f6fa60fbd1512afc10d0bc34a8`.
+`a61beb574a49f2d83f70008596c1183532b78f40`, Basic Memory Store at
+`e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553`, and Chat Orchestrator at
+`3802c3d30e9bb580a2d9597f521af52b7d6dc8dc`.
 
 The distinct-client owner-memory proof does not by itself establish live-thread
 continuation, automatic conversation selection, Telegram-to-Alexa handoff,

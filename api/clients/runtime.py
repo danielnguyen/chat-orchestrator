@@ -74,6 +74,22 @@ _CONTINUATION_DECLINE_REASONS = (
     "unavailable_thread_present",
     "runtime_state_inconsistent",
 )
+_RETIREMENT_REASONS = {
+    "safe_idle_retirement_reserved",
+    "existing_retirement_reservation",
+    "candidate_not_open",
+    "durable_activity_not_over_horizon",
+    "runtime_activity_not_over_horizon",
+    "runtime_state_missing",
+    "runtime_state_inconsistent",
+    "runtime_thread_active",
+    "runtime_thread_contended",
+    "runtime_thread_unavailable",
+}
+_RETIREMENT_RESERVED_REASONS = {
+    "safe_idle_retirement_reserved",
+    "existing_retirement_reservation",
+}
 
 _SITUATED_VISIBILITY = {"private", "shared", "public", "unknown"}
 _SITUATED_CONSTRAINT = {"normal", "constrained", "unknown"}
@@ -511,6 +527,23 @@ def _continuation_outcome_is_coherent(
 
 def _bounded_runtime_identifier(value: Any) -> bool:
     return isinstance(value, str) and bool(value) and len(value) <= 120
+
+
+def _parse_aware_runtime_datetime(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise RuntimeError("runtime_timestamp_invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise RuntimeError("runtime_timestamp_invalid") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RuntimeError("runtime_timestamp_invalid")
+    return parsed
+
+
+def _require_aware_runtime_datetime(value: datetime) -> None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("runtime_timestamp_timezone_required")
 
 
 def _optional_uuid_ids_equivalent(actual: Any, expected: str | None) -> bool:
@@ -1094,6 +1127,289 @@ class RuntimeClient:
                 or event.get("event_type") != "turn_started"
             ):
                 raise RuntimeError("runtime_turn_response_context_mismatch")
+        return response
+
+    async def resolve_thread(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/v1/runtime/threads/resolve",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+            },
+        )
+        expected_fields = {
+            "owner_id",
+            "conversation_id",
+            "state",
+            "revision",
+            "active_runtime_session_id",
+            "active_runtime_turn_id",
+            "active_surface",
+            "participating_surfaces",
+            "participating_session_count",
+            "last_activity_at",
+            "created_at",
+            "updated_at",
+        }
+        if not isinstance(response, dict) or set(response) != expected_fields:
+            raise RuntimeError("runtime_thread_response_invalid")
+        if (
+            response.get("owner_id") != owner_id
+            or response.get("conversation_id") != conversation_id
+        ):
+            raise RuntimeError("runtime_thread_response_context_mismatch")
+        state = response.get("state")
+        revision = response.get("revision")
+        surfaces = response.get("participating_surfaces")
+        session_count = response.get("participating_session_count")
+        optional_identifiers = (
+            "active_runtime_session_id",
+            "active_runtime_turn_id",
+            "active_surface",
+        )
+        if (
+            state not in {"idle", "active", "contended", "unavailable"}
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+            or not isinstance(surfaces, list)
+            or len(surfaces) > 32
+            or any(
+                not isinstance(surface, str) or not surface or len(surface) > 64
+                for surface in surfaces
+            )
+            or surfaces != sorted(set(surfaces))
+            or isinstance(session_count, bool)
+            or not isinstance(session_count, int)
+            or session_count < len(surfaces)
+            or len(surfaces) < 32
+            and session_count != len(surfaces)
+            or any(
+                response.get(field) is not None
+                and not _bounded_runtime_identifier(response.get(field))
+                for field in optional_identifiers
+            )
+        ):
+            raise RuntimeError("runtime_thread_response_invalid")
+        active_values = [response.get(field) for field in optional_identifiers]
+        if state == "idle" and any(value is not None for value in active_values):
+            raise RuntimeError("runtime_thread_response_invalid")
+        if state == "active" and any(value is None for value in active_values):
+            raise RuntimeError("runtime_thread_response_invalid")
+        try:
+            for field in ("last_activity_at", "created_at", "updated_at"):
+                _parse_aware_runtime_datetime(response.get(field))
+        except RuntimeError:
+            raise RuntimeError("runtime_thread_response_invalid") from None
+        return response
+
+    async def reserve_retirement(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        lifecycle_state: str,
+        durable_updated_at: datetime,
+        retirement_before: datetime,
+    ) -> dict[str, Any]:
+        _require_aware_runtime_datetime(durable_updated_at)
+        _require_aware_runtime_datetime(retirement_before)
+        if lifecycle_state not in {"open", "closed", "superseded"}:
+            raise ValueError("retirement_lifecycle_state_invalid")
+        response = await self._post(
+            "/v1/runtime/retirements/reserve",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "lifecycle_state": lifecycle_state,
+                "durable_updated_at": durable_updated_at.isoformat(),
+                "retirement_before": retirement_before.isoformat(),
+            },
+        )
+        if not isinstance(response, dict) or set(response) != {
+            "schema_version",
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "result",
+        }:
+            raise RuntimeError("retirement_reservation_response_invalid")
+        if (
+            response.get("schema_version") != "runtime-retirement-reservation.v1"
+            or response.get("request_id") != request_id
+            or response.get("owner_id") != owner_id
+            or response.get("conversation_id") != conversation_id
+        ):
+            raise RuntimeError("retirement_reservation_response_context_mismatch")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("retirement_reservation_response_invalid")
+        outcome = result.get("outcome")
+        expected_result_fields = {"outcome", "reason_codes", "policy_version"}
+        if outcome == "reserved":
+            expected_result_fields.update(
+                {
+                    "reservation_id",
+                    "reserved_thread_revision",
+                    "reserved_durable_updated_at",
+                }
+            )
+        if set(result) != expected_result_fields:
+            raise RuntimeError("retirement_reservation_response_invalid")
+        reasons = result.get("reason_codes")
+        reason = reasons[0] if isinstance(reasons, list) and len(reasons) == 1 else None
+        if (
+            outcome not in {"reserved", "wait", "decline"}
+            or reason not in _RETIREMENT_REASONS
+            or result.get("policy_version") != "conversation-retirement-safety.v1"
+        ):
+            raise RuntimeError("retirement_reservation_response_invalid")
+        reservation_id = result.get("reservation_id")
+        revision = result.get("reserved_thread_revision")
+        reserved_activity = result.get("reserved_durable_updated_at")
+        if outcome == "reserved":
+            if (
+                reason not in _RETIREMENT_RESERVED_REASONS
+                or not _bounded_runtime_identifier(reservation_id)
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+            ):
+                raise RuntimeError("retirement_reservation_response_invalid")
+            try:
+                _parse_aware_runtime_datetime(reserved_activity)
+            except RuntimeError:
+                raise RuntimeError("retirement_reservation_response_invalid") from None
+        elif (
+            reservation_id is not None
+            or revision is not None
+            or reserved_activity is not None
+            or reason in _RETIREMENT_RESERVED_REASONS
+            or outcome == "wait"
+            and reason != "runtime_thread_active"
+            or outcome == "decline"
+            and reason == "runtime_thread_active"
+        ):
+            raise RuntimeError("retirement_reservation_response_invalid")
+        return response
+
+    async def cancel_retirement(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        reservation_id: str,
+        reserved_thread_revision: int,
+    ) -> dict[str, Any]:
+        return await self._retirement_mutation(
+            operation="cancel",
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            reservation_id=reservation_id,
+            reserved_thread_revision=reserved_thread_revision,
+        )
+
+    async def finalize_retirement(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        reservation_id: str,
+        reserved_thread_revision: int,
+    ) -> dict[str, Any]:
+        return await self._retirement_mutation(
+            operation="finalize",
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            reservation_id=reservation_id,
+            reserved_thread_revision=reserved_thread_revision,
+        )
+
+    async def _retirement_mutation(
+        self,
+        *,
+        operation: str,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        reservation_id: str,
+        reserved_thread_revision: int,
+    ) -> dict[str, Any]:
+        if operation not in {"cancel", "finalize"}:
+            raise ValueError("retirement_operation_invalid")
+        if not _bounded_runtime_identifier(reservation_id):
+            raise ValueError("retirement_reservation_id_invalid")
+        if (
+            isinstance(reserved_thread_revision, bool)
+            or not isinstance(reserved_thread_revision, int)
+            or reserved_thread_revision < 0
+        ):
+            raise ValueError("retirement_thread_revision_invalid")
+        response = await self._post(
+            f"/v1/runtime/retirements/{operation}",
+            json={
+                "request_id": request_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "reservation_id": reservation_id,
+                "reserved_thread_revision": reserved_thread_revision,
+            },
+        )
+        common = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "reservation_id": reservation_id,
+        }
+        if operation == "cancel":
+            expected_fields = {
+                "schema_version",
+                *common,
+                "thread_revision",
+                "outcome",
+            }
+            if not isinstance(response, dict) or set(response) != expected_fields:
+                raise RuntimeError("retirement_cancellation_response_invalid")
+            if (
+                response.get("schema_version") != "runtime-retirement-cancellation.v1"
+                or response.get("outcome") != "cancelled"
+                or response.get("thread_revision") != reserved_thread_revision
+            ):
+                raise RuntimeError("retirement_cancellation_response_invalid")
+        else:
+            expected_fields = {
+                "schema_version",
+                *common,
+                "previous_thread_revision",
+                "fenced_thread_revision",
+                "outcome",
+            }
+            if not isinstance(response, dict) or set(response) != expected_fields:
+                raise RuntimeError("retirement_finalization_response_invalid")
+            if (
+                response.get("schema_version") != "runtime-retirement-finalization.v1"
+                or response.get("outcome") != "finalized"
+                or response.get("previous_thread_revision")
+                != reserved_thread_revision
+                or response.get("fenced_thread_revision")
+                != reserved_thread_revision + 1
+            ):
+                raise RuntimeError("retirement_finalization_response_invalid")
+        if any(response.get(field) != value for field, value in common.items()):
+            raise RuntimeError(f"retirement_{operation}_response_context_mismatch")
         return response
 
     async def select_continuation(
