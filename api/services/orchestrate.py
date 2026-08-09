@@ -5,7 +5,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
@@ -6716,8 +6716,12 @@ async def orchestrate_chat(
         conversation_resolution_trace = {"mode": "compatibility"}
     else:
         try:
+            updated_since = datetime.now(UTC) - timedelta(
+                seconds=_CONTINUATION_STALE_AFTER_SECONDS
+            )
             listed = await memory_store.list_open_conversations(
                 owner_id=payload["owner_id"],
+                updated_since=updated_since,
                 limit=_CONTINUATION_OVERFETCH_LIMIT,
             )
             rows = listed["conversations"]

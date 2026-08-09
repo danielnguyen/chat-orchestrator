@@ -6,7 +6,7 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="1a8278278fcabd871f6235bc66acdfe80523c6f4"
+BMS_COMMIT="ea49890e2ca318a5a76a26e2ee45bdbd2f94b307"
 CR_COMMIT="0c3954df95b2d4d958e14acc7011a11cf445356a"
 DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
 CO_COMMIT="a0375065bbf764758192b6f67deac77c0ec1eb70"
@@ -1928,8 +1928,13 @@ run_omitted_continuation_scenario() {
   local other_owner="owner-omitted-isolated" other_client="client-isolated"
   local zero_owner="owner-omitted-zero" zero_client="client-zero" zero_surface="surface-zero"
   local other_conversation zero_response zero_conversation zero_request zero_provider zero_thread
+  local stale_only_owner="owner-omitted-stale-only" stale_only_response stale_only_conversation
+  local stale_only_request stale_only_before stale_only_after stale_only_provider stale_only_thread
   local resume_owner="owner-omitted-resume" resume_conversation first_response second_response
   local first_request second_request second_provider resume_counts resume_provenance resume_thread
+  local stale_mix_owner="owner-omitted-stale-mix" stale_mix_conversation stale_mix_seed
+  local stale_mix_response stale_mix_request stale_mix_before stale_mix_after stale_mix_counts
+  local stale_mix_provenance stale_mix_provider stale_mix_thread
   local multiple_owner="owner-omitted-multiple" multiple_a multiple_b multiple_response multiple_request
   local multiple_before multiple_after multiple_runtime_before multiple_runtime_after multiple_provider
   local active_owner="owner-omitted-active" active_conversation initial_response winner_payload winner_file winner_pid
@@ -1955,6 +1960,26 @@ run_omitted_continuation_scenario() {
   jq -e '.state == "idle" and .revision == 2 and .session_count == 1' <<<"$zero_thread" >/dev/null
 
   provider_post "/fixture/reset" '{}'
+  for ordinal in $(seq 1 12); do
+    create_conversation "$stale_only_owner" "client-stale-only-$ordinal" >/dev/null
+  done
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '2 hours' WHERE owner_id='$stale_only_owner';" >/dev/null
+  stale_only_before="$(psql_exec -At -F '|' -c "SELECT count(*), count(*) FILTER (WHERE lifecycle_state='open'), count(*) FILTER (WHERE lifecycle_state='open' AND updated_at < now() - interval '1 hour') FROM conversations WHERE owner_id='$stale_only_owner';")"
+  [ "$stale_only_before" = "12|12|12" ]
+  stale_only_response="$(run_omitted_chat "$stale_only_owner" "client-stale-only-request" "surface-stale-only" "neutral after stale accumulation")"
+  stale_only_conversation="$(jq -r '.conversation_id' <<<"$stale_only_response")"
+  stale_only_request="$(jq -r '.request_id' <<<"$stale_only_response")"
+  jq -e '.status == "ok" and (.conversation_id | type == "string")' <<<"$stale_only_response" >/dev/null
+  [ "$(psql_exec -At -c "SELECT client_id FROM conversations WHERE owner_id='$stale_only_owner' AND id='$stale_only_conversation';")" = "client-stale-only-request" ]
+  stale_only_after="$(psql_exec -At -F '|' -c "SELECT count(*), count(*) FILTER (WHERE lifecycle_state='open'), count(*) FILTER (WHERE client_id LIKE 'client-stale-only-%' AND client_id != 'client-stale-only-request' AND lifecycle_state='open' AND updated_at < now() - interval '1 hour') FROM conversations WHERE owner_id='$stale_only_owner';")"
+  [ "$stale_only_after" = "13|13|12" ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages m JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id WHERE c.owner_id='$stale_only_owner' AND c.client_id LIKE 'client-stale-only-%' AND c.client_id != 'client-stale-only-request';")" = "0" ]
+  stale_only_provider="$(fetch_provider_calls "$stale_only_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$stale_only_provider")" = "1" ]
+  stale_only_thread="$(runtime_thread_snapshot "$stale_only_owner" "$stale_only_conversation")"
+  jq -e '.state == "idle" and .revision == 2 and .session_count == 1' <<<"$stale_only_thread" >/dev/null
+
+  provider_post "/fixture/reset" '{}'
   resume_conversation="$(create_conversation "$resume_owner" "client-resume-a")"
   first_response="$(run_distinct_client_chat "$resume_owner" "client-resume-a" "surface-resume-a" "$resume_conversation" "neutral first turn")"
   first_request="$(jq -r '.request_id' <<<"$first_response")"
@@ -1972,6 +1997,32 @@ run_omitted_continuation_scenario() {
   [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$second_provider")" = "1" ]
   resume_thread="$(runtime_thread_snapshot "$resume_owner" "$resume_conversation")"
   jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and .surfaces == ["surface-resume-a", "surface-resume-b"]' <<<"$resume_thread" >/dev/null
+
+  provider_post "/fixture/reset" '{}'
+  for ordinal in $(seq 1 12); do
+    create_conversation "$stale_mix_owner" "client-stale-mix-$ordinal" >/dev/null
+  done
+  psql_exec -c "UPDATE conversations SET updated_at=now() - interval '2 hours' WHERE owner_id='$stale_mix_owner';" >/dev/null
+  stale_mix_conversation="$(create_conversation "$stale_mix_owner" "client-stale-mix-fresh")"
+  stale_mix_seed="$(run_distinct_client_chat "$stale_mix_owner" "client-stale-mix-fresh" "surface-stale-mix-a" "$stale_mix_conversation" "neutral fresh candidate")"
+  jq -e --arg conversation "$stale_mix_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$stale_mix_seed" >/dev/null
+  stale_mix_before="$(psql_exec -At -F '|' -c "SELECT count(*), count(*) FILTER (WHERE lifecycle_state='open'), count(*) FILTER (WHERE client_id LIKE 'client-stale-mix-%' AND client_id != 'client-stale-mix-fresh' AND lifecycle_state='open' AND updated_at < now() - interval '1 hour') FROM conversations WHERE owner_id='$stale_mix_owner';")"
+  [ "$stale_mix_before" = "13|13|12" ]
+  provider_post "/fixture/reset" '{}'
+  stale_mix_response="$(run_omitted_chat "$stale_mix_owner" "client-stale-mix-current" "surface-stale-mix-b" "neutral resume among stale accumulation")"
+  stale_mix_request="$(jq -r '.request_id' <<<"$stale_mix_response")"
+  jq -e --arg conversation "$stale_mix_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$stale_mix_response" >/dev/null
+  stale_mix_after="$(psql_exec -At -F '|' -c "SELECT count(*), count(*) FILTER (WHERE lifecycle_state='open'), count(*) FILTER (WHERE client_id LIKE 'client-stale-mix-%' AND client_id != 'client-stale-mix-fresh' AND lifecycle_state='open' AND updated_at < now() - interval '1 hour') FROM conversations WHERE owner_id='$stale_mix_owner';")"
+  [ "$stale_mix_after" = "13|13|12" ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages m JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id WHERE c.owner_id='$stale_mix_owner' AND c.client_id LIKE 'client-stale-mix-%' AND c.client_id != 'client-stale-mix-fresh';")" = "0" ]
+  stale_mix_counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$stale_mix_owner' AND conversation_id='$stale_mix_conversation';")"
+  [ "$stale_mix_counts" = "2|2" ]
+  stale_mix_provenance="$(psql_exec -At -F '|' -c "SELECT client_id, metadata->>'surface' FROM messages WHERE owner_id='$stale_mix_owner' AND conversation_id='$stale_mix_conversation' AND role='user' ORDER BY created_at;")"
+  [ "$stale_mix_provenance" = $'client-stale-mix-fresh|surface-stale-mix-a\nclient-stale-mix-current|surface-stale-mix-b' ]
+  stale_mix_provider="$(fetch_provider_calls "$stale_mix_request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$stale_mix_provider")" = "1" ]
+  stale_mix_thread="$(runtime_thread_snapshot "$stale_mix_owner" "$stale_mix_conversation")"
+  jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and .surfaces == ["surface-stale-mix-a", "surface-stale-mix-b"]' <<<"$stale_mix_thread" >/dev/null
 
   provider_post "/fixture/reset" '{}'
   multiple_a="$(create_conversation "$multiple_owner" "client-multiple-a")"
@@ -2052,7 +2103,9 @@ run_omitted_continuation_scenario() {
   esac
 
   echo "Omitted continuation zero: status=ok request_id=$zero_request conversation_id=$zero_conversation owner_conversations=1 user_messages=1 assistant_messages=1 provider_calls=1 thread_state=idle thread_revision=2 isolated_conversation_rejected=true"
+  echo "Omitted continuation stale-only: status=ok request_id=$stale_only_request conversation_id=$stale_only_conversation stale_open_before=12 stale_open_after=12 owner_conversations=13 provider_calls=1 stale_rows_resumed=false"
   echo "Omitted continuation resume: first_request_id=$first_request second_request_id=$second_request conversation_id=$resume_conversation user_messages=2 assistant_messages=2 provider_calls=1 session_surfaces=surface-resume-a,surface-resume-b thread_state=idle thread_revision=4 provenance_preserved=true"
+  echo "Omitted continuation stale-mix: status=ok request_id=$stale_mix_request conversation_id=$stale_mix_conversation stale_open_before=12 stale_open_after=12 owner_conversations=13 provider_calls=1 session_surfaces=surface-stale-mix-a,surface-stale-mix-b thread_state=idle thread_revision=4 stale_rows_resumed=false provenance_preserved=true"
   echo "Omitted continuation multiple: status=degraded conversation_id=null provider_calls=0 durable_counts_unchanged=true runtime_counts_unchanged=true side_effects=0"
   echo "Omitted continuation active: status=degraded conversation_id=null provider_calls=0 losing_messages=0 losing_sessions=0 thread_state=idle thread_revision=4"
   echo "Omitted continuation incomplete: status=degraded conversation_id=null candidates=9 provider_calls=0 durable_counts=9,0,0,0 runtime_counts_unchanged=true side_effects=0"
