@@ -530,6 +530,10 @@ owner, conversation_id, activity_at = sys.argv[1:]
 for path in pathlib.Path("/data").glob("*.sqlite3"):
     connection = sqlite3.connect(path)
     try:
+        if connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversation_runtime_threads'"
+        ).fetchone()[0] == 0:
+            continue
         changed = connection.execute(
             "UPDATE conversation_runtime_threads SET last_activity_at = ? WHERE owner_id = ? AND conversation_id = ?",
             (activity_at, owner, conversation_id),
@@ -554,6 +558,10 @@ owner, conversation_id, state, inconsistent = sys.argv[1:]
 for path in pathlib.Path("/data").glob("*.sqlite3"):
     connection = sqlite3.connect(path)
     try:
+        if connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversation_runtime_threads'"
+        ).fetchone()[0] == 0:
+            continue
         changed = connection.execute(
             """
             UPDATE conversation_runtime_threads
