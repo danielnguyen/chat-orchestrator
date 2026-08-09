@@ -135,8 +135,8 @@ services:
       COMPANION_CONTRACTS_DB_PATH: /data/companion_contracts.sqlite3
     ports:
       - "14371:8000"
-    tmpfs:
-      - /data
+    volumes:
+      - runtime-data:/data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
       interval: 1s
@@ -190,3 +190,4 @@ services:
 
 volumes:
   qdrant-data:
+  runtime-data:
