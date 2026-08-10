@@ -727,12 +727,15 @@ class FakeDsa:
     ):
         self.sources = sources
         self.calls = []
+        self.list_request_ids = []
+        self.operation_request_ids = []
         self.inventory_metadata = dict(inventory_metadata or {})
         self.source_response = source_response
         self.fetch_responses = list(fetch_responses or [])
         self.context_responses = list(context_responses or [])
 
-    async def list_sources(self):
+    async def list_sources(self, *, request_id=None):
+        self.list_request_ids.append(request_id)
         self.calls.append("list_sources")
         if self.source_response is not None:
             return copy.deepcopy(self.source_response)
@@ -742,6 +745,7 @@ class FakeDsa:
         }
 
     async def fetch_source(self, **kwargs):
+        self.operation_request_ids.append(kwargs.pop("request_id", None))
         self.calls.append(("fetch_source", kwargs))
         response = self.fetch_responses.pop(0)
         if isinstance(response, Exception):
@@ -749,6 +753,7 @@ class FakeDsa:
         return response
 
     async def context_source(self, **kwargs):
+        self.operation_request_ids.append(kwargs.pop("request_id", None))
         self.calls.append(("context_source", kwargs))
         response = self.context_responses.pop(0)
         if isinstance(response, Exception):
@@ -1100,6 +1105,7 @@ async def test_malformed_source_scope_metadata_fails_inventory_before_plan():
     assert state.status == "inventory_dependency_failed"
     assert state.plan is None
     assert dsa.calls == ["list_sources"]
+    assert dsa.list_request_ids == ["rid"]
     assert [name for name, _ in runtime.calls] == ["shape"]
 
 

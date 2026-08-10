@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+_request_logger = logging.getLogger("chat_orchestrator.dsa")
 
 
 class DataSourceAggregatorClient:
@@ -16,32 +19,152 @@ class DataSourceAggregatorClient:
         self.timeout = timeout_ms / 1000
         self.api_key = api_key
 
-    def _build_headers(self) -> dict[str, str] | None:
-        if not self.api_key:
-            return None
-        return {"X-API-Key": self.api_key}
+    def _build_headers(self, *, request_id: str | None = None) -> dict[str, str] | None:
+        headers: dict[str, str] = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        if request_id is not None:
+            headers["X-Request-ID"] = request_id
+        return headers or None
 
-    async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
+    async def _post(
+        self,
+        path: str,
+        *,
+        json: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                f"{self.base_url}{path}",
-                json=json,
-                headers=self._build_headers(),
+            try:
+                resp = await client.post(
+                    f"{self.base_url}{path}",
+                    json=json,
+                    headers=self._build_headers(request_id=request_id),
+                )
+                resp.raise_for_status()
+                result = resp.json()
+            except httpx.HTTPStatusError as error:
+                self._log_request(
+                    request_id=request_id,
+                    method="POST",
+                    path=path,
+                    status_code=error.response.status_code,
+                    error_category="http_status",
+                )
+                raise
+            except httpx.TimeoutException:
+                self._log_request(
+                    request_id=request_id,
+                    method="POST",
+                    path=path,
+                    error_category="timeout",
+                )
+                raise
+            except httpx.RequestError:
+                self._log_request(
+                    request_id=request_id,
+                    method="POST",
+                    path=path,
+                    error_category="transport",
+                )
+                raise
+            except ValueError:
+                self._log_request(
+                    request_id=request_id,
+                    method="POST",
+                    path=path,
+                    status_code=resp.status_code,
+                    error_category="response_decode",
+                )
+                raise
+            self._log_request(
+                request_id=request_id,
+                method="POST",
+                path=path,
+                status_code=resp.status_code,
             )
-            resp.raise_for_status()
-            return resp.json()
+            return result
 
-    async def _get(self, path: str) -> dict[str, Any]:
+    async def _get(
+        self,
+        path: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(
-                f"{self.base_url}{path}",
-                headers=self._build_headers(),
+            try:
+                resp = await client.get(
+                    f"{self.base_url}{path}",
+                    headers=self._build_headers(request_id=request_id),
+                )
+                resp.raise_for_status()
+                result = resp.json()
+            except httpx.HTTPStatusError as error:
+                self._log_request(
+                    request_id=request_id,
+                    method="GET",
+                    path=path,
+                    status_code=error.response.status_code,
+                    error_category="http_status",
+                )
+                raise
+            except httpx.TimeoutException:
+                self._log_request(
+                    request_id=request_id,
+                    method="GET",
+                    path=path,
+                    error_category="timeout",
+                )
+                raise
+            except httpx.RequestError:
+                self._log_request(
+                    request_id=request_id,
+                    method="GET",
+                    path=path,
+                    error_category="transport",
+                )
+                raise
+            except ValueError:
+                self._log_request(
+                    request_id=request_id,
+                    method="GET",
+                    path=path,
+                    status_code=resp.status_code,
+                    error_category="response_decode",
+                )
+                raise
+            self._log_request(
+                request_id=request_id,
+                method="GET",
+                path=path,
+                status_code=resp.status_code,
             )
-            resp.raise_for_status()
-            return resp.json()
+            return result
 
-    async def list_sources(self) -> dict[str, Any]:
-        return await self._get("/v1/sources")
+    @staticmethod
+    def _log_request(
+        *,
+        request_id: str | None,
+        method: str,
+        path: str,
+        status_code: int | None = None,
+        error_category: str | None = None,
+    ) -> None:
+        fields: list[object] = [request_id or "absent", method, path]
+        message = (
+            "dsa_request_completed component=chat-orchestrator "
+            "request_id=%s method=%s path=%s"
+        )
+        if status_code is not None:
+            message += " status=%d"
+            fields.append(status_code)
+        if error_category is not None:
+            message += " error_category=%s"
+            fields.append(error_category)
+        _request_logger.info(message, *fields)
+
+    async def list_sources(self, *, request_id: str | None = None) -> dict[str, Any]:
+        return await self._get("/v1/sources", request_id=request_id)
 
     async def context_pack(
         self,
@@ -52,6 +175,7 @@ class DataSourceAggregatorClient:
         retrieval_mode: str = "targeted",
         allowed_sensitivity: str = "medium",
         budget: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_source_ids = source_ids or None
         normalized_domain_tags = domain_tags or None
@@ -70,6 +194,7 @@ class DataSourceAggregatorClient:
                     "max_text_chars": 12000,
                 },
             },
+            request_id=request_id,
         )
 
     async def fetch_source(
@@ -78,6 +203,7 @@ class DataSourceAggregatorClient:
         source_ref: str,
         include_raw: bool = False,
         budget: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._post(
             "/v1/sources/fetch",
@@ -91,6 +217,7 @@ class DataSourceAggregatorClient:
                     "max_text_chars": 12000,
                 },
             },
+            request_id=request_id,
         )
 
     async def context_source(
@@ -99,6 +226,7 @@ class DataSourceAggregatorClient:
         source_ref: str,
         context_mode: str,
         budget: dict[str, int] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._post(
             "/v1/sources/context",
@@ -112,4 +240,5 @@ class DataSourceAggregatorClient:
                     "max_text_chars": 12000,
                 },
             },
+            request_id=request_id,
         )

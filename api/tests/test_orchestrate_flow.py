@@ -1,7 +1,9 @@
 import copy
 import hashlib
+import importlib
 import inspect
 import json
+import logging
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -12,7 +14,7 @@ import services.capabilities as capability_service
 import services.orchestrate as orchestrate_service
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import RuntimeClient
-from models import ChatResponse
+from models import ChatRequest, ChatResponse
 from services.action_connectors import (
     ActionConnectorRegistry,
     ConnectorArguments,
@@ -1872,8 +1874,10 @@ class FakeDSA:
     ):
         self.calls = []
         self.list_calls = []
+        self.list_request_ids = []
         self.fetch_calls = []
         self.context_calls = []
+        self.operation_request_ids = []
         self.response = response or {"sources_used": [], "items": []}
         self.error = error
         self.source_response = source_response or {
@@ -1897,19 +1901,22 @@ class FakeDSA:
         self.fetch_responses = list(fetch_responses or [])
         self.context_responses = list(context_responses or [])
 
-    async def list_sources(self):
+    async def list_sources(self, *, request_id=None):
+        self.list_request_ids.append(request_id)
         self.list_calls.append({})
         if self.source_error is not None:
             raise self.source_error
         return self.source_response
 
     async def context_pack(self, **kwargs):
+        self.operation_request_ids.append(kwargs.pop("request_id", None))
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
         return self.response
 
     async def fetch_source(self, **kwargs):
+        self.operation_request_ids.append(kwargs.pop("request_id", None))
         self.fetch_calls.append(kwargs)
         response = self.fetch_responses.pop(0)
         if isinstance(response, Exception):
@@ -1917,6 +1924,7 @@ class FakeDSA:
         return response
 
     async def context_source(self, **kwargs):
+        self.operation_request_ids.append(kwargs.pop("request_id", None))
         self.context_calls.append(kwargs)
         if not self.context_responses:
             raise AssertionError("context expansion is not supported by this test path")
@@ -13953,6 +13961,92 @@ def _first_party_chat_payload(
     return payload
 
 
+def _load_main_for_chat_logging(monkeypatch):
+    monkeypatch.setenv("ORCH_API_KEY", "orch-test")
+    monkeypatch.setenv("MEMORY_STORE_BASE_URL", "http://memory")
+    monkeypatch.setenv("MEMORY_STORE_API_KEY", "memory")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm")
+
+    import settings
+
+    settings.get_settings.cache_clear()
+    import main
+
+    return importlib.reload(main)
+
+
+@pytest.mark.asyncio
+async def test_chat_boundary_logs_generated_request_id_without_content(
+    monkeypatch,
+    caplog,
+):
+    main = _load_main_for_chat_logging(monkeypatch)
+    request_id = "11111111-1111-4111-8111-111111111111"
+
+    async def fake_orchestrate_chat(**kwargs):
+        assert kwargs["request_id"] == request_id
+        return {
+            "request_id": request_id,
+            "conversation_id": "conv-1",
+            "profile_name": "default",
+            "selected_model": "gpt-4o-mini",
+            "answer": "PRIVATE_PROVIDER_ANSWER_SENTINEL",
+            "status": "ok",
+            "sources": [],
+        }
+
+    monkeypatch.setattr(main, "uuid4", lambda: request_id)
+    monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
+    caplog.set_level(logging.INFO, logger="chat_orchestrator.chat")
+    body = ChatRequest.model_validate(
+        _first_party_chat_payload("PRIVATE_USER_TEXT_SENTINEL")
+    )
+
+    response = await main.chat(body)
+
+    assert isinstance(response, ChatResponse)
+    assert response.request_id == request_id
+    assert "chat_request_started" in caplog.text
+    assert "chat_request_completed" in caplog.text
+    assert f"request_id={request_id}" in caplog.text
+    assert "status=ok" in caplog.text
+    assert "PRIVATE_USER_TEXT_SENTINEL" not in caplog.text
+    assert "PRIVATE_PROVIDER_ANSWER_SENTINEL" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_chat_boundary_failure_logs_and_returns_same_request_id_without_error(
+    monkeypatch,
+    caplog,
+):
+    main = _load_main_for_chat_logging(monkeypatch)
+    request_id = "22222222-2222-4222-8222-222222222222"
+
+    async def fake_orchestrate_chat(**kwargs):
+        assert kwargs["request_id"] == request_id
+        raise RuntimeError("PRIVATE_EXCEPTION_SENTINEL")
+
+    monkeypatch.setattr(main, "uuid4", lambda: request_id)
+    monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
+    caplog.set_level(logging.INFO, logger="chat_orchestrator.chat")
+    body = ChatRequest.model_validate(
+        _first_party_chat_payload("PRIVATE_FAILED_USER_TEXT_SENTINEL")
+    )
+
+    response = await main.chat(body)
+    response_body = json.loads(response.body)
+
+    assert response.status_code == 500
+    assert response_body["request_id"] == request_id
+    assert response_body["status"] == "failed"
+    assert "chat_request_started" in caplog.text
+    assert "chat_request_failed" in caplog.text
+    assert f"request_id={request_id}" in caplog.text
+    assert "error_category=orchestration_exception" in caplog.text
+    assert "PRIVATE_FAILED_USER_TEXT_SENTINEL" not in caplog.text
+    assert "PRIVATE_EXCEPTION_SENTINEL" not in caplog.text
+
+
 def _governed_context_pack(query: str) -> dict[str, object]:
     return {
         "query_id": "query_1",
@@ -14914,6 +15008,11 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
     assert len(dsa.list_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
     assert len(dsa.calls) == 1
+    assert dsa.list_request_ids == ["rid-evidence-bounded-exhaustive"]
+    assert dsa.operation_request_ids == [
+        "rid-evidence-bounded-exhaustive",
+        "rid-evidence-bounded-exhaustive",
+    ]
     assert dsa.calls[0]["query"] == (
         "Review every maintenance record in the configured worksheet."
     )
@@ -15407,9 +15506,9 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     user_text = "Verify   the maintenance record."
 
     class OrderedDsa(FakeDSA):
-        async def list_sources(self):
+        async def list_sources(self, *, request_id=None):
             runtime.call_order.append("dsa_inventory")
-            return await super().list_sources()
+            return await super().list_sources(request_id=request_id)
 
         async def context_pack(self, **kwargs):
             runtime.call_order.append("dsa_context_pack")
@@ -15459,6 +15558,8 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert len(runtime.evidence_next_step_calls) == 1
     assert len(dsa.list_calls) == 1
     assert len(dsa.calls) == 1
+    assert dsa.list_request_ids == ["rid-evidence-targeted"]
+    assert dsa.operation_request_ids == ["rid-evidence-targeted"]
     assert dsa.fetch_calls == []
     assert dsa.context_calls == []
     assert dsa.calls[0]["query"] == "Verify the maintenance record."
@@ -16394,6 +16495,12 @@ async def test_hybrid_comparison_executes_declared_expansion_per_source_and_pers
     assert len(dsa.list_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
     assert len(dsa.calls) == 1
+    assert dsa.list_request_ids == ["rid-evidence-hybrid-comparison"]
+    assert dsa.operation_request_ids == [
+        "rid-evidence-hybrid-comparison",
+        "rid-evidence-hybrid-comparison",
+        "rid-evidence-hybrid-comparison",
+    ]
     assert dsa.calls[0]["source_ids"] == [
         "vehicle_log_primary",
         "vehicle_log_secondary",
@@ -18079,6 +18186,8 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
     )
     assert dsa.calls == []
     assert len(dsa.fetch_calls) == 1
+    assert dsa.list_request_ids == [request_id]
+    assert dsa.operation_request_ids == [request_id]
     assert dsa.fetch_calls[0] == {
         "source_ref": "neutral_connector:vehicle_log_primary:record_1",
         "include_raw": False,
@@ -25377,6 +25486,7 @@ async def test_orchestrate_dsa_top_level_opt_in_calls_client_and_includes_prompt
             },
         }
     ]
+    assert dsa.operation_request_ids == ["rid-dsa-success"]
     system_messages = [
         msg["content"] for msg in litellm.calls[0]["messages"] if msg["role"] == "system"
     ]
