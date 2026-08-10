@@ -4,6 +4,7 @@ import json
 import os
 from collections import defaultdict
 from copy import deepcopy
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -95,33 +96,52 @@ _GOOGLE_VALUES: dict[str, list[list[str]]] = {
     ],
 }
 
+_FIXTURE_ANCHOR_DATE = datetime.now(UTC).date()
+
+
+def _calendar_fixture(
+    *,
+    uid: str,
+    day_offset: int,
+    summary: str,
+    description: str,
+    location: str,
+) -> str:
+    start = datetime.combine(
+        _FIXTURE_ANCHOR_DATE + timedelta(days=day_offset),
+        time(hour=9, tzinfo=UTC),
+    )
+    end = start + timedelta(hours=1)
+    return f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Composed Fixture//EN
+BEGIN:VEVENT
+UID:{uid}
+DTSTART:{start.strftime("%Y%m%dT%H%M%SZ")}
+DTEND:{end.strftime("%Y%m%dT%H%M%SZ")}
+SUMMARY:{summary}
+DESCRIPTION:{description}
+LOCATION:{location}
+END:VEVENT
+END:VCALENDAR
+"""
+
+
 _ICS_VALUES: dict[str, str] = {
-    "calendar-alpha": """BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Composed Fixture//EN
-BEGIN:VEVENT
-UID:alpha-event
-DTSTART:20260810T090000Z
-DTEND:20260810T100000Z
-SUMMARY:Migration review alpha
-DESCRIPTION:Alpha source records the migration review.
-LOCATION:Room A
-END:VEVENT
-END:VCALENDAR
-""",
-    "calendar-beta": """BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Composed Fixture//EN
-BEGIN:VEVENT
-UID:beta-event
-DTSTART:20260811T090000Z
-DTEND:20260811T100000Z
-SUMMARY:Migration review beta
-DESCRIPTION:Beta source records the migration review.
-LOCATION:Room B
-END:VEVENT
-END:VCALENDAR
-""",
+    "calendar-alpha": _calendar_fixture(
+        uid="alpha-event",
+        day_offset=1,
+        summary="Migration review alpha",
+        description="Alpha source records the migration review.",
+        location="Room A",
+    ),
+    "calendar-beta": _calendar_fixture(
+        uid="beta-event",
+        day_offset=2,
+        summary="Migration review beta",
+        description="Beta source records the migration review.",
+        location="Room B",
+    ),
 }
 
 
