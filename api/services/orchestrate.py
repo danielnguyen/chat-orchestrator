@@ -77,6 +77,7 @@ from services.evidence_acquisition import (
     execute_hybrid_comparison,
     governed_evidence_claim_anchor,
     grounded_provider_allowed,
+    helpful_grounded_recovery_allowed,
     ineligible_exact_evidence_state,
     promote_exact_fetch_proposal,
     provider_allowed,
@@ -9610,10 +9611,19 @@ async def orchestrate_chat(
                     retained_source_refs=retained_external_refs,
                 )
             )
+            successful_provider_call = any(
+                attempt.get("status") == "ok" for attempt in model_calls
+            )
+            helpful_recovery = helpful_grounded_recovery_allowed(
+                state=evidence_acquisition,
+                validation=governed_validation,
+                provider_call_occurred=successful_provider_call,
+            )
             raw_answer = render_governed_evidence_answer(
                 state=evidence_acquisition,
                 validation=governed_validation,
                 excerpts=validated_governed_excerpts,
+                provider_call_occurred=successful_provider_call,
             )
             prompt.trace["evidence_response"] = {
                 "contract_active": True,
@@ -9623,6 +9633,13 @@ async def orchestrate_chat(
                 ),
                 "failure_reason": governed_validation.failure_reason,
                 "provider_tool_count": 0,
+                "recovery_status": (
+                    "not_needed"
+                    if governed_validation.validation_status == "valid"
+                    else "deterministic_helpful_fallback"
+                    if helpful_recovery
+                    else "not_eligible"
+                ),
             }
             if governed_validation.validation_status == "invalid":
                 status = "degraded"
@@ -9927,6 +9944,12 @@ async def orchestrate_chat(
         ):
             artifact_refs_for_sources = []
         answer_sources = _public_answer_sources(artifact_refs_for_sources)
+        if (
+            governed_validation is not None
+            and governed_validation.validation_status == "invalid"
+        ):
+            artifact_refs_for_sources = []
+            answer_sources = []
         if advisory_evidence_provider_call:
             artifact_refs_for_sources = []
             answer_sources = []

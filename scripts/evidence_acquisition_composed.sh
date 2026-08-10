@@ -1346,10 +1346,8 @@ run_evidence_adversarial_provider_scenario() {
     and (.answer | contains("no evidence exists outside this result") | not)
   '
   assert_jq "adversarial.malformed_freeform.safe_answer" "$response" '
-    ([.answer | scan("The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion\\.")] | length) == 1
-  '
-  assert_jq "adversarial.malformed_freeform.boundary" "$response" '
-    .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
+    .answer == "The evidence acquisition completed and returned usable material, but I couldn’t validate the generated grounded answer, so I’m not presenting a substantive conclusion from it. Please try again."
+    and .sources == []
   '
   assert_jq "adversarial.malformed_freeform.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
@@ -1383,7 +1381,8 @@ run_evidence_adversarial_provider_scenario() {
     and (.model_calls | length) == 1
     and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
-    and .retrieval.prompt_assembly.evidence_response.failure_reason == "invalid_json"'
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == "invalid_json"
+    and .retrieval.prompt_assembly.evidence_response.recovery_status == "deterministic_helpful_fallback"'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
     echo "Assertion failed: adversarial.malformed_freeform.persistence" >&2
@@ -1494,10 +1493,8 @@ run_evidence_adversarial_provider_scenario() {
     '.answer | contains($provider_text) | not' \
     --arg provider_text "$forged_candidate"
   assert_jq "adversarial.forged_reference.safe_answer" "$response" '
-    ([.answer | scan("The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion\\.")] | length) == 1
-  '
-  assert_jq "adversarial.forged_reference.boundary" "$response" '
-    .answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")
+    .answer == "The evidence acquisition completed and returned usable material, but I couldn’t validate the generated grounded answer, so I’m not presenting a substantive conclusion from it. Please try again."
+    and .sources == []
   '
   assert_jq "adversarial.forged_reference.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
@@ -1531,7 +1528,8 @@ run_evidence_adversarial_provider_scenario() {
     and (.model_calls | length) == 1
     and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
-    and .retrieval.prompt_assembly.evidence_response.failure_reason == "reference_not_retained"'
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == "reference_not_retained"
+    and .retrieval.prompt_assembly.evidence_response.recovery_status == "deterministic_helpful_fallback"'
   if ! assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$answer" >/dev/null 2>&1; then
     echo "Assertion failed: adversarial.forged_reference.persistence" >&2
@@ -2940,15 +2938,14 @@ run_evidence_compound_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  replacement="The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion."
+  replacement="The evidence acquisition completed and returned usable material, but I couldn’t validate the generated grounded answer, so I’m not presenting a substantive conclusion from it. Please try again."
   assert_jq "compound.label_conflict.response_status" "$response" \
     '.status == "degraded"'
   assert_jq "compound.label_conflict.original_section" "$response" \
     '.answer | startswith("Original acquisition:\n")'
   assert_jq "compound.label_conflict.replacement" "$response" \
     '.answer
-    | contains("\n\nNew verification:\n" + $replacement)
-    and endswith("This reflects only the targeted sources checked, not a complete search of every possible source.")' \
+    | endswith("\n\nNew verification:\n" + $replacement)' \
     --arg replacement "$replacement"
   assert_jq "compound.label_conflict.original_section_count" "$response" \
     '([.answer | scan("Original acquisition:")] | length) == 1'
@@ -2993,6 +2990,11 @@ run_evidence_compound_scenarios() {
     '.fallback.triggered == false'
   assert_jq "compound.label_conflict.trace_model_count" "$trace" \
     '(.model_calls | length) == 1'
+  assert_jq "compound.label_conflict.recovery" "$trace" '
+    .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == "invalid_json"
+    and .retrieval.prompt_assembly.evidence_response.recovery_status == "deterministic_helpful_fallback"
+  '
   assert_jq "compound.label_conflict.provider_calls" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
@@ -3583,7 +3585,7 @@ run_evidence_scope_reference_scenarios() {
 run_structured_answer_failure_case() {
   local case_name="$1" candidate="$2" expected_reason="$3" raw_marker="$4"
   local owner client conversation_id response request_id answer trace manifest
-  local provider_calls diagnostics audit claims serialized
+  local provider_calls diagnostics audit claims response_digest serialized
   owner="owner-structured-${case_name}"
   client="client-structured-${case_name}"
   provider_post "/fixture/reset" '{}'
@@ -3604,8 +3606,8 @@ run_structured_answer_failure_case() {
   claims="$(list_claim_records "$owner" "$conversation_id")"
   assert_jq "structured.${case_name}.response" "$response" '
     .status == "degraded"
-    and ([.answer | scan("The generated evidence response could not be used safely, so I’m not presenting a substantive conclusion\\.")] | length) == 1
-    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+    and .answer == "The evidence acquisition completed and returned usable material, but I couldn’t validate the generated grounded answer, so I’m not presenting a substantive conclusion from it. Please try again."
+    and .sources == []
     and (.answer | contains($raw) | not)
     and (.answer | contains("I withheld the generated answer because it claimed evidence coverage beyond the examined scope.") | not)
   ' --arg raw "$raw_marker"
@@ -3623,7 +3625,8 @@ run_structured_answer_failure_case() {
   assert_jq "structured.${case_name}.validation" "$trace" \
     '.retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
-    and .retrieval.prompt_assembly.evidence_response.failure_reason == $reason' \
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == $reason
+    and .retrieval.prompt_assembly.evidence_response.recovery_status == "deterministic_helpful_fallback"' \
     --arg reason "$expected_reason"
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
@@ -3639,6 +3642,9 @@ run_structured_answer_failure_case() {
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  response_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
+  assert_jq "structured.${case_name}.digest" "$manifest" \
+    '.response_digest == $digest' --arg digest "$response_digest"
   STRUCTURED_MALFORMED_OWNER="$owner"
   STRUCTURED_MALFORMED_CLIENT="$client"
   STRUCTURED_MALFORMED_CONVERSATION="$conversation_id"
@@ -3686,7 +3692,8 @@ run_evidence_structured_answer_recovery_scenarios() {
       validation_status:"valid",
       validated_excerpt_count:1,
       failure_reason:null,
-      provider_tool_count:0
+      provider_tool_count:0,
+      recovery_status:"not_needed"
     }
   '
   assert_jq "structured.supports.provider" "$provider_calls" '
