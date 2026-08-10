@@ -13997,7 +13997,7 @@ async def test_chat_boundary_logs_generated_request_id_without_content(
 
     monkeypatch.setattr(main, "uuid4", lambda: request_id)
     monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
-    caplog.set_level(logging.INFO, logger="chat_orchestrator.chat")
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.chat")
     body = ChatRequest.model_validate(
         _first_party_chat_payload("PRIVATE_USER_TEXT_SENTINEL")
     )
@@ -14028,7 +14028,7 @@ async def test_chat_boundary_failure_logs_and_returns_same_request_id_without_er
 
     monkeypatch.setattr(main, "uuid4", lambda: request_id)
     monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
-    caplog.set_level(logging.INFO, logger="chat_orchestrator.chat")
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.chat")
     body = ChatRequest.model_validate(
         _first_party_chat_payload("PRIVATE_FAILED_USER_TEXT_SENTINEL")
     )

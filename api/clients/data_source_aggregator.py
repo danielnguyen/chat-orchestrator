@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-_request_logger = logging.getLogger("chat_orchestrator.dsa")
+_request_logger = logging.getLogger("uvicorn.error.chat_orchestrator.dsa")
 
 
 class DataSourceAggregatorClient:

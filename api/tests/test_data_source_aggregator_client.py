@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -220,7 +224,7 @@ async def test_fetch_source_timeout_propagates_without_retry(monkeypatch, caplog
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1750)
-    caplog.set_level(logging.INFO, logger="chat_orchestrator.dsa")
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.dsa")
 
     with pytest.raises(httpx.ReadTimeout):
         await client.fetch_source(
@@ -400,7 +404,7 @@ async def test_correlation_log_excludes_request_and_response_content(monkeypatch
         )
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-    caplog.set_level(logging.INFO, logger="chat_orchestrator.dsa")
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.dsa")
 
     await client.context_pack(
         query="PRIVATE_QUERY_SENTINEL",
@@ -413,3 +417,46 @@ async def test_correlation_log_excludes_request_and_response_content(monkeypatch
     assert "status=200" in caplog.text
     assert "PRIVATE_QUERY_SENTINEL" not in caplog.text
     assert "PRIVATE_RESPONSE_SENTINEL" not in caplog.text
+
+
+def test_correlation_loggers_emit_info_with_default_uvicorn_logging() -> None:
+    api_root = Path(__file__).resolve().parents[1]
+    program = """
+import copy
+import logging.config
+
+from uvicorn.config import LOGGING_CONFIG
+
+import main
+from clients import data_source_aggregator
+
+assert main._chat_logger.name == "uvicorn.error.chat_orchestrator.chat"
+assert data_source_aggregator._request_logger.name == (
+    "uvicorn.error.chat_orchestrator.dsa"
+)
+logging.config.dictConfig(copy.deepcopy(LOGGING_CONFIG))
+main._chat_logger.info("CO_CHAT_CORRELATION_VISIBILITY_SENTINEL")
+data_source_aggregator._request_logger.info(
+    "CO_DSA_CORRELATION_VISIBILITY_SENTINEL"
+)
+"""
+    environment = {
+        **os.environ,
+        "ORCH_API_KEY": "orch-test",
+        "MEMORY_STORE_BASE_URL": "http://memory",
+        "MEMORY_STORE_API_KEY": "memory",
+        "LITELLM_BASE_URL": "http://litellm",
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=api_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = completed.stdout + completed.stderr
+
+    assert "CO_CHAT_CORRELATION_VISIBILITY_SENTINEL" in output
+    assert "CO_DSA_CORRELATION_VISIBILITY_SENTINEL" in output

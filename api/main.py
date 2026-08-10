@@ -20,7 +20,7 @@ from services.orchestrate import orchestrate_chat
 from settings import get_settings
 
 settings = get_settings()
-_chat_logger = logging.getLogger("chat_orchestrator.chat")
+_chat_logger = logging.getLogger("uvicorn.error.chat_orchestrator.chat")
 
 
 @asynccontextmanager
