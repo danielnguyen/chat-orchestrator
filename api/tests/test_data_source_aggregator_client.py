@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import httpx
 import pytest
 from clients.data_source_aggregator import DataSourceAggregatorClient
@@ -10,7 +16,7 @@ async def test_list_sources_gets_inventory():
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
     calls = []
 
-    async def fake_get(path):
+    async def fake_get(path, *, request_id=None):
         calls.append(path)
         return {"sources": []}
 
@@ -36,10 +42,13 @@ async def test_list_sources_preserves_api_key_header(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
 
-    assert await client.list_sources() == {"sources": []}
+    assert await client.list_sources(request_id="request-list-1") == {"sources": []}
     assert captured == {
         "url": "http://dsa.local/v1/sources",
-        "headers": {"X-API-Key": "dsa-secret"},
+        "headers": {
+            "X-API-Key": "dsa-secret",
+            "X-Request-ID": "request-list-1",
+        },
     }
 
 
@@ -48,7 +57,7 @@ async def test_context_pack_posts_expected_payload():
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
     calls: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_post(path: str, *, json: dict[str, object]):
+    async def fake_post(path: str, *, json: dict[str, object], request_id=None):
         calls.append((path, json))
         return {"items": []}
 
@@ -81,7 +90,7 @@ async def test_context_pack_posts_targeting_and_budget_overrides():
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
     calls: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_post(path: str, *, json: dict[str, object]):
+    async def fake_post(path: str, *, json: dict[str, object], request_id=None):
         calls.append((path, json))
         return {"items": []}
 
@@ -123,7 +132,7 @@ async def test_fetch_source_posts_exact_bounded_no_raw_payload():
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
     calls: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_post(path: str, *, json: dict[str, object]):
+    async def fake_post(path: str, *, json: dict[str, object], request_id=None):
         calls.append((path, json))
         return {"retrieval_mode": "fetch", "results": []}
 
@@ -180,16 +189,22 @@ async def test_fetch_source_preserves_headers_timeout_and_http_boundary(monkeypa
     )
 
     with pytest.raises(httpx.HTTPStatusError):
-        await client.fetch_source(source_ref="connector:source-a:item-1")
+        await client.fetch_source(
+            source_ref="connector:source-a:item-1",
+            request_id="request-fetch-1",
+        )
 
     assert captured["timeout"] == 1.75
     assert captured["url"] == "http://dsa.local/v1/sources/fetch"
-    assert captured["headers"] == {"X-API-Key": "dsa-secret"}
+    assert captured["headers"] == {
+        "X-API-Key": "dsa-secret",
+        "X-Request-ID": "request-fetch-1",
+    }
     assert captured["json"]["include_raw"] is False
 
 
 @pytest.mark.asyncio
-async def test_fetch_source_timeout_propagates_without_retry(monkeypatch):
+async def test_fetch_source_timeout_propagates_without_retry(monkeypatch, caplog):
     calls = 0
 
     class FakeAsyncClient:
@@ -209,10 +224,19 @@ async def test_fetch_source_timeout_propagates_without_retry(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1750)
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.dsa")
 
     with pytest.raises(httpx.ReadTimeout):
-        await client.fetch_source(source_ref="connector:source-a:item-1")
+        await client.fetch_source(
+            source_ref="connector:PRIVATE_SOURCE_SENTINEL:item-1",
+            request_id="request-timeout-1",
+        )
     assert calls == 1
+    assert "request_id=request-timeout-1" in caplog.text
+    assert "path=/v1/sources/fetch" in caplog.text
+    assert "error_category=timeout" in caplog.text
+    assert "PRIVATE_SOURCE_SENTINEL" not in caplog.text
+    assert "timed out" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -220,7 +244,7 @@ async def test_context_source_posts_exact_bounded_payload_and_override():
     client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=1500)
     calls: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_post(path: str, *, json: dict[str, object]):
+    async def fake_post(path: str, *, json: dict[str, object], request_id=None):
         calls.append((path, json))
         return {"retrieval_mode": "context", "results": []}
 
@@ -302,11 +326,15 @@ async def test_context_source_preserves_headers_timeout_and_http_boundary(monkey
         await client.context_source(
             source_ref="connector:source-a:item-1",
             context_mode="nearby_rows",
+            request_id="request-context-1",
         )
 
     assert captured["timeout"] == 1.75
     assert captured["url"] == "http://dsa.local/v1/sources/context"
-    assert captured["headers"] == {"X-API-Key": "dsa-secret"}
+    assert captured["headers"] == {
+        "X-API-Key": "dsa-secret",
+        "X-Request-ID": "request-context-1",
+    }
     assert captured["json"] == {
         "source_ref": "connector:source-a:item-1",
         "context_mode": "nearby_rows",
@@ -335,11 +363,17 @@ async def test_client_includes_api_key_header_when_configured(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
-    response = await client.context_pack(query="battery replacement")
+    response = await client.context_pack(
+        query="battery replacement",
+        request_id="request-pack-1",
+    )
 
     assert response == {"items": []}
     assert captured["url"] == "http://dsa.local/v1/context-pack"
-    assert captured["headers"] == {"X-API-Key": "dsa-secret"}
+    assert captured["headers"] == {
+        "X-API-Key": "dsa-secret",
+        "X-Request-ID": "request-pack-1",
+    }
 
 
 @pytest.mark.asyncio
@@ -356,3 +390,73 @@ async def test_client_omits_api_key_header_when_not_configured(monkeypatch):
     await client.context_pack(query="battery replacement")
 
     assert captured["headers"] is None
+
+
+@pytest.mark.asyncio
+async def test_correlation_log_excludes_request_and_response_content(monkeypatch, caplog):
+    client = DataSourceAggregatorClient("http://dsa.local", timeout_ms=5000)
+
+    async def fake_post(self, url, *, json=None, headers=None, **kwargs):
+        return httpx.Response(
+            200,
+            json={"items": ["PRIVATE_RESPONSE_SENTINEL"]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.dsa")
+
+    await client.context_pack(
+        query="PRIVATE_QUERY_SENTINEL",
+        request_id="request-log-1",
+    )
+
+    assert "request_id=request-log-1" in caplog.text
+    assert "method=POST" in caplog.text
+    assert "path=/v1/context-pack" in caplog.text
+    assert "status=200" in caplog.text
+    assert "PRIVATE_QUERY_SENTINEL" not in caplog.text
+    assert "PRIVATE_RESPONSE_SENTINEL" not in caplog.text
+
+
+def test_correlation_loggers_emit_info_with_default_uvicorn_logging() -> None:
+    api_root = Path(__file__).resolve().parents[1]
+    program = """
+import copy
+import logging.config
+
+from uvicorn.config import LOGGING_CONFIG
+
+import main
+from clients import data_source_aggregator
+
+assert main._chat_logger.name == "uvicorn.error.chat_orchestrator.chat"
+assert data_source_aggregator._request_logger.name == (
+    "uvicorn.error.chat_orchestrator.dsa"
+)
+logging.config.dictConfig(copy.deepcopy(LOGGING_CONFIG))
+main._chat_logger.info("CO_CHAT_CORRELATION_VISIBILITY_SENTINEL")
+data_source_aggregator._request_logger.info(
+    "CO_DSA_CORRELATION_VISIBILITY_SENTINEL"
+)
+"""
+    environment = {
+        **os.environ,
+        "ORCH_API_KEY": "orch-test",
+        "MEMORY_STORE_BASE_URL": "http://memory",
+        "MEMORY_STORE_API_KEY": "memory",
+        "LITELLM_BASE_URL": "http://litellm",
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=api_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = completed.stdout + completed.stderr
+
+    assert "CO_CHAT_CORRELATION_VISIBILITY_SENTINEL" in output
+    assert "CO_DSA_CORRELATION_VISIBILITY_SENTINEL" in output

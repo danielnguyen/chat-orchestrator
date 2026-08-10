@@ -1173,6 +1173,7 @@ class EvidenceAcquisitionState:
     enabled: bool
     attempted: bool
     status: str
+    request_id: str | None = None
     shape: ShapeResult | None = None
     inventory: DsaSourceListResponse | None = None
     declared_scope: dict[str, Any] | None = None
@@ -1998,6 +1999,7 @@ async def compile_safe_exact_fetch_proposal(
             enabled=state.enabled,
             attempted=True,
             status="acquisition_ready",
+            request_id=state.request_id,
             shape=state.shape,
             inventory=state.inventory,
             declared_scope=proposed_scope,
@@ -2276,6 +2278,7 @@ async def begin_evidence_acquisition(
         enabled=True,
         attempted=True,
         status="shape_requested",
+        request_id=request_id,
         exact_source_refs=exact_source_refs,
     )
     scope = _scope(
@@ -2348,7 +2351,7 @@ async def begin_evidence_acquisition(
         return state
 
     try:
-        source_list_raw = await dsa.list_sources()
+        source_list_raw = await dsa.list_sources(request_id=request_id)
         state.inventory = DsaSourceListResponse.model_validate(source_list_raw)
     except Exception:
         state.status = "inventory_dependency_failed"
@@ -2783,6 +2786,7 @@ async def execute_bounded_exhaustive_review(
         context_call_count = 1
         try:
             response_raw = await dsa.context_source(
+                request_id=state.request_id,
                 source_ref=attempt["seed_source_ref"],
                 context_mode=CONFIGURED_WORKSHEET_CONTEXT_MODE,
                 budget=dict(BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET),
@@ -3025,6 +3029,7 @@ async def execute_hybrid_comparison(
         context_call_count += 1
         try:
             response_raw = await dsa.context_source(
+                request_id=state.request_id,
                 source_ref=attempt["seed_source_ref"],
                 context_mode=attempt["context_mode"],
                 budget={
@@ -3193,6 +3198,7 @@ async def execute_exact_fetches(
         }
         try:
             response_raw = await dsa.fetch_source(
+                request_id=state.request_id,
                 source_ref=reference["source_ref"],
                 include_raw=False,
                 budget={

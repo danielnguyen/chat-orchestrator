@@ -4611,6 +4611,7 @@ def _sanitize_context_pack(
 
 async def _resolve_external_context(
     *,
+    request_id: str,
     dsa: DataSourceAggregatorClient | None,
     dsa_enabled: bool,
     external_context_enabled: bool,
@@ -4660,6 +4661,7 @@ async def _resolve_external_context(
         }
     try:
         response = await dsa.context_pack(
+            request_id=request_id,
             query=query,
             source_ids=external_context_config.get("source_ids"),
             domain_tags=external_context_config.get("domain_tags"),
@@ -8047,6 +8049,7 @@ async def orchestrate_chat(
             }
         else:
             external_context_pack, dsa_trace = await _resolve_external_context(
+                request_id=request_id,
                 dsa=dsa,
                 dsa_enabled=dsa_enabled,
                 external_context_enabled=external_context_enabled,
@@ -8248,6 +8251,7 @@ async def orchestrate_chat(
                 }
             elif isinstance(matched_capability_id, str):
                 external_context_pack, dsa_trace = await _resolve_external_context(
+                    request_id=request_id,
                     dsa=dsa,
                     dsa_enabled=dsa_enabled,
                     external_context_enabled=external_context_enabled,
@@ -8302,6 +8306,7 @@ async def orchestrate_chat(
                         exhaustive_external_config["max_results"] = 1
                         external_context_pack, dsa_trace = (
                             await _resolve_external_context(
+                                request_id=request_id,
                                 dsa=dsa,
                                 dsa_enabled=dsa_enabled,
                                 external_context_enabled=True,
@@ -8350,6 +8355,7 @@ async def orchestrate_chat(
                         )
                         external_context_pack, dsa_trace = (
                             await _resolve_external_context(
+                                request_id=request_id,
                                 dsa=dsa,
                                 dsa_enabled=dsa_enabled,
                                 external_context_enabled=True,
@@ -8407,6 +8413,7 @@ async def orchestrate_chat(
                             )
                             targeted_external_config["domain_tags"] = []
                         external_context_pack, dsa_trace = await _resolve_external_context(
+                            request_id=request_id,
                             dsa=dsa,
                             dsa_enabled=dsa_enabled,
                             external_context_enabled=True,

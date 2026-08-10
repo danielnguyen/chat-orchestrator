@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from services.orchestrate import orchestrate_chat
 from settings import get_settings
 
 settings = get_settings()
+_chat_logger = logging.getLogger("uvicorn.error.chat_orchestrator.chat")
 
 
 @asynccontextmanager
@@ -123,6 +125,10 @@ async def brief_generate(body: BriefGenerateRequest) -> BriefGenerateResponse:
 )
 async def chat(body: ChatRequest) -> ChatResponse:
     request_id = str(uuid4())
+    _chat_logger.info(
+        "chat_request_started component=chat-orchestrator request_id=%s",
+        request_id,
+    )
     try:
         result = await orchestrate_chat(
             payload=body.model_dump(),
@@ -156,8 +162,19 @@ async def chat(body: ChatRequest) -> ChatResponse:
             prompt_context_safety_margin=settings.prompt_context_safety_margin,
             request_id=request_id,
         )
-        return ChatResponse(**result)
+        response = ChatResponse(**result)
+        _chat_logger.info(
+            "chat_request_completed component=chat-orchestrator request_id=%s status=%s",
+            request_id,
+            response.status,
+        )
+        return response
     except Exception:
+        _chat_logger.info(
+            "chat_request_failed component=chat-orchestrator request_id=%s "
+            "error_category=orchestration_exception",
+            request_id,
+        )
         return JSONResponse(
             status_code=500,
             content={
