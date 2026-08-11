@@ -11,6 +11,7 @@ from services.evidence_acquisition import (
     BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
     COMPARISON_SCOPE_SUFFIX,
     CONFIGURED_WORKSHEET_CONTEXT_MODE,
+    HELPFUL_GROUNDED_RECOVERY_RESPONSE,
     MALFORMED_EVIDENCE_RESPONSE,
     NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
@@ -46,6 +47,7 @@ from services.evidence_acquisition import (
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
+    helpful_grounded_recovery_allowed,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
@@ -630,6 +632,7 @@ def _rendering_state(
     limitation_codes=None,
     inventory=None,
     declared_scope=None,
+    recovery_eligible=False,
 ):
     evaluations = evaluations or [
         {
@@ -637,7 +640,19 @@ def _rendering_state(
             "requirement_kind": "targeted_evidence",
             "criticality": "material",
             "effective_outcome": "satisfied",
-        }
+        },
+        *(
+            [
+                {
+                    "requirement_id": "context-delivery",
+                    "requirement_kind": "context_delivery",
+                    "criticality": "material",
+                    "effective_outcome": "satisfied",
+                }
+            ]
+            if recovery_eligible
+            else []
+        ),
     ]
     requirements = [
         {
@@ -677,6 +692,17 @@ def _rendering_state(
         plan=PlanResult.model_validate(plan_data),
         manifest_id="evidence_manifest_0123456789abcdef0123456789abcdef",
         sufficiency=SufficiencyResult.model_validate(response),
+        acquisition_facts=(
+            [
+                {
+                    "requirement_id": evaluation["requirement_id"],
+                    "outcome": evaluation["effective_outcome"],
+                }
+                for evaluation in evaluations
+            ]
+            if recovery_eligible
+            else None
+        ),
         forced_answer=(
             WITHHELD_ANSWER if status in {"insufficient", "unknown"} else None
         ),
@@ -5256,6 +5282,142 @@ def test_malformed_candidate_renderer_is_deterministic_and_content_free():
 
     assert answer == MALFORMED_EVIDENCE_RESPONSE
     assert "PRIVATE MALFORMED PROVIDER OUTPUT" not in answer
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "invalid_json",
+        "invalid_candidate",
+        "reference_not_retained",
+        "reference_not_unique",
+        "excerpt_not_extractive",
+        "excerpt_token_boundary_invalid",
+    ],
+)
+def test_invalid_grounded_candidate_uses_helpful_recovery_only_after_successful_state(
+    reason,
+):
+    state = _rendering_state(recovery_eligible=True)
+    validation = EvidenceCandidateValidation(
+        validation_status="invalid",
+        conclusion_disposition=None,
+        validated_excerpt_count=0,
+        validated_source_references=(),
+        failure_reason=reason,
+    )
+
+    assert helpful_grounded_recovery_allowed(
+        state=state,
+        validation=validation,
+        provider_call_occurred=True,
+    ) is True
+    answer = render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=(),
+        provider_call_occurred=True,
+    )
+
+    assert answer == HELPFUL_GROUNDED_RECOVERY_RESPONSE
+    assert enforce_final_answer(answer, state) == answer
+    assert reason not in answer
+
+
+def test_helpful_grounded_recovery_preserves_trusted_limitation_disclosure():
+    evaluations = [
+        {
+            "requirement_id": "targeted-evidence",
+            "requirement_kind": "targeted_evidence",
+            "criticality": "material",
+            "effective_outcome": "satisfied",
+        },
+        {
+            "requirement_id": "context-delivery",
+            "requirement_kind": "context_delivery",
+            "criticality": "material",
+            "effective_outcome": "satisfied",
+        },
+        {
+            "requirement_id": "selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "optional",
+            "effective_outcome": "unavailable",
+        },
+    ]
+    state = _rendering_state(
+        status="sufficient_with_limitations",
+        evaluations=evaluations,
+        limitation_codes=["optional_source_unavailable"],
+        recovery_eligible=True,
+    )
+    validation = EvidenceCandidateValidation(
+        validation_status="invalid",
+        conclusion_disposition=None,
+        validated_excerpt_count=0,
+        validated_source_references=(),
+        failure_reason="invalid_json",
+    )
+
+    answer = render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=(),
+        provider_call_occurred=True,
+    )
+
+    assert answer.startswith(HELPFUL_GROUNDED_RECOVERY_RESPONSE)
+    assert answer.endswith("Limitation: an optional selected source was not available.")
+    assert enforce_final_answer(answer, state) == answer
+    assert TARGETED_SCOPE_SUFFIX not in answer
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "provider_not_called",
+        "failed_material_acquisition",
+        "no_retained_context",
+        "insufficient",
+        "unknown",
+        "dependency_failure",
+        "provider_blocked",
+    ],
+)
+def test_helpful_grounded_recovery_rejects_untrusted_or_incomplete_state(mutation):
+    state = _rendering_state(recovery_eligible=True)
+    provider_call_occurred = True
+    if mutation == "provider_not_called":
+        provider_call_occurred = False
+    elif mutation == "failed_material_acquisition":
+        state.acquisition_facts[0]["outcome"] = "failed"
+    elif mutation == "no_retained_context":
+        state.acquisition_facts[1]["outcome"] = "unknown"
+    elif mutation in {"insufficient", "unknown"}:
+        state = _rendering_state(status=mutation, recovery_eligible=True)
+    elif mutation == "dependency_failure":
+        state.next_step_failure = "dependency_failure"
+    elif mutation == "provider_blocked":
+        state.forced_answer = WITHHELD_ANSWER
+    validation = EvidenceCandidateValidation(
+        validation_status="invalid",
+        conclusion_disposition=None,
+        validated_excerpt_count=0,
+        validated_source_references=(),
+        failure_reason="invalid_json",
+    )
+
+    assert helpful_grounded_recovery_allowed(
+        state=state,
+        validation=validation,
+        provider_call_occurred=provider_call_occurred,
+    ) is False
+    assert render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=(),
+        provider_call_occurred=provider_call_occurred,
+    ) == MALFORMED_EVIDENCE_RESPONSE
 
 @pytest.mark.parametrize(
     ("unavailable_count", "expected"),

@@ -39,7 +39,7 @@ from services.capabilities import (
 from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
-    MALFORMED_EVIDENCE_RESPONSE,
+    HELPFUL_GROUNDED_RECOVERY_RESPONSE,
     NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
     EvidenceAcquisitionPremise,
@@ -16829,7 +16829,7 @@ async def test_hybrid_comparison_prompt_budget_source_loss_blocks_provider(
 
 
 @pytest.mark.asyncio
-async def test_hybrid_comparison_provider_overclaim_gets_selected_scope_disclosure(
+async def test_hybrid_comparison_provider_overclaim_gets_helpful_fail_closed_recovery(
     tmp_path,
 ):
     out, _, _, litellm, _ = await _run_hybrid_comparison_case(
@@ -16838,8 +16838,10 @@ async def test_hybrid_comparison_provider_overclaim_gets_selected_scope_disclosu
     )
 
     assert len(litellm.calls) == 1
-    assert out["answer"].endswith(COMPARISON_SCOPE_SUFFIX)
-    assert out["answer"].count(COMPARISON_SCOPE_SUFFIX) == 1
+    assert out["status"] == "degraded"
+    assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
+    assert out["sources"] == []
+    assert COMPARISON_SCOPE_SUFFIX not in out["answer"]
 
 
 @pytest.mark.asyncio
@@ -17038,13 +17040,14 @@ async def test_governed_evidence_free_form_provider_content_is_degraded_without_
         request_id="rid-evidence-overclaim",
     )
 
-    replacement = MALFORMED_EVIDENCE_RESPONSE
+    replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["status"] == "degraded"
     assert len(litellm.calls) == 1
     assert litellm.calls[0]["tools"] == []
     assert provider_answer not in out["answer"]
-    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
-    assert out["answer"].count("This reflects only the targeted sources checked") == 1
+    assert out["answer"] == replacement
+    assert out["sources"] == []
+    assert out.get("pending_action") is None
     trace = memory_store.trace_calls[0]["payload"]
     manifest = trace["prompt"]["evidence_acquisition"]
     assert manifest["shape"]["task_shape"] == "targeted_lookup"
@@ -17057,13 +17060,18 @@ async def test_governed_evidence_free_form_provider_content_is_degraded_without_
         "validated_excerpt_count": 0,
         "failure_reason": "invalid_json",
         "provider_tool_count": 0,
+        "recovery_status": "deterministic_helpful_fallback",
     }
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
+    assert provider_answer not in json.dumps(trace, sort_keys=True)
     assistant_write = next(
         item for item in memory_store.added_messages if item["role"] == "assistant"
     )
     assert assistant_write["content"] == out["answer"]
+    assert manifest["response_digest"] == (
+        "sha256:" + hashlib.sha256(out["answer"].encode("utf-8")).hexdigest()
+    )
 
 
 @pytest.mark.asyncio
@@ -17182,13 +17190,13 @@ async def test_governed_evidence_rejects_structurally_malformed_provider_content
         request_id=request_id,
     )
 
-    replacement = MALFORMED_EVIDENCE_RESPONSE
+    replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["status"] == "degraded"
     assert len(litellm.calls) == 1
     assert provider_answer not in out["answer"]
-    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == replacement
     assert out["answer"].count(replacement) == 1
-    assert out["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
+    assert out["sources"] == []
     trace = memory_store.trace_calls[0]["payload"]
     manifest = trace["prompt"]["evidence_acquisition"]
     assert manifest["shape"]["task_shape"] == "targeted_lookup"
@@ -17248,12 +17256,12 @@ async def test_governed_evidence_never_surfaces_non_contract_provider_prose(
         request_id=request_id,
     )
 
-    replacement = MALFORMED_EVIDENCE_RESPONSE
+    replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["status"] == "degraded"
     assert len(litellm.calls) == 1
-    assert out["answer"] == f"{replacement}\n\n{TARGETED_SCOPE_SUFFIX}"
+    assert out["answer"] == replacement
     assert provider_answer not in out["answer"]
-    assert out["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
+    assert out["sources"] == []
     trace = memory_store.trace_calls[0]["payload"]
     manifest = trace["prompt"]["evidence_acquisition"]
     assert manifest["shape"]["task_shape"] == "targeted_lookup"
@@ -17297,9 +17305,8 @@ async def test_evidence_acquisition_provider_cannot_rewrite_policy_history(tmp_p
         request_id="rid-evidence-provider-policy",
     )
 
-    assert out["answer"] == (
-        f"{MALFORMED_EVIDENCE_RESPONSE}\n\n{TARGETED_SCOPE_SUFFIX}"
-    )
+    assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
+    assert out["sources"] == []
     assert malicious not in out["answer"]
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
@@ -18138,6 +18145,53 @@ async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordin
 
 
 @pytest.mark.asyncio
+async def test_natural_owner_data_question_remains_not_applicable_without_source_discovery(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "what's the median of my fuel litres for the Jeep"
+    request_id = "rid-natural-owner-data-not-applicable"
+    runtime = FakeRuntime(evidence_shape_response=_not_applicable_shape_response)
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM(content="Please provide the values to calculate.")
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert out["answer"] == "Please provide the values to calculate."
+    assert out["status"] == "ok"
+    assert dsa.list_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == []
+    assert runtime.evidence_next_step_calls == []
+    assert len(litellm.calls) == 1
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["status"] == "not_applicable"
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+
+
+@pytest.mark.asyncio
 async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_manifest(
     tmp_path,
 ):
@@ -18340,10 +18394,10 @@ async def test_evidence_acquisition_exact_fetch_provider_cannot_rewrite_history(
         request_id=request_id,
     )
 
-    assert out["answer"].count(
-        "This reflects only the targeted sources checked, not a complete search "
-        "of every possible source."
-    ) == 1
+    assert out["status"] == "degraded"
+    assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
+    assert out["sources"] == []
+    assert provider_claim not in out["answer"]
     manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
     ]
@@ -20887,9 +20941,7 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
     )
     result = outcome["result"]
     trace = outcome["trace"]
-    expected_replacement = (
-        f"{MALFORMED_EVIDENCE_RESPONSE}\n\n{TARGETED_SCOPE_SUFFIX}"
-    )
+    expected_replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
 
     assert result["status"] == "degraded"
     assert result["answer"].count("Original acquisition:") == 1
@@ -20948,7 +21000,7 @@ async def test_orchestrate_compound_free_form_prose_is_malformed(
     result = outcome["result"]
     assert result["status"] == "degraded"
     assert provider_content not in result["answer"]
-    assert MALFORMED_EVIDENCE_RESPONSE in result["answer"]
+    assert HELPFUL_GROUNDED_RECOVERY_RESPONSE in result["answer"]
     assert result["answer"].count("Original acquisition:") == 1
     assert result["answer"].count("New verification:") == 1
     assert len(outcome["provider"].calls) == 1
@@ -20971,9 +21023,11 @@ async def test_orchestrate_compound_limited_policy_label_boundary_fails_closed(
     assert result["answer"].count("Original acquisition:") == 1
     assert result["answer"].count("New verification:") == 1
     assert "PRIVATE-LIMITED-LABEL-CONTENT" not in result["answer"]
-    assert "Limitation:" not in result["answer"]
-    assert MALFORMED_EVIDENCE_RESPONSE in result["answer"]
-    assert TARGETED_SCOPE_SUFFIX in result["answer"]
+    assert "Limitation: an optional selected source was not available." in result[
+        "answer"
+    ]
+    assert HELPFUL_GROUNDED_RECOVERY_RESPONSE in result["answer"]
+    assert TARGETED_SCOPE_SUFFIX not in result["answer"]
     assert len(outcome["provider"].calls) == 1
     assert len(outcome["dsa"].calls) == 1
     assert outcome["memory_store"].claim_record_calls == []
@@ -29894,6 +29948,7 @@ async def test_support_compound_structured_excerpt_label_boundary_fails_closed(
 
     assert evidence_response["validation_status"] == "valid"
     assert evidence_response["validated_excerpt_count"] == 1
+    assert evidence_response["recovery_status"] == "not_needed"
     assert result["status"] == "degraded"
     assert result["answer"].count("Original support:") == 1
     assert result["answer"].count("New verification:") == 1
@@ -29949,6 +30004,7 @@ async def test_support_compound_structured_inline_prose_remains_allowed(
 
     assert evidence_response["validation_status"] == "valid"
     assert evidence_response["validated_excerpt_count"] == 1
+    assert evidence_response["recovery_status"] == "not_needed"
     assert result["status"] == "ok"
     assert result["answer"].count("Original support:") == 1
     assert result["answer"].count("New verification:") == 1

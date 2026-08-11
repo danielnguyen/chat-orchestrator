@@ -213,6 +213,11 @@ MALFORMED_EVIDENCE_RESPONSE = (
     "The generated evidence response could not be used safely, so I’m not "
     "presenting a substantive conclusion."
 )
+HELPFUL_GROUNDED_RECOVERY_RESPONSE = (
+    "The evidence acquisition completed and returned usable material, but I "
+    "couldn’t validate the generated grounded answer, so I’m not presenting a "
+    "substantive conclusion from it. Please try again."
+)
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
     "max_rows": 20,
@@ -3925,6 +3930,8 @@ def enforce_final_answer(
 ) -> str:
     if state is None or state.follow_existing_path:
         return answer
+    if answer.startswith(HELPFUL_GROUNDED_RECOVERY_RESPONSE):
+        return answer
     if state.next_step_selection_attempted:
         next_step = state.next_step
         if next_step is None:
@@ -4109,17 +4116,106 @@ def governed_evidence_claim_anchor(
     return _EVIDENCE_CONCLUSION_SENTENCES[disposition]
 
 
+def helpful_grounded_recovery_allowed(
+    *,
+    state: EvidenceAcquisitionState,
+    validation: EvidenceCandidateValidation,
+    provider_call_occurred: bool,
+) -> bool:
+    if (
+        not provider_call_occurred
+        or validation.validation_status != "invalid"
+        or validation.failure_reason is None
+        or not state.enabled
+        or not state.attempted
+        or state.follow_existing_path
+        or state.forced_answer is not None
+        or state.next_step_failure is not None
+        or not state.supported_governed_path
+        or state.plan is None
+        or state.plan.plan_status not in {"ready", "ready_with_limitations"}
+        or state.manifest_id is None
+        or state.acquisition_facts is None
+        or state.sufficiency is None
+        or state.sufficiency.sufficiency_status
+        not in {
+            "sufficient_for_declared_scope",
+            "sufficient_with_limitations",
+        }
+        or state.status != state.sufficiency.sufficiency_status
+    ):
+        return False
+
+    facts_by_id = {
+        item.get("requirement_id"): item.get("outcome")
+        for item in state.acquisition_facts
+    }
+    material_requirements = [
+        requirement
+        for requirement in state.plan.declared_requirements
+        if requirement.criticality == "material"
+    ]
+    if not material_requirements or any(
+        facts_by_id.get(requirement.requirement_id) != "satisfied"
+        for requirement in material_requirements
+    ):
+        return False
+    if not any(
+        requirement.requirement_kind == "context_delivery"
+        and facts_by_id.get(requirement.requirement_id) == "satisfied"
+        for requirement in material_requirements
+    ):
+        return False
+
+    evaluations_by_id = {
+        item.requirement_id: item.effective_outcome
+        for item in state.sufficiency.evaluated_requirements
+    }
+    if evaluations_by_id != facts_by_id:
+        return False
+
+    if not state.next_step_selection_attempted:
+        return state.next_step is None
+    next_step = state.next_step
+    if next_step is None or next_step.provider_disposition != "allowed":
+        return False
+    expected_step = {
+        "sufficient_for_declared_scope": "answer_within_declared_scope",
+        "sufficient_with_limitations": "provide_qualified_partial_answer",
+    }[state.sufficiency.sufficiency_status]
+    return bool(
+        next_step.sufficiency_status == state.sufficiency.sufficiency_status
+        and next_step.selected_next_step == expected_step
+    )
+
+
 def render_governed_evidence_answer(
     *,
     state: EvidenceAcquisitionState,
     validation: EvidenceCandidateValidation,
     excerpts: tuple[ValidatedEvidenceExcerpt, ...],
+    provider_call_occurred: bool = False,
 ) -> str:
     if (
         validation.validation_status != "valid"
         or validation.conclusion_disposition is None
         or validation.validated_excerpt_count != len(excerpts)
     ):
+        if helpful_grounded_recovery_allowed(
+            state=state,
+            validation=validation,
+            provider_call_occurred=provider_call_occurred,
+        ):
+            if (
+                state.sufficiency is not None
+                and state.sufficiency.sufficiency_status
+                == "sufficient_with_limitations"
+            ):
+                return (
+                    f"{HELPFUL_GROUNDED_RECOVERY_RESPONSE}\n\n"
+                    f"{_render_limitation_disclosure(state)}"
+                )
+            return HELPFUL_GROUNDED_RECOVERY_RESPONSE
         return MALFORMED_EVIDENCE_RESPONSE
     paragraphs = [
         _EVIDENCE_CONCLUSION_SENTENCES[validation.conclusion_disposition],
