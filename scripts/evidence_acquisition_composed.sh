@@ -706,10 +706,9 @@ run_evidence_source_scope_scenarios() {
       | length) == 0
   '
   assert_jq "source_scope.natural.dsa_scope" "$audit" '
-    [.[] | select(.operation == "context_pack")][0].considered_source_ids
-      == ["complete_register"]
-    and [.[] | select(.operation == "context_pack")][0].selected_source_ids
-      == ["complete_register"]
+    [.[] | select(.operation == "context_pack")] as $calls
+    | ($calls | length) == 1
+    and $calls[0].source_ids == ["complete_register"]
   '
   assert_single_inventory_request 1
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
