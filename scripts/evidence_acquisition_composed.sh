@@ -4515,6 +4515,7 @@ run_history_followup_composed_suite() {
     psql_exec -At -c "SELECT id FROM messages WHERE conversation_id = '$conversation_id' AND role = 'assistant' AND metadata->>'request_id' = '$request_id' ORDER BY created_at DESC LIMIT 1;"
   )"
   expected_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
+  echo "Ordinary history manifest: $(jq -c '{status,shape,plan_status:.plan.plan_status,dsa_outcome:.acquisition.dsa_outcome,inventory_discovery:.acquisition.inventory_discovery,sufficiency:.sufficiency.status,next_step_count:.next_steps.selection_count}' <<<"$original_manifest")"
   assert_jq "history.ordinary.original" "$response" '
     .status == "ok"
     and .answer == $answer
