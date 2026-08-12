@@ -1266,6 +1266,7 @@ run_evidence_clarification_scenario() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
+  echo "Clarification policy: $(jq -c '{sufficiency:.sufficiency.status,selections:[.next_steps.selections[] | {selected_next_step,clarification_target}]}' <<<"$manifest")"
   assert_jq "clarification.response" "$response" '
     .status == "degraded"
     and (.answer | contains("reasoning context"))
