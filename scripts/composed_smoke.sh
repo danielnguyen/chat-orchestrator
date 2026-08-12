@@ -1345,7 +1345,7 @@ run_evidence_advisory_scenario() {
   client="client-evidence-advisory-high-impact"
   question="Does this payroll module support version 3.14?"
   conversation="$(resolve_conversation "$owner" "$client" "evidence high impact block")"
-  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question" '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   provider_calls="$(fetch_provider_calls "$request_id")"
@@ -1407,7 +1407,7 @@ run_evidence_advisory_scenario() {
     "high_impact" "dsa_called" "true" \
     "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
   assert_evidence_advisory_equal \
-    "high_impact" "dsa_activation_source" "evidence_policy" \
+    "high_impact" "dsa_activation_source" "client_request" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "high_impact" "dsa_status" "error" \
