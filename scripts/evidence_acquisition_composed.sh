@@ -642,23 +642,21 @@ readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory reco
 readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
 readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
+SOURCE_SCOPE_STARTED_AT="1970-01-01T00:00:00Z"
 
 assert_single_inventory_request() {
-  local baseline_count="$1" expected_delta="$2" count
-  count="$(docker compose -f "$COMPOSE" logs --no-color dsa 2>/dev/null \
+  local expected_delta="$1" count
+  count="$(docker compose -f "$COMPOSE" logs --no-color --since "$SOURCE_SCOPE_STARTED_AT" dsa 2>/dev/null \
     | grep -F '"GET /v1/sources HTTP/1.1" 200 OK' \
     | wc -l)"
-  test "$count" = "$((baseline_count + expected_delta))"
+  test "$count" = "$expected_delta"
 }
 
 run_evidence_source_scope_scenarios() {
   local owner client conversation_id question external response request_id
   local trace manifest diagnostics provider_calls fixture_calls audit
-  local inventory_request_baseline
   external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
-  inventory_request_baseline="$(docker compose -f "$COMPOSE" logs --no-color dsa 2>/dev/null \
-    | grep -F '"GET /v1/sources HTTP/1.1" 200 OK' \
-    | wc -l)"
+  SOURCE_SCOPE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
@@ -714,7 +712,7 @@ run_evidence_source_scope_scenarios() {
     | ($calls | length) == 1
     and $calls[0].source_ids == ["complete_register"]
   '
-  assert_single_inventory_request "$inventory_request_baseline" 1
+  assert_single_inventory_request 1
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
 
   provider_post "/fixture/reset" '{}'
@@ -746,7 +744,7 @@ run_evidence_source_scope_scenarios() {
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_calls" >/dev/null
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request "$inventory_request_baseline" 2
+  assert_single_inventory_request 2
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
 
   provider_post "/fixture/reset" '{}'
@@ -775,7 +773,7 @@ run_evidence_source_scope_scenarios() {
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' \
     <<<"$provider_calls" >/dev/null
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request "$inventory_request_baseline" 3
+  assert_single_inventory_request 3
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
   echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
 }
