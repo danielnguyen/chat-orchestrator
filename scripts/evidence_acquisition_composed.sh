@@ -4552,6 +4552,7 @@ run_history_followup_composed_suite() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
+  echo "Ordinary history follow-up: $(jq -c '{status,selected_model,answer}' <<<"$response")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
   assert_jq "history.ordinary.follow_up" "$response" '
     .answer == "I didn’t run an evidence acquisition for the original answer.\n\nI didn’t run another search or verification for this explanation."
