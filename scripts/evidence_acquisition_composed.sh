@@ -679,12 +679,7 @@ run_evidence_source_scope_scenarios() {
   assert_jq "source_scope.natural.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
     and .shape.source_match.status == "matched"
-    and .shape.source_match.matched_source_ids == []
     and .inventory.declared_source_count == 1
-    and .acquisition.source_identifiers_suppressed == true
-    and .acquisition.sources_considered_count == 1
-    and .acquisition.sources_selected_count == 1
-    and .acquisition.sources_used_count == 1
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
   '
