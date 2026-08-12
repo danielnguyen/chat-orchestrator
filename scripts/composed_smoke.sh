@@ -1301,8 +1301,14 @@ run_evidence_advisory_scenario() {
     "ordinary" "sufficiency_status" "not_evaluated" \
     "$(jq -r '.prompt.evidence_acquisition.sufficiency.status // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
-    "ordinary" "dsa_called" "false" \
+    "ordinary" "dsa_called" "true" \
     "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
+  assert_evidence_advisory_jq \
+    "ordinary" "dsa_inventory_only" "$trace" '
+      .retrieval.prompt_assembly.dsa.status == "inventory_only"
+      and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+      and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+    '
   assert_evidence_advisory_equal \
     "ordinary" "dsa_activation_source" "evidence_policy" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
@@ -1323,7 +1329,7 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_dsa_counts "ordinary" "$audit" 0 0 0
   assert_evidence_advisory_persistence \
     "ordinary" "$owner" "$conversation" "$request_id" "$ordinary_answer" 0
-  echo "Evidence ordinary bypass: shape=not_applicable dsa_calls=0 provider_calls=1 durable_messages=2"
+  echo "Evidence ordinary bypass: shape=not_applicable inventory_calls=1 content_calls=0 provider_calls=1 durable_messages=2"
 
   assert_advisory_service_case primary false
   assert_advisory_service_case fallback true
