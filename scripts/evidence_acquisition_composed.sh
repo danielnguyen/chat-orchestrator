@@ -4498,13 +4498,13 @@ run_history_followup_composed_suite() {
   owner="owner-history-no-acquisition"
   client="client-history-no-acquisition"
   conversation_id="$(resolve_conversation "$owner" "$client" "history-no-acquisition")"
-  question="What is the migration setting?"
-  answer="The migration setting is ready."
+  question="What is a checksum?"
+  answer="A checksum is a compact value used to detect changes in data."
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
   queue_provider_answer "$answer"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" '{"enabled":true,"allowed_sensitivity":"medium","max_results":5}')"
   request_id="$(jq -er '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
@@ -4530,7 +4530,9 @@ run_history_followup_composed_suite() {
     and .plan.optional_requirement_count == 0
     and .plan.limitation_codes == []
     and .acquisition.strategy_attempted == null
-    and .acquisition.dsa_outcome == "not_called"
+    and .acquisition.dsa_outcome == "inventory_only"
+    and .acquisition.inventory_discovery.called == true
+    and .acquisition.inventory_discovery.outcome == "success"
     and .acquisition.dsa_error_codes == []
     and .acquisition.item_count == 0
     and .acquisition.usable_item_count == 0
