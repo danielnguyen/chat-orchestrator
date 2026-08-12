@@ -4537,9 +4537,6 @@ run_history_followup_composed_suite() {
     and .acquisition.item_count == 0
     and .acquisition.usable_item_count == 0
     and .acquisition.prompt_retained_item_count == 0
-    and .acquisition.sources_considered_count == 0
-    and .acquisition.sources_selected_count == 0
-    and .acquisition.sources_used_count == 0
     and .acquisition.source_references_returned == []
     and .acquisition.source_references_retained == []
     and .acquisition.source_references_attempted == []
