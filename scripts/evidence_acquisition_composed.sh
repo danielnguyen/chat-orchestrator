@@ -1266,15 +1266,15 @@ run_evidence_clarification_scenario() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  jq -e '
+  assert_jq "clarification.response" "$response" '
     .status == "degraded"
     and .answer == "Which bounded source or source set should I examine?"
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "clarification.next_step" "$manifest" '
     .sufficiency.status == "unknown"
     and .next_steps.selections[0].selected_next_step == "ask_narrow_clarification"
     and .next_steps.selections[0].clarification_target == "source_scope"
-  ' <<<"$manifest" >/dev/null
+  '
   assert_jq "clarification.additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "clarification.inventory" "$manifest" '
@@ -1282,12 +1282,17 @@ run_evidence_clarification_scenario() {
     and .inventory.inventory_source_count == 1
     and .inventory.declared_source_count == 1
   '
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  assert_jq "clarification.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 0'
   if ! assert_dsa_operation_counts "$audit" 1 1 0 >/dev/null 2>&1; then
     echo "Assertion failed: clarification.dsa" >&2
     return 1
   fi
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: clarification.runtime" >&2
+    return 1
+  fi
   configure_source_fixture "complete-sheet" "ready"
   restore_dsa_config
   echo "Evidence clarification: cr_selection=ask_narrow_clarification provider_chat=0 dsa_context_pack=1 dsa_context=1 dsa_fetch=0 additional_acquisition=0"
