@@ -1095,6 +1095,8 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
 
+  echo "Evidence outcome case passed: limited"
+
   owner="owner-evidence-empty"
   client="client-evidence-empty"
   question="Verify the zephyr artifact."
@@ -1134,6 +1136,8 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
+
+  echo "Evidence outcome case passed: empty"
 
   owner="owner-evidence-failure"
   client="client-evidence-failure"
@@ -1181,6 +1185,7 @@ run_evidence_limitation_and_failure_scenarios() {
       ;;
   esac
   configure_source_fixture "calendar-alpha" "ready"
+  echo "Evidence outcome case passed: unavailable"
 
   owner="owner-evidence-malformed"
   client="client-evidence-malformed"
@@ -1231,6 +1236,7 @@ run_evidence_limitation_and_failure_scenarios() {
       ;;
   esac
   configure_source_fixture "targeted-sheet" "ready"
+  echo "Evidence outcome case passed: malformed"
 
   local unauthorized_response unauthorized_status
   unauthorized_response="$(mktemp)"
