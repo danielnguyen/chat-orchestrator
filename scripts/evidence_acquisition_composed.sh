@@ -644,12 +644,11 @@ readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response
 readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
 
 assert_single_inventory_request() {
-  local request_id="$1" count
+  local expected_count="$1" count
   count="$(docker compose -f "$COMPOSE" logs --no-color dsa 2>/dev/null \
-    | grep -F "request_id=$request_id" \
-    | grep -F "route=/v1/sources" \
+    | grep -F '"GET /v1/sources HTTP/1.1" 200 OK' \
     | wc -l)"
-  test "$count" = "1"
+  test "$count" = "$expected_count"
 }
 
 run_evidence_source_scope_scenarios() {
@@ -677,18 +676,19 @@ run_evidence_source_scope_scenarios() {
     .status == "ok"
     and (.answer | startswith("The retained evidence supports the requested conclusion."))
   ' <<<"$response" >/dev/null
-  jq -e '
+  assert_jq "source_scope.natural.manifest" "$manifest" '
     .shape.task_shape == "targeted_lookup"
     and .shape.source_match.status == "matched"
-    and .shape.source_match.matched_source_ids == ["complete_register"]
+    and .shape.source_match.matched_source_ids == []
     and .inventory.declared_source_count == 1
-    and .acquisition.sources_considered == ["complete_register"]
-    and .acquisition.sources_selected == ["complete_register"]
-    and .acquisition.sources_used == ["complete_register"]
+    and .acquisition.source_identifiers_suppressed == true
+    and .acquisition.sources_considered_count == 1
+    and .acquisition.sources_selected_count == 1
+    and .acquisition.sources_used_count == 1
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
-  ' <<<"$manifest" >/dev/null
-  jq -e --arg request_id "$request_id" '
+  '
+  if ! jq -e --arg request_id "$request_id" '
     [.events[] | select(
       .event_type == "evidence_shape_derived"
       and .event_payload_json.request_id == $request_id
@@ -696,7 +696,10 @@ run_evidence_source_scope_scenarios() {
     | ($events | length) == 1
     and $events[0].source_match_status == "matched"
     and $events[0].matched_source_ids == ["complete_register"]
-  ' <<<"$diagnostics" >/dev/null
+  ' <<<"$diagnostics" >/dev/null; then
+    echo "Assertion failed: source_scope.natural.runtime_match" >&2
+    return 1
+  fi
   jq -e '
     ([.calls[] | select(.kind == "chat")] | length) == 1
     and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
@@ -714,7 +717,7 @@ run_evidence_source_scope_scenarios() {
     and [.[] | select(.operation == "context_pack")][0].selected_source_ids
       == ["complete_register"]
   ' <<<"$audit" >/dev/null
-  assert_single_inventory_request "$request_id"
+  assert_single_inventory_request 1
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
 
   provider_post "/fixture/reset" '{}'
@@ -746,7 +749,7 @@ run_evidence_source_scope_scenarios() {
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_calls" >/dev/null
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request "$request_id"
+  assert_single_inventory_request 2
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
 
   provider_post "/fixture/reset" '{}'
@@ -775,7 +778,7 @@ run_evidence_source_scope_scenarios() {
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' \
     <<<"$provider_calls" >/dev/null
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request "$request_id"
+  assert_single_inventory_request 3
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
   echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
 }
