@@ -1063,7 +1063,7 @@ run_evidence_limitation_and_failure_scenarios() {
   owner="owner-evidence-limited"
   client="client-evidence-limited"
   question="Verify the migration record."
-  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
