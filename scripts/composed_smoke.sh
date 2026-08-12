@@ -7,9 +7,9 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
-CR_COMMIT="a61beb574a49f2d83f70008596c1183532b78f40"
-DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="3802c3d30e9bb580a2d9597f521af52b7d6dc8dc"
+CR_COMMIT="2e9bb4ddb4bf92436ceab68fdac460313887a67e"
+DSA_COMMIT="5bd7e6e68eaf80f1722e3041b7e0c2e80feed2b6"
+CO_COMMIT="812dd266835e2b3ae92b4e9e1d39d4426c01db65"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"

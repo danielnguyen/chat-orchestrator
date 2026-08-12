@@ -643,6 +643,143 @@ readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained ac
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
 readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
 
+assert_single_inventory_request() {
+  local request_id="$1" count
+  count="$(docker compose -f "$COMPOSE" logs --no-color dsa 2>/dev/null \
+    | grep -F "request_id=$request_id" \
+    | grep -F "route=/v1/sources" \
+    | wc -l)"
+  test "$count" = "1"
+}
+
+run_evidence_source_scope_scenarios() {
+  local owner client conversation_id question external response request_id
+  local trace manifest diagnostics provider_calls fixture_calls audit
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-source-scope-natural"
+  client="client-source-scope-natural"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-natural")"
+  question="What is recorded in Configured Review Register?"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+
+  jq -e '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .shape.task_shape == "targeted_lookup"
+    and .shape.source_match.status == "matched"
+    and .shape.source_match.matched_source_ids == ["complete_register"]
+    and .inventory.declared_source_count == 1
+    and .acquisition.sources_considered == ["complete_register"]
+    and .acquisition.sources_selected == ["complete_register"]
+    and .acquisition.sources_used == ["complete_register"]
+    and .acquisition.inventory_discovery.called == true
+    and .acquisition.inventory_discovery.outcome == "success"
+  ' <<<"$manifest" >/dev/null
+  jq -e --arg request_id "$request_id" '
+    [.events[] | select(
+      .event_type == "evidence_shape_derived"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 1
+    and $events[0].source_match_status == "matched"
+    and $events[0].matched_source_ids == ["complete_register"]
+  ' <<<"$diagnostics" >/dev/null
+  jq -e '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
+      | length) == 0
+  ' <<<"$provider_calls" >/dev/null
+  jq -e '
+    ([.calls[] | select(.source == "complete-sheet")] | length) == 1
+    and ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
+      | length) == 0
+  ' <<<"$fixture_calls" >/dev/null
+  jq -e '
+    [.[] | select(.operation == "context_pack")][0].considered_source_ids
+      == ["complete_register"]
+    and [.[] | select(.operation == "context_pack")][0].selected_source_ids
+      == ["complete_register"]
+  ' <<<"$audit" >/dev/null
+  assert_single_inventory_request "$request_id"
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-source-scope-ambiguous"
+  client="client-source-scope-ambiguous"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-ambiguous")"
+  question="Check the comparison source."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+
+  jq -e '
+    .status == "degraded"
+    and .answer == "I need a narrower evidence request before I can determine what should be checked."
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .status == "source_scope_ambiguous"
+    and .shape.source_match.status == "ambiguous"
+    and .shape.source_match.matched_source_ids == []
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.dsa_outcome == "inventory_only"
+  ' <<<"$manifest" >/dev/null
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
+    <<<"$provider_calls" >/dev/null
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_single_inventory_request "$request_id"
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-source-scope-ordinary"
+  client="client-source-scope-ordinary"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-ordinary")"
+  question="Tell me a short joke."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+
+  jq -e '.status == "ok"' <<<"$response" >/dev/null
+  jq -e '
+    .status == "not_applicable"
+    and .shape.source_match.status == "no_match"
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.dsa_outcome == "inventory_only"
+    and .acquisition.inventory_discovery.called == true
+  ' <<<"$manifest" >/dev/null
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' \
+    <<<"$provider_calls" >/dev/null
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_single_inventory_request "$request_id"
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
+}
+
 run_evidence_targeted_scenario() {
   local owner client conversation_id question external response request_id answer
   local trace provider_calls fixture_calls diagnostics manifest audit
@@ -4844,6 +4981,7 @@ run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
     ""|all)
+      run_evidence_source_scope_scenarios
       run_evidence_targeted_scenario
       run_evidence_exact_scenario
       run_evidence_hybrid_scenarios
@@ -4894,6 +5032,10 @@ run_evidence_acquisition_composed_suite() {
       run_evidence_adversarial_provider_scenario
       run_evidence_structured_answer_recovery_scenarios
       echo "Evidence acquisition composed smoke passed: scenarios=structured-answer-recovery"
+      ;;
+    source-scope)
+      run_evidence_source_scope_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=source-scope"
       ;;
     *)
       if [[ "$scenario" =~ ^[A-Za-z0-9_.:-]{1,120}$ ]]; then

@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -72,6 +73,25 @@ ShapeReasonCode = Literal[
     "non_evidence_interaction",
     "ambiguous_interaction_without_shape_signal",
     "multiple_incompatible_shapes",
+]
+SourceMatchStatus = Literal[
+    "matched",
+    "no_match",
+    "ambiguous",
+    "inventory_unavailable",
+]
+SourceMatchReasonCode = Literal[
+    "source_id_match",
+    "display_name_match",
+    "domain_tag_match",
+    "scope_reference_match",
+    "multiple_explicit_source_matches",
+    "multiple_possible_source_matches",
+    "no_source_specific_match",
+    "generic_source_signal_rejected",
+    "inventory_partial",
+    "inventory_unknown",
+    "inventory_unavailable",
 ]
 PlanLimitationCode = Literal[
     "declared_source_missing_from_inventory",
@@ -393,6 +413,25 @@ class EvidenceCandidateValidation:
     failure_reason: EvidenceCandidateFailureReason | None
 
 
+class SourceMatchResult(StrictModel):
+    status: SourceMatchStatus
+    matched_source_ids: list[Identifier] = Field(max_length=32)
+    reason_codes: list[SourceMatchReasonCode] = Field(min_length=1, max_length=11)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> SourceMatchResult:
+        if self.matched_source_ids != sorted(set(self.matched_source_ids)):
+            raise ValueError("source_match_ids_not_sorted_unique")
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("duplicate_source_match_reason_code")
+        if self.status == "matched":
+            if not self.matched_source_ids:
+                raise ValueError("matched_source_ids_required")
+        elif self.matched_source_ids:
+            raise ValueError("matched_source_ids_not_allowed")
+        return self
+
+
 class ShapeResult(StrictModel):
     derivation_id: Identifier
     question_anchor: Annotated[str, Field(min_length=1, max_length=500)]
@@ -407,6 +446,7 @@ class ShapeResult(StrictModel):
     clarification_required: bool
     reason_codes: list[ShapeReasonCode] = Field(max_length=17)
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+    source_match: SourceMatchResult | None = None
 
     @model_validator(mode="after")
     def validate_outcome(self) -> ShapeResult:
@@ -1197,6 +1237,14 @@ class EvidenceAcquisitionState:
     next_step_history: list[dict[str, Any]] | None = None
     initial_attempt_summary: dict[str, Any] | None = None
     additional_acquisition_count: int = 0
+    inventory_discovery: dict[str, Any] = dataclass_field(
+        default_factory=lambda: {
+            "called": False,
+            "outcome": "not_called",
+            "inventory_status": None,
+            "source_count": 0,
+        }
+    )
 
     @property
     def supported_targeted_path(self) -> bool:
@@ -1641,6 +1689,42 @@ def _adapt_inventory(source_list: DsaSourceListResponse) -> list[dict[str, Any]]
     return inventory
 
 
+def _source_availability(source: DsaSourceEntry) -> str:
+    if not source.enabled or source.status == "disabled":
+        return "disabled"
+    if source.status == "ready":
+        return "available"
+    if source.status == "unavailable":
+        return "unavailable"
+    return "unknown"
+
+
+def _source_discovery_projection(
+    source_list: DsaSourceListResponse,
+) -> dict[str, Any]:
+    sources: list[dict[str, Any]] = []
+    for source in sorted(source_list.sources, key=lambda item: item.source_id):
+        projected = {
+            "source_id": source.source_id,
+            "display_name": source.display_name,
+            "connector": source.connector,
+            "domain_tags": sorted(source.domain_tags),
+            "capabilities": sorted(source.capabilities),
+            "availability": _source_availability(source),
+            "authority_role": source.authority_role,
+        }
+        if source.scope_refs is not None:
+            projected["scope_refs"] = source.scope_refs.model_dump(
+                mode="json",
+                exclude_none=True,
+            )
+        sources.append(projected)
+    return {
+        "inventory_status": source_list.inventory_status or "unknown",
+        "sources": sources,
+    }
+
+
 def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
     if (
         source_list.inventory_scope is None
@@ -1706,6 +1790,7 @@ def _resolve_declared_scope(
     *,
     external_context: dict[str, Any] | None,
     exact_source_refs: list[dict[str, str]],
+    natural_source_ids: list[str] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     config = external_context if isinstance(external_context, dict) else {}
     source_ids = sorted(
@@ -1715,6 +1800,8 @@ def _resolve_declared_scope(
             if isinstance(item, str) and item
         }
     )
+    if not source_ids and not exact_source_refs and natural_source_ids is not None:
+        source_ids = list(natural_source_ids)
     source_categories = sorted(
         {
             item
@@ -1794,6 +1881,18 @@ def _resolve_declared_scope(
             if len(distinct_values) == 1:
                 resolved_scope[declared_field] = values[0]
     return resolved_scope, True
+
+
+def _has_trusted_explicit_selector(
+    external_context: dict[str, Any] | None,
+    exact_source_refs: list[dict[str, str]],
+) -> bool:
+    if exact_source_refs:
+        return True
+    config = external_context if isinstance(external_context, dict) else {}
+    return any(
+        bool(config.get(field_name)) for field_name in ("source_ids", "domain_tags", "scope_refs")
+    )
 
 
 def _acquisition_premise_digest(premise: EvidenceAcquisitionPremise) -> str:
@@ -2282,7 +2381,7 @@ async def begin_evidence_acquisition(
     state = EvidenceAcquisitionState(
         enabled=True,
         attempted=True,
-        status="shape_requested",
+        status="inventory_requested",
         request_id=request_id,
         exact_source_refs=exact_source_refs,
     )
@@ -2294,21 +2393,55 @@ async def begin_evidence_acquisition(
         runtime_session_id=runtime_session_id,
         runtime_turn_id=runtime_turn_id,
     )
+    explicit_selector = _has_trusted_explicit_selector(
+        external_context,
+        exact_source_refs,
+    )
+    source_discovery: dict[str, Any] | None = None
+    try:
+        source_list_raw = await dsa.list_sources(request_id=request_id)
+    except Exception:
+        state.inventory_discovery = {
+            "called": True,
+            "outcome": "dependency_failure",
+            "inventory_status": None,
+            "source_count": 0,
+        }
+    else:
+        try:
+            state.inventory = DsaSourceListResponse.model_validate(source_list_raw)
+            source_discovery = _source_discovery_projection(state.inventory)
+            state.inventory_discovery = {
+                "called": True,
+                "outcome": "success",
+                "inventory_status": source_discovery["inventory_status"],
+                "source_count": len(source_discovery["sources"]),
+            }
+        except (ValidationError, ValueError, TypeError):
+            state.inventory_discovery = {
+                "called": True,
+                "outcome": "malformed_response",
+                "inventory_status": None,
+                "source_count": 0,
+            }
+
+    task_context: dict[str, Any] = {
+        "evidence_input_kinds": (["external_source"] if explicit_selector else []),
+        "external_verification_required": explicit_selector,
+        "freshness_sensitive": False,
+        "high_stakes_accuracy_required": False,
+        "continuation_of_prior_evidence_task": False,
+        "prior_task_shape": None,
+    }
+    if source_discovery is not None:
+        task_context["source_discovery"] = source_discovery
+    state.status = "shape_requested"
     try:
         shape_raw = await runtime.derive_evidence_shape(
             **scope,
             task_text=task_text,
             interaction_kind=interaction_kind,
-            task_context={
-                "evidence_input_kinds": (
-                    ["external_source"] if exact_source_refs else []
-                ),
-                "external_verification_required": bool(exact_source_refs),
-                "freshness_sensitive": False,
-                "high_stakes_accuracy_required": False,
-                "continuation_of_prior_evidence_task": False,
-                "prior_task_shape": None,
-            },
+            task_context=task_context,
         )
         shape_response = ShapeResponse.model_validate(shape_raw)
         _validate_scope_echo(shape_response, scope)
@@ -2318,6 +2451,12 @@ async def begin_evidence_acquisition(
         )
         if state.shape.question_anchor_digest != expected_digest:
             raise ValueError("shape_anchor_digest_mismatch")
+        if source_discovery is not None:
+            if state.shape.source_match is None:
+                raise ValueError("source_match_missing")
+            supplied_source_ids = {source["source_id"] for source in source_discovery["sources"]}
+            if not set(state.shape.source_match.matched_source_ids).issubset(supplied_source_ids):
+                raise ValueError("source_match_inventory_mismatch")
     except Exception:
         state.status = "shape_dependency_failed"
         state.forced_answer = UNSUPPORTED_ANSWER
@@ -2355,10 +2494,7 @@ async def begin_evidence_acquisition(
         )
         return state
 
-    try:
-        source_list_raw = await dsa.list_sources(request_id=request_id)
-        state.inventory = DsaSourceListResponse.model_validate(source_list_raw)
-    except Exception:
+    if state.inventory is None:
         state.status = "inventory_dependency_failed"
         state.forced_answer = UNSUPPORTED_ANSWER
         state.manifest_id = _manifest_id(
@@ -2369,11 +2505,38 @@ async def begin_evidence_acquisition(
         )
         return state
 
+    natural_source_ids: list[str] | None = None
+    if not explicit_selector:
+        source_match = state.shape.source_match
+        if source_match is None:
+            state.status = "shape_dependency_failed"
+            state.forced_answer = UNSUPPORTED_ANSWER
+        elif source_match.status == "ambiguous":
+            state.status = "source_scope_ambiguous"
+            state.forced_answer = AMBIGUOUS_ANSWER
+        elif source_match.status == "no_match":
+            state.status = "source_scope_no_match"
+            state.forced_answer = AMBIGUOUS_ANSWER
+        elif source_match.status == "inventory_unavailable":
+            state.status = "inventory_dependency_failed"
+            state.forced_answer = UNSUPPORTED_ANSWER
+        else:
+            natural_source_ids = list(source_match.matched_source_ids)
+        if natural_source_ids is None:
+            state.manifest_id = _manifest_id(
+                scope=scope,
+                plan_id=None,
+                selected_strategies=[],
+                declared_scope=None,
+            )
+            return state
+
     try:
         state.declared_scope, selector_matched = _resolve_declared_scope(
             state.inventory,
             external_context=external_context,
             exact_source_refs=exact_source_refs,
+            natural_source_ids=natural_source_ids,
         )
     except Exception:
         state.status = "inventory_dependency_failed"
@@ -4876,6 +5039,19 @@ def build_manifest_trace(
             "candidate_count": len(shape.candidate_task_shapes) if shape else 0,
             "clarification_required": shape.clarification_required if shape else False,
             "reason_codes": list(shape.reason_codes) if shape else [],
+            "source_match": (
+                {
+                    "status": shape.source_match.status,
+                    "matched_source_ids": (
+                        list(shape.source_match.matched_source_ids)
+                        if shape.source_match.status == "matched"
+                        else []
+                    ),
+                    "reason_codes": list(shape.source_match.reason_codes),
+                }
+                if shape and shape.source_match
+                else None
+            ),
         },
         "inventory": _inventory_summary(state.inventory, state.declared_scope),
         "plan": {
@@ -4901,6 +5077,7 @@ def build_manifest_trace(
             "limitation_codes": list(plan.limitation_codes) if plan else [],
         },
         "acquisition": {
+            "inventory_discovery": dict(state.inventory_discovery),
             "strategy_attempted": (
                 plan.selected_strategies[0]
                 if state.supported_governed_path
@@ -5117,4 +5294,8 @@ def suppress_manifest_identifiers(manifest: dict[str, Any]) -> dict[str, Any]:
         acquisition[f"{field}_count"] = len(values) if isinstance(values, list) else 0
         acquisition[field] = []
     acquisition["source_identifiers_suppressed"] = True
+    shape = sanitized.get("shape")
+    source_match = shape.get("source_match") if isinstance(shape, dict) else None
+    if isinstance(source_match, dict):
+        source_match["matched_source_ids"] = []
     return sanitized

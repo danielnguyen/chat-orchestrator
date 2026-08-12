@@ -8,6 +8,7 @@ import pytest
 from models import ChatRequest
 from pydantic import ValidationError
 from services.evidence_acquisition import (
+    AMBIGUOUS_ANSWER,
     BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
     COMPARISON_SCOPE_SUFFIX,
     CONFIGURED_WORKSHEET_CONTEXT_MODE,
@@ -15,6 +16,7 @@ from services.evidence_acquisition import (
     MALFORMED_EVIDENCE_RESPONSE,
     NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
+    UNSUPPORTED_ANSWER,
     WITHHELD_ANSWER,
     DsaItem,
     DsaSourceListResponse,
@@ -26,6 +28,7 @@ from services.evidence_acquisition import (
     PlanResult,
     RequirementEvaluation,
     ShapeResult,
+    SourceMatchResult,
     SufficiencyResult,
     ValidatedEvidenceExcerpt,
     _acquisition_premise_digest,
@@ -34,6 +37,7 @@ from services.evidence_acquisition import (
     _expected_sufficiency_constraints,
     _manifest_id,
     _resolve_declared_scope,
+    _source_discovery_projection,
     _source_summaries,
     advisory_provider_allowed,
     begin_evidence_acquisition,
@@ -716,15 +720,47 @@ class FakeRuntime:
         shape=None,
         plan=None,
         sufficiency_status="sufficient_for_declared_scope",
+        auto_source_match=True,
     ):
         self.shape = shape or _shape_response()
         self.plan = plan or _plan_response()
         self.sufficiency_status = sufficiency_status
+        self.auto_source_match = auto_source_match
         self.calls = []
 
     async def derive_evidence_shape(self, **kwargs):
         self.calls.append(("shape", kwargs))
-        return self.shape
+        response = copy.deepcopy(self.shape)
+        discovery = kwargs.get("task_context", {}).get("source_discovery")
+        result = response.get("result", {})
+        if self.auto_source_match and discovery is not None and "source_match" not in result:
+            source_ids = sorted(source["source_id"] for source in discovery.get("sources", []))
+            planned_ids = sorted(
+                source_id
+                for source_id in self.plan.get("result", {}).get("eligible_source_ids", [])
+                if source_id in source_ids
+            )
+            if result.get("derivation_status") == "derived" and source_ids:
+                result["source_match"] = {
+                    "status": "matched",
+                    "matched_source_ids": planned_ids or source_ids[:1],
+                    "reason_codes": ["source_id_match"],
+                }
+            elif result.get("derivation_status") == "ambiguous":
+                result["source_match"] = {
+                    "status": "ambiguous",
+                    "matched_source_ids": [],
+                    "reason_codes": ["multiple_possible_source_matches"],
+                }
+            else:
+                result["source_match"] = {
+                    "status": ("no_match" if source_ids else "inventory_unavailable"),
+                    "matched_source_ids": [],
+                    "reason_codes": [
+                        ("no_source_specific_match" if source_ids else "inventory_unavailable")
+                    ],
+                }
+        return response
 
     async def compile_evidence_plan(self, **kwargs):
         self.calls.append(("plan", kwargs))
@@ -785,6 +821,368 @@ class FakeDsa:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def _shape_with_source_match(
+    *,
+    status: str,
+    matched_source_ids: list[str] | None = None,
+    derivation_status: str = "derived",
+) -> dict[str, object]:
+    response = _shape_response(status=derivation_status)
+    response["result"]["source_match"] = {
+        "status": status,
+        "matched_source_ids": matched_source_ids or [],
+        "reason_codes": [
+            {
+                "matched": "source_id_match",
+                "no_match": "no_source_specific_match",
+                "ambiguous": "multiple_possible_source_matches",
+                "inventory_unavailable": "inventory_unavailable",
+            }[status]
+        ],
+    }
+    return response
+
+
+def test_source_discovery_projection_is_canonical_bounded_and_private():
+    source_b = _source(
+        "source_b",
+        tags=["zeta", "alpha"],
+        capabilities=["search", "profile"],
+        enabled=False,
+        status="ready",
+        scope_refs={"project": "public-project", "time": "fy2026"},
+    )
+    source_b["last_error"] = "PRIVATE-LAST-ERROR"
+    source_b["sensitivity"] = "restricted"
+    source_a = _source(
+        "source_a",
+        capabilities=["context", "fetch"],
+        status="unavailable",
+    )
+    source_a["last_error"] = "PRIVATE-SECOND-ERROR"
+    projection = _source_discovery_projection(
+        DsaSourceListResponse.model_validate(
+            {
+                "inventory_scope": "configured_sources",
+                "inventory_status": "partial",
+                "sources": [source_b, source_a],
+            }
+        )
+    )
+
+    assert projection["inventory_status"] == "partial"
+    assert [source["source_id"] for source in projection["sources"]] == [
+        "source_a",
+        "source_b",
+    ]
+    assert projection["sources"][0]["availability"] == "unavailable"
+    assert projection["sources"][1]["availability"] == "disabled"
+    assert projection["sources"][1]["domain_tags"] == ["alpha", "zeta"]
+    assert projection["sources"][1]["capabilities"] == ["profile", "search"]
+    assert projection["sources"][1]["scope_refs"] == {
+        "time": "fy2026",
+        "project": "public-project",
+    }
+    serialized = json.dumps(projection, sort_keys=True)
+    for prohibited in (
+        "sensitivity",
+        "access_mode",
+        "last_checked_at",
+        "last_error",
+        "PRIVATE-LAST-ERROR",
+        "PRIVATE-SECOND-ERROR",
+    ):
+        assert prohibited not in serialized
+
+
+def test_source_discovery_projection_legacy_inventory_is_unknown_and_omits_scope():
+    projection = _source_discovery_projection(
+        DsaSourceListResponse.model_validate({"sources": [_source("source_a")]})
+    )
+
+    assert projection["inventory_status"] == "unknown"
+    assert "scope_refs" not in projection["sources"][0]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "matched",
+            "matched_source_ids": [],
+            "reason_codes": ["source_id_match"],
+        },
+        {
+            "status": "no_match",
+            "matched_source_ids": ["source_a"],
+            "reason_codes": ["no_source_specific_match"],
+        },
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_b", "source_a"],
+            "reason_codes": ["source_id_match"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "reason_codes": [
+                "multiple_possible_source_matches",
+                "multiple_possible_source_matches",
+            ],
+        },
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_a"],
+            "reason_codes": ["unsupported_reason"],
+        },
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_a"],
+            "reason_codes": ["source_id_match"],
+            "extra": True,
+        },
+        {
+            "status": "unsupported",
+            "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        },
+        {
+            "status": "matched",
+            "matched_source_ids": [f"source_{index}" for index in range(33)],
+            "reason_codes": ["source_id_match"],
+        },
+    ],
+)
+def test_source_match_consumer_rejects_malformed_contract(payload):
+    with pytest.raises(ValidationError):
+        SourceMatchResult.model_validate(payload)
+
+
+@pytest.mark.asyncio
+async def test_inventory_precedes_shape_and_natural_match_bounds_plan_scope():
+    order = []
+    plan = _plan_response()
+    runtime = FakeRuntime(
+        shape=_shape_with_source_match(
+            status="matched",
+            matched_source_ids=["source_a"],
+        ),
+        plan=plan,
+        auto_source_match=False,
+    )
+    original_derive = runtime.derive_evidence_shape
+
+    async def ordered_derive(**kwargs):
+        order.append("shape")
+        return await original_derive(**kwargs)
+
+    runtime.derive_evidence_shape = ordered_derive
+
+    class OrderedDsa(FakeDsa):
+        async def list_sources(self, *, request_id=None):
+            order.append("inventory")
+            return await super().list_sources(request_id=request_id)
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=OrderedDsa([_source("source_b"), _source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert order == ["inventory", "shape"]
+    assert state.declared_scope["source_ids"] == ["source_a"]
+    assert state.declared_scope["source_categories"] == []
+    assert runtime.calls[1][1]["declared_scope"]["source_ids"] == ["source_a"]
+    assert runtime.calls[1][1]["source_inventory"][0]["source_id"] == "source_a"
+
+
+@pytest.mark.asyncio
+async def test_natural_multiple_match_is_sorted_and_excludes_decoy():
+    plan = _plan_response()
+    plan["result"]["eligible_source_ids"] = ["source_a", "source_b"]
+    runtime = FakeRuntime(
+        shape=_shape_with_source_match(
+            status="matched",
+            matched_source_ids=["source_a", "source_b"],
+        ),
+        plan=plan,
+        auto_source_match=False,
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_decoy"), _source("source_b"), _source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.declared_scope["source_ids"] == ["source_a", "source_b"]
+    assert "source_decoy" not in state.declared_scope["source_ids"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_source_selector_has_precedence_over_natural_match():
+    runtime = FakeRuntime(
+        shape=_shape_with_source_match(
+            status="matched",
+            matched_source_ids=["source_b"],
+        ),
+        auto_source_match=False,
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a"), _source("source_b")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"source_ids": ["source_a"]},
+        **SCOPE,
+    )
+
+    assert state.declared_scope["source_ids"] == ["source_a"]
+    assert runtime.calls[1][1]["declared_scope"]["source_ids"] == ["source_a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("match_status", "expected_status", "expected_answer"),
+    [
+        ("ambiguous", "source_scope_ambiguous", AMBIGUOUS_ANSWER),
+        ("no_match", "source_scope_no_match", AMBIGUOUS_ANSWER),
+        (
+            "inventory_unavailable",
+            "inventory_dependency_failed",
+            UNSUPPORTED_ANSWER,
+        ),
+    ],
+)
+async def test_nondefinitive_natural_match_never_compiles_broad_plan(
+    match_status,
+    expected_status,
+    expected_answer,
+):
+    runtime = FakeRuntime(
+        shape=_shape_with_source_match(status=match_status),
+        auto_source_match=False,
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a"), _source("source_b")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.status == expected_status
+    assert state.forced_answer == expected_answer
+    assert [name for name, _ in runtime.calls] == ["shape"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformation", ["missing", "outside_inventory"])
+async def test_cr_discovery_contract_failure_is_not_retried(malformation):
+    shape = _shape_response()
+    if malformation == "outside_inventory":
+        shape["result"]["source_match"] = {
+            "status": "matched",
+            "matched_source_ids": ["source_outside"],
+            "reason_codes": ["source_id_match"],
+        }
+    runtime = FakeRuntime(shape=shape, auto_source_match=False)
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a")]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.status == "shape_dependency_failed"
+    assert [name for name, _ in runtime.calls] == ["shape"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordinary", [True, False])
+async def test_inventory_dependency_failure_preserves_only_ordinary_path(ordinary):
+    class FailingDsa(FakeDsa):
+        async def list_sources(self, *, request_id=None):
+            self.list_request_ids.append(request_id)
+            raise RuntimeError("PRIVATE-INVENTORY-FAILURE")
+
+    runtime = FakeRuntime(shape=_shape_response(status="not_applicable" if ordinary else "derived"))
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FailingDsa([]),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert runtime.calls[0][1]["task_context"].get("source_discovery") is None
+    assert state.inventory_discovery["outcome"] == "dependency_failure"
+    assert state.follow_existing_path is ordinary
+    assert state.status == ("not_applicable" if ordinary else "inventory_dependency_failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordinary", [True, False])
+async def test_malformed_inventory_preserves_only_ordinary_path(ordinary):
+    runtime = FakeRuntime(shape=_shape_response(status="not_applicable" if ordinary else "derived"))
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([], source_response={"sources": [{"source_id": "broken"}]}),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert runtime.calls[0][1]["task_context"].get("source_discovery") is None
+    assert state.inventory_discovery["outcome"] == "malformed_response"
+    assert state.follow_existing_path is ordinary
+    assert state.status == ("not_applicable" if ordinary else "inventory_dependency_failed")
+
+
+@pytest.mark.asyncio
+async def test_unavailable_matched_source_identity_is_not_redirected():
+    runtime = FakeRuntime(
+        shape=_shape_with_source_match(
+            status="matched",
+            matched_source_ids=["source_unavailable"],
+        ),
+        auto_source_match=False,
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source("source_available"),
+                _source("source_unavailable", status="unavailable"),
+            ]
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.declared_scope["source_ids"] == ["source_unavailable"]
+    plan_call = runtime.calls[1][1]
+    assert plan_call["declared_scope"]["source_ids"] == ["source_unavailable"]
+    assert {
+        source["source_id"]: source["availability"] for source in plan_call["source_inventory"]
+    } == {
+        "source_available": "available",
+        "source_unavailable": "unavailable",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1517,7 +1915,7 @@ async def test_scope_selector_and_unanimous_refs_reach_cr_without_raw_metadata()
 
 
 @pytest.mark.asyncio
-async def test_legacy_inventory_without_selector_preserves_null_scope_contract():
+async def test_legacy_inventory_without_selector_uses_natural_matched_scope():
     runtime = FakeRuntime()
     state = await begin_evidence_acquisition(
         runtime=runtime,
@@ -1530,7 +1928,7 @@ async def test_legacy_inventory_without_selector_preserves_null_scope_contract()
 
     assert state.status == "acquisition_ready"
     assert state.declared_scope == {
-        "source_ids": [],
+        "source_ids": ["source_a"],
         "source_categories": [],
         "exact_source_refs": [],
         "inventory_status": "unknown",
@@ -1936,7 +2334,7 @@ async def test_suggestive_inventory_and_request_text_cannot_fabricate_trust():
 
 
 @pytest.mark.asyncio
-async def test_successful_empty_legacy_inventory_remains_unknown():
+async def test_successful_empty_legacy_inventory_fails_closed_without_scope():
     runtime = FakeRuntime(plan=_plan_response(status="unsupported"))
     state = await begin_evidence_acquisition(
         runtime=runtime,
@@ -1947,9 +2345,8 @@ async def test_successful_empty_legacy_inventory_remains_unknown():
         **SCOPE,
     )
 
-    assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == "unknown"
-    assert runtime.calls[1][1]["source_inventory"] == []
-    assert state.status == "unsupported_plan"
+    assert state.status == "inventory_dependency_failed"
+    assert [name for name, _ in runtime.calls] == ["shape"]
 
 
 @pytest.mark.asyncio
@@ -1976,7 +2373,8 @@ async def test_exact_scope_reaches_shape_and_plan_in_deterministic_order():
     )
 
     assert state.supported_exact_path is True
-    assert runtime.calls[0][1]["task_context"] == {
+    task_context = runtime.calls[0][1]["task_context"]
+    assert {key: value for key, value in task_context.items() if key != "source_discovery"} == {
         "evidence_input_kinds": ["external_source"],
         "external_verification_required": True,
         "freshness_sensitive": False,
@@ -1984,6 +2382,7 @@ async def test_exact_scope_reaches_shape_and_plan_in_deterministic_order():
         "continuation_of_prior_evidence_task": False,
         "prior_task_shape": None,
     }
+    assert task_context["source_discovery"]["sources"][0]["source_id"] == "source_a"
     assert runtime.calls[1][1]["declared_scope"]["exact_source_refs"] == [
         {
             "source_id": "source_a",
@@ -2038,7 +2437,7 @@ async def test_exact_request_not_applicable_and_inconsistent_plans_fail_closed()
 
 
 @pytest.mark.asyncio
-async def test_not_applicable_stops_before_inventory_and_follows_existing_path():
+async def test_not_applicable_uses_inventory_only_and_follows_existing_path():
     runtime = FakeRuntime(shape=_shape_response(status="not_applicable"))
     dsa = FakeDsa([_source("source_a")])
 
@@ -2052,7 +2451,8 @@ async def test_not_applicable_stops_before_inventory_and_follows_existing_path()
     )
 
     assert state.follow_existing_path is True
-    assert dsa.calls == []
+    assert dsa.calls == ["list_sources"]
+    assert state.inventory_discovery["outcome"] == "success"
     assert [name for name, _ in runtime.calls] == ["shape"]
 
 
@@ -5773,6 +6173,12 @@ async def test_manifest_association_and_privacy_exclude_raw_content():
         "candidate_count",
         "clarification_required",
         "reason_codes",
+        "source_match",
+    }
+    assert manifest["shape"]["source_match"] == {
+        "status": "matched",
+        "matched_source_ids": ["source_a"],
+        "reason_codes": ["source_id_match"],
     }
     assert set(manifest["inventory"]) == {
         "inventory_status",
