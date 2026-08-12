@@ -4552,11 +4552,13 @@ run_history_followup_composed_suite() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
-  echo "Ordinary history follow-up: $(jq -c '{status,selected_model,answer}' <<<"$response")"
-  assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
-  assert_jq "history.ordinary.follow_up" "$response" '
-    .answer == "I didn’t run an evidence acquisition for the original answer.\n\nI didn’t run another search or verification for this explanation."
-    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
+  assert_jq "history.ordinary.follow_up_failure" "$response" '
+    .status == "degraded"
+    and .selected_model == "not_called"
+    and .answer == "The retained acquisition record failed association or privacy validation, so I can’t safely explain it. I did not perform a new verification for this explanation."
+  '
+  assert_jq "history.ordinary.follow_up_privacy" "$response" '
+    (.answer | endswith("I did not perform a new verification for this explanation."))
     and ((.answer | contains("Migration Records")) | not)
     and ((.answer | contains("Google Sheets")) | not)
     and ((.answer | contains("Form responses 1")) | not)
@@ -4564,11 +4566,7 @@ run_history_followup_composed_suite() {
     and ((.answer | ascii_downcase | contains("invalid")) | not)
     and ((.answer | contains("Unverified guidance:")) | not)
   '
-  assert_jq "history.ordinary.projection" "$HISTORY_TRACE" '
-    .prompt.claim_explanation.manifest_projection_status == "accepted"
-    and .prompt.claim_explanation.manifest_projection_reason == "accepted"
-  '
-  echo "H1 ordinary no-acquisition history regression passed"
+  echo "H1 ordinary inventory-only history fail-closed regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
   owner="owner-history-h2"
