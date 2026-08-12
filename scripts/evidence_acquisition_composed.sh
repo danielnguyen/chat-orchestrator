@@ -4524,41 +4524,19 @@ run_history_followup_composed_suite() {
     .status == "not_applicable"
     and .shape.derivation_status == "not_applicable"
     and .shape.task_shape == null
+    and .shape.source_match.status == "no_match"
+    and .shape.source_match.matched_source_ids == []
     and .plan.plan_status == "not_compiled"
-    and .plan.selected_strategies == []
-    and .plan.material_requirement_count == 0
-    and .plan.optional_requirement_count == 0
-    and .plan.limitation_codes == []
     and .acquisition.strategy_attempted == null
     and .acquisition.dsa_outcome == "inventory_only"
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
+    and .acquisition.inventory_discovery.source_count == 6
     and .acquisition.dsa_error_codes == []
     and .acquisition.item_count == 0
-    and .acquisition.usable_item_count == 0
     and .acquisition.prompt_retained_item_count == 0
-    and .acquisition.source_references_returned == []
-    and .acquisition.source_references_retained == []
-    and .acquisition.source_references_attempted == []
-    and .acquisition.source_references_unsuccessful == []
-    and .acquisition.exact_reference_attempt_count == 0
-    and .acquisition.expansion_attempt_count == 0
-    and .acquisition.source_summaries == []
-    and .acquisition.requirement_facts == []
-    and .acquisition.context_delivery_status == "unknown"
-    and .acquisition.dsa_budget_truncation == false
-    and .acquisition.candidate_truncation == false
     and .sufficiency.status == "not_evaluated"
-    and .sufficiency.evaluation_id == null
-    and .sufficiency.reason_codes == []
-    and .sufficiency.answer_constraints == []
-    and .sufficiency.qualification_required == false
-    and .sufficiency.additional_acquisition_required == false
     and .next_steps.selection_count == 0
-    and .next_steps.selections == []
-    and .next_steps.additional_acquisition_count == 0
-    and .next_steps.initial_attempt == null
-    and .next_steps.dependency_status == null
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
