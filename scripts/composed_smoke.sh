@@ -1593,7 +1593,10 @@ run_claim_traceability_scenario() {
     and .prompt.evidence_acquisition.plan.plan_status == "not_compiled"
     and .prompt.evidence_acquisition.sufficiency.status == "not_evaluated"
     and (.prompt.evidence_acquisition.next_steps.selections | length) == 0
-    and .retrieval.prompt_assembly.dsa.called == false
+    and .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
     and .retrieval.prompt_assembly.dsa.activation_source == "evidence_policy"
     and .retrieval.prompt_assembly.evidence_provider_mode.mode == "ordinary"
     and ([.retrieval.prompt_assembly.included_layers[]?
