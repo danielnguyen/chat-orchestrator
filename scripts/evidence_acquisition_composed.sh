@@ -2450,7 +2450,7 @@ run_evidence_history_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   conversation_id="$(resolve_conversation "$owner" "$client" "history-limited")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"allowed_sensitivity":"medium"}')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"domain_tags":["migration"],"allowed_sensitivity":"medium"}')"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What might you have missed?" "usable only with those limits" \
