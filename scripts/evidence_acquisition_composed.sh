@@ -1266,7 +1266,6 @@ run_evidence_clarification_scenario() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  echo "Clarification policy: $(jq -c '{sufficiency:.sufficiency.status,selections:[.next_steps.selections[] | {selected_next_step,clarification_target}]}' <<<"$manifest")"
   assert_jq "clarification.response" "$response" '
     .status == "degraded"
     and (.answer | contains("reasoning context"))
@@ -1275,7 +1274,7 @@ run_evidence_clarification_scenario() {
   assert_jq "clarification.next_step" "$manifest" '
     .sufficiency.status == "unknown"
     and .next_steps.selections[0].selected_next_step
-      == "withhold_unsupported_conclusion"
+      == "disclose_unexamined_scope"
   '
   assert_jq "clarification.additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
@@ -1297,7 +1296,7 @@ run_evidence_clarification_scenario() {
   fi
   configure_source_fixture "complete-sheet" "ready"
   restore_dsa_config
-  echo "Evidence clarification: matched_scope=1 cr_selection=withhold_unsupported_conclusion provider_chat=0 dsa_context_pack=1 dsa_context=1 dsa_fetch=0 additional_acquisition=0"
+  echo "Evidence clarification: matched_scope=1 cr_selection=disclose_unexamined_scope provider_chat=0 dsa_context_pack=1 dsa_context=1 dsa_fetch=0 additional_acquisition=0"
 }
 
 run_evidence_changed_premise_scenarios() {
