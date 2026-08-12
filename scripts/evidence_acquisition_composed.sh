@@ -695,23 +695,22 @@ run_evidence_source_scope_scenarios() {
     echo "Assertion failed: source_scope.natural.runtime_match" >&2
     return 1
   fi
-  jq -e '
+  assert_jq "source_scope.natural.provider_scope" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
     and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
       | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
       | length) == 0
-  ' <<<"$provider_calls" >/dev/null
-  jq -e '
-    ([.calls[] | select(.source == "complete-sheet")] | length) == 1
-    and ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
+  '
+  assert_jq "source_scope.natural.fixture_decoys" "$fixture_calls" '
+    ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
       | length) == 0
-  ' <<<"$fixture_calls" >/dev/null
-  jq -e '
+  '
+  assert_jq "source_scope.natural.dsa_scope" "$audit" '
     [.[] | select(.operation == "context_pack")][0].considered_source_ids
       == ["complete_register"]
     and [.[] | select(.operation == "context_pack")][0].selected_source_ids
       == ["complete_register"]
-  ' <<<"$audit" >/dev/null
+  '
   assert_single_inventory_request 1
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
 
