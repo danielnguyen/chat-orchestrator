@@ -1162,7 +1162,7 @@ Treat this as a working direction, not a confirmed result."
   assert_evidence_advisory_jq \
     "$tag" "empty_public_sources" "$response" '.sources == []'
   assert_evidence_advisory_equal \
-    "$tag" "dsa_activation_source" "evidence_policy" \
+    "$tag" "dsa_activation_source" "client_request" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "$tag" "dsa_called" "true" \
