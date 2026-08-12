@@ -1280,7 +1280,7 @@ run_evidence_clarification_scenario() {
   assert_jq "clarification.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 1
-    and .inventory.declared_source_count == 0
+    and .inventory.declared_source_count == 1
   '
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
   if ! assert_dsa_operation_counts "$audit" 1 1 0 >/dev/null 2>&1; then
