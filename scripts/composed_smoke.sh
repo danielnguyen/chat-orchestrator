@@ -1000,12 +1000,15 @@ assert_common_trace() {
 
 run_policy_admitted_chat() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
+  local external_context="${5:-null}"
   co_post "$(jq -nc \
     --arg owner "$owner" \
     --arg client "$client" \
     --arg conversation "$conversation_id" \
     --arg question "$question" \
-    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private"}')"
+    --argjson external_context "$external_context" \
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private"}
+    + if $external_context == null then {} else {external_context_enabled:true,external_context:$external_context} end')"
 }
 
 evidence_advisory_assertion_failed() {
@@ -1139,7 +1142,7 @@ Treat this as a working direction, not a confirmed result."
     provider_post "/fixture/fail-next-primary" '{}' >/dev/null
   fi
   conversation="$(resolve_conversation "$owner" "$client" "evidence advisory $tag")"
-  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question" '{"enabled":true,"domain_tags":["migration"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   provider_calls="$(fetch_provider_calls "$request_id")"
