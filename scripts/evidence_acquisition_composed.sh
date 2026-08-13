@@ -4589,7 +4589,7 @@ run_history_followup_composed_suite() {
     ) | .event_payload_json] as $events
     | ($events | length) == 1
     and $events[0].source_match_status == "no_match"
-    and $events[0].matched_source_ids == []
+    and (($events[0] | has("matched_source_ids")) | not)
   ' --arg request_id "$request_id"
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
