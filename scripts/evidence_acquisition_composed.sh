@@ -773,16 +773,12 @@ run_evidence_source_scope_scenarios() {
     and .acquisition.source_summaries == []
     and .acquisition.unavailable_source_ids == []
   '
-  if ! assert_jq "source_scope.ordinary.dsa_trace" "$trace" '
-    .dsa.called == true
-    and .dsa.status == "inventory_only"
-    and .dsa.inventory_discovery.called == true
-    and .dsa.inventory_discovery.outcome == "success"
-  '; then
-    jq -c '{dsa: {called: .dsa.called, status: .dsa.status, inventory_discovery: .dsa.inventory_discovery}}' \
-      <<<"$trace" >&2
-    return 1
-  fi
+  assert_jq "source_scope.ordinary.dsa_trace" "$trace" '
+    .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+  '
   assert_jq "source_scope.ordinary.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   assert_dsa_operation_counts "$audit" 0 0 0
@@ -4576,11 +4572,11 @@ run_history_followup_composed_suite() {
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
   assert_jq "history.ordinary.dsa_trace" "$trace" '
-    .dsa.called == true
-    and .dsa.status == "inventory_only"
-    and .dsa.inventory_discovery.called == true
-    and .dsa.inventory_discovery.outcome == "success"
-    and .dsa.inventory_discovery.source_count == 6
+    .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.source_count == 6
   '
   assert_jq "history.ordinary.provider" "$calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
