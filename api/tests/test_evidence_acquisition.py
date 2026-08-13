@@ -2439,7 +2439,24 @@ async def test_exact_request_not_applicable_and_inconsistent_plans_fail_closed()
 @pytest.mark.asyncio
 async def test_not_applicable_uses_inventory_only_and_follows_existing_path():
     runtime = FakeRuntime(shape=_shape_response(status="not_applicable"))
-    dsa = FakeDsa([_source("source_a")])
+    private_source_id = "private_inventory_source_sentinel"
+    dsa = FakeDsa(
+        [
+            _source("source_a"),
+            _source(
+                private_source_id,
+                enabled=False,
+                status="disabled",
+                display_name="PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+                tags=["PRIVATE_INVENTORY_TAG_SENTINEL"],
+                scope_refs={"project": "PRIVATE_INVENTORY_SCOPE_SENTINEL"},
+            ),
+        ],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
 
     state = await begin_evidence_acquisition(
         runtime=runtime,
@@ -2453,7 +2470,68 @@ async def test_not_applicable_uses_inventory_only_and_follows_existing_path():
     assert state.follow_existing_path is True
     assert dsa.calls == ["list_sources"]
     assert state.inventory_discovery["outcome"] == "success"
+    assert state.inventory_discovery["source_count"] == 2
     assert [name for name, _ in runtime.calls] == ["shape"]
+
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace={
+            "called": True,
+            "status": "inventory_only",
+            "inventory_discovery": state.inventory_discovery,
+        },
+        retained_source_refs=set(),
+    )
+
+    assert manifest["inventory"] == {
+        "inventory_status": "unknown",
+        "inventory_source_count": 0,
+        "declared_source_count": 0,
+        "declared_category_count": 0,
+        "available_source_count": 0,
+        "unavailable_source_count": 0,
+        "disabled_source_count": 0,
+        "unknown_source_count": 0,
+    }
+    assert manifest["acquisition"]["inventory_discovery"] == {
+        "called": True,
+        "outcome": "success",
+        "inventory_status": "complete",
+        "source_count": 2,
+    }
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+    assert manifest["acquisition"]["strategy_attempted"] is None
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_summaries",
+        "unavailable_source_ids",
+        "failed_source_ids",
+        "source_references_returned",
+        "source_references_retained",
+        "source_references_filtered_or_omitted",
+        "source_references_attempted",
+        "source_references_unsuccessful",
+    ):
+        assert manifest["acquisition"][field] == []
+    for field in (
+        "exact_reference_attempt_count",
+        "expansion_attempt_count",
+        "item_count",
+        "usable_item_count",
+        "prompt_retained_item_count",
+    ):
+        assert manifest["acquisition"][field] == 0
+    serialized = json.dumps(manifest, sort_keys=True)
+    for sentinel in (
+        private_source_id,
+        "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+        "PRIVATE_INVENTORY_TAG_SENTINEL",
+        "PRIVATE_INVENTORY_SCOPE_SENTINEL",
+    ):
+        assert sentinel not in serialized
 
 
 def test_inventory_rejects_duplicates_extras_and_unknown_capabilities():

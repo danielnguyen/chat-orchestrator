@@ -765,11 +765,20 @@ run_evidence_source_scope_scenarios() {
   jq -e '.status == "ok"' <<<"$response" >/dev/null
   jq -e '
     .status == "not_applicable"
-    and .shape.source_match.status == "no_match"
+    and ((.shape | has("source_match")) | not)
     and .plan.plan_status == "not_compiled"
-    and .acquisition.dsa_outcome == "inventory_only"
+    and .acquisition.dsa_outcome == "not_called"
     and .acquisition.inventory_discovery.called == true
+    and .acquisition.inventory_discovery.outcome == "success"
+    and .acquisition.source_summaries == []
+    and .acquisition.unavailable_source_ids == []
   ' <<<"$manifest" >/dev/null
+  jq -e '
+    .dsa.called == true
+    and .dsa.status == "inventory_only"
+    and .dsa.inventory_discovery.called == true
+    and .dsa.inventory_discovery.outcome == "success"
+  ' <<<"$trace" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' \
     <<<"$provider_calls" >/dev/null
   assert_dsa_operation_counts "$audit" 0 0 0
@@ -4526,26 +4535,62 @@ run_history_followup_composed_suite() {
     .status == "not_applicable"
     and .shape.derivation_status == "not_applicable"
     and .shape.task_shape == null
-    and .shape.source_match.status == "no_match"
-    and .shape.source_match.matched_source_ids == []
+    and ((.shape | has("source_match")) | not)
     and .plan.plan_status == "not_compiled"
     and .acquisition.strategy_attempted == null
-    and .acquisition.dsa_outcome == "inventory_only"
+    and .inventory.inventory_status == "unknown"
+    and .inventory.inventory_source_count == 0
+    and .inventory.declared_source_count == 0
+    and .inventory.available_source_count == 0
+    and .inventory.unavailable_source_count == 0
+    and .inventory.disabled_source_count == 0
+    and .inventory.unknown_source_count == 0
+    and .acquisition.dsa_outcome == "not_called"
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
     and .acquisition.inventory_discovery.source_count == 6
     and .acquisition.dsa_error_codes == []
+    and .acquisition.sources_considered == []
+    and .acquisition.sources_selected == []
+    and .acquisition.sources_used == []
+    and .acquisition.source_summaries == []
+    and .acquisition.unavailable_source_ids == []
+    and .acquisition.failed_source_ids == []
+    and .acquisition.source_references_returned == []
+    and .acquisition.source_references_retained == []
+    and .acquisition.source_references_filtered_or_omitted == []
+    and .acquisition.source_references_attempted == []
+    and .acquisition.source_references_unsuccessful == []
+    and .acquisition.exact_reference_attempt_count == 0
+    and .acquisition.expansion_attempt_count == 0
     and .acquisition.item_count == 0
+    and .acquisition.usable_item_count == 0
     and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "not_evaluated"
     and .next_steps.selection_count == 0
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
+  assert_jq "history.ordinary.dsa_trace" "$trace" '
+    .dsa.called == true
+    and .dsa.status == "inventory_only"
+    and .dsa.inventory_discovery.called == true
+    and .dsa.inventory_discovery.outcome == "success"
+    and .dsa.inventory_discovery.source_count == 6
+  '
   assert_jq "history.ordinary.provider" "$calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
   '
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_jq "history.ordinary.source_match" "$diagnostics" '
+    [.events[] | select(
+      .event_type == "evidence_shape_derived"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 1
+    and $events[0].source_match_status == "no_match"
+    and $events[0].matched_source_ids == []
+  ' --arg request_id "$request_id"
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
@@ -4554,13 +4599,10 @@ run_history_followup_composed_suite() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
-  assert_jq "history.ordinary.follow_up_failure" "$response" '
-    .status == "degraded"
-    and .selected_model == "not_called"
-    and .answer == "The retained acquisition record failed association or privacy validation, so I can’t safely explain it. I did not perform a new verification for this explanation."
-  '
-  assert_jq "history.ordinary.follow_up_privacy" "$response" '
-    (.answer | endswith("I did not perform a new verification for this explanation."))
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
+  assert_jq "history.ordinary.follow_up" "$response" '
+    .answer == "I didn’t run an evidence acquisition for the original answer.\n\nI didn’t run another search or verification for this explanation."
+    and (.answer | endswith("I didn’t run another search or verification for this explanation."))
     and ((.answer | contains("Migration Records")) | not)
     and ((.answer | contains("Google Sheets")) | not)
     and ((.answer | contains("Form responses 1")) | not)
@@ -4568,7 +4610,11 @@ run_history_followup_composed_suite() {
     and ((.answer | ascii_downcase | contains("invalid")) | not)
     and ((.answer | contains("Unverified guidance:")) | not)
   '
-  echo "H1 ordinary inventory-only history fail-closed regression passed"
+  assert_jq "history.ordinary.projection" "$HISTORY_TRACE" '
+    .prompt.claim_explanation.manifest_projection_status == "accepted"
+    and .prompt.claim_explanation.manifest_projection_reason == "accepted"
+  '
+  echo "H1 ordinary inventory-only no-acquisition history regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
   owner="owner-history-h2"

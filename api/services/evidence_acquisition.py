@@ -4930,6 +4930,12 @@ def build_manifest_trace(
     retained_source_refs: set[str] | None,
 ) -> dict[str, Any]:
     trace = dsa_trace if isinstance(dsa_trace, dict) else {}
+    ordinary_without_content_acquisition = bool(
+        state.status == "not_applicable"
+        and state.follow_existing_path
+        and trace.get("status")
+        in {"not_called", "inventory_only", "inventory_failure"}
+    )
     diagnostics = (
         context_pack.get("diagnostics")
         if isinstance(context_pack, dict)
@@ -4981,6 +4987,18 @@ def build_manifest_trace(
     considered_sources = sorted(
         diagnostics.get("considered_source_ids", []) or selected_sources
     )
+    manifest_inventory = state.inventory
+    manifest_declared_scope = state.declared_scope
+    if ordinary_without_content_acquisition:
+        manifest_inventory = None
+        manifest_declared_scope = None
+        items = []
+        returned_refs = []
+        retained_refs = []
+        omitted_refs = []
+        sources_used = []
+        selected_sources = []
+        considered_sources = []
     plan = state.plan
     shape = state.shape
     exact_attempts = state.exact_attempts or []
@@ -5026,6 +5044,27 @@ def build_manifest_trace(
         if item.get("outcome") != "satisfied"
         and isinstance(item.get("seed_source_ref"), str)
     }
+    shape_projection: dict[str, Any] = {
+        "derivation_status": shape.derivation_status if shape else "unavailable",
+        "task_shape": shape.task_shape if shape else None,
+        "candidate_count": len(shape.candidate_task_shapes) if shape else 0,
+        "clarification_required": shape.clarification_required if shape else False,
+        "reason_codes": list(shape.reason_codes) if shape else [],
+    }
+    if not ordinary_without_content_acquisition:
+        shape_projection["source_match"] = (
+            {
+                "status": shape.source_match.status,
+                "matched_source_ids": (
+                    list(shape.source_match.matched_source_ids)
+                    if shape.source_match.status == "matched"
+                    else []
+                ),
+                "reason_codes": list(shape.source_match.reason_codes),
+            }
+            if shape and shape.source_match
+            else None
+        )
     return {
         "enabled": state.enabled,
         "attempted": state.attempted,
@@ -5033,27 +5072,11 @@ def build_manifest_trace(
         "manifest_id": state.manifest_id,
         "assistant_message_id": None,
         "response_digest": None,
-        "shape": {
-            "derivation_status": shape.derivation_status if shape else "unavailable",
-            "task_shape": shape.task_shape if shape else None,
-            "candidate_count": len(shape.candidate_task_shapes) if shape else 0,
-            "clarification_required": shape.clarification_required if shape else False,
-            "reason_codes": list(shape.reason_codes) if shape else [],
-            "source_match": (
-                {
-                    "status": shape.source_match.status,
-                    "matched_source_ids": (
-                        list(shape.source_match.matched_source_ids)
-                        if shape.source_match.status == "matched"
-                        else []
-                    ),
-                    "reason_codes": list(shape.source_match.reason_codes),
-                }
-                if shape and shape.source_match
-                else None
-            ),
-        },
-        "inventory": _inventory_summary(state.inventory, state.declared_scope),
+        "shape": shape_projection,
+        "inventory": _inventory_summary(
+            manifest_inventory,
+            manifest_declared_scope,
+        ),
         "plan": {
             "plan_id": plan.plan_id if plan else None,
             "plan_status": plan.plan_status if plan else "not_compiled",
@@ -5089,7 +5112,7 @@ def build_manifest_trace(
             "sources_selected": selected_sources,
             "sources_used": sources_used,
             "source_summaries": _source_summaries(
-                inventory=state.inventory,
+                inventory=manifest_inventory,
                 items=items,
                 considered_sources=considered_sources,
                 selected_sources=selected_sources,
@@ -5126,7 +5149,9 @@ def build_manifest_trace(
             "exact_reference_truncated_count": exact_outcome_counts["truncated"],
             "unavailable_source_ids": sorted(
                 source.source_id
-                for source in (state.inventory.sources if state.inventory else [])
+                for source in (
+                    manifest_inventory.sources if manifest_inventory else []
+                )
                 if not source.enabled
                 or source.status in {"unavailable", "disabled", "unknown"}
             ),
@@ -5170,22 +5195,42 @@ def build_manifest_trace(
             "expansion_filtered_count": expansion_outcome_counts["filtered"],
             "expansion_truncated_count": expansion_outcome_counts["truncated"],
             "expansion_unsupported_count": expansion_outcome_counts["unsupported"],
-            "item_count": int(trace.get("raw_item_count") or len(items)),
+            "item_count": (
+                0
+                if ordinary_without_content_acquisition
+                else int(trace.get("raw_item_count") or len(items))
+            ),
             "usable_item_count": len(items),
             "prompt_retained_item_count": len(retained_refs),
-            "dsa_outcome": trace.get("status", "not_called"),
-            "dsa_error_codes": sorted(
-                {
-                    code
-                    for code in [
-                        trace.get("error_code"),
-                        *(trace.get("error_codes") or []),
-                    ]
-                    if isinstance(code, str)
-                }
+            "dsa_outcome": (
+                "not_called"
+                if ordinary_without_content_acquisition
+                else trace.get("status", "not_called")
             ),
-            "dsa_budget_truncation": bool(trace.get("budget_truncated")),
-            "candidate_truncation": bool(trace.get("candidate_truncated")),
+            "dsa_error_codes": (
+                []
+                if ordinary_without_content_acquisition
+                else sorted(
+                    {
+                        code
+                        for code in [
+                            trace.get("error_code"),
+                            *(trace.get("error_codes") or []),
+                        ]
+                        if isinstance(code, str)
+                    }
+                )
+            ),
+            "dsa_budget_truncation": (
+                False
+                if ordinary_without_content_acquisition
+                else bool(trace.get("budget_truncated"))
+            ),
+            "candidate_truncation": (
+                False
+                if ordinary_without_content_acquisition
+                else bool(trace.get("candidate_truncated"))
+            ),
             "context_delivery_status": (
                 "retained"
                 if delivery_outcome == "satisfied"

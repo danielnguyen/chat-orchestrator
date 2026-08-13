@@ -18183,9 +18183,37 @@ async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
             "user_safe_summary": "Evidence planning does not apply.",
         },
     }
-    dsa = FakeDSA(response=_governed_context_pack("Tell me a joke."))
+    private_source_id = "private_inventory_source_sentinel"
+    source_response = copy.deepcopy(FakeDSA().source_response)
+    source_response.update(
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        }
+    )
+    source_response["sources"].append(
+        {
+            "source_id": private_source_id,
+            "display_name": "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+            "connector": "neutral_connector",
+            "domain_tags": ["PRIVATE_INVENTORY_TAG_SENTINEL"],
+            "sensitivity": "medium",
+            "access_mode": "read_only",
+            "capabilities": ["profile", "search"],
+            "enabled": False,
+            "status": "disabled",
+            "last_checked_at": "2026-07-17T00:00:00Z",
+            "last_error": None,
+            "authority_role": "unknown",
+            "scope_refs": {"project": "PRIVATE_INVENTORY_SCOPE_SENTINEL"},
+        }
+    )
+    dsa = FakeDSA(
+        response=_governed_context_pack("Tell me a joke."),
+        source_response=source_response,
+    )
     litellm = FakeLiteLLM(content="A bounded joke.")
-    memory_store = FakeMemoryStore()
+    memory_store = ClaimExplanationMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -18215,9 +18243,8 @@ async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
     assert "External source context:" not in provider_prompt
     assert "Governed evidence response contract:" not in provider_prompt
     assert "Unverified guidance" not in provider_prompt
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    retained_trace = memory_store.trace_calls[0]["payload"]
+    manifest = retained_trace["prompt"]["evidence_acquisition"]
     assert manifest["status"] == "not_applicable"
     assert manifest["shape"] == {
         "derivation_status": "not_applicable",
@@ -18225,20 +18252,74 @@ async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
         "candidate_count": 0,
         "clarification_required": False,
         "reason_codes": ["non_evidence_interaction"],
-        "source_match": {
-            "status": "no_match",
-            "matched_source_ids": [],
-            "reason_codes": ["no_source_specific_match"],
-        },
     }
     assert manifest["plan"]["plan_status"] == "not_compiled"
     assert manifest["sufficiency"]["status"] == "not_evaluated"
-    assert manifest["acquisition"]["dsa_outcome"] == "inventory_only"
+    assert retained_trace["dsa"]["called"] is True
+    assert retained_trace["dsa"]["status"] == "inventory_only"
+    assert retained_trace["dsa"]["inventory_discovery"] == {
+        "called": True,
+        "outcome": "success",
+        "inventory_status": "complete",
+        "source_count": 2,
+    }
+    assert manifest["inventory"]["inventory_status"] == "unknown"
+    assert manifest["inventory"]["inventory_source_count"] == 0
+    assert manifest["inventory"]["declared_source_count"] == 0
+    assert manifest["inventory"]["unavailable_source_count"] == 0
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+    assert manifest["acquisition"]["inventory_discovery"]["source_count"] == 2
+    assert manifest["acquisition"]["source_summaries"] == []
+    assert manifest["acquisition"]["unavailable_source_ids"] == []
     assert manifest["acquisition"]["source_references_retained"] == []
-    assert "The maintenance record lists" not in json.dumps(
-        manifest,
-        sort_keys=True,
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "The maintenance record lists" not in serialized
+    for sentinel in (
+        private_source_id,
+        "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+        "PRIVATE_INVENTORY_TAG_SENTINEL",
+        "PRIVATE_INVENTORY_SCOPE_SENTINEL",
+    ):
+        assert sentinel not in serialized
+
+    follow_up, history_provider, history_dsa, _ = (
+        await _run_acquisition_explanation_follow_up(
+            tmp_path,
+            follow_up="What did you check?",
+            prior_answer=out["answer"],
+            memory_store=memory_store,
+            runtime=runtime,
+            request_id="rid-evidence-not-applicable-history",
+            claim_capture_enabled=False,
+        )
     )
+    assert follow_up["status"] == "ok", (
+        follow_up,
+        memory_store.trace_calls[-1]["payload"]["prompt"]["claim_explanation"],
+    )
+    assert follow_up["selected_model"] == "not_called"
+    assert follow_up["answer"] == (
+        "I didn’t run an evidence acquisition for the original answer.\n\n"
+        "I didn’t run another search or verification for this explanation."
+    )
+    assert history_provider.calls == []
+    assert history_dsa.list_calls == []
+    assert history_dsa.calls == []
+    history_trace = memory_store.trace_calls[-1]["payload"]
+    assert history_trace["prompt"]["claim_explanation"][
+        "manifest_projection_status"
+    ] == "accepted"
+    assert history_trace["prompt"]["claim_explanation"][
+        "manifest_projection_reason"
+    ] == "accepted"
+    history_serialized = json.dumps((follow_up, history_trace), sort_keys=True)
+    for sentinel in (
+        private_source_id,
+        "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+        "PRIVATE_INVENTORY_TAG_SENTINEL",
+        "PRIVATE_INVENTORY_SCOPE_SENTINEL",
+    ):
+        assert sentinel not in history_serialized
 
 
 @pytest.mark.asyncio
@@ -18286,6 +18367,14 @@ async def test_inventory_failure_is_ordinary_only_when_shape_is_not_applicable(
     assert trace["dsa"]["called"] is True
     assert trace["dsa"]["status"] == "inventory_failure"
     assert trace["dsa"]["inventory_discovery"]["outcome"] == ("dependency_failure")
+    manifest = trace["prompt"]["evidence_acquisition"]
+    if ordinary:
+        assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+        assert manifest["acquisition"]["inventory_discovery"]["outcome"] == (
+            "dependency_failure"
+        )
+        assert manifest["acquisition"]["source_summaries"] == []
+        assert manifest["acquisition"]["unavailable_source_ids"] == []
     assert "PRIVATE-INVENTORY-FAILURE" not in json.dumps(trace, sort_keys=True)
 
 
@@ -18333,7 +18422,7 @@ async def test_natural_owner_data_question_remains_not_applicable_after_source_d
         "evidence_acquisition"
     ]
     assert manifest["status"] == "not_applicable"
-    assert manifest["acquisition"]["dsa_outcome"] == "inventory_only"
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
 
 
 @pytest.mark.asyncio
@@ -20184,7 +20273,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     assert manifest["plan"]["plan_status"] == "not_compiled"
     assert manifest["sufficiency"]["status"] == "not_evaluated"
     assert manifest["next_steps"]["selections"] == []
-    assert manifest["acquisition"]["dsa_outcome"] == "inventory_only"
+    assert manifest["acquisition"]["dsa_outcome"] == "not_called"
     assert initial_trace["dsa"]["called"] is True
     assert initial_trace["retrieval"]["prompt_assembly"][
         "evidence_provider_mode"
