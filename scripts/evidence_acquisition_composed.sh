@@ -762,8 +762,8 @@ run_evidence_source_scope_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
 
-  jq -e '.status == "ok"' <<<"$response" >/dev/null
-  jq -e '
+  assert_jq "source_scope.ordinary.response" "$response" '.status == "ok"'
+  assert_jq "source_scope.ordinary.manifest" "$manifest" '
     .status == "not_applicable"
     and ((.shape | has("source_match")) | not)
     and .plan.plan_status == "not_compiled"
@@ -772,15 +772,15 @@ run_evidence_source_scope_scenarios() {
     and .acquisition.inventory_discovery.outcome == "success"
     and .acquisition.source_summaries == []
     and .acquisition.unavailable_source_ids == []
-  ' <<<"$manifest" >/dev/null
-  jq -e '
+  '
+  assert_jq "source_scope.ordinary.dsa_trace" "$trace" '
     .dsa.called == true
     and .dsa.status == "inventory_only"
     and .dsa.inventory_discovery.called == true
     and .dsa.inventory_discovery.outcome == "success"
-  ' <<<"$trace" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' \
-    <<<"$provider_calls" >/dev/null
+  '
+  assert_jq "source_scope.ordinary.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 3
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
