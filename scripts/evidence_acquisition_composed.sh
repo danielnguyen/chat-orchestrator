@@ -773,12 +773,16 @@ run_evidence_source_scope_scenarios() {
     and .acquisition.source_summaries == []
     and .acquisition.unavailable_source_ids == []
   '
-  assert_jq "source_scope.ordinary.dsa_trace" "$trace" '
+  if ! assert_jq "source_scope.ordinary.dsa_trace" "$trace" '
     .dsa.called == true
     and .dsa.status == "inventory_only"
     and .dsa.inventory_discovery.called == true
     and .dsa.inventory_discovery.outcome == "success"
-  '
+  '; then
+    jq -c '{dsa: {called: .dsa.called, status: .dsa.status, inventory_discovery: .dsa.inventory_discovery}}' \
+      <<<"$trace" >&2
+    return 1
+  fi
   assert_jq "source_scope.ordinary.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   assert_dsa_operation_counts "$audit" 0 0 0
