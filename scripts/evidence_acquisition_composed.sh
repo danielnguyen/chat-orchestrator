@@ -642,6 +642,150 @@ readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory reco
 readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
 readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
+SOURCE_SCOPE_STARTED_AT="1970-01-01T00:00:00Z"
+
+assert_single_inventory_request() {
+  local expected_delta="$1" count
+  count="$(docker compose -f "$COMPOSE" logs --no-color --since "$SOURCE_SCOPE_STARTED_AT" dsa 2>/dev/null \
+    | grep -F '"GET /v1/sources HTTP/1.1" 200 OK' \
+    | wc -l)"
+  test "$count" = "$expected_delta"
+}
+
+run_evidence_source_scope_scenarios() {
+  local owner client conversation_id question external response request_id
+  local trace manifest diagnostics provider_calls fixture_calls audit
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+  SOURCE_SCOPE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-source-scope-natural"
+  client="client-source-scope-natural"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-natural")"
+  question="What is recorded in Configured Review Register?"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+
+  jq -e '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+  ' <<<"$response" >/dev/null
+  assert_jq "source_scope.natural.manifest" "$manifest" '
+    .shape.task_shape == "targeted_lookup"
+    and .shape.source_match.status == "matched"
+    and .inventory.declared_source_count == 1
+    and .acquisition.inventory_discovery.called == true
+    and .acquisition.inventory_discovery.outcome == "success"
+  '
+  if ! jq -e --arg request_id "$request_id" '
+    [.events[] | select(
+      .event_type == "evidence_shape_derived"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 1
+    and $events[0].source_match_status == "matched"
+    and $events[0].matched_source_ids == ["complete_register"]
+  ' <<<"$diagnostics" >/dev/null; then
+    echo "Assertion failed: source_scope.natural.runtime_match" >&2
+    return 1
+  fi
+  assert_jq "source_scope.natural.provider_scope" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
+      | length) == 0
+  '
+  assert_jq "source_scope.natural.fixture_decoys" "$fixture_calls" '
+    ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
+      | length) == 0
+  '
+  assert_jq "source_scope.natural.dsa_scope" "$audit" '
+    [.[] | select(.operation == "context_pack")] as $calls
+    | ($calls | length) == 1
+    and $calls[0].source_ids == ["complete_register"]
+  '
+  assert_single_inventory_request 1
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-source-scope-ambiguous"
+  client="client-source-scope-ambiguous"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-ambiguous")"
+  question="Check the comparison source."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+
+  jq -e '
+    .status == "degraded"
+    and .answer == "I need a narrower evidence request before I can determine what should be checked."
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .status == "source_scope_ambiguous"
+    and .shape.source_match.status == "ambiguous"
+    and .shape.source_match.matched_source_ids == []
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.dsa_outcome == "inventory_only"
+  ' <<<"$manifest" >/dev/null
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
+    <<<"$provider_calls" >/dev/null
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_single_inventory_request 2
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  owner="owner-source-scope-ordinary"
+  client="client-source-scope-ordinary"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-ordinary")"
+  question="Tell me a short joke."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+
+  assert_jq "source_scope.ordinary.response" "$response" '.status == "ok"'
+  assert_jq "source_scope.ordinary.manifest" "$manifest" '
+    .status == "not_applicable"
+    and ((.shape | has("source_match")) | not)
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.dsa_outcome == "not_called"
+    and .acquisition.inventory_discovery.called == true
+    and .acquisition.inventory_discovery.outcome == "success"
+    and .acquisition.source_summaries == []
+    and .acquisition.unavailable_source_ids == []
+  '
+  assert_jq "source_scope.ordinary.dsa_trace" "$trace" '
+    .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+  '
+  assert_jq "source_scope.ordinary.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_single_inventory_request 3
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
+}
 
 run_evidence_targeted_scenario() {
   local owner client conversation_id question external response request_id answer
@@ -930,7 +1074,7 @@ run_evidence_limitation_and_failure_scenarios() {
   owner="owner-evidence-limited"
   client="client-evidence-limited"
   question="Verify the migration record."
-  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+  external='{"enabled":true,"domain_tags":["migration"],"allowed_sensitivity":"medium","max_results":5}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
@@ -961,6 +1105,8 @@ run_evidence_limitation_and_failure_scenarios() {
     <<<"$trace" >/dev/null
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
+
+  echo "Evidence outcome case passed: limited"
 
   owner="owner-evidence-empty"
   client="client-evidence-empty"
@@ -1001,6 +1147,8 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
+
+  echo "Evidence outcome case passed: empty"
 
   owner="owner-evidence-failure"
   client="client-evidence-failure"
@@ -1048,6 +1196,7 @@ run_evidence_limitation_and_failure_scenarios() {
       ;;
   esac
   configure_source_fixture "calendar-alpha" "ready"
+  echo "Evidence outcome case passed: unavailable"
 
   owner="owner-evidence-malformed"
   client="client-evidence-malformed"
@@ -1098,6 +1247,7 @@ run_evidence_limitation_and_failure_scenarios() {
       ;;
   esac
   configure_source_fixture "targeted-sheet" "ready"
+  echo "Evidence outcome case passed: malformed"
 
   local unauthorized_response unauthorized_status
   unauthorized_response="$(mktemp)"
@@ -1127,31 +1277,37 @@ run_evidence_clarification_scenario() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  jq -e '
+  assert_jq "clarification.response" "$response" '
     .status == "degraded"
-    and .answer == "Which bounded source or source set should I examine?"
-  ' <<<"$response" >/dev/null
-  jq -e '
+    and (.answer | contains("reasoning context"))
+    and (.answer | contains("withholding a complete-scope conclusion"))
+  '
+  assert_jq "clarification.next_step" "$manifest" '
     .sufficiency.status == "unknown"
-    and .next_steps.selections[0].selected_next_step == "ask_narrow_clarification"
-    and .next_steps.selections[0].clarification_target == "source_scope"
-  ' <<<"$manifest" >/dev/null
+    and .next_steps.selections[0].selected_next_step
+      == "disclose_unexamined_scope"
+  '
   assert_jq "clarification.additional_acquisition" "$manifest" \
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "clarification.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
     and .inventory.inventory_source_count == 1
-    and .inventory.declared_source_count == 0
+    and .inventory.declared_source_count == 1
   '
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  assert_jq "clarification.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 0'
   if ! assert_dsa_operation_counts "$audit" 1 1 0 >/dev/null 2>&1; then
     echo "Assertion failed: clarification.dsa" >&2
     return 1
   fi
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  if ! assert_evidence_runtime_events \
+    "$diagnostics" "$request_id" 1 1 1 1 >/dev/null 2>&1; then
+    echo "Assertion failed: clarification.runtime" >&2
+    return 1
+  fi
   configure_source_fixture "complete-sheet" "ready"
   restore_dsa_config
-  echo "Evidence clarification: cr_selection=ask_narrow_clarification provider_chat=0 dsa_context_pack=1 dsa_context=1 dsa_fetch=0 additional_acquisition=0"
+  echo "Evidence clarification: matched_scope=1 cr_selection=disclose_unexamined_scope provider_chat=0 dsa_context_pack=1 dsa_context=1 dsa_fetch=0 additional_acquisition=0"
 }
 
 run_evidence_changed_premise_scenarios() {
@@ -2305,7 +2461,7 @@ run_evidence_history_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   conversation_id="$(resolve_conversation "$owner" "$client" "history-limited")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"allowed_sensitivity":"medium"}')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"domain_tags":["migration"],"allowed_sensitivity":"medium"}')"
   answer="$(jq -r '.answer' <<<"$response")"
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What might you have missed?" "usable only with those limits" \
@@ -4353,13 +4509,13 @@ run_history_followup_composed_suite() {
   owner="owner-history-no-acquisition"
   client="client-history-no-acquisition"
   conversation_id="$(resolve_conversation "$owner" "$client" "history-no-acquisition")"
-  question="What is the migration setting?"
-  answer="The migration setting is ready."
+  question="What is a checksum?"
+  answer="A checksum is a compact value used to detect changes in data."
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
   queue_provider_answer "$answer"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" '{"enabled":true,"allowed_sensitivity":"medium","max_results":5}')"
   request_id="$(jq -er '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
@@ -4379,49 +4535,62 @@ run_history_followup_composed_suite() {
     .status == "not_applicable"
     and .shape.derivation_status == "not_applicable"
     and .shape.task_shape == null
+    and ((.shape | has("source_match")) | not)
     and .plan.plan_status == "not_compiled"
-    and .plan.selected_strategies == []
-    and .plan.material_requirement_count == 0
-    and .plan.optional_requirement_count == 0
-    and .plan.limitation_codes == []
     and .acquisition.strategy_attempted == null
+    and .inventory.inventory_status == "unknown"
+    and .inventory.inventory_source_count == 0
+    and .inventory.declared_source_count == 0
+    and .inventory.available_source_count == 0
+    and .inventory.unavailable_source_count == 0
+    and .inventory.disabled_source_count == 0
+    and .inventory.unknown_source_count == 0
     and .acquisition.dsa_outcome == "not_called"
+    and .acquisition.inventory_discovery.called == true
+    and .acquisition.inventory_discovery.outcome == "success"
+    and .acquisition.inventory_discovery.source_count == 6
     and .acquisition.dsa_error_codes == []
-    and .acquisition.item_count == 0
-    and .acquisition.usable_item_count == 0
-    and .acquisition.prompt_retained_item_count == 0
     and .acquisition.sources_considered == []
     and .acquisition.sources_selected == []
     and .acquisition.sources_used == []
+    and .acquisition.source_summaries == []
+    and .acquisition.unavailable_source_ids == []
+    and .acquisition.failed_source_ids == []
     and .acquisition.source_references_returned == []
     and .acquisition.source_references_retained == []
+    and .acquisition.source_references_filtered_or_omitted == []
     and .acquisition.source_references_attempted == []
     and .acquisition.source_references_unsuccessful == []
     and .acquisition.exact_reference_attempt_count == 0
     and .acquisition.expansion_attempt_count == 0
-    and .acquisition.source_summaries == []
-    and .acquisition.requirement_facts == []
-    and .acquisition.context_delivery_status == "unknown"
-    and .acquisition.dsa_budget_truncation == false
-    and .acquisition.candidate_truncation == false
+    and .acquisition.item_count == 0
+    and .acquisition.usable_item_count == 0
+    and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "not_evaluated"
-    and .sufficiency.evaluation_id == null
-    and .sufficiency.reason_codes == []
-    and .sufficiency.answer_constraints == []
-    and .sufficiency.qualification_required == false
-    and .sufficiency.additional_acquisition_required == false
     and .next_steps.selection_count == 0
-    and .next_steps.selections == []
-    and .next_steps.additional_acquisition_count == 0
-    and .next_steps.initial_attempt == null
-    and .next_steps.dependency_status == null
     and .assistant_message_id == $assistant_message_id
     and .response_digest == $response_digest
   ' --arg assistant_message_id "$assistant_message_id" --arg response_digest "$expected_digest"
+  assert_jq "history.ordinary.dsa_trace" "$trace" '
+    .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.source_count == 6
+  '
   assert_jq "history.ordinary.provider" "$calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
   '
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_jq "history.ordinary.source_match" "$diagnostics" '
+    [.events[] | select(
+      .event_type == "evidence_shape_derived"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 1
+    and $events[0].source_match_status == "no_match"
+    and (($events[0] | has("matched_source_ids")) | not)
+  ' --arg request_id "$request_id"
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   HISTORY_ORIGINAL_ANSWER="$answer"
@@ -4445,7 +4614,7 @@ run_history_followup_composed_suite() {
     .prompt.claim_explanation.manifest_projection_status == "accepted"
     and .prompt.claim_explanation.manifest_projection_reason == "accepted"
   '
-  echo "H1 ordinary no-acquisition history regression passed"
+  echo "H1 ordinary inventory-only no-acquisition history regression passed"
 
   # H2: support resolves through the exact retained support record and renders structurally.
   owner="owner-history-h2"
@@ -4844,6 +5013,7 @@ run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
     ""|all)
+      run_evidence_source_scope_scenarios
       run_evidence_targeted_scenario
       run_evidence_exact_scenario
       run_evidence_hybrid_scenarios
@@ -4894,6 +5064,10 @@ run_evidence_acquisition_composed_suite() {
       run_evidence_adversarial_provider_scenario
       run_evidence_structured_answer_recovery_scenarios
       echo "Evidence acquisition composed smoke passed: scenarios=structured-answer-recovery"
+      ;;
+    source-scope)
+      run_evidence_source_scope_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=source-scope"
       ;;
     *)
       if [[ "$scenario" =~ ^[A-Za-z0-9_.:-]{1,120}$ ]]; then

@@ -4454,6 +4454,27 @@ def _build_dsa_trace_base(
     }
 
 
+def _merge_inventory_discovery_trace(
+    dsa_trace: dict[str, Any],
+    evidence_acquisition: EvidenceAcquisitionState | None,
+) -> dict[str, Any]:
+    if evidence_acquisition is None:
+        return dsa_trace
+    discovery = evidence_acquisition.inventory_discovery
+    if not isinstance(discovery, dict):
+        return dsa_trace
+    merged = {**dsa_trace, "inventory_discovery": dict(discovery)}
+    if discovery.get("called") is not True:
+        return merged
+    content_called = dsa_trace.get("called") is True
+    merged["called"] = True
+    if not content_called:
+        outcome = discovery.get("outcome")
+        merged["status"] = "inventory_only" if outcome == "success" else "inventory_failure"
+        merged["reason"] = outcome
+    return merged
+
+
 def _normalize_external_context_config(
     external_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -8403,12 +8424,8 @@ async def orchestrate_chat(
                             else last_user_text
                         )
                         targeted_external_config = external_config
-                        if (
-                            governed_plan is not None
-                            and isinstance(external_config, dict)
-                            and external_config.get("scope_refs")
-                        ):
-                            targeted_external_config = dict(external_config)
+                        if governed_plan is not None:
+                            targeted_external_config = dict(external_config or {})
                             targeted_external_config["source_ids"] = list(
                                 governed_plan.eligible_source_ids
                             )
@@ -8449,6 +8466,10 @@ async def orchestrate_chat(
                         "status": "not_called",
                         "reason": evidence_acquisition.status,
                     }
+            dsa_trace = _merge_inventory_discovery_trace(
+                dsa_trace,
+                evidence_acquisition,
+            )
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,

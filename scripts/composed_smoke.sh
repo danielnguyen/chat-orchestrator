@@ -7,9 +7,9 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
-CR_COMMIT="a61beb574a49f2d83f70008596c1183532b78f40"
-DSA_COMMIT="e23f582e4aac32a12c7ad3c71278fc21e5697ea4"
-CO_COMMIT="3802c3d30e9bb580a2d9597f521af52b7d6dc8dc"
+CR_COMMIT="2e9bb4ddb4bf92436ceab68fdac460313887a67e"
+DSA_COMMIT="5bd7e6e68eaf80f1722e3041b7e0c2e80feed2b6"
+CO_COMMIT="812dd266835e2b3ae92b4e9e1d39d4426c01db65"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -1000,12 +1000,15 @@ assert_common_trace() {
 
 run_policy_admitted_chat() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
+  local external_context="${5:-null}"
   co_post "$(jq -nc \
     --arg owner "$owner" \
     --arg client "$client" \
     --arg conversation "$conversation_id" \
     --arg question "$question" \
-    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private"}')"
+    --argjson external_context "$external_context" \
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private"}
+    + if $external_context == null then {} else {external_context_enabled:true,external_context:$external_context} end')"
 }
 
 evidence_advisory_assertion_failed() {
@@ -1139,7 +1142,7 @@ Treat this as a working direction, not a confirmed result."
     provider_post "/fixture/fail-next-primary" '{}' >/dev/null
   fi
   conversation="$(resolve_conversation "$owner" "$client" "evidence advisory $tag")"
-  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question" '{"enabled":true,"domain_tags":["migration"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   provider_calls="$(fetch_provider_calls "$request_id")"
@@ -1159,7 +1162,7 @@ Treat this as a working direction, not a confirmed result."
   assert_evidence_advisory_jq \
     "$tag" "empty_public_sources" "$response" '.sources == []'
   assert_evidence_advisory_equal \
-    "$tag" "dsa_activation_source" "evidence_policy" \
+    "$tag" "dsa_activation_source" "client_request" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "$tag" "dsa_called" "true" \
@@ -1301,8 +1304,14 @@ run_evidence_advisory_scenario() {
     "ordinary" "sufficiency_status" "not_evaluated" \
     "$(jq -r '.prompt.evidence_acquisition.sufficiency.status // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
-    "ordinary" "dsa_called" "false" \
+    "ordinary" "dsa_called" "true" \
     "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
+  assert_evidence_advisory_jq \
+    "ordinary" "dsa_inventory_only" "$trace" '
+      .retrieval.prompt_assembly.dsa.status == "inventory_only"
+      and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+      and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+    '
   assert_evidence_advisory_equal \
     "ordinary" "dsa_activation_source" "evidence_policy" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
@@ -1323,7 +1332,7 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_dsa_counts "ordinary" "$audit" 0 0 0
   assert_evidence_advisory_persistence \
     "ordinary" "$owner" "$conversation" "$request_id" "$ordinary_answer" 0
-  echo "Evidence ordinary bypass: shape=not_applicable dsa_calls=0 provider_calls=1 durable_messages=2"
+  echo "Evidence ordinary bypass: shape=not_applicable inventory_calls=1 content_calls=0 provider_calls=1 durable_messages=2"
 
   assert_advisory_service_case primary false
   assert_advisory_service_case fallback true
@@ -1336,7 +1345,7 @@ run_evidence_advisory_scenario() {
   client="client-evidence-advisory-high-impact"
   question="Does this payroll module support version 3.14?"
   conversation="$(resolve_conversation "$owner" "$client" "evidence high impact block")"
-  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
+  response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question" '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   provider_calls="$(fetch_provider_calls "$request_id")"
@@ -1398,7 +1407,7 @@ run_evidence_advisory_scenario() {
     "high_impact" "dsa_called" "true" \
     "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
   assert_evidence_advisory_equal \
-    "high_impact" "dsa_activation_source" "evidence_policy" \
+    "high_impact" "dsa_activation_source" "client_request" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
     "high_impact" "dsa_status" "error" \
@@ -1584,7 +1593,10 @@ run_claim_traceability_scenario() {
     and .prompt.evidence_acquisition.plan.plan_status == "not_compiled"
     and .prompt.evidence_acquisition.sufficiency.status == "not_evaluated"
     and (.prompt.evidence_acquisition.next_steps.selections | length) == 0
-    and .retrieval.prompt_assembly.dsa.called == false
+    and .retrieval.prompt_assembly.dsa.called == true
+    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
     and .retrieval.prompt_assembly.dsa.activation_source == "evidence_policy"
     and .retrieval.prompt_assembly.evidence_provider_mode.mode == "ordinary"
     and ([.retrieval.prompt_assembly.included_layers[]?

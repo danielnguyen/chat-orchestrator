@@ -517,6 +517,7 @@ class FakeRuntime:
         evidence_plan_error: Exception | None = None,
         evidence_sufficiency_error: Exception | None = None,
         evidence_next_step_error: Exception | None = None,
+        auto_source_match: bool = True,
         continuation_selection_response=None,
         continuation_selection_error: Exception | None = None,
         thread_response=None,
@@ -907,6 +908,7 @@ class FakeRuntime:
         self.evidence_plan_error = evidence_plan_error
         self.evidence_sufficiency_error = evidence_sufficiency_error
         self.evidence_next_step_error = evidence_next_step_error
+        self.auto_source_match = auto_source_match
         self.continuation_selection_response = continuation_selection_response
         self.continuation_selection_error = continuation_selection_error
         self.thread_response = thread_response
@@ -1130,41 +1132,80 @@ class FakeRuntime:
         if self.evidence_shape_error is not None:
             raise self.evidence_shape_error
         if self.evidence_shape_response is not None:
-            return (
+            response = (
                 self.evidence_shape_response(kwargs)
                 if callable(self.evidence_shape_response)
                 else self.evidence_shape_response
             )
-        question = " ".join(kwargs["task_text"].split())
-        digest = f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
-        return {
-            **{
-                key: kwargs[key]
-                for key in (
-                    "request_id",
-                    "owner_id",
-                    "conversation_id",
-                    "surface",
-                    "runtime_session_id",
-                    "runtime_turn_id",
+        else:
+            question = " ".join(kwargs["task_text"].split())
+            digest = f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            response = {
+                **{
+                    key: kwargs[key]
+                    for key in (
+                        "request_id",
+                        "owner_id",
+                        "conversation_id",
+                        "surface",
+                        "runtime_session_id",
+                        "runtime_turn_id",
+                    )
+                },
+                "result": {
+                    "derivation_id": "evidence_shape_1",
+                    "question_anchor": question,
+                    "question_anchor_digest": digest,
+                    "derivation_status": "derived",
+                    "task_shape": "targeted_lookup",
+                    "candidate_task_shapes": ["targeted_lookup"],
+                    "evidence_scope_material": True,
+                    "clarification_required": False,
+                    "reason_codes": [
+                        "explicit_evidence_language",
+                        "targeted_lookup_derived",
+                    ],
+                    "user_safe_summary": "A bounded acquisition mode was identified.",
+                },
+            }
+        response = copy.deepcopy(response)
+        discovery = kwargs.get("task_context", {}).get("source_discovery")
+        result = response.get("result", {})
+        if self.auto_source_match and discovery is not None and "source_match" not in result:
+            source_ids = sorted(source["source_id"] for source in discovery.get("sources", []))
+            plan_response = self.evidence_plan_response
+            if isinstance(plan_response, list):
+                plan_response = plan_response[0] if plan_response else None
+            planned_ids = sorted(
+                source_id
+                for source_id in (
+                    plan_response.get("result", {}).get("eligible_source_ids", [])
+                    if isinstance(plan_response, dict)
+                    else []
                 )
-            },
-            "result": {
-                "derivation_id": "evidence_shape_1",
-                "question_anchor": question,
-                "question_anchor_digest": digest,
-                "derivation_status": "derived",
-                "task_shape": "targeted_lookup",
-                "candidate_task_shapes": ["targeted_lookup"],
-                "evidence_scope_material": True,
-                "clarification_required": False,
-                "reason_codes": [
-                    "explicit_evidence_language",
-                    "targeted_lookup_derived",
-                ],
-                "user_safe_summary": "A bounded acquisition mode was identified.",
-            },
-        }
+                if source_id in source_ids
+            )
+            if result.get("derivation_status") == "derived" and source_ids:
+                result["source_match"] = {
+                    "status": "matched",
+                    "matched_source_ids": planned_ids or source_ids[:1],
+                    "reason_codes": ["source_id_match"],
+                }
+            elif result.get("derivation_status") == "ambiguous":
+                result["source_match"] = {
+                    "status": "ambiguous",
+                    "matched_source_ids": [],
+                    "reason_codes": ["multiple_possible_source_matches"],
+                }
+            else:
+                result["source_match"] = {
+                    "status": ("no_match" if source_ids else "inventory_unavailable"),
+                    "matched_source_ids": [],
+                    "reason_codes": [
+                        ("no_source_specific_match" if source_ids else "inventory_unavailable")
+                    ],
+                }
+        return response
 
     async def compile_evidence_plan(self, **kwargs):
         self.evidence_plan_calls.append(kwargs)
@@ -15567,8 +15608,8 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
         "evidence_shape"
     )
-    assert runtime.call_order.index("evidence_shape") < runtime.call_order.index(
-        "dsa_inventory"
+    assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index(
+        "evidence_shape"
     )
     assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index(
         "evidence_plan"
@@ -16735,9 +16776,7 @@ async def test_hybrid_comparison_context_failure_is_bounded_and_never_retried(
     )
 
     if expected_outcome == "unknown":
-        assert out["answer"] == (
-            "Which bounded source or source set should I examine?"
-        )
+        assert out["answer"].endswith("I’m withholding the requested conclusion.")
     else:
         expected_fragment = {
             "failed": "acquisition failed",
@@ -17003,11 +17042,64 @@ async def test_evidence_acquisition_ambiguous_shape_is_provider_and_dsa_free(tmp
         "I need a narrower evidence request before I can determine what should be checked."
     )
     assert out["selected_model"] == "not_called"
-    assert dsa.list_calls == []
+    assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert litellm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_source_match_ambiguity_is_inventory_only_and_provider_free(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    request_id = "rid-source-match-ambiguous"
+    question = "Review the shared register."
+    shape = _derived_shape_response(
+        request_id=request_id,
+        question=question,
+        task_shape="targeted_lookup",
+    )
+    shape["result"]["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "reason_codes": ["multiple_possible_source_matches"],
+    }
+    runtime = FakeRuntime(
+        evidence_shape_response=shape,
+        auto_source_match=False,
+    )
+    dsa = FakeDSA()
+    provider = FakeLiteLLM()
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(question),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    assert result["answer"] == (
+        "I need a narrower evidence request before I can determine what should be checked."
+    )
+    assert dsa.list_calls == [{}]
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert runtime.evidence_plan_calls == []
+    assert provider.calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["dsa"]["called"] is True
+    assert trace["dsa"]["status"] == "inventory_only"
+    assert trace["prompt"]["evidence_acquisition"]["status"] == ("source_scope_ambiguous")
 
 
 @pytest.mark.asyncio
@@ -18063,7 +18155,7 @@ async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_deli
 
 
 @pytest.mark.asyncio
-async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordinary_provider_path(
+async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -18091,9 +18183,37 @@ async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordin
             "user_safe_summary": "Evidence planning does not apply.",
         },
     }
-    dsa = FakeDSA(response=_governed_context_pack("Tell me a joke."))
+    private_source_id = "private_inventory_source_sentinel"
+    source_response = copy.deepcopy(FakeDSA().source_response)
+    source_response.update(
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        }
+    )
+    source_response["sources"].append(
+        {
+            "source_id": private_source_id,
+            "display_name": "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+            "connector": "neutral_connector",
+            "domain_tags": ["PRIVATE_INVENTORY_TAG_SENTINEL"],
+            "sensitivity": "medium",
+            "access_mode": "read_only",
+            "capabilities": ["profile", "search"],
+            "enabled": False,
+            "status": "disabled",
+            "last_checked_at": "2026-07-17T00:00:00Z",
+            "last_error": None,
+            "authority_role": "unknown",
+            "scope_refs": {"project": "PRIVATE_INVENTORY_SCOPE_SENTINEL"},
+        }
+    )
+    dsa = FakeDSA(
+        response=_governed_context_pack("Tell me a joke."),
+        source_response=source_response,
+    )
     litellm = FakeLiteLLM(content="A bounded joke.")
-    memory_store = FakeMemoryStore()
+    memory_store = ClaimExplanationMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -18114,7 +18234,7 @@ async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordin
     )
 
     assert out["answer"] == "A bounded joke."
-    assert dsa.list_calls == []
+    assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
@@ -18123,9 +18243,8 @@ async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordin
     assert "External source context:" not in provider_prompt
     assert "Governed evidence response contract:" not in provider_prompt
     assert "Unverified guidance" not in provider_prompt
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    retained_trace = memory_store.trace_calls[0]["payload"]
+    manifest = retained_trace["prompt"]["evidence_acquisition"]
     assert manifest["status"] == "not_applicable"
     assert manifest["shape"] == {
         "derivation_status": "not_applicable",
@@ -18136,16 +18255,131 @@ async def test_evidence_acquisition_not_applicable_skips_dsa_and_preserves_ordin
     }
     assert manifest["plan"]["plan_status"] == "not_compiled"
     assert manifest["sufficiency"]["status"] == "not_evaluated"
+    assert retained_trace["dsa"]["called"] is True
+    assert retained_trace["dsa"]["status"] == "inventory_only"
+    assert retained_trace["dsa"]["inventory_discovery"] == {
+        "called": True,
+        "outcome": "success",
+        "inventory_status": "complete",
+        "source_count": 2,
+    }
+    assert manifest["inventory"]["inventory_status"] == "unknown"
+    assert manifest["inventory"]["inventory_source_count"] == 0
+    assert manifest["inventory"]["declared_source_count"] == 0
+    assert manifest["inventory"]["unavailable_source_count"] == 0
     assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+    assert manifest["acquisition"]["inventory_discovery"]["source_count"] == 2
+    assert manifest["acquisition"]["source_summaries"] == []
+    assert manifest["acquisition"]["unavailable_source_ids"] == []
     assert manifest["acquisition"]["source_references_retained"] == []
-    assert "The maintenance record lists" not in json.dumps(
-        manifest,
-        sort_keys=True,
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "The maintenance record lists" not in serialized
+    for sentinel in (
+        private_source_id,
+        "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+        "PRIVATE_INVENTORY_TAG_SENTINEL",
+        "PRIVATE_INVENTORY_SCOPE_SENTINEL",
+    ):
+        assert sentinel not in serialized
+
+    follow_up, history_provider, history_dsa, _ = (
+        await _run_acquisition_explanation_follow_up(
+            tmp_path,
+            follow_up="What did you check?",
+            prior_answer=out["answer"],
+            memory_store=memory_store,
+            runtime=runtime,
+            request_id="rid-evidence-not-applicable-history",
+            claim_capture_enabled=False,
+        )
     )
+    assert follow_up["status"] == "ok", (
+        follow_up,
+        memory_store.trace_calls[-1]["payload"]["prompt"]["claim_explanation"],
+    )
+    assert follow_up["selected_model"] == "not_called"
+    assert follow_up["answer"] == (
+        "I didn’t run an evidence acquisition for the original answer.\n\n"
+        "I didn’t run another search or verification for this explanation."
+    )
+    assert history_provider.calls == []
+    assert history_dsa.list_calls == []
+    assert history_dsa.calls == []
+    history_trace = memory_store.trace_calls[-1]["payload"]
+    assert history_trace["prompt"]["claim_explanation"][
+        "manifest_projection_status"
+    ] == "accepted"
+    assert history_trace["prompt"]["claim_explanation"][
+        "manifest_projection_reason"
+    ] == "accepted"
+    history_serialized = json.dumps((follow_up, history_trace), sort_keys=True)
+    for sentinel in (
+        private_source_id,
+        "PRIVATE-INVENTORY-DISPLAY-SENTINEL",
+        "PRIVATE_INVENTORY_TAG_SENTINEL",
+        "PRIVATE_INVENTORY_SCOPE_SENTINEL",
+    ):
+        assert sentinel not in history_serialized
 
 
 @pytest.mark.asyncio
-async def test_natural_owner_data_question_remains_not_applicable_without_source_discovery(
+@pytest.mark.parametrize("ordinary", [True, False])
+async def test_inventory_failure_is_ordinary_only_when_shape_is_not_applicable(
+    tmp_path,
+    ordinary,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime(
+        evidence_shape_response=(_not_applicable_shape_response if ordinary else None)
+    )
+    dsa = FakeDSA(source_error=RuntimeError("PRIVATE-INVENTORY-FAILURE"))
+    provider = FakeLiteLLM(content="Ordinary answer.")
+    memory_store = FakeMemoryStore()
+
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload("Explain the current record."),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-inventory-failure-{ordinary}",
+    )
+
+    assert dsa.list_calls == [{}]
+    assert dsa.calls == []
+    assert runtime.evidence_plan_calls == []
+    assert len(provider.calls) == (1 if ordinary else 0)
+    assert result["answer"] == (
+        "Ordinary answer."
+        if ordinary
+        else (
+            "I can’t safely complete that evidence request with the currently "
+            "available source capabilities."
+        )
+    )
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["dsa"]["called"] is True
+    assert trace["dsa"]["status"] == "inventory_failure"
+    assert trace["dsa"]["inventory_discovery"]["outcome"] == ("dependency_failure")
+    manifest = trace["prompt"]["evidence_acquisition"]
+    if ordinary:
+        assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+        assert manifest["acquisition"]["inventory_discovery"]["outcome"] == (
+            "dependency_failure"
+        )
+        assert manifest["acquisition"]["source_summaries"] == []
+        assert manifest["acquisition"]["unavailable_source_ids"] == []
+    assert "PRIVATE-INVENTORY-FAILURE" not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_natural_owner_data_question_remains_not_applicable_after_source_discovery(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -18176,7 +18410,7 @@ async def test_natural_owner_data_question_remains_not_applicable_without_source
 
     assert out["answer"] == "Please provide the values to calculate."
     assert out["status"] == "ok"
-    assert dsa.list_calls == []
+    assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert dsa.fetch_calls == []
     assert dsa.context_calls == []
@@ -18934,7 +19168,7 @@ async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_poli
     assert runtime.evidence_shape_calls[0]["task_text"] == question
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
-    assert dsa.list_calls == []
+    assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert len(litellm.calls) == 1
 
@@ -18948,7 +19182,7 @@ async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_poli
         "Tell me a joke about incompatible components.",
     ],
 )
-async def test_ordinary_turns_use_shape_gate_and_never_call_dsa_without_opt_in(
+async def test_ordinary_turns_use_inventory_only_shape_gate_without_opt_in(
     tmp_path,
     question,
 ):
@@ -18980,7 +19214,7 @@ async def test_ordinary_turns_use_shape_gate_and_never_call_dsa_without_opt_in(
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert runtime.evidence_next_step_calls == []
-    assert dsa.list_calls == []
+    assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert dsa.fetch_calls == []
     assert dsa.context_calls == []
@@ -18992,7 +19226,14 @@ async def test_ordinary_turns_use_shape_gate_and_never_call_dsa_without_opt_in(
     assert "Governed evidence response contract:" not in prompt_text
     trace = memory_store.trace_calls[-1]["payload"]
     assert trace["dsa"]["activation_source"] == "evidence_policy"
-    assert trace["dsa"]["called"] is False
+    assert trace["dsa"]["called"] is True
+    assert trace["dsa"]["status"] == "inventory_only"
+    assert trace["dsa"]["inventory_discovery"] == {
+        "called": True,
+        "outcome": "success",
+        "inventory_status": "unknown",
+        "source_count": 1,
+    }
 
 
 def _route_files_with_fallback(tmp_path):
@@ -19993,7 +20234,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert runtime.evidence_next_step_calls == []
-    assert dsa.list_calls == []
+    assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert dsa.fetch_calls == []
     assert dsa.context_calls == []
@@ -20033,7 +20274,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     assert manifest["sufficiency"]["status"] == "not_evaluated"
     assert manifest["next_steps"]["selections"] == []
     assert manifest["acquisition"]["dsa_outcome"] == "not_called"
-    assert initial_trace["dsa"]["called"] is False
+    assert initial_trace["dsa"]["called"] is True
     assert initial_trace["retrieval"]["prompt_assembly"][
         "evidence_provider_mode"
     ]["mode"] == "ordinary"

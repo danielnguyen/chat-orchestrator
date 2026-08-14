@@ -18,6 +18,7 @@ on:
           - adversarial-provider
           - scope-references
           - structured-answer-recovery
+          - source-scope
   pull_request:
     branches:
       - main
@@ -51,7 +52,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: a61beb574a49f2d83f70008596c1183532b78f40
+          ref: 2e9bb4ddb4bf92436ceab68fdac460313887a67e
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -59,7 +60,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/data-source-aggregator
-          ref: e23f582e4aac32a12c7ad3c71278fc21e5697ea4
+          ref: 5bd7e6e68eaf80f1722e3041b7e0c2e80feed2b6
           path: data-source-aggregator
           fetch-depth: 0
 
@@ -73,10 +74,10 @@ jobs:
 
       - name: Establish pinned local main refs
         run: |
-          git -C cognitive-runtime branch --force main a61beb574a49f2d83f70008596c1183532b78f40
-          git -C data-source-aggregator branch --force main e23f582e4aac32a12c7ad3c71278fc21e5697ea4
+          git -C cognitive-runtime branch --force main 2e9bb4ddb4bf92436ceab68fdac460313887a67e
+          git -C data-source-aggregator branch --force main 5bd7e6e68eaf80f1722e3041b7e0c2e80feed2b6
           git -C basic-memory-store branch --force main e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553
-          git -C chat-orchestrator merge-base --is-ancestor 3802c3d30e9bb580a2d9597f521af52b7d6dc8dc HEAD
+          git -C chat-orchestrator merge-base --is-ancestor 812dd266835e2b3ae92b4e9e1d39d4426c01db65 HEAD
 
       - name: Validate Compose configuration
         working-directory: chat-orchestrator
