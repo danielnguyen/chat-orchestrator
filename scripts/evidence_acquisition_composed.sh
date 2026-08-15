@@ -861,15 +861,16 @@ run_evidence_source_scope_scenarios() {
     [.[] | select(.operation == "context_pack")] as $calls
     | ($calls | length) == 1
     and $calls[0].source_ids == ["complete_register"]
-    and ([.[] | select(
-      .operation == "context_pack"
-      and (.source_ids | any(
+    and ([.[]
+      | select(.operation == "context_pack")
+      | .source_ids[]
+      | select(
         . == "records_primary"
         or . == "records_optional"
         or . == "followup_records"
         or . == "calendar_alpha"
         or . == "calendar_beta"
-      ))
+      )
     ] | length) == 0
   '
   assert_dsa_operation_counts "$audit" 1 0 0
