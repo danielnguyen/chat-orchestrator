@@ -73,6 +73,8 @@ ShapeReasonCode = Literal[
     "non_evidence_interaction",
     "ambiguous_interaction_without_shape_signal",
     "multiple_incompatible_shapes",
+    "semantic_operation_hint",
+    "semantic_operation_unsupported",
 ]
 SourceMatchStatus = Literal[
     "matched",
@@ -92,6 +94,9 @@ SourceMatchReasonCode = Literal[
     "inventory_partial",
     "inventory_unknown",
     "inventory_unavailable",
+    "semantic_candidate_validated",
+    "semantic_candidates_ambiguous",
+    "semantic_no_match",
 ]
 PlanLimitationCode = Literal[
     "declared_source_missing_from_inventory",
@@ -411,6 +416,49 @@ class EvidenceCandidateValidation:
     validated_excerpt_count: int
     validated_source_references: tuple[str, ...]
     failure_reason: EvidenceCandidateFailureReason | None
+
+
+SemanticInterpretationStatus = Literal["resolved", "ambiguous", "no_match"]
+SemanticOperationHint = Literal[
+    "lookup",
+    "latest",
+    "comparison",
+    "exhaustive_review",
+    "contradiction_review",
+    "absence_check",
+    "historical_reconstruction",
+    "decision_support",
+    "aggregate",
+    "unknown",
+]
+
+
+class EvidenceInterpreterOutput(StrictModel):
+    interpretation_status: SemanticInterpretationStatus
+    operation_hint: SemanticOperationHint
+    candidate_source_ids: list[Identifier] = Field(max_length=3)
+
+    @model_validator(mode="after")
+    def validate_candidate_set(self) -> EvidenceInterpreterOutput:
+        candidate_count = len(self.candidate_source_ids)
+        if len(set(self.candidate_source_ids)) != candidate_count:
+            raise ValueError("duplicate_semantic_candidate_source_id")
+        if self.interpretation_status == "resolved" and candidate_count != 1:
+            raise ValueError("resolved_semantic_candidate_required")
+        if self.interpretation_status == "ambiguous" and candidate_count not in {
+            2,
+            3,
+        }:
+            raise ValueError("ambiguous_semantic_candidates_required")
+        if self.interpretation_status == "no_match" and candidate_count != 0:
+            raise ValueError("semantic_no_match_candidates_not_allowed")
+        return self
+
+
+class SemanticInterpreterFailure(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class SourceMatchResult(StrictModel):
@@ -932,6 +980,25 @@ class DsaSourceEntry(StrictModel):
     last_error: Annotated[str, Field(max_length=240)] | None = None
     authority_role: Literal["authoritative", "supplemental", "unknown"] = "unknown"
     scope_refs: MaterialScopeReferences | None = None
+    content_fields: list[
+        Annotated[StrictStr, Field(min_length=1, max_length=120)]
+    ] | None = Field(default=None, max_length=24)
+
+    @field_validator("content_fields")
+    @classmethod
+    def validate_content_fields(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is None:
+            return value
+        if any(not item.strip() for item in value):
+            raise ValueError("blank_source_content_field")
+        if any(re.search(r"[\x00-\x1f\x7f]", item) for item in value):
+            raise ValueError("unsafe_source_content_field")
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate_source_content_field")
+        return value
 
     @model_validator(mode="after")
     def validate_collections(self) -> DsaSourceEntry:
@@ -941,6 +1008,8 @@ class DsaSourceEntry(StrictModel):
             raise ValueError("duplicate_source_category")
         if len(set(self.capabilities)) != len(self.capabilities):
             raise ValueError("duplicate_source_capability")
+        if "content_fields" in self.model_fields_set and self.content_fields is None:
+            raise ValueError("source_content_fields_null")
         return self
 
 
@@ -1243,6 +1312,16 @@ class EvidenceAcquisitionState:
             "outcome": "not_called",
             "inventory_status": None,
             "source_count": 0,
+        }
+    )
+    semantic_interpreter: dict[str, Any] = dataclass_field(
+        default_factory=lambda: {
+            "called": False,
+            "status": "not_called",
+            "reason": "not_eligible",
+            "interpretation_status": None,
+            "operation_hint": None,
+            "candidate_count": 0,
         }
     )
 
@@ -1723,6 +1802,163 @@ def _source_discovery_projection(
         "inventory_status": source_list.inventory_status or "unknown",
         "sources": sources,
     }
+
+
+def _evidence_interpreter_inventory(
+    source_list: DsaSourceListResponse,
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for source in sorted(source_list.sources, key=lambda item: item.source_id):
+        projected: dict[str, Any] = {
+            "source_id": source.source_id,
+            "display_name": source.display_name,
+            "domain_tags": sorted(source.domain_tags),
+            "capabilities": sorted(source.capabilities),
+            "availability": _source_availability(source),
+        }
+        if source.scope_refs is not None:
+            scope_refs = source.scope_refs.model_dump(mode="json", exclude_none=True)
+            projected["scope_refs"] = {
+                key: scope_refs[key]
+                for key in ("time", "version", "domain", "project")
+                if key in scope_refs
+            }
+        if source.content_fields is not None:
+            projected["content_fields"] = sorted(source.content_fields)
+        sources.append(projected)
+    return sources
+
+
+def evidence_interpreter_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "evidence_source_interpretation",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "interpretation_status": {
+                        "type": "string",
+                        "enum": ["resolved", "ambiguous", "no_match"],
+                    },
+                    "operation_hint": {
+                        "type": "string",
+                        "enum": [
+                            "lookup",
+                            "latest",
+                            "comparison",
+                            "exhaustive_review",
+                            "contradiction_review",
+                            "absence_check",
+                            "historical_reconstruction",
+                            "decision_support",
+                            "aggregate",
+                            "unknown",
+                        ],
+                    },
+                    "candidate_source_ids": {
+                        "type": "array",
+                        "maxItems": 3,
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 120,
+                            "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                        },
+                    },
+                },
+                "required": [
+                    "interpretation_status",
+                    "operation_hint",
+                    "candidate_source_ids",
+                ],
+            },
+        },
+    }
+
+
+def evidence_interpreter_messages(
+    *,
+    task_text: str,
+    source_list: DsaSourceListResponse,
+) -> list[dict[str, str]]:
+    inventory = _evidence_interpreter_inventory(source_list)
+    classifier_input = json.dumps(
+        {"request_text": task_text, "sources": inventory},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Interpret which configured sources are plausibly relevant to the "
+                "user request and which closed evidence operation is requested. "
+                "The user may describe desired data with natural paraphrases rather "
+                "than name a source. Choose only source_id values in the supplied "
+                "inventory. Return ambiguous for two or three genuinely plausible "
+                "sources, or no_match when none is plausible. Do not answer the user, "
+                "infer access authority, use tools, or explain the result. Return "
+                "exactly one JSON object matching the supplied schema."
+            ),
+        },
+        {"role": "user", "content": classifier_input},
+    ]
+
+
+def parse_evidence_interpreter_completion(
+    value: Any,
+    *,
+    inventory_source_ids: set[str],
+) -> dict[str, Any]:
+    allowed_fields = {
+        "choices",
+        "usage",
+        "id",
+        "object",
+        "created",
+        "model",
+        "system_fingerprint",
+    }
+    if not isinstance(value, dict) or set(value) - allowed_fields:
+        raise ValueError("semantic_completion_invalid")
+    choices = value.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError("semantic_choices_invalid")
+    choice = choices[0]
+    if not isinstance(choice, dict) or set(choice) - {
+        "index",
+        "message",
+        "finish_reason",
+        "logprobs",
+    }:
+        raise ValueError("semantic_choice_invalid")
+    message = choice.get("message")
+    if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
+        raise ValueError("semantic_tool_call_forbidden")
+    if message.get("refusal") not in (None, ""):
+        raise ValueError("semantic_refusal_invalid")
+    if set(message) - {"role", "content", "refusal", "tool_calls"}:
+        raise ValueError("semantic_message_invalid")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("semantic_content_invalid")
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("semantic_json_invalid") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("semantic_json_object_required")
+    output = EvidenceInterpreterOutput.model_validate(decoded)
+    if not set(output.candidate_source_ids).issubset(inventory_source_ids):
+        raise ValueError("semantic_candidate_source_not_in_inventory")
+    projected = output.model_dump()
+    projected["candidate_source_ids"] = sorted(output.candidate_source_ids)
+    return projected
 
 
 def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
@@ -2363,6 +2599,7 @@ async def begin_evidence_acquisition(
     task_text: str,
     interaction_kind: str,
     external_context: dict[str, Any] | None,
+    semantic_interpreter: Any | None = None,
 ) -> EvidenceAcquisitionState:
     try:
         exact_source_refs = _normalize_exact_source_refs(external_context)
@@ -2435,28 +2672,37 @@ async def begin_evidence_acquisition(
     }
     if source_discovery is not None:
         task_context["source_discovery"] = source_discovery
-    state.status = "shape_requested"
-    try:
+
+    async def derive_shape(context: dict[str, Any]) -> ShapeResult:
         shape_raw = await runtime.derive_evidence_shape(
             **scope,
             task_text=task_text,
             interaction_kind=interaction_kind,
-            task_context=task_context,
+            task_context=context,
         )
         shape_response = ShapeResponse.model_validate(shape_raw)
         _validate_scope_echo(shape_response, scope)
-        state.shape = shape_response.result
+        result = shape_response.result
         expected_digest = (
-            f"sha256:{hashlib.sha256(state.shape.question_anchor.encode()).hexdigest()}"
+            f"sha256:{hashlib.sha256(result.question_anchor.encode()).hexdigest()}"
         )
-        if state.shape.question_anchor_digest != expected_digest:
+        if result.question_anchor_digest != expected_digest:
             raise ValueError("shape_anchor_digest_mismatch")
         if source_discovery is not None:
-            if state.shape.source_match is None:
+            if result.source_match is None:
                 raise ValueError("source_match_missing")
-            supplied_source_ids = {source["source_id"] for source in source_discovery["sources"]}
-            if not set(state.shape.source_match.matched_source_ids).issubset(supplied_source_ids):
+            supplied_source_ids = {
+                source["source_id"] for source in source_discovery["sources"]
+            }
+            if not set(result.source_match.matched_source_ids).issubset(
+                supplied_source_ids
+            ):
                 raise ValueError("source_match_inventory_mismatch")
+        return result
+
+    state.status = "shape_requested"
+    try:
+        state.shape = await derive_shape(task_context)
     except Exception:
         state.status = "shape_dependency_failed"
         state.forced_answer = UNSUPPORTED_ANSWER
@@ -2467,6 +2713,95 @@ async def begin_evidence_acquisition(
             declared_scope=None,
         )
         return state
+
+    first_shape = state.shape
+    semantic_eligible = bool(
+        not explicit_selector
+        and semantic_interpreter is not None
+        and state.inventory is not None
+        and source_discovery is not None
+        and source_discovery["inventory_status"] in {"complete", "partial"}
+        and source_discovery["sources"]
+        and first_shape.source_match is not None
+        and first_shape.source_match.status != "matched"
+        and interaction_kind not in {"joke_or_playful", "vent_or_expression"}
+    )
+    if semantic_eligible:
+        state.semantic_interpreter = {
+            "called": True,
+            "status": "requested",
+            "reason": "unresolved_source_scope",
+            "interpretation_status": None,
+            "operation_hint": None,
+            "candidate_count": 0,
+        }
+        try:
+            advisory_raw = await semantic_interpreter(
+                request_id=request_id,
+                task_text=task_text,
+                source_list=state.inventory,
+            )
+            advisory = EvidenceInterpreterOutput.model_validate(advisory_raw)
+            inventory_source_ids = {
+                source.source_id for source in state.inventory.sources
+            }
+            if not set(advisory.candidate_source_ids).issubset(inventory_source_ids):
+                raise ValueError("semantic_candidate_source_not_in_inventory")
+            advisory_payload = advisory.model_dump()
+            advisory_payload["candidate_source_ids"] = sorted(
+                advisory.candidate_source_ids
+            )
+        except SemanticInterpreterFailure as exc:
+            state.semantic_interpreter.update(
+                {"status": "failed", "reason": exc.reason}
+            )
+            if first_shape.derivation_status != "not_applicable":
+                state.status = "semantic_interpreter_failed"
+                state.forced_answer = AMBIGUOUS_ANSWER
+                state.manifest_id = _manifest_id(
+                    scope=scope,
+                    plan_id=None,
+                    selected_strategies=[],
+                    declared_scope=None,
+                )
+                return state
+        except (ValidationError, ValueError, TypeError):
+            state.semantic_interpreter.update(
+                {"status": "failed", "reason": "malformed_response"}
+            )
+            if first_shape.derivation_status != "not_applicable":
+                state.status = "semantic_interpreter_failed"
+                state.forced_answer = AMBIGUOUS_ANSWER
+                state.manifest_id = _manifest_id(
+                    scope=scope,
+                    plan_id=None,
+                    selected_strategies=[],
+                    declared_scope=None,
+                )
+                return state
+        else:
+            state.semantic_interpreter = {
+                "called": True,
+                "status": "accepted",
+                "reason": "validated",
+                "interpretation_status": advisory.interpretation_status,
+                "operation_hint": advisory.operation_hint,
+                "candidate_count": len(advisory.candidate_source_ids),
+            }
+            semantic_context = {**task_context, "semantic_advisory": advisory_payload}
+            state.status = "semantic_shape_requested"
+            try:
+                state.shape = await derive_shape(semantic_context)
+            except Exception:
+                state.status = "shape_dependency_failed"
+                state.forced_answer = UNSUPPORTED_ANSWER
+                state.manifest_id = _manifest_id(
+                    scope=scope,
+                    plan_id=None,
+                    selected_strategies=[],
+                    declared_scope=None,
+                )
+                return state
 
     if state.shape.derivation_status == "not_applicable":
         state.status = (

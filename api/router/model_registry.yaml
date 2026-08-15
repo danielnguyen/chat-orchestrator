@@ -39,3 +39,6 @@ logical_routes:
   intent_classifier:
     model: gpt-5-mini
     provider: cloud
+  evidence_interpreter:
+    model: gpt-5-mini
+    provider: cloud
