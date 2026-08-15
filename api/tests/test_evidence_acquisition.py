@@ -1143,6 +1143,224 @@ def test_source_match_consumer_rejects_malformed_contract(payload):
         SourceMatchResult.model_validate(payload)
 
 
+def test_source_match_consumer_defaults_absent_probe_ids_for_legacy_cr():
+    parsed = SourceMatchResult.model_validate(
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "reason_codes": ["multiple_possible_source_matches"],
+        }
+    )
+
+    assert parsed.probe_source_ids == []
+    assert "probe_source_ids" not in parsed.model_fields_set
+
+
+def test_source_match_consumer_accepts_three_sorted_probe_ids():
+    parsed = SourceMatchResult.model_validate(
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a", "source_b", "source_c"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        }
+    )
+
+    assert parsed.probe_source_ids == ["source_a", "source_b", "source_c"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": [
+                "source_a",
+                "source_b",
+                "source_c",
+                "source_d",
+            ],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a", "source_a"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_b", "source_a"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_a"],
+            "probe_source_ids": ["source_b", "source_c"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a", "source_b"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "inventory_unavailable",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a", "source_b"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a", "source_b"],
+            "reason_codes": ["multiple_possible_source_matches"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": ["source_a"],
+            "probe_source_ids": ["source_b", "source_c"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+    ],
+    ids=[
+        "one_probe_id",
+        "four_probe_ids",
+        "duplicate_probe_ids",
+        "unsorted_probe_ids",
+        "matched_status",
+        "no_match_status",
+        "inventory_unavailable_status",
+        "missing_semantic_ambiguity_reason",
+        "nonempty_matched_source_ids",
+    ],
+)
+def test_source_match_consumer_rejects_invalid_probe_contract(payload):
+    with pytest.raises(ValidationError):
+        SourceMatchResult.model_validate(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "probe_source_ids",
+    [
+        ["source_a", "source_b"],
+        ["source_a", "source_b", "source_c"],
+    ],
+    ids=["two_sources", "three_sources"],
+)
+async def test_bounded_probe_authorization_remains_nonoperational_ambiguity(
+    probe_source_ids,
+):
+    first = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    second = _shape_with_source_match(
+        status="ambiguous",
+        derivation_status="ambiguous",
+    )
+    second["result"]["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": probe_source_ids,
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    runtime = SequentialShapeRuntime([first, second])
+    dsa = FakeDsa(
+        [
+            _source("source_a"),
+            _source("source_b"),
+            _source("source_c"),
+            _source("source_decoy"),
+        ],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+    interpreter_calls = []
+
+    async def interpreter(**kwargs):
+        interpreter_calls.append(kwargs)
+        return {
+            "interpretation_status": "ambiguous",
+            "operation_hint": "lookup",
+            "candidate_source_ids": probe_source_ids,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "ambiguous"
+    assert state.forced_answer == AMBIGUOUS_ANSWER
+    assert state.shape.source_match.probe_source_ids == probe_source_ids
+    assert state.shape.source_match.matched_source_ids == []
+    assert state.declared_scope is None
+    assert state.plan is None
+    assert state.sufficiency is None
+    assert state.next_step is None
+    assert state.next_step_selection_attempted is False
+    assert state.semantic_interpreter == {
+        "called": True,
+        "status": "accepted",
+        "reason": "validated",
+        "interpretation_status": "ambiguous",
+        "operation_hint": "lookup",
+        "candidate_count": len(probe_source_ids),
+    }
+    assert len(interpreter_calls) == 1
+    assert [name for name, _ in runtime.calls] == ["shape", "shape"]
+    assert dsa.calls == ["list_sources"]
+    assert dsa.operation_request_ids == []
+
+
+@pytest.mark.asyncio
+async def test_probe_source_id_outside_exact_inventory_fails_shape_consumption():
+    shape = _shape_with_source_match(
+        status="ambiguous",
+        derivation_status="ambiguous",
+    )
+    shape["result"]["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": ["source_a", "source_stale"],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    runtime = FakeRuntime(shape=shape, auto_source_match=False)
+    dsa = FakeDsa([_source("source_a"), _source("source_b")])
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        **SCOPE,
+    )
+
+    assert state.status == "shape_dependency_failed"
+    assert state.forced_answer == UNSUPPORTED_ANSWER
+    assert [name for name, _ in runtime.calls] == ["shape"]
+    assert dsa.calls == ["list_sources"]
+
+
 @pytest.mark.asyncio
 async def test_inventory_precedes_shape_and_natural_match_bounds_plan_scope():
     order = []
