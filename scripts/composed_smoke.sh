@@ -1327,8 +1327,9 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_jq \
     "ordinary" "provider_tool_count_sanity" "$provider_calls" \
     '[.calls[] | select(.kind == "chat")] | all(.tool_count >= 0)'
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_evidence_advisory_runtime_events \
-    "ordinary" "$diagnostics" "$request_id" 1 0 0 0
+    "ordinary" "$diagnostics" "$request_id" 2 0 0 0
   assert_evidence_advisory_dsa_counts "ordinary" "$audit" 0 0 0
   assert_evidence_advisory_persistence \
     "ordinary" "$owner" "$conversation" "$request_id" "$ordinary_answer" 0
