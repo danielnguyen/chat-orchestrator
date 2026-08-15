@@ -815,10 +815,10 @@ run_evidence_source_scope_scenarios() {
   '
   assert_jq "source_scope.ordinary.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
-  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 3
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
   echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
 }
 
