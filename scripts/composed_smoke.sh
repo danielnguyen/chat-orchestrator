@@ -1585,6 +1585,7 @@ run_claim_traceability_scenario() {
   jq -e '
     ([.calls[] | select(.kind == "chat")] | length) == 1
   ' <<<"$provider_g1" >/dev/null
+  assert_semantic_interpreter_calls "$provider_g1" 1
 
   trace_g1="$(fetch_trace "$request_g1")"
   jq -e '
@@ -1631,13 +1632,16 @@ run_claim_traceability_scenario() {
   runtime_diagnostics="$(fetch_runtime_diagnostics "$runtime_session_id")"
   dsa_audit_g1="$(fetch_dsa_audit)"
   jq -e --arg request_id "$request_g1" '
-    ([.events[]
-      | select(.event_type == "evidence_shape_derived")
-      | select(.event_payload_json.request_id == $request_id)] | length) == 1
-    and ([.events[]
+    [.events[]
       | select(.event_type == "evidence_shape_derived")
       | select(.event_payload_json.request_id == $request_id)
-      | .event_payload_json][0]
+      | .event_payload_json] as $events
+    | ($events | length) == 2
+    and all($events[];
+      .source_match_status == "no_match"
+      and ((. | has("matched_source_ids")) | not)
+    )
+    and ($events[0]
       | .derivation_status == "not_applicable"
         and .task_shape == null)
     and ([.events[]
