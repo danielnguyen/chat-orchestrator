@@ -607,6 +607,38 @@ assert_advisory_provider_calls() {
   ' <<<"$provider_calls" >/dev/null
 }
 
+assert_semantic_interpreter_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(.kind == "semantic_interpreter")] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .response_schema_name == "evidence_source_interpretation"
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required
+        == ["interpretation_status", "operation_hint", "candidate_source_ids"]
+      and .tool_count == 0
+      and .max_completion_tokens == 120
+      and .status == "ok"
+      and ((keys - [
+        "kind",
+        "max_completion_tokens",
+        "model",
+        "request_id",
+        "response_format_type",
+        "response_schema_additional_properties",
+        "response_schema_name",
+        "response_schema_required",
+        "response_schema_strict",
+        "status",
+        "tool_count"
+      ]) | length) == 0
+    ))
+  ' <<<"$provider_calls" >/dev/null
+}
+
 assert_history_request_boundaries() {
   local conversation_id="$1" response="$2" expected_resolution="$3"
   local request_id trace provider_calls diagnostics audit
@@ -703,6 +735,7 @@ run_evidence_source_scope_scenarios() {
       | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
       | length) == 0
   '
+  assert_semantic_interpreter_calls "$provider_calls" 0
   assert_jq "source_scope.natural.fixture_decoys" "$fixture_calls" '
     ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
       | length) == 0
@@ -743,9 +776,10 @@ run_evidence_source_scope_scenarios() {
   ' <<<"$manifest" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_calls" >/dev/null
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 2
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
@@ -781,6 +815,7 @@ run_evidence_source_scope_scenarios() {
   '
   assert_jq "source_scope.ordinary.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_semantic_interpreter_calls "$provider_calls" 0
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 3
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0

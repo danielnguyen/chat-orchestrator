@@ -7,7 +7,7 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
-CR_COMMIT="2e9bb4ddb4bf92436ceab68fdac460313887a67e"
+CR_COMMIT="1f65bf467cb86524fe0483f30dde6662e16bd7f0"
 DSA_COMMIT="5bd7e6e68eaf80f1722e3041b7e0c2e80feed2b6"
 CO_COMMIT="812dd266835e2b3ae92b4e9e1d39d4426c01db65"
 

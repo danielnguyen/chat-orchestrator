@@ -64,10 +64,6 @@ async def chat_completions(
     x_request_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     global _next_primary_delay_ms
-    delay_ms = _next_primary_delay_ms
-    _next_primary_delay_ms = 0
-    if delay_ms:
-        await asyncio.sleep(delay_ms / 1000)
     request_id = x_request_id or "unscoped"
     messages = body.get("messages")
     messages = messages if isinstance(messages, list) else []
@@ -99,6 +95,44 @@ async def chat_completions(
         ),
         "max_completion_tokens": body.get("max_completion_tokens"),
     }
+    if classifier_diagnostics["response_schema_name"] == (
+        "evidence_source_interpretation"
+    ):
+        _calls[request_id].append(
+            {
+                "kind": "semantic_interpreter",
+                "request_id": x_request_id,
+                "model": model,
+                "tool_count": tool_count,
+                **classifier_diagnostics,
+                "status": "ok",
+            }
+        )
+        return {
+            "id": "completion-smoke",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "interpretation_status": "no_match",
+                                "operation_hint": "unknown",
+                                "candidate_source_ids": [],
+                            },
+                            separators=(",", ":"),
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
+        }
+    delay_ms = _next_primary_delay_ms
+    _next_primary_delay_ms = 0
+    if delay_ms:
+        await asyncio.sleep(delay_ms / 1000)
     prompt_text = "\n".join(
         message.get("content", "")
         for message in messages
