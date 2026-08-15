@@ -4570,8 +4570,7 @@ run_history_followup_composed_suite() {
     .status == "not_applicable"
     and .shape.derivation_status == "not_applicable"
     and .shape.task_shape == null
-    and .shape.source_match.status == "no_match"
-    and .shape.source_match.matched_source_ids == []
+    and ((.shape | has("source_match")) | not)
     and .plan.plan_status == "not_compiled"
     and .acquisition.strategy_attempted == null
     and .inventory.inventory_status == "unknown"
