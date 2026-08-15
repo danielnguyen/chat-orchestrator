@@ -17,7 +17,30 @@ _fail_next_primary = False
 _next_primary_delay_ms = 0
 _watched_sentinels: dict[str, str] = {}
 _next_answers: list[str] = []
+_next_semantic_interpretations: list[dict[str, Any]] = []
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+_FIXTURE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
+_SEMANTIC_STATUSES = {"resolved", "ambiguous", "no_match"}
+_SEMANTIC_OPERATIONS = {
+    "lookup",
+    "latest",
+    "comparison",
+    "exhaustive_review",
+    "contradiction_review",
+    "absence_check",
+    "historical_reconstruction",
+    "decision_support",
+    "aggregate",
+    "unknown",
+}
+_SEMANTIC_FIXTURE_FIELDS = {
+    "expected_request_text",
+    "expected_source_id",
+    "expected_content_fields",
+    "interpretation_status",
+    "operation_hint",
+    "candidate_source_ids",
+}
 _EXTERNAL_EVIDENCE_ITEM = re.compile(
     r"source_ref: (?P<source_ref>[^\n]+)\n(?P<text>[^\n]+)"
 )
@@ -51,6 +74,123 @@ def _governed_evidence_candidate(prompt_text: str) -> str | None:
         },
         separators=(",", ":"),
     )
+
+
+def _validate_identifier(value: object) -> str:
+    if not isinstance(value, str) or _FIXTURE_IDENTIFIER_RE.fullmatch(value) is None:
+        raise HTTPException(status_code=422, detail="invalid semantic fixture identifier")
+    return value
+
+
+def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
+    if set(body) != _SEMANTIC_FIXTURE_FIELDS:
+        raise HTTPException(status_code=422, detail="invalid semantic fixture fields")
+    request_text = body.get("expected_request_text")
+    if (
+        not isinstance(request_text, str)
+        or not request_text.strip()
+        or len(request_text) > 2_000
+    ):
+        raise HTTPException(status_code=422, detail="invalid semantic fixture request")
+    expected_source_id = _validate_identifier(body.get("expected_source_id"))
+    content_fields = body.get("expected_content_fields")
+    if (
+        not isinstance(content_fields, list)
+        or not content_fields
+        or len(content_fields) > 24
+        or any(
+            not isinstance(field, str)
+            or not field.strip()
+            or len(field) > 120
+            or re.search(r"[\x00-\x1f\x7f]", field) is not None
+            for field in content_fields
+        )
+        or len(content_fields) != len(set(content_fields))
+    ):
+        raise HTTPException(status_code=422, detail="invalid semantic fixture fields")
+    interpretation_status = body.get("interpretation_status")
+    if (
+        not isinstance(interpretation_status, str)
+        or interpretation_status not in _SEMANTIC_STATUSES
+    ):
+        raise HTTPException(status_code=422, detail="invalid semantic fixture status")
+    operation_hint = body.get("operation_hint")
+    if not isinstance(operation_hint, str) or operation_hint not in _SEMANTIC_OPERATIONS:
+        raise HTTPException(status_code=422, detail="invalid semantic fixture operation")
+    candidate_source_ids = body.get("candidate_source_ids")
+    if (
+        not isinstance(candidate_source_ids, list)
+        or len(candidate_source_ids) > 3
+        or any(
+            _FIXTURE_IDENTIFIER_RE.fullmatch(candidate) is None
+            if isinstance(candidate, str)
+            else True
+            for candidate in candidate_source_ids
+        )
+        or len(candidate_source_ids) != len(set(candidate_source_ids))
+    ):
+        raise HTTPException(status_code=422, detail="invalid semantic fixture candidates")
+    expected_count = {"resolved": 1, "ambiguous": (2, 3), "no_match": 0}
+    count = len(candidate_source_ids)
+    consistent = (
+        count in expected_count[interpretation_status]
+        if isinstance(expected_count[interpretation_status], tuple)
+        else count == expected_count[interpretation_status]
+    )
+    if not consistent:
+        raise HTTPException(status_code=422, detail="incoherent semantic fixture")
+    return {
+        "expected_request_text": request_text,
+        "expected_source_id": expected_source_id,
+        "expected_content_fields": list(content_fields),
+        "interpretation_status": interpretation_status,
+        "operation_hint": operation_hint,
+        "candidate_source_ids": list(candidate_source_ids),
+    }
+
+
+def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
+    if not _next_semantic_interpretations:
+        return None
+    fixture = _next_semantic_interpretations.pop(0)
+    user_content = next(
+        (
+            message.get("content")
+            for message in reversed(messages)
+            if isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        ),
+        None,
+    )
+    try:
+        classifier_input = json.loads(user_content) if user_content is not None else None
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422, detail="semantic fixture input is not JSON"
+        ) from exc
+    if not isinstance(classifier_input, dict):
+        raise HTTPException(status_code=422, detail="semantic fixture input is invalid")
+    if classifier_input.get("request_text") != fixture["expected_request_text"]:
+        raise HTTPException(status_code=422, detail="semantic fixture request mismatch")
+    sources = classifier_input.get("sources")
+    if not isinstance(sources, list):
+        raise HTTPException(status_code=422, detail="semantic fixture inventory missing")
+    matches = [
+        source
+        for source in sources
+        if isinstance(source, dict)
+        and source.get("source_id") == fixture["expected_source_id"]
+    ]
+    if len(matches) != 1:
+        raise HTTPException(status_code=422, detail="semantic fixture source mismatch")
+    if matches[0].get("content_fields") != fixture["expected_content_fields"]:
+        raise HTTPException(status_code=422, detail="semantic fixture content fields mismatch")
+    return {
+        "interpretation_status": fixture["interpretation_status"],
+        "operation_hint": fixture["operation_hint"],
+        "candidate_source_ids": fixture["candidate_source_ids"],
+    }
 
 
 @app.get("/healthz")
@@ -98,6 +238,11 @@ async def chat_completions(
     if classifier_diagnostics["response_schema_name"] == (
         "evidence_source_interpretation"
     ):
+        semantic_result = _consume_semantic_fixture(messages) or {
+            "interpretation_status": "no_match",
+            "operation_hint": "unknown",
+            "candidate_source_ids": [],
+        }
         _calls[request_id].append(
             {
                 "kind": "semantic_interpreter",
@@ -116,11 +261,7 @@ async def chat_completions(
                     "message": {
                         "role": "assistant",
                         "content": json.dumps(
-                            {
-                                "interpretation_status": "no_match",
-                                "operation_hint": "unknown",
-                                "candidate_source_ids": [],
-                            },
+                            semantic_result,
                             separators=(",", ":"),
                         ),
                     },
@@ -299,6 +440,7 @@ async def calls(request_id: str) -> dict[str, Any]:
 async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
     global _fail_next_primary, _next_primary_delay_ms
     _next_primary_delay_ms = 0
+    _next_semantic_interpretations.clear()
     request_id = (body or {}).get("request_id")
     if isinstance(request_id, str) and request_id:
         _calls.pop(request_id, None)
@@ -358,6 +500,16 @@ async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="invalid fixture answer")
     _next_answers.append(answer)
     return {"status": "ok", "queued": len(_next_answers)}
+
+
+@app.post("/fixture/next-semantic-interpretation")
+async def fixture_next_semantic_interpretation(
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    if _next_semantic_interpretations:
+        raise HTTPException(status_code=409, detail="semantic fixture already queued")
+    _next_semantic_interpretations.append(_validate_semantic_fixture(body))
+    return {"status": "ok", "queued": 1}
 
 
 def _embedding_vector(value: Any) -> list[float]:

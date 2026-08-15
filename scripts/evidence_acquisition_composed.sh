@@ -244,6 +244,10 @@ queue_provider_answer() {
     "$(jq -nc --arg answer "$answer" '{answer:$answer}')"
 }
 
+queue_semantic_interpretation() {
+  provider_post "/fixture/next-semantic-interpretation" "$1"
+}
+
 queue_evidence_candidate() {
   local disposition="$1" source_ref="$2" excerpt="$3"
   queue_provider_answer "$(jq -nc \
@@ -751,6 +755,130 @@ run_evidence_source_scope_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  owner="owner-source-scope-semantic"
+  client="client-source-scope-semantic"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-semantic")"
+  question="Which entries are required?"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" \
+    '{
+      expected_request_text:$request_text,
+      expected_source_id:"complete_register",
+      expected_content_fields:["Entry","Required","Status"],
+      interpretation_status:"resolved",
+      operation_hint:"lookup",
+      candidate_source_ids:["complete_register"]
+    }')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+
+  assert_jq "source_scope.semantic.response" "$response" '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: Entry: alpha"))
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+  '
+  assert_jq "source_scope.semantic.manifest" "$manifest" '
+    .shape.derivation_status == "derived"
+    and .shape.task_shape == "targeted_lookup"
+    and .shape.source_match.status == "matched"
+    and .shape.source_match.matched_source_ids == ["complete_register"]
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["targeted_retrieval"]
+    and .inventory.declared_source_count == 1
+    and .acquisition.strategy_attempted == "targeted_retrieval"
+    and .acquisition.sources_considered == ["complete_register"]
+    and .acquisition.sources_selected == ["complete_register"]
+    and .acquisition.sources_used == ["complete_register"]
+    and .acquisition.item_count > 0
+    and .acquisition.prompt_retained_item_count > 0
+  '
+  assert_jq "source_scope.semantic.trace" "$trace" '
+    .prompt.semantic_interpreter == {
+      called: true,
+      status: "accepted",
+      reason: "validated",
+      interpretation_status: "resolved",
+      operation_hint: "lookup",
+      candidate_count: 1
+    }
+  '
+  if ! jq -e --arg request_id "$request_id" '
+    [.events[] | select(
+      .event_type == "evidence_shape_derived"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 2
+    and $events[0].source_match_status == "no_match"
+    and (($events[0] | has("matched_source_ids")) | not)
+    and $events[1].source_match_status == "matched"
+    and $events[1].matched_source_ids == ["complete_register"]
+    and $events[1].derivation_status == "derived"
+    and $events[1].task_shape == "targeted_lookup"
+  ' <<<"$diagnostics" >/dev/null; then
+    echo "Assertion failed: source_scope.semantic.runtime_match" >&2
+    return 1
+  fi
+  if ! jq -e --arg request_id "$request_id" '
+    [.events[] | select(
+      .event_type == "evidence_plan_compiled"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 1
+    and $events[0].task_shape == "targeted_lookup"
+    and $events[0].eligible_source_count == 1
+    and $events[0].authoritative_source_count == 1
+    and $events[0].selected_strategies == ["targeted_retrieval"]
+  ' <<<"$diagnostics" >/dev/null; then
+    echo "Assertion failed: source_scope.semantic.runtime_plan" >&2
+    return 1
+  fi
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_jq "source_scope.semantic.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
+      | length) == 0
+  '
+  assert_jq "source_scope.semantic.fixture_scope" "$fixture_calls" '
+    [.calls[] | select(.operation == "google_values")] as $calls
+    | ($calls | length) == 1
+    and $calls[0].source == "complete-sheet"
+    and ([.calls[] | select(
+      .source == "targeted-sheet"
+      or .source == "followup-sheet"
+      or .source == "calendar-alpha"
+      or .source == "calendar-beta"
+    )] | length) == 0
+  '
+  assert_jq "source_scope.semantic.dsa_scope" "$audit" '
+    [.[] | select(.operation == "context_pack")] as $calls
+    | ($calls | length) == 1
+    and $calls[0].source_ids == ["complete_register"]
+    and ([.[] | select(
+      .operation == "context_pack"
+      and (.source_ids | any(
+        . == "records_primary"
+        or . == "records_optional"
+        or . == "followup_records"
+        or . == "calendar_alpha"
+        or . == "calendar_beta"
+      ))
+    ] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_single_inventory_request 2
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
   owner="owner-source-scope-ambiguous"
   client="client-source-scope-ambiguous"
   conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-ambiguous")"
@@ -778,7 +906,7 @@ run_evidence_source_scope_scenarios() {
     <<<"$provider_calls" >/dev/null
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request 2
+  assert_single_inventory_request 3
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
 
   provider_post "/fixture/reset" '{}'
@@ -817,9 +945,9 @@ run_evidence_source_scope_scenarios() {
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request 3
+  assert_single_inventory_request 4
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
-  echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
+  echo "Evidence source scope: natural_match=1 semantic_match=1 ambiguous=1 ordinary_inventory_only=1"
 }
 
 run_evidence_targeted_scenario() {
