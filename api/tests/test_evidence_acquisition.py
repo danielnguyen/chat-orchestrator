@@ -1185,7 +1185,7 @@ async def test_inventory_precedes_shape_and_natural_match_bounds_plan_scope():
 
 
 @pytest.mark.asyncio
-async def test_not_applicable_no_match_uses_semantic_second_pass_and_cr_scope():
+async def test_not_applicable_no_match_uses_semantic_second_derivation_and_cr_scope():
     first = _shape_with_source_match(
         status="no_match",
         derivation_status="not_applicable",
