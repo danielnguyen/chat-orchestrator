@@ -7,7 +7,7 @@ CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
-CR_COMMIT="2e9bb4ddb4bf92436ceab68fdac460313887a67e"
+CR_COMMIT="1f65bf467cb86524fe0483f30dde6662e16bd7f0"
 DSA_COMMIT="5bd7e6e68eaf80f1722e3041b7e0c2e80feed2b6"
 CO_COMMIT="812dd266835e2b3ae92b4e9e1d39d4426c01db65"
 
@@ -1327,8 +1327,9 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_jq \
     "ordinary" "provider_tool_count_sanity" "$provider_calls" \
     '[.calls[] | select(.kind == "chat")] | all(.tool_count >= 0)'
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_evidence_advisory_runtime_events \
-    "ordinary" "$diagnostics" "$request_id" 1 0 0 0
+    "ordinary" "$diagnostics" "$request_id" 2 0 0 0
   assert_evidence_advisory_dsa_counts "ordinary" "$audit" 0 0 0
   assert_evidence_advisory_persistence \
     "ordinary" "$owner" "$conversation" "$request_id" "$ordinary_answer" 0
@@ -1584,6 +1585,7 @@ run_claim_traceability_scenario() {
   jq -e '
     ([.calls[] | select(.kind == "chat")] | length) == 1
   ' <<<"$provider_g1" >/dev/null
+  assert_semantic_interpreter_calls "$provider_g1" 1
 
   trace_g1="$(fetch_trace "$request_g1")"
   jq -e '
@@ -1630,13 +1632,16 @@ run_claim_traceability_scenario() {
   runtime_diagnostics="$(fetch_runtime_diagnostics "$runtime_session_id")"
   dsa_audit_g1="$(fetch_dsa_audit)"
   jq -e --arg request_id "$request_g1" '
-    ([.events[]
-      | select(.event_type == "evidence_shape_derived")
-      | select(.event_payload_json.request_id == $request_id)] | length) == 1
-    and ([.events[]
+    [.events[]
       | select(.event_type == "evidence_shape_derived")
       | select(.event_payload_json.request_id == $request_id)
-      | .event_payload_json][0]
+      | .event_payload_json] as $events
+    | ($events | length) == 2
+    and all($events[];
+      .source_match_status == "no_match"
+      and ((. | has("matched_source_ids")) | not)
+    )
+    and ($events[0]
       | .derivation_status == "not_applicable"
         and .task_shape == null)
     and ([.events[]

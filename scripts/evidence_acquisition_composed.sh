@@ -607,6 +607,38 @@ assert_advisory_provider_calls() {
   ' <<<"$provider_calls" >/dev/null
 }
 
+assert_semantic_interpreter_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(.kind == "semantic_interpreter")] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .response_schema_name == "evidence_source_interpretation"
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required
+        == ["interpretation_status", "operation_hint", "candidate_source_ids"]
+      and .tool_count == 0
+      and .max_completion_tokens == 120
+      and .status == "ok"
+      and ((keys - [
+        "kind",
+        "max_completion_tokens",
+        "model",
+        "request_id",
+        "response_format_type",
+        "response_schema_additional_properties",
+        "response_schema_name",
+        "response_schema_required",
+        "response_schema_strict",
+        "status",
+        "tool_count"
+      ]) | length) == 0
+    ))
+  ' <<<"$provider_calls" >/dev/null
+}
+
 assert_history_request_boundaries() {
   local conversation_id="$1" response="$2" expected_resolution="$3"
   local request_id trace provider_calls diagnostics audit
@@ -703,6 +735,7 @@ run_evidence_source_scope_scenarios() {
       | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
       | length) == 0
   '
+  assert_semantic_interpreter_calls "$provider_calls" 0
   assert_jq "source_scope.natural.fixture_decoys" "$fixture_calls" '
     ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
       | length) == 0
@@ -743,9 +776,10 @@ run_evidence_source_scope_scenarios() {
   ' <<<"$manifest" >/dev/null
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_calls" >/dev/null
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 2
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
@@ -781,9 +815,10 @@ run_evidence_source_scope_scenarios() {
   '
   assert_jq "source_scope.ordinary.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 3
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
   echo "Evidence source scope: natural_match=1 ambiguous=1 ordinary_inventory_only=1"
 }
 
@@ -4581,15 +4616,28 @@ run_history_followup_composed_suite() {
   assert_jq "history.ordinary.provider" "$calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
   '
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  assert_semantic_interpreter_calls "$calls" 1
+  assert_jq "history.ordinary.semantic_interpreter" "$trace" '
+    .prompt.semantic_interpreter == {
+      called: true,
+      status: "accepted",
+      reason: "validated",
+      interpretation_status: "no_match",
+      operation_hint: "unknown",
+      candidate_count: 0
+    }
+  '
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
   assert_jq "history.ordinary.source_match" "$diagnostics" '
     [.events[] | select(
       .event_type == "evidence_shape_derived"
       and .event_payload_json.request_id == $request_id
     ) | .event_payload_json] as $events
-    | ($events | length) == 1
-    and $events[0].source_match_status == "no_match"
-    and (($events[0] | has("matched_source_ids")) | not)
+    | ($events | length) == 2
+    and all($events[];
+      .source_match_status == "no_match"
+      and ((. | has("matched_source_ids")) | not)
+    )
   ' --arg request_id "$request_id"
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
@@ -4600,6 +4648,11 @@ run_history_followup_composed_suite() {
   reset_dsa_audit
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What did you check?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What did you check?" deterministic acquisition_checked acquisition 0
+  calls="$(fetch_provider_calls "$HISTORY_REQUEST_ID")"
+  assert_semantic_interpreter_calls "$calls" 0
+  assert_jq "history.ordinary.follow_up_no_semantic_trace" "$HISTORY_TRACE" '
+    (.prompt | has("semantic_interpreter")) | not
+  '
   assert_jq "history.ordinary.follow_up" "$response" '
     .answer == "I didn’t run an evidence acquisition for the original answer.\n\nI didn’t run another search or verification for this explanation."
     and (.answer | endswith("I didn’t run another search or verification for this explanation."))

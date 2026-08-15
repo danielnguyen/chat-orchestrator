@@ -13978,6 +13978,41 @@ def _write_default_route_files(tmp_path):
     return rules, models
 
 
+def _write_evidence_interpreter_route_files(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_interpreter:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    return rules, models
+
+
+def _evidence_interpreter_completion(
+    interpretation_status,
+    operation_hint,
+    candidate_source_ids,
+):
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "interpretation_status": interpretation_status,
+                            "operation_hint": operation_hint,
+                            "candidate_source_ids": candidate_source_ids,
+                        }
+                    )
+                }
+            }
+        ]
+    }
+
+
 def _first_party_chat_payload(
     user_text: str,
     **overrides,
@@ -17704,6 +17739,8 @@ async def test_hybrid_non_comparison_shapes_remain_acquisition_and_provider_free
             task_shape=task_shape,
         ),
     )
+    schedule_sources = _neutral_schedule_sources()
+    schedule_sources[0]["content_fields"] = ["PRIVATE-CONTENT-FIELD-SENTINEL"]
     dsa = FakeDSA(
         source_response={
             "sources": [
@@ -18423,6 +18460,473 @@ async def test_natural_owner_data_question_remains_not_applicable_after_source_d
     ]
     assert manifest["status"] == "not_applicable"
     assert manifest["acquisition"]["dsa_outcome"] == "not_called"
+
+
+def _semantic_test_shape(call, *, second_status="resolved"):
+    response = _not_applicable_shape_response(call)
+    advisory = call["task_context"].get("semantic_advisory")
+    if advisory is None:
+        response["result"]["source_match"] = {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        }
+        return response
+    if second_status == "resolved":
+        response["result"].update(
+            {
+                "derivation_status": "derived",
+                "task_shape": "targeted_lookup",
+                "candidate_task_shapes": ["targeted_lookup"],
+                "evidence_scope_material": True,
+                "reason_codes": [
+                    "semantic_operation_hint",
+                    "targeted_lookup_derived",
+                ],
+            }
+        )
+        response["result"]["source_match"] = {
+            "status": "matched",
+            "matched_source_ids": list(advisory["candidate_source_ids"]),
+            "reason_codes": ["semantic_candidate_validated"],
+        }
+    elif second_status == "ambiguous":
+        response["result"].update(
+            {
+                "derivation_status": "ambiguous",
+                "evidence_scope_material": True,
+                "clarification_required": True,
+                "reason_codes": ["source_context_present"],
+            }
+        )
+        response["result"]["source_match"] = {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        }
+    elif second_status == "aggregate":
+        response["result"].update(
+            {
+                "derivation_status": "ambiguous",
+                "evidence_scope_material": True,
+                "clarification_required": True,
+                "reason_codes": [
+                    "semantic_operation_hint",
+                    "semantic_operation_unsupported",
+                ],
+            }
+        )
+        response["result"]["source_match"] = {
+            "status": "matched",
+            "matched_source_ids": list(advisory["candidate_source_ids"]),
+            "reason_codes": ["semantic_candidate_validated"],
+        }
+    else:
+        response["result"]["source_match"] = {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["semantic_no_match"],
+        }
+    return response
+
+
+def _neutral_schedule_sources():
+    return [
+        {
+            "source_id": source_id,
+            "display_name": display_name,
+            "connector": "ics_calendar",
+            "domain_tags": tags,
+            "sensitivity": "medium",
+            "access_mode": "read_only",
+            "capabilities": ["profile", "search"],
+            "enabled": True,
+            "status": "ready",
+            "last_checked_at": "2026-08-15T00:00:00Z",
+            "last_error": None,
+            "authority_role": "authoritative",
+        }
+        for source_id, display_name, tags in (
+            ("personal_schedule", "Personal Schedule", ["personal", "calendar"]),
+            ("household_schedule", "Household Schedule", ["household", "calendar"]),
+            ("public_holidays", "Public Holidays", ["holidays", "calendar"]),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(tmp_path):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "How are you today?"
+    schedule_sources = _neutral_schedule_sources()
+    schedule_sources[0]["content_fields"] = ["PRIVATE-CONTENT-FIELD-SENTINEL"]
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(
+            call,
+            second_status="no_match",
+        ),
+        auto_source_match=False,
+    )
+    classifier = _evidence_interpreter_completion("no_match", "unknown", [])
+    litellm = SequenceLiteLLM(
+        [classifier, {"choices": [{"message": {"content": "Doing well."}}]}]
+    )
+    dsa = FakeDSA(
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": schedule_sources,
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-semantic-ordinary",
+    )
+
+    assert out["answer"] == "Doing well."
+    assert len(runtime.evidence_shape_calls) == 2
+    assert len(litellm.calls) == 2
+    assert dsa.list_calls == [{}]
+    assert dsa.calls == []
+    assert runtime.evidence_plan_calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["prompt"]["semantic_interpreter"] == {
+        "called": True,
+        "status": "accepted",
+        "reason": "validated",
+        "interpretation_status": "no_match",
+        "operation_hint": "unknown",
+        "candidate_count": 0,
+    }
+    assert trace["prompt"]["evidence_acquisition"]["acquisition"]["dsa_outcome"] == "not_called"
+    assert "PRIVATE-CONTENT-FIELD-SENTINEL" not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [True, False])
+async def test_explicit_and_deterministic_source_fast_paths_skip_interpreter(
+    tmp_path,
+    explicit,
+):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime = FakeRuntime()
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "vehicle_log_primary:record_1",
+                "The maintenance record lists 2025-07-12.",
+            )
+        )
+    )
+    external_context = {"source_ids": ["vehicle_log_primary"]} if explicit else None
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+            external_context=external_context,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-semantic-fast-{explicit}",
+    )
+
+    assert out["status"] == "ok"
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(litellm.calls) == 1
+    assert "response_format" not in litellm.calls[0]
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == [
+        "vehicle_log_primary"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_chat_survives_semantic_interpreter_failure(tmp_path):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(call),
+        auto_source_match=False,
+    )
+    litellm = SequenceLiteLLM(
+        [
+            RuntimeError("PRIVATE-CLASSIFIER-FAILURE"),
+            {"choices": [{"message": {"content": "Still here."}}]},
+        ]
+    )
+    dsa = FakeDSA(
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": _neutral_schedule_sources(),
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("How are you today?", external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-semantic-ordinary-failure",
+    )
+
+    assert out["answer"] == "Still here."
+    assert len(runtime.evidence_shape_calls) == 1
+    assert len(litellm.calls) == 2
+    assert dsa.calls == []
+    trace = memory_store.trace_calls[0]["payload"]
+    assert trace["prompt"]["semantic_interpreter"]["status"] == "failed"
+    assert trace["prompt"]["semantic_interpreter"]["reason"] == "dependency_failure"
+    assert "PRIVATE-CLASSIFIER-FAILURE" not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "classifier_result",
+    [
+        RuntimeError("classifier unavailable"),
+        _evidence_interpreter_completion(
+            "resolved",
+            "lookup",
+            ["fabricated_source"],
+        ),
+    ],
+)
+async def test_material_unresolved_classifier_failure_is_safe_and_provider_free(
+    tmp_path,
+    classifier_result,
+):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+
+    def material_no_match(call):
+        response = _derived_shape_response(
+            request_id=call["request_id"],
+            question=" ".join(call["task_text"].split()),
+            task_shape="targeted_lookup",
+        )
+        response["result"]["source_match"] = {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        }
+        return response
+
+    runtime = FakeRuntime(
+        evidence_shape_response=material_no_match,
+        auto_source_match=False,
+    )
+    litellm = SequenceLiteLLM([classifier_result])
+    dsa = FakeDSA(
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": _neutral_schedule_sources(),
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the relevant owner record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-semantic-material-failure",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(litellm.calls) == 1
+    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_plan_calls == []
+    assert dsa.calls == []
+    semantic_trace = memory_store.trace_calls[0]["payload"]["prompt"][
+        "semantic_interpreter"
+    ]
+    assert semantic_trace["status"] == "failed"
+    assert semantic_trace["candidate_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_neutral_upcoming_events_semantic_resolution_bounds_acquisition(tmp_path):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "What upcoming events do I have?"
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(call),
+        evidence_plan_response=_targeted_plan_response(
+            request_id="rid-semantic-calendar",
+            question=question,
+            eligible_source_ids=["personal_schedule"],
+        ),
+        auto_source_match=False,
+    )
+    context = _governed_context_pack(question)
+    context["sources_used"] = ["personal_schedule"]
+    context["items"][0]["source_id"] = "personal_schedule"
+    context["items"][0]["source_name"] = "Personal Schedule"
+    context["items"][0]["source_ref"] = "personal_schedule:event_1"
+    context["items"][0]["text"] = "The schedule contains one upcoming event."
+    context["diagnostics"]["considered_source_ids"] = ["personal_schedule"]
+    context["diagnostics"]["selected_source_ids"] = ["personal_schedule"]
+    context["diagnostics"]["candidate_counts_by_source"] = {"personal_schedule": 1}
+    dsa = FakeDSA(
+        response=context,
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": _neutral_schedule_sources(),
+        },
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion("resolved", "latest", ["personal_schedule"]),
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": _evidence_candidate(
+                                (
+                                    "personal_schedule:event_1",
+                                    "The schedule contains one upcoming event.",
+                                )
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-semantic-calendar",
+    )
+
+    assert out["status"] == "ok"
+    assert len(runtime.evidence_shape_calls) == 2
+    assert len(litellm.calls) == 2
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == ["personal_schedule"]
+    assert dsa.calls[0]["source_ids"] == ["personal_schedule"]
+    assert "household_schedule" not in dsa.calls[0]["source_ids"]
+    assert "public_holidays" not in dsa.calls[0]["source_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("classifier", "second_status"),
+    [
+        (
+            _evidence_interpreter_completion(
+                "ambiguous",
+                "latest",
+                ["personal_schedule", "household_schedule"],
+            ),
+            "ambiguous",
+        ),
+        (
+            _evidence_interpreter_completion(
+                "resolved",
+                "aggregate",
+                ["personal_schedule"],
+            ),
+            "aggregate",
+        ),
+    ],
+)
+async def test_semantic_ambiguity_and_aggregate_are_provider_free(
+    tmp_path,
+    classifier,
+    second_status,
+):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(
+            call,
+            second_status=second_status,
+        ),
+        auto_source_match=False,
+    )
+    litellm = SequenceLiteLLM([classifier])
+    dsa = FakeDSA(
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": _neutral_schedule_sources(),
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "What upcoming events do I have?",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=f"rid-semantic-{second_status}",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(litellm.calls) == 1
+    assert len(runtime.evidence_shape_calls) == 2
+    assert runtime.evidence_plan_calls == []
+    assert dsa.calls == []
 
 
 @pytest.mark.asyncio
@@ -29356,6 +29860,16 @@ def test_intent_classifier_logical_route_is_closed_and_configurable(tmp_path):
         encoding="utf-8",
     )
     assert _load_logical_route(str(local), "intent_classifier") is None
+
+
+def test_evidence_interpreter_logical_route_is_distinct_and_configurable(tmp_path):
+    _, models = _write_evidence_interpreter_route_files(tmp_path)
+
+    assert _load_logical_route(str(models), "evidence_interpreter") == {
+        "model": "gpt-5-mini",
+        "provider": "cloud",
+    }
+    assert _load_logical_route(str(models), "intent_classifier") is None
 
 
 @pytest.mark.asyncio

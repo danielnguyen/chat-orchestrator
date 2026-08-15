@@ -63,6 +63,7 @@ from services.companion_presentation import build_companion_presentation
 from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     EvidenceAcquisitionState,
+    SemanticInterpreterFailure,
     advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
@@ -72,6 +73,8 @@ from services.evidence_acquisition import (
     disabled_evidence_trace,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
+    evidence_interpreter_messages,
+    evidence_interpreter_response_format,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
@@ -79,6 +82,7 @@ from services.evidence_acquisition import (
     grounded_provider_allowed,
     helpful_grounded_recovery_allowed,
     ineligible_exact_evidence_state,
+    parse_evidence_interpreter_completion,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
@@ -190,6 +194,8 @@ _RETIREMENT_POLICY_UNAVAILABLE = (
 )
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
+_EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
+_EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 120
 _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
     "The governed new evidence check completed, but I withheld the generated "
     "explanation because it conflicted with the verification response boundary."
@@ -4159,6 +4165,8 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
     }
     if isinstance(trace.get("evidence_acquisition"), dict):
         summary["evidence_acquisition"] = trace["evidence_acquisition"]
+    if isinstance(trace.get("semantic_interpreter"), dict):
+        summary["semantic_interpreter"] = trace["semantic_interpreter"]
     if isinstance(trace.get("claim_explanation"), dict):
         summary["claim_explanation"] = trace["claim_explanation"]
     if isinstance(trace.get("history_followup"), dict):
@@ -6407,6 +6415,53 @@ async def _classify_history_followup(
     return candidate
 
 
+async def _interpret_evidence_request(
+    *,
+    request_id: str,
+    task_text: str,
+    source_list: Any,
+    litellm: Any,
+    model_registry_path: str,
+    timeout_ms: int,
+    local_only: bool,
+    routing_policy: dict[str, Any],
+    effective_payload: dict[str, Any],
+) -> dict[str, Any]:
+    route = _load_logical_route(model_registry_path, _EVIDENCE_INTERPRETER_ROUTE)
+    if route is None:
+        raise SemanticInterpreterFailure("route_unavailable")
+    if not _classifier_cloud_allowed(
+        provider=route["provider"],
+        local_only=local_only,
+        routing_policy=routing_policy,
+        effective_payload=effective_payload,
+    ):
+        raise SemanticInterpreterFailure("provider_disallowed")
+    if litellm is None or not callable(getattr(litellm, "chat", None)):
+        raise SemanticInterpreterFailure("client_unavailable")
+    try:
+        completion = await litellm.chat(
+            request_id=request_id,
+            model=route["model"],
+            messages=evidence_interpreter_messages(
+                task_text=task_text,
+                source_list=source_list,
+            ),
+            response_format=evidence_interpreter_response_format(),
+            max_completion_tokens=_EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS,
+            timeout_ms=timeout_ms,
+        )
+    except Exception as exc:
+        raise SemanticInterpreterFailure("dependency_failure") from exc
+    try:
+        return parse_evidence_interpreter_completion(
+            completion,
+            inventory_source_ids={source.source_id for source in source_list.sources},
+        )
+    except Exception as exc:
+        raise SemanticInterpreterFailure("malformed_response") from exc
+
+
 async def _resolve_history_policy(
     *,
     runtime: Any,
@@ -8287,6 +8342,17 @@ async def orchestrate_chat(
                     ),
                 )
             else:
+                async def semantic_interpreter(**kwargs: Any) -> dict[str, Any]:
+                    return await _interpret_evidence_request(
+                        **kwargs,
+                        litellm=litellm,
+                        model_registry_path=model_registry_path,
+                        timeout_ms=intent_classifier_timeout_ms,
+                        local_only=local_only,
+                        routing_policy=routing_policy,
+                        effective_payload=effective_payload,
+                    )
+
                 evidence_acquisition = await begin_evidence_acquisition(
                     runtime=runtime,
                     dsa=dsa,
@@ -8299,6 +8365,7 @@ async def orchestrate_chat(
                     task_text=evidence_task_text,
                     interaction_kind=interaction_governance["interaction_kind"],
                     external_context=external_config,
+                    semantic_interpreter=semantic_interpreter,
                 )
                 if evidence_acquisition.follow_existing_path:
                     external_context_pack = None
@@ -9344,6 +9411,9 @@ async def orchestrate_chat(
                 retained_source_refs=retained_external_refs,
             )
             prompt.trace["evidence_acquisition"] = evidence_manifest
+            prompt.trace["semantic_interpreter"] = dict(
+                evidence_acquisition.semantic_interpreter
+            )
         elif evidence_acquisition_enabled:
             prompt.trace["evidence_acquisition"] = disabled_evidence_trace(
                 enabled=True,
