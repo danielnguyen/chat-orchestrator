@@ -5499,8 +5499,8 @@ run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
     ""|all)
-      run_evidence_aggregate_scenario
       run_evidence_source_scope_scenarios
+      run_evidence_aggregate_scenario
       run_evidence_targeted_scenario
       run_evidence_exact_scenario
       run_evidence_hybrid_scenarios
