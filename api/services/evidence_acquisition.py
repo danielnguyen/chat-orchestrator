@@ -1336,6 +1336,21 @@ class EvidenceAcquisitionState:
     )
 
     @property
+    def authorized_probe_source_ids(self) -> list[str]:
+        source_match = self.shape.source_match if self.shape else None
+        if (
+            source_match is None
+            or source_match.status != "ambiguous"
+            or not source_match.probe_source_ids
+        ):
+            return []
+        return list(source_match.probe_source_ids)
+
+    @property
+    def is_authorized_probe(self) -> bool:
+        return bool(self.authorized_probe_source_ids)
+
+    @property
     def supported_targeted_path(self) -> bool:
         return bool(
             self.plan
@@ -2859,8 +2874,11 @@ async def begin_evidence_acquisition(
             state.status = "shape_dependency_failed"
             state.forced_answer = UNSUPPORTED_ANSWER
         elif source_match.status == "ambiguous":
-            state.status = "source_scope_ambiguous"
-            state.forced_answer = AMBIGUOUS_ANSWER
+            if source_match.probe_source_ids:
+                natural_source_ids = list(source_match.probe_source_ids)
+            else:
+                state.status = "source_scope_ambiguous"
+                state.forced_answer = AMBIGUOUS_ANSWER
         elif source_match.status == "no_match":
             state.status = "source_scope_no_match"
             state.forced_answer = AMBIGUOUS_ANSWER
@@ -2905,6 +2923,18 @@ async def begin_evidence_acquisition(
             declared_scope=state.declared_scope,
         )
         return state
+    if state.is_authorized_probe and state.declared_scope.get("source_ids") != (
+        state.authorized_probe_source_ids
+    ):
+        state.status = "scope_selector_no_match"
+        state.forced_answer = UNSUPPORTED_ANSWER
+        state.manifest_id = _manifest_id(
+            scope=scope,
+            plan_id=None,
+            selected_strategies=[],
+            declared_scope=state.declared_scope,
+        )
+        return state
     try:
         plan_raw = await runtime.compile_evidence_plan(
             **scope,
@@ -2930,6 +2960,23 @@ async def begin_evidence_acquisition(
             scope=scope,
             plan_id=None,
             selected_strategies=[],
+            declared_scope=state.declared_scope,
+        )
+        return state
+
+    if state.is_authorized_probe and not (
+        state.plan.task_shape == "targeted_lookup"
+        and state.plan.plan_status in {"ready", "ready_with_limitations"}
+        and state.plan.selected_strategies == ["targeted_retrieval"]
+        and state.plan.eligible_source_ids == state.authorized_probe_source_ids
+        and state.declared_scope.get("exact_source_refs") == []
+    ):
+        state.status = "unsupported_plan"
+        state.forced_answer = UNSUPPORTED_ANSWER
+        state.manifest_id = _manifest_id(
+            scope=scope,
+            plan_id=state.plan.plan_id,
+            selected_strategies=state.plan.selected_strategies,
             declared_scope=state.declared_scope,
         )
         return state
@@ -5412,6 +5459,10 @@ def build_manifest_trace(
             if shape and shape.source_match
             else None
         )
+        if shape and shape.source_match and shape.source_match.probe_source_ids:
+            shape_projection["source_match"]["probe_source_count"] = len(
+                shape.source_match.probe_source_ids
+            )
     return {
         "enabled": state.enabled,
         "attempted": state.attempted,

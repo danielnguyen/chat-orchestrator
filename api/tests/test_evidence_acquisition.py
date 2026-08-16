@@ -1258,7 +1258,7 @@ def test_source_match_consumer_rejects_invalid_probe_contract(payload):
     ],
     ids=["two_sources", "three_sources"],
 )
-async def test_bounded_probe_authorization_remains_nonoperational_ambiguity(
+async def test_bounded_probe_authorization_compiles_exact_acquisition_scope(
     probe_source_ids,
 ):
     first = _shape_with_source_match(
@@ -1267,7 +1267,7 @@ async def test_bounded_probe_authorization_remains_nonoperational_ambiguity(
     )
     second = _shape_with_source_match(
         status="ambiguous",
-        derivation_status="ambiguous",
+        derivation_status="derived",
     )
     second["result"]["source_match"] = {
         "status": "ambiguous",
@@ -1275,7 +1275,9 @@ async def test_bounded_probe_authorization_remains_nonoperational_ambiguity(
         "probe_source_ids": probe_source_ids,
         "reason_codes": ["semantic_candidates_ambiguous"],
     }
-    runtime = SequentialShapeRuntime([first, second])
+    plan = _plan_response()
+    plan["result"]["eligible_source_ids"] = probe_source_ids
+    runtime = SequentialShapeRuntime([first, second], plan=plan)
     dsa = FakeDsa(
         [
             _source("source_a"),
@@ -1308,12 +1310,14 @@ async def test_bounded_probe_authorization_remains_nonoperational_ambiguity(
         **SCOPE,
     )
 
-    assert state.status == "ambiguous"
-    assert state.forced_answer == AMBIGUOUS_ANSWER
+    assert state.status == "acquisition_ready"
+    assert state.forced_answer is None
     assert state.shape.source_match.probe_source_ids == probe_source_ids
     assert state.shape.source_match.matched_source_ids == []
-    assert state.declared_scope is None
-    assert state.plan is None
+    assert state.declared_scope["source_ids"] == probe_source_ids
+    assert state.declared_scope["exact_source_refs"] == []
+    assert state.plan.eligible_source_ids == probe_source_ids
+    assert state.plan.selected_strategies == ["targeted_retrieval"]
     assert state.sufficiency is None
     assert state.next_step is None
     assert state.next_step_selection_attempted is False
@@ -1326,9 +1330,112 @@ async def test_bounded_probe_authorization_remains_nonoperational_ambiguity(
         "candidate_count": len(probe_source_ids),
     }
     assert len(interpreter_calls) == 1
-    assert [name for name, _ in runtime.calls] == ["shape", "shape"]
+    assert [name for name, _ in runtime.calls] == ["shape", "shape", "plan"]
+    assert runtime.calls[-1][1]["declared_scope"]["source_ids"] == probe_source_ids
     assert dsa.calls == ["list_sources"]
     assert dsa.operation_request_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "planned_source_ids",
+    [
+        ["source_a"],
+        ["source_a", "source_b", "source_decoy"],
+    ],
+    ids=["plan_drops_probe", "plan_expands_probe"],
+)
+async def test_bounded_probe_rejects_plan_source_set_mismatch(planned_source_ids):
+    probe_source_ids = ["source_a", "source_b"]
+    first = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    second = _shape_with_source_match(status="ambiguous")
+    second["result"]["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": probe_source_ids,
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    plan = _plan_response()
+    plan["result"]["eligible_source_ids"] = planned_source_ids
+    runtime = SequentialShapeRuntime([first, second], plan=plan)
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": "ambiguous",
+            "operation_hint": "lookup",
+            "candidate_source_ids": probe_source_ids,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [_source("source_a"), _source("source_b"), _source("source_decoy")],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "unsupported_plan"
+    assert state.forced_answer == UNSUPPORTED_ANSWER
+    assert state.declared_scope["source_ids"] == probe_source_ids
+    assert state.plan.eligible_source_ids == planned_source_ids
+    assert [name for name, _ in runtime.calls] == ["shape", "shape", "plan"]
+
+
+def test_probe_manifest_trace_exposes_count_without_candidate_ids():
+    shape = _shape_with_source_match(status="ambiguous")["result"]
+    shape["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": ["source_a", "source_b"],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    state = EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        shape=ShapeResult.model_validate(shape),
+    )
+
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace=None,
+        retained_source_refs=None,
+    )
+
+    source_match = manifest["shape"]["source_match"]
+    assert source_match["status"] == "ambiguous"
+    assert source_match["matched_source_ids"] == []
+    assert source_match["probe_source_count"] == 2
+    assert "probe_source_ids" not in source_match
+    assert "source_a" not in json.dumps(source_match, sort_keys=True)
+    assert "source_b" not in json.dumps(source_match, sort_keys=True)
+
+    shape["source_match"].pop("probe_source_ids")
+    no_probe = EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="source_scope_ambiguous",
+        shape=ShapeResult.model_validate(shape),
+    )
+    no_probe_manifest = build_manifest_trace(
+        state=no_probe,
+        context_pack=None,
+        dsa_trace=None,
+        retained_source_refs=None,
+    )
+    assert "probe_source_count" not in no_probe_manifest["shape"]["source_match"]
 
 
 @pytest.mark.asyncio
