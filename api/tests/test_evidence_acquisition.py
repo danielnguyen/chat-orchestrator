@@ -18,12 +18,14 @@ from services.evidence_acquisition import (
     TARGETED_SCOPE_SUFFIX,
     UNSUPPORTED_ANSWER,
     WITHHELD_ANSWER,
+    AggregateSpec,
     DsaItem,
     DsaSourceListResponse,
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
     EvidenceCandidateValidation,
     EvidenceInterpreterOutput,
+    EvidenceSourceDescriptor,
     ExactFetchProposal,
     NextStepResult,
     PlanResult,
@@ -862,6 +864,357 @@ def _shape_with_source_match(
         ],
     }
     return response
+
+
+def _future_aggregate_shape(
+    *, function="median", field_name="Fuel (L)"
+):
+    response = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+    )
+    response["result"].update(
+        {
+            "task_shape": "aggregate",
+            "candidate_task_shapes": ["aggregate"],
+            "reason_codes": ["semantic_operation_hint"],
+            "aggregate_spec": {"function": function, "field_name": field_name},
+        }
+    )
+    response["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+    ]
+    return response
+
+
+def _future_aggregate_plan(*, function="median", field_name="Fuel (L)"):
+    response = _plan_response(
+        requirements=[
+            {
+                "requirement_id": "complete-scope",
+                "requirement_kind": "complete_scope_coverage",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "context-delivery",
+                "requirement_kind": "context_delivery",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "no-truncation",
+                "requirement_kind": "no_material_truncation",
+                "criticality": "material",
+            },
+        ]
+    )
+    response["result"].update(
+        {
+            "task_shape": "aggregate",
+            "completeness_expectation": "complete_for_declared_scope",
+            "eligible_source_ids": ["source_a"],
+            "authoritative_source_ids": [],
+            "selected_strategies": ["structured_field_values"],
+            "aggregate_spec": {"function": function, "field_name": field_name},
+        }
+    )
+    return response
+
+
+@pytest.mark.parametrize(
+    "function",
+    ["median", "mean", "count", "sum", "minimum", "maximum"],
+)
+def test_aggregate_spec_accepts_closed_functions(function):
+    spec = AggregateSpec.model_validate(
+        {"function": function, "field_name": "Fuel (L)"}
+    )
+    assert spec.model_dump(mode="json") == {
+        "function": function,
+        "field_name": "Fuel (L)",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"function": "average", "field_name": "Fuel (L)"},
+        {"function": "median", "field_name": ""},
+        {"function": "median", "field_name": " Fuel (L)"},
+        {"function": "median", "field_name": "Fuel (L) "},
+        {"function": "median", "field_name": "Fuel\n(L)"},
+        {"function": "median", "field_name": "x" * 121},
+        {"function": "median", "field_name": "Fuel (L)", "extra": True},
+    ],
+)
+def test_aggregate_spec_rejects_malformed_contract(payload):
+    with pytest.raises(ValidationError):
+        AggregateSpec.model_validate(payload)
+
+
+def test_shape_result_accepts_only_derived_aggregate_spec():
+    aggregate = ShapeResult.model_validate(_future_aggregate_shape()["result"])
+    assert aggregate.aggregate_spec == AggregateSpec(
+        function="median", field_name="Fuel (L)"
+    )
+
+    missing = copy.deepcopy(_future_aggregate_shape()["result"])
+    missing.pop("aggregate_spec")
+    with pytest.raises(ValidationError):
+        ShapeResult.model_validate(missing)
+
+    nonaggregate_shapes = [
+        "targeted_lookup",
+        "bounded_exhaustive_review",
+        "cross_source_comparison",
+        "contradiction_review",
+        "absence_or_coverage_check",
+        "historical_reconstruction",
+        "recommendation_or_decision_support",
+    ]
+    invalid_outcomes = [
+        _shape_response(status="derived", shape=shape)["result"]
+        for shape in nonaggregate_shapes
+    ]
+    invalid_outcomes.extend(
+        [
+            _shape_response(status="ambiguous")["result"],
+            _shape_response(status="not_applicable")["result"],
+        ]
+    )
+    for shape in invalid_outcomes:
+        shape["aggregate_spec"] = {
+            "function": "median",
+            "field_name": "Fuel (L)",
+        }
+        with pytest.raises(ValidationError):
+            ShapeResult.model_validate(shape)
+
+    legacy = ShapeResult.model_validate(_shape_response()["result"])
+    assert "aggregate_spec" not in legacy.model_dump(mode="json")
+
+
+def test_plan_result_accepts_only_aggregate_plan_spec():
+    aggregate = PlanResult.model_validate(_future_aggregate_plan()["result"])
+    assert aggregate.selected_strategies == ["structured_field_values"]
+    assert aggregate.aggregate_spec.field_name == "Fuel (L)"
+
+    missing = copy.deepcopy(_future_aggregate_plan()["result"])
+    missing.pop("aggregate_spec")
+    with pytest.raises(ValidationError):
+        PlanResult.model_validate(missing)
+
+    nonaggregate = _plan_response()["result"]
+    nonaggregate["aggregate_spec"] = {
+        "function": "median",
+        "field_name": "Fuel (L)",
+    }
+    with pytest.raises(ValidationError):
+        PlanResult.model_validate(nonaggregate)
+
+    malformed = copy.deepcopy(_future_aggregate_plan()["result"])
+    malformed["aggregate_spec"]["field_name"] = " Fuel (L)"
+    with pytest.raises(ValidationError):
+        PlanResult.model_validate(malformed)
+
+    legacy = PlanResult.model_validate(_plan_response()["result"])
+    assert "aggregate_spec" not in legacy.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("status", ["ready", "ready_with_limitations", "unsupported"])
+def test_aggregate_plan_statuses_and_field_limitation_are_contract_compatible(status):
+    payload = _future_aggregate_plan()["result"]
+    payload["plan_status"] = status
+    if status == "ready_with_limitations":
+        payload["declared_requirements"].append(
+            {
+                "requirement_id": "optional-field",
+                "requirement_kind": "targeted_evidence",
+                "criticality": "optional",
+            }
+        )
+        payload["limitation_codes"] = ["aggregate_field_unavailable"]
+
+    plan = PlanResult.model_validate(payload)
+
+    assert plan.plan_status == status
+    assert plan.aggregate_spec.field_name == "Fuel (L)"
+
+
+def test_plan_source_descriptor_content_fields_are_bounded_exact_and_optional():
+    base = {
+        "source_id": "source_a",
+        "source_categories": ["records"],
+        "capabilities": ["targeted_retrieval"],
+        "availability": "available",
+        "authority_role": "authoritative",
+    }
+    legacy = EvidenceSourceDescriptor.model_validate(base)
+    exact = EvidenceSourceDescriptor.model_validate(
+        {**base, "content_fields": [" Fuel (L)", "Date", "Odometer"]}
+    )
+    assert "content_fields" not in legacy.model_dump(mode="json")
+    assert exact.content_fields == [" Fuel (L)", "Date", "Odometer"]
+
+    invalid_values = [
+        None,
+        [f"field-{index:02d}" for index in range(25)],
+        [""],
+        ["Field\nName"],
+        ["Date", "Date"],
+        ["Odometer", "Date"],
+        [1],
+        ["x" * 121],
+    ]
+    for content_fields in invalid_values:
+        with pytest.raises(ValidationError):
+            EvidenceSourceDescriptor.model_validate(
+                {**base, "content_fields": content_fields}
+            )
+
+
+def test_adapt_inventory_adds_content_fields_only_when_explicitly_requested():
+    source = _source(
+        "source_a",
+        content_fields=["Odometer", " Fuel (L)", "Date"],
+    )
+    inventory = DsaSourceListResponse.model_validate({"sources": [source]})
+
+    legacy = _adapt_inventory(inventory)
+    aggregate = _adapt_inventory(inventory, include_content_fields=True)
+
+    assert "content_fields" not in legacy[0]
+    assert aggregate[0]["content_fields"] == [
+        " Fuel (L)",
+        "Date",
+        "Odometer",
+    ]
+    assert set(aggregate[0]) == {
+        "source_id",
+        "source_categories",
+        "capabilities",
+        "availability",
+        "authority_role",
+        "content_fields",
+    }
+
+
+@pytest.mark.asyncio
+async def test_future_aggregate_contract_reaches_plan_then_remains_unsupported():
+    runtime = FakeRuntime(
+        shape=_future_aggregate_shape(),
+        plan=_future_aggregate_plan(),
+        auto_source_match=False,
+    )
+    dsa = FakeDsa(
+        [_source("source_a", content_fields=["Odometer", "Fuel (L)", "Date"])],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"source_ids": ["source_a"]},
+        **SCOPE,
+    )
+
+    assert state.status == "unsupported_plan"
+    assert state.shape.task_shape == "aggregate"
+    assert state.declared_scope["source_ids"] == ["source_a"]
+    assert state.plan.aggregate_spec == state.shape.aggregate_spec
+    assert state.plan.selected_strategies == ["structured_field_values"]
+    plan_call = [payload for name, payload in runtime.calls if name == "plan"]
+    assert plan_call[0]["aggregate_spec"] == {
+        "function": "median",
+        "field_name": "Fuel (L)",
+    }
+    assert plan_call[0]["source_inventory"][0]["content_fields"] == [
+        "Date",
+        "Fuel (L)",
+        "Odometer",
+    ]
+    assert [name for name, _ in runtime.calls] == ["shape", "plan"]
+    assert dsa.calls == ["list_sources"]
+    assert state.sufficiency is None
+    assert state.next_step is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("function", "field_name"),
+    [("mean", "Fuel (L)"), ("median", "Fuel (Gallons)")],
+)
+async def test_future_aggregate_plan_spec_mismatch_fails_closed(
+    function,
+    field_name,
+):
+    runtime = FakeRuntime(
+        shape=_future_aggregate_shape(),
+        plan=_future_aggregate_plan(function=function, field_name=field_name),
+        auto_source_match=False,
+    )
+    dsa = FakeDsa(
+        [_source("source_a", content_fields=["Fuel (L)"])],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"source_ids": ["source_a"]},
+        **SCOPE,
+    )
+
+    assert state.status == "plan_dependency_failed"
+    assert state.plan is None
+    assert dsa.calls == ["list_sources"]
+    assert [name for name, _ in runtime.calls] == ["shape", "plan"]
+
+
+@pytest.mark.asyncio
+async def test_future_aggregate_authority_details_remain_private_in_trace():
+    sentinel = "Fuel (L)"
+    runtime = FakeRuntime(
+        shape=_future_aggregate_shape(field_name=sentinel),
+        plan=_future_aggregate_plan(field_name=sentinel),
+        auto_source_match=False,
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [_source("source_a", content_fields=[sentinel])],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"source_ids": ["source_a"]},
+        **SCOPE,
+    )
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace={"called": False, "status": "not_called"},
+        retained_source_refs=set(),
+    )
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert sentinel not in serialized
+    assert "content_fields" not in serialized
+    assert "aggregate_spec" not in serialized
+    assert manifest["shape"]["task_shape"] == "aggregate"
+    assert manifest["plan"]["selected_strategies"] == [
+        "structured_field_values"
+    ]
 
 
 def test_source_discovery_projection_is_canonical_bounded_and_private():

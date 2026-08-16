@@ -911,6 +911,7 @@ class RuntimeClient:
         task_shape: str,
         declared_scope: dict[str, Any],
         source_inventory: list[dict[str, Any]],
+        aggregate_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         scope = {
             "request_id": request_id,
@@ -920,15 +921,18 @@ class RuntimeClient:
             "runtime_session_id": runtime_session_id,
             "runtime_turn_id": runtime_turn_id,
         }
+        payload = {
+            **scope,
+            "question_anchor": question_anchor,
+            "task_shape": task_shape,
+            "declared_scope": declared_scope,
+            "source_inventory": source_inventory,
+        }
+        if aggregate_spec is not None:
+            payload["aggregate_spec"] = aggregate_spec
         response = await self._post(
             "/v1/runtime/evidence-plans/compile",
-            json={
-                **scope,
-                "question_anchor": question_anchor,
-                "task_shape": task_shape,
-                "declared_scope": declared_scope,
-                "source_inventory": source_inventory,
-            },
+            json=payload,
         )
         if not isinstance(response, dict) or any(
             response.get(field) != value for field, value in scope.items()
