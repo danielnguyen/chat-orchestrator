@@ -431,15 +431,48 @@ SemanticOperationHint = Literal[
     "aggregate",
     "unknown",
 ]
+AggregateFunction = Literal[
+    "median",
+    "mean",
+    "count",
+    "sum",
+    "minimum",
+    "maximum",
+]
+AggregateFieldName = Annotated[StrictStr, Field(min_length=1, max_length=120)]
 
 
 class EvidenceInterpreterOutput(StrictModel):
     interpretation_status: SemanticInterpretationStatus
     operation_hint: SemanticOperationHint
     candidate_source_ids: list[Identifier] = Field(max_length=3)
+    aggregate_function: AggregateFunction | None = None
+    aggregate_field_name: AggregateFieldName | None = None
+
+    @field_validator("aggregate_field_name")
+    @classmethod
+    def validate_aggregate_field_name(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return value
+        if value != value.strip():
+            raise ValueError("aggregate_field_name_has_outer_whitespace")
+        if re.search(r"[\x00-\x1f\x7f]", value):
+            raise ValueError("aggregate_field_name_has_control_character")
+        return value
 
     @model_validator(mode="after")
     def validate_candidate_set(self) -> EvidenceInterpreterOutput:
+        aggregate_details = (
+            self.aggregate_function is not None,
+            self.aggregate_field_name is not None,
+        )
+        if self.operation_hint != "aggregate" and any(aggregate_details):
+            raise ValueError("aggregate_details_require_aggregate_operation")
+        if aggregate_details[0] != aggregate_details[1]:
+            raise ValueError("aggregate_details_must_be_supplied_together")
         candidate_count = len(self.candidate_source_ids)
         if len(set(self.candidate_source_ids)) != candidate_count:
             raise ValueError("duplicate_semantic_candidate_source_id")
@@ -1822,6 +1855,8 @@ def _source_discovery_projection(
                 mode="json",
                 exclude_none=True,
             )
+        if source.content_fields is not None:
+            projected["content_fields"] = sorted(source.content_fields)
         sources.append(projected)
     return {
         "inventory_status": source_list.inventory_status or "unknown",
@@ -1894,11 +1929,40 @@ def evidence_interpreter_response_format() -> dict[str, Any]:
                             "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
                         },
                     },
+                    "aggregate_function": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": [
+                                    "median",
+                                    "mean",
+                                    "count",
+                                    "sum",
+                                    "minimum",
+                                    "maximum",
+                                ],
+                            },
+                            {"type": "null"},
+                        ]
+                    },
+                    "aggregate_field_name": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 120,
+                                "pattern": r"^(?!\s)[^\x00-\x1f\x7f]*\S$",
+                            },
+                            {"type": "null"},
+                        ]
+                    },
                 },
                 "required": [
                     "interpretation_status",
                     "operation_hint",
                     "candidate_source_ids",
+                    "aggregate_function",
+                    "aggregate_field_name",
                 ],
             },
         },
@@ -1927,7 +1991,14 @@ def evidence_interpreter_messages(
                 "than name a source. Choose only source_id values in the supplied "
                 "inventory. Return ambiguous for two or three genuinely plausible "
                 "sources, or no_match when none is plausible. Do not answer the user, "
-                "infer access authority, use tools, or explain the result. Return "
+                "infer access authority, use tools, or explain the result. For an "
+                "aggregate request, choose aggregate_function only from median, mean, "
+                "count, sum, minimum, or maximum, and copy aggregate_field_name "
+                "exactly from content_fields shared by every selected candidate. Do "
+                "not invent, trim, or normalize field names. Use null for both "
+                "aggregate fields on non-aggregate requests; aggregate no_match may "
+                "also use null because no executable candidate field was established. "
+                "Return "
                 "exactly one JSON object matching the supplied schema."
             ),
         },
@@ -1981,9 +2052,29 @@ def parse_evidence_interpreter_completion(
     output = EvidenceInterpreterOutput.model_validate(decoded)
     if not set(output.candidate_source_ids).issubset(inventory_source_ids):
         raise ValueError("semantic_candidate_source_not_in_inventory")
-    projected = output.model_dump()
+    projected = output.model_dump(exclude_none=True)
     projected["candidate_source_ids"] = sorted(output.candidate_source_ids)
     return projected
+
+
+def _validate_aggregate_advisory_inventory(
+    advisory: EvidenceInterpreterOutput,
+    source_list: DsaSourceListResponse,
+) -> None:
+    if (
+        advisory.operation_hint != "aggregate"
+        or advisory.aggregate_field_name is None
+    ):
+        return
+    sources_by_id = {source.source_id: source for source in source_list.sources}
+    for source_id in advisory.candidate_source_ids:
+        source = sources_by_id.get(source_id)
+        if source is None:
+            raise ValueError("semantic_candidate_source_not_in_inventory")
+        if source.content_fields is None:
+            raise ValueError("aggregate_candidate_content_fields_required")
+        if advisory.aggregate_field_name not in source.content_fields:
+            raise ValueError("aggregate_field_not_configured_for_candidate")
 
 
 def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
@@ -2774,7 +2865,8 @@ async def begin_evidence_acquisition(
             }
             if not set(advisory.candidate_source_ids).issubset(inventory_source_ids):
                 raise ValueError("semantic_candidate_source_not_in_inventory")
-            advisory_payload = advisory.model_dump()
+            _validate_aggregate_advisory_inventory(advisory, state.inventory)
+            advisory_payload = advisory.model_dump(exclude_none=True)
             advisory_payload["candidate_source_ids"] = sorted(
                 advisory.candidate_source_ids
             )

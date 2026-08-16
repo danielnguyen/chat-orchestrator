@@ -23,6 +23,7 @@ from services.evidence_acquisition import (
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
     EvidenceCandidateValidation,
+    EvidenceInterpreterOutput,
     ExactFetchProposal,
     NextStepResult,
     PlanResult,
@@ -130,6 +131,7 @@ def _source(
     connector="neutral_connector",
     last_error=None,
     scope_refs=None,
+    content_fields=None,
 ):
     source = {
         "source_id": source_id,
@@ -148,6 +150,8 @@ def _source(
         source["authority_role"] = authority_role
     if scope_refs is not None:
         source["scope_refs"] = scope_refs
+    if content_fields is not None:
+        source["content_fields"] = content_fields
     return source
 
 
@@ -868,6 +872,7 @@ def test_source_discovery_projection_is_canonical_bounded_and_private():
         enabled=False,
         status="ready",
         scope_refs={"project": "public-project", "time": "fy2026"},
+        content_fields=["Zulu Field", " Fuel (L)", "Alpha Field"],
     )
     source_b["last_error"] = "PRIVATE-LAST-ERROR"
     source_b["sensitivity"] = "restricted"
@@ -900,6 +905,11 @@ def test_source_discovery_projection_is_canonical_bounded_and_private():
         "time": "fy2026",
         "project": "public-project",
     }
+    assert projection["sources"][1]["content_fields"] == [
+        " Fuel (L)",
+        "Alpha Field",
+        "Zulu Field",
+    ]
     serialized = json.dumps(projection, sort_keys=True)
     for prohibited in (
         "sensitivity",
@@ -919,6 +929,7 @@ def test_source_discovery_projection_legacy_inventory_is_unknown_and_omits_scope
 
     assert projection["inventory_status"] == "unknown"
     assert "scope_refs" not in projection["sources"][0]
+    assert "content_fields" not in projection["sources"][0]
 
 
 def _semantic_completion(payload):
@@ -994,6 +1005,15 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
         "authority_role",
     ):
         assert forbidden not in serialized
+    system_instruction = messages[0]["content"]
+    assert "aggregate_function" in system_instruction
+    assert "aggregate_field_name" in system_instruction
+    assert "copy aggregate_field_name exactly from content_fields" in (
+        system_instruction.lower()
+    )
+    assert "do not invent, trim, or normalize field names" in (
+        system_instruction.lower()
+    )
 
 
 def test_evidence_interpreter_response_format_is_strict_and_closed():
@@ -1002,11 +1022,152 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
     assert schema["schema"]["properties"]["candidate_source_ids"]["maxItems"] == 3
-    assert set(schema["schema"]["required"]) == {
+    assert schema["schema"]["required"] == [
         "interpretation_status",
         "operation_hint",
         "candidate_source_ids",
+        "aggregate_function",
+        "aggregate_field_name",
+    ]
+    function_schema = schema["schema"]["properties"]["aggregate_function"]
+    assert function_schema == {
+        "anyOf": [
+            {
+                "type": "string",
+                "enum": ["median", "mean", "count", "sum", "minimum", "maximum"],
+            },
+            {"type": "null"},
+        ]
     }
+    field_schema = schema["schema"]["properties"]["aggregate_field_name"]
+    assert field_schema == {
+        "anyOf": [
+            {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "pattern": r"^(?!\s)[^\x00-\x1f\x7f]*\S$",
+            },
+            {"type": "null"},
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "aggregate_function",
+    ["median", "mean", "count", "sum", "minimum", "maximum"],
+)
+def test_evidence_interpreter_output_accepts_closed_aggregate_contract(
+    aggregate_function,
+):
+    output = EvidenceInterpreterOutput.model_validate(
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": aggregate_function,
+            "aggregate_field_name": "Fuel (L)",
+        }
+    )
+
+    assert output.aggregate_function == aggregate_function
+    assert output.aggregate_field_name == "Fuel (L)"
+
+
+def test_evidence_interpreter_output_preserves_legacy_and_nullable_contracts():
+    legacy_lookup = EvidenceInterpreterOutput.model_validate(
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "lookup",
+            "candidate_source_ids": ["source_a"],
+        }
+    )
+    legacy_aggregate = EvidenceInterpreterOutput.model_validate(
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+        }
+    )
+    nullable_lookup = EvidenceInterpreterOutput.model_validate(
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "lookup",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": None,
+            "aggregate_field_name": None,
+        }
+    )
+
+    assert legacy_lookup.aggregate_function is None
+    assert legacy_aggregate.aggregate_field_name is None
+    assert nullable_lookup.aggregate_function is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "average",
+            "aggregate_field_name": "Fuel (L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_field_name": "Fuel (L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "lookup",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+            "aggregate_field_name": "Fuel (L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+            "aggregate_field_name": " Fuel (L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+            "aggregate_field_name": "Fuel\n(L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+            "aggregate_field_name": "x" * 121,
+        },
+    ],
+    ids=[
+        "unknown-function",
+        "function-only",
+        "field-only",
+        "details-on-lookup",
+        "outer-whitespace",
+        "control-character",
+        "overlong-field",
+    ],
+)
+def test_evidence_interpreter_output_rejects_invalid_aggregate_contract(payload):
+    with pytest.raises(ValidationError):
+        EvidenceInterpreterOutput.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -1087,6 +1248,50 @@ def test_evidence_interpreter_parser_canonicalizes_candidate_ids():
     )
 
     assert parsed["candidate_source_ids"] == ["source_a", "source_b"]
+
+
+def test_evidence_interpreter_parser_omits_provider_nulls_from_cr_advisory():
+    parsed = parse_evidence_interpreter_completion(
+        _semantic_completion(
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "lookup",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": None,
+                "aggregate_field_name": None,
+            }
+        ),
+        inventory_source_ids={"source_a"},
+    )
+
+    assert parsed == {
+        "interpretation_status": "resolved",
+        "operation_hint": "lookup",
+        "candidate_source_ids": ["source_a"],
+    }
+
+
+def test_evidence_interpreter_parser_preserves_enriched_aggregate_details():
+    parsed = parse_evidence_interpreter_completion(
+        _semantic_completion(
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "aggregate",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": "median",
+                "aggregate_field_name": "Fuel (L)",
+            }
+        ),
+        inventory_source_ids={"source_a"},
+    )
+
+    assert parsed == {
+        "interpretation_status": "resolved",
+        "operation_hint": "aggregate",
+        "candidate_source_ids": ["source_a"],
+        "aggregate_function": "median",
+        "aggregate_field_name": "Fuel (L)",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1535,6 +1740,8 @@ async def test_not_applicable_no_match_uses_semantic_second_derivation_and_cr_sc
             "interpretation_status": "resolved",
             "operation_hint": "lookup",
             "candidate_source_ids": ["source_a"],
+            "aggregate_function": None,
+            "aggregate_field_name": None,
         }
 
     state = await begin_evidence_acquisition(
@@ -1787,6 +1994,227 @@ async def test_semantic_ambiguity_and_aggregate_never_compile_a_plan():
     assert aggregate_state.shape.task_shape is None
     assert all(call[0] != "plan" for call in ambiguous_runtime.calls)
     assert all(call[0] != "plan" for call in aggregate_runtime.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_count", [1, 2, 3])
+async def test_enriched_aggregate_reaches_cr_and_remains_fail_closed(candidate_count):
+    candidate_ids = [f"source_{letter}" for letter in "abc"[:candidate_count]]
+    first = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    second = _shape_with_source_match(
+        status="matched" if candidate_count == 1 else "ambiguous",
+        matched_source_ids=candidate_ids if candidate_count == 1 else [],
+        derivation_status="ambiguous",
+    )
+    second["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+        if candidate_count == 1
+        else "semantic_candidates_ambiguous"
+    ]
+    second["result"]["reason_codes"] = [
+        "semantic_operation_hint",
+        "semantic_operation_unsupported",
+    ]
+    runtime = SequentialShapeRuntime([first, second])
+    dsa = FakeDsa(
+        [
+            _source(
+                source_id,
+                content_fields=["Date", "Fuel (L)", "Odometer"],
+            )
+            for source_id in candidate_ids
+        ],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": (
+                "resolved" if candidate_count == 1 else "ambiguous"
+            ),
+            "operation_hint": "aggregate",
+            "candidate_source_ids": list(reversed(candidate_ids)),
+            "aggregate_function": "median",
+            "aggregate_field_name": "Fuel (L)",
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    shape_calls = [payload for name, payload in runtime.calls if name == "shape"]
+    assert state.status == "ambiguous"
+    assert state.shape.derivation_status == "ambiguous"
+    assert state.shape.task_shape is None
+    assert state.shape.candidate_task_shapes == []
+    assert state.shape.source_match.probe_source_ids == []
+    assert state.declared_scope is None
+    assert state.plan is None
+    assert state.semantic_interpreter == {
+        "called": True,
+        "status": "accepted",
+        "reason": "validated",
+        "interpretation_status": (
+            "resolved" if candidate_count == 1 else "ambiguous"
+        ),
+        "operation_hint": "aggregate",
+        "candidate_count": candidate_count,
+    }
+    assert len(shape_calls) == 2
+    assert all(
+        source["content_fields"] == ["Date", "Fuel (L)", "Odometer"]
+        for source in shape_calls[1]["task_context"]["source_discovery"]["sources"]
+    )
+    assert shape_calls[1]["task_context"]["semantic_advisory"] == {
+        "interpretation_status": (
+            "resolved" if candidate_count == 1 else "ambiguous"
+        ),
+        "operation_hint": "aggregate",
+        "candidate_source_ids": candidate_ids,
+        "aggregate_function": "median",
+        "aggregate_field_name": "Fuel (L)",
+    }
+    assert all(name != "plan" for name, _ in runtime.calls)
+    assert dsa.calls == ["list_sources"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate_fields", "aggregate_field_name"),
+    [
+        ([None], "Fuel (L)"),
+        (["Date"], "Fuel (L)"),
+        (["fuel (l)"], "Fuel (L)"),
+        (["Fuel"], "Fuel (L)"),
+        (["Fuel (L)", "Date"], "Fuel (L)"),
+        (["Fuel (L)", "Fuel (L)", "Date"], "Fuel (L)"),
+    ],
+    ids=[
+        "missing-content-fields",
+        "field-absent",
+        "case-mismatch",
+        "substring-only",
+        "second-candidate-missing",
+        "third-candidate-missing",
+    ],
+)
+async def test_enriched_aggregate_rejects_unsafe_candidate_field_membership(
+    candidate_fields,
+    aggregate_field_name,
+):
+    candidate_ids = [f"source_{letter}" for letter in "abc"[: len(candidate_fields)]]
+    first = _shape_with_source_match(status="no_match", derivation_status="derived")
+    sources = []
+    for source_id, field in zip(candidate_ids, candidate_fields, strict=True):
+        fields = None if field is None else [field]
+        sources.append(_source(source_id, content_fields=fields))
+    unrelated = _source("source_unrelated", content_fields=["Fuel (L)"])
+    runtime = SequentialShapeRuntime([first])
+    dsa = FakeDsa(
+        [*sources, unrelated],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": (
+                "resolved" if len(candidate_ids) == 1 else "ambiguous"
+            ),
+            "operation_hint": "aggregate",
+            "candidate_source_ids": candidate_ids,
+            "aggregate_function": "median",
+            "aggregate_field_name": aggregate_field_name,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "semantic_interpreter_failed"
+    assert state.semantic_interpreter["reason"] == "malformed_response"
+    assert [name for name, _ in runtime.calls] == ["shape"]
+    assert state.plan is None
+    assert dsa.calls == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_enriched_aggregate_field_is_private_in_manifest_trace():
+    sentinel = "PRIVATE_AGGREGATE_FIELD"
+    first = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    second = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+        derivation_status="ambiguous",
+    )
+    second["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+    ]
+    second["result"]["reason_codes"] = [
+        "semantic_operation_hint",
+        "semantic_operation_unsupported",
+    ]
+    runtime = SequentialShapeRuntime([first, second])
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+            "aggregate_field_name": sentinel,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [_source("source_a", content_fields=[sentinel])],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+    manifest = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace={"called": False, "status": "not_called"},
+        retained_source_refs=set(),
+    )
+
+    serialized_manifest = json.dumps(manifest, sort_keys=True)
+    assert sentinel in json.dumps(runtime.calls[1][1], sort_keys=True)
+    assert sentinel not in serialized_manifest
+    assert "content_fields" not in serialized_manifest
+    assert "aggregate_function" not in serialized_manifest
 
 
 @pytest.mark.asyncio
