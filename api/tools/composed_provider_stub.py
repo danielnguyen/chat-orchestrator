@@ -41,6 +41,8 @@ _SEMANTIC_FIXTURE_FIELDS = {
     "operation_hint",
     "candidate_source_ids",
 }
+_SEMANTIC_AGGREGATE_FIELDS = {"aggregate_function", "aggregate_field_name"}
+_AGGREGATE_FUNCTIONS = {"median", "mean", "count", "sum", "minimum", "maximum"}
 _EXTERNAL_EVIDENCE_ITEM = re.compile(
     r"source_ref: (?P<source_ref>[^\n]+)\n(?P<text>[^\n]+)"
 )
@@ -83,7 +85,11 @@ def _validate_identifier(value: object) -> str:
 
 
 def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
-    if set(body) != _SEMANTIC_FIXTURE_FIELDS:
+    supplied = set(body)
+    if not (
+        supplied == _SEMANTIC_FIXTURE_FIELDS
+        or supplied == _SEMANTIC_FIXTURE_FIELDS | _SEMANTIC_AGGREGATE_FIELDS
+    ):
         raise HTTPException(status_code=422, detail="invalid semantic fixture fields")
     request_text = body.get("expected_request_text")
     if (
@@ -139,7 +145,20 @@ def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
     )
     if not consistent:
         raise HTTPException(status_code=422, detail="incoherent semantic fixture")
-    return {
+    aggregate_function = body.get("aggregate_function")
+    aggregate_field_name = body.get("aggregate_field_name")
+    if supplied & _SEMANTIC_AGGREGATE_FIELDS:
+        if (
+            operation_hint != "aggregate"
+            or aggregate_function not in _AGGREGATE_FUNCTIONS
+            or not isinstance(aggregate_field_name, str)
+            or not aggregate_field_name
+            or len(aggregate_field_name) > 120
+            or aggregate_field_name != aggregate_field_name.strip()
+            or re.search(r"[\x00-\x1f\x7f]", aggregate_field_name) is not None
+        ):
+            raise HTTPException(status_code=422, detail="invalid aggregate semantic fixture")
+    fixture = {
         "expected_request_text": request_text,
         "expected_source_id": expected_source_id,
         "expected_content_fields": list(content_fields),
@@ -147,6 +166,10 @@ def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
         "operation_hint": operation_hint,
         "candidate_source_ids": list(candidate_source_ids),
     }
+    if aggregate_function is not None:
+        fixture["aggregate_function"] = aggregate_function
+        fixture["aggregate_field_name"] = aggregate_field_name
+    return fixture
 
 
 def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
@@ -186,11 +209,15 @@ def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
         raise HTTPException(status_code=422, detail="semantic fixture source mismatch")
     if matches[0].get("content_fields") != fixture["expected_content_fields"]:
         raise HTTPException(status_code=422, detail="semantic fixture content fields mismatch")
-    return {
+    result = {
         "interpretation_status": fixture["interpretation_status"],
         "operation_hint": fixture["operation_hint"],
         "candidate_source_ids": fixture["candidate_source_ids"],
     }
+    if "aggregate_function" in fixture:
+        result["aggregate_function"] = fixture["aggregate_function"]
+        result["aggregate_field_name"] = fixture["aggregate_field_name"]
+    return result
 
 
 @app.get("/healthz")

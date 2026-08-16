@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 import pytest
 from models import ChatRequest
@@ -18,9 +19,12 @@ from services.evidence_acquisition import (
     TARGETED_SCOPE_SUFFIX,
     UNSUPPORTED_ANSWER,
     WITHHELD_ANSWER,
+    AggregateNumericValidationError,
     AggregateSpec,
+    DsaContextItem,
     DsaItem,
     DsaSourceListResponse,
+    DsaStructuredFieldValues,
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
     EvidenceCandidateValidation,
@@ -50,14 +54,17 @@ from services.evidence_acquisition import (
     build_current_acquisition_premise,
     build_manifest_trace,
     compile_safe_exact_fetch_proposal,
+    compute_aggregate_result,
     deterministic_clarification_target,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
     evidence_interpreter_messages,
     evidence_interpreter_response_format,
+    execute_aggregate_values,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
+    finalize_aggregate_conclusion,
     helpful_grounded_recovery_allowed,
     parse_evidence_interpreter_completion,
     promote_exact_fetch_proposal,
@@ -72,6 +79,7 @@ from services.evidence_acquisition import (
     validate_context_response,
     validate_evidence_response_candidate,
     validate_fetch_response,
+    validate_structured_field_values_response,
 )
 from settings import Settings
 
@@ -1099,14 +1107,20 @@ def test_adapt_inventory_adds_content_fields_only_when_explicitly_requested():
 
 
 @pytest.mark.asyncio
-async def test_future_aggregate_contract_reaches_plan_then_remains_unsupported():
+async def test_future_aggregate_contract_reaches_supported_execution_boundary():
     runtime = FakeRuntime(
         shape=_future_aggregate_shape(),
         plan=_future_aggregate_plan(),
         auto_source_match=False,
     )
     dsa = FakeDsa(
-        [_source("source_a", content_fields=["Odometer", "Fuel (L)", "Date"])],
+        [
+            _source(
+                "source_a",
+                capabilities=["search", "context"],
+                content_fields=["Odometer", "Fuel (L)", "Date"],
+            )
+        ],
         inventory_metadata={
             "inventory_scope": "configured_sources",
             "inventory_status": "complete",
@@ -1122,7 +1136,8 @@ async def test_future_aggregate_contract_reaches_plan_then_remains_unsupported()
         **SCOPE,
     )
 
-    assert state.status == "unsupported_plan"
+    assert state.status == "acquisition_ready"
+    assert state.supported_aggregate_path is True
     assert state.shape.task_shape == "aggregate"
     assert state.declared_scope["source_ids"] == ["source_a"]
     assert state.plan.aggregate_spec == state.shape.aggregate_spec
@@ -1212,9 +1227,495 @@ async def test_future_aggregate_authority_details_remain_private_in_trace():
     assert "content_fields" not in serialized
     assert "aggregate_spec" not in serialized
     assert manifest["shape"]["task_shape"] == "aggregate"
-    assert manifest["plan"]["selected_strategies"] == [
-        "structured_field_values"
+    assert manifest["plan"]["selected_strategies"] == ["structured_field_values"]
+
+
+def _aggregate_ready_state(*, function="median", field_name="Reading"):
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        request_id="rid",
+        shape=ShapeResult.model_validate(
+            _future_aggregate_shape(
+                function=function,
+                field_name=field_name,
+            )["result"]
+        ),
+        inventory=DsaSourceListResponse.model_validate(
+            {
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+                "sources": [
+                    _source(
+                        "source_a",
+                        capabilities=["search", "context"],
+                        content_fields=["Entry", field_name],
+                    )
+                ],
+            }
+        ),
+        declared_scope={
+            "source_ids": ["source_a"],
+            "source_categories": [],
+            "exact_source_refs": [],
+            "inventory_status": "complete_for_declared_scope",
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        plan=PlanResult.model_validate(
+            _future_aggregate_plan(
+                function=function,
+                field_name=field_name,
+            )["result"]
+        ),
+        manifest_id="evidence_manifest_0123456789abcdef0123456789abcdef",
+    )
+
+
+def _structured_field_response(
+    values,
+    *,
+    field_name="Reading",
+    source_id="source_a",
+    result=True,
+    truncated=False,
+    errors=None,
+):
+    results = []
+    if result:
+        results.append(
+            {
+                "result_id": "structured-result",
+                "source_type": "google_sheets",
+                "source_id": source_id,
+                "source_name": "Private source",
+                "source_ref": f"google_sheets:{source_id}:Measurements!A2:C6",
+                "retrieved_at": "2026-07-17T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": "Configured field values",
+                "content_type": "structured_field_values",
+                "text": "Retrieved configured records.",
+                "url": None,
+                "confidence": "high",
+                "raw": None,
+                "structured_data": {
+                    "kind": "field_values",
+                    "field_name": field_name,
+                    "record_count": len(values),
+                    "non_empty_value_count": sum(value is not None for value in values),
+                    "values": values,
+                },
+                "available_context": [],
+                "warnings": [],
+            }
+        )
+    return {
+        "query_id": "structured-query",
+        "answerable": bool(results),
+        "confidence": "high" if results else "none",
+        "retrieval_mode": "context",
+        "results": results,
+        "warnings": [],
+        "errors": errors or [],
+        "budget": {
+            "max_results": None,
+            "returned_results": len(results),
+            "estimated_bytes": 200 if results else 0,
+            "truncated": truncated,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "multi_source",
+        "exact_ref",
+        "wrong_strategy",
+        "limitation",
+        "missing_requirement",
+        "source_unavailable",
+        "missing_context",
+        "missing_field",
+        "shape_source_mismatch",
+    ],
+)
+def test_supported_aggregate_path_rejects_every_malformed_authority(mutation):
+    state = _aggregate_ready_state()
+    if mutation == "multi_source":
+        state.plan.eligible_source_ids.append("source_b")
+    elif mutation == "exact_ref":
+        state.declared_scope["exact_source_refs"] = [
+            {"source_id": "source_a", "source_ref": "source_a:item"}
+        ]
+    elif mutation == "wrong_strategy":
+        state.plan.selected_strategies = ["targeted_retrieval"]
+    elif mutation == "limitation":
+        state.plan.limitation_codes = ["aggregate_field_unavailable"]
+    elif mutation == "missing_requirement":
+        state.plan.declared_requirements.pop()
+    elif mutation == "source_unavailable":
+        state.inventory.sources[0].status = "unavailable"
+    elif mutation == "missing_context":
+        state.inventory.sources[0].capabilities = ["search"]
+    elif mutation == "missing_field":
+        state.inventory.sources[0].content_fields = ["Entry"]
+    else:
+        state.shape.source_match.matched_source_ids = ["source_b"]
+
+    assert state.supported_aggregate_path is False
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ("satisfied", "satisfied"),
+        ("unknown", "unknown"),
+        ("failed", "failed"),
+        ("filtered", "filtered"),
+        ("truncated", "truncated"),
+        ("unsupported", "unsupported"),
+    ],
+)
+def test_aggregate_outcome_maps_uniformly_to_material_requirements(outcome, expected):
+    state = _aggregate_ready_state()
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=None,
+        dsa_trace={"status": "empty"},
+        retained_source_refs=set(),
+        aggregate_execution={"outcome": outcome},
+    )
+    assert {fact["outcome"] for fact in facts} == {expected}
+
+
+def test_aggregate_current_premise_binds_spec_and_content_fields():
+    state = _aggregate_ready_state()
+    premise = build_current_acquisition_premise(state)
+
+    assert premise.aggregate_spec == state.plan.aggregate_spec
+    assert premise.source_inventory[0].content_fields == ["Entry", "Reading"]
+    assert _acquisition_premise_digest(premise) == (
+        "sha256:c475d6003f2a6f51f235ccc9f338324c17e506eff29fa7d7aae5071a82cdd81a"
+    )
+    legacy = build_current_acquisition_premise(_next_step_test_state())
+    assert "aggregate_spec" not in legacy.model_dump(mode="json")
+    assert "content_fields" not in legacy.source_inventory[0].model_dump(mode="json")
+
+
+def test_structured_field_value_contract_is_strict_and_counted():
+    structured = DsaStructuredFieldValues.model_validate(
+        {
+            "kind": "field_values",
+            "field_name": "Reading",
+            "record_count": 3,
+            "non_empty_value_count": 2,
+            "values": ["10", None, "20"],
+        }
+    )
+    assert structured.values == ["10", None, "20"]
+    for update in (
+        {"record_count": 2},
+        {"non_empty_value_count": 1},
+        {"field_name": " Reading"},
+        {"values": ["10", 2, None]},
+        {"extra": True},
+    ):
+        payload = structured.model_dump(mode="json")
+        payload.update(update)
+        with pytest.raises(ValidationError):
+            DsaStructuredFieldValues.model_validate(payload)
+
+    legacy_item = _context_response()["results"][0]
+    serialized_legacy = DsaContextItem.model_validate(legacy_item).model_dump(mode="json")
+    assert "structured_data" not in serialized_legacy
+
+    legacy_item["structured_data"] = structured.model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        DsaContextItem.model_validate(legacy_item)
+
+    structured_item = _structured_field_response(["10", None, "20"])["results"][0]
+    serialized_structured = DsaContextItem.model_validate(structured_item).model_dump(mode="json")
+    assert serialized_structured["structured_data"]["kind"] == "field_values"
+
+
+def test_structured_response_requires_exact_source_field_and_shape():
+    valid, outcome = validate_structured_field_values_response(
+        _structured_field_response(["10", None, "20"]),
+        expected_source_id="source_a",
+        expected_field_name="Reading",
+    )
+    assert outcome == "satisfied"
+    assert valid.results[0].raw is None
+    assert valid.results[0].available_context == []
+
+    for response, expected in (
+        (_structured_field_response([], result=False), "unknown"),
+        (_structured_field_response(["10"], truncated=True), "truncated"),
+        (_structured_field_response(["10"], source_id="source_b"), "filtered"),
+        (_structured_field_response(["10"], field_name="Other"), "filtered"),
+    ):
+        _, outcome = validate_structured_field_values_response(
+            response,
+            expected_source_id="source_a",
+            expected_field_name="Reading",
+        )
+        assert outcome == expected
+
+
+@pytest.mark.parametrize(
+    ("function", "expected"),
+    [
+        ("median", 'Median for "Reading": 27.875 (4 non-empty values across 5 records).'),
+        ("mean", 'Mean for "Reading": 30.40625 (4 non-empty values across 5 records).'),
+        ("count", 'Count for "Reading": 4 non-empty values across 5 records.'),
+        ("sum", 'Sum for "Reading": 121.625 (4 non-empty values across 5 records).'),
+        ("minimum", 'Minimum for "Reading": 10.125 (4 non-empty values across 5 records).'),
+        ("maximum", 'Maximum for "Reading": 55.75 (4 non-empty values across 5 records).'),
+    ],
+)
+def test_deterministic_aggregate_numeric_matrix(function, expected):
+    structured = DsaStructuredFieldValues.model_validate(
+        {
+            "kind": "field_values",
+            "field_name": "Reading",
+            "record_count": 5,
+            "non_empty_value_count": 4,
+            "values": ["10.125", "20.25", None, "35.5", "55.75"],
+        }
+    )
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function=function, field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.answer == expected
+
+
+def test_aggregate_decimal_edges_and_count_semantics():
+    def compute(function, values):
+        structured = DsaStructuredFieldValues(
+            kind="field_values",
+            field_name="Reading",
+            record_count=len(values),
+            non_empty_value_count=sum(value is not None for value in values),
+            values=values,
+        )
+        return compute_aggregate_result(
+            aggregate_spec=AggregateSpec(function=function, field_name="Reading"),
+            structured_data=structured,
+        )
+
+    assert compute("median", ["-1", "+1", "00012.500"]).rendered_value == "1"
+    assert compute("median", ["-1", "+1"]).rendered_value == "0"
+    assert compute("sum", ["-0.000"]).rendered_value == "0"
+    assert compute("count", ["ready", None, "pending"]).answer == (
+        'Count for "Reading": 2 non-empty values across 3 records.'
+    )
+    repeating = compute("mean", ["1", "0", "0"])
+    assert repeating.approximate is True
+    assert repeating.answer == (
+        'Mean for "Reading": approximately '
+        "0.3333333333333333333333333333333333 "
+        "(3 non-empty values across 3 records)."
+    )
+
+
+def _max_bound_decimal_inputs():
+    return "9" * 120, "0." + "0" * 117 + "1"
+
+
+def _high_precision_canonical(value):
+    rendered = format(value, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def test_max_bound_sum_preserves_complete_fractional_tail():
+    large, tiny = _max_bound_decimal_inputs()
+    values = [large] * 249 + [tiny]
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=250,
+        non_empty_value_count=250,
+        values=values,
+    )
+    with localcontext() as oracle_context:
+        oracle_context.prec = 300
+        oracle_context.rounding = ROUND_HALF_EVEN
+        expected = _high_precision_canonical(sum((Decimal(value) for value in values), Decimal(0)))
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function="sum", field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.rendered_value == expected
+    assert result.rendered_value.endswith("0" * 117 + "1")
+
+
+def test_max_bound_even_median_is_exact_beyond_160_digits():
+    large, tiny = _max_bound_decimal_inputs()
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=2,
+        non_empty_value_count=2,
+        values=[large, tiny],
+    )
+    with localcontext() as oracle_context:
+        oracle_context.prec = 300
+        oracle_context.rounding = ROUND_HALF_EVEN
+        expected = _high_precision_canonical((Decimal(large) + Decimal(tiny)) / Decimal(2))
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function="median", field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.rendered_value == expected
+
+
+def test_max_bound_mean_uses_exact_numerator_before_precision_34_division():
+    _, tiny = _max_bound_decimal_inputs()
+    large = "9" * 119
+    values = [large, tiny, "-" + large]
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=3,
+        non_empty_value_count=3,
+        values=values,
+    )
+    with localcontext() as oracle_context:
+        oracle_context.prec = 300
+        oracle_context.rounding = ROUND_HALF_EVEN
+        numerator = sum((Decimal(value) for value in values), Decimal(0))
+    with localcontext() as mean_context:
+        mean_context.prec = 34
+        mean_context.rounding = ROUND_HALF_EVEN
+        expected = _high_precision_canonical(numerator / Decimal(3))
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function="mean", field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.rendered_value == expected
+    assert result.approximate is True
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["1e3", "1,000", "$12", "12 L", "NaN", "Infinity", "", " 12", "12 ", "1" * 121],
+)
+def test_numeric_aggregate_rejects_every_invalid_non_null_value(invalid):
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=2,
+        non_empty_value_count=2,
+        values=["10", invalid],
+    )
+    with pytest.raises(AggregateNumericValidationError):
+        compute_aggregate_result(
+            aggregate_spec=AggregateSpec(function="mean", field_name="Reading"),
+            structured_data=structured,
+        )
+
+
+def test_all_null_numeric_filters_but_count_is_zero():
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=2,
+        non_empty_value_count=0,
+        values=[None, None],
+    )
+    assert (
+        compute_aggregate_result(
+            aggregate_spec=AggregateSpec(function="count", field_name="Reading"),
+            structured_data=structured,
+        ).rendered_value
+        == "0"
+    )
+    with pytest.raises(AggregateNumericValidationError):
+        compute_aggregate_result(
+            aggregate_spec=AggregateSpec(function="sum", field_name="Reading"),
+            structured_data=structured,
+        )
+
+
+@pytest.mark.asyncio
+async def test_aggregate_executor_uses_direct_complete_vector_and_keeps_it_private():
+    state = _aggregate_ready_state()
+    dsa = FakeDsa(
+        [],
+        context_responses=[_structured_field_response(["10.125", "20.25", None, "35.5", "55.75"])],
+    )
+    pack, trace = await execute_aggregate_values(
+        state=state,
+        dsa=dsa,
+        dsa_trace={"called": False, "status": "deferred_for_evidence_governance"},
+    )
+
+    assert pack is None
+    assert state.aggregate_result == (
+        'Median for "Reading": 27.875 (4 non-empty values across 5 records).'
+    )
+    assert dsa.calls == [
+        (
+            "context_source",
+            {
+                "source_id": "source_a",
+                "context_mode": "configured_field_values",
+                "field_name": "Reading",
+                "budget": {
+                    "max_rows": 250,
+                    "max_bytes": 5_000_000,
+                    "max_text_chars": 500,
+                },
+            },
+        )
     ]
+    assert trace["context_pack_call_count"] == 0
+    assert trace["context_expansion_call_count"] == 1
+    assert state.aggregate_execution["record_count"] == 5
+    assert state.aggregate_execution["non_empty_value_count"] == 4
+    serialized = json.dumps((trace, state.aggregate_delivery_identity), sort_keys=True)
+    assert "55.75" not in serialized
+    assert "Reading" not in serialized
+    assert state.aggregate_delivery_identity["structured_data_digest"].startswith("sha256:")
+
+
+def test_aggregate_facts_distinguish_numeric_filter_and_policy_blocks_result():
+    state = _aggregate_ready_state()
+    state.aggregate_result = 'Median for "Reading": 27.875 (4 non-empty values across 5 records).'
+    state.aggregate_execution = {
+        "outcome": "filtered",
+        "numeric_validation_failed": True,
+    }
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=None,
+        dsa_trace={"status": "empty"},
+        retained_source_refs=set(),
+        aggregate_execution=state.aggregate_execution,
+    )
+    assert {fact["requirement_id"]: fact["outcome"] for fact in facts} == {
+        "complete-scope": "satisfied",
+        "context-delivery": "filtered",
+        "no-truncation": "satisfied",
+    }
+    finalize_aggregate_conclusion(state)
+    assert state.forced_answer == WITHHELD_ANSWER
+    trace = build_manifest_trace(
+        state=state,
+        context_pack=None,
+        dsa_trace={"called": True, "status": "empty"},
+        retained_source_refs=set(),
+    )
+    serialized = json.dumps(trace, sort_keys=True)
+    assert "Reading" not in serialized
+    assert "27.875" not in serialized
+    assert "content_fields" not in serialized
 
 
 def test_source_discovery_projection_is_canonical_bounded_and_private():

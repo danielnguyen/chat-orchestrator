@@ -13995,22 +13995,20 @@ def _evidence_interpreter_completion(
     interpretation_status,
     operation_hint,
     candidate_source_ids,
+    *,
+    aggregate_function=None,
+    aggregate_field_name=None,
 ):
-    return {
-        "choices": [
-            {
-                "message": {
-                    "content": json.dumps(
-                        {
-                            "interpretation_status": interpretation_status,
-                            "operation_hint": operation_hint,
-                            "candidate_source_ids": candidate_source_ids,
-                        }
-                    )
-                }
-            }
-        ]
+    payload = {
+        "interpretation_status": interpretation_status,
+        "operation_hint": operation_hint,
+        "candidate_source_ids": candidate_source_ids,
     }
+    if aggregate_function is not None:
+        payload["aggregate_function"] = aggregate_function
+    if aggregate_field_name is not None:
+        payload["aggregate_field_name"] = aggregate_field_name
+    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
 
 
 def _first_party_chat_payload(
@@ -18550,6 +18548,118 @@ def _semantic_test_shape(call, *, second_status="resolved"):
     return response
 
 
+def _aggregate_test_shape(call):
+    response = _not_applicable_shape_response(call)
+    advisory = call["task_context"].get("semantic_advisory")
+    if advisory is None:
+        response["result"]["source_match"] = {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        }
+        return response
+    response["result"].update(
+        {
+            "derivation_status": "derived",
+            "task_shape": "aggregate",
+            "candidate_task_shapes": ["aggregate"],
+            "evidence_scope_material": True,
+            "clarification_required": False,
+            "reason_codes": ["semantic_operation_hint"],
+            "aggregate_spec": {
+                "function": advisory["aggregate_function"],
+                "field_name": advisory["aggregate_field_name"],
+            },
+        }
+    )
+    response["result"]["source_match"] = {
+        "status": "matched",
+        "matched_source_ids": list(advisory["candidate_source_ids"]),
+        "reason_codes": ["semantic_candidate_validated"],
+    }
+    return response
+
+
+def _aggregate_plan_response(*, request_id, question):
+    response = _targeted_plan_response(
+        request_id=request_id,
+        question=question,
+        task_shape="aggregate",
+        strategy="structured_field_values",
+        eligible_source_ids=["metrics_archive"],
+    )
+    response["result"].update(
+        {
+            "completeness_expectation": "complete_for_declared_scope",
+            "contradiction_search_required": False,
+            "aggregate_spec": {"function": "median", "field_name": "Reading"},
+            "declared_requirements": [
+                {
+                    "requirement_id": "complete-scope",
+                    "requirement_kind": "complete_scope_coverage",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "context-delivery",
+                    "requirement_kind": "context_delivery",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "no-truncation",
+                    "requirement_kind": "no_material_truncation",
+                    "criticality": "material",
+                },
+            ],
+        }
+    )
+    return response
+
+
+def _aggregate_structured_response():
+    values = ["10.125", "20.25", None, "35.5", "55.75"]
+    return {
+        "query_id": "aggregate-query",
+        "answerable": True,
+        "confidence": "high",
+        "retrieval_mode": "context",
+        "results": [
+            {
+                "result_id": "aggregate-result",
+                "source_type": "google_sheets",
+                "source_id": "metrics_archive",
+                "source_name": "Configured Metrics Archive",
+                "source_ref": "google_sheets:metrics_archive:Measurements!A2:C6",
+                "retrieved_at": "2026-08-16T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": "Configured values",
+                "content_type": "structured_field_values",
+                "text": "Retrieved five configured records.",
+                "url": None,
+                "confidence": "high",
+                "raw": None,
+                "structured_data": {
+                    "kind": "field_values",
+                    "field_name": "Reading",
+                    "record_count": 5,
+                    "non_empty_value_count": 4,
+                    "values": values,
+                },
+                "available_context": [],
+                "warnings": [],
+            }
+        ],
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": None,
+            "returned_results": 1,
+            "estimated_bytes": 250,
+            "truncated": False,
+        },
+    }
+
+
 def _neutral_schedule_sources():
     return [
         {
@@ -19055,6 +19165,120 @@ async def test_semantic_ambiguity_and_aggregate_are_provider_free(
     assert len(runtime.evidence_shape_calls) == 2
     assert runtime.evidence_plan_calls == []
     assert dsa.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_policy", [False, True])
+async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy_gated(
+    tmp_path,
+    block_policy,
+):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "What is the median reading in my measurements?"
+    request_id = f"rid-aggregate-{block_policy}"
+    runtime = FakeRuntime(
+        evidence_shape_response=_aggregate_test_shape,
+        evidence_plan_response=_aggregate_plan_response(
+            request_id=request_id,
+            question=question,
+        ),
+        evidence_next_step_error=(RuntimeError("policy unavailable") if block_policy else None),
+        auto_source_match=False,
+    )
+    dsa = FakeDSA(
+        context_responses=[_aggregate_structured_response()],
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "metrics_archive",
+                    "display_name": "Configured Metrics Archive",
+                    "connector": "google_sheets",
+                    "domain_tags": ["metrics", "archive"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-08-16T00:00:00Z",
+                    "last_error": None,
+                    "content_fields": ["Entry", "Reading"],
+                }
+            ],
+        },
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved",
+                "aggregate",
+                ["metrics_archive"],
+                aggregate_function="median",
+                aggregate_field_name="Reading",
+            )
+        ]
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    expected = 'Median for "Reading": 27.875 (4 non-empty values across 5 records).'
+    assert out["answer"] == (NEXT_STEP_DEPENDENCY_ANSWER if block_policy else expected)
+    assert out["status"] == ("degraded" if block_policy else "ok")
+    assert len(litellm.calls) == 1
+    assert len(runtime.evidence_shape_calls) == 2
+    assert len(runtime.evidence_plan_calls) == 1
+    assert runtime.evidence_plan_calls[0]["aggregate_spec"] == {
+        "function": "median",
+        "field_name": "Reading",
+    }
+    assert runtime.evidence_plan_calls[0]["source_inventory"][0]["content_fields"] == [
+        "Entry",
+        "Reading",
+    ]
+    assert dsa.calls == []
+    assert dsa.context_calls == [
+        {
+            "source_id": "metrics_archive",
+            "context_mode": "configured_field_values",
+            "field_name": "Reading",
+            "budget": {
+                "max_rows": 250,
+                "max_bytes": 5_000_000,
+                "max_text_chars": 500,
+            },
+        }
+    ]
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "complete-scope", "outcome": "satisfied"},
+        {"requirement_id": "context-delivery", "outcome": "satisfied"},
+        {"requirement_id": "no-truncation", "outcome": "satisfied"},
+    ]
+    premise = runtime.evidence_next_step_calls[0]["current_premise"]
+    assert premise["aggregate_spec"] == {
+        "function": "median",
+        "field_name": "Reading",
+    }
+    assert premise["source_inventory"][0]["content_fields"] == ["Entry", "Reading"]
+    serialized_trace = json.dumps(memory_store.trace_calls[-1]["payload"], sort_keys=True)
+    assert "55.75" not in serialized_trace
+    assert "content_fields" not in serialized_trace
+    if block_policy:
+        assert "27.875" not in serialized_trace
 
 
 @pytest.mark.asyncio

@@ -223,22 +223,30 @@ class DataSourceAggregatorClient:
     async def context_source(
         self,
         *,
-        source_ref: str,
+        source_ref: str | None = None,
+        source_id: str | None = None,
         context_mode: str,
+        field_name: str | None = None,
         budget: dict[str, int] | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "context_mode": context_mode,
+            "budget": budget
+            or {
+                "max_rows": 5,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+        if source_ref is not None:
+            payload["source_ref"] = source_ref
+        if source_id is not None:
+            payload["source_id"] = source_id
+        if field_name is not None:
+            payload["field_name"] = field_name
         return await self._post(
             "/v1/sources/context",
-            json={
-                "source_ref": source_ref,
-                "context_mode": context_mode,
-                "budget": budget
-                or {
-                    "max_rows": 5,
-                    "max_bytes": 50000,
-                    "max_text_chars": 12000,
-                },
-            },
+            json=payload,
             request_id=request_id,
         )

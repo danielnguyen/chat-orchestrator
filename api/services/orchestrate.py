@@ -75,9 +75,11 @@ from services.evidence_acquisition import (
     evaluate_acquisition_sufficiency,
     evidence_interpreter_messages,
     evidence_interpreter_response_format,
+    execute_aggregate_values,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
     execute_hybrid_comparison,
+    finalize_aggregate_conclusion,
     governed_evidence_claim_anchor,
     grounded_provider_allowed,
     helpful_grounded_recovery_allowed,
@@ -8381,6 +8383,12 @@ async def orchestrate_chat(
                             state=evidence_acquisition,
                             dsa=dsa,
                         )
+                    elif evidence_acquisition.supported_aggregate_path:
+                        external_context_pack, dsa_trace = await execute_aggregate_values(
+                            state=evidence_acquisition,
+                            dsa=dsa,
+                            dsa_trace=dsa_trace,
+                        )
                     elif evidence_acquisition.supported_bounded_exhaustive_path:
                         governed_plan = evidence_acquisition.plan
                         if governed_plan is None:
@@ -8970,7 +8978,10 @@ async def orchestrate_chat(
                 clarification_target = deterministic_clarification_target(
                     evidence_acquisition
                 )
-                if clarification_target is None:
+                if (
+                    clarification_target is None
+                    and not evidence_acquisition.supported_aggregate_path
+                ):
                     exact_fetch_proposal = await compile_safe_exact_fetch_proposal(
                         state=evidence_acquisition,
                         runtime=runtime,
@@ -9256,6 +9267,8 @@ async def orchestrate_chat(
                             )
                         ),
                     )
+            if evidence_acquisition.supported_aggregate_path:
+                finalize_aggregate_conclusion(evidence_acquisition)
             if advisory_provider_allowed(evidence_acquisition):
                 capability_descriptors = []
                 capability_exposure_trace = {
@@ -9513,7 +9526,14 @@ async def orchestrate_chat(
                 completion = {"choices": [{"message": {"content": ""}}]}
                 selected_model = "not_called"
                 selected_provider = "none"
-                status = "degraded"
+                status = (
+                    "ok"
+                    if evidence_acquisition is not None
+                    and evidence_acquisition.supported_aggregate_path
+                    and evidence_acquisition.aggregate_result is not None
+                    and evidence_acquisition.forced_answer == evidence_acquisition.aggregate_result
+                    else "degraded"
+                )
             elif pending_continuation is not None:
                 completion = {"choices": [{"message": {"content": ""}}]}
             else:

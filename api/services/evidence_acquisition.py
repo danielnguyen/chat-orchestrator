@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
+from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, Rounded, localcontext
 from typing import Annotated, Any, Literal
 
 from models import MaterialScopeReferences
@@ -248,10 +249,22 @@ HELPFUL_GROUNDED_RECOVERY_RESPONSE = (
     "substantive conclusion from it. Please try again."
 )
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
+CONFIGURED_FIELD_VALUES_CONTEXT_MODE = "configured_field_values"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
     "max_rows": 20,
     "max_bytes": 50000,
     "max_text_chars": 12000,
+}
+AGGREGATE_CONTEXT_BUDGET = {
+    "max_rows": 250,
+    "max_bytes": 5000000,
+    "max_text_chars": 500,
+}
+_AGGREGATE_NUMERIC_TOKEN = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+_AGGREGATE_REQUIREMENTS = {
+    "complete_scope_coverage",
+    "context_delivery",
+    "no_material_truncation",
 }
 
 _SCOPE_BOUNDARIES = {
@@ -901,14 +914,28 @@ class EvidenceAcquisitionPremise(StrictModel):
     declared_scope: EvidenceDeclaredScope
     source_inventory: list[EvidenceSourceDescriptor] = Field(max_length=32)
     selected_strategies: list[AcquisitionStrategy] = Field(max_length=5)
+    aggregate_spec: AggregateSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_spec(self, handler):
+        serialized = handler(self)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_unique_premise_values(self) -> EvidenceAcquisitionPremise:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
         source_ids = [source.source_id for source in self.source_inventory]
         if len(set(source_ids)) != len(source_ids):
             raise ValueError("duplicate_source_descriptor")
         if len(set(self.selected_strategies)) != len(self.selected_strategies):
             raise ValueError("duplicate_acquisition_strategy")
+        if self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_premise_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_aggregate_premise")
         return self
 
 
@@ -1337,6 +1364,31 @@ class DsaFetchResponse(StrictModel):
         return self
 
 
+class DsaStructuredFieldValues(StrictModel):
+    kind: Literal["field_values"]
+    field_name: AggregateFieldName
+    record_count: int = Field(ge=0, le=250)
+    non_empty_value_count: int = Field(ge=0, le=250)
+    values: list[StrictStr | None] = Field(max_length=250)
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("structured_field_name_has_outer_whitespace")
+        if re.search(r"[\x00-\x1f\x7f]", value):
+            raise ValueError("structured_field_name_has_control_character")
+        return value
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> DsaStructuredFieldValues:
+        if self.record_count != len(self.values):
+            raise ValueError("structured_record_count_mismatch")
+        if self.non_empty_value_count != sum(value is not None for value in self.values):
+            raise ValueError("structured_non_empty_count_mismatch")
+        return self
+
+
 class DsaContextItem(StrictModel):
     result_id: Identifier
     source_type: Identifier
@@ -1352,8 +1404,16 @@ class DsaContextItem(StrictModel):
     url: Annotated[str, Field(max_length=2048)] | None = None
     confidence: Literal["none", "low", "medium", "high"]
     raw: dict[str, Any] | None = None
+    structured_data: DsaStructuredFieldValues | None = None
     available_context: list[DsaAvailableContext] = Field(max_length=16)
     warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
+
+    @model_serializer(mode="wrap")
+    def omit_absent_structured_data(self, handler):
+        serialized = handler(self)
+        if self.structured_data is None:
+            serialized.pop("structured_data", None)
+        return serialized
 
     @field_validator("source_ref")
     @classmethod
@@ -1377,6 +1437,14 @@ class DsaContextItem(StrictModel):
     def reject_raw_data(self) -> DsaContextItem:
         if self.raw is not None:
             raise ValueError("raw_context_data_not_allowed")
+        structured_supplied = "structured_data" in self.model_fields_set
+        if self.content_type == "structured_field_values":
+            if self.structured_data is None:
+                raise ValueError("structured_context_data_required")
+            if self.available_context:
+                raise ValueError("structured_context_modes_not_allowed")
+        elif structured_supplied:
+            raise ValueError("structured_context_type_mismatch")
         return self
 
 
@@ -1405,6 +1473,25 @@ class DsaContextResponse(StrictModel):
         return self
 
 
+AggregateExecutionOutcome = Literal[
+    "satisfied",
+    "unknown",
+    "failed",
+    "filtered",
+    "truncated",
+    "unsupported",
+]
+
+
+@dataclass(frozen=True)
+class AggregateComputation:
+    answer: str
+    rendered_value: str
+    numeric_value_count: int
+    invalid_numeric_count: int
+    approximate: bool
+
+
 @dataclass
 class EvidenceAcquisitionState:
     enabled: bool
@@ -1429,6 +1516,9 @@ class EvidenceAcquisitionState:
     next_step_history: list[dict[str, Any]] | None = None
     initial_attempt_summary: dict[str, Any] | None = None
     additional_acquisition_count: int = 0
+    aggregate_execution: dict[str, Any] | None = None
+    aggregate_delivery_identity: dict[str, Any] | None = None
+    aggregate_result: str | None = None
     inventory_discovery: dict[str, Any] = dataclass_field(
         default_factory=lambda: {
             "called": False,
@@ -1632,12 +1722,65 @@ class EvidenceAcquisitionState:
         )
 
     @property
+    def supported_aggregate_path(self) -> bool:
+        plan = self.plan
+        shape = self.shape
+        inventory = self.inventory
+        declared_scope = self.declared_scope
+        if not (
+            plan is not None
+            and shape is not None
+            and inventory is not None
+            and isinstance(declared_scope, dict)
+            and plan.task_shape == "aggregate"
+            and shape.task_shape == "aggregate"
+            and shape.aggregate_spec is not None
+            and shape.source_match is not None
+            and shape.source_match.status == "matched"
+            and plan.aggregate_spec is not None
+            and plan.aggregate_spec == shape.aggregate_spec
+            and plan.plan_status == "ready"
+            and plan.completeness_expectation == "complete_for_declared_scope"
+            and plan.contradiction_search_required is False
+            and len(plan.eligible_source_ids) == 1
+            and shape.source_match.matched_source_ids == plan.eligible_source_ids
+            and declared_scope.get("source_ids") == plan.eligible_source_ids
+            and declared_scope.get("exact_source_refs") == []
+            and not self.exact_source_refs
+            and plan.selected_strategies == ["structured_field_values"]
+            and plan.limitation_codes == []
+            and len(plan.declared_requirements) == len(_AGGREGATE_REQUIREMENTS)
+            and all(
+                requirement.criticality == "material" for requirement in plan.declared_requirements
+            )
+            and {requirement.requirement_kind for requirement in plan.declared_requirements}
+            == _AGGREGATE_REQUIREMENTS
+            and inventory.inventory_scope == "configured_sources"
+            and inventory.inventory_status == "complete"
+        ):
+            return False
+        source_id = plan.eligible_source_ids[0]
+        source = next(
+            (item for item in inventory.sources if item.source_id == source_id),
+            None,
+        )
+        return bool(
+            source is not None
+            and source.enabled
+            and source.status == "ready"
+            and "context" in source.capabilities
+            and source.content_fields is not None
+            and plan.aggregate_spec.field_name in source.content_fields
+        )
+
+    @property
     def supported_governed_path(self) -> bool:
         return (
             self.supported_targeted_path
             or self.supported_exact_path
             or self.supported_hybrid_comparison_path
             or self.supported_bounded_exhaustive_path
+            or self.supported_aggregate_path
         )
 
 
@@ -1859,15 +2002,23 @@ def _manifest_id(
         ],
     }
     if delivery_identity is not None:
-        material["delivery_identity"] = {
-            "returned_source_refs": sorted(
-                delivery_identity.get("returned_source_refs") or []
-            ),
-            "retained_source_refs": sorted(
-                delivery_identity.get("retained_source_refs") or []
-            ),
+        normalized_delivery_identity = {
+            "returned_source_refs": sorted(delivery_identity.get("returned_source_refs") or []),
+            "retained_source_refs": sorted(delivery_identity.get("retained_source_refs") or []),
             "retention_status": delivery_identity.get("retention_status"),
         }
+        for key in (
+            "query_id",
+            "structured_source_ref_digest",
+            "structured_data_digest",
+            "result_semantics_digest",
+            "record_count",
+            "non_empty_value_count",
+            "outcome",
+        ):
+            if delivery_identity.get(key) is not None:
+                normalized_delivery_identity[key] = delivery_identity[key]
+        material["delivery_identity"] = normalized_delivery_identity
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"evidence_manifest_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
 
@@ -2359,11 +2510,11 @@ def _acquisition_premise_digest(premise: EvidenceAcquisitionPremise) -> str:
         "question_anchor_digest": premise.question_anchor_digest,
         "task_shape": premise.task_shape,
         "declared_scope": scope.model_dump(mode="json"),
-        "source_inventory": [
-            source.model_dump(mode="json") for source in inventory
-        ],
+        "source_inventory": [source.model_dump(mode="json") for source in inventory],
         "selected_strategies": sorted(premise.selected_strategies),
     }
+    if premise.aggregate_spec is not None:
+        material["aggregate_spec"] = premise.aggregate_spec.model_dump(mode="json")
     encoded = json.dumps(
         material,
         sort_keys=True,
@@ -2376,21 +2527,22 @@ def _acquisition_premise_digest(premise: EvidenceAcquisitionPremise) -> str:
 def build_current_acquisition_premise(
     state: EvidenceAcquisitionState,
 ) -> EvidenceAcquisitionPremise:
-    if (
-        state.plan is None
-        or state.inventory is None
-        or not isinstance(state.declared_scope, dict)
-    ):
+    if state.plan is None or state.inventory is None or not isinstance(state.declared_scope, dict):
         raise ValueError("current_acquisition_premise_unavailable")
-    return EvidenceAcquisitionPremise.model_validate(
-        {
-            "question_anchor_digest": state.plan.question_anchor_digest,
-            "task_shape": state.plan.task_shape,
-            "declared_scope": state.declared_scope,
-            "source_inventory": _adapt_inventory(state.inventory),
-            "selected_strategies": state.plan.selected_strategies,
-        }
-    )
+    aggregate_path = state.plan.task_shape == "aggregate"
+    fields: dict[str, Any] = {
+        "question_anchor_digest": state.plan.question_anchor_digest,
+        "task_shape": state.plan.task_shape,
+        "declared_scope": state.declared_scope,
+        "source_inventory": _adapt_inventory(
+            state.inventory,
+            include_content_fields=aggregate_path,
+        ),
+        "selected_strategies": state.plan.selected_strategies,
+    }
+    if aggregate_path:
+        fields["aggregate_spec"] = state.plan.aggregate_spec
+    return EvidenceAcquisitionPremise.model_validate(fields)
 
 
 def deterministic_clarification_target(
@@ -2751,15 +2903,14 @@ def _validate_supported_plan(state: EvidenceAcquisitionState) -> bool:
     if (
         state.supported_hybrid_comparison_path
         or state.supported_bounded_exhaustive_path
+        or state.supported_aggregate_path
     ):
         return True
     if plan is None or plan.task_shape != "targeted_lookup":
         return False
     if plan.plan_status not in {"ready", "ready_with_limitations"}:
         return False
-    requirement_kinds = {
-        requirement.requirement_kind for requirement in plan.declared_requirements
-    }
+    requirement_kinds = {requirement.requirement_kind for requirement in plan.declared_requirements}
     if not {"targeted_evidence", "context_delivery"}.issubset(requirement_kinds):
         return False
     exact_references = state.exact_source_refs or []
@@ -3320,6 +3471,380 @@ def validate_configured_worksheet_response(
     ):
         return validated, "filtered"
     return validated, "satisfied"
+
+
+def validate_structured_field_values_response(
+    response: dict[str, Any],
+    *,
+    expected_source_id: str,
+    expected_field_name: str,
+) -> tuple[DsaContextResponse, AggregateExecutionOutcome]:
+    validated = DsaContextResponse.model_validate(response)
+    if validated.budget.truncated:
+        return validated, "truncated"
+    if validated.errors:
+        return validated, "failed"
+    if not validated.results:
+        return validated, "unknown"
+    if not validated.answerable or len(validated.results) != 1:
+        return validated, "filtered"
+    item = validated.results[0]
+    if (
+        item.source_id != expected_source_id
+        or item.content_type != "structured_field_values"
+        or item.raw is not None
+        or item.available_context
+        or item.structured_data is None
+        or item.structured_data.kind != "field_values"
+        or item.structured_data.field_name != expected_field_name
+    ):
+        return validated, "filtered"
+    return validated, "satisfied"
+
+
+class AggregateNumericValidationError(ValueError):
+    def __init__(self, reason: str, *, invalid_count: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.invalid_count = invalid_count
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
+def _aggregate_answer(
+    *,
+    function: AggregateFunction,
+    field_name: str,
+    rendered_value: str,
+    non_empty_value_count: int,
+    record_count: int,
+    approximate: bool,
+) -> str:
+    label = {
+        "median": "Median",
+        "mean": "Mean",
+        "count": "Count",
+        "sum": "Sum",
+        "minimum": "Minimum",
+        "maximum": "Maximum",
+    }[function]
+    value_word = "value" if non_empty_value_count == 1 else "values"
+    record_word = "record" if record_count == 1 else "records"
+    if function == "count":
+        return (
+            f'{label} for "{field_name}": {rendered_value} non-empty '
+            f"{value_word} across {record_count} {record_word}."
+        )
+    qualifier = "approximately " if approximate else ""
+    return (
+        f'{label} for "{field_name}": {qualifier}{rendered_value} '
+        f"({non_empty_value_count} non-empty {value_word} across "
+        f"{record_count} {record_word})."
+    )
+
+
+def compute_aggregate_result(
+    *,
+    aggregate_spec: AggregateSpec,
+    structured_data: DsaStructuredFieldValues,
+) -> AggregateComputation:
+    non_null_values = [value for value in structured_data.values if value is not None]
+    if aggregate_spec.function == "count":
+        rendered = str(structured_data.non_empty_value_count)
+        return AggregateComputation(
+            answer=_aggregate_answer(
+                function=aggregate_spec.function,
+                field_name=aggregate_spec.field_name,
+                rendered_value=rendered,
+                non_empty_value_count=structured_data.non_empty_value_count,
+                record_count=structured_data.record_count,
+                approximate=False,
+            ),
+            rendered_value=rendered,
+            numeric_value_count=0,
+            invalid_numeric_count=0,
+            approximate=False,
+        )
+    if not non_null_values:
+        raise AggregateNumericValidationError(
+            "aggregate_numeric_values_empty",
+            invalid_count=0,
+        )
+
+    invalid_count = sum(
+        len(value) > 120 or _AGGREGATE_NUMERIC_TOKEN.fullmatch(value) is None
+        for value in non_null_values
+    )
+    if invalid_count:
+        raise AggregateNumericValidationError(
+            "aggregate_numeric_value_invalid",
+            invalid_count=invalid_count,
+        )
+    try:
+        with localcontext() as decimal_context:
+            decimal_context.prec = 256
+            decimal_context.rounding = ROUND_HALF_EVEN
+            values = [Decimal(value) for value in non_null_values]
+            total = sum(values, Decimal(0))
+            approximate = False
+            if aggregate_spec.function == "sum":
+                result = total
+            elif aggregate_spec.function == "minimum":
+                result = min(values)
+            elif aggregate_spec.function == "maximum":
+                result = max(values)
+            elif aggregate_spec.function == "median":
+                ordered = sorted(values)
+                midpoint = len(ordered) // 2
+                result = (
+                    ordered[midpoint]
+                    if len(ordered) % 2
+                    else (ordered[midpoint - 1] + ordered[midpoint]) / Decimal(2)
+                )
+            else:
+                with localcontext() as mean_context:
+                    mean_context.prec = 34
+                    mean_context.rounding = ROUND_HALF_EVEN
+                    mean_context.clear_flags()
+                    result = total / Decimal(len(values))
+                    approximate = bool(mean_context.flags[Inexact] or mean_context.flags[Rounded])
+    except InvalidOperation as exc:
+        raise AggregateNumericValidationError(
+            "aggregate_numeric_value_invalid",
+            invalid_count=1,
+        ) from exc
+
+    rendered = _canonical_decimal(result)
+    return AggregateComputation(
+        answer=_aggregate_answer(
+            function=aggregate_spec.function,
+            field_name=aggregate_spec.field_name,
+            rendered_value=rendered,
+            non_empty_value_count=structured_data.non_empty_value_count,
+            record_count=structured_data.record_count,
+            approximate=approximate,
+        ),
+        rendered_value=rendered,
+        numeric_value_count=len(values),
+        invalid_numeric_count=0,
+        approximate=approximate,
+    )
+
+
+def _aggregate_transport_outcome(error: Exception) -> AggregateExecutionOutcome:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code == 413:
+        return "truncated"
+    if status_code == 501:
+        return "unsupported"
+    return "failed"
+
+
+def _aggregate_trace(
+    *,
+    base: dict[str, Any],
+    outcome: AggregateExecutionOutcome,
+    context_call_count: int,
+    record_count: int = 0,
+    non_empty_value_count: int = 0,
+    numeric_value_count: int = 0,
+    invalid_numeric_count: int = 0,
+    error_code: str | None = None,
+) -> dict[str, Any]:
+    return {
+        **base,
+        "called": True,
+        "call_count": context_call_count,
+        "context_pack_call_count": 0,
+        "context_expansion_call_count": context_call_count,
+        "status": "included" if outcome == "satisfied" else "empty",
+        "reason": "aggregate_acquisition_completed",
+        "error_code": error_code,
+        "error_codes": [error_code] if error_code else [],
+        "raw_item_count": record_count,
+        "final_combined_item_count": 0,
+        "budget_truncated": outcome == "truncated",
+        "aggregate_execution": {
+            "called": True,
+            "outcome": outcome,
+            "structured_context_call_count": context_call_count,
+            "record_count": record_count,
+            "non_empty_value_count": non_empty_value_count,
+            "null_count": record_count - non_empty_value_count,
+            "numeric_value_count": numeric_value_count,
+            "invalid_numeric_count": invalid_numeric_count,
+        },
+    }
+
+
+async def execute_aggregate_values(
+    *,
+    state: EvidenceAcquisitionState,
+    dsa: Any,
+    dsa_trace: dict[str, Any],
+) -> tuple[None, dict[str, Any]]:
+    if (
+        not state.supported_aggregate_path
+        or state.plan is None
+        or state.plan.aggregate_spec is None
+    ):
+        state.aggregate_execution = {
+            "called": False,
+            "outcome": "unsupported",
+            "structured_context_call_count": 0,
+            "record_count": 0,
+            "non_empty_value_count": 0,
+            "null_count": 0,
+            "numeric_value_count": 0,
+            "invalid_numeric_count": 0,
+        }
+        return None, _aggregate_trace(
+            base=dsa_trace,
+            outcome="unsupported",
+            context_call_count=0,
+            error_code="unsupported_aggregate_plan",
+        )
+
+    source_id = state.plan.eligible_source_ids[0]
+    spec = state.plan.aggregate_spec
+    context_call_count = 1
+    outcome: AggregateExecutionOutcome
+    error_code: str | None = None
+    try:
+        response_raw = await dsa.context_source(
+            request_id=state.request_id,
+            source_id=source_id,
+            context_mode=CONFIGURED_FIELD_VALUES_CONTEXT_MODE,
+            field_name=spec.field_name,
+            budget=dict(AGGREGATE_CONTEXT_BUDGET),
+        )
+        if not isinstance(response_raw, dict):
+            raise ValueError("malformed_structured_context_response")
+        response, outcome = validate_structured_field_values_response(
+            response_raw,
+            expected_source_id=source_id,
+            expected_field_name=spec.field_name,
+        )
+    except (ValueError, TypeError):
+        response = None
+        outcome = "filtered"
+        error_code = "malformed_response"
+    except Exception as exc:
+        response = None
+        outcome = _aggregate_transport_outcome(exc)
+        error_code = (
+            "budget_truncated"
+            if outcome == "truncated"
+            else "unsupported_operation"
+            if outcome == "unsupported"
+            else "dependency_failure"
+        )
+
+    record_count = 0
+    non_empty_value_count = 0
+    numeric_value_count = 0
+    invalid_numeric_count = 0
+    numeric_validation_failed = False
+    structured_digest = None
+    result_digest = None
+    query_id = None
+    structured_source_ref_digest = None
+    if response is not None:
+        query_id = response.query_id
+        if outcome == "failed":
+            error_code = "dependency_failure"
+        elif outcome == "truncated":
+            error_code = "budget_truncated"
+        elif outcome == "filtered":
+            error_code = "malformed_response"
+        if outcome == "satisfied":
+            item = response.results[0]
+            structured = item.structured_data
+            if structured is None:
+                outcome = "filtered"
+                error_code = "malformed_response"
+            else:
+                record_count = structured.record_count
+                non_empty_value_count = structured.non_empty_value_count
+                canonical_structured = json.dumps(
+                    structured.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                structured_digest = (
+                    f"sha256:{hashlib.sha256(canonical_structured.encode()).hexdigest()}"
+                )
+                structured_source_ref_digest = (
+                    f"sha256:{hashlib.sha256(item.source_ref.encode()).hexdigest()}"
+                )
+                try:
+                    computation = compute_aggregate_result(
+                        aggregate_spec=spec,
+                        structured_data=structured,
+                    )
+                except AggregateNumericValidationError as exc:
+                    outcome = "filtered"
+                    error_code = "invalid_numeric_value"
+                    invalid_numeric_count = exc.invalid_count
+                    numeric_validation_failed = True
+                else:
+                    numeric_value_count = computation.numeric_value_count
+                    invalid_numeric_count = computation.invalid_numeric_count
+                    state.aggregate_result = computation.answer
+                    result_material = json.dumps(
+                        {
+                            "answer": computation.answer,
+                            "approximate": computation.approximate,
+                            "rendered_value": computation.rendered_value,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                    result_digest = f"sha256:{hashlib.sha256(result_material.encode()).hexdigest()}"
+
+    state.aggregate_execution = {
+        "called": True,
+        "outcome": outcome,
+        "structured_context_call_count": context_call_count,
+        "record_count": record_count,
+        "non_empty_value_count": non_empty_value_count,
+        "null_count": record_count - non_empty_value_count,
+        "numeric_value_count": numeric_value_count,
+        "invalid_numeric_count": invalid_numeric_count,
+        "numeric_validation_failed": numeric_validation_failed,
+    }
+    state.aggregate_delivery_identity = {
+        "returned_source_refs": [],
+        "retained_source_refs": [],
+        "retention_status": "satisfied" if outcome == "satisfied" else outcome,
+        "query_id": query_id,
+        "structured_source_ref_digest": structured_source_ref_digest,
+        "structured_data_digest": structured_digest,
+        "result_semantics_digest": result_digest,
+        "record_count": record_count,
+        "non_empty_value_count": non_empty_value_count,
+        "outcome": outcome,
+    }
+    return None, _aggregate_trace(
+        base=dsa_trace,
+        outcome=outcome,
+        context_call_count=context_call_count,
+        record_count=record_count,
+        non_empty_value_count=non_empty_value_count,
+        numeric_value_count=numeric_value_count,
+        invalid_numeric_count=invalid_numeric_count,
+        error_code=error_code,
+    )
 
 
 def _exact_bundle_id(
@@ -4322,6 +4847,7 @@ def _build_acquisition_facts(
     exact_attempts: list[dict[str, Any]] | None = None,
     expansion_attempts: list[dict[str, Any]] | None = None,
     bounded_exhaustive_path: bool = False,
+    aggregate_execution: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     status = dsa_trace.get("status")
     error_code = dsa_trace.get("error_code")
@@ -4368,7 +4894,24 @@ def _build_acquisition_facts(
         plan.declared_requirements,
         key=lambda item: item.requirement_id,
     ):
-        if exhaustive_outcomes is not None:
+        if plan.task_shape == "aggregate":
+            aggregate_outcome = (
+                aggregate_execution.get("outcome")
+                if isinstance(aggregate_execution, dict)
+                else "unknown"
+            )
+            if (
+                isinstance(aggregate_execution, dict)
+                and aggregate_execution.get("numeric_validation_failed") is True
+            ):
+                outcome = (
+                    "filtered"
+                    if requirement.requirement_kind == "context_delivery"
+                    else "satisfied"
+                )
+            else:
+                outcome = str(aggregate_outcome)
+        elif exhaustive_outcomes is not None:
             outcome = exhaustive_outcomes.get(
                 requirement.requirement_kind,
                 "unknown",
@@ -4452,13 +4995,13 @@ async def evaluate_acquisition_sufficiency(
         runtime_session_id=runtime_session_id,
         runtime_turn_id=runtime_turn_id,
     )
-    delivery_identity = None
+    delivery_identity = (
+        state.aggregate_delivery_identity if state.supported_aggregate_path else None
+    )
     if state.supported_bounded_exhaustive_path:
-        retention_status, returned_refs, retained_refs = (
-            _delivery_reference_state(
-                context_pack=context_pack,
-                retained_source_refs=retained_source_refs,
-            )
+        retention_status, returned_refs, retained_refs = _delivery_reference_state(
+            context_pack=context_pack,
+            retained_source_refs=retained_source_refs,
         )
         delivery_identity = {
             "returned_source_refs": sorted(returned_refs),
@@ -4493,6 +5036,7 @@ async def evaluate_acquisition_sufficiency(
         exact_attempts=state.exact_attempts,
         expansion_attempts=state.expansion_attempts,
         bounded_exhaustive_path=state.supported_bounded_exhaustive_path,
+        aggregate_execution=state.aggregate_execution,
     )
     state.acquisition_facts = facts
     try:
@@ -4628,11 +5172,41 @@ def advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
     )
 
 
+def aggregate_conclusion_allowed(state: EvidenceAcquisitionState | None) -> bool:
+    return bool(
+        state is not None
+        and state.supported_aggregate_path
+        and state.plan is not None
+        and state.plan.task_shape == "aggregate"
+        and state.aggregate_result is not None
+        and isinstance(state.aggregate_execution, dict)
+        and state.aggregate_execution.get("outcome") == "satisfied"
+        and state.sufficiency is not None
+        and state.sufficiency.sufficiency_status == "sufficient_for_declared_scope"
+        and state.next_step is not None
+        and state.next_step.task_shape == "aggregate"
+        and state.next_step.selected_next_step == "answer_within_declared_scope"
+        and state.next_step.conclusion_disposition == "bounded_conclusion_allowed"
+        and state.next_step.provider_disposition == "allowed"
+    )
+
+
+def finalize_aggregate_conclusion(state: EvidenceAcquisitionState) -> None:
+    if not state.supported_aggregate_path:
+        return
+    state.forced_answer = (
+        state.aggregate_result
+        if aggregate_conclusion_allowed(state)
+        else state.forced_answer or WITHHELD_ANSWER
+    )
+
+
 def grounded_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
     if (
         state is None
         or state.follow_existing_path
         or state.forced_answer is not None
+        or state.supported_aggregate_path
     ):
         return False
     if state.next_step_selection_attempted:
@@ -4667,9 +5241,9 @@ def provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
         return True
     if state.forced_answer is not None:
         return False
-    return bool(
-        grounded_provider_allowed(state) or advisory_provider_allowed(state)
-    )
+    if state.supported_aggregate_path:
+        return False
+    return bool(grounded_provider_allowed(state) or advisory_provider_allowed(state))
 
 
 def enforce_final_answer(
@@ -5534,21 +6108,18 @@ def build_manifest_trace(
     )
     exact_path = state.supported_exact_path
     hybrid_path = state.supported_hybrid_comparison_path
+    aggregate_path = state.supported_aggregate_path
     if exact_path:
-        delivery_outcome, returned_ref_set, retained_ref_set = (
-            _exact_delivery_reference_state(
-                exact_source_refs=state.exact_source_refs or [],
-                exact_attempts=state.exact_attempts or [],
-                context_pack=context_pack,
-                retained_source_refs=retained_source_refs,
-            )
+        delivery_outcome, returned_ref_set, retained_ref_set = _exact_delivery_reference_state(
+            exact_source_refs=state.exact_source_refs or [],
+            exact_attempts=state.exact_attempts or [],
+            context_pack=context_pack,
+            retained_source_refs=retained_source_refs,
         )
     else:
-        delivery_outcome, returned_ref_set, retained_ref_set = (
-            _delivery_reference_state(
-                context_pack=context_pack,
-                retained_source_refs=retained_source_refs,
-            )
+        delivery_outcome, returned_ref_set, retained_ref_set = _delivery_reference_state(
+            context_pack=context_pack,
+            retained_source_refs=retained_source_refs,
         )
         if hybrid_path and state.plan is not None:
             _, _, delivery_outcome = _hybrid_fact_outcomes(
@@ -5558,6 +6129,8 @@ def build_manifest_trace(
                 dsa_trace=trace,
                 retained_source_refs=retained_source_refs,
             )
+        elif aggregate_path and isinstance(state.aggregate_execution, dict):
+            delivery_outcome = str(state.aggregate_execution.get("outcome") or "unknown")
     returned_refs = sorted(returned_ref_set)
     retained_refs = sorted(retained_ref_set)
     omitted_refs = sorted(returned_ref_set - retained_ref_set)
@@ -5654,7 +6227,7 @@ def build_manifest_trace(
             shape_projection["source_match"]["probe_source_count"] = len(
                 shape.source_match.probe_source_ids
             )
-    return {
+    manifest = {
         "enabled": state.enabled,
         "attempted": state.attempted,
         "status": state.status,
@@ -5885,6 +6458,21 @@ def build_manifest_trace(
             ),
         },
     }
+    if aggregate_path and isinstance(state.aggregate_execution, dict):
+        manifest["acquisition"]["aggregate_execution"] = {
+            key: state.aggregate_execution.get(key)
+            for key in (
+                "called",
+                "outcome",
+                "structured_context_call_count",
+                "record_count",
+                "non_empty_value_count",
+                "null_count",
+                "numeric_value_count",
+                "invalid_numeric_count",
+            )
+        }
+    return manifest
 
 
 def bind_manifest_response(

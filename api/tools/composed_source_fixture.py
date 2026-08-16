@@ -57,6 +57,14 @@ _FOLLOWUP_COMPACT_VALUES: list[list[str]] = [
 ]
 
 _GOOGLE_VALUES: dict[str, list[list[str]]] = {
+    "measurement-sheet": [
+        ["Entry", "Reading", "Secret"],
+        ["alpha", "10.125", "PRIVATE_AGGREGATE_SECRET_ALPHA"],
+        ["beta", "20.25", "PRIVATE_AGGREGATE_SECRET_BETA"],
+        ["gamma", "", "PRIVATE_AGGREGATE_SECRET_GAMMA"],
+        ["delta", "35.5", "PRIVATE_AGGREGATE_SECRET_DELTA"],
+        ["epsilon", "55.75", "PRIVATE_AGGREGATE_SECRET_EPSILON"],
+    ],
     "targeted-sheet": [
         ["Record", "Status", "Notes"],
         ["migration", "ready", "The migration record confirms the bounded setting."],
