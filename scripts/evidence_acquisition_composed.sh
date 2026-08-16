@@ -622,7 +622,8 @@ assert_semantic_interpreter_calls() {
       and .response_schema_strict == true
       and .response_schema_additional_properties == false
       and .response_schema_required
-        == ["interpretation_status", "operation_hint", "candidate_source_ids"]
+        == ["interpretation_status", "operation_hint", "candidate_source_ids",
+            "aggregate_function", "aggregate_field_name"]
       and .tool_count == 0
       and .max_completion_tokens == 120
       and .status == "ok"
