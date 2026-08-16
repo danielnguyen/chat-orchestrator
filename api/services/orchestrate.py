@@ -8513,6 +8513,9 @@ async def orchestrate_chat(
                                         eligible_source_ids=(
                                             governed_plan.eligible_source_ids
                                         ),
+                                        require_all_eligible_sources=(
+                                            evidence_acquisition.is_authorized_probe
+                                        ),
                                     )
                                 )
                                 if governed_plan is not None

@@ -18490,6 +18490,26 @@ def _semantic_test_shape(call, *, second_status="resolved"):
             "matched_source_ids": list(advisory["candidate_source_ids"]),
             "reason_codes": ["semantic_candidate_validated"],
         }
+    elif second_status == "probe":
+        response["result"].update(
+            {
+                "derivation_status": "derived",
+                "task_shape": "targeted_lookup",
+                "candidate_task_shapes": ["targeted_lookup"],
+                "evidence_scope_material": True,
+                "clarification_required": False,
+                "reason_codes": [
+                    "semantic_operation_hint",
+                    "targeted_lookup_derived",
+                ],
+            }
+        )
+        response["result"]["source_match"] = {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": sorted(advisory["candidate_source_ids"]),
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        }
     elif second_status == "ambiguous":
         response["result"].update(
             {
@@ -18857,6 +18877,114 @@ async def test_neutral_upcoming_events_semantic_resolution_bounds_acquisition(tm
     assert dsa.calls[0]["source_ids"] == ["personal_schedule"]
     assert "household_schedule" not in dsa.calls[0]["source_ids"]
     assert "public_holidays" not in dsa.calls[0]["source_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete_probe_accounting", [True, False])
+async def test_authorized_probe_requires_every_planned_source_in_dsa_accounting(
+    tmp_path,
+    complete_probe_accounting,
+):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "What upcoming events do I have?"
+    probe_source_ids = ["household_schedule", "personal_schedule"]
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(
+            call,
+            second_status="probe",
+        ),
+        evidence_plan_response=_targeted_plan_response(
+            request_id="rid-semantic-probe-accounting",
+            question=question,
+            eligible_source_ids=probe_source_ids,
+        ),
+        auto_source_match=False,
+    )
+    context = _governed_context_pack(question)
+    context["sources_used"] = (
+        probe_source_ids if complete_probe_accounting else ["personal_schedule"]
+    )
+    context["items"][0]["source_id"] = "personal_schedule"
+    context["items"][0]["source_name"] = "Personal Schedule"
+    context["items"][0]["source_ref"] = "personal_schedule:event_1"
+    context["items"][0]["text"] = "The schedule contains one upcoming event."
+    context["diagnostics"]["considered_source_ids"] = list(context["sources_used"])
+    context["diagnostics"]["selected_source_ids"] = list(context["sources_used"])
+    context["diagnostics"]["candidate_counts_by_source"] = {
+        source_id: int(source_id == "personal_schedule")
+        for source_id in context["sources_used"]
+    }
+    dsa = FakeDSA(
+        response=context,
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": _neutral_schedule_sources(),
+        },
+    )
+    completions = [
+        _evidence_interpreter_completion(
+            "ambiguous",
+            "lookup",
+            probe_source_ids,
+        )
+    ]
+    if complete_probe_accounting:
+        completions.append(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": _evidence_candidate(
+                                (
+                                    "personal_schedule:event_1",
+                                    "The schedule contains one upcoming event.",
+                                )
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+    litellm = SequenceLiteLLM(completions)
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-semantic-probe-accounting",
+    )
+
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == (
+        probe_source_ids
+    )
+    assert dsa.calls[0]["source_ids"] == probe_source_ids
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert manifest["shape"]["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+        "probe_source_count": 2,
+    }
+    if complete_probe_accounting:
+        assert out["status"] == "ok"
+        assert len(litellm.calls) == 2
+        assert manifest["acquisition"]["sources_used"] == probe_source_ids
+    else:
+        assert out["status"] == "degraded"
+        assert len(litellm.calls) == 1
+        assert manifest["acquisition"]["dsa_outcome"] != "success"
 
 
 @pytest.mark.asyncio

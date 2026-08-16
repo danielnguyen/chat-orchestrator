@@ -688,6 +688,135 @@ assert_single_inventory_request() {
   test "$count" = "$expected_delta"
 }
 
+run_authorized_probe_source_scope_case() {
+  local suffix="$1" candidate_ids="$2" expected_fixture_sources="$3"
+  local expected_inventory_count="$4"
+  local owner client conversation_id question external response request_id
+  local trace manifest diagnostics provider_calls fixture_calls audit
+  owner="owner-source-scope-probe-$suffix"
+  client="client-source-scope-probe-$suffix"
+  question="Which entries are required?"
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-probe-$suffix")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" \
+    --argjson candidate_ids "$candidate_ids" \
+    '{
+      expected_request_text:$request_text,
+      expected_source_id:"complete_register",
+      expected_content_fields:["Entry","Required","Status"],
+      interpretation_status:"ambiguous",
+      operation_hint:"lookup",
+      candidate_source_ids:$candidate_ids
+    }')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+
+  assert_jq "source_scope.probe_${suffix}.response" "$response" '
+    .status == "ok"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("Retained evidence excerpt 1: Entry: alpha"))
+    and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
+  '
+  if ! jq -e --argjson probes "$candidate_ids" '
+    .shape.derivation_status == "derived"
+    and .shape.task_shape == "targeted_lookup"
+    and .shape.source_match.status == "ambiguous"
+    and .shape.source_match.matched_source_ids == []
+    and .shape.source_match.probe_source_count == ($probes | length)
+    and ((.shape.source_match | has("probe_source_ids")) | not)
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["targeted_retrieval"]
+    and .inventory.declared_source_count == ($probes | length)
+    and .acquisition.strategy_attempted == "targeted_retrieval"
+    and .acquisition.sources_considered == $probes
+    and .acquisition.sources_selected == $probes
+    and .acquisition.sources_used == $probes
+    and .acquisition.item_count > 0
+    and .acquisition.prompt_retained_item_count > 0
+    and ([.acquisition.source_summaries[]
+      | select(.contribution_reason_codes == ["retained_records_contributed"])
+      | .source_id] == ["complete_register"])
+  ' <<<"$manifest" >/dev/null; then
+    echo "Assertion failed: source_scope.probe_${suffix}.manifest" >&2
+    return 1
+  fi
+  assert_jq "source_scope.probe_${suffix}.semantic_trace" "$trace" \
+    ".prompt.semantic_interpreter == {
+      called: true,
+      status: \"accepted\",
+      reason: \"validated\",
+      interpretation_status: \"ambiguous\",
+      operation_hint: \"lookup\",
+      candidate_count: $(jq 'length' <<<"$candidate_ids")
+    }"
+  if ! jq -e --arg request_id "$request_id" --argjson count "$(jq 'length' <<<"$candidate_ids")" '
+    [.events[] | select(
+      .event_type == "evidence_shape_derived"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 2
+    and $events[0].source_match_status == "no_match"
+    and (($events[0] | has("matched_source_ids")) | not)
+    and $events[1].derivation_status == "derived"
+    and $events[1].task_shape == "targeted_lookup"
+    and $events[1].source_match_status == "ambiguous"
+    and (($events[1] | has("matched_source_ids")) | not)
+    and $events[1].probe_source_count == $count
+    and (($events[1] | has("probe_source_ids")) | not)
+  ' <<<"$diagnostics" >/dev/null; then
+    echo "Assertion failed: source_scope.probe_${suffix}.runtime_shape" >&2
+    return 1
+  fi
+  if ! jq -e --arg request_id "$request_id" --argjson count "$(jq 'length' <<<"$candidate_ids")" '
+    [.events[] | select(
+      .event_type == "evidence_plan_compiled"
+      and .event_payload_json.request_id == $request_id
+    ) | .event_payload_json] as $events
+    | ($events | length) == 1
+    and $events[0].task_shape == "targeted_lookup"
+    and $events[0].eligible_source_count == $count
+    and $events[0].selected_strategies == ["targeted_retrieval"]
+  ' <<<"$diagnostics" >/dev/null; then
+    echo "Assertion failed: source_scope.probe_${suffix}.runtime_plan" >&2
+    return 1
+  fi
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_jq "source_scope.probe_${suffix}.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+      | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
+      | length) == 0
+  '
+  if ! jq -e --argjson expected "$expected_fixture_sources" '
+    [.calls[] | select(.operation == "google_values") | .source] | sort == $expected
+  ' <<<"$fixture_calls" >/dev/null; then
+    echo "Assertion failed: source_scope.probe_${suffix}.fixture_scope" >&2
+    return 1
+  fi
+  if ! jq -e --argjson probes "$candidate_ids" '
+    [.[] | select(.operation == "context_pack")] as $calls
+    | ($calls | length) == 1
+    and $calls[0].source_ids == $probes
+  ' <<<"$audit" >/dev/null; then
+    echo "Assertion failed: source_scope.probe_${suffix}.dsa_scope" >&2
+    return 1
+  fi
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_single_inventory_request "$expected_inventory_count"
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
+}
+
 run_evidence_source_scope_scenarios() {
   local owner client conversation_id question external response request_id
   local trace manifest diagnostics provider_calls fixture_calls audit
@@ -877,6 +1006,18 @@ run_evidence_source_scope_scenarios() {
   assert_single_inventory_request 2
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
 
+  run_authorized_probe_source_scope_case \
+    "two" \
+    '["complete_register","records_primary"]' \
+    '["complete-sheet","targeted-sheet"]' \
+    3
+
+  run_authorized_probe_source_scope_case \
+    "three" \
+    '["complete_register","followup_records","records_primary"]' \
+    '["complete-sheet","followup-sheet","targeted-sheet"]' \
+    4
+
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
@@ -907,7 +1048,7 @@ run_evidence_source_scope_scenarios() {
     <<<"$provider_calls" >/dev/null
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request 3
+  assert_single_inventory_request 5
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
 
   provider_post "/fixture/reset" '{}'
@@ -946,9 +1087,9 @@ run_evidence_source_scope_scenarios() {
     '([.calls[] | select(.kind == "chat")] | length) == 1'
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
-  assert_single_inventory_request 4
+  assert_single_inventory_request 6
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
-  echo "Evidence source scope: natural_match=1 semantic_match=1 ambiguous=1 ordinary_inventory_only=1"
+  echo "Evidence source scope: natural_match=1 semantic_match=1 probes=2 ambiguous=1 ordinary_inventory_only=1"
 }
 
 run_evidence_targeted_scenario() {
