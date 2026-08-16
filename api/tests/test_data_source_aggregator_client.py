@@ -263,6 +263,12 @@ async def test_context_source_posts_exact_bounded_payload_and_override():
             "max_text_chars": 9000,
         },
     )
+    await client.context_source(
+        source_ref="connector:source-c:item-3",
+        context_mode="configured_field_values",
+        field_name="Reading",
+        request_id="request-aggregate-1",
+    )
 
     assert response == {"retrieval_mode": "context", "results": []}
     assert calls == [
@@ -288,6 +294,19 @@ async def test_context_source_posts_exact_bounded_payload_and_override():
                     "max_bytes": 40000,
                     "max_text_chars": 9000,
                 },
+            },
+        ),
+        (
+            "/v1/sources/context",
+            {
+                "source_ref": "connector:source-c:item-3",
+                "context_mode": "configured_field_values",
+                "budget": {
+                    "max_rows": 5,
+                    "max_bytes": 50000,
+                    "max_text_chars": 12000,
+                },
+                "field_name": "Reading",
             },
         ),
     ]
@@ -325,7 +344,8 @@ async def test_context_source_preserves_headers_timeout_and_http_boundary(monkey
     with pytest.raises(httpx.HTTPStatusError):
         await client.context_source(
             source_ref="connector:source-a:item-1",
-            context_mode="nearby_rows",
+            context_mode="configured_field_values",
+            field_name="Reading",
             request_id="request-context-1",
         )
 
@@ -337,12 +357,13 @@ async def test_context_source_preserves_headers_timeout_and_http_boundary(monkey
     }
     assert captured["json"] == {
         "source_ref": "connector:source-a:item-1",
-        "context_mode": "nearby_rows",
+        "context_mode": "configured_field_values",
         "budget": {
             "max_rows": 5,
             "max_bytes": 50000,
             "max_text_chars": 12000,
         },
+        "field_name": "Reading",
     }
 
 

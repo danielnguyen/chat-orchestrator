@@ -152,8 +152,7 @@ class DataSourceAggregatorClient:
     ) -> None:
         fields: list[object] = [request_id or "absent", method, path]
         message = (
-            "dsa_request_completed component=chat-orchestrator "
-            "request_id=%s method=%s path=%s"
+            "dsa_request_completed component=chat-orchestrator " "request_id=%s method=%s path=%s"
         )
         if status_code is not None:
             message += " status=%d"
@@ -225,20 +224,24 @@ class DataSourceAggregatorClient:
         *,
         source_ref: str,
         context_mode: str,
+        field_name: str | None = None,
         budget: dict[str, int] | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "source_ref": source_ref,
+            "context_mode": context_mode,
+            "budget": budget
+            or {
+                "max_rows": 5,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+        if field_name is not None:
+            payload["field_name"] = field_name
         return await self._post(
             "/v1/sources/context",
-            json={
-                "source_ref": source_ref,
-                "context_mode": context_mode,
-                "budget": budget
-                or {
-                    "max_rows": 5,
-                    "max_bytes": 50000,
-                    "max_text_chars": 12000,
-                },
-            },
+            json=payload,
             request_id=request_id,
         )

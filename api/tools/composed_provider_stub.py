@@ -41,9 +41,9 @@ _SEMANTIC_FIXTURE_FIELDS = {
     "operation_hint",
     "candidate_source_ids",
 }
-_EXTERNAL_EVIDENCE_ITEM = re.compile(
-    r"source_ref: (?P<source_ref>[^\n]+)\n(?P<text>[^\n]+)"
-)
+_SEMANTIC_AGGREGATE_FIELDS = {"aggregate_function", "aggregate_field_name"}
+_AGGREGATE_FUNCTIONS = {"median", "mean", "count", "sum", "minimum", "maximum"}
+_EXTERNAL_EVIDENCE_ITEM = re.compile(r"source_ref: (?P<source_ref>[^\n]+)\n(?P<text>[^\n]+)")
 
 
 def _bounded_excerpt(value: str) -> str:
@@ -83,14 +83,14 @@ def _validate_identifier(value: object) -> str:
 
 
 def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
-    if set(body) != _SEMANTIC_FIXTURE_FIELDS:
+    supplied = set(body)
+    if not (
+        supplied == _SEMANTIC_FIXTURE_FIELDS
+        or supplied == _SEMANTIC_FIXTURE_FIELDS | _SEMANTIC_AGGREGATE_FIELDS
+    ):
         raise HTTPException(status_code=422, detail="invalid semantic fixture fields")
     request_text = body.get("expected_request_text")
-    if (
-        not isinstance(request_text, str)
-        or not request_text.strip()
-        or len(request_text) > 2_000
-    ):
+    if not isinstance(request_text, str) or not request_text.strip() or len(request_text) > 2_000:
         raise HTTPException(status_code=422, detail="invalid semantic fixture request")
     expected_source_id = _validate_identifier(body.get("expected_source_id"))
     content_fields = body.get("expected_content_fields")
@@ -139,7 +139,20 @@ def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
     )
     if not consistent:
         raise HTTPException(status_code=422, detail="incoherent semantic fixture")
-    return {
+    aggregate_function = body.get("aggregate_function")
+    aggregate_field_name = body.get("aggregate_field_name")
+    if supplied & _SEMANTIC_AGGREGATE_FIELDS:
+        if (
+            operation_hint != "aggregate"
+            or aggregate_function not in _AGGREGATE_FUNCTIONS
+            or not isinstance(aggregate_field_name, str)
+            or not aggregate_field_name
+            or len(aggregate_field_name) > 120
+            or aggregate_field_name != aggregate_field_name.strip()
+            or re.search(r"[\x00-\x1f\x7f]", aggregate_field_name) is not None
+        ):
+            raise HTTPException(status_code=422, detail="invalid aggregate semantic fixture")
+    fixture = {
         "expected_request_text": request_text,
         "expected_source_id": expected_source_id,
         "expected_content_fields": list(content_fields),
@@ -147,6 +160,10 @@ def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
         "operation_hint": operation_hint,
         "candidate_source_ids": list(candidate_source_ids),
     }
+    if aggregate_function is not None:
+        fixture["aggregate_function"] = aggregate_function
+        fixture["aggregate_field_name"] = aggregate_field_name
+    return fixture
 
 
 def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
@@ -166,9 +183,7 @@ def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
     try:
         classifier_input = json.loads(user_content) if user_content is not None else None
     except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=422, detail="semantic fixture input is not JSON"
-        ) from exc
+        raise HTTPException(status_code=422, detail="semantic fixture input is not JSON") from exc
     if not isinstance(classifier_input, dict):
         raise HTTPException(status_code=422, detail="semantic fixture input is invalid")
     if classifier_input.get("request_text") != fixture["expected_request_text"]:
@@ -179,18 +194,21 @@ def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
     matches = [
         source
         for source in sources
-        if isinstance(source, dict)
-        and source.get("source_id") == fixture["expected_source_id"]
+        if isinstance(source, dict) and source.get("source_id") == fixture["expected_source_id"]
     ]
     if len(matches) != 1:
         raise HTTPException(status_code=422, detail="semantic fixture source mismatch")
     if matches[0].get("content_fields") != fixture["expected_content_fields"]:
         raise HTTPException(status_code=422, detail="semantic fixture content fields mismatch")
-    return {
+    result = {
         "interpretation_status": fixture["interpretation_status"],
         "operation_hint": fixture["operation_hint"],
         "candidate_source_ids": fixture["candidate_source_ids"],
     }
+    if "aggregate_function" in fixture:
+        result["aggregate_function"] = fixture["aggregate_function"]
+        result["aggregate_field_name"] = fixture["aggregate_field_name"]
+    return result
 
 
 @app.get("/healthz")
@@ -211,11 +229,7 @@ async def chat_completions(
     tools = body.get("tools")
     tool_count = len(tools) if isinstance(tools, list) else 0
     response_format = body.get("response_format")
-    json_schema = (
-        response_format.get("json_schema")
-        if isinstance(response_format, dict)
-        else None
-    )
+    json_schema = response_format.get("json_schema") if isinstance(response_format, dict) else None
     schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
     classifier_diagnostics = {
         "response_format_type": (
@@ -230,14 +244,10 @@ async def chat_completions(
         "response_schema_additional_properties": (
             schema.get("additionalProperties") if isinstance(schema, dict) else None
         ),
-        "response_schema_required": (
-            schema.get("required") if isinstance(schema, dict) else None
-        ),
+        "response_schema_required": (schema.get("required") if isinstance(schema, dict) else None),
         "max_completion_tokens": body.get("max_completion_tokens"),
     }
-    if classifier_diagnostics["response_schema_name"] == (
-        "evidence_source_interpretation"
-    ):
+    if classifier_diagnostics["response_schema_name"] == ("evidence_source_interpretation"):
         semantic_result = _consume_semantic_fixture(messages) or {
             "interpretation_status": "no_match",
             "operation_hint": "unknown",
@@ -305,15 +315,12 @@ async def chat_completions(
         "",
     )
     prompt_fingerprint = hashlib.sha256(
-        json.dumps(normalized_messages, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(normalized_messages, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     current_memory_messages = [
         message["content"]
         for message in normalized_messages
-        if message["role"] == "system"
-        and "Current memory evidence:" in message["content"]
+        if message["role"] == "system" and "Current memory evidence:" in message["content"]
     ]
     has_current = bool(current_memory_messages)
     has_historical = "Historical or unverified memory context:" in prompt_text

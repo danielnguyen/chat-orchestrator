@@ -188,6 +188,33 @@ result_text:
   title_from: summary
   include_fields: [summary, start, end, location, description]
 YAML
+
+  cat >"$COMPOSED_SMOKE_TMP/config/sources/metrics_archive.yaml" <<'YAML'
+source_id: metrics_archive
+display_name: Configured Metrics Archive
+description: Bounded configured numeric metrics.
+domain_tags: [metrics, archive]
+connector: google_sheets
+enabled: true
+authority_role: authoritative
+sensitivity: medium
+access_mode: read_only
+connector_config:
+  spreadsheet_id: measurement-sheet
+  worksheet: Measurements
+  header_row: 1
+  credentials_ref: fixture_google
+retrieval:
+  default_mode: targeted
+  max_results: 8
+  max_bytes: 50000
+  max_text_chars: 12000
+  max_context_rows: 20
+  allow_full_fetch: true
+result_text:
+  title_from: Entry
+  include_fields: [Entry, Reading]
+YAML
 }
 
 run_evidence_chat() {
@@ -361,7 +388,7 @@ restore_dsa_config() {
   restart_dsa
   source_count="$(find "$COMPOSED_SMOKE_TMP/config/sources" -maxdepth 1 -type f -name '*.yaml' | wc -l)"
   disabled_count="$(find "$COMPOSED_SMOKE_TMP/config/sources" -maxdepth 1 -type f -name '*.yaml.disabled' | wc -l)"
-  test "$source_count" = "6"
+  test "$source_count" = "7"
   test "$disabled_count" = "0"
 }
 
@@ -1150,7 +1177,7 @@ run_evidence_targeted_scenario() {
   ' <<<"$fixture_calls" >/dev/null
   assert_jq "targeted.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
@@ -1819,7 +1846,7 @@ run_evidence_adversarial_provider_scenario() {
   '
   assert_jq "adversarial.malformed_freeform.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   assert_jq "adversarial.malformed_freeform.provider_calls" "$provider_calls" \
@@ -1897,7 +1924,7 @@ run_evidence_adversarial_provider_scenario() {
   '
   assert_jq "adversarial.valid_mixed.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   assert_jq "adversarial.valid_mixed.provider_calls" "$provider_calls" \
@@ -1966,7 +1993,7 @@ run_evidence_adversarial_provider_scenario() {
   '
   assert_jq "adversarial.forged_reference.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   assert_jq "adversarial.forged_reference.provider_calls" "$provider_calls" \
@@ -3343,7 +3370,7 @@ run_evidence_compound_scenarios() {
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "compound.verification.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   assert_jq "compound.verification.provider_calls" "$provider_calls" \
@@ -3428,7 +3455,7 @@ run_evidence_compound_scenarios() {
     '.next_steps.additional_acquisition_count == 0'
   assert_jq "compound.label_conflict.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   assert_jq "compound.label_conflict.trace_storage" "$trace" \
@@ -3543,7 +3570,7 @@ Treat this as a working direction, not a confirmed result."
   assert_advisory_manifest "$manifest" "unknown" "not_applicable"
   assert_jq "compound.attempt.inventory" "$manifest" '
     .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
   '
   assert_jq "compound.attempt.trace_storage" "$trace" \
@@ -3674,7 +3701,7 @@ run_evidence_scope_reference_scenarios() {
     and .acquisition.sources_selected == ["records_primary"]
     and .acquisition.sources_used == ["records_primary"]
     and .inventory.inventory_status == "complete_for_declared_scope"
-    and .inventory.inventory_source_count == 6
+    and .inventory.inventory_source_count == 7
     and .inventory.declared_source_count == 1
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
@@ -3835,7 +3862,7 @@ run_evidence_scope_reference_scenarios() {
   assert_jq "scope.malformed.partial_inventory" "$inventory" '
     .inventory_scope == "configured_sources"
     and .inventory_status == "partial"
-    and (.sources | length) == 5
+    and (.sources | length) == 6
     and ([.sources[] | select(.source_id == "records_optional")] | length) == 0
     and ([.sources[] | select(.source_id == "records_primary" and .scope_refs.project == "firefox")] | length) == 1
   '
@@ -3864,7 +3891,7 @@ run_evidence_scope_reference_scenarios() {
   '
   assert_jq "scope.malformed.inventory" "$manifest" '
     .inventory.inventory_status == "partial"
-    and .inventory.inventory_source_count == 5
+    and .inventory.inventory_source_count == 6
     and .inventory.declared_source_count == 1
   '
   assert_jq "scope.malformed.plan" "$manifest" \
@@ -4854,7 +4881,7 @@ run_history_followup_composed_suite() {
     and .acquisition.dsa_outcome == "not_called"
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
-    and .acquisition.inventory_discovery.source_count == 6
+    and .acquisition.inventory_discovery.source_count == 7
     and .acquisition.dsa_error_codes == []
     and .acquisition.sources_considered == []
     and .acquisition.sources_selected == []
@@ -4882,7 +4909,7 @@ run_history_followup_composed_suite() {
     and .retrieval.prompt_assembly.dsa.status == "inventory_only"
     and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
     and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
-    and .retrieval.prompt_assembly.dsa.inventory_discovery.source_count == 6
+    and .retrieval.prompt_assembly.dsa.inventory_discovery.source_count == 7
   '
   assert_jq "history.ordinary.provider" "$calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
@@ -5333,10 +5360,146 @@ MATRIX
   echo "Server-owned history-followup composed proof passed: scenarios=chained-acquisition,restart-durability,ordinary-dsa-association,chained-support,classifier-boundaries,ordinary-answer-termination,support-bare-verification,invalid-lineage,H9-auth"
 }
 
+run_evidence_aggregate_scenario() {
+  local owner client conversation_id question external response request_id answer
+  local trace manifest diagnostics provider_calls fixture_calls audit serialized
+  owner="owner-evidence-aggregate"
+  client="client-evidence-aggregate"
+  question="What is the median reading in my measurements?"
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "aggregate")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"median",
+      aggregate_field_name:"Reading"
+    }')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  serialized="$(jq -c . <<<"$trace")"
+
+  assert_jq "aggregate.response" "$response" '
+    .status == "ok"
+    and .answer == "Median for \"Reading\": 27.875 (4 non-empty values across 5 records)."
+    and .sources == []
+    and .pending_action == null
+  '
+  assert_jq "aggregate.manifest" "$manifest" '
+    .shape.derivation_status == "derived"
+    and .shape.task_shape == "aggregate"
+    and .shape.source_match.status == "matched"
+    and .shape.source_match.matched_source_ids == ["metrics_archive"]
+    and .plan.plan_status == "ready"
+    and .plan.completeness_expectation == "complete_for_declared_scope"
+    and .plan.selected_strategies == ["structured_field_values"]
+    and .plan.material_requirement_count == 3
+    and .sufficiency.status == "sufficient_for_declared_scope"
+    and .next_steps.selections[-1].selected_next_step == "answer_within_declared_scope"
+    and .next_steps.selections[-1].conclusion_disposition == "bounded_conclusion_allowed"
+    and .next_steps.selections[-1].provider_disposition == "allowed"
+    and .acquisition.strategy_attempted == "structured_field_values"
+    and .acquisition.aggregate_execution.outcome == "satisfied"
+    and .acquisition.aggregate_execution.seed_call_count == 1
+    and .acquisition.aggregate_execution.structured_context_call_count == 1
+    and .acquisition.aggregate_execution.record_count == 5
+    and .acquisition.aggregate_execution.non_empty_value_count == 4
+    and .acquisition.aggregate_execution.null_count == 1
+    and .acquisition.aggregate_execution.numeric_value_count == 4
+    and .acquisition.aggregate_execution.invalid_numeric_count == 0
+  '
+  assert_jq "aggregate.semantic_trace" "$trace" '
+    .prompt.semantic_interpreter == {
+      called:true,
+      status:"accepted",
+      reason:"validated",
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_count:1
+    }
+  '
+  assert_provider_free_trace "$trace"
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_jq "aggregate.provider_accounting" "$provider_calls" '
+    ([.calls[] | select(.kind == "semantic_interpreter")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")] | length) == 0
+  '
+  assert_jq "aggregate.fixture_scope" "$fixture_calls" '
+    [.calls[] | select(.operation == "google_values")] as $calls
+    | ($calls | length) == 2
+    and ($calls | all(.source == "measurement-sheet"))
+    and ($calls | all(.returned_row_count == 6))
+  '
+  assert_jq "aggregate.dsa_operations" "$audit" '
+    [.[] | select(.operation == "context_pack")] as $seed
+    | [.[] | select(.operation == "context")] as $context
+    | ($seed | length) == 1
+    and $seed[0].source_ids == ["metrics_archive"]
+    and $seed[0].result_count == 1
+    and $seed[0].status == "success"
+    and ($context | length) == 1
+    and $context[0].source_ids == ["metrics_archive"]
+    and $context[0].result_count == 1
+    and $context[0].status == "success"
+  '
+  assert_dsa_operation_counts "$audit" 1 1 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
+  assert_jq "aggregate.runtime" "$diagnostics" '
+    [.events[] | select(.event_payload_json.request_id == $request_id)] as $events
+    | ([$events[] | select(.event_type == "evidence_shape_derived")][-1].event_payload_json) as $shape
+    | ([$events[] | select(.event_type == "evidence_plan_compiled")][0].event_payload_json) as $plan
+    | ([$events[] | select(.event_type == "evidence_sufficiency_evaluated")][0].event_payload_json) as $sufficiency
+    | ([$events[] | select(.event_type == "evidence_next_step_selected")][0].event_payload_json) as $next
+    | $shape.derivation_status == "derived"
+    and $shape.task_shape == "aggregate"
+    and (($shape | has("probe_source_count")) | not)
+    and $plan.task_shape == "aggregate"
+    and $plan.plan_status == "ready"
+    and $plan.completeness_expectation == "complete_for_declared_scope"
+    and $plan.selected_strategies == ["structured_field_values"]
+    and $plan.material_requirement_count == 3
+    and $sufficiency.sufficiency_status == "sufficient_for_declared_scope"
+    and $next.selected_next_step == "answer_within_declared_scope"
+    and $next.conclusion_disposition == "bounded_conclusion_allowed"
+    and $next.provider_disposition == "allowed"
+  ' --arg request_id "$request_id"
+  case "$serialized" in
+    *PRIVATE_AGGREGATE_SECRET_*|*55.75*|*content_fields*|*structured_data*)
+      echo "Aggregate trace exposed private structured acquisition data" >&2
+      return 1
+      ;;
+  esac
+  case "$(jq -c . <<<"$provider_calls")" in
+    *PRIVATE_AGGREGATE_SECRET_*|*55.75*)
+      echo "Aggregate provider call exposed private structured acquisition data" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "Evidence aggregate: semantic=1 answer_provider=0 seed=1 structured_context=1 records=5 non_empty=4 median=27.875"
+}
+
 run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
     ""|all)
+      run_evidence_aggregate_scenario
       run_evidence_source_scope_scenarios
       run_evidence_targeted_scenario
       run_evidence_exact_scenario
@@ -5355,6 +5518,10 @@ run_evidence_acquisition_composed_suite() {
       run_evidence_scope_reference_scenarios
       run_evidence_structured_answer_recovery_scenarios
       echo "Evidence acquisition recovery proof passed: scenarios=scope-references,structured-answer-recovery"
+      ;;
+    aggregate)
+      run_evidence_aggregate_scenario
+      echo "Evidence acquisition composed smoke passed: scenarios=aggregate"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario

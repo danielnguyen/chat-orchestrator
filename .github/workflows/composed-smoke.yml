@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - all
+          - aggregate
           - history-hybrid
           - history-exhaustive
           - history-unknown
@@ -52,7 +53,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: eb0b81292aed4a0b06bcbdddb93ce17ce081a97a
+          ref: 1e4b0d3ac83199520c0165db037a1436eec47370
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -74,10 +75,10 @@ jobs:
 
       - name: Establish pinned local main refs
         run: |
-          git -C cognitive-runtime branch --force main eb0b81292aed4a0b06bcbdddb93ce17ce081a97a
+          git -C cognitive-runtime branch --force main 1e4b0d3ac83199520c0165db037a1436eec47370
           git -C data-source-aggregator branch --force main 4febcb841307efa232f051e8319df26fd7795a5b
           git -C basic-memory-store branch --force main e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553
-          git -C chat-orchestrator merge-base --is-ancestor 254566cb65ba9a9844e7cc43cb009e075ee60e06 HEAD
+          git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD
 
       - name: Validate Compose configuration
         working-directory: chat-orchestrator

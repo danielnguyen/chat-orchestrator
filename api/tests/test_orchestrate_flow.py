@@ -1223,9 +1223,7 @@ class FakeRuntime:
             if exact_references
             else ["vehicle_log_primary"]
         )
-        selected_strategies = (
-            ["exact_fetch"] if exact_references else ["targeted_retrieval"]
-        )
+        selected_strategies = ["exact_fetch"] if exact_references else ["targeted_retrieval"]
         return {
             **{
                 key: kwargs[key]
@@ -1297,13 +1295,11 @@ class FakeRuntime:
             for item in evaluations
         )
         unknown = any(
-            item["criticality"] == "material"
-            and item["effective_outcome"] == "unknown"
+            item["criticality"] == "material" and item["effective_outcome"] == "unknown"
             for item in evaluations
         )
         optional = any(
-            item["criticality"] == "optional"
-            and item["effective_outcome"] != "satisfied"
+            item["criticality"] == "optional" and item["effective_outcome"] != "satisfied"
             for item in evaluations
         )
         status = (
@@ -1370,8 +1366,7 @@ class FakeRuntime:
                 "reason_codes": reasons,
                 "answer_constraints": constraints,
                 "qualification_required": status != "sufficient_for_declared_scope",
-                "additional_acquisition_required": status
-                in {"insufficient", "unknown"},
+                "additional_acquisition_required": status in {"insufficient", "unknown"},
                 "user_safe_summary": "Bounded sufficiency.",
             },
         }
@@ -1392,9 +1387,7 @@ class FakeRuntime:
             return response(kwargs) if callable(response) else response
         sufficiency = self._last_evidence_sufficiency_result
         status = sufficiency["sufficiency_status"]
-        current = EvidenceAcquisitionPremise.model_validate(
-            kwargs["current_premise"]
-        )
+        current = EvidenceAcquisitionPremise.model_validate(kwargs["current_premise"])
         proposed_raw = kwargs.get("proposed_acquisition_premise")
         proposed = (
             EvidenceAcquisitionPremise.model_validate(proposed_raw)
@@ -1472,14 +1465,10 @@ class FakeRuntime:
                 )
             },
             "result": {
-                "selection_id": (
-                    f"evidence_next_step_{len(self.evidence_next_step_calls)}"
-                ),
+                "selection_id": (f"evidence_next_step_{len(self.evidence_next_step_calls)}"),
                 "evaluation_id": kwargs["evaluation_id"],
                 "evidence_plan_id": kwargs["evidence_plan_id"],
-                "acquisition_manifest_id": kwargs[
-                    "acquisition_manifest_id"
-                ],
+                "acquisition_manifest_id": kwargs["acquisition_manifest_id"],
                 "task_shape": current.task_shape,
                 "sufficiency_status": status,
                 "selected_next_step": selected_next_step,
@@ -1487,9 +1476,7 @@ class FakeRuntime:
                 "provider_disposition": provider_disposition,
                 "current_premise_digest": _acquisition_premise_digest(current),
                 "proposed_premise_digest": (
-                    _acquisition_premise_digest(proposed)
-                    if proposed is not None
-                    else None
+                    _acquisition_premise_digest(proposed) if proposed is not None else None
                 ),
                 "reacquisition_guard": reacquisition_guard,
                 "clarification_target": (
@@ -2323,11 +2310,14 @@ def _retirement_response(
     revision=7,
     reason=None,
 ):
-    reason = reason or {
-        "reserved": "safe_idle_retirement_reserved",
-        "wait": "runtime_thread_active",
-        "decline": "runtime_state_missing",
-    }[outcome]
+    reason = (
+        reason
+        or {
+            "reserved": "safe_idle_retirement_reserved",
+            "wait": "runtime_thread_active",
+            "decline": "runtime_state_missing",
+        }[outcome]
+    )
     result = {
         "outcome": outcome,
         "reservation_id": None,
@@ -2459,18 +2449,14 @@ async def test_supplied_open_conversation_uses_exact_lookup_without_resolver(tmp
     assert runtime.continuation_selection_calls == []
     assert runtime.turn_start_calls[0]["expected_thread_revision"] == 0
     assert len(provider.calls) == 1
-    assert memory_store.trace_calls[0]["payload"]["conversation_id"] == (
-        "shared-conversation"
-    )
+    assert memory_store.trace_calls[0]["payload"]["conversation_id"] == ("shared-conversation")
 
 
 @pytest.mark.asyncio
 async def test_supplied_open_conversation_keeps_current_client_and_surface(tmp_path):
     rules, models = _write_router_files(tmp_path)
     memory_store = FakeMemoryStore()
-    memory_store.exact_conversation_response = _conversation_projection(
-        client_id="origin-client"
-    )
+    memory_store.exact_conversation_response = _conversation_projection(client_id="origin-client")
 
     result = await orchestrate_chat(
         payload=_base_payload(
@@ -2537,24 +2523,18 @@ async def test_omitted_conversation_uses_runtime_create_new_without_rolling_reso
         {
             "owner_id": "owner",
             "updated_since": fixed_now
-            - timedelta(
-                seconds=orchestrate_service._CONTINUATION_STALE_AFTER_SECONDS
-            ),
+            - timedelta(seconds=orchestrate_service._CONTINUATION_STALE_AFTER_SECONDS),
             "limit": 9,
         },
         {
             "owner_id": "owner",
             "updated_before": fixed_now
-            - timedelta(
-                seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS
-            ),
+            - timedelta(seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS),
             "limit": orchestrate_service._RETIREMENT_SCAN_LIMIT,
         },
     ]
     assert memory_store.list_conversation_calls[0]["updated_since"].tzinfo is UTC
-    assert memory_store.create_conversation_calls == [
-        {"owner_id": "owner", "client_id": "vscode"}
-    ]
+    assert memory_store.create_conversation_calls == [{"owner_id": "owner", "client_id": "vscode"}]
     assert runtime.turn_start_calls[0]["expected_thread_revision"] is None
 
 
@@ -2716,10 +2696,13 @@ async def test_memory_store_exact_projection_accepts_non_utc_activity_offset(mon
         return projection
 
     monkeypatch.setattr(client, "_get", fake_get)
-    assert await client.get_conversation(
-        conversation_id="shared-conversation",
-        owner_id="owner",
-    ) == projection
+    assert (
+        await client.get_conversation(
+            conversation_id="shared-conversation",
+            owner_id="owner",
+        )
+        == projection
+    )
 
 
 @pytest.mark.asyncio
@@ -2739,11 +2722,14 @@ async def test_memory_store_close_posts_exact_cas_and_validates_closed_projectio
         return closed
 
     monkeypatch.setattr(client, "_post", fake_post)
-    assert await client.close_conversation(
-        conversation_id="shared-conversation",
-        owner_id="owner",
-        expected_updated_at=expected_updated_at,
-    ) == closed
+    assert (
+        await client.close_conversation(
+            conversation_id="shared-conversation",
+            owner_id="owner",
+            expected_updated_at=expected_updated_at,
+        )
+        == closed
+    )
     assert calls == [
         {
             "path": "/v1/conversations/shared-conversation/lifecycle",
@@ -2782,9 +2768,7 @@ async def test_memory_store_close_rejects_malformed_mismatched_or_nonclosed_resu
         await client.close_conversation(
             conversation_id="shared-conversation",
             owner_id="owner",
-            expected_updated_at=datetime.fromisoformat(
-                "2026-08-01T12:00:00+00:00"
-            ),
+            expected_updated_at=datetime.fromisoformat("2026-08-01T12:00:00+00:00"),
         )
 
 
@@ -2824,10 +2808,13 @@ def test_chat_response_serializes_truthful_nullable_conversation_identity():
     assert ordinary["conversation_id"] is None
     assert "conversation_disposition" not in ordinary
     assert "pending_action" not in ordinary
-    assert ChatResponse(
-        **base,
-        conversation_id="00000000-0000-4000-8000-000000000001",
-    ).model_dump()["conversation_id"] == "00000000-0000-4000-8000-000000000001"
+    assert (
+        ChatResponse(
+            **base,
+            conversation_id="00000000-0000-4000-8000-000000000001",
+        ).model_dump()["conversation_id"]
+        == "00000000-0000-4000-8000-000000000001"
+    )
     disposition = ChatResponse(
         **base,
         conversation_id="00000000-0000-4000-8000-000000000001",
@@ -2900,9 +2887,9 @@ async def test_omitted_resume_binds_selected_revision_without_resolution_or_crea
         message for message in memory_store.added_messages if message["role"] == "user"
     )
     assert user_message["metadata"]["surface"] == "voice"
-    resolution_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["turn_state"]["conversation_resolution"]
+    resolution_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "turn_state"
+    ]["conversation_resolution"]
     assert resolution_trace == {
         "mode": "runtime_selected",
         "candidate_count": 1,
@@ -2946,11 +2933,15 @@ async def test_nine_omitted_candidates_are_sent_as_incomplete_bounded_set(tmp_pa
     selection_call = runtime.continuation_selection_calls[0]
     assert selection_call["candidate_set_complete"] is False
     assert len(selection_call["candidates"]) == 8
-    assert all(set(candidate) == {
-        "conversation_id",
-        "lifecycle_state",
-        "durable_updated_at",
-    } for candidate in selection_call["candidates"])
+    assert all(
+        set(candidate)
+        == {
+            "conversation_id",
+            "lifecycle_state",
+            "durable_updated_at",
+        }
+        for candidate in selection_call["candidates"]
+    )
     assert result["status"] == "degraded"
     assert result["conversation_id"] is None
     assert memory_store.create_conversation_calls == []
@@ -3137,15 +3128,11 @@ async def test_runtime_disabled_omitted_conversation_keeps_rolling_compatibility
 
     assert result["status"] == "ok"
     assert result["conversation_id"] == "conv-1"
-    assert memory_store.resolve_conversation_calls == [
-        {"owner_id": "owner", "client_id": "vscode"}
-    ]
+    assert memory_store.resolve_conversation_calls == [{"owner_id": "owner", "client_id": "vscode"}]
     assert memory_store.list_conversation_calls == []
     assert memory_store.create_conversation_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
-    assert trace["turn_state"]["conversation_resolution"] == {
-        "mode": "compatibility"
-    }
+    assert trace["turn_state"]["conversation_resolution"] == {"mode": "compatibility"}
 
 
 @pytest.mark.asyncio
@@ -3563,9 +3550,7 @@ async def test_mandatory_safe_retirement_uses_cr_captured_activity_and_finalizes
             "owner_id": "owner",
             "conversation_id": "shared-conversation",
             "lifecycle_state": "open",
-            "durable_updated_at": datetime.fromisoformat(
-                "2026-08-01T12:00:00+00:00"
-            ),
+            "durable_updated_at": datetime.fromisoformat("2026-08-01T12:00:00+00:00"),
             "retirement_before": expected_cutoff,
         }
     ]
@@ -3611,9 +3596,7 @@ async def test_mandatory_retirement_wait_or_decline_never_closes_or_admits(
     memory_store.exact_conversation_response = _conversation_projection(
         updated_at=(fixed_now - timedelta(days=8)).isoformat()
     )
-    runtime = FakeRuntime(
-        retirement_reservation_response=_retirement_response(outcome)
-    )
+    runtime = FakeRuntime(retirement_reservation_response=_retirement_response(outcome))
 
     result, provider = await _run_retirement_chat(
         tmp_path,
@@ -3638,9 +3621,7 @@ async def test_close_failure_reread_open_cancels_once_without_retry_or_dispositi
     cancel_fails,
 ):
     fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
-    old = _conversation_projection(
-        updated_at=(fixed_now - timedelta(days=8)).isoformat()
-    )
+    old = _conversation_projection(updated_at=(fixed_now - timedelta(days=8)).isoformat())
     _freeze_orchestration_time(monkeypatch, fixed_now)
     memory_store = FakeMemoryStore()
     memory_store.exact_conversation_effects = [old, old]
@@ -3679,9 +3660,7 @@ async def test_close_failure_reconciles_authoritative_non_current_without_cancel
     reconciled_state,
 ):
     fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
-    old = _conversation_projection(
-        updated_at=(fixed_now - timedelta(days=8)).isoformat()
-    )
+    old = _conversation_projection(updated_at=(fixed_now - timedelta(days=8)).isoformat())
     reconciled = _conversation_projection(
         lifecycle_state=reconciled_state,
         superseded_by_conversation_id=(
@@ -3709,9 +3688,7 @@ async def test_close_failure_reconciles_authoritative_non_current_without_cancel
     assert len(memory_store.close_conversation_calls) == 1
     assert len(memory_store.exact_conversation_calls) == 2
     assert runtime.retirement_cancel_calls == []
-    assert len(runtime.retirement_finalize_calls) == (
-        1 if reconciled_state == "closed" else 0
-    )
+    assert len(runtime.retirement_finalize_calls) == (1 if reconciled_state == "closed" else 0)
     assert result["conversation_disposition"] == "non_current"
     assert "replacement-conversation" not in json.dumps(result)
     assert runtime.turn_start_calls == []
@@ -3724,9 +3701,7 @@ async def test_close_failure_and_failed_reread_keeps_reservation_without_disposi
     monkeypatch,
 ):
     fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
-    old = _conversation_projection(
-        updated_at=(fixed_now - timedelta(days=8)).isoformat()
-    )
+    old = _conversation_projection(updated_at=(fixed_now - timedelta(days=8)).isoformat())
     _freeze_orchestration_time(monkeypatch, fixed_now)
     memory_store = FakeMemoryStore()
     memory_store.exact_conversation_effects = [
@@ -3763,9 +3738,7 @@ async def test_confirmed_close_finalize_failure_remains_non_current_and_never_ca
     monkeypatch,
 ):
     fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
-    old = _conversation_projection(
-        updated_at=(fixed_now - timedelta(days=8)).isoformat()
-    )
+    old = _conversation_projection(updated_at=(fixed_now - timedelta(days=8)).isoformat())
     _freeze_orchestration_time(monkeypatch, fixed_now)
     memory_store = FakeMemoryStore()
     memory_store.exact_conversation_response = old
@@ -3844,9 +3817,7 @@ async def test_create_new_runs_bounded_old_open_cleanup_before_durable_creation(
     assert memory_store.list_conversation_calls[1] == {
         "owner_id": "owner",
         "updated_before": fixed_now
-        - timedelta(
-            seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS
-        ),
+        - timedelta(seconds=orchestrate_service._CONVERSATION_RETIREMENT_AFTER_SECONDS),
         "limit": orchestrate_service._RETIREMENT_SCAN_LIMIT,
     }
     assert len(memory_store.list_conversation_effects) == 0
@@ -3854,9 +3825,7 @@ async def test_create_new_runs_bounded_old_open_cleanup_before_durable_creation(
     assert len(memory_store.close_conversation_calls) == 1
     assert len(runtime.retirement_finalize_calls) == 1
     assert operations[:2] == ["close_old", "create_new"]
-    assert memory_store.create_conversation_calls == [
-        {"owner_id": "owner", "client_id": "vscode"}
-    ]
+    assert memory_store.create_conversation_calls == [{"owner_id": "owner", "client_id": "vscode"}]
     assert len(provider.calls) == 1
 
 
@@ -3872,9 +3841,7 @@ async def test_cleanup_negative_or_ambiguous_outcome_never_blocks_create_new(
 ):
     fixed_now = datetime(2026, 8, 9, 12, tzinfo=UTC)
     _freeze_orchestration_time(monkeypatch, fixed_now)
-    old = _open_candidate() | {
-        "updated_at": (fixed_now - timedelta(days=8)).isoformat()
-    }
+    old = _open_candidate() | {"updated_at": (fixed_now - timedelta(days=8)).isoformat()}
     memory_store = FakeMemoryStore()
     memory_store.list_conversation_effects = [
         {"conversations": [], "next_cursor": None},
@@ -3882,9 +3849,7 @@ async def test_cleanup_negative_or_ambiguous_outcome_never_blocks_create_new(
     ]
     runtime = FakeRuntime()
     if cleanup_outcome == "ambiguous":
-        runtime.retirement_reservation_error = httpx.ReadTimeout(
-            "PRIVATE-CLEANUP-SENTINEL"
-        )
+        runtime.retirement_reservation_error = httpx.ReadTimeout("PRIVATE-CLEANUP-SENTINEL")
     elif cleanup_outcome == "close_conflict":
         runtime.retirement_reservation_response = _retirement_response(
             "reserved", durable_updated_at=old["updated_at"]
@@ -3912,9 +3877,7 @@ async def test_cleanup_negative_or_ambiguous_outcome_never_blocks_create_new(
     assert len(memory_store.close_conversation_calls) == (
         1 if cleanup_outcome == "close_conflict" else 0
     )
-    assert len(runtime.retirement_cancel_calls) == (
-        1 if cleanup_outcome == "close_conflict" else 0
-    )
+    assert len(runtime.retirement_cancel_calls) == (1 if cleanup_outcome == "close_conflict" else 0)
     assert len(provider.calls) == 1
 
 
@@ -4309,9 +4272,7 @@ def _world_state_registry_runtime(
             capability_id="runtime.world_state.read",
             confirmation_required=confirmation_required,
             confirmation_text=(
-                "Confirm reading bounded runtime world state."
-                if confirmation_required
-                else None
+                "Confirm reading bounded runtime world state." if confirmation_required else None
             ),
             execution_allowed=execution_allowed,
             verification_required=verification_required,
@@ -4856,8 +4817,7 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
             ],
             confirmation_required=True,
             confirmation_text=(
-                "Confirm Restart media service for media server. "
-                "This may interrupt streaming."
+                "Confirm Restart media service for media server. " "This may interrupt streaming."
             ),
             execution_allowed=False,
             verification_required=True,
@@ -4946,8 +4906,7 @@ async def test_orchestrate_traces_governance_to_scoped_confirmation_without_exec
             dry_run_required=False,
             confirmation_required=True,
             confirmation_text=(
-                "Confirm Restart media service for media server. "
-                "This may interrupt streaming."
+                "Confirm Restart media service for media server. " "This may interrupt streaming."
             ),
             execution_allowed=False,
             verification_required=True,
@@ -5072,17 +5031,13 @@ async def test_orchestrate_traces_high_tension_governance_suppression_without_ex
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == (
-        "Action office_lights_on was blocked by policy. No action was taken."
-    )
+    assert out["answer"] == ("Action office_lights_on was blocked by policy. No action was taken.")
     assert "Done" not in out["answer"]
     assert runtime.capability_authority_calls[0]["interaction_governance_kind"] == (
         "vent_or_expression"
     )
     assert runtime.capability_authority_calls[0]["interaction_governance_tension"] == "high"
-    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] == (
-        "vent_or_expression"
-    )
+    assert runtime.capability_flow_calls[0]["interaction_governance_kind"] == ("vent_or_expression")
     assert runtime.capability_flow_calls[0]["interaction_governance_tension"] == "high"
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["decision_provenance"] == {
@@ -5338,9 +5293,7 @@ async def test_orchestrate_blocked_authority_refuses_without_execution(tmp_path)
         capability_registry_enabled=True,
     )
 
-    assert out["answer"] == (
-        "Action external_purchase was blocked by policy. No action was taken."
-    )
+    assert out["answer"] == ("Action external_purchase was blocked by policy. No action was taken.")
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["authority"]["authority_level"] == "blocked"
     assert trace["capability_registry"]["action_flow"]["execution_allowed"] is False
@@ -5728,8 +5681,7 @@ async def test_orchestrate_action_flow_confirmation_uses_scoped_text(tmp_path):
             dry_run_required=False,
             confirmation_required=True,
             confirmation_text=(
-                "Confirm Restart Jellyfin for media server. "
-                "This may be difficult to reverse."
+                "Confirm Restart Jellyfin for media server. " "This may be difficult to reverse."
             ),
             execution_allowed=False,
             verification_supported=True,
@@ -5995,9 +5947,9 @@ async def test_orchestrate_reports_registry_world_state_verification_failure(tmp
     assert summary_call["verification_status"] == "failed"
     assert summary_call["verification_reason_code"] == "result_check_failed"
     assert summary_call["degradation_reason"] == "result_check_failed"
-    action_summary = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["capabilities"]["action_summary"]
+    action_summary = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]["action_summary"]
     assert action_summary["status"] == "included"
     assert action_summary["execution_status"] == "executed"
     assert action_summary["verification_status"] == "failed"
@@ -6090,8 +6042,7 @@ async def test_orchestrate_action_summary_unavailable_preserves_execution_outcom
     )
 
     assert out["answer"] == (
-        "I read bounded runtime world state and verified the result: found "
-        "0 matching claim(s)."
+        "I read bounded runtime world state and verified the result: found " "0 matching claim(s)."
     )
     execute_calls = [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
@@ -6101,9 +6052,7 @@ async def test_orchestrate_action_summary_unavailable_preserves_execution_outcom
     assert len(runtime.action_summary_calls) == 1
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capabilities"]["action_summary"]["status"] == "unavailable"
-    assert trace["capabilities"]["action_summary"]["reason"] == (
-        "action_summary_unavailable"
-    )
+    assert trace["capabilities"]["action_summary"]["reason"] == ("action_summary_unavailable")
     assert "PRIVATE-SUMMARY-ERROR" not in str(trace["capabilities"]["action_summary"])
 
 
@@ -6220,8 +6169,7 @@ async def test_orchestrate_rejects_invalid_action_summary_response(
     )
 
     assert out["answer"] == (
-        "I read bounded runtime world state and verified the result: found "
-        "0 matching claim(s)."
+        "I read bounded runtime world state and verified the result: found " "0 matching claim(s)."
     )
     execute_calls = [
         call for call in runtime.world_state_calls if call["request_id"].endswith(":execute")
@@ -6353,7 +6301,7 @@ async def test_orchestrate_does_not_claim_success_for_missing_verification_resul
                 "authority_allowed": False,
                 "authority_level": "suggest_only",
             },
-                "No action was taken",
+            "No action was taken",
         ),
         ({"execution_allowed": False}, "No action was taken"),
         (
@@ -13995,22 +13943,20 @@ def _evidence_interpreter_completion(
     interpretation_status,
     operation_hint,
     candidate_source_ids,
+    *,
+    aggregate_function=None,
+    aggregate_field_name=None,
 ):
-    return {
-        "choices": [
-            {
-                "message": {
-                    "content": json.dumps(
-                        {
-                            "interpretation_status": interpretation_status,
-                            "operation_hint": operation_hint,
-                            "candidate_source_ids": candidate_source_ids,
-                        }
-                    )
-                }
-            }
-        ]
+    payload = {
+        "interpretation_status": interpretation_status,
+        "operation_hint": operation_hint,
+        "candidate_source_ids": candidate_source_ids,
     }
+    if aggregate_function is not None:
+        payload["aggregate_function"] = aggregate_function
+    if aggregate_field_name is not None:
+        payload["aggregate_field_name"] = aggregate_field_name
+    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
 
 
 def _first_party_chat_payload(
@@ -14074,9 +14020,7 @@ async def test_chat_boundary_logs_generated_request_id_without_content(
     monkeypatch.setattr(main, "uuid4", lambda: request_id)
     monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
     caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.chat")
-    body = ChatRequest.model_validate(
-        _first_party_chat_payload("PRIVATE_USER_TEXT_SENTINEL")
-    )
+    body = ChatRequest.model_validate(_first_party_chat_payload("PRIVATE_USER_TEXT_SENTINEL"))
 
     response = await main.chat(body)
 
@@ -14225,8 +14169,7 @@ def _evidence_candidate(
         {
             "conclusion_disposition": disposition,
             "evidence_excerpts": [
-                {"source_ref": source_ref, "excerpt": excerpt}
-                for source_ref, excerpt in excerpts
+                {"source_ref": source_ref, "excerpt": excerpt} for source_ref, excerpt in excerpts
             ],
         },
         separators=(",", ":"),
@@ -14240,16 +14183,9 @@ def _rendered_evidence_answer(
 ) -> str:
     conclusions = {
         "supports": "The retained evidence supports the requested conclusion.",
-        "does_not_support": (
-            "The retained evidence does not support the requested conclusion."
-        ),
-        "mixed": (
-            "The retained evidence is mixed and does not establish a single "
-            "conclusion."
-        ),
-        "descriptive": (
-            "The retained evidence supports only the following bounded description."
-        ),
+        "does_not_support": ("The retained evidence does not support the requested conclusion."),
+        "mixed": ("The retained evidence is mixed and does not establish a single " "conclusion."),
+        "descriptive": ("The retained evidence supports only the following bounded description."),
     }
     return "\n\n".join(
         [
@@ -14462,15 +14398,12 @@ def _targeted_plan_response(
         "result": {
             "plan_id": "evidence_plan_1",
             "question_anchor": question,
-            "question_anchor_digest": (
-                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
-            ),
+            "question_anchor_digest": (f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"),
             "task_shape": task_shape,
             "plan_status": status,
             "completeness_expectation": (
                 "complete_for_declared_scope"
-                if task_shape
-                in {"bounded_exhaustive_review", "absence_or_coverage_check"}
+                if task_shape in {"bounded_exhaustive_review", "absence_or_coverage_check"}
                 else "targeted_scope"
             ),
             "contradiction_search_required": task_shape == "bounded_exhaustive_review",
@@ -14601,9 +14534,7 @@ def _bounded_exhaustive_plan_response(
             "criticality": "material",
         },
     ]
-    result["limitation_codes"] = (
-        [] if status == "ready" else ["required_capability_unavailable"]
-    )
+    result["limitation_codes"] = [] if status == "ready" else ["required_capability_unavailable"]
     return response
 
 
@@ -14617,9 +14548,7 @@ def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
             "source_type": "google_sheets",
             "source_id": "vehicle_log_primary",
             "source_name": "PRIVATE WORKSHEET NAME",
-            "source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
-            ),
+            "source_ref": ("google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"),
             "retrieved_at": "2026-07-17T00:00:00Z",
             "source_modified_at": None,
             "title": "PRIVATE TARGETED SEED TITLE",
@@ -14629,9 +14558,7 @@ def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
             "available_context": [
                 {
                     "context_mode": "nearby_rows",
-                    "description": (
-                        "Fetch every record from the complete configured worksheet."
-                    ),
+                    "description": ("Fetch every record from the complete configured worksheet."),
                 },
                 {
                     "context_mode": "configured_worksheet",
@@ -14672,17 +14599,13 @@ def _configured_worksheet_context_response(
                 "source_type": "google_sheets",
                 "source_id": source_id,
                 "source_name": "PRIVATE WORKSHEET NAME",
-                "source_ref": (
-                    f"google_sheets:{source_id}:Maintenance%20Log!A2:E20"
-                ),
+                "source_ref": (f"google_sheets:{source_id}:Maintenance%20Log!A2:E20"),
                 "retrieved_at": "2026-07-17T00:00:00Z",
                 "source_modified_at": None,
                 "cache_status": "live",
                 "title": "PRIVATE COMPLETE RANGE TITLE",
                 "content_type": "spreadsheet_range",
-                "text": (
-                    "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records."
-                ),
+                "text": ("COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records."),
                 "url": None,
                 "confidence": "high",
                 "raw": None,
@@ -14750,9 +14673,7 @@ def _derived_shape_response(
         "result": {
             "derivation_id": "evidence_shape_1",
             "question_anchor": question,
-            "question_anchor_digest": (
-                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
-            ),
+            "question_anchor_digest": (f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"),
             "derivation_status": "derived",
             "task_shape": task_shape,
             "candidate_task_shapes": [task_shape],
@@ -14781,17 +14702,13 @@ def _not_applicable_shape_response(call) -> dict[str, object]:
         "result": {
             "derivation_id": "evidence_shape_ordinary",
             "question_anchor": question,
-            "question_anchor_digest": (
-                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
-            ),
+            "question_anchor_digest": (f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"),
             "derivation_status": "not_applicable",
             "task_shape": None,
             "candidate_task_shapes": [],
             "evidence_scope_material": False,
             "clarification_required": False,
-            "reason_codes": [
-                "ordinary_chat_without_material_evidence_scope"
-            ],
+            "reason_codes": ["ordinary_chat_without_material_evidence_scope"],
             "user_safe_summary": "Evidence acquisition is not required.",
         },
     }
@@ -15071,9 +14988,7 @@ async def _run_bounded_exhaustive_case(
 async def test_bounded_exhaustive_review_delivers_only_complete_configured_worksheet(
     tmp_path,
 ):
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(tmp_path=tmp_path)
-    )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(tmp_path=tmp_path)
 
     assert out["answer"] == _rendered_evidence_answer(
         "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
@@ -15089,16 +15004,12 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
         "rid-evidence-bounded-exhaustive",
         "rid-evidence-bounded-exhaustive",
     ]
-    assert dsa.calls[0]["query"] == (
-        "Review every maintenance record in the configured worksheet."
-    )
+    assert dsa.calls[0]["query"] == ("Review every maintenance record in the configured worksheet.")
     assert dsa.calls[0]["source_ids"] == ["vehicle_log_primary"]
     assert dsa.calls[0]["budget"]["max_results"] == 1
     assert dsa.context_calls == [
         {
-            "source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
-            ),
+            "source_ref": ("google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"),
             "context_mode": "configured_worksheet",
             "budget": {
                 "max_rows": 20,
@@ -15155,9 +15066,7 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
     assert acquisition["expansion_attempts"] == [
         {
             "source_id": "vehicle_log_primary",
-            "seed_source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
-            ),
+            "seed_source_ref": ("google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"),
             "context_mode": "configured_worksheet",
             "outcome": "satisfied",
             "returned_reference_count": 1,
@@ -15191,9 +15100,7 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         "assemble_prompt",
         filtered_assemble_prompt,
     )
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(tmp_path=tmp_path)
-    )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(tmp_path=tmp_path)
 
     _assert_material_gap_answer(
         out["answer"],
@@ -15222,9 +15129,7 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         "no-material-truncation": "filtered",
     }
     assert len(memory_store.trace_calls) == 1
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["status"] == "insufficient"
     assert manifest["sufficiency"]["status"] == "insufficient"
     assert manifest["sufficiency"]["answer_constraints"] == [
@@ -15244,13 +15149,10 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
     assert len(acquisition["source_references_returned"]) == 1
     assert acquisition["source_references_retained"] == []
     assert len(acquisition["source_references_filtered_or_omitted"]) == 1
-    assert len(
-        [
-            message
-            for message in memory_store.added_messages
-            if message["role"] == "assistant"
-        ]
-    ) == 1
+    assert (
+        len([message for message in memory_store.added_messages if message["role"] == "assistant"])
+        == 1
+    )
     assert memory_store.claim_record_calls == []
 
 
@@ -15264,10 +15166,7 @@ async def test_bounded_exhaustive_malformed_sufficiency_constraints_fail_closed(
     malformation,
 ):
     def malformed_response(kwargs):
-        facts = {
-            fact["requirement_id"]: fact["outcome"]
-            for fact in kwargs["acquisition_facts"]
-        }
+        facts = {fact["requirement_id"]: fact["outcome"] for fact in kwargs["acquisition_facts"]}
         constraints = [
             "qualify_conclusion",
             "disclose_limitations",
@@ -15317,21 +15216,17 @@ async def test_bounded_exhaustive_malformed_sufficiency_constraints_fail_closed(
             },
         }
 
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(
-            tmp_path=tmp_path,
-            context_responses=[_configured_worksheet_context_response(truncated=True)],
-            evidence_sufficiency_response=malformed_response,
-        )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        context_responses=[_configured_worksheet_context_response(truncated=True)],
+        evidence_sufficiency_response=malformed_response,
     )
 
     assert len(runtime.evidence_sufficiency_calls) == 1
     assert runtime.evidence_next_step_calls == []
     assert litellm.calls == []
     assert len(dsa.context_calls) == 1
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["status"] == "sufficiency_dependency_failed"
     assert manifest["sufficiency"]["status"] == "not_evaluated"
     assert "complete-scope conclusion" not in out["answer"]
@@ -15351,12 +15246,10 @@ async def test_bounded_exhaustive_missing_exact_descriptor_never_falls_back(
             "description": "Fetch the complete configured worksheet.",
         }
     ]
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(
-            tmp_path=tmp_path,
-            context_pack=context_pack,
-            context_responses=[],
-        )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        context_pack=context_pack,
+        context_responses=[],
     )
 
     _assert_material_gap_answer(
@@ -15376,9 +15269,9 @@ async def test_bounded_exhaustive_missing_exact_descriptor_never_falls_back(
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts["complete-scope-coverage"] == "unsupported"
-    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]["acquisition"]
+    acquisition = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"][
+        "acquisition"
+    ]
     assert acquisition["expansion_attempt_count"] == 1
     assert acquisition["expansion_unsupported_count"] == 1
 
@@ -15415,11 +15308,9 @@ async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
     expected_outcome,
     count_field,
 ):
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(
-            tmp_path=tmp_path,
-            context_responses=[response],
-        )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        context_responses=[response],
     )
 
     expected_fragment = {
@@ -15442,9 +15333,9 @@ async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts["complete-scope-coverage"] == expected_outcome
-    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]["acquisition"]
+    acquisition = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"][
+        "acquisition"
+    ]
     assert acquisition["expansion_attempt_count"] == 1
     assert acquisition[count_field] == 1
     serialized = json.dumps(memory_store.trace_calls[0]["payload"], sort_keys=True)
@@ -15456,12 +15347,10 @@ async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
 async def test_bounded_exhaustive_current_unsupported_plan_never_acquires(
     tmp_path,
 ):
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(
-            tmp_path=tmp_path,
-            plan_status="unsupported",
-            context_responses=[],
-        )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        plan_status="unsupported",
+        context_responses=[],
     )
 
     assert out["answer"] == (
@@ -15474,9 +15363,7 @@ async def test_bounded_exhaustive_current_unsupported_plan_never_acquires(
     assert dsa.fetch_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert litellm.calls == []
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["status"] == "unsupported_plan"
 
 
@@ -15484,38 +15371,34 @@ async def test_bounded_exhaustive_current_unsupported_plan_never_acquires(
 async def test_bounded_exhaustive_privacy_suppresses_expansion_identifiers(
     tmp_path,
 ):
-    out, runtime, dsa, litellm, memory_store = (
-        await _run_bounded_exhaustive_case(
-            tmp_path=tmp_path,
-            memory_store=ClaimCaptureMemoryStore(),
-            privacy_context_response=_privacy_runtime_response(
-                surface_type="desktop_private",
-                sensitivity_level="sensitive",
-                sensitive_detail_allowed=False,
-                screen_detail_allowed=False,
-                redaction_required=True,
-                safe_summary_required=True,
-                reason_codes=["safe_summary_required"],
-            ),
-            privacy_context_enabled=True,
-            claim_record_capture_enabled=True,
-        )
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        memory_store=ClaimCaptureMemoryStore(),
+        privacy_context_response=_privacy_runtime_response(
+            surface_type="desktop_private",
+            sensitivity_level="sensitive",
+            sensitive_detail_allowed=False,
+            screen_detail_allowed=False,
+            redaction_required=True,
+            safe_summary_required=True,
+            reason_codes=["safe_summary_required"],
+        ),
+        privacy_context_enabled=True,
+        claim_record_capture_enabled=True,
     )
 
     assert out["answer"] == (
-        "Details cannot safely be shown on this surface.\n\n"
-        f"{EXHAUSTIVE_SCOPE_SUFFIX}"
+        "Details cannot safely be shown on this surface.\n\n" f"{EXHAUSTIVE_SCOPE_SUFFIX}"
     )
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
-    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
-        "reason_code"
-    ] == "privacy_suppressed"
+    assert (
+        memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]["reason_code"]
+        == "privacy_suppressed"
+    )
     assert len(dsa.context_calls) == 1
     assert len(litellm.calls) == 1
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     acquisition = manifest["acquisition"]
     assert acquisition["source_identifiers_suppressed"] is True
     assert acquisition["expansion_attempts"] == []
@@ -15643,24 +15526,16 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
         "evidence_shape"
     )
-    assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index(
-        "evidence_shape"
-    )
-    assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index(
-        "evidence_plan"
-    )
-    assert runtime.call_order.index("evidence_plan") < runtime.call_order.index(
-        "dsa_context_pack"
-    )
+    assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index("evidence_shape")
+    assert runtime.call_order.index("dsa_inventory") < runtime.call_order.index("evidence_plan")
+    assert runtime.call_order.index("evidence_plan") < runtime.call_order.index("dsa_context_pack")
     assert runtime.call_order.index("dsa_context_pack") < runtime.call_order.index(
         "evidence_sufficiency"
     )
     assert runtime.call_order.index("evidence_sufficiency") < runtime.call_order.index(
         "evidence_next_step"
     )
-    assert runtime.call_order.index("evidence_next_step") < runtime.call_order.index(
-        "provider"
-    )
+    assert runtime.call_order.index("evidence_next_step") < runtime.call_order.index("provider")
     submitted_facts = runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     assert {fact["requirement_id"]: fact["outcome"] for fact in submitted_facts} == {
         "context-delivery": "satisfied",
@@ -15675,19 +15550,11 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
     assert manifest["response_digest"] == (
         f"sha256:{hashlib.sha256(out['answer'].encode()).hexdigest()}"
     )
-    assert manifest["acquisition"]["source_references_returned"] == [
-        "vehicle_log_primary:record_1"
-    ]
-    assert manifest["acquisition"]["source_references_retained"] == [
-        "vehicle_log_primary:record_1"
-    ]
+    assert manifest["acquisition"]["source_references_returned"] == ["vehicle_log_primary:record_1"]
+    assert manifest["acquisition"]["source_references_retained"] == ["vehicle_log_primary:record_1"]
     eligible_sources = {"vehicle_log_primary"}
-    assert set(manifest["acquisition"]["sources_considered"]).issubset(
-        eligible_sources
-    )
-    assert manifest["acquisition"]["sources_selected"] == manifest["acquisition"][
-        "sources_used"
-    ]
+    assert set(manifest["acquisition"]["sources_considered"]).issubset(eligible_sources)
+    assert manifest["acquisition"]["sources_selected"] == manifest["acquisition"]["sources_used"]
     assert set(manifest["acquisition"]["source_references_retained"]).issubset(
         manifest["acquisition"]["source_references_returned"]
     )
@@ -15821,16 +15688,14 @@ async def test_trusted_scope_selector_narrows_targeted_cr_and_dsa_without_metada
         assert raw_metadata not in provider_prompt
         assert raw_metadata not in public_response
 
-    history, history_provider, history_dsa, _ = (
-        await _run_acquisition_explanation_follow_up(
-            tmp_path,
-            follow_up="What did you check?",
-            prior_answer=out["answer"],
-            memory_store=memory_store,
-            runtime=runtime,
-            request_id="rid-trusted-scope-history",
-            claim_capture_enabled=False,
-        )
+    history, history_provider, history_dsa, _ = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up="What did you check?",
+        prior_answer=out["answer"],
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="rid-trusted-scope-history",
+        claim_capture_enabled=False,
     )
     assert history["status"] == "ok"
     assert history_provider.calls == []
@@ -15887,9 +15752,7 @@ async def test_scope_selector_mismatch_is_plan_acquisition_and_provider_free(tmp
     assert dsa.context_calls == []
     assert litellm.calls == []
     trace = memory_store.trace_calls[0]["payload"]
-    assert trace["prompt"]["evidence_acquisition"]["status"] == (
-        "scope_selector_no_match"
-    )
+    assert trace["prompt"]["evidence_acquisition"]["status"] == ("scope_selector_no_match")
     serialized = json.dumps(trace, sort_keys=True)
     assert "thunderbird" not in serialized
     assert "PRIVATE PROVIDER ANSWER" not in serialized
@@ -15900,9 +15763,7 @@ async def test_malformed_trusted_scope_inventory_is_plan_and_provider_free(tmp_p
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
     dsa = FakeDSA()
-    dsa.source_response["sources"][0]["scope_refs"] = {
-        "project": "fire fox"
-    }
+    dsa.source_response["sources"][0]["scope_refs"] = {"project": "fire fox"}
     litellm = FakeLiteLLM(content="PRIVATE PROVIDER ANSWER")
 
     out = await orchestrate_chat(
@@ -16058,12 +15919,8 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
     )
     assert assembly_count == 2
     assert len(runtime.evidence_plan_calls) == 2
-    assert runtime.evidence_plan_calls[0]["declared_scope"][
-        "exact_source_refs"
-    ] == []
-    assert runtime.evidence_plan_calls[1]["declared_scope"][
-        "exact_source_refs"
-    ] == [
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["exact_source_refs"] == []
+    assert runtime.evidence_plan_calls[1]["declared_scope"]["exact_source_refs"] == [
         {
             "source_id": "vehicle_log_primary",
             "source_ref": "vehicle_log_primary:record_1",
@@ -16071,22 +15928,13 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
     ]
     assert len(runtime.evidence_sufficiency_calls) == 2
     assert [
-        call["current_premise"]["selected_strategies"]
-        for call in runtime.evidence_next_step_calls
+        call["current_premise"]["selected_strategies"] for call in runtime.evidence_next_step_calls
     ] == [["targeted_retrieval"], ["exact_fetch"]]
     assert len(runtime.evidence_next_step_calls) == 2
-    assert (
-        runtime.evidence_next_step_calls[0][
-            "proposed_acquisition_premise"
-        ]["selected_strategies"]
-        == ["exact_fetch"]
-    )
-    assert (
-        runtime.evidence_next_step_calls[1][
-            "proposed_acquisition_premise"
-        ]
-        is None
-    )
+    assert runtime.evidence_next_step_calls[0]["proposed_acquisition_premise"][
+        "selected_strategies"
+    ] == ["exact_fetch"]
+    assert runtime.evidence_next_step_calls[1]["proposed_acquisition_premise"] is None
     assert dsa.fetch_calls == [
         {
             "source_ref": "vehicle_log_primary:record_1",
@@ -16102,9 +15950,7 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
     provider_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
     assert "The exact maintenance item lists 2025-07-12." in provider_messages
     assert "The maintenance record lists 2025-07-12." not in provider_messages
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["acquisition"]["strategy_attempted"] == "exact_fetch"
     assert manifest["next_steps"]["additional_acquisition_count"] == 1
     assert manifest["next_steps"]["selection_count"] == 2
@@ -16115,16 +15961,11 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
         "retained_reference_count": 0,
         "changed_premise_exact_fetch_followed": True,
     }
-    assert [
-        item["selected_next_step"]
-        for item in manifest["next_steps"]["selections"]
-    ] == [
+    assert [item["selected_next_step"] for item in manifest["next_steps"]["selections"]] == [
         "perform_additional_acquisition",
         "answer_within_declared_scope",
     ]
-    assert manifest["next_steps"]["selections"][0][
-        "additional_acquisition_executed"
-    ] is True
+    assert manifest["next_steps"]["selections"][0]["additional_acquisition_executed"] is True
     assert "The maintenance record lists" not in json.dumps(
         manifest,
         sort_keys=True,
@@ -16216,9 +16057,7 @@ async def test_evidence_next_step_already_attempted_guard_prevents_exact_fetch(
         fragments=["reasoning context", "filtered or omitted before reasoning"],
     )
     assert len(runtime.evidence_next_step_calls) == 1
-    assert runtime.evidence_next_step_calls[0][
-        "proposed_acquisition_premise"
-    ] is not None
+    assert runtime.evidence_next_step_calls[0]["proposed_acquisition_premise"] is not None
     assert dsa.fetch_calls == []
     assert litellm.calls == []
 
@@ -16310,24 +16149,18 @@ async def test_evidence_next_step_guarded_partial_is_provider_and_fetch_free(
         "The available evidence establishes the requested targeted evidence."
     )
     assert "reasoning context" in out["answer"]
-    assert out["answer"].endswith(
-        "I’m withholding the requested conclusion."
-    )
+    assert out["answer"].endswith("I’m withholding the requested conclusion.")
     assert "PRIVATE PROVIDER CONCLUSION" not in out["answer"]
     assert len(runtime.evidence_next_step_calls) == 1
-    assert runtime.evidence_next_step_calls[0][
-        "proposed_acquisition_premise"
-    ] is not None
+    assert runtime.evidence_next_step_calls[0]["proposed_acquisition_premise"] is not None
     assert dsa.fetch_calls == []
     assert litellm.calls == []
     assert memory_store.claim_record_calls == []
-    next_steps = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]["next_steps"]
+    next_steps = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"][
+        "next_steps"
+    ]
     assert next_steps["additional_acquisition_count"] == 0
-    assert next_steps["selections"][0]["selected_next_step"] == (
-        "provide_qualified_partial_answer"
-    )
+    assert next_steps["selections"][0]["selected_next_step"] == ("provide_qualified_partial_answer")
     assert next_steps["selections"][0]["reacquisition_guard"] == guard
 
 
@@ -16399,9 +16232,7 @@ async def test_evidence_next_step_deterministic_partial_remains_provider_free(
         "The available evidence establishes the requested targeted evidence."
     )
     assert "reasoning context" in out["answer"]
-    assert out["answer"].endswith(
-        "I’m withholding the requested conclusion."
-    )
+    assert out["answer"].endswith("I’m withholding the requested conclusion.")
     assert "PRIVATE PROVIDER CONCLUSION" not in out["answer"]
     assert litellm.calls == []
 
@@ -16412,9 +16243,7 @@ async def test_evidence_next_step_dependency_failure_is_provider_free(
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
-    runtime = FakeRuntime(
-        evidence_next_step_error=RuntimeError("PRIVATE SELECTOR ERROR")
-    )
+    runtime = FakeRuntime(evidence_next_step_error=RuntimeError("PRIVATE SELECTOR ERROR"))
     dsa = FakeDSA(response=_governed_context_pack(question))
     litellm = FakeLiteLLM(content="PRIVATE PROVIDER CONCLUSION")
     memory_store = FakeMemoryStore()
@@ -16442,9 +16271,7 @@ async def test_evidence_next_step_dependency_failure_is_provider_free(
         "the requested conclusion."
     )
     assert litellm.calls == []
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["next_steps"]["dependency_status"] == "dependency_failure"
     assert "PRIVATE SELECTOR ERROR" not in json.dumps(manifest, sort_keys=True)
 
@@ -16538,14 +16365,10 @@ async def test_evidence_next_step_never_executes_a_second_acquisition(
         "the requested conclusion."
     )
     assert len(runtime.evidence_next_step_calls) == 2
-    assert runtime.evidence_next_step_calls[1][
-        "proposed_acquisition_premise"
-    ] is None
+    assert runtime.evidence_next_step_calls[1]["proposed_acquisition_premise"] is None
     assert len(dsa.fetch_calls) == 1
     assert litellm.calls == []
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["next_steps"]["additional_acquisition_count"] == 1
     assert manifest["next_steps"]["dependency_status"] == "dependency_failure"
     serialized = json.dumps(manifest, sort_keys=True)
@@ -16557,9 +16380,7 @@ async def test_evidence_next_step_never_executes_a_second_acquisition(
 async def test_hybrid_comparison_executes_declared_expansion_per_source_and_persists_truth(
     tmp_path,
 ):
-    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
-        tmp_path=tmp_path
-    )
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(tmp_path=tmp_path)
 
     assert out["answer"] == _rendered_evidence_answer(
         "Primary expanded history includes an oil change.",
@@ -16658,12 +16479,8 @@ async def test_hybrid_comparison_executes_declared_expansion_per_source_and_pers
         "vehicle_log_primary:expanded_1",
         "vehicle_log_secondary:expanded_2",
     }
-    assert set(
-        manifest["acquisition"]["source_references_returned"]
-    ) == expected_refs
-    assert set(
-        manifest["acquisition"]["source_references_retained"]
-    ) == expected_refs
+    assert set(manifest["acquisition"]["source_references_returned"]) == expected_refs
+    assert set(manifest["acquisition"]["source_references_retained"]) == expected_refs
     assert manifest["acquisition"]["source_references_filtered_or_omitted"] == []
     assert manifest["acquisition"]["prompt_retained_item_count"] == 4
     assert memory_store.claim_record_calls == []
@@ -16745,9 +16562,7 @@ async def test_hybrid_comparison_missing_descriptor_withholds_without_targeted_f
     }
     assert facts["selected-source-coverage"] == "unsupported"
     assert facts["cross-source-comparison"] == "unsupported"
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["acquisition"]["expansion_unsupported_count"] == 1
     assert manifest["acquisition"]["expansion_successful_count"] == 1
 
@@ -16829,9 +16644,7 @@ async def test_hybrid_comparison_context_failure_is_bounded_and_never_retried(
         for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts["selected-source-coverage"] == expected_outcome
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["acquisition"][count_field] == 1
     serialized = json.dumps(manifest, sort_keys=True)
     for prohibited in (
@@ -16866,9 +16679,7 @@ async def test_hybrid_comparison_prompt_budget_source_loss_blocks_provider(
         "assemble_prompt",
         filtered_assemble_prompt,
     )
-    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
-        tmp_path=tmp_path
-    )
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(tmp_path=tmp_path)
 
     _assert_material_gap_answer(
         out["answer"],
@@ -16889,17 +16700,13 @@ async def test_hybrid_comparison_prompt_budget_source_loss_blocks_provider(
         "cross-source-comparison": "filtered",
         "selected-source-coverage": "filtered",
     }
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert len(manifest["acquisition"]["source_references_returned"]) == 4
     assert all(
         ref.startswith("vehicle_log_primary:")
         for ref in manifest["acquisition"]["source_references_retained"]
     )
-    assert len(
-        manifest["acquisition"]["source_references_filtered_or_omitted"]
-    ) == 2
+    assert len(manifest["acquisition"]["source_references_filtered_or_omitted"]) == 2
 
 
 @pytest.mark.asyncio
@@ -16937,14 +16744,11 @@ async def test_hybrid_comparison_privacy_suppresses_expansion_identifiers_not_ou
     )
 
     assert out["answer"] == (
-        "Details cannot safely be shown on this surface.\n\n"
-        f"{COMPARISON_SCOPE_SUFFIX}"
+        "Details cannot safely be shown on this surface.\n\n" f"{COMPARISON_SCOPE_SUFFIX}"
     )
     assert len(dsa.context_calls) == 2
     assert len(litellm.calls) == 1
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     acquisition = manifest["acquisition"]
     assert acquisition["source_identifiers_suppressed"] is True
     assert acquisition["expansion_attempts"] == []
@@ -17435,9 +17239,7 @@ async def test_evidence_acquisition_provider_cannot_rewrite_policy_history(tmp_p
     assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["sources"] == []
     assert malicious not in out["answer"]
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["plan"]["plan_id"] == "evidence_plan_1"
     assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
     assert manifest["sufficiency"]["answer_constraints"] == []
@@ -17487,9 +17289,7 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
 
     assert len(litellm.calls) == 1
     assert len(runtime.evidence_next_step_calls) == 1
-    assert runtime.evidence_next_step_calls[0][
-        "proposed_acquisition_premise"
-    ] is None
+    assert runtime.evidence_next_step_calls[0]["proposed_acquisition_premise"] is None
     limitation = "Limitation: an optional selected source was not available."
     assert out["answer"] == (
         "The retained evidence supports the requested conclusion.\n\n"
@@ -17502,10 +17302,9 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
         "requirement_id": "targeted-evidence",
         "outcome": "satisfied",
     }
-    assert {
-        fact["requirement_id"]: fact["outcome"]
-        for fact in trace["acquisition_facts"]
-    }["optional-selected-source-coverage"] == "unavailable"
+    assert {fact["requirement_id"]: fact["outcome"] for fact in trace["acquisition_facts"]}[
+        "optional-selected-source-coverage"
+    ] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -17529,9 +17328,7 @@ async def test_partial_inventory_remains_limited_through_governed_answer(tmp_pat
             "inventory_status": "partial",
         }
     )
-    source_response["sources"][0]["last_error"] = (
-        "malformed_optional_source scope_refs=PRIVATE"
-    )
+    source_response["sources"][0]["last_error"] = "malformed_optional_source scope_refs=PRIVATE"
     dsa = FakeDSA(
         response=_governed_context_pack(question),
         source_response=source_response,
@@ -17569,9 +17366,7 @@ async def test_partial_inventory_remains_limited_through_governed_answer(tmp_pat
         "source coverage remains incomplete."
     )
     assert result["status"] == "ok"
-    assert result["answer"].startswith(
-        "The retained evidence supports the requested conclusion."
-    )
+    assert result["answer"].startswith("The retained evidence supports the requested conclusion.")
     assert result["answer"].count(limitation) == 1
     assert result["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
     assert result["answer"].endswith(TARGETED_SCOPE_SUFFIX)
@@ -17856,9 +17651,7 @@ async def test_evidence_acquisition_malformed_context_is_filtered_and_withheld(
 ):
     rules, models = _write_default_route_files(tmp_path)
     malformed = _governed_context_pack("Verify the maintenance record.")
-    malformed["items"][0]["raw_metadata"] = {
-        "private": "PRIVATE RAW METADATA"
-    }
+    malformed["items"][0]["raw_metadata"] = {"private": "PRIVATE RAW METADATA"}
     runtime = FakeRuntime()
     dsa = FakeDSA(response=malformed)
     litellm = FakeLiteLLM()
@@ -17904,9 +17697,7 @@ async def test_evidence_acquisition_malformed_context_descriptor_is_filtered_and
     tmp_path,
 ):
     malformed = _governed_context_pack("Verify the maintenance record.")
-    malformed["items"][0]["available_context"][0]["credentials"] = (
-        "PRIVATE DESCRIPTOR CREDENTIAL"
-    )
+    malformed["items"][0]["available_context"][0]["credentials"] = "PRIVATE DESCRIPTOR CREDENTIAL"
     out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
         tmp_path=tmp_path,
         response=malformed,
@@ -18030,9 +17821,7 @@ async def test_evidence_acquisition_rejects_diagnostic_association_mismatch(
             }
         ]
     else:
-        diagnostics["candidate_counts_by_source"] = {
-            "vehicle_log_secondary": 1
-        }
+        diagnostics["candidate_counts_by_source"] = {"vehicle_log_secondary": 1}
 
     out, runtime, dsa, litellm, memory_store = await _run_governed_context_case(
         tmp_path=tmp_path,
@@ -18057,9 +17846,7 @@ async def test_evidence_acquisition_prompt_filtered_context_cannot_satisfy_deliv
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
-    dsa = FakeDSA(
-        response=_governed_context_pack("Verify the maintenance record.")
-    )
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
     litellm = FakeLiteLLM()
     original_assemble_prompt = orchestrate_service.assemble_prompt
 
@@ -18126,9 +17913,7 @@ async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_deli
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
-    dsa = FakeDSA(
-        response=_governed_context_pack("Verify the maintenance record.")
-    )
+    dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
     litellm = FakeLiteLLM()
     memory_store = FakeMemoryStore()
     original_assemble_prompt = orchestrate_service.assemble_prompt
@@ -18138,9 +17923,7 @@ async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_deli
         trace = copy.deepcopy(prompt.trace)
         for layer in trace["layers"]:
             if layer.get("name") == "external_source_context":
-                layer["metadata"]["source_refs"] = [
-                    "vehicle_log_primary:not_returned"
-                ]
+                layer["metadata"]["source_refs"] = ["vehicle_log_primary:not_returned"]
         return replace(prompt, trace=trace)
 
     monkeypatch.setattr(
@@ -18180,12 +17963,8 @@ async def test_evidence_acquisition_unknown_prompt_reference_cannot_satisfy_deli
         {"requirement_id": "context-delivery", "outcome": "unknown"},
         {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
     ]
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
-    assert manifest["acquisition"]["source_references_returned"] == [
-        "vehicle_log_primary:record_1"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
+    assert manifest["acquisition"]["source_references_returned"] == ["vehicle_log_primary:record_1"]
     assert manifest["acquisition"]["source_references_retained"] == []
     assert manifest["acquisition"]["context_delivery_status"] == "unknown"
     assert "not_returned" not in json.dumps(manifest, sort_keys=True)
@@ -18319,16 +18098,14 @@ async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
     ):
         assert sentinel not in serialized
 
-    follow_up, history_provider, history_dsa, _ = (
-        await _run_acquisition_explanation_follow_up(
-            tmp_path,
-            follow_up="What did you check?",
-            prior_answer=out["answer"],
-            memory_store=memory_store,
-            runtime=runtime,
-            request_id="rid-evidence-not-applicable-history",
-            claim_capture_enabled=False,
-        )
+    follow_up, history_provider, history_dsa, _ = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up="What did you check?",
+        prior_answer=out["answer"],
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="rid-evidence-not-applicable-history",
+        claim_capture_enabled=False,
     )
     assert follow_up["status"] == "ok", (
         follow_up,
@@ -18343,12 +18120,8 @@ async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
     assert history_dsa.list_calls == []
     assert history_dsa.calls == []
     history_trace = memory_store.trace_calls[-1]["payload"]
-    assert history_trace["prompt"]["claim_explanation"][
-        "manifest_projection_status"
-    ] == "accepted"
-    assert history_trace["prompt"]["claim_explanation"][
-        "manifest_projection_reason"
-    ] == "accepted"
+    assert history_trace["prompt"]["claim_explanation"]["manifest_projection_status"] == "accepted"
+    assert history_trace["prompt"]["claim_explanation"]["manifest_projection_reason"] == "accepted"
     history_serialized = json.dumps((follow_up, history_trace), sort_keys=True)
     for sentinel in (
         private_source_id,
@@ -18407,9 +18180,7 @@ async def test_inventory_failure_is_ordinary_only_when_shape_is_not_applicable(
     manifest = trace["prompt"]["evidence_acquisition"]
     if ordinary:
         assert manifest["acquisition"]["dsa_outcome"] == "not_called"
-        assert manifest["acquisition"]["inventory_discovery"]["outcome"] == (
-            "dependency_failure"
-        )
+        assert manifest["acquisition"]["inventory_discovery"]["outcome"] == ("dependency_failure")
         assert manifest["acquisition"]["source_summaries"] == []
         assert manifest["acquisition"]["unavailable_source_ids"] == []
     assert "PRIVATE-INVENTORY-FAILURE" not in json.dumps(trace, sort_keys=True)
@@ -18455,9 +18226,7 @@ async def test_natural_owner_data_question_remains_not_applicable_after_source_d
     assert runtime.evidence_sufficiency_calls == []
     assert runtime.evidence_next_step_calls == []
     assert len(litellm.calls) == 1
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["status"] == "not_applicable"
     assert manifest["acquisition"]["dsa_outcome"] == "not_called"
 
@@ -18550,6 +18319,118 @@ def _semantic_test_shape(call, *, second_status="resolved"):
     return response
 
 
+def _aggregate_test_shape(call):
+    response = _not_applicable_shape_response(call)
+    advisory = call["task_context"].get("semantic_advisory")
+    if advisory is None:
+        response["result"]["source_match"] = {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        }
+        return response
+    response["result"].update(
+        {
+            "derivation_status": "derived",
+            "task_shape": "aggregate",
+            "candidate_task_shapes": ["aggregate"],
+            "evidence_scope_material": True,
+            "clarification_required": False,
+            "reason_codes": ["semantic_operation_hint"],
+            "aggregate_spec": {
+                "function": advisory["aggregate_function"],
+                "field_name": advisory["aggregate_field_name"],
+            },
+        }
+    )
+    response["result"]["source_match"] = {
+        "status": "matched",
+        "matched_source_ids": list(advisory["candidate_source_ids"]),
+        "reason_codes": ["semantic_candidate_validated"],
+    }
+    return response
+
+
+def _aggregate_plan_response(*, request_id, question):
+    response = _targeted_plan_response(
+        request_id=request_id,
+        question=question,
+        task_shape="aggregate",
+        strategy="structured_field_values",
+        eligible_source_ids=["metrics_archive"],
+    )
+    response["result"].update(
+        {
+            "completeness_expectation": "complete_for_declared_scope",
+            "contradiction_search_required": False,
+            "aggregate_spec": {"function": "median", "field_name": "Reading"},
+            "declared_requirements": [
+                {
+                    "requirement_id": "complete-scope",
+                    "requirement_kind": "complete_scope_coverage",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "context-delivery",
+                    "requirement_kind": "context_delivery",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "no-truncation",
+                    "requirement_kind": "no_material_truncation",
+                    "criticality": "material",
+                },
+            ],
+        }
+    )
+    return response
+
+
+def _aggregate_structured_response():
+    values = ["10.125", "20.25", None, "35.5", "55.75"]
+    return {
+        "query_id": "aggregate-query",
+        "answerable": True,
+        "confidence": "high",
+        "retrieval_mode": "context",
+        "results": [
+            {
+                "result_id": "aggregate-result",
+                "source_type": "google_sheets",
+                "source_id": "metrics_archive",
+                "source_name": "Configured Metrics Archive",
+                "source_ref": "google_sheets:metrics_archive:Measurements!A2:C6",
+                "retrieved_at": "2026-08-16T00:00:00Z",
+                "source_modified_at": None,
+                "cache_status": "live",
+                "title": "Configured values",
+                "content_type": "structured_field_values",
+                "text": "Retrieved five configured records.",
+                "url": None,
+                "confidence": "high",
+                "raw": None,
+                "structured_data": {
+                    "kind": "field_values",
+                    "field_name": "Reading",
+                    "record_count": 5,
+                    "non_empty_value_count": 4,
+                    "values": values,
+                },
+                "available_context": [],
+                "warnings": [],
+            }
+        ],
+        "warnings": [],
+        "errors": [],
+        "budget": {
+            "max_results": None,
+            "returned_results": 1,
+            "estimated_bytes": 250,
+            "truncated": False,
+        },
+    }
+
+
 def _neutral_schedule_sources():
     return [
         {
@@ -18588,9 +18469,7 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
         auto_source_match=False,
     )
     classifier = _evidence_interpreter_completion("no_match", "unknown", [])
-    litellm = SequenceLiteLLM(
-        [classifier, {"choices": [{"message": {"content": "Doing well."}}]}]
-    )
+    litellm = SequenceLiteLLM([classifier, {"choices": [{"message": {"content": "Doing well."}}]}])
     dsa = FakeDSA(
         source_response={
             "inventory_scope": "configured_sources",
@@ -18677,9 +18556,7 @@ async def test_explicit_and_deterministic_source_fast_paths_skip_interpreter(
     assert len(runtime.evidence_shape_calls) == 1
     assert len(litellm.calls) == 1
     assert "response_format" not in litellm.calls[0]
-    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == [
-        "vehicle_log_primary"
-    ]
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == ["vehicle_log_primary"]
 
 
 @pytest.mark.asyncio
@@ -18797,9 +18674,7 @@ async def test_material_unresolved_classifier_failure_is_safe_and_provider_free(
     assert len(runtime.evidence_shape_calls) == 1
     assert runtime.evidence_plan_calls == []
     assert dsa.calls == []
-    semantic_trace = memory_store.trace_calls[0]["payload"]["prompt"][
-        "semantic_interpreter"
-    ]
+    semantic_trace = memory_store.trace_calls[0]["payload"]["prompt"]["semantic_interpreter"]
     assert semantic_trace["status"] == "failed"
     assert semantic_trace["candidate_count"] == 0
 
@@ -18911,8 +18786,7 @@ async def test_authorized_probe_requires_every_planned_source_in_dsa_accounting(
     context["diagnostics"]["considered_source_ids"] = list(context["sources_used"])
     context["diagnostics"]["selected_source_ids"] = list(context["sources_used"])
     context["diagnostics"]["candidate_counts_by_source"] = {
-        source_id: int(source_id == "personal_schedule")
-        for source_id in context["sources_used"]
+        source_id: int(source_id == "personal_schedule") for source_id in context["sources_used"]
     }
     dsa = FakeDSA(
         response=context,
@@ -18964,13 +18838,9 @@ async def test_authorized_probe_requires_every_planned_source_in_dsa_accounting(
         request_id="rid-semantic-probe-accounting",
     )
 
-    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == (
-        probe_source_ids
-    )
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == (probe_source_ids)
     assert dsa.calls[0]["source_ids"] == probe_source_ids
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["shape"]["source_match"] == {
         "status": "ambiguous",
         "matched_source_ids": [],
@@ -19058,6 +18928,141 @@ async def test_semantic_ambiguity_and_aggregate_are_provider_free(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("block_policy", [False, True])
+async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy_gated(
+    tmp_path,
+    block_policy,
+):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "What is the median reading in my measurements?"
+    request_id = f"rid-aggregate-{block_policy}"
+    runtime = FakeRuntime(
+        evidence_shape_response=_aggregate_test_shape,
+        evidence_plan_response=_aggregate_plan_response(
+            request_id=request_id,
+            question=question,
+        ),
+        evidence_next_step_error=(RuntimeError("policy unavailable") if block_policy else None),
+        auto_source_match=False,
+    )
+    seed = _governed_context_pack(question)
+    seed["sources_used"] = ["metrics_archive"]
+    seed["items"] = [seed["items"][0]]
+    seed["items"][0].update(
+        {
+            "source_id": "metrics_archive",
+            "source_name": "Configured Metrics Archive",
+            "source_ref": "google_sheets:metrics_archive:Measurements!A2:C2",
+            "text": "PRIVATE SEED 999999",
+        }
+    )
+    seed["diagnostics"].update(
+        {
+            "considered_source_ids": ["metrics_archive"],
+            "selected_source_ids": ["metrics_archive"],
+            "candidate_counts_by_source": {"metrics_archive": 1},
+        }
+    )
+    dsa = FakeDSA(
+        response=seed,
+        context_responses=[_aggregate_structured_response()],
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "metrics_archive",
+                    "display_name": "Configured Metrics Archive",
+                    "connector": "google_sheets",
+                    "domain_tags": ["metrics", "archive"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-08-16T00:00:00Z",
+                    "last_error": None,
+                    "content_fields": ["Entry", "Reading"],
+                }
+            ],
+        },
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved",
+                "aggregate",
+                ["metrics_archive"],
+                aggregate_function="median",
+                aggregate_field_name="Reading",
+            )
+        ]
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    expected = 'Median for "Reading": 27.875 (4 non-empty values across 5 records).'
+    assert out["answer"] == (NEXT_STEP_DEPENDENCY_ANSWER if block_policy else expected)
+    assert out["status"] == ("degraded" if block_policy else "ok")
+    assert len(litellm.calls) == 1
+    assert len(runtime.evidence_shape_calls) == 2
+    assert len(runtime.evidence_plan_calls) == 1
+    assert runtime.evidence_plan_calls[0]["aggregate_spec"] == {
+        "function": "median",
+        "field_name": "Reading",
+    }
+    assert runtime.evidence_plan_calls[0]["source_inventory"][0]["content_fields"] == [
+        "Entry",
+        "Reading",
+    ]
+    assert dsa.calls[0]["source_ids"] == ["metrics_archive"]
+    assert dsa.calls[0]["budget"]["max_results"] == 1
+    assert dsa.context_calls == [
+        {
+            "source_ref": "google_sheets:metrics_archive:Measurements!A2:C2",
+            "context_mode": "configured_field_values",
+            "field_name": "Reading",
+            "budget": {
+                "max_rows": 250,
+                "max_bytes": 5_000_000,
+                "max_text_chars": 500,
+            },
+        }
+    ]
+    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+        {"requirement_id": "complete-scope", "outcome": "satisfied"},
+        {"requirement_id": "context-delivery", "outcome": "satisfied"},
+        {"requirement_id": "no-truncation", "outcome": "satisfied"},
+    ]
+    premise = runtime.evidence_next_step_calls[0]["current_premise"]
+    assert premise["aggregate_spec"] == {
+        "function": "median",
+        "field_name": "Reading",
+    }
+    assert premise["source_inventory"][0]["content_fields"] == ["Entry", "Reading"]
+    serialized_trace = json.dumps(memory_store.trace_calls[-1]["payload"], sort_keys=True)
+    assert "55.75" not in serialized_trace
+    assert "PRIVATE SEED" not in serialized_trace
+    assert "content_fields" not in serialized_trace
+    if block_policy:
+        assert "27.875" not in serialized_trace
+
+
+@pytest.mark.asyncio
 async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_manifest(
     tmp_path,
 ):
@@ -19122,15 +19127,11 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
         litellm.calls[0]["messages"],
         sort_keys=True,
     )
-    assert runtime.evidence_shape_calls[0]["task_context"][
-        "evidence_input_kinds"
-    ] == ["external_source"]
-    assert runtime.evidence_shape_calls[0]["task_context"][
-        "external_verification_required"
-    ] is True
-    assert runtime.evidence_plan_calls[0]["declared_scope"][
-        "exact_source_refs"
-    ] == [
+    assert runtime.evidence_shape_calls[0]["task_context"]["evidence_input_kinds"] == [
+        "external_source"
+    ]
+    assert runtime.evidence_shape_calls[0]["task_context"]["external_verification_required"] is True
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["exact_source_refs"] == [
         {
             "source_id": "vehicle_log_primary",
             "source_ref": "neutral_connector:vehicle_log_primary:record_1",
@@ -19140,9 +19141,7 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
         {"requirement_id": "context-delivery", "outcome": "satisfied"},
         {"requirement_id": "targeted-evidence", "outcome": "satisfied"},
     ]
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["acquisition"]["strategy_attempted"] == "exact_fetch"
     assert manifest["acquisition"]["exact_reference_attempt_count"] == 1
     assert manifest["acquisition"]["exact_reference_successful_count"] == 1
@@ -19156,8 +19155,9 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
             "outcome": "satisfied",
         }
     ]
-    assert manifest["acquisition"]["source_references_returned"] == (
-        manifest["acquisition"]["source_references_retained"]
+    assert (
+        manifest["acquisition"]["source_references_returned"]
+        == (manifest["acquisition"]["source_references_retained"])
     )
     assert manifest["assistant_message_id"] == "m-1"
     assert manifest["response_digest"] == (
@@ -19264,9 +19264,7 @@ async def test_evidence_acquisition_exact_fetch_provider_cannot_rewrite_history(
     assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["sources"] == []
     assert provider_claim not in out["answer"]
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["acquisition"]["source_references_attempted"] == [
         "neutral_connector:vehicle_log_primary:record_1"
     ]
@@ -19301,9 +19299,7 @@ async def test_evidence_acquisition_exact_fetch_failures_withhold_without_fallba
     if response_mutation == "wrong-source":
         response["results"][0]["source_id"] = "vehicle_log_secondary"
     elif response_mutation == "wrong-reference":
-        response["results"][0]["source_ref"] = (
-            "neutral_connector:vehicle_log_primary:record-other"
-        )
+        response["results"][0]["source_ref"] = "neutral_connector:vehicle_log_primary:record-other"
     elif response_mutation == "raw-data":
         response["results"][0]["raw"] = {"private": "PRIVATE RAW"}
     elif response_mutation == "answerability":
@@ -19369,9 +19365,7 @@ async def test_evidence_acquisition_exact_fetch_failures_withhold_without_fallba
         for item in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts["targeted-evidence"] == expected_outcome
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert manifest["acquisition"]["source_references_returned"] == []
     assert manifest["acquisition"]["source_references_retained"] == []
     assert "PRIVATE" not in json.dumps(manifest, sort_keys=True)
@@ -19491,8 +19485,7 @@ async def test_evidence_acquisition_exact_fetch_ineligible_paths_fail_closed(
     )
 
     assert out["answer"] == (
-        "I need a narrower evidence request before I can determine what should "
-        "be checked."
+        "I need a narrower evidence request before I can determine what should " "be checked."
         if case == "ambiguous"
         else "I can’t safely complete that evidence request with the currently "
         "available source capabilities."
@@ -19578,8 +19571,7 @@ async def test_evidence_acquisition_exact_fetch_pending_continuation_blocks_disp
     revalidation_calls_before = len(revalidation_calls)
     action_summary_calls_before = len(runtime.action_summary_calls)
     assistant_message_calls_before = sum(
-        message.get("role") == "assistant"
-        for message in memory_store.added_messages
+        message.get("role") == "assistant" for message in memory_store.added_messages
     )
     trace_calls_before = len(memory_store.trace_calls)
 
@@ -19626,15 +19618,13 @@ async def test_evidence_acquisition_exact_fetch_pending_continuation_blocks_disp
     assert operations.apply_inputs == []
     assert connector.verify_inputs == []
     assert len(runtime.action_summary_calls) == action_summary_calls_before
-    assert sum(
-        message.get("role") == "assistant"
-        for message in memory_store.added_messages
-    ) == assistant_message_calls_before + 1
+    assert (
+        sum(message.get("role") == "assistant" for message in memory_store.added_messages)
+        == assistant_message_calls_before + 1
+    )
     assert len(memory_store.trace_calls) == trace_calls_before + 1
 
-    blocked_trace = memory_store.trace_calls[-1]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]
+    blocked_trace = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
     capability_trace = blocked_trace["capabilities"]
     assert capability_trace["validation"] == {
         "validation_status": "not_requested",
@@ -19687,10 +19677,7 @@ async def test_evidence_acquisition_exact_fetch_pending_continuation_blocks_disp
 
     assert len(operations.apply_inputs) == 1
     assert operations.apply_inputs[0] == {
-        "request_id": (
-            "rid-exact-pending-control:"
-            "fixture.display_setting_apply:execute"
-        ),
+        "request_id": ("rid-exact-pending-control:" "fixture.display_setting_apply:execute"),
         "target": "fixture:display",
         "level": 6,
     }
@@ -19770,9 +19757,7 @@ async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_poli
                 "candidate_task_shapes": [],
                 "evidence_scope_material": False,
                 "clarification_required": False,
-                "reason_codes": [
-                    "ordinary_chat_without_material_evidence_scope"
-                ],
+                "reason_codes": ["ordinary_chat_without_material_evidence_scope"],
                 "user_safe_summary": "Evidence acquisition is not required.",
             },
         }
@@ -19819,9 +19804,7 @@ async def test_ordinary_turns_use_inventory_only_shape_gate_without_opt_in(
     question,
 ):
     rules, models = _write_default_route_files(tmp_path)
-    runtime = FakeRuntime(
-        evidence_shape_response=_not_applicable_shape_response
-    )
+    runtime = FakeRuntime(evidence_shape_response=_not_applicable_shape_response)
     dsa = FakeDSA()
     provider = FakeLiteLLM(content="Ordinary answer.")
     memory_store = FakeMemoryStore()
@@ -19851,9 +19834,7 @@ async def test_ordinary_turns_use_inventory_only_shape_gate_without_opt_in(
     assert dsa.fetch_calls == []
     assert dsa.context_calls == []
     assert len(provider.calls) == 1
-    prompt_text = "\n".join(
-        message["content"] for message in provider.calls[0]["messages"]
-    )
+    prompt_text = "\n".join(message["content"] for message in provider.calls[0]["messages"])
     assert "Evidence advisory guidance:" not in prompt_text
     assert "Governed evidence response contract:" not in prompt_text
     trace = memory_store.trace_calls[-1]["payload"]
@@ -19909,11 +19890,7 @@ async def test_verification_dependent_request_without_opt_in_uses_grounded_path(
     question = "Is this capability implemented in the current code?"
     context_pack = _governed_context_pack(question)
     excerpt = context_pack["items"][0]["text"]
-    provider = FakeLiteLLM(
-        content=_evidence_candidate(
-            ("vehicle_log_primary:record_1", excerpt)
-        )
-    )
+    provider = FakeLiteLLM(content=_evidence_candidate(("vehicle_log_primary:record_1", excerpt)))
     runtime = FakeRuntime()
     dsa = FakeDSA(response=context_pack)
     memory_store = FakeMemoryStore()
@@ -19943,16 +19920,12 @@ async def test_verification_dependent_request_without_opt_in_uses_grounded_path(
     assert len(dsa.calls) == 1
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] == []
-    prompt_text = "\n".join(
-        message["content"] for message in provider.calls[0]["messages"]
-    )
+    prompt_text = "\n".join(message["content"] for message in provider.calls[0]["messages"])
     assert "Governed evidence response contract:" in prompt_text
     assert "Evidence advisory guidance:" not in prompt_text
     trace = memory_store.trace_calls[-1]["payload"]
     assert trace["dsa"]["activation_source"] == "evidence_policy"
-    assert trace["retrieval"]["prompt_assembly"]["evidence_provider_mode"][
-        "mode"
-    ] == "grounded"
+    assert trace["retrieval"]["prompt_assembly"]["evidence_provider_mode"]["mode"] == "grounded"
 
 
 async def _run_advisory_evidence_case(
@@ -19965,18 +19938,12 @@ async def _run_advisory_evidence_case(
     fail_advisory_prompt: bool = False,
 ):
     attempt_kind = (
-        "prompt-budget"
-        if fail_advisory_prompt
-        else "fallback"
-        if fail_first
-        else "primary"
+        "prompt-budget" if fail_advisory_prompt else "fallback" if fail_first else "primary"
     )
     request_id = f"rid-advisory-{sufficiency_status}-{attempt_kind}"
     question = "Will this part fit?"
     rules, models = (
-        _route_files_with_fallback(tmp_path)
-        if fail_first
-        else _write_default_route_files(tmp_path)
+        _route_files_with_fallback(tmp_path) if fail_first else _write_default_route_files(tmp_path)
     )
     context_pack = _governed_context_pack(question)
     if sufficiency_status == "unknown":
@@ -20024,9 +19991,7 @@ async def _run_advisory_evidence_case(
                 raise orchestrate_service.PromptBudgetError(
                     "required_prompt_content_exceeds_budget",
                     {
-                        "failure_reason": (
-                            "required_prompt_content_exceeds_budget"
-                        ),
+                        "failure_reason": ("required_prompt_content_exceeds_budget"),
                         "omission_or_truncation_occurred": True,
                     },
                 )
@@ -20090,13 +20055,11 @@ async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_usefu
     sufficiency_status,
     provider_content,
 ):
-    result, memory_store, runtime, provider, dsa = (
-        await _run_advisory_evidence_case(
-            tmp_path,
-            monkeypatch,
-            sufficiency_status=sufficiency_status,
-            provider_content=provider_content,
-        )
+    result, memory_store, runtime, provider, dsa = await _run_advisory_evidence_case(
+        tmp_path,
+        monkeypatch,
+        sufficiency_status=sufficiency_status,
+        provider_content=provider_content,
     )
     expected = (
         "I couldn’t verify the requested conclusion from the available evidence.\n\n"
@@ -20119,9 +20082,7 @@ async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_usefu
     assert runtime.call_order.index("interaction_governance") < runtime.call_order.index(
         "evidence_shape"
     )
-    assert runtime.call_order.index("evidence_shape") < runtime.call_order.index(
-        "evidence_plan"
-    )
+    assert runtime.call_order.index("evidence_shape") < runtime.call_order.index("evidence_plan")
     assert runtime.call_order.index("evidence_plan") < runtime.call_order.index(
         "evidence_sufficiency"
     )
@@ -20132,16 +20093,12 @@ async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_usefu
     assert len(dsa.calls) == 1
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] == []
-    prompt_text = "\n".join(
-        message["content"] for message in provider.calls[0]["messages"]
-    )
+    prompt_text = "\n".join(message["content"] for message in provider.calls[0]["messages"])
     assert prompt_text.count("Evidence advisory guidance:") == 1
     assert "Governed evidence response contract:" not in prompt_text
     assert "External source context:" not in prompt_text
     assistant_messages = [
-        message
-        for message in memory_store.added_messages
-        if message["role"] == "assistant"
+        message for message in memory_store.added_messages if message["role"] == "assistant"
     ]
     assert len(assistant_messages) == 1
     assert assistant_messages[0]["content"] == expected
@@ -20156,21 +20113,15 @@ async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_usefu
         "advisory_rebuild_count": 1,
         "reason": "runtime_policy_permission",
     }
-    assert prompt_trace["included_layers"].count(
-        "evidence_advisory_guidance"
-    ) == 1
+    assert prompt_trace["included_layers"].count("evidence_advisory_guidance") == 1
     assert "evidence_response_contract" not in prompt_trace["included_layers"]
     assert prompt_trace["capabilities"]["executor_call_count"] == 0
     assert prompt_trace["capabilities"]["dispatch_completed"] is False
     assert prompt_trace["capabilities"]["action_summary"]["attempted"] is False
-    assert prompt_trace["memory_episode_recall_composition"][
-        "final_callback_applied"
-    ] is False
+    assert prompt_trace["memory_episode_recall_composition"]["final_callback_applied"] is False
     assert prompt_trace["claim_capture"]["enabled"] is False
     assert manifest["acquisition"]["source_references_retained"] == []
-    assert manifest["next_steps"]["selections"][-1][
-        "provider_disposition"
-    ] == "allowed"
+    assert manifest["next_steps"]["selections"][-1]["provider_disposition"] == "allowed"
     assert manifest["response_digest"] == (
         "sha256:" + hashlib.sha256(expected.encode()).hexdigest()
     )
@@ -20189,12 +20140,8 @@ async def test_advisory_empty_provider_body_uses_deterministic_guidance(
     )
 
     assert len(provider.calls) == 1
-    assert "Unverified guidance:\nThe next useful step is to compare the exact " in result[
-        "answer"
-    ]
-    assert result["answer"].endswith(
-        "Treat this as a working direction, not a confirmed result."
-    )
+    assert "Unverified guidance:\nThe next useful step is to compare the exact " in result["answer"]
+    assert result["answer"].endswith("Treat this as a working direction, not a confirmed result.")
 
 
 @pytest.mark.asyncio
@@ -20222,22 +20169,19 @@ async def test_advisory_fallback_reuses_identical_prompt_and_zero_tools(
     )
     trace = memory_store.trace_calls[-1]["payload"]
     prompt_trace = trace["retrieval"]["prompt_assembly"]
-    assert prompt_trace["provider_fallback_context"][
-        "same_sanitized_messages_reused"
-    ] is True
-    assert prompt_trace["provider_fallback_context"]["prompt_fingerprint"] == (
-        prompt_trace["provider_prompt"]["fingerprint"]
+    assert prompt_trace["provider_fallback_context"]["same_sanitized_messages_reused"] is True
+    assert (
+        prompt_trace["provider_fallback_context"]["prompt_fingerprint"]
+        == (prompt_trace["provider_prompt"]["fingerprint"])
     )
-    assert trace["model_calls"][0]["prompt_fingerprint"] == trace["model_calls"][1][
-        "prompt_fingerprint"
-    ]
-    assert len(
-        [
-            message
-            for message in memory_store.added_messages
-            if message["role"] == "assistant"
-        ]
-    ) == 1
+    assert (
+        trace["model_calls"][0]["prompt_fingerprint"]
+        == trace["model_calls"][1]["prompt_fingerprint"]
+    )
+    assert (
+        len([message for message in memory_store.added_messages if message["role"] == "assistant"])
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -20265,9 +20209,7 @@ async def test_advisory_prompt_budget_failure_preserves_authoritative_trace(
     assert provider.calls == []
     assert "Unverified guidance:" not in result["answer"]
     assistant_messages = [
-        message
-        for message in memory_store.added_messages
-        if message["role"] == "assistant"
+        message for message in memory_store.added_messages if message["role"] == "assistant"
     ]
     assert len(assistant_messages) == 1
     assert assistant_messages[0]["content"] == NEXT_STEP_DEPENDENCY_ANSWER
@@ -20289,8 +20231,7 @@ async def test_advisory_prompt_budget_failure_preserves_authoritative_trace(
     assert prompt_trace["claim_capture"]["enabled"] is False
     manifest = prompt_trace["evidence_acquisition"]
     assert manifest["response_digest"] == (
-        "sha256:"
-        + hashlib.sha256(NEXT_STEP_DEPENDENCY_ANSWER.encode()).hexdigest()
+        "sha256:" + hashlib.sha256(NEXT_STEP_DEPENDENCY_ANSWER.encode()).hexdigest()
     )
 
 
@@ -20300,9 +20241,7 @@ async def test_high_impact_targeted_verification_remains_provider_blocked(
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
-    runtime.interaction_governance_response["result"][
-        "interaction_kind"
-    ] = "high_impact_decision"
+    runtime.interaction_governance_response["result"]["interaction_kind"] = "high_impact_decision"
     context_pack = _governed_context_pack("Will this part fit?")
     context_pack["items"] = []
     context_pack["sources_used"] = []
@@ -20329,15 +20268,11 @@ async def test_high_impact_targeted_verification_remains_provider_blocked(
 
     assert result["status"] == "degraded"
     assert provider.calls == []
-    assert runtime.evidence_shape_calls[0]["interaction_kind"] == (
-        "high_impact_decision"
-    )
+    assert runtime.evidence_shape_calls[0]["interaction_kind"] == ("high_impact_decision")
     trace = memory_store.trace_calls[-1]["payload"]
     prompt_trace = trace["retrieval"]["prompt_assembly"]
     assert prompt_trace["evidence_provider_mode"]["mode"] == "blocked"
-    assert "evidence_advisory_guidance" not in prompt_trace.get(
-        "included_layers", []
-    )
+    assert "evidence_advisory_guidance" not in prompt_trace.get("included_layers", [])
     assert prompt_trace["capabilities"]["executor_call_count"] == 0
     assert memory_store.claim_record_calls == []
 
@@ -20363,11 +20298,7 @@ class ClaimCaptureMemoryStore(FakeMemoryStore):
             if self.malformed_assistant_ack:
                 return {}
             return {"message_id": "00000000-0000-4000-8000-000000000002"}
-        return {
-            "message_id": kwargs.get(
-                "message_id", "00000000-0000-4000-8000-000000000001"
-            )
-        }
+        return {"message_id": kwargs.get("message_id", "00000000-0000-4000-8000-000000000001")}
 
     async def create_trace(self, **kwargs):
         self.trace_calls.append(copy.deepcopy(kwargs))
@@ -20412,9 +20343,7 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
 
     async def create_trace(self, **kwargs):
         response = await super().create_trace(**kwargs)
-        self.traces_by_request_id[kwargs["request_id"]] = copy.deepcopy(
-            kwargs["payload"]
-        )
+        self.traces_by_request_id[kwargs["request_id"]] = copy.deepcopy(kwargs["payload"])
         return response
 
     async def create_claim_record(self, **kwargs):
@@ -20453,9 +20382,7 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
                 message
                 for message in assistants[-50:]
                 if " ".join(
-                    re.split(r"\r?\n[ \t]*\r?\n", message["content"], maxsplit=1)[
-                        0
-                    ].split()
+                    re.split(r"\r?\n[ \t]*\r?\n", message["content"], maxsplit=1)[0].split()
                 )
                 == target
             ]
@@ -20478,9 +20405,7 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
                 reason="quoted_response_ambiguous",
             )
         candidate = candidates[0]
-        digest = "sha256:" + hashlib.sha256(
-            candidate["content"].encode("utf-8")
-        ).hexdigest()
+        digest = "sha256:" + hashlib.sha256(candidate["content"].encode("utf-8")).hexdigest()
         if (
             kwargs["target_mode"] == "immediate_previous"
             and kwargs.get("response_digest") != digest
@@ -20494,9 +20419,7 @@ class ClaimExplanationMemoryStore(ClaimCaptureMemoryStore):
         original_request_id = candidate.get("metadata", {}).get("request_id")
         trace = self.traces_by_request_id.get(original_request_id)
         manifest = (
-            trace.get("prompt", {}).get("evidence_acquisition")
-            if isinstance(trace, dict)
-            else None
+            trace.get("prompt", {}).get("evidence_acquisition") if isinstance(trace, dict) else None
         )
         if not isinstance(manifest, dict):
             return _history_resolution_response(
@@ -20712,9 +20635,7 @@ async def _run_acquisition_explanation_follow_up(
 async def _capture_two_explanation_claims(tmp_path):
     memory_store = ClaimExplanationMemoryStore()
     runtime = FakeRuntime()
-    first_litellm = FakeLiteLLM(
-        content="The retained file reports that the setting is active."
-    )
+    first_litellm = FakeLiteLLM(content="The retained file reports that the setting is active.")
     first, _, _, _ = await _run_claim_capture_chat(
         tmp_path,
         memory_store=memory_store,
@@ -20724,14 +20645,10 @@ async def _capture_two_explanation_claims(tmp_path):
     )
     memory_store.listed_records[0]["claim_id"] = "claim-setting-active"
     memory_store.listed_records[0]["freshness_summary"] = "stale"
-    memory_store.listed_records[0]["validated_evidence_references"][0][
-        "freshness_state"
-    ] = "stale"
+    memory_store.listed_records[0]["validated_evidence_references"][0]["freshness_state"] = "stale"
     memory_store.listed_records[0]["limitation_codes"].append("stale_evidence")
 
-    second_litellm = FakeLiteLLM(
-        content="The retained file reports that the service is healthy."
-    )
+    second_litellm = FakeLiteLLM(content="The retained file reports that the service is healthy.")
     second, _, _, _ = await _run_claim_capture_chat(
         tmp_path,
         memory_store=memory_store,
@@ -20740,9 +20657,7 @@ async def _capture_two_explanation_claims(tmp_path):
         request_id="request-second-quoted-claim",
     )
     memory_store.listed_records[0]["claim_id"] = "claim-service-healthy"
-    memory_store.listed_records[0]["assistant_message_id"] = (
-        "00000000-0000-4000-8000-000000000003"
-    )
+    memory_store.listed_records[0]["assistant_message_id"] = "00000000-0000-4000-8000-000000000003"
     return first, second, memory_store, runtime
 
 
@@ -20813,8 +20728,9 @@ async def test_orchestrate_captures_one_sentence_with_one_retained_file_source(t
     assert record_payload["request_id"] == assistant_write["metadata"]["request_id"]
     assert record_payload["calibration_result"]["claim_id"] == "claim-capture-1"
     assert record_payload["calibration_result"]["claim_anchor"] == result["answer"]
-    assert record_payload["calibration_result"]["validated_evidence_references"] == (
-        calibration_call["evidence_references"]
+    assert (
+        record_payload["calibration_result"]["validated_evidence_references"]
+        == (calibration_call["evidence_references"])
     )
     assert "claim_capture" not in result
 
@@ -20829,9 +20745,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     runtime = FakeRuntime(evidence_shape_response=_not_applicable_shape_response)
     memory_store = ClaimCaptureMemoryStore()
     dsa = FakeDSA()
-    litellm = FakeLiteLLM(
-        content="The retained file reports that the setting is active."
-    )
+    litellm = FakeLiteLLM(content="The retained file reports that the setting is active.")
 
     result = await orchestrate_chat(
         payload=_base_payload(messages=[{"role": "user", "content": question}]),
@@ -20849,9 +20763,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
         request_id=request_id,
     )
 
-    assert result["answer"] == (
-        "The retained file reports that the setting is active."
-    )
+    assert result["answer"] == ("The retained file reports that the setting is active.")
     assert len(result["sources"]) == 1
     assert result["sources"][0]["source_ref"] == {
         "ref_type": "derived_text",
@@ -20888,12 +20800,11 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     assert claim_payload["request_id"] == request_id
     assert claim_payload["owner_id"] == "owner"
     assert claim_payload["conversation_id"] == "conv-1"
-    assert claim_payload["assistant_message_id"] == (
-        "00000000-0000-4000-8000-000000000002"
+    assert claim_payload["assistant_message_id"] == ("00000000-0000-4000-8000-000000000002")
+    assert (
+        claim_payload["calibration_result"]["validated_evidence_references"]
+        == runtime.claim_calibration_calls[0]["evidence_references"]
     )
-    assert claim_payload["calibration_result"][
-        "validated_evidence_references"
-    ] == runtime.claim_calibration_calls[0]["evidence_references"]
     assert "acquisition_manifest_id" not in claim_payload
 
     initial_trace = memory_store.trace_calls[0]["payload"]
@@ -20907,9 +20818,10 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     assert manifest["next_steps"]["selections"] == []
     assert manifest["acquisition"]["dsa_outcome"] == "not_called"
     assert initial_trace["dsa"]["called"] is True
-    assert initial_trace["retrieval"]["prompt_assembly"][
-        "evidence_provider_mode"
-    ]["mode"] == "ordinary"
+    assert (
+        initial_trace["retrieval"]["prompt_assembly"]["evidence_provider_mode"]["mode"]
+        == "ordinary"
+    )
     assert final_trace["prompt"]["evidence_acquisition"] == manifest
     assert final_trace["prompt"]["claim_capture"] == {
         "enabled": True,
@@ -20921,9 +20833,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
         "storage_call_count": 1,
         "evidence_count": 1,
         "claim_id": "claim-capture-1",
-        "claim_anchor_digest": claim_payload["calibration_result"][
-            "claim_anchor_digest"
-        ],
+        "claim_anchor_digest": claim_payload["calibration_result"]["claim_anchor_digest"],
         "acquisition_manifest_status": "not_applicable",
         "acquisition_manifest_linked": False,
     }
@@ -20933,9 +20843,7 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
 async def test_governed_evidence_claim_links_bound_manifest_without_copying_acquisition(
     tmp_path,
 ):
-    result, memory_store, runtime, litellm, dsa = (
-        await _run_evidence_claim_capture_chat(tmp_path)
-    )
+    result, memory_store, runtime, litellm, dsa = await _run_evidence_claim_capture_chat(tmp_path)
 
     claim_anchor = "The retained evidence supports the requested conclusion."
     assert result["answer"] == _rendered_evidence_answer(
@@ -20957,9 +20865,7 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
     final_trace = memory_store.trace_calls[1]["payload"]
     manifest = initial_trace["prompt"]["evidence_acquisition"]
     claim_payload = memory_store.claim_record_calls[0]["payload"]
-    claim_support = claim_payload["calibration_result"][
-        "validated_evidence_references"
-    ]
+    claim_support = claim_payload["calibration_result"]["validated_evidence_references"]
     expected_message_id = "00000000-0000-4000-8000-000000000002"
     expected_digest = f"sha256:{hashlib.sha256(result['answer'].encode()).hexdigest()}"
 
@@ -20985,9 +20891,7 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
 
     assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
     assert claim_payload["assistant_message_id"] == expected_message_id
-    claim_digest = (
-        f"sha256:{hashlib.sha256(claim_anchor.encode()).hexdigest()}"
-    )
+    claim_digest = f"sha256:{hashlib.sha256(claim_anchor.encode()).hexdigest()}"
     assert claim_payload["calibration_result"]["claim_anchor"] == claim_anchor
     assert claim_payload["calibration_result"]["claim_anchor_digest"] == claim_digest
     assert claim_digest != expected_digest
@@ -21024,18 +20928,12 @@ async def test_governed_evidence_claim_links_bound_manifest_without_copying_acqu
         claim_payload["calibration_result"],
         sort_keys=True,
     )
-    assert initial_trace["prompt"]["claim_capture"][
-        "acquisition_manifest_status"
-    ] == "bound"
-    assert initial_trace["prompt"]["claim_capture"][
-        "acquisition_manifest_linked"
-    ] is True
+    assert initial_trace["prompt"]["claim_capture"]["acquisition_manifest_status"] == "bound"
+    assert initial_trace["prompt"]["claim_capture"]["acquisition_manifest_linked"] is True
     assert final_trace["prompt"]["claim_capture"]["persistence_status"] == "persisted"
     assert final_trace["prompt"]["evidence_acquisition"] == manifest
     assistant_write = next(
-        item
-        for item in memory_store.added_messages
-        if item["role"] == "assistant"
+        item for item in memory_store.added_messages if item["role"] == "assistant"
     )
     assert assistant_write["content"] == result["answer"]
 
@@ -21096,9 +20994,7 @@ async def test_governed_exact_claim_links_full_bounded_response_to_manifest(
     assert len(runtime.claim_calibration_calls) == 1
     assert runtime.claim_calibration_calls[0]["claim_anchor"] == claim_anchor
     assert len(memory_store.claim_record_calls) == 1
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     claim_payload = memory_store.claim_record_calls[0]["payload"]
     assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
     assert manifest["response_digest"] == (
@@ -21107,9 +21003,7 @@ async def test_governed_exact_claim_links_full_bounded_response_to_manifest(
     assert claim_payload["calibration_result"]["claim_anchor_digest"] == (
         f"sha256:{hashlib.sha256(claim_anchor.encode()).hexdigest()}"
     )
-    assert manifest["response_digest"] != claim_payload["calibration_result"][
-        "claim_anchor_digest"
-    ]
+    assert manifest["response_digest"] != claim_payload["calibration_result"]["claim_anchor_digest"]
     assert TARGETED_SCOPE_SUFFIX not in json.dumps(
         claim_payload,
         sort_keys=True,
@@ -21136,9 +21030,7 @@ async def test_invalid_bound_manifest_skips_claim_storage_without_exposing_manif
         "bind_manifest_response",
         bind_invalid_digest,
     )
-    result, memory_store, runtime, litellm, _ = (
-        await _run_evidence_claim_capture_chat(tmp_path)
-    )
+    result, memory_store, runtime, litellm, _ = await _run_evidence_claim_capture_chat(tmp_path)
 
     assert result["answer"] == _rendered_evidence_answer(
         "The maintenance record lists 2025-07-12.",
@@ -21200,9 +21092,7 @@ async def test_provider_text_cannot_select_the_claim_acquisition_manifest_id(tmp
         litellm=litellm,
     )
 
-    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
-        "evidence_acquisition"
-    ]
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     claim_payload = memory_store.claim_record_calls[0]["payload"]
     assert fake_manifest_id not in result["answer"]
     assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
@@ -21213,8 +21103,8 @@ async def test_provider_text_cannot_select_the_claim_acquisition_manifest_id(tmp
 async def test_limited_evidence_answer_captures_pre_boundary_claim_and_full_response(
     tmp_path,
 ):
-    result, memory_store, runtime, litellm, _ = (
-        await _run_evidence_claim_capture_chat(tmp_path, optional=True)
+    result, memory_store, runtime, litellm, _ = await _run_evidence_claim_capture_chat(
+        tmp_path, optional=True
     )
 
     assert len(litellm.calls) == 1
@@ -21233,17 +21123,15 @@ async def test_limited_evidence_answer_captures_pre_boundary_claim_and_full_resp
     manifest = trace["prompt"]["evidence_acquisition"]
     capture = trace["prompt"]["claim_capture"]
     assert manifest["status"] == "sufficient_with_limitations"
-    assert manifest["assistant_message_id"] == (
-        "00000000-0000-4000-8000-000000000002"
-    )
+    assert manifest["assistant_message_id"] == ("00000000-0000-4000-8000-000000000002")
     assert manifest["response_digest"] == (
         f"sha256:{hashlib.sha256(result['answer'].encode()).hexdigest()}"
     )
     claim_payload = memory_store.claim_record_calls[0]["payload"]
     assert claim_payload["acquisition_manifest_id"] == manifest["manifest_id"]
     assert claim_payload["calibration_result"]["claim_anchor"] == claim_anchor
-    assert claim_payload["calibration_result"]["claim_anchor_digest"] != (
-        manifest["response_digest"]
+    assert (
+        claim_payload["calibration_result"]["claim_anchor_digest"] != (manifest["response_digest"])
     )
     assert limitation not in json.dumps(claim_payload, sort_keys=True)
     assert TARGETED_SCOPE_SUFFIX not in json.dumps(claim_payload, sort_keys=True)
@@ -21263,9 +21151,10 @@ async def test_orchestrate_disabled_capture_preserves_single_trace_and_no_extra_
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
     assert len(memory_store.trace_calls) == 1
-    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
-        "reason_code"
-    ] == "disabled"
+    assert (
+        memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]["reason_code"]
+        == "disabled"
+    )
 
 
 @pytest.mark.asyncio
@@ -21280,9 +21169,10 @@ async def test_orchestrate_ambiguous_answer_skips_runtime_and_storage_calls(tmp_
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
     assert len(memory_store.trace_calls) == 1
-    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
-        "reason_code"
-    ] == "multi_sentence_answer"
+    assert (
+        memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]["reason_code"]
+        == "multi_sentence_answer"
+    )
 
 
 @pytest.mark.asyncio
@@ -21296,13 +21186,15 @@ async def test_orchestrate_subjective_sentence_with_file_source_skips_capture(tm
     assert len(litellm.calls) == 1
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
-    assert len(
-        [message for message in memory_store.added_messages if message["role"] == "assistant"]
-    ) == 1
+    assert (
+        len([message for message in memory_store.added_messages if message["role"] == "assistant"])
+        == 1
+    )
     assert len(memory_store.trace_calls) == 1
-    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
-        "reason_code"
-    ] == "factual_source_attribution_unavailable"
+    assert (
+        memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]["reason_code"]
+        == "factual_source_attribution_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -21331,16 +21223,15 @@ async def test_orchestrate_malformed_message_ack_skips_claim_storage(tmp_path):
     assert result["status"] == "ok"
     assert memory_store.claim_record_calls == []
     assert len(memory_store.trace_calls) == 1
-    assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
-        "reason_code"
-    ] == "assistant_message_ack_invalid"
+    assert (
+        memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"]["reason_code"]
+        == "assistant_message_ack_invalid"
+    )
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_claim_storage_failure_is_nonfatal_and_traced_once(tmp_path):
-    memory_store = ClaimCaptureMemoryStore(
-        claim_record_error=RuntimeError("PRIVATE-STORAGE-ERROR")
-    )
+    memory_store = ClaimCaptureMemoryStore(claim_record_error=RuntimeError("PRIVATE-STORAGE-ERROR"))
     result, memory_store, _, litellm = await _run_claim_capture_chat(
         tmp_path,
         memory_store=memory_store,
@@ -21357,9 +21248,7 @@ async def test_orchestrate_claim_storage_failure_is_nonfatal_and_traced_once(tmp
 
 @pytest.mark.asyncio
 async def test_orchestrate_final_trace_update_failure_does_not_repeat_capture(tmp_path):
-    memory_store = ClaimCaptureMemoryStore(
-        final_trace_error=RuntimeError("PRIVATE-TRACE-ERROR")
-    )
+    memory_store = ClaimCaptureMemoryStore(final_trace_error=RuntimeError("PRIVATE-TRACE-ERROR"))
     result, memory_store, runtime, litellm = await _run_claim_capture_chat(
         tmp_path,
         memory_store=memory_store,
@@ -21402,31 +21291,25 @@ async def test_orchestrate_provider_fallback_still_calibrates_and_persists_once(
 async def test_orchestrate_governed_turn_explains_acquisition_provider_free(tmp_path):
     memory_store = ClaimExplanationMemoryStore()
     runtime = None
-    first, _, runtime, first_provider, first_dsa = (
-        await _run_evidence_claim_capture_chat(
-            tmp_path,
-            memory_store=memory_store,
-            runtime=runtime,
-            request_id="request-acquisition-original",
-        )
+    first, _, runtime, first_provider, first_dsa = await _run_evidence_claim_capture_chat(
+        tmp_path,
+        memory_store=memory_store,
+        runtime=runtime,
+        request_id="request-acquisition-original",
     )
     assert len(first_provider.calls) == 1
     assert len(memory_store.claim_record_calls) == 1
-    manifest = memory_store.traces_by_request_id["request-acquisition-original"][
-        "prompt"
-    ]["evidence_acquisition"]
-    assert memory_store.listed_records[0]["acquisition_manifest_id"] == manifest[
-        "manifest_id"
+    manifest = memory_store.traces_by_request_id["request-acquisition-original"]["prompt"][
+        "evidence_acquisition"
     ]
+    assert memory_store.listed_records[0]["acquisition_manifest_id"] == manifest["manifest_id"]
 
-    follow_up, provider, dsa, prior_counts = (
-        await _run_acquisition_explanation_follow_up(
-            tmp_path,
-            follow_up="What did you check?",
-            prior_answer=first["answer"],
-            memory_store=memory_store,
-            runtime=runtime,
-        )
+    follow_up, provider, dsa, prior_counts = await _run_acquisition_explanation_follow_up(
+        tmp_path,
+        follow_up="What did you check?",
+        prior_answer=first["answer"],
+        memory_store=memory_store,
+        runtime=runtime,
     )
 
     assert follow_up["request_id"] == "request-acquisition-explanation"
@@ -21559,9 +21442,7 @@ async def test_orchestrate_acquisition_coverage_and_quoted_target_are_provider_f
     assert provider.calls == []
     assert dsa.list_calls == []
     assert dsa.calls == []
-    explanation = memory_store.trace_calls[-1]["payload"]["prompt"][
-        "claim_explanation"
-    ]
+    explanation = memory_store.trace_calls[-1]["payload"]["prompt"]["claim_explanation"]
     assert explanation["target_mode"] == "quoted_first_paragraph"
     assert explanation["reason_code"] == "quoted_acquisition_record_resolved"
 
@@ -21604,8 +21485,7 @@ async def test_external_source_claim_support_explanation_stays_bounded_and_provi
 
     assert result["status"] == "degraded"
     assert result["answer"].startswith(
-        "The retained evidence record for that earlier answer was incomplete or "
-        "unsupported"
+        "The retained evidence record for that earlier answer was incomplete or " "unsupported"
     )
     assert memory_store.trace_get_calls == []
     assert memory_store.acquisition_history_calls == []
@@ -21784,8 +21664,7 @@ def _assert_compound_claim_capture_excluded(trace):
         ("- New verification attempt:\nPRIVATE-LABEL-CONTENT", "bullet"),
         ("new verification unavailable:\nPRIVATE-LABEL-CONTENT", "lowercase"),
         (
-            "I did not perform a new verification for this explanation.\n"
-            "PRIVATE-LABEL-CONTENT",
+            "I did not perform a new verification for this explanation.\n" "PRIVATE-LABEL-CONTENT",
             "historical-explanation",
         ),
         (
@@ -21827,21 +21706,18 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
     assert len(outcome["dsa"].calls) == 1
     assert outcome["dsa"].fetch_calls == []
     assert outcome["memory_store"].claim_record_calls == []
-    assert len(outcome["runtime"].evidence_shape_calls) == (
-        outcome["runtime_counts"]["shape"] + 1
-    )
-    assert len(outcome["runtime"].evidence_plan_calls) == (
-        outcome["runtime_counts"]["plan"] + 1
-    )
+    assert len(outcome["runtime"].evidence_shape_calls) == (outcome["runtime_counts"]["shape"] + 1)
+    assert len(outcome["runtime"].evidence_plan_calls) == (outcome["runtime_counts"]["plan"] + 1)
     assert len(outcome["runtime"].evidence_sufficiency_calls) == (
         outcome["runtime_counts"]["sufficiency"] + 1
     )
     assert len(outcome["runtime"].evidence_next_step_calls) == (
         outcome["runtime_counts"]["next_step"] + 1
     )
-    assert len(outcome["runtime"].claim_calibration_calls) == outcome[
-        "runtime_counts"
-    ]["claim_calibration"]
+    assert (
+        len(outcome["runtime"].claim_calibration_calls)
+        == outcome["runtime_counts"]["claim_calibration"]
+    )
     _assert_compound_claim_capture_excluded(trace)
     final_manifest = trace["prompt"]["evidence_acquisition"]
     assert final_manifest["response_digest"] == (
@@ -21896,9 +21772,7 @@ async def test_orchestrate_compound_limited_policy_label_boundary_fails_closed(
     assert result["answer"].count("Original acquisition:") == 1
     assert result["answer"].count("New verification:") == 1
     assert "PRIVATE-LIMITED-LABEL-CONTENT" not in result["answer"]
-    assert "Limitation: an optional selected source was not available." in result[
-        "answer"
-    ]
+    assert "Limitation: an optional selected source was not available." in result["answer"]
     assert HELPFUL_GROUNDED_RECOVERY_RESPONSE in result["answer"]
     assert TARGETED_SCOPE_SUFFIX not in result["answer"]
     assert len(outcome["provider"].calls) == 1
@@ -21921,10 +21795,7 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
     )
     runtime.evidence_plan_response = None
     verification_target = first["answer"].split("\n\n", 1)[0]
-    task_text = (
-        "Verify this prior statement with a new evidence check: "
-        f'"{verification_target}"'
-    )
+    task_text = "Verify this prior statement with a new evidence check: " f'"{verification_target}"'
     dsa = FakeDSA(response=_governed_context_pack(task_text))
     provider = FakeLiteLLM(
         content=_evidence_candidate(
@@ -21961,9 +21832,7 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
 
     assert result["answer"].startswith("Original acquisition:\n")
     assert "\n\nNew verification:\n" in result["answer"]
-    assert "The retained evidence supports the requested conclusion." in result[
-        "answer"
-    ]
+    assert "The retained evidence supports the requested conclusion." in result["answer"]
     assert "The maintenance record lists 2025-07-12." in result["answer"]
     assert len(memory_store.acquisition_history_calls) == 1
     assert memory_store.claim_record_list_calls == []
@@ -21985,9 +21854,12 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
     assert final_manifest["response_digest"] == (
         "sha256:" + hashlib.sha256(result["answer"].encode("utf-8")).hexdigest()
     )
-    assert final_manifest != memory_store.traces_by_request_id[
-        "request-compound-original"
-    ]["prompt"]["evidence_acquisition"]
+    assert (
+        final_manifest
+        != memory_store.traces_by_request_id["request-compound-original"]["prompt"][
+            "evidence_acquisition"
+        ]
+    )
 
 
 @pytest.mark.asyncio
@@ -22040,9 +21912,7 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
     assert "Original acquisition:\n" in result["answer"]
     assert "\n\nNew verification:\n" in result["answer"]
     assert runtime.evidence_shape_calls[-1]["task_text"] == task_text
-    assert memory_store.acquisition_history_calls[-1]["target_mode"] == (
-        "quoted_first_paragraph"
-    )
+    assert memory_store.acquisition_history_calls[-1]["target_mode"] == ("quoted_first_paragraph")
     assert "response_digest" not in memory_store.acquisition_history_calls[-1] or (
         memory_store.acquisition_history_calls[-1]["response_digest"] is None
     )
@@ -22068,9 +21938,8 @@ async def test_orchestrate_compound_insufficiency_uses_advisory_attempt_without_
     failed_response["sources_used"] = []
     failed_response["budget"]["returned_results"] = 0
     failed_response["diagnostics"]["selected_source_ids"] = []
-    failed_response["diagnostics"]["candidate_counts_by_source"] = {
-        "vehicle_log_primary": 0
-    }
+    failed_response["diagnostics"]["candidate_counts_by_source"] = {"vehicle_log_primary": 0}
+
     def advisory_next_step(call):
         return _next_step_response_from_call(
             call,
@@ -22114,18 +21983,14 @@ async def test_orchestrate_compound_insufficiency_uses_advisory_attempt_without_
         in result["answer"]
     )
     assert f"Unverified guidance:\n{guidance}" in result["answer"]
-    assert result["answer"].endswith(
-        "Treat this as a working direction, not a confirmed result."
-    )
+    assert result["answer"].endswith("Treat this as a working direction, not a confirmed result.")
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] == []
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
     trace = memory_store.trace_calls[-1]["payload"]
     assert trace["prompt"]["claim_capture"]["enabled"] is False
-    assert trace["prompt"]["claim_capture"]["eligibility_status"] == (
-        "ineligible"
-    )
+    assert trace["prompt"]["claim_capture"]["eligibility_status"] == ("ineligible")
     assert trace["dsa"]["activation_source"] == "evidence_policy"
     assert trace["prompt"]["claim_explanation"]["compound_mode"] is True
 
@@ -22295,16 +22160,15 @@ async def test_orchestrate_two_turn_claim_explanation_is_record_backed_and_provi
         {"owner_id": "owner", "conversation_id": "conv-1", "limit": 20}
     ]
     assert len(memory_store.trace_calls) == 3
-    assert len(
-        [message for message in memory_store.added_messages if message["role"] == "assistant"]
-    ) == 2
+    assert (
+        len([message for message in memory_store.added_messages if message["role"] == "assistant"])
+        == 2
+    )
     follow_up_trace = memory_store.trace_calls[-1]["payload"]
     assert follow_up_trace["prompt"]["claim_explanation"]["reason_code"] == (
         "latest_claim_record_resolved"
     )
-    assert follow_up_trace["prompt"]["claim_explanation"]["target_mode"] == (
-        "immediate_previous"
-    )
+    assert follow_up_trace["prompt"]["claim_explanation"]["target_mode"] == ("immediate_previous")
     assert follow_up_trace["retrieval"]["status"] == "not_requested"
     assert follow_up_trace["model_call"]["status"] == "not_called"
     assert follow_up_trace["model_calls"] == []
@@ -22314,9 +22178,7 @@ async def test_orchestrate_two_turn_claim_explanation_is_record_backed_and_provi
 
 @pytest.mark.asyncio
 async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_path):
-    first, second, memory_store, runtime = await _capture_two_explanation_claims(
-        tmp_path
-    )
+    first, second, memory_store, runtime = await _capture_two_explanation_claims(tmp_path)
     assert memory_store.listed_records[0]["claim_anchor"] == second["answer"]
     assert memory_store.listed_records[1]["claim_anchor"] == first["answer"]
 
@@ -22325,11 +22187,7 @@ async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_pa
         "calibration": len(runtime.claim_calibration_calls),
         "claim_create": len(memory_store.claim_record_calls),
         "assistant": len(
-            [
-                item
-                for item in memory_store.added_messages
-                if item["role"] == "assistant"
-            ]
+            [item for item in memory_store.added_messages if item["role"] == "assistant"]
         ),
         "trace": len(memory_store.trace_calls),
     }
@@ -22373,9 +22231,10 @@ async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_pa
     assert len(runtime.claim_calibration_calls) == prior_counts["calibration"]
     assert len(memory_store.claim_record_calls) == prior_counts["claim_create"]
     assert len(memory_store.claim_record_list_calls) == 1
-    assert len(
-        [item for item in memory_store.added_messages if item["role"] == "assistant"]
-    ) == prior_counts["assistant"] + 1
+    assert (
+        len([item for item in memory_store.added_messages if item["role"] == "assistant"])
+        == prior_counts["assistant"] + 1
+    )
     assert len(memory_store.trace_calls) == prior_counts["trace"] + 1
     trace = memory_store.trace_calls[-1]["payload"]
     explanation = trace["prompt"]["claim_explanation"]
@@ -22393,9 +22252,7 @@ async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_pa
 
 @pytest.mark.asyncio
 async def test_orchestrate_generic_follow_up_still_resolves_only_latest_claim(tmp_path):
-    first, second, memory_store, runtime = await _capture_two_explanation_claims(
-        tmp_path
-    )
+    first, second, memory_store, runtime = await _capture_two_explanation_claims(tmp_path)
     rules, models = _write_router_files(tmp_path)
     result = await orchestrate_chat(
         payload=_base_payload(
@@ -22419,9 +22276,7 @@ async def test_orchestrate_generic_follow_up_still_resolves_only_latest_claim(tm
     assert result["status"] == "ok"
     assert "directly supported the answer" in result["answer"]
     assert "directly supported the answer" in result["answer"]
-    explanation = memory_store.trace_calls[-1]["payload"]["prompt"][
-        "claim_explanation"
-    ]
+    explanation = memory_store.trace_calls[-1]["payload"]["prompt"]["claim_explanation"]
     assert explanation["target_mode"] == "immediate_previous"
     assert explanation["claim_id"] == "claim-service-healthy"
 
@@ -22432,9 +22287,7 @@ async def test_orchestrate_quoted_missing_or_ambiguous_claim_is_provider_free(
     tmp_path,
     ambiguous,
 ):
-    first, second, memory_store, runtime = await _capture_two_explanation_claims(
-        tmp_path
-    )
+    first, second, memory_store, runtime = await _capture_two_explanation_claims(tmp_path)
     target = "The retained file reports that an older value is enabled."
     expected_reason = "quoted_claim_record_not_found"
     if ambiguous:
@@ -22494,9 +22347,7 @@ async def test_orchestrate_quoted_missing_or_ambiguous_claim_is_provider_free(
             "no_claim_records",
         ),
         (
-            ClaimExplanationMemoryStore(
-                list_error=RuntimeError("PRIVATE-LOOKUP-EXCEPTION")
-            ),
+            ClaimExplanationMemoryStore(list_error=RuntimeError("PRIVATE-LOOKUP-EXCEPTION")),
             [
                 {"role": "assistant", "content": "A prior answer."},
                 {"role": "user", "content": "How are you sure?"},
@@ -22541,9 +22392,7 @@ async def test_orchestrate_claim_explanation_fallbacks_are_provider_free(
     assert trace["prompt"]["claim_explanation"]["reason_code"] == reason
     assert "PRIVATE-LOOKUP-EXCEPTION" not in json.dumps((result, trace))
     expected_list_calls = (
-        0
-        if reason in {"prior_assistant_unavailable", "quoted_target_invalid"}
-        else 1
+        0 if reason in {"prior_assistant_unavailable", "quoted_target_invalid"} else 1
     )
     assert len(memory_store.claim_record_list_calls) == expected_list_calls
 
@@ -22614,9 +22463,7 @@ async def test_orchestrate_ambiguous_claim_records_never_invoke_provider(tmp_pat
     assert result["status"] == "degraded"
     assert "more than one retained claim" in result["answer"]
     trace = memory_store.trace_calls[0]["payload"]
-    assert trace["prompt"]["claim_explanation"]["reason_code"] == (
-        "ambiguous_latest_response"
-    )
+    assert trace["prompt"]["claim_explanation"]["reason_code"] == ("ambiguous_latest_response")
     assert "derived-text-private" not in json.dumps((result, trace))
 
 
@@ -22664,8 +22511,7 @@ async def test_orchestrate_non_user_supported_text_uses_ordinary_provider_path(t
     memory_store = ClaimExplanationMemoryStore()
     litellm = FakeLiteLLM(content="ordinary response after assistant context")
     quoted_follow_up = (
-        'What supports the statement "The retained file reports that the setting '
-        'is active."?'
+        'What supports the statement "The retained file reports that the setting ' 'is active."?'
     )
     result = await orchestrate_chat(
         payload=_base_payload(
@@ -24662,21 +24508,14 @@ class DisplaySettingConnector:
         pending_confirmation=(
             "Applying the display setting requires confirmation. No action was taken."
         ),
-        confirmation_rejected=(
-            "The display setting was rejected. No action was taken."
-        ),
+        confirmation_rejected=("The display setting was rejected. No action was taken."),
         execution_failed="I could not apply the display setting. No action was taken.",
-        execution_unknown=(
-            "The display setting outcome is unknown. I did not retry it."
-        ),
-        partially_executed=(
-            "The display setting was only partially applied. I did not retry it."
-        ),
+        execution_unknown=("The display setting outcome is unknown. I did not retry it."),
+        partially_executed=("The display setting was only partially applied. I did not retry it."),
         executed="I applied the display setting once without verification.",
         executed_verified="I applied and verified the display setting.",
         executed_unverified=(
-            "The display setting was applied, but verification did not pass. "
-            "I did not retry it."
+            "The display setting was applied, but verification did not pass. " "I did not retry it."
         ),
     )
 
@@ -24727,9 +24566,7 @@ class DisplaySettingConnector:
         level_text = text[len(prefix) : -len(suffix)]
         if not level_text.isdigit():
             raise ConnectorInputError("continuation_mismatch")
-        return self.normalize_arguments(
-            {"target": description.target, "level": int(level_text)}
-        )
+        return self.normalize_arguments({"target": description.target, "level": int(level_text)})
 
     def check_availability(self, request):
         return ConnectorAvailabilityResult(True, "available")
@@ -24751,9 +24588,7 @@ class DisplaySettingConnector:
         status = ExecutionStatus(state)
         return ConnectorExecutionResult(
             status=status,
-            reason_code=(
-                "executed" if status is ExecutionStatus.COMPLETED else f"setting_{state}"
-            ),
+            reason_code=("executed" if status is ExecutionStatus.COMPLETED else f"setting_{state}"),
             external_reason_code=f"fixture_{state}",
             external_call_count=1,
             effect_mode="simulated",
@@ -24766,9 +24601,7 @@ class DisplaySettingConnector:
             self.verification_status,
             f"verification_{self.verification_status.value}",
             f"fixture_{self.verification_status.value}",
-            0
-            if self.verification_status is VerificationStatus.NOT_SUPPORTED
-            else 1,
+            0 if self.verification_status is VerificationStatus.NOT_SUPPORTED else 1,
             effect_mode="simulated",
             target_label="fixture:display",
         )
@@ -24888,9 +24721,7 @@ class DisplaySettingRuntime(CapabilityRuntime):
                 "verification_required": self.verification_required,
                 "verification_supported": self.verification_required,
                 "verification_method": (
-                    "capability_verification"
-                    if self.verification_required
-                    else None
+                    "capability_verification" if self.verification_required else None
                 ),
                 "reason_summary": reasons,
                 "action_taken": False,
@@ -25247,12 +25078,10 @@ def test_shared_action_helpers_have_no_product_identity_branches():
     ):
         assert product_identity not in shared_source
     assert all(
-        base.__name__ != "JellyfinActionConnector"
-        for base in DisplaySettingConnector.__mro__
+        base.__name__ != "JellyfinActionConnector" for base in DisplaySettingConnector.__mro__
     )
     assert DISPLAY_CAPABILITY.capability_id not in {
-        entry.capability_id
-        for entry in capability_service.PRODUCTION_CAPABILITIES
+        entry.capability_id for entry in capability_service.PRODUCTION_CAPABILITIES
     }
 
 
@@ -25297,9 +25126,7 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
     assert connector.verify_inputs == []
     assert runtime.confirmation_calls == []
     assert runtime.dispatch_count == 0
-    first_trace = memory_store.trace_calls[0]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]
+    first_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert first_trace["capabilities"]["provider_call_count"] == 1
     assert first_trace["capabilities"]["action_summary_call_count"] == 1
     assert first["pending_action"] == {
@@ -25354,32 +25181,24 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
 
     assert len(litellm.calls) == 1
     assert len(runtime.confirmation_calls) == 1
-    assert runtime.confirmation_calls[0]["confirmation_challenge_ref"] == (
-        "challenge-display-1"
-    )
+    assert runtime.confirmation_calls[0]["confirmation_challenge_ref"] == ("challenge-display-1")
     assert runtime.dispatch_count == 1
     assert len(operations.apply_inputs) == 1
     assert operations.apply_inputs[0]["level"] == level
     assert connector.verify_inputs == []
     assert "Verification is not supported" in accepted["answer"]
-    accepted_prompt_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]
+    accepted_prompt_trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
     accepted_trace = accepted_prompt_trace["capabilities"]
     assert accepted_trace["provider_call_count"] == 0
     assert runtime.capability_flow_calls[1]["target_label"] == "fixture:display"
     assert runtime.capability_flow_calls[1].get("confirmation_text") is None
     assert (
-        accepted_prompt_trace["capability_registry"]["action_flow"][
-            "confirmation_text"
-        ]
+        accepted_prompt_trace["capability_registry"]["action_flow"]["confirmation_text"]
         == "Confirm the display setting change."
     )
     assert (
         first["pending_action"]["confirmation_text"]
-        != accepted_prompt_trace["capability_registry"]["action_flow"][
-            "confirmation_text"
-        ]
+        != accepted_prompt_trace["capability_registry"]["action_flow"]["confirmation_text"]
     )
     assert accepted_trace["execution"]["connector_execution_call_count"] == 1
     assert accepted_trace["execution"]["connector_verification_call_count"] == 0
@@ -25409,9 +25228,9 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
     assert runtime.dispatch_count == 1
     assert len(operations.apply_inputs) == 1
     assert "pending_action" not in replay
-    replay_trace = memory_store.trace_calls[2]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["capabilities"]
+    replay_trace = memory_store.trace_calls[2]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
     assert replay_trace["provider_call_count"] == 0
     assert replay_trace["execution"]["failure_reason_code"] == "challenge_consumed"
 
@@ -25532,9 +25351,9 @@ async def test_orchestrate_display_setting_expiry_and_mismatch_do_not_replace_ch
     assert runtime.dispatch_count == 0
     assert operations.apply_inputs == []
     assert "pending_action" not in expired
-    expired_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["capabilities"]
+    expired_trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
     assert expired_trace["provider_call_count"] == 0
     assert expired_trace["execution"]["failure_reason_code"] == "challenge_expired"
 
@@ -25780,17 +25599,15 @@ async def test_orchestrate_display_setting_partial_execution_is_degraded_and_not
         "outcome is unknown",
     ):
         assert false_outcome not in accepted["answer"].casefold()
-    accepted_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["capabilities"]
+    accepted_trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
     assert accepted_trace["provider_call_count"] == 0
     assert accepted_trace["action_summary_call_count"] == 1
     assert accepted_trace["execution"]["response_status"] == "partially_executed"
     assert accepted_trace["execution"]["connector_execution_call_count"] == 1
     assert accepted_trace["execution"]["connector_verification_call_count"] == 0
-    assert accepted_trace["action_summary"]["execution_status"] == (
-        "partially_executed"
-    )
+    assert accepted_trace["action_summary"]["execution_status"] == ("partially_executed")
     assert "fixture_partial" not in str(summary_call)
     assert "fixture_partial" not in accepted["answer"]
 
@@ -25818,9 +25635,9 @@ async def test_orchestrate_display_setting_partial_execution_is_degraded_and_not
     assert len(runtime.confirmation_calls) == 1
     assert runtime.dispatch_count == 1
     assert len(operations.apply_inputs) == 1
-    replay_trace = memory_store.trace_calls[2]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]["capabilities"]
+    replay_trace = memory_store.trace_calls[2]["payload"]["retrieval"]["prompt_assembly"][
+        "capabilities"
+    ]
     assert replay_trace["provider_call_count"] == 0
     assert replay_trace["execution"]["failure_reason_code"] == "challenge_consumed"
 
@@ -25892,14 +25709,10 @@ async def test_orchestrate_partial_with_passed_verification_remains_partial(
     assert "partially completed" in accepted["answer"].casefold()
     assert "degraded" in accepted["answer"].casefold()
     trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
-    assert trace["capabilities"]["execution"]["response_status"] == (
-        "partially_executed"
-    )
+    assert trace["capabilities"]["execution"]["response_status"] == ("partially_executed")
     assert trace["capabilities"]["execution"]["connector_execution_call_count"] == 1
     assert trace["capabilities"]["execution"]["connector_verification_call_count"] == 1
-    assert trace["capabilities"]["action_summary"]["execution_status"] == (
-        "partially_executed"
-    )
+    assert trace["capabilities"]["action_summary"]["execution_status"] == ("partially_executed")
     assert trace["capabilities"]["action_summary"]["verification_status"] == "passed"
 
 
@@ -25915,14 +25728,10 @@ async def test_orchestrate_partial_summary_degradation_does_not_reexecute(
     memory_store = FakeMemoryStore()
     runtime = DisplaySettingRuntime(
         action_summary_error=(
-            RuntimeError("PRIVATE-SUMMARY-ERROR")
-            if summary_mode == "unavailable"
-            else None
+            RuntimeError("PRIVATE-SUMMARY-ERROR") if summary_mode == "unavailable" else None
         ),
         action_summary_response=(
-            {"result": "PRIVATE-MALFORMED-SUMMARY"}
-            if summary_mode == "malformed"
-            else None
+            {"result": "PRIVATE-MALFORMED-SUMMARY"} if summary_mode == "malformed" else None
         ),
     )
     operations = DisplaySettingOperations("partially_executed")
@@ -25978,9 +25787,7 @@ async def test_orchestrate_partial_summary_degradation_does_not_reexecute(
     )
     trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capabilities"]["action_summary"]["status"] == summary_mode
-    assert trace["capabilities"]["execution"]["response_status"] == (
-        "partially_executed"
-    )
+    assert trace["capabilities"]["execution"]["response_status"] == ("partially_executed")
     assert "PRIVATE" not in str(trace["capabilities"])
     assert "PRIVATE" not in accepted["answer"]
 
@@ -26036,9 +25843,7 @@ async def test_orchestrate_display_setting_summary_failure_does_not_reexecute(
     )
     assert len(litellm.calls) == 1
     assert len(operations.apply_inputs) == 1
-    assert second["answer"] == (
-        "I applied the display setting once without verification."
-    )
+    assert second["answer"] == ("I applied the display setting once without verification.")
     trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capabilities"]["action_summary"]["status"] == "unavailable"
     assert trace["capabilities"]["execution"]["connector_execution_call_count"] == 1
@@ -26082,9 +25887,7 @@ async def test_orchestrate_jellyfin_two_turn_continuation_skips_model_rediscover
         "argument_digest": first["pending_action"]["argument_digest"],
         "challenge_ref": "challenge-jellyfin-1",
         "challenge_expires_at": "2026-07-12T01:00:00+00:00",
-        "confirmation_text": (
-            "Confirm Restart Jellyfin. This may be difficult to reverse."
-        ),
+        "confirmation_text": ("Confirm Restart Jellyfin. This may be difficult to reverse."),
     }
     assert operations.restart_inputs == []
     assert len(runtime.confirmation_calls) == 0
@@ -26213,32 +26016,21 @@ async def test_orchestrate_jellyfin_cancelled_policy_records_rejection_once(tmp_
     )
     assert len(litellm.calls) - provider_before == 0
     assert (
-        len(
-            [
-                item
-                for item in operations.status_inputs
-                if item["purpose"] == "revalidation"
-            ]
-        )
+        len([item for item in operations.status_inputs if item["purpose"] == "revalidation"])
         - revalidation_before
         == 1
     )
     assert len(runtime.world_state_verification_calls) - verification_before == 1
     assert len(runtime.confirmation_calls) - confirmation_before == 1
     assert runtime.confirmation_calls[-1]["confirmed"] is False
-    assert runtime.confirmation_calls[-1]["confirmation_challenge_ref"] == (
-        first["pending_action"]["challenge_ref"]
+    assert (
+        runtime.confirmation_calls[-1]["confirmation_challenge_ref"]
+        == (first["pending_action"]["challenge_ref"])
     )
     assert runtime.dispatch_count - dispatch_before == 0
     assert len(operations.restart_inputs) - restart_before == 0
     assert (
-        len(
-            [
-                item
-                for item in operations.status_inputs
-                if item["purpose"] == "post_restart"
-            ]
-        )
+        len([item for item in operations.status_inputs if item["purpose"] == "post_restart"])
         - post_status_before
         == 0
     )
@@ -26248,9 +26040,7 @@ async def test_orchestrate_jellyfin_cancelled_policy_records_rejection_once(tmp_
     assert summary["execution_status"] == "not_attempted"
     assert summary["verification_status"] == "not_required"
 
-    second_authorizations = runtime.capability_authorization_calls[
-        authorization_before:
-    ]
+    second_authorizations = runtime.capability_authorization_calls[authorization_before:]
     selections = [
         item
         for item in second_authorizations
@@ -26258,14 +26048,11 @@ async def test_orchestrate_jellyfin_cancelled_policy_records_rejection_once(tmp_
     ]
     assert len(selections) == 2
     assert all(
-        item["confirmation_challenge_ref"]
-        == first["pending_action"]["challenge_ref"]
+        item["confirmation_challenge_ref"] == first["pending_action"]["challenge_ref"]
         for item in selections
     )
 
-    second_trace = memory_store.trace_calls[1]["payload"]["retrieval"][
-        "prompt_assembly"
-    ]
+    second_trace = memory_store.trace_calls[1]["payload"]["retrieval"]["prompt_assembly"]
     authority = second_trace["capability_registry"]["authority"]
     assert authority["authority_level"] == "execute_after_confirmation"
     assert authority["requires_confirmation"] is True
@@ -26285,19 +26072,13 @@ async def test_orchestrate_jellyfin_cancelled_policy_records_rejection_once(tmp_
     execution = second_trace["capabilities"]["execution"]
     selection = execution["authorization"]["selection"]
     confirmation = execution["confirmation"]
-    assert selection["confirmation_challenge_ref"] == first["pending_action"][
-        "challenge_ref"
-    ]
-    assert selection["challenge_expires_at"] == first["pending_action"][
-        "challenge_expires_at"
-    ]
+    assert selection["confirmation_challenge_ref"] == first["pending_action"]["challenge_ref"]
+    assert selection["challenge_expires_at"] == first["pending_action"]["challenge_expires_at"]
     assert confirmation["status"] == "rejected"
     assert confirmation["accepted"] is False
     assert confirmation["call_count"] == 1
     assert confirmation["reason_code"] == "confirmation_rejected"
-    assert confirmation["confirmed_challenge_ref"] == first["pending_action"][
-        "challenge_ref"
-    ]
+    assert confirmation["confirmed_challenge_ref"] == first["pending_action"]["challenge_ref"]
     assert execution["response_status"] == "not_executed"
     assert execution["restart_call_count"] == 0
     assert execution["post_restart_verification_call_count"] == 0
@@ -29567,9 +29348,7 @@ class ImmediateHistoryMemoryStore(FakeMemoryStore):
             response.update(
                 resolution_status="resolved",
                 resolution_source=self.resolution_source,
-                lineage_dereference_count=(
-                    1 if self.resolution_source == "root_lineage" else 0
-                ),
+                lineage_dereference_count=(1 if self.resolution_source == "root_lineage" else 0),
                 match_count=1,
                 reason_code=(
                     "root_lineage_support_record_resolved"
@@ -29625,9 +29404,7 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
         original_request_id = assistant["metadata"]["request_id"]
         trace = self.persisted_traces[original_request_id]
         manifest = trace["prompt"]["evidence_acquisition"]
-        response_digest = "sha256:" + hashlib.sha256(
-            assistant["content"].encode()
-        ).hexdigest()
+        response_digest = "sha256:" + hashlib.sha256(assistant["content"].encode()).hexdigest()
         assert manifest["assistant_message_id"] == assistant["message_id"]
         assert manifest["response_digest"] == response_digest
         assert trace["owner_id"] == kwargs["owner_id"]
@@ -29694,16 +29471,12 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     context_pack["items"][0]["source_name"] = "Primary vehicle maintenance log"
     context_pack["items"][1]["source_id"] = "vehicle_log_ev"
     context_pack["items"][1]["source_name"] = "EV maintenance log"
-    context_pack["items"][1]["source_ref"] = (
-        "google_sheets:vehicle_log_ev:FormResponses!A84:H84"
-    )
+    context_pack["items"][1]["source_ref"] = "google_sheets:vehicle_log_ev:FormResponses!A84:H84"
     context_pack["items"].append(
         {
             **copy.deepcopy(context_pack["items"][0]),
             "result_id": "result_3",
-            "source_ref": (
-                "google_sheets:vehicle_log_primary:'Form responses 1'!A8:I8"
-            ),
+            "source_ref": ("google_sheets:vehicle_log_primary:'Form responses 1'!A8:I8"),
             "text": "The retained service record includes a power-steering flush.",
         }
     )
@@ -29723,10 +29496,7 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     retained_excerpts = tuple(item["text"] for item in context_pack["items"])
     answer_text = _rendered_evidence_answer(*retained_excerpts)
     provider_candidate = _evidence_candidate(
-        *(
-            (item["source_ref"], item["text"])
-            for item in context_pack["items"]
-        )
+        *((item["source_ref"], item["text"]) for item in context_pack["items"])
     )
     memory_store = PersistedOrdinaryAcquisitionMemoryStore()
     provider = FakeLiteLLM(content=provider_candidate)
@@ -29792,9 +29562,7 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     persisted_assistant = memory_store.added_messages[-1]
     original_trace = memory_store.persisted_traces[original_request_id]
     manifest = original_trace["prompt"]["evidence_acquisition"]
-    exact_digest = "sha256:" + hashlib.sha256(
-        persisted_assistant["content"].encode()
-    ).hexdigest()
+    exact_digest = "sha256:" + hashlib.sha256(persisted_assistant["content"].encode()).hexdigest()
     assert original["answer"] == answer_text
     assert persisted_assistant["content"] == original["answer"]
     assert manifest["assistant_message_id"] == persisted_assistant["message_id"]
@@ -29812,16 +29580,12 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         "google_sheets:vehicle_log_primary:'Form responses 1'!A13:I13",
         "google_sheets:vehicle_log_primary:'Form responses 1'!A8:I8",
     ]
-    assert manifest["acquisition"]["source_references_returned"] == (
-        expected_source_references
-    )
-    assert manifest["acquisition"]["source_references_retained"] == (
-        expected_source_references
-    )
-    assert [
-        summary["display_name"]
-        for summary in manifest["acquisition"]["source_summaries"]
-    ] == ["EV maintenance log", "Primary vehicle maintenance log"]
+    assert manifest["acquisition"]["source_references_returned"] == (expected_source_references)
+    assert manifest["acquisition"]["source_references_retained"] == (expected_source_references)
+    assert [summary["display_name"] for summary in manifest["acquisition"]["source_summaries"]] == [
+        "EV maintenance log",
+        "Primary vehicle maintenance log",
+    ]
 
     follow_up = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -29841,9 +29605,9 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         request_id="request-ordinary-dsa-follow-up",
     )
 
-    follow_up_prompt_trace = memory_store.persisted_traces[
-        "request-ordinary-dsa-follow-up"
-    ]["prompt"]
+    follow_up_prompt_trace = memory_store.persisted_traces["request-ordinary-dsa-follow-up"][
+        "prompt"
+    ]
     history_trace = follow_up_prompt_trace["history_followup"]
     candidate_calls = [
         call
@@ -29877,12 +29641,11 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
     assert len(candidate_calls) == 1
     assert len(provider.calls) == 1
     assert history_trace["bms_resolution_status"] == "resolved"
-    assert follow_up_prompt_trace["claim_explanation"][
-        "manifest_projection_status"
-    ] == "accepted"
-    assert follow_up_prompt_trace["claim_explanation"][
-        "manifest_projection_reason"
-    ] != "identity_projection_invalid_source_references_returned"
+    assert follow_up_prompt_trace["claim_explanation"]["manifest_projection_status"] == "accepted"
+    assert (
+        follow_up_prompt_trace["claim_explanation"]["manifest_projection_reason"]
+        != "identity_projection_invalid_source_references_returned"
+    )
     assert history_trace["fresh_verification_entry_status"] == "not_requested"
     assert history_trace["answer_provider_call_count"] == 0
     follow_up_assistant = memory_store.added_messages[-1]
@@ -30098,9 +29861,7 @@ async def test_root_support_history_transports_same_original_lineage(tmp_path):
         ("unavailable", "history_store_unavailable", 0),
     ],
 )
-async def test_degraded_history_persists_no_lineage(
-    tmp_path, status, reason, match_count
-):
+async def test_degraded_history_persists_no_lineage(tmp_path, status, reason, match_count):
     response = {
         "schema_version": "immediate-history-resolution.v2",
         "request_id": "replaced",
@@ -30140,9 +29901,7 @@ class RejectingLineageMemoryStore(ImmediateHistoryMemoryStore):
     async def add_message(self, **kwargs):
         self.append_attempts.append(copy.deepcopy(kwargs))
         if kwargs.get("history_root_lineage") is not None:
-            raise RuntimeError(
-                "PRIVATE-LINEAGE-APPEND-ERROR " + HISTORY_ROOT_MESSAGE_ID
-            )
+            raise RuntimeError("PRIVATE-LINEAGE-APPEND-ERROR " + HISTORY_ROOT_MESSAGE_ID)
         return await super().add_message(**kwargs)
 
 
@@ -30216,9 +29975,7 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
         (result, memory_store.trace_calls[-1]["payload"]),
         sort_keys=True,
     )
-    history_trace = memory_store.trace_calls[-1]["payload"]["prompt"][
-        "history_followup"
-    ]
+    history_trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
     assert set(history_trace) == {
         "feature_enabled",
         "deterministic_match_status",
@@ -30238,15 +29995,15 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
         "verification_after_history_allowed",
         "bms_call_count",
         "bms_resolution_status",
-            "bms_reason_code",
-            "resolution_source",
-            "lineage_dereference_count",
-            "lineage_result",
+        "bms_reason_code",
+        "resolution_source",
+        "lineage_dereference_count",
+        "lineage_result",
         "resolved_record_kind",
         "render_status",
         "fresh_verification_entry_status",
         "answer_provider_call_count",
-        }
+    }
     assert history_trace["resolution_source"] == "direct_record"
     assert history_trace["lineage_dereference_count"] == 0
     assert history_trace["lineage_result"] == "accepted"
@@ -30371,9 +30128,7 @@ async def test_classifier_failures_are_provider_free_clarifications(tmp_path, co
         RuntimeError("classifier client failed"),
     ],
 )
-async def test_classifier_transport_failures_make_one_attempt_and_clarify(
-    tmp_path, error
-):
+async def test_classifier_transport_failures_make_one_attempt_and_clarify(tmp_path, error):
     classifier = SequenceLiteLLM([error])
     result, memory_store, runtime, litellm = await _run_history_followup(
         tmp_path,
@@ -30455,9 +30210,7 @@ async def test_cloud_classifier_respects_profile_surface_and_provider_policy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["unsupported", ""])
-async def test_malformed_classifier_route_fails_closed_without_provider_or_bms(
-    tmp_path, provider
-):
+async def test_malformed_classifier_route_fails_closed_without_provider_or_bms(tmp_path, provider):
     result, memory_store, runtime, litellm = await _run_history_followup(
         tmp_path,
         text="Where did that conclusion come from?",
@@ -30616,9 +30369,7 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
         payload=_first_party_chat_payload(
             "Can you verify that again now?",
             conversation_id="conv-1",
-            messages=[
-                {"role": "user", "content": "Can you verify that again now?"}
-            ],
+            messages=[{"role": "user", "content": "Can you verify that again now?"}],
         ),
         memory_store=memory_store,
         litellm=provider,
@@ -30650,9 +30401,7 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
     assert history["fresh_verification_entry_status"] == "entered_existing_governed_path"
     assert len(trace["model_calls"]) == 1
     assert trace["model_calls"][0]["model"] != "gpt-5-mini"
-    assert trace["prompt"]["claim_capture"]["reason_code"] == (
-        "compound_verification_response"
-    )
+    assert trace["prompt"]["claim_capture"]["reason_code"] == ("compound_verification_response")
     compound_assistant = [
         message for message in memory_store.added_messages if message["role"] == "assistant"
     ][-1]
@@ -30759,9 +30508,7 @@ async def _run_support_structured_verification_case(
         payload=_first_party_chat_payload(
             "Can you verify that again now?",
             conversation_id="conv-1",
-            messages=[
-                {"role": "user", "content": "Can you verify that again now?"}
-            ],
+            messages=[{"role": "user", "content": "Can you verify that again now?"}],
         ),
         memory_store=memory_store,
         litellm=provider,
@@ -30817,13 +30564,11 @@ async def test_support_compound_structured_excerpt_label_boundary_fails_closed(
     case_id,
     limited,
 ):
-    result, memory_store, runtime, provider, dsa = (
-        await _run_support_structured_verification_case(
-            tmp_path,
-            excerpt=excerpt,
-            request_id=f"request-support-structured-label-{case_id}",
-            limited=limited,
-        )
+    result, memory_store, runtime, provider, dsa = await _run_support_structured_verification_case(
+        tmp_path,
+        excerpt=excerpt,
+        request_id=f"request-support-structured-label-{case_id}",
+        limited=limited,
     )
     trace = memory_store.trace_calls[-1]["payload"]
     evidence_response = trace["retrieval"]["prompt_assembly"]["evidence_response"]
@@ -30875,12 +30620,10 @@ async def test_support_compound_structured_inline_prose_remains_allowed(
     tmp_path,
     excerpt,
 ):
-    result, memory_store, runtime, provider, dsa = (
-        await _run_support_structured_verification_case(
-            tmp_path,
-            excerpt=excerpt,
-            request_id="request-support-structured-inline-prose",
-        )
+    result, memory_store, runtime, provider, dsa = await _run_support_structured_verification_case(
+        tmp_path,
+        excerpt=excerpt,
+        request_id="request-support-structured-inline-prose",
     )
     trace = memory_store.trace_calls[-1]["payload"]
     evidence_response = trace["retrieval"]["prompt_assembly"]["evidence_response"]
@@ -30892,10 +30635,7 @@ async def test_support_compound_structured_inline_prose_remains_allowed(
     assert result["answer"].count("Original support:") == 1
     assert result["answer"].count("New verification:") == 1
     assert excerpt in result["answer"]
-    assert (
-        orchestrate_service._COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT
-        not in result["answer"]
-    )
+    assert orchestrate_service._COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT not in result["answer"]
     assert len(provider.calls) == 2
     assert len(dsa.calls) == 1
     assert len(runtime.interaction_governance_calls) == 2
@@ -30921,9 +30661,7 @@ async def test_unavailable_fresh_path_keeps_history_and_calls_no_provider_or_ret
     assert memory_store.retrieve_calls == []
     assert len(runtime.interaction_governance_calls) == 2
     trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
-    assert trace["fresh_verification_entry_status"] == (
-        "unavailable_after_history_resolution"
-    )
+    assert trace["fresh_verification_entry_status"] == ("unavailable_after_history_resolution")
 
 
 def _situated_runtime_response(
@@ -31033,9 +30771,7 @@ async def test_situated_presence_is_called_once_and_shapes_prompt_after_style_re
     assert trace["situated_presence"]["humor_allowed"] is True
     assert trace["style"]["resolved_envelope"]["playfulness_budget"] == "low"
     assert "hi" not in str(trace["situated_presence"])
-    assert runtime.call_order.index("restraint") < runtime.call_order.index(
-        "situated_presence"
-    )
+    assert runtime.call_order.index("restraint") < runtime.call_order.index("situated_presence")
     assert memory_store.added_messages[0]["role"] == "user"
 
 
@@ -31168,10 +30904,7 @@ async def test_provider_fallback_reuses_identical_situated_presence_messages(tmp
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n"
-        "  gpt-4o-mini:\n"
-        "    provider: cloud\n"
-        "    max_context_tokens: 128000\n",
+        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     memory_store = FakeMemoryStore()
