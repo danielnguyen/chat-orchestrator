@@ -5416,7 +5416,6 @@ run_evidence_aggregate_scenario() {
     and .next_steps.selections[-1].provider_disposition == "allowed"
     and .acquisition.strategy_attempted == "structured_field_values"
     and .acquisition.aggregate_execution.outcome == "satisfied"
-    and .acquisition.aggregate_execution.seed_call_count == 1
     and .acquisition.aggregate_execution.structured_context_call_count == 1
     and .acquisition.aggregate_execution.record_count == 5
     and .acquisition.aggregate_execution.non_empty_value_count == 4
@@ -5442,23 +5441,21 @@ run_evidence_aggregate_scenario() {
   '
   assert_jq "aggregate.fixture_scope" "$fixture_calls" '
     [.calls[] | select(.operation == "google_values")] as $calls
-    | ($calls | length) == 2
+    | ($calls | length) == 1
     and ($calls | all(.source == "measurement-sheet"))
     and ($calls | all(.returned_row_count == 6))
   '
   assert_jq "aggregate.dsa_operations" "$audit" '
-    [.[] | select(.operation == "context_pack")] as $seed
+    [.[] | select(.operation == "context_pack")] as $search
     | [.[] | select(.operation == "context")] as $context
-    | ($seed | length) == 1
-    and $seed[0].source_ids == ["metrics_archive"]
-    and $seed[0].result_count == 1
-    and $seed[0].status == "success"
+    | ($search | length) == 0
     and ($context | length) == 1
     and $context[0].source_ids == ["metrics_archive"]
+    and (($context[0].source_ref // null) == null)
     and $context[0].result_count == 1
     and $context[0].status == "success"
   '
-  assert_dsa_operation_counts "$audit" 1 1 0
+  assert_dsa_operation_counts "$audit" 0 1 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
   assert_jq "aggregate.runtime" "$diagnostics" '
     [.events[] | select(.event_payload_json.request_id == $request_id)] as $events
@@ -5492,7 +5489,7 @@ run_evidence_aggregate_scenario() {
       ;;
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Evidence aggregate: semantic=1 answer_provider=0 seed=1 structured_context=1 records=5 non_empty=4 median=27.875"
+  echo "Evidence aggregate: semantic=1 answer_provider=0 search=0 structured_context=1 records=5 non_empty=4 median=27.875"
 }
 
 run_evidence_acquisition_composed_suite() {

@@ -255,11 +255,6 @@ BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
     "max_bytes": 50000,
     "max_text_chars": 12000,
 }
-AGGREGATE_SEED_BUDGET = {
-    "max_results": 1,
-    "max_bytes": 50000,
-    "max_text_chars": 12000,
-}
 AGGREGATE_CONTEXT_BUDGET = {
     "max_rows": 250,
     "max_bytes": 5000000,
@@ -299,21 +294,27 @@ _REQUIREMENT_DESCRIPTIONS = {
     "exact_authoritative_fetch": "the exact authoritative item",
     "complete_scope_coverage": "the complete declared source scope",
     "selected_source_coverage": "coverage of every selected source",
-    "structured_absence_check": ("an absence-supporting check of the declared source set"),
+    "structured_absence_check": (
+        "an absence-supporting check of the declared source set"
+    ),
     "contradiction_search": "the required contradiction search",
     "counterevidence_coverage": "counterevidence coverage",
     "historical_scope": "the required historical scope",
     "historical_sequence_coverage": "the historical sequence",
     "candidate_evidence_coverage": "candidate evidence coverage",
     "cross_source_comparison": "the selected-source comparison",
-    "context_delivery": ("delivery of the required acquired evidence to the reasoning context"),
+    "context_delivery": (
+        "delivery of the required acquired evidence to the reasoning context"
+    ),
     "no_material_truncation": "full delivery of the material evidence",
 }
 _PLAN_LIMITATION_DESCRIPTIONS = {
     "declared_source_missing_from_inventory": (
         "a declared optional source was missing from the configured inventory"
     ),
-    "declared_category_not_available": ("a declared optional source category was unavailable"),
+    "declared_category_not_available": (
+        "a declared optional source category was unavailable"
+    ),
     "source_inventory_partial": (
         "the configured source inventory was partial, so optional source coverage "
         "remains incomplete"
@@ -326,22 +327,36 @@ _PLAN_LIMITATION_DESCRIPTIONS = {
         "the configured source inventory was unavailable, so optional source "
         "coverage could not be established"
     ),
-    "authoritative_source_missing": ("an optional authoritative source was not established"),
+    "authoritative_source_missing": (
+        "an optional authoritative source was not established"
+    ),
     "required_capability_unavailable": (
         "a capability required for optional evidence was unavailable"
     ),
-    "targeted_only_not_exhaustive": ("optional evidence was limited to targeted retrieval"),
-    "absence_scope_not_enumerable": ("optional source scope could not support an absence check"),
-    "insufficient_comparison_scope": ("optional source coverage was insufficient for comparison"),
+    "targeted_only_not_exhaustive": (
+        "optional evidence was limited to targeted retrieval"
+    ),
+    "absence_scope_not_enumerable": (
+        "optional source scope could not support an absence check"
+    ),
+    "insufficient_comparison_scope": (
+        "optional source coverage was insufficient for comparison"
+    ),
     "contradiction_search_not_supported": (
         "optional contradiction-search coverage was unsupported"
     ),
-    "historical_time_scope_missing": ("the optional historical time scope was not established"),
-    "historical_sequence_not_supported": ("optional historical-sequence coverage was unsupported"),
+    "historical_time_scope_missing": (
+        "the optional historical time scope was not established"
+    ),
+    "historical_sequence_not_supported": (
+        "optional historical-sequence coverage was unsupported"
+    ),
     "decision_support_scope_insufficient": (
         "optional decision-support evidence remained incomplete"
     ),
-    "aggregate_field_unavailable": ("the configured aggregate field was unavailable"),
+    "aggregate_field_unavailable": (
+        "the configured aggregate field was unavailable"
+    ),
 }
 _SOURCE_AVAILABILITY_LIMITATIONS = {
     "authoritative_source_unavailable",
@@ -685,7 +700,8 @@ class PlanResult(StrictModel):
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate_evidence_requirement")
         requirement_shapes = [
-            (item.requirement_kind, item.criticality) for item in self.declared_requirements
+            (item.requirement_kind, item.criticality)
+            for item in self.declared_requirements
         ]
         if len(set(requirement_shapes)) != len(requirement_shapes):
             raise ValueError("duplicate_evidence_requirement_shape")
@@ -748,7 +764,9 @@ class SufficiencyResult(StrictModel):
             raise ValueError("duplicate_sufficiency_reason_code")
         if len(set(self.answer_constraints)) != len(self.answer_constraints):
             raise ValueError("duplicate_answer_constraint")
-        qualification_expected = self.sufficiency_status != "sufficient_for_declared_scope"
+        qualification_expected = (
+            self.sufficiency_status != "sufficient_for_declared_scope"
+        )
         acquisition_expected = self.sufficiency_status in {"insufficient", "unknown"}
         if self.qualification_required != qualification_expected:
             raise ValueError("qualification_flag_mismatch")
@@ -826,7 +844,8 @@ class EvidenceDeclaredScope(StrictModel):
         if len(set(source_refs)) != len(source_refs):
             raise ValueError("duplicate_exact_source_ref")
         if self.source_ids and any(
-            reference.source_id not in self.source_ids for reference in self.exact_source_refs
+            reference.source_id not in self.source_ids
+            for reference in self.exact_source_refs
         ):
             raise ValueError("exact_source_ref_outside_declared_source_ids")
         return self
@@ -846,9 +865,9 @@ class EvidenceSourceDescriptor(StrictModel):
     ] = Field(max_length=5)
     availability: Literal["available", "unavailable", "disabled", "unknown"]
     authority_role: Literal["authoritative", "supplemental", "unknown"]
-    content_fields: list[Annotated[StrictStr, Field(min_length=1, max_length=120)]] | None = Field(
-        default=None, max_length=24
-    )
+    content_fields: list[
+        Annotated[StrictStr, Field(min_length=1, max_length=120)]
+    ] | None = Field(default=None, max_length=24)
 
     @model_serializer(mode="wrap")
     def omit_absent_content_fields(self, handler):
@@ -939,13 +958,10 @@ class NextStepResult(StrictModel):
         str,
         Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
     ]
-    proposed_premise_digest: (
-        Annotated[
-            str,
-            Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
-        ]
-        | None
-    ) = None
+    proposed_premise_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ] | None = None
     reacquisition_guard: ReacquisitionGuard
     clarification_target: ClarificationTarget | None = None
     unresolved_material_requirement_ids: list[Identifier] = Field(max_length=32)
@@ -1004,7 +1020,8 @@ class NextStepResult(StrictModel):
             raise ValueError("invalid_bounded_answer_next_step")
 
         if terminal and (
-            self.proposed_premise_digest is not None or self.clarification_target is not None
+            self.proposed_premise_digest is not None
+            or self.clarification_target is not None
         ):
             raise ValueError("terminal_next_step_has_follow_up")
 
@@ -1023,7 +1040,8 @@ class NextStepResult(StrictModel):
                 raise ValueError("qualified_partial_reason_required")
         elif self.selected_next_step == "withhold_unsupported_conclusion":
             if (
-                self.conclusion_disposition != "requested_conclusion_withheld"
+                self.conclusion_disposition
+                != "requested_conclusion_withheld"
                 or "unsupported_conclusion_withheld" not in self.reason_codes
             ):
                 raise ValueError("invalid_withheld_next_step")
@@ -1042,11 +1060,18 @@ class NextStepResult(StrictModel):
 
         required_step_reason = {
             "answer_within_declared_scope": "declared_scope_sufficient",
-            "perform_additional_acquisition": ("changed_acquisition_premise_available"),
-            "ask_narrow_clarification": ("material_uncertainty_requires_clarification"),
+            "perform_additional_acquisition": (
+                "changed_acquisition_premise_available"
+            ),
+            "ask_narrow_clarification": (
+                "material_uncertainty_requires_clarification"
+            ),
             "disclose_unexamined_scope": "unexamined_material_scope",
         }.get(self.selected_next_step)
-        if required_step_reason is not None and required_step_reason not in self.reason_codes:
+        if (
+            required_step_reason is not None
+            and required_step_reason not in self.reason_codes
+        ):
             raise ValueError("selected_next_step_reason_required")
 
         if self.selected_next_step == "ask_narrow_clarification":
@@ -1096,16 +1121,18 @@ class DsaSourceEntry(StrictModel):
     domain_tags: list[Identifier] = Field(max_length=8)
     sensitivity: Literal["low", "medium", "high", "restricted"]
     access_mode: Literal["read_only"]
-    capabilities: list[Literal["search", "fetch", "context", "profile"]] = Field(max_length=4)
+    capabilities: list[Literal["search", "fetch", "context", "profile"]] = Field(
+        max_length=4
+    )
     enabled: bool
     status: Literal["ready", "unavailable", "disabled", "unknown"]
     last_checked_at: datetime | None
     last_error: Annotated[str, Field(max_length=240)] | None = None
     authority_role: Literal["authoritative", "supplemental", "unknown"] = "unknown"
     scope_refs: MaterialScopeReferences | None = None
-    content_fields: list[Annotated[StrictStr, Field(min_length=1, max_length=120)]] | None = Field(
-        default=None, max_length=24
-    )
+    content_fields: list[
+        Annotated[StrictStr, Field(min_length=1, max_length=120)]
+    ] | None = Field(default=None, max_length=24)
 
     @field_validator("content_fields")
     @classmethod
@@ -1138,7 +1165,9 @@ class DsaSourceEntry(StrictModel):
 
 class DsaSourceListResponse(StrictModel):
     inventory_scope: Literal["configured_sources"] | None = None
-    inventory_status: Literal["complete", "partial", "unknown", "unavailable"] | None = None
+    inventory_status: Literal["complete", "partial", "unknown", "unavailable"] | None = (
+        None
+    )
     sources: list[DsaSourceEntry] = Field(max_length=32)
 
     @model_validator(mode="after")
@@ -1379,6 +1408,13 @@ class DsaContextItem(StrictModel):
     available_context: list[DsaAvailableContext] = Field(max_length=16)
     warnings: list[Annotated[str, Field(max_length=160)]] = Field(max_length=12)
 
+    @model_serializer(mode="wrap")
+    def omit_absent_structured_data(self, handler):
+        serialized = handler(self)
+        if self.structured_data is None:
+            serialized.pop("structured_data", None)
+        return serialized
+
     @field_validator("source_ref")
     @classmethod
     def validate_opaque_source_ref(cls, value: str) -> str:
@@ -1537,14 +1573,20 @@ class EvidenceAcquisitionState:
             and self.exact_source_refs
         ):
             return False
-        referenced_sources = {item["source_id"] for item in self.exact_source_refs}
+        referenced_sources = {
+            item["source_id"] for item in self.exact_source_refs
+        }
         eligible_sources = set(self.plan.eligible_source_ids)
         authoritative_sources = set(self.plan.authoritative_source_ids)
-        requirement_kinds = {item.requirement_kind for item in self.plan.declared_requirements}
+        requirement_kinds = {
+            item.requirement_kind for item in self.plan.declared_requirements
+        }
         return bool(
             referenced_sources == eligible_sources
             and authoritative_sources.issubset(eligible_sources)
-            and {"targeted_evidence", "context_delivery"}.issubset(requirement_kinds)
+            and {"targeted_evidence", "context_delivery"}.issubset(
+                requirement_kinds
+            )
             and (
                 ("exact_authoritative_fetch" in requirement_kinds)
                 == bool(referenced_sources & authoritative_sources)
@@ -1589,7 +1631,9 @@ class EvidenceAcquisitionState:
         eligible = set(plan.eligible_source_ids)
         if not set(plan.authoritative_source_ids).issubset(eligible):
             return False
-        inventory_by_id = {source.source_id: source for source in self.inventory.sources}
+        inventory_by_id = {
+            source.source_id: source for source in self.inventory.sources
+        }
         for source_id in eligible:
             source = inventory_by_id.get(source_id)
             if (
@@ -1630,13 +1674,18 @@ class EvidenceAcquisitionState:
             and plan.authoritative_source_ids == plan.eligible_source_ids
             and len(plan.declared_requirements) == len(required_material)
             and all(
-                requirement.criticality == "material" for requirement in plan.declared_requirements
+                requirement.criticality == "material"
+                for requirement in plan.declared_requirements
             )
-            and {requirement.requirement_kind for requirement in plan.declared_requirements}
+            and {
+                requirement.requirement_kind
+                for requirement in plan.declared_requirements
+            }
             == required_material
             and inventory.inventory_scope == "configured_sources"
             and inventory.inventory_status == "complete"
-            and declared_scope.get("inventory_status") == "complete_for_declared_scope"
+            and declared_scope.get("inventory_status")
+            == "complete_for_declared_scope"
         ):
             return False
 
@@ -1644,7 +1693,9 @@ class EvidenceAcquisitionState:
         declared_categories = set(declared_scope.get("source_categories") or [])
         if declared_source_ids:
             scoped_sources = [
-                source for source in inventory.sources if source.source_id in declared_source_ids
+                source
+                for source in inventory.sources
+                if source.source_id in declared_source_ids
             ]
         elif declared_categories:
             scoped_sources = [
@@ -1786,7 +1837,8 @@ def _normalize_exact_source_refs(
     if not isinstance(raw_references, list) or len(raw_references) > 16:
         raise ValueError("invalid_exact_source_references")
     references = [
-        ExactSourceReference.model_validate(item).model_dump(mode="json") for item in raw_references
+        ExactSourceReference.model_validate(item).model_dump(mode="json")
+        for item in raw_references
     ]
     source_refs = [item["source_ref"] for item in references]
     if len(set(source_refs)) != len(source_refs):
@@ -1917,7 +1969,9 @@ def _manifest_id(
                     "context_mode": item.get("context_mode"),
                     "outcome": item.get("outcome"),
                     "query_id": item.get("query_id"),
-                    "returned_reference_count": item.get("returned_reference_count"),
+                    "returned_reference_count": item.get(
+                        "returned_reference_count"
+                    ),
                 }
                 for item in (expansion_attempts or [])
             ],
@@ -2243,7 +2297,10 @@ def _validate_aggregate_advisory_inventory(
     advisory: EvidenceInterpreterOutput,
     source_list: DsaSourceListResponse,
 ) -> None:
-    if advisory.operation_hint != "aggregate" or advisory.aggregate_field_name is None:
+    if (
+        advisory.operation_hint != "aggregate"
+        or advisory.aggregate_field_name is None
+    ):
         return
     sources_by_id = {source.source_id: source for source in source_list.sources}
     for source_id in advisory.candidate_source_ids:
@@ -2257,7 +2314,10 @@ def _validate_aggregate_advisory_inventory(
 
 
 def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
-    if source_list.inventory_scope is None or source_list.inventory_status is None:
+    if (
+        source_list.inventory_scope is None
+        or source_list.inventory_status is None
+    ):
         return "unknown"
     return {
         "complete": "complete_for_declared_scope",
@@ -2285,15 +2345,31 @@ def _declared_source_universe(
     categories = set(source_categories)
     if exact_source_refs:
         referenced_ids = {item["source_id"] for item in exact_source_refs}
-        sources = [source for source in source_list.sources if source.source_id in referenced_ids]
+        sources = [
+            source
+            for source in source_list.sources
+            if source.source_id in referenced_ids
+        ]
         if categories:
-            sources = [source for source in sources if set(source.domain_tags) & categories]
+            sources = [
+                source
+                for source in sources
+                if set(source.domain_tags) & categories
+            ]
         return sources
     if source_ids:
         declared_ids = set(source_ids)
-        return [source for source in source_list.sources if source.source_id in declared_ids]
+        return [
+            source
+            for source in source_list.sources
+            if source.source_id in declared_ids
+        ]
     if categories:
-        return [source for source in source_list.sources if set(source.domain_tags) & categories]
+        return [
+            source
+            for source in source_list.sources
+            if set(source.domain_tags) & categories
+        ]
     return list(source_list.sources)
 
 
@@ -2306,12 +2382,20 @@ def _resolve_declared_scope(
 ) -> tuple[dict[str, Any], bool]:
     config = external_context if isinstance(external_context, dict) else {}
     source_ids = sorted(
-        {item for item in config.get("source_ids", []) if isinstance(item, str) and item}
+        {
+            item
+            for item in config.get("source_ids", [])
+            if isinstance(item, str) and item
+        }
     )
     if not source_ids and not exact_source_refs and natural_source_ids is not None:
         source_ids = list(natural_source_ids)
     source_categories = sorted(
-        {item for item in config.get("domain_tags", []) if isinstance(item, str) and item}
+        {
+            item
+            for item in config.get("domain_tags", [])
+            if isinstance(item, str) and item
+        }
     )
     unresolved_scope = {
         "source_ids": source_ids,
@@ -2331,7 +2415,9 @@ def _resolve_declared_scope(
     )
     configured_ids = {source.source_id for source in source_list.sources}
     explicitly_declared_ids = (
-        {item["source_id"] for item in exact_source_refs} if exact_source_refs else set(source_ids)
+        {item["source_id"] for item in exact_source_refs}
+        if exact_source_refs
+        else set(source_ids)
     )
     declared_sources_complete = not explicitly_declared_ids or (
         explicitly_declared_ids <= configured_ids
@@ -2356,7 +2442,9 @@ def _resolve_declared_scope(
         matching_ids = {source.source_id for source in universe}
         if not matching_ids:
             return unresolved_scope, False
-        if exact_source_refs and matching_ids != {item["source_id"] for item in exact_source_refs}:
+        if exact_source_refs and matching_ids != {
+            item["source_id"] for item in exact_source_refs
+        }:
             return unresolved_scope, False
         unresolved_scope["source_ids"] = sorted(matching_ids)
 
@@ -2367,10 +2455,16 @@ def _resolve_declared_scope(
             resolved_scope[declared_field] = requested_values[dimension]
             continue
         values = [
-            getattr(source.scope_refs, dimension) if source.scope_refs is not None else None
+            getattr(source.scope_refs, dimension)
+            if source.scope_refs is not None
+            else None
             for source in universe
         ]
-        if universe and declared_sources_complete and all(value is not None for value in values):
+        if (
+            universe
+            and declared_sources_complete
+            and all(value is not None for value in values)
+        ):
             distinct_values = set(values)
             if len(distinct_values) == 1:
                 resolved_scope[declared_field] = values[0]
@@ -2463,9 +2557,15 @@ def deterministic_clarification_target(
         and evaluation.effective_outcome in {"missing", "unknown"}
     }
     scope = state.declared_scope or {}
-    if "exact_authoritative_fetch" in uncertain_material and not scope.get("exact_source_refs"):
+    if (
+        "exact_authoritative_fetch" in uncertain_material
+        and not scope.get("exact_source_refs")
+    ):
         return "exact_reference"
-    if "historical_scope" in uncertain_material and scope.get("time_scope_ref") is None:
+    if (
+        "historical_scope" in uncertain_material
+        and scope.get("time_scope_ref") is None
+    ):
         return "time_scope"
     scope_kinds = {
         "authoritative_inventory",
@@ -2480,7 +2580,8 @@ def deterministic_clarification_target(
         "cross_source_comparison",
     }
     if uncertain_material & scope_kinds and not any(
-        scope.get(field) for field in ("source_ids", "source_categories", "exact_source_refs")
+        scope.get(field)
+        for field in ("source_ids", "source_categories", "exact_source_refs")
     ):
         return "source_scope"
     return None
@@ -2503,7 +2604,9 @@ def _safe_exact_fetch_candidate(
     ):
         return None
     eligible = set(state.plan.eligible_source_ids)
-    inventory = {source["source_id"]: source for source in _adapt_inventory(state.inventory)}
+    inventory = {
+        source["source_id"]: source for source in _adapt_inventory(state.inventory)
+    }
     candidates: list[dict[str, str]] = []
     for item in context_pack.get("items") or []:
         if not isinstance(item, dict):
@@ -2656,7 +2759,9 @@ async def select_evidence_next_step(
             ],
             current_premise=current_premise.model_dump(mode="json"),
             proposed_acquisition_premise=(
-                proposal.premise.model_dump(mode="json") if proposal is not None else None
+                proposal.premise.model_dump(mode="json")
+                if proposal is not None
+                else None
             ),
             clarification_target=clarification_target,
         )
@@ -2669,11 +2774,14 @@ async def select_evidence_next_step(
             or result.acquisition_manifest_id != state.manifest_id
             or result.task_shape != state.plan.task_shape
             or result.sufficiency_status != state.sufficiency.sufficiency_status
-            or result.current_premise_digest != _acquisition_premise_digest(current_premise)
+            or result.current_premise_digest
+            != _acquisition_premise_digest(current_premise)
         ):
             raise ValueError("next_step_association_mismatch")
         proposed_digest = (
-            _acquisition_premise_digest(proposal.premise) if proposal is not None else None
+            _acquisition_premise_digest(proposal.premise)
+            if proposal is not None
+            else None
         )
         if result.proposed_premise_digest != proposed_digest:
             raise ValueError("next_step_proposed_premise_mismatch")
@@ -2685,11 +2793,15 @@ async def select_evidence_next_step(
         expected_unresolved = sorted(
             evaluation.requirement_id
             for evaluation in state.sufficiency.evaluated_requirements
-            if evaluation.criticality == "material" and evaluation.effective_outcome != "satisfied"
+            if evaluation.criticality == "material"
+            and evaluation.effective_outcome != "satisfied"
         )
         if result.unresolved_material_requirement_ids != expected_unresolved:
             raise ValueError("next_step_requirement_mismatch")
-        if result.selected_next_step == "perform_additional_acquisition" and proposal is None:
+        if (
+            result.selected_next_step == "perform_additional_acquisition"
+            and proposal is None
+        ):
             raise ValueError("next_step_proposal_missing")
         state.next_step = result
         state.next_step_history = [
@@ -2727,7 +2839,8 @@ def retain_initial_attempt_summary(
 ) -> None:
     items = (
         context_pack.get("items")
-        if isinstance(context_pack, dict) and isinstance(context_pack.get("items"), list)
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("items"), list)
         else []
     )
     state.initial_attempt_summary = {
@@ -2736,7 +2849,9 @@ def retain_initial_attempt_summary(
             if state.plan and state.plan.selected_strategies
             else None
         ),
-        "sufficiency_status": (state.sufficiency.sufficiency_status if state.sufficiency else None),
+        "sufficiency_status": (
+            state.sufficiency.sufficiency_status if state.sufficiency else None
+        ),
         "result_count": len(items),
         "retained_reference_count": (
             len(retained_source_refs) if retained_source_refs is not None else None
@@ -2754,7 +2869,8 @@ def promote_exact_fetch_proposal(
     if state.next_step is None or (
         state.next_step.selected_next_step != "perform_additional_acquisition"
         or state.next_step.reacquisition_guard != "changed_premise_allowed"
-        or state.next_step.proposed_premise_digest != _acquisition_premise_digest(proposal.premise)
+        or state.next_step.proposed_premise_digest
+        != _acquisition_premise_digest(proposal.premise)
     ):
         raise ValueError("additional_acquisition_not_authorized")
     state.additional_acquisition_count = 1
@@ -2808,8 +2924,12 @@ def _validate_supported_plan(state: EvidenceAcquisitionState) -> bool:
             return False
         if not authoritative_sources.issubset(eligible_sources):
             return False
-        exact_authoritative_declared = "exact_authoritative_fetch" in requirement_kinds
-        if exact_authoritative_declared != bool(referenced_sources & authoritative_sources):
+        exact_authoritative_declared = (
+            "exact_authoritative_fetch" in requirement_kinds
+        )
+        if exact_authoritative_declared != bool(
+            referenced_sources & authoritative_sources
+        ):
             return False
         return True
     return (
@@ -2915,13 +3035,17 @@ async def begin_evidence_acquisition(
         shape_response = ShapeResponse.model_validate(shape_raw)
         _validate_scope_echo(shape_response, scope)
         result = shape_response.result
-        expected_digest = f"sha256:{hashlib.sha256(result.question_anchor.encode()).hexdigest()}"
+        expected_digest = (
+            f"sha256:{hashlib.sha256(result.question_anchor.encode()).hexdigest()}"
+        )
         if result.question_anchor_digest != expected_digest:
             raise ValueError("shape_anchor_digest_mismatch")
         if source_discovery is not None:
             if result.source_match is None:
                 raise ValueError("source_match_missing")
-            supplied_source_ids = {source["source_id"] for source in source_discovery["sources"]}
+            supplied_source_ids = {
+                source["source_id"] for source in source_discovery["sources"]
+            }
             returned_source_ids = {
                 *result.source_match.matched_source_ids,
                 *result.source_match.probe_source_ids,
@@ -2972,14 +3096,20 @@ async def begin_evidence_acquisition(
                 source_list=state.inventory,
             )
             advisory = EvidenceInterpreterOutput.model_validate(advisory_raw)
-            inventory_source_ids = {source.source_id for source in state.inventory.sources}
+            inventory_source_ids = {
+                source.source_id for source in state.inventory.sources
+            }
             if not set(advisory.candidate_source_ids).issubset(inventory_source_ids):
                 raise ValueError("semantic_candidate_source_not_in_inventory")
             _validate_aggregate_advisory_inventory(advisory, state.inventory)
             advisory_payload = advisory.model_dump(exclude_none=True)
-            advisory_payload["candidate_source_ids"] = sorted(advisory.candidate_source_ids)
+            advisory_payload["candidate_source_ids"] = sorted(
+                advisory.candidate_source_ids
+            )
         except SemanticInterpreterFailure as exc:
-            state.semantic_interpreter.update({"status": "failed", "reason": exc.reason})
+            state.semantic_interpreter.update(
+                {"status": "failed", "reason": exc.reason}
+            )
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
                 state.forced_answer = AMBIGUOUS_ANSWER
@@ -2991,7 +3121,9 @@ async def begin_evidence_acquisition(
                 )
                 return state
         except (ValidationError, ValueError, TypeError):
-            state.semantic_interpreter.update({"status": "failed", "reason": "malformed_response"})
+            state.semantic_interpreter.update(
+                {"status": "failed", "reason": "malformed_response"}
+            )
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
                 state.forced_answer = AMBIGUOUS_ANSWER
@@ -3027,7 +3159,11 @@ async def begin_evidence_acquisition(
                 return state
 
     if state.shape.derivation_status == "not_applicable":
-        state.status = "not_applicable_exact_request" if exact_source_refs else "not_applicable"
+        state.status = (
+            "not_applicable_exact_request"
+            if exact_source_refs
+            else "not_applicable"
+        )
         state.follow_existing_path = not exact_source_refs
         state.forced_answer = UNSUPPORTED_ANSWER if exact_source_refs else None
         state.manifest_id = _manifest_id(
@@ -3138,7 +3274,11 @@ async def begin_evidence_acquisition(
                 include_content_fields=state.shape.task_shape == "aggregate",
             ),
             **(
-                {"aggregate_spec": state.shape.aggregate_spec.model_dump(mode="json")}
+                {
+                    "aggregate_spec": state.shape.aggregate_spec.model_dump(
+                        mode="json"
+                    )
+                }
                 if state.shape.aggregate_spec is not None
                 else {}
             ),
@@ -3147,7 +3287,8 @@ async def begin_evidence_acquisition(
         _validate_scope_echo(plan_response, scope)
         if (
             plan_response.result.question_anchor != state.shape.question_anchor
-            or plan_response.result.question_anchor_digest != state.shape.question_anchor_digest
+            or plan_response.result.question_anchor_digest
+            != state.shape.question_anchor_digest
             or plan_response.result.task_shape != state.shape.task_shape
         ):
             raise ValueError("plan_shape_mismatch")
@@ -3234,7 +3375,9 @@ def validate_context_pack_response(
             for item in validated.diagnostics.source_diagnostics
         ):
             raise ValueError("source_diagnostic_not_considered")
-        if not set(validated.diagnostics.candidate_counts_by_source).issubset(selected_sources):
+        if not set(validated.diagnostics.candidate_counts_by_source).issubset(
+            selected_sources
+        ):
             raise ValueError("candidate_count_source_not_selected")
     normalized = validated.model_dump(mode="json")
     if not preserve_available_context:
@@ -3296,7 +3439,10 @@ def validate_context_response(
     expected_source_id: str,
 ) -> DsaContextResponse:
     validated = DsaContextResponse.model_validate(response)
-    if any(item.source_id != expected_source_id for item in validated.results):
+    if any(
+        item.source_id != expected_source_id
+        for item in validated.results
+    ):
         raise ValueError("context_source_id_mismatch")
     return validated
 
@@ -3325,25 +3471,6 @@ def validate_configured_worksheet_response(
     ):
         return validated, "filtered"
     return validated, "satisfied"
-
-
-def validate_aggregate_seed_response(
-    response: dict[str, Any],
-    *,
-    expected_query: str,
-    expected_source_id: str,
-) -> dict[str, Any]:
-    normalized = validate_context_pack_response(
-        response,
-        expected_query=expected_query,
-        eligible_source_ids=[expected_source_id],
-        preserve_available_context=False,
-    )
-    if len(normalized["items"]) > 1:
-        raise ValueError("aggregate_seed_result_count_invalid")
-    if any(item.get("source_id") != expected_source_id for item in normalized["items"]):
-        raise ValueError("aggregate_seed_source_mismatch")
-    return normalized
 
 
 def validate_structured_field_values_response(
@@ -3462,7 +3589,7 @@ def compute_aggregate_result(
         )
     try:
         with localcontext() as decimal_context:
-            decimal_context.prec = 160
+            decimal_context.prec = 256
             decimal_context.rounding = ROUND_HALF_EVEN
             values = [Decimal(value) for value in non_null_values]
             total = sum(values, Decimal(0))
@@ -3525,7 +3652,6 @@ def _aggregate_trace(
     *,
     base: dict[str, Any],
     outcome: AggregateExecutionOutcome,
-    seed_call_count: int,
     context_call_count: int,
     record_count: int = 0,
     non_empty_value_count: int = 0,
@@ -3536,8 +3662,8 @@ def _aggregate_trace(
     return {
         **base,
         "called": True,
-        "call_count": seed_call_count + context_call_count,
-        "context_pack_call_count": seed_call_count,
+        "call_count": context_call_count,
+        "context_pack_call_count": 0,
         "context_expansion_call_count": context_call_count,
         "status": "included" if outcome == "satisfied" else "empty",
         "reason": "aggregate_acquisition_completed",
@@ -3549,7 +3675,6 @@ def _aggregate_trace(
         "aggregate_execution": {
             "called": True,
             "outcome": outcome,
-            "seed_call_count": seed_call_count,
             "structured_context_call_count": context_call_count,
             "record_count": record_count,
             "non_empty_value_count": non_empty_value_count,
@@ -3564,7 +3689,6 @@ async def execute_aggregate_values(
     *,
     state: EvidenceAcquisitionState,
     dsa: Any,
-    seed_context_pack: dict[str, Any] | None,
     dsa_trace: dict[str, Any],
 ) -> tuple[None, dict[str, Any]]:
     if (
@@ -3575,7 +3699,6 @@ async def execute_aggregate_values(
         state.aggregate_execution = {
             "called": False,
             "outcome": "unsupported",
-            "seed_call_count": 0,
             "structured_context_call_count": 0,
             "record_count": 0,
             "non_empty_value_count": 0,
@@ -3586,110 +3709,19 @@ async def execute_aggregate_values(
         return None, _aggregate_trace(
             base=dsa_trace,
             outcome="unsupported",
-            seed_call_count=0,
             context_call_count=0,
             error_code="unsupported_aggregate_plan",
         )
 
     source_id = state.plan.eligible_source_ids[0]
     spec = state.plan.aggregate_spec
-    seed_call_count = int(dsa_trace.get("called") is True)
-    context_call_count = 0
+    context_call_count = 1
     outcome: AggregateExecutionOutcome
     error_code: str | None = None
-    if seed_context_pack is None:
-        outcome = (
-            "truncated"
-            if dsa_trace.get("budget_truncated")
-            else "filtered"
-            if dsa_trace.get("error_code") == "malformed_response"
-            else "failed"
-            if dsa_trace.get("status") == "error"
-            else "unknown"
-        )
-        error_code = (
-            "budget_truncated"
-            if outcome == "truncated"
-            else "malformed_response"
-            if outcome == "filtered"
-            else "dependency_failure"
-            if outcome == "failed"
-            else None
-        )
-        state.aggregate_execution = {
-            "called": True,
-            "outcome": outcome,
-            "seed_call_count": seed_call_count,
-            "structured_context_call_count": 0,
-            "record_count": 0,
-            "non_empty_value_count": 0,
-            "null_count": 0,
-            "numeric_value_count": 0,
-            "invalid_numeric_count": 0,
-            "numeric_validation_failed": False,
-        }
-        return None, _aggregate_trace(
-            base=dsa_trace,
-            outcome=outcome,
-            seed_call_count=seed_call_count,
-            context_call_count=0,
-            error_code=error_code,
-        )
-
-    seed_items = seed_context_pack.get("items")
-    if not isinstance(seed_items, list) or not seed_items:
-        outcome = "unknown"
-        state.aggregate_execution = {
-            "called": True,
-            "outcome": outcome,
-            "seed_call_count": seed_call_count,
-            "structured_context_call_count": 0,
-            "record_count": 0,
-            "non_empty_value_count": 0,
-            "null_count": 0,
-            "numeric_value_count": 0,
-            "invalid_numeric_count": 0,
-            "numeric_validation_failed": False,
-        }
-        return None, _aggregate_trace(
-            base=dsa_trace,
-            outcome=outcome,
-            seed_call_count=seed_call_count,
-            context_call_count=0,
-        )
-    seed = seed_items[0]
-    seed_source_ref = seed.get("source_ref") if isinstance(seed, dict) else None
-    if (
-        not isinstance(seed, dict)
-        or seed.get("source_id") != source_id
-        or not isinstance(seed_source_ref, str)
-    ):
-        outcome = "filtered"
-        state.aggregate_execution = {
-            "called": True,
-            "outcome": outcome,
-            "seed_call_count": seed_call_count,
-            "structured_context_call_count": 0,
-            "record_count": 0,
-            "non_empty_value_count": 0,
-            "null_count": 0,
-            "numeric_value_count": 0,
-            "invalid_numeric_count": 0,
-            "numeric_validation_failed": False,
-        }
-        return None, _aggregate_trace(
-            base=dsa_trace,
-            outcome=outcome,
-            seed_call_count=seed_call_count,
-            context_call_count=0,
-            error_code="malformed_response",
-        )
-
-    context_call_count = 1
     try:
         response_raw = await dsa.context_source(
             request_id=state.request_id,
-            source_ref=seed_source_ref,
+            source_id=source_id,
             context_mode=CONFIGURED_FIELD_VALUES_CONTEXT_MODE,
             field_name=spec.field_name,
             budget=dict(AGGREGATE_CONTEXT_BUDGET),
@@ -3783,7 +3815,6 @@ async def execute_aggregate_values(
     state.aggregate_execution = {
         "called": True,
         "outcome": outcome,
-        "seed_call_count": seed_call_count,
         "structured_context_call_count": context_call_count,
         "record_count": record_count,
         "non_empty_value_count": non_empty_value_count,
@@ -3807,7 +3838,6 @@ async def execute_aggregate_values(
     return None, _aggregate_trace(
         base=dsa_trace,
         outcome=outcome,
-        seed_call_count=seed_call_count,
         context_call_count=context_call_count,
         record_count=record_count,
         non_empty_value_count=non_empty_value_count,
@@ -3862,7 +3892,9 @@ def _hybrid_bundle_id(
                     "context_mode": item.get("context_mode"),
                     "outcome": item.get("outcome"),
                     "query_id": item.get("query_id"),
-                    "returned_reference_count": item.get("returned_reference_count"),
+                    "returned_reference_count": item.get(
+                        "returned_reference_count"
+                    ),
                 }
                 for item in attempts
             ],
@@ -3894,11 +3926,16 @@ def _bounded_exhaustive_bundle_id(
             "context_mode": attempt.get("context_mode"),
             "outcome": attempt.get("outcome"),
             "query_id": attempt.get("query_id"),
-            "returned_reference_count": attempt.get("returned_reference_count"),
+            "returned_reference_count": attempt.get(
+                "returned_reference_count"
+            ),
         },
     }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
-    return "evidence_exhaustive_bundle_" f"{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
+    return (
+        "evidence_exhaustive_bundle_"
+        f"{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
+    )
 
 
 def _prompt_safe_context_item(item: DsaContextItem) -> dict[str, Any]:
@@ -3910,7 +3947,9 @@ def _prompt_safe_context_item(item: DsaContextItem) -> dict[str, Any]:
         "source_ref": item.source_ref,
         "retrieved_at": item.retrieved_at.isoformat(),
         "source_modified_at": (
-            item.source_modified_at.isoformat() if item.source_modified_at is not None else None
+            item.source_modified_at.isoformat()
+            if item.source_modified_at is not None
+            else None
         ),
         "title": item.title,
         "content_type": item.content_type,
@@ -3947,7 +3986,11 @@ async def execute_bounded_exhaustive_review(
     targeted_context_pack: dict[str, Any] | None,
     dsa_trace: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not state.supported_bounded_exhaustive_path or state.plan is None or state.shape is None:
+    if (
+        not state.supported_bounded_exhaustive_path
+        or state.plan is None
+        or state.shape is None
+    ):
         return {}, {
             **dsa_trace,
             "status": "error",
@@ -3957,7 +4000,11 @@ async def execute_bounded_exhaustive_review(
 
     source_id = state.plan.eligible_source_ids[0]
     targeted_items = (
-        [item for item in targeted_context_pack.get("items", []) if isinstance(item, dict)]
+        [
+            item
+            for item in targeted_context_pack.get("items", [])
+            if isinstance(item, dict)
+        ]
         if isinstance(targeted_context_pack, dict)
         else []
     )
@@ -3968,7 +4015,8 @@ async def execute_bounded_exhaustive_review(
             continue
         if any(
             isinstance(descriptor, dict)
-            and descriptor.get("context_mode") == CONFIGURED_WORKSHEET_CONTEXT_MODE
+            and descriptor.get("context_mode")
+            == CONFIGURED_WORKSHEET_CONTEXT_MODE
             for descriptor in descriptors
         ):
             target = item
@@ -4004,9 +4052,13 @@ async def execute_bounded_exhaustive_review(
 
     if targeted_context_pack is None:
         attempt["outcome"] = (
-            "filtered" if dsa_trace.get("error_code") == "malformed_response" else "failed"
+            "filtered"
+            if dsa_trace.get("error_code") == "malformed_response"
+            else "failed"
         )
-    elif not isinstance(target, dict) or not isinstance(attempt["seed_source_ref"], str):
+    elif not isinstance(target, dict) or not isinstance(
+        attempt["seed_source_ref"], str
+    ):
         attempt["outcome"] = "unsupported"
     else:
         context_call_count = 1
@@ -4030,11 +4082,15 @@ async def execute_bounded_exhaustive_review(
             expansion_estimated_bytes = response.budget.estimated_bytes
             expansion_truncated = outcome == "truncated"
             if outcome == "satisfied":
-                safe_items = [_prompt_safe_context_item(response.results[0])]
+                safe_items = [
+                    _prompt_safe_context_item(response.results[0])
+                ]
             elif outcome == "truncated":
                 aggregate_error_codes.add("budget_truncated")
             elif outcome == "failed":
-                aggregate_error_codes.update(error.code for error in response.errors)
+                aggregate_error_codes.update(
+                    error.code for error in response.errors
+                )
             elif outcome == "filtered":
                 aggregate_error_codes.add("malformed_response")
         except (ValueError, TypeError):
@@ -4083,7 +4139,9 @@ async def execute_bounded_exhaustive_review(
         "query": state.plan.question_anchor,
         "sources_used": sources_used,
         "items": safe_items,
-        "errors": [{"code": code} for code in sorted(aggregate_error_codes)],
+        "errors": [
+            {"code": code} for code in sorted(aggregate_error_codes)
+        ],
         "budget": {
             "max_results": 1,
             "returned_results": len(safe_items),
@@ -4140,11 +4198,13 @@ async def execute_bounded_exhaustive_review(
             or expansion_truncated
         ),
         "search_budget_truncated": bool(
-            dsa_trace.get("budget_truncated") or targeted_budget.get("truncated")
+            dsa_trace.get("budget_truncated")
+            or targeted_budget.get("truncated")
         ),
         "expansion_budget_truncated": expansion_truncated,
         "candidate_truncated": bool(
-            dsa_trace.get("candidate_truncated") or diagnostics.get("budget_truncated_candidates")
+            dsa_trace.get("candidate_truncated")
+            or diagnostics.get("budget_truncated_candidates")
         ),
     }
 
@@ -4156,7 +4216,11 @@ async def execute_hybrid_comparison(
     targeted_context_pack: dict[str, Any],
     dsa_trace: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    if not state.supported_hybrid_comparison_path or state.plan is None or state.shape is None:
+    if (
+        not state.supported_hybrid_comparison_path
+        or state.plan is None
+        or state.shape is None
+    ):
         return None, {
             **dsa_trace,
             "status": "error",
@@ -4165,7 +4229,9 @@ async def execute_hybrid_comparison(
         }
 
     targeted_items = [
-        item for item in targeted_context_pack.get("items", []) if isinstance(item, dict)
+        item
+        for item in targeted_context_pack.get("items", [])
+        if isinstance(item, dict)
     ]
     attempts: list[dict[str, Any]] = []
     expanded_items_by_source: dict[str, list[dict[str, Any]]] = {}
@@ -4182,19 +4248,26 @@ async def execute_hybrid_comparison(
     context_call_count = 0
     targeted_budget = targeted_context_pack.get("budget")
     aggregate_max_results = (
-        int(targeted_budget.get("max_results") or 0) if isinstance(targeted_budget, dict) else 0
+        int(targeted_budget.get("max_results") or 0)
+        if isinstance(targeted_budget, dict)
+        else 0
     )
     aggregate_estimated_bytes = (
-        int(targeted_budget.get("estimated_bytes") or 0) if isinstance(targeted_budget, dict) else 0
+        int(targeted_budget.get("estimated_bytes") or 0)
+        if isinstance(targeted_budget, dict)
+        else 0
     )
 
     for source_id in sorted(state.plan.eligible_source_ids):
-        source_items = [item for item in targeted_items if item.get("source_id") == source_id]
+        source_items = [
+            item for item in targeted_items if item.get("source_id") == source_id
+        ]
         target = next(
             (
                 item
                 for item in source_items
-                if isinstance(item.get("available_context"), list) and item["available_context"]
+                if isinstance(item.get("available_context"), list)
+                and item["available_context"]
             ),
             None,
         )
@@ -4215,7 +4288,9 @@ async def execute_hybrid_comparison(
                 else None
             ),
             "context_mode": (
-                descriptor.get("context_mode") if isinstance(descriptor, dict) else None
+                descriptor.get("context_mode")
+                if isinstance(descriptor, dict)
+                else None
             ),
             "outcome": "unsupported",
             "query_id": None,
@@ -4265,7 +4340,8 @@ async def execute_hybrid_comparison(
                 attempt["outcome"] = "satisfied"
             if attempt["outcome"] in {"satisfied", "truncated"}:
                 expanded_items_by_source[source_id] = [
-                    _prompt_safe_context_item(item) for item in response.results
+                    _prompt_safe_context_item(item)
+                    for item in response.results
                 ]
         except ValueError:
             attempt["outcome"] = "filtered"
@@ -4314,7 +4390,11 @@ async def execute_hybrid_comparison(
     else:
         status = "empty"
     sources_used = sorted(
-        {item["source_id"] for item in combined_items if isinstance(item.get("source_id"), str)}
+        {
+            item["source_id"]
+            for item in combined_items
+            if isinstance(item.get("source_id"), str)
+        }
     )
     query_id = targeted_context_pack.get("query_id")
     bundle = {
@@ -4328,12 +4408,16 @@ async def execute_hybrid_comparison(
         "query": state.plan.question_anchor,
         "sources_used": sources_used,
         "items": combined_items,
-        "errors": [{"code": code} for code in sorted(aggregate_error_codes)],
+        "errors": [
+            {"code": code} for code in sorted(aggregate_error_codes)
+        ],
         "budget": {
             "max_results": aggregate_max_results,
             "returned_results": raw_total_item_count,
             "estimated_bytes": aggregate_estimated_bytes,
-            "truncated": bool(dsa_trace.get("budget_truncated") or expansion_truncated),
+            "truncated": bool(
+                dsa_trace.get("budget_truncated") or expansion_truncated
+            ),
         },
         "diagnostics": targeted_context_pack.get("diagnostics"),
         "raw_item_count": raw_total_item_count,
@@ -4359,7 +4443,9 @@ async def execute_hybrid_comparison(
         "raw_item_count": raw_total_item_count,
         "final_combined_item_count": len(combined_items),
         "expansion_attempt_counts": outcome_counts,
-        "budget_truncated": bool(dsa_trace.get("budget_truncated") or expansion_truncated),
+        "budget_truncated": bool(
+            dsa_trace.get("budget_truncated") or expansion_truncated
+        ),
         "search_budget_truncated": bool(dsa_trace.get("budget_truncated")),
         "expansion_budget_truncated": expansion_truncated,
         "candidate_truncated": bool(dsa_trace.get("candidate_truncated")),
@@ -4443,7 +4529,8 @@ async def execute_exact_fetches(
     considered_sources = sorted({item["source_id"] for item in attempts})
     successful_counts = {
         source_id: sum(
-            item["source_id"] == source_id and item["outcome"] == "satisfied" for item in attempts
+            item["source_id"] == source_id and item["outcome"] == "satisfied"
+            for item in attempts
         )
         for source_id in successful_sources
     }
@@ -4460,7 +4547,9 @@ async def execute_exact_fetches(
         "budget": {
             "max_results": len(attempts),
             "returned_results": len(safe_items),
-            "estimated_bytes": sum(len(item["text"].encode("utf-8")) for item in safe_items),
+            "estimated_bytes": sum(
+                len(item["text"].encode("utf-8")) for item in safe_items
+            ),
             "truncated": any(item["outcome"] == "truncated" for item in attempts),
         },
         "diagnostics": {
@@ -4470,7 +4559,9 @@ async def execute_exact_fetches(
             "source_diagnostics": [],
             "ranking_mode": "declared_exact_reference_order",
             "candidate_counts_by_source": successful_counts,
-            "budget_truncated_candidates": any(item["outcome"] == "truncated" for item in attempts),
+            "budget_truncated_candidates": any(
+                item["outcome"] == "truncated" for item in attempts
+            ),
         },
         "raw_item_count": len(safe_items),
     }
@@ -4569,7 +4660,11 @@ def _hybrid_non_satisfied_outcome(
     dsa_trace: dict[str, Any],
 ) -> str:
     if not attempts and dsa_trace.get("status") == "error":
-        return "filtered" if dsa_trace.get("error_code") == "malformed_response" else "failed"
+        return (
+            "filtered"
+            if dsa_trace.get("error_code") == "malformed_response"
+            else "failed"
+        )
     outcomes = {str(item.get("outcome")) for item in attempts}
     for outcome in (
         "truncated",
@@ -4594,7 +4689,8 @@ def _hybrid_fact_outcomes(
     planned_sources = set(plan.eligible_source_ids)
     items = (
         context_pack.get("items")
-        if isinstance(context_pack, dict) and isinstance(context_pack.get("items"), list)
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("items"), list)
         else []
     )
     returned_refs: set[str] = set()
@@ -4617,25 +4713,22 @@ def _hybrid_fact_outcomes(
         if isinstance(item.get("source_id"), str)
     }
     all_expansions_satisfied = bool(planned_sources) and all(
-        attempts_by_source.get(source_id) == "satisfied" for source_id in planned_sources
+        attempts_by_source.get(source_id) == "satisfied"
+        for source_id in planned_sources
     )
     material_truncated = bool(
-        dsa_trace.get("budget_truncated") or dsa_trace.get("candidate_truncated")
+        dsa_trace.get("budget_truncated")
+        or dsa_trace.get("candidate_truncated")
     )
     base_failure = _hybrid_non_satisfied_outcome(attempts, dsa_trace)
     if retained_source_refs is None:
         return (
             base_failure if not all_expansions_satisfied else "unknown",
-            base_failure
-            if len(
-                {
-                    source_id
-                    for source_id, outcome in attempts_by_source.items()
-                    if outcome == "satisfied"
-                }
-            )
-            < 2
-            else "unknown",
+            base_failure if len({
+                source_id
+                for source_id, outcome in attempts_by_source.items()
+                if outcome == "satisfied"
+            }) < 2 else "unknown",
             "unknown",
         )
     if retained_source_refs - returned_refs:
@@ -4662,7 +4755,9 @@ def _hybrid_fact_outcomes(
         coverage_outcome = "satisfied"
 
     successful_sources = {
-        source_id for source_id, outcome in attempts_by_source.items() if outcome == "satisfied"
+        source_id
+        for source_id, outcome in attempts_by_source.items()
+        if outcome == "satisfied"
     }
     if material_truncated:
         comparison_outcome = "truncated"
@@ -4688,7 +4783,11 @@ def _bounded_exhaustive_fact_outcomes(
     context_pack: dict[str, Any] | None,
     retained_source_refs: set[str] | None,
 ) -> dict[str, str]:
-    attempt_outcome = str(attempts[0].get("outcome")) if len(attempts) == 1 else "unknown"
+    attempt_outcome = (
+        str(attempts[0].get("outcome"))
+        if len(attempts) == 1
+        else "unknown"
+    )
     if attempt_outcome not in {
         "satisfied",
         "unknown",
@@ -4709,10 +4808,14 @@ def _bounded_exhaustive_fact_outcomes(
         "complete_scope_coverage": attempt_outcome,
         "context_delivery": delivery_outcome,
         "contradiction_search": (
-            delivery_outcome if attempt_outcome == "satisfied" else attempt_outcome
+            delivery_outcome
+            if attempt_outcome == "satisfied"
+            else attempt_outcome
         ),
         "no_material_truncation": (
-            delivery_outcome if attempt_outcome == "satisfied" else attempt_outcome
+            delivery_outcome
+            if attempt_outcome == "satisfied"
+            else attempt_outcome
         ),
     }
 
@@ -4750,9 +4853,10 @@ def _build_acquisition_facts(
     error_code = dsa_trace.get("error_code")
     usable_count = len(context_pack.get("items", [])) if isinstance(context_pack, dict) else 0
     exact_path = plan.selected_strategies == ["exact_fetch"]
-    hybrid_path = plan.task_shape == "cross_source_comparison" and plan.selected_strategies == [
-        "hybrid"
-    ]
+    hybrid_path = (
+        plan.task_shape == "cross_source_comparison"
+        and plan.selected_strategies == ["hybrid"]
+    )
     if exact_path:
         delivery_outcome, _, _ = _exact_delivery_reference_state(
             exact_source_refs=exact_source_refs or [],
@@ -4845,7 +4949,9 @@ def _build_acquisition_facts(
             requirement.requirement_kind == "selected_source_coverage"
             and requirement.criticality == "optional"
         ):
-            outcome = _optional_selected_source_coverage_outcome(plan.limitation_codes)
+            outcome = _optional_selected_source_coverage_outcome(
+                plan.limitation_codes
+            )
         else:
             outcome = "unknown"
         facts.append(
@@ -4877,7 +4983,8 @@ async def evaluate_acquisition_sufficiency(
         return
     diagnostics = (
         context_pack.get("diagnostics")
-        if isinstance(context_pack, dict) and isinstance(context_pack.get("diagnostics"), dict)
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("diagnostics"), dict)
         else {}
     )
     scope = _scope(
@@ -4908,7 +5015,8 @@ async def evaluate_acquisition_sufficiency(
         declared_scope=state.declared_scope,
         query_id=(
             context_pack.get("query_id")
-            if isinstance(context_pack, dict) and isinstance(context_pack.get("query_id"), str)
+            if isinstance(context_pack, dict)
+            and isinstance(context_pack.get("query_id"), str)
             else None
         ),
         considered_source_ids=diagnostics.get("considered_source_ids", []),
@@ -5027,9 +5135,12 @@ def _advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
         and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
         and state.next_step is not None
         and state.next_step.task_shape == "targeted_lookup"
-        and state.next_step.sufficiency_status == state.sufficiency.sufficiency_status
-        and state.next_step.selected_next_step == "withhold_unsupported_conclusion"
-        and state.next_step.conclusion_disposition == "requested_conclusion_withheld"
+        and state.next_step.sufficiency_status
+        == state.sufficiency.sufficiency_status
+        and state.next_step.selected_next_step
+        == "withhold_unsupported_conclusion"
+        and state.next_step.conclusion_disposition
+        == "requested_conclusion_withheld"
         and state.next_step.provider_disposition == "allowed"
         and "unsupported_conclusion_withheld" in state.next_step.reason_codes
         and (
@@ -5038,12 +5149,14 @@ def _advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
                 and state.next_step.proposed_premise_digest is None
             )
             or (
-                state.next_step.reacquisition_guard == "unchanged_premise_blocked"
+                state.next_step.reacquisition_guard
+                == "unchanged_premise_blocked"
                 and state.next_step.proposed_premise_digest
                 == state.next_step.current_premise_digest
             )
             or (
-                state.next_step.reacquisition_guard == "premise_already_attempted"
+                state.next_step.reacquisition_guard
+                == "premise_already_attempted"
                 and state.next_step.proposed_premise_digest is not None
             )
         )
@@ -5103,12 +5216,16 @@ def grounded_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
             state.next_step.provider_disposition == "allowed"
             and (
                 (
-                    state.next_step.selected_next_step == "answer_within_declared_scope"
-                    and state.sufficiency.sufficiency_status == "sufficient_for_declared_scope"
+                    state.next_step.selected_next_step
+                    == "answer_within_declared_scope"
+                    and state.sufficiency.sufficiency_status
+                    == "sufficient_for_declared_scope"
                 )
                 or (
-                    state.next_step.selected_next_step == "provide_qualified_partial_answer"
-                    and state.sufficiency.sufficiency_status == "sufficient_with_limitations"
+                    state.next_step.selected_next_step
+                    == "provide_qualified_partial_answer"
+                    and state.sufficiency.sufficiency_status
+                    == "sufficient_with_limitations"
                 )
             )
         )
@@ -5159,10 +5276,10 @@ def enforce_final_answer(
             return _render_blocked_answer(state.sufficiency)
         if next_step.selected_next_step == "perform_additional_acquisition":
             return NEXT_STEP_DEPENDENCY_ANSWER
-    if state.sufficiency is not None and state.sufficiency.sufficiency_status in {
-        "insufficient",
-        "unknown",
-    }:
+    if (
+        state.sufficiency is not None
+        and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
+    ):
         return _render_blocked_answer(state.sufficiency)
     if state.forced_answer is not None:
         return state.forced_answer
@@ -5207,8 +5324,12 @@ def _has_bounded_substring(text: str, excerpt: str) -> tuple[bool, bool]:
     saw_unbounded_match = False
     while start >= 0:
         end = start + len(excerpt)
-        starts_inside_token = start > 0 and text[start - 1].isalnum() and excerpt[0].isalnum()
-        ends_inside_token = end < len(text) and text[end].isalnum() and excerpt[-1].isalnum()
+        starts_inside_token = (
+            start > 0 and text[start - 1].isalnum() and excerpt[0].isalnum()
+        )
+        ends_inside_token = (
+            end < len(text) and text[end].isalnum() and excerpt[-1].isalnum()
+        )
         if not starts_inside_token and not ends_inside_token:
             return True, saw_unbounded_match
         saw_unbounded_match = True
@@ -5269,7 +5390,9 @@ def validate_evidence_response_candidate(
         )
         if not matched:
             return _invalid_candidate(
-                "excerpt_token_boundary_invalid" if unbounded else "excerpt_not_extractive"
+                "excerpt_token_boundary_invalid"
+                if unbounded
+                else "excerpt_not_extractive"
             )
         validated.append(
             ValidatedEvidenceExcerpt(
@@ -5283,7 +5406,9 @@ def validate_evidence_response_candidate(
             validation_status="valid",
             conclusion_disposition=candidate.conclusion_disposition,
             validated_excerpt_count=len(validated),
-            validated_source_references=tuple(item.source_ref for item in validated),
+            validated_source_references=tuple(
+                item.source_ref for item in validated
+            ),
             failure_reason=None,
         ),
         tuple(validated),
@@ -5292,9 +5417,15 @@ def validate_evidence_response_candidate(
 
 _EVIDENCE_CONCLUSION_SENTENCES: dict[EvidenceConclusionDisposition, str] = {
     "supports": "The retained evidence supports the requested conclusion.",
-    "does_not_support": ("The retained evidence does not support the requested conclusion."),
-    "mixed": ("The retained evidence is mixed and does not establish a single conclusion."),
-    "descriptive": ("The retained evidence supports only the following bounded description."),
+    "does_not_support": (
+        "The retained evidence does not support the requested conclusion."
+    ),
+    "mixed": (
+        "The retained evidence is mixed and does not establish a single conclusion."
+    ),
+    "descriptive": (
+        "The retained evidence supports only the following bounded description."
+    ),
 }
 
 
@@ -5338,7 +5469,8 @@ def helpful_grounded_recovery_allowed(
         return False
 
     facts_by_id = {
-        item.get("requirement_id"): item.get("outcome") for item in state.acquisition_facts
+        item.get("requirement_id"): item.get("outcome")
+        for item in state.acquisition_facts
     }
     material_requirements = [
         requirement
@@ -5398,7 +5530,8 @@ def render_governed_evidence_answer(
         ):
             if (
                 state.sufficiency is not None
-                and state.sufficiency.sufficiency_status == "sufficient_with_limitations"
+                and state.sufficiency.sufficiency_status
+                == "sufficient_with_limitations"
             ):
                 return (
                     f"{HELPFUL_GROUNDED_RECOVERY_RESPONSE}\n\n"
@@ -5447,25 +5580,29 @@ def _render_requirement_outcome(
             "scope was unavailable"
         ),
         "unsupported": (
-            f"{description} was not established because the required acquisition " "was unsupported"
+            f"{description} was not established because the required acquisition "
+            "was unsupported"
         ),
         "failed": f"{description} was not established because acquisition failed",
         "excluded": (
-            f"{description} was not established because required evidence was " "excluded"
+            f"{description} was not established because required evidence was "
+            "excluded"
         ),
         "filtered": (
             f"{description} was not established because required evidence was "
             "filtered or omitted before reasoning"
         ),
         "truncated": (
-            f"{description} was not established because material evidence was " "truncated"
+            f"{description} was not established because material evidence was "
+            "truncated"
         ),
         "unresolved_contradiction": (
             f"{description} was not established because contradictory evidence "
             "remained unresolved"
         ),
         "unknown": (
-            f"{description} could not be established from the available " "acquisition facts"
+            f"{description} could not be established from the available "
+            "acquisition facts"
         ),
         "missing": (
             f"{description} could not be established because the required "
@@ -5487,10 +5624,16 @@ def _scoped_inventory_sources(
     source_ids = set(scope.get("source_ids") or [])
     categories = set(scope.get("source_categories") or [])
     if source_ids:
-        return [source for source in state.inventory.sources if source.source_id in source_ids]
+        return [
+            source
+            for source in state.inventory.sources
+            if source.source_id in source_ids
+        ]
     if categories:
         return [
-            source for source in state.inventory.sources if set(source.domain_tags) & categories
+            source
+            for source in state.inventory.sources
+            if set(source.domain_tags) & categories
         ]
     return list(state.inventory.sources)
 
@@ -5539,7 +5682,9 @@ def _render_limitation_disclosure(state: EvidenceAcquisitionState) -> str:
         if description:
             clauses.append(description)
 
-    source_availability_rendered = bool(plan_codes & _SOURCE_AVAILABILITY_LIMITATIONS)
+    source_availability_rendered = bool(
+        plan_codes & _SOURCE_AVAILABILITY_LIMITATIONS
+    )
     inventory_limitation_rendered = bool(
         plan_codes
         & {
@@ -5561,7 +5706,8 @@ def _render_limitation_disclosure(state: EvidenceAcquisitionState) -> str:
         if (
             (source_availability_rendered or inventory_limitation_rendered)
             and evaluation.requirement_kind == "selected_source_coverage"
-            and evaluation.effective_outcome in {"partial", "unavailable", "unknown"}
+            and evaluation.effective_outcome
+            in {"partial", "unavailable", "unknown"}
         ):
             continue
         rendered = _render_requirement_outcome(
@@ -5577,7 +5723,9 @@ def _render_limitation_disclosure(state: EvidenceAcquisitionState) -> str:
     bounded, omitted = _bounded_clauses(clauses)
     disclosure = f"Limitation: {_join_clauses(bounded)}."
     if omitted:
-        disclosure = f"{disclosure} Additional optional evidence limitations remained."
+        disclosure = (
+            f"{disclosure} Additional optional evidence limitations remained."
+        )
     return disclosure
 
 
@@ -5620,7 +5768,10 @@ def _render_blocked_answer(sufficiency: SufficiencyResult) -> str:
     )
     response = f"{lead} {_join_clauses(bounded)}."
     if omitted:
-        response = f"{response} Additional material evidence requirements were also " "unresolved."
+        response = (
+            f"{response} Additional material evidence requirements were also "
+            "unresolved."
+        )
     return f"{response} {_withholding_sentence(sufficiency.task_shape)}"
 
 
@@ -5635,7 +5786,8 @@ def _render_qualified_partial_answer(sufficiency: SufficiencyResult) -> str:
             )
             for evaluation in sufficiency.evaluated_requirements
             if evaluation.criticality == "material"
-            and evaluation.requirement_kind not in _ADMINISTRATIVE_REQUIREMENT_KINDS
+            and evaluation.requirement_kind
+            not in _ADMINISTRATIVE_REQUIREMENT_KINDS
             and evaluation.effective_outcome in {"satisfied", "partial"}
         }
     )
@@ -5660,7 +5812,9 @@ def _render_qualified_partial_answer(sufficiency: SufficiencyResult) -> str:
     supported_bounded, supported_omitted = _bounded_clauses(supported)
     unresolved_bounded, unresolved_omitted = _bounded_clauses(unresolved)
     supported_text = (
-        _join_clauses(supported_bounded) if supported_bounded else "some substantive evidence"
+        _join_clauses(supported_bounded)
+        if supported_bounded
+        else "some substantive evidence"
     )
     unresolved_text = (
         _join_clauses(unresolved_bounded)
@@ -5668,10 +5822,14 @@ def _render_qualified_partial_answer(sufficiency: SufficiencyResult) -> str:
         else "material evidence remains unresolved"
     )
     response = (
-        f"The available evidence establishes {supported_text}. However, " f"{unresolved_text}."
+        f"The available evidence establishes {supported_text}. However, "
+        f"{unresolved_text}."
     )
     if supported_omitted or unresolved_omitted:
-        response = f"{response} Additional evidence details remain outside this bounded " "summary."
+        response = (
+            f"{response} Additional evidence details remain outside this bounded "
+            "summary."
+        )
     return f"{response} {_withholding_sentence(sufficiency.task_shape)}"
 
 
@@ -5810,7 +5968,9 @@ def _source_summaries(
         if not isinstance(source_id, str):
             source_ref = item.get("source_ref")
             source_id = (
-                _source_id_from_reference(source_ref) if isinstance(source_ref, str) else None
+                _source_id_from_reference(source_ref)
+                if isinstance(source_ref, str)
+                else None
             )
         if isinstance(source_id, str):
             item_by_source[source_id] = item
@@ -5830,7 +5990,8 @@ def _source_summaries(
             (
                 candidate
                 for candidate in sorted(known_source_ids, key=len, reverse=True)
-                if reference.startswith(f"{candidate}:") or f":{candidate}:" in reference
+                if reference.startswith(f"{candidate}:")
+                or f":{candidate}:" in reference
             ),
             _source_id_from_reference(reference),
         )
@@ -5841,7 +6002,8 @@ def _source_summaries(
             (
                 candidate
                 for candidate in sorted(known_source_ids, key=len, reverse=True)
-                if reference.startswith(f"{candidate}:") or f":{candidate}:" in reference
+                if reference.startswith(f"{candidate}:")
+                or f":{candidate}:" in reference
             ),
             _source_id_from_reference(reference),
         )
@@ -5859,7 +6021,9 @@ def _source_summaries(
         display_name_value = (
             source.display_name if source is not None else result_item.get("source_name")
         )
-        connector_value = source.connector if source is not None else result_item.get("source_type")
+        connector_value = (
+            source.connector if source is not None else result_item.get("source_type")
+        )
         if connector_value is None:
             result_ref = result_item.get("source_ref")
             if isinstance(result_ref, str):
@@ -5895,7 +6059,9 @@ def _source_summaries(
                 "source_id": source_id,
                 "display_name": display_name,
                 "connector": connector,
-                "authority_role": (source.authority_role if source is not None else "unknown"),
+                "authority_role": (
+                    source.authority_role if source is not None else "unknown"
+                ),
                 "domain_tags": sorted(source.domain_tags) if source is not None else [],
                 "considered": source_id in considered_sources,
                 "selected": source_id in selected,
@@ -5926,11 +6092,13 @@ def build_manifest_trace(
     ordinary_without_content_acquisition = bool(
         state.status == "not_applicable"
         and state.follow_existing_path
-        and trace.get("status") in {"not_called", "inventory_only", "inventory_failure"}
+        and trace.get("status")
+        in {"not_called", "inventory_only", "inventory_failure"}
     )
     diagnostics = (
         context_pack.get("diagnostics")
-        if isinstance(context_pack, dict) and isinstance(context_pack.get("diagnostics"), dict)
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("diagnostics"), dict)
         else {}
     )
     items = (
@@ -5967,10 +6135,16 @@ def build_manifest_trace(
     retained_refs = sorted(retained_ref_set)
     omitted_refs = sorted(returned_ref_set - retained_ref_set)
     sources_used = sorted(
-        context_pack.get("sources_used", []) if isinstance(context_pack, dict) else []
+        context_pack.get("sources_used", [])
+        if isinstance(context_pack, dict)
+        else []
     )
-    selected_sources = sorted(diagnostics.get("selected_source_ids", []) or sources_used)
-    considered_sources = sorted(diagnostics.get("considered_source_ids", []) or selected_sources)
+    selected_sources = sorted(
+        diagnostics.get("selected_source_ids", []) or sources_used
+    )
+    considered_sources = sorted(
+        diagnostics.get("considered_source_ids", []) or selected_sources
+    )
     manifest_inventory = state.inventory
     manifest_declared_scope = state.declared_scope
     if ordinary_without_content_acquisition:
@@ -5998,7 +6172,8 @@ def build_manifest_trace(
         {
             str(item["source_ref"])
             for item in exact_attempts
-            if item.get("outcome") != "satisfied" and isinstance(item.get("source_ref"), str)
+            if item.get("outcome") != "satisfied"
+            and isinstance(item.get("source_ref"), str)
         }
     )
     exact_outcome_counts = {
@@ -6024,7 +6199,8 @@ def build_manifest_trace(
     unsuccessful_expansion_refs = {
         str(item["seed_source_ref"])
         for item in expansion_attempts
-        if item.get("outcome") != "satisfied" and isinstance(item.get("seed_source_ref"), str)
+        if item.get("outcome") != "satisfied"
+        and isinstance(item.get("seed_source_ref"), str)
     }
     shape_projection: dict[str, Any] = {
         "derivation_status": shape.derivation_status if shape else "unavailable",
@@ -6066,7 +6242,9 @@ def build_manifest_trace(
         "plan": {
             "plan_id": plan.plan_id if plan else None,
             "plan_status": plan.plan_status if plan else "not_compiled",
-            "completeness_expectation": (plan.completeness_expectation if plan else None),
+            "completeness_expectation": (
+                plan.completeness_expectation if plan else None
+            ),
             "contradiction_search_required": (
                 plan.contradiction_search_required if plan else False
             ),
@@ -6087,7 +6265,9 @@ def build_manifest_trace(
             "inventory_discovery": dict(state.inventory_discovery),
             "strategy_attempted": (
                 plan.selected_strategies[0]
-                if state.supported_governed_path and plan and trace.get("called") is True
+                if state.supported_governed_path
+                and plan
+                and trace.get("called") is True
                 else None
             ),
             "sources_considered": considered_sources,
@@ -6131,19 +6311,24 @@ def build_manifest_trace(
             "exact_reference_truncated_count": exact_outcome_counts["truncated"],
             "unavailable_source_ids": sorted(
                 source.source_id
-                for source in (manifest_inventory.sources if manifest_inventory else [])
-                if not source.enabled or source.status in {"unavailable", "disabled", "unknown"}
+                for source in (
+                    manifest_inventory.sources if manifest_inventory else []
+                )
+                if not source.enabled
+                or source.status in {"unavailable", "disabled", "unknown"}
             ),
             "failed_source_ids": sorted(
                 {
                     str(item["source_id"])
                     for item in exact_attempts
-                    if item.get("outcome") == "failed" and isinstance(item.get("source_id"), str)
+                    if item.get("outcome") == "failed"
+                    and isinstance(item.get("source_id"), str)
                 }
                 | {
                     str(item["source_id"])
                     for item in expansion_attempts
-                    if item.get("outcome") == "failed" and isinstance(item.get("source_id"), str)
+                    if item.get("outcome") == "failed"
+                    and isinstance(item.get("source_id"), str)
                 }
             ),
             "expansion_attempts": sorted(
@@ -6153,7 +6338,9 @@ def build_manifest_trace(
                         "seed_source_ref": item.get("seed_source_ref"),
                         "context_mode": item.get("context_mode"),
                         "outcome": str(item["outcome"]),
-                        "returned_reference_count": int(item.get("returned_reference_count") or 0),
+                        "returned_reference_count": int(
+                            item.get("returned_reference_count") or 0
+                        ),
                     }
                     for item in expansion_attempts
                 ],
@@ -6225,9 +6412,13 @@ def build_manifest_trace(
                     "selection_id": item.get("selection_id"),
                     "evaluation_id": item.get("evaluation_id"),
                     "evidence_plan_id": item.get("evidence_plan_id"),
-                    "acquisition_manifest_id": item.get("acquisition_manifest_id"),
+                    "acquisition_manifest_id": item.get(
+                        "acquisition_manifest_id"
+                    ),
                     "selected_next_step": item.get("selected_next_step"),
-                    "conclusion_disposition": item.get("conclusion_disposition"),
+                    "conclusion_disposition": item.get(
+                        "conclusion_disposition"
+                    ),
                     "provider_disposition": item.get("provider_disposition"),
                     "reacquisition_guard": item.get("reacquisition_guard"),
                     "clarification_target": item.get("clarification_target"),
@@ -6241,7 +6432,9 @@ def build_manifest_trace(
             "additional_acquisition_count": state.additional_acquisition_count,
             "initial_attempt": state.initial_attempt_summary,
             "dependency_status": (
-                state.next_step_failure if state.next_step_selection_attempted else None
+                state.next_step_failure
+                if state.next_step_selection_attempted
+                else None
             ),
         },
         "sufficiency": {
@@ -6249,7 +6442,9 @@ def build_manifest_trace(
             "status": (
                 state.sufficiency.sufficiency_status if state.sufficiency else "not_evaluated"
             ),
-            "reason_codes": (list(state.sufficiency.reason_codes) if state.sufficiency else []),
+            "reason_codes": (
+                list(state.sufficiency.reason_codes) if state.sufficiency else []
+            ),
             "answer_constraints": (
                 list(state.sufficiency.answer_constraints) if state.sufficiency else []
             ),
@@ -6257,7 +6452,9 @@ def build_manifest_trace(
                 state.sufficiency.qualification_required if state.sufficiency else False
             ),
             "additional_acquisition_required": (
-                state.sufficiency.additional_acquisition_required if state.sufficiency else False
+                state.sufficiency.additional_acquisition_required
+                if state.sufficiency
+                else False
             ),
         },
     }
@@ -6267,7 +6464,6 @@ def build_manifest_trace(
             for key in (
                 "called",
                 "outcome",
-                "seed_call_count",
                 "structured_context_call_count",
                 "record_count",
                 "non_empty_value_count",

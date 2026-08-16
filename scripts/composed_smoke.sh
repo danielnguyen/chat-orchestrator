@@ -8,7 +8,7 @@ DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
 CR_COMMIT="1e4b0d3ac83199520c0165db037a1436eec47370"
-DSA_COMMIT="4febcb841307efa232f051e8319df26fd7795a5b"
+DSA_COMMIT="342b731d8c239dad78ec77bfd6ace41916c20704"
 CO_COMMIT="22c327966c32da733391e5490b8d422ebbee9288"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh

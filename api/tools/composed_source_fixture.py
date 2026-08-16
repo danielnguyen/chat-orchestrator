@@ -35,7 +35,10 @@ _FOLLOWUP_LARGE_VALUES: list[list[str]] = [
         [
             f"follow-up-{index}",
             "ready",
-            (f"Bounded follow-up detail {index}. " + "Expanded deterministic context. " * 150),
+            (
+                f"Bounded follow-up detail {index}. "
+                + "Expanded deterministic context. " * 150
+            ),
         ]
         for index in range(1, 9)
     ],
@@ -91,7 +94,10 @@ _GOOGLE_VALUES: dict[str, list[list[str]]] = {
             [
                 f"follow-up-{index}",
                 "ready",
-                (f"Bounded follow-up detail {index}. " + "Deterministic supporting context. " * 36),
+                (
+                    f"Bounded follow-up detail {index}. "
+                    + "Deterministic supporting context. " * 36
+                ),
             ]
             for index in range(1, 9)
         ],
@@ -169,7 +175,13 @@ async def configure_source(source_name: str, state: SourceState) -> dict[str, st
 
 @fixture_app.get("/fixture/calls")
 async def fixture_calls() -> dict[str, Any]:
-    return {"calls": [call for source_name in sorted(_calls) for call in _calls[source_name]]}
+    return {
+        "calls": [
+            call
+            for source_name in sorted(_calls)
+            for call in _calls[source_name]
+        ]
+    }
 
 
 @fixture_app.get("/google/{spreadsheet_id}")
@@ -184,9 +196,15 @@ async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, 
     variant = "compact"
     if mode == "alternating_large_compact" and spreadsheet_id == "followup-sheet":
         variant = "large" if call_ordinal % 2 == 1 else "compact"
-        values = _FOLLOWUP_LARGE_VALUES if variant == "large" else _FOLLOWUP_COMPACT_VALUES
+        values = (
+            _FOLLOWUP_LARGE_VALUES
+            if variant == "large"
+            else _FOLLOWUP_COMPACT_VALUES
+        )
     else:
-        return_empty = mode == "empty" or (mode == "empty_after_first" and call_ordinal > 1)
+        return_empty = mode == "empty" or (
+            mode == "empty_after_first" and call_ordinal > 1
+        )
         values = [] if return_empty else _GOOGLE_VALUES.get(spreadsheet_id)
     if values is None:
         raise HTTPException(status_code=404, detail="source not found")
@@ -200,7 +218,9 @@ async def google_values(spreadsheet_id: str, range_name: str = "") -> dict[str, 
             "mode": mode,
             "variant": variant,
             "returned_row_count": len(values),
-            "returned_cell_character_count": sum(len(str(cell)) for row in values for cell in row),
+            "returned_cell_character_count": sum(
+                len(str(cell)) for row in values for cell in row
+            ),
         }
     )
     return {"values": deepcopy(values)}

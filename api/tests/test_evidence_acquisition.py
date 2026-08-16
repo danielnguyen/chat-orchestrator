@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 import pytest
 from models import ChatRequest
@@ -242,7 +243,9 @@ def _hybrid_shape_response():
     response["result"].update(
         {
             "question_anchor": question,
-            "question_anchor_digest": (f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"),
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
             "reason_codes": [
                 "explicit_evidence_language",
                 "comparison_requested",
@@ -273,7 +276,8 @@ def _hybrid_plan_response(
             "plan_status": status,
             "completeness_expectation": completeness,
             "contradiction_search_required": contradiction_required,
-            "eligible_source_ids": eligible_source_ids or ["source_a", "source_b"],
+            "eligible_source_ids": eligible_source_ids
+            or ["source_a", "source_b"],
             "authoritative_source_ids": [],
             "selected_strategies": [strategy] if strategy else [],
             "declared_requirements": requirements
@@ -306,7 +310,9 @@ def _exhaustive_shape_response():
     response["result"].update(
         {
             "question_anchor": question,
-            "question_anchor_digest": (f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"),
+            "question_anchor_digest": (
+                f"sha256:{hashlib.sha256(question.encode()).hexdigest()}"
+            ),
             "reason_codes": [
                 "explicit_evidence_language",
                 "exhaustive_scope_requested",
@@ -353,7 +359,9 @@ def _exhaustive_plan_response(
         if eligible_source_ids is not None
         else ["source_a"],
         "authoritative_source_ids": (
-            authoritative_source_ids if authoritative_source_ids is not None else ["source_a"]
+            authoritative_source_ids
+            if authoritative_source_ids is not None
+            else ["source_a"]
         ),
         "selected_strategies": ["hybrid"],
         "declared_requirements": (
@@ -482,7 +490,9 @@ def _configured_worksheet_response(
                 "source_type": "google_sheets",
                 "source_id": source_id,
                 "source_name": "PRIVATE CONFIGURED SOURCE",
-                "source_ref": (f"google_sheets:{source_id}:Maintenance!A2:E5"),
+                "source_ref": (
+                    f"google_sheets:{source_id}:Maintenance!A2:E5"
+                ),
                 "retrieved_at": "2026-07-17T00:00:00Z",
                 "source_modified_at": None,
                 "cache_status": "live",
@@ -631,13 +641,10 @@ def test_expected_sufficiency_constraints_are_exact_and_task_specific(
     task_shape,
     expected,
 ):
-    assert (
-        _expected_sufficiency_constraints(
-            status,
-            task_shape=task_shape,
-        )
-        == expected
-    )
+    assert _expected_sufficiency_constraints(
+        status,
+        task_shape=task_shape,
+    ) == expected
 
 
 def _rendering_state(
@@ -679,7 +686,11 @@ def _rendering_state(
         for evaluation in evaluations
     ]
     plan_data = _plan_response(
-        status=("ready_with_limitations" if status == "sufficient_with_limitations" else "ready"),
+        status=(
+            "ready_with_limitations"
+            if status == "sufficient_with_limitations"
+            else "ready"
+        ),
         requirements=requirements,
         limitations=limitation_codes or [],
     )["result"]
@@ -696,7 +707,9 @@ def _rendering_state(
         attempted=True,
         status=status,
         inventory=(
-            DsaSourceListResponse.model_validate(inventory) if inventory is not None else None
+            DsaSourceListResponse.model_validate(inventory)
+            if inventory is not None
+            else None
         ),
         declared_scope=declared_scope,
         plan=PlanResult.model_validate(plan_data),
@@ -713,7 +726,9 @@ def _rendering_state(
             if recovery_eligible
             else None
         ),
-        forced_answer=(WITHHELD_ANSWER if status in {"insufficient", "unknown"} else None),
+        forced_answer=(
+            WITHHELD_ANSWER if status in {"insufficient", "unknown"} else None
+        ),
     )
 
 
@@ -859,7 +874,9 @@ def _shape_with_source_match(
     return response
 
 
-def _future_aggregate_shape(*, function="median", field_name="Fuel (L)"):
+def _future_aggregate_shape(
+    *, function="median", field_name="Fuel (L)"
+):
     response = _shape_with_source_match(
         status="matched",
         matched_source_ids=["source_a"],
@@ -872,7 +889,9 @@ def _future_aggregate_shape(*, function="median", field_name="Fuel (L)"):
             "aggregate_spec": {"function": function, "field_name": field_name},
         }
     )
-    response["result"]["source_match"]["reason_codes"] = ["semantic_candidate_validated"]
+    response["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+    ]
     return response
 
 
@@ -914,7 +933,9 @@ def _future_aggregate_plan(*, function="median", field_name="Fuel (L)"):
     ["median", "mean", "count", "sum", "minimum", "maximum"],
 )
 def test_aggregate_spec_accepts_closed_functions(function):
-    spec = AggregateSpec.model_validate({"function": function, "field_name": "Fuel (L)"})
+    spec = AggregateSpec.model_validate(
+        {"function": function, "field_name": "Fuel (L)"}
+    )
     assert spec.model_dump(mode="json") == {
         "function": function,
         "field_name": "Fuel (L)",
@@ -940,7 +961,9 @@ def test_aggregate_spec_rejects_malformed_contract(payload):
 
 def test_shape_result_accepts_only_derived_aggregate_spec():
     aggregate = ShapeResult.model_validate(_future_aggregate_shape()["result"])
-    assert aggregate.aggregate_spec == AggregateSpec(function="median", field_name="Fuel (L)")
+    assert aggregate.aggregate_spec == AggregateSpec(
+        function="median", field_name="Fuel (L)"
+    )
 
     missing = copy.deepcopy(_future_aggregate_shape()["result"])
     missing.pop("aggregate_spec")
@@ -957,7 +980,8 @@ def test_shape_result_accepts_only_derived_aggregate_spec():
         "recommendation_or_decision_support",
     ]
     invalid_outcomes = [
-        _shape_response(status="derived", shape=shape)["result"] for shape in nonaggregate_shapes
+        _shape_response(status="derived", shape=shape)["result"]
+        for shape in nonaggregate_shapes
     ]
     invalid_outcomes.extend(
         [
@@ -1051,7 +1075,9 @@ def test_plan_source_descriptor_content_fields_are_bounded_exact_and_optional():
     ]
     for content_fields in invalid_values:
         with pytest.raises(ValidationError):
-            EvidenceSourceDescriptor.model_validate({**base, "content_fields": content_fields})
+            EvidenceSourceDescriptor.model_validate(
+                {**base, "content_fields": content_fields}
+            )
 
 
 def test_adapt_inventory_adds_content_fields_only_when_explicitly_requested():
@@ -1405,9 +1431,16 @@ def test_structured_field_value_contract_is_strict_and_counted():
             DsaStructuredFieldValues.model_validate(payload)
 
     legacy_item = _context_response()["results"][0]
+    serialized_legacy = DsaContextItem.model_validate(legacy_item).model_dump(mode="json")
+    assert "structured_data" not in serialized_legacy
+
     legacy_item["structured_data"] = structured.model_dump(mode="json")
     with pytest.raises(ValidationError):
         DsaContextItem.model_validate(legacy_item)
+
+    structured_item = _structured_field_response(["10", None, "20"])["results"][0]
+    serialized_structured = DsaContextItem.model_validate(structured_item).model_dump(mode="json")
+    assert serialized_structured["structured_data"]["kind"] == "field_values"
 
 
 def test_structured_response_requires_exact_source_field_and_shape():
@@ -1491,6 +1524,84 @@ def test_aggregate_decimal_edges_and_count_semantics():
     )
 
 
+def _max_bound_decimal_inputs():
+    return "9" * 120, "0." + "0" * 117 + "1"
+
+
+def _high_precision_canonical(value):
+    rendered = format(value, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def test_max_bound_sum_preserves_complete_fractional_tail():
+    large, tiny = _max_bound_decimal_inputs()
+    values = [large] * 249 + [tiny]
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=250,
+        non_empty_value_count=250,
+        values=values,
+    )
+    with localcontext() as oracle_context:
+        oracle_context.prec = 300
+        oracle_context.rounding = ROUND_HALF_EVEN
+        expected = _high_precision_canonical(sum((Decimal(value) for value in values), Decimal(0)))
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function="sum", field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.rendered_value == expected
+    assert result.rendered_value.endswith("0" * 117 + "1")
+
+
+def test_max_bound_even_median_is_exact_beyond_160_digits():
+    large, tiny = _max_bound_decimal_inputs()
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=2,
+        non_empty_value_count=2,
+        values=[large, tiny],
+    )
+    with localcontext() as oracle_context:
+        oracle_context.prec = 300
+        oracle_context.rounding = ROUND_HALF_EVEN
+        expected = _high_precision_canonical((Decimal(large) + Decimal(tiny)) / Decimal(2))
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function="median", field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.rendered_value == expected
+
+
+def test_max_bound_mean_uses_exact_numerator_before_precision_34_division():
+    _, tiny = _max_bound_decimal_inputs()
+    large = "9" * 119
+    values = [large, tiny, "-" + large]
+    structured = DsaStructuredFieldValues(
+        kind="field_values",
+        field_name="Reading",
+        record_count=3,
+        non_empty_value_count=3,
+        values=values,
+    )
+    with localcontext() as oracle_context:
+        oracle_context.prec = 300
+        oracle_context.rounding = ROUND_HALF_EVEN
+        numerator = sum((Decimal(value) for value in values), Decimal(0))
+    with localcontext() as mean_context:
+        mean_context.prec = 34
+        mean_context.rounding = ROUND_HALF_EVEN
+        expected = _high_precision_canonical(numerator / Decimal(3))
+    result = compute_aggregate_result(
+        aggregate_spec=AggregateSpec(function="mean", field_name="Reading"),
+        structured_data=structured,
+    )
+    assert result.rendered_value == expected
+    assert result.approximate is True
+
+
 @pytest.mark.parametrize(
     "invalid",
     ["1e3", "1,000", "$12", "12 L", "NaN", "Infinity", "", " 12", "12 ", "1" * 121],
@@ -1533,19 +1644,16 @@ def test_all_null_numeric_filters_but_count_is_zero():
 
 
 @pytest.mark.asyncio
-async def test_aggregate_executor_uses_complete_vector_not_seed_and_keeps_it_private():
+async def test_aggregate_executor_uses_direct_complete_vector_and_keeps_it_private():
     state = _aggregate_ready_state()
     dsa = FakeDsa(
         [],
         context_responses=[_structured_field_response(["10.125", "20.25", None, "35.5", "55.75"])],
     )
-    seed = _context_pack()
-    seed["items"][0]["text"] = "999999 PRIVATE SEED TEXT"
     pack, trace = await execute_aggregate_values(
         state=state,
         dsa=dsa,
-        seed_context_pack=seed,
-        dsa_trace={"called": True, "status": "included"},
+        dsa_trace={"called": False, "status": "deferred_for_evidence_governance"},
     )
 
     assert pack is None
@@ -1556,7 +1664,7 @@ async def test_aggregate_executor_uses_complete_vector_not_seed_and_keeps_it_pri
         (
             "context_source",
             {
-                "source_ref": "source_a:record_1",
+                "source_id": "source_a",
                 "context_mode": "configured_field_values",
                 "field_name": "Reading",
                 "budget": {
@@ -1567,11 +1675,11 @@ async def test_aggregate_executor_uses_complete_vector_not_seed_and_keeps_it_pri
             },
         )
     ]
-    assert state.aggregate_execution["seed_call_count"] == 1
+    assert trace["context_pack_call_count"] == 0
+    assert trace["context_expansion_call_count"] == 1
     assert state.aggregate_execution["record_count"] == 5
     assert state.aggregate_execution["non_empty_value_count"] == 4
     serialized = json.dumps((trace, state.aggregate_delivery_identity), sort_keys=True)
-    assert "999999" not in serialized
     assert "55.75" not in serialized
     assert "Reading" not in serialized
     assert state.aggregate_delivery_identity["structured_data_digest"].startswith("sha256:")
@@ -1726,7 +1834,9 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
     source_b["content_fields"] = ["Zulu Field", "Alpha Field"]
     source_b["last_error"] = "PRIVATE-ERROR-SENTINEL"
     source_a = _source("source_a", capabilities=["context", "fetch"])
-    inventory = DsaSourceListResponse.model_validate({"sources": [source_b, source_a]})
+    inventory = DsaSourceListResponse.model_validate(
+        {"sources": [source_b, source_a]}
+    )
 
     projected = _evidence_interpreter_inventory(inventory)
     messages = evidence_interpreter_messages(
@@ -1752,8 +1862,12 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
     system_instruction = messages[0]["content"]
     assert "aggregate_function" in system_instruction
     assert "aggregate_field_name" in system_instruction
-    assert "copy aggregate_field_name exactly from content_fields" in (system_instruction.lower())
-    assert "do not invent, trim, or normalize field names" in (system_instruction.lower())
+    assert "copy aggregate_field_name exactly from content_fields" in (
+        system_instruction.lower()
+    )
+    assert "do not invent, trim, or normalize field names" in (
+        system_instruction.lower()
+    )
 
 
 def test_evidence_interpreter_response_format_is_strict_and_closed():
@@ -2464,7 +2578,9 @@ async def test_not_applicable_no_match_uses_semantic_second_derivation_and_cr_sc
         status="matched",
         matched_source_ids=["source_a"],
     )
-    second["result"]["source_match"]["reason_codes"] = ["semantic_candidate_validated"]
+    second["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+    ]
     second["result"]["reason_codes"] = [
         "semantic_operation_hint",
         "targeted_lookup_derived",
@@ -2628,7 +2744,9 @@ async def test_semantic_failure_preserves_ordinary_but_clarifies_material_reques
         semantic_interpreter=failed_interpreter,
         **SCOPE,
     )
-    material_runtime = SequentialShapeRuntime([_shape_with_source_match(status="no_match")])
+    material_runtime = SequentialShapeRuntime(
+        [_shape_with_source_match(status="no_match")]
+    )
     material = await begin_evidence_acquisition(
         runtime=material_runtime,
         dsa=FakeDsa(
@@ -2668,7 +2786,9 @@ async def test_semantic_ambiguity_and_aggregate_never_compile_a_plan():
         matched_source_ids=["source_a"],
         derivation_status="ambiguous",
     )
-    aggregate["result"]["source_match"]["reason_codes"] = ["semantic_candidate_validated"]
+    aggregate["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+    ]
     aggregate["result"]["reason_codes"] = [
         "semantic_operation_hint",
         "semantic_operation_unsupported",
@@ -2744,7 +2864,9 @@ async def test_enriched_aggregate_reaches_cr_and_remains_fail_closed(candidate_c
         derivation_status="ambiguous",
     )
     second["result"]["source_match"]["reason_codes"] = [
-        "semantic_candidate_validated" if candidate_count == 1 else "semantic_candidates_ambiguous"
+        "semantic_candidate_validated"
+        if candidate_count == 1
+        else "semantic_candidates_ambiguous"
     ]
     second["result"]["reason_codes"] = [
         "semantic_operation_hint",
@@ -2767,7 +2889,9 @@ async def test_enriched_aggregate_reaches_cr_and_remains_fail_closed(candidate_c
 
     async def interpreter(**kwargs):
         return {
-            "interpretation_status": ("resolved" if candidate_count == 1 else "ambiguous"),
+            "interpretation_status": (
+                "resolved" if candidate_count == 1 else "ambiguous"
+            ),
             "operation_hint": "aggregate",
             "candidate_source_ids": list(reversed(candidate_ids)),
             "aggregate_function": "median",
@@ -2796,7 +2920,9 @@ async def test_enriched_aggregate_reaches_cr_and_remains_fail_closed(candidate_c
         "called": True,
         "status": "accepted",
         "reason": "validated",
-        "interpretation_status": ("resolved" if candidate_count == 1 else "ambiguous"),
+        "interpretation_status": (
+            "resolved" if candidate_count == 1 else "ambiguous"
+        ),
         "operation_hint": "aggregate",
         "candidate_count": candidate_count,
     }
@@ -2806,7 +2932,9 @@ async def test_enriched_aggregate_reaches_cr_and_remains_fail_closed(candidate_c
         for source in shape_calls[1]["task_context"]["source_discovery"]["sources"]
     )
     assert shape_calls[1]["task_context"]["semantic_advisory"] == {
-        "interpretation_status": ("resolved" if candidate_count == 1 else "ambiguous"),
+        "interpretation_status": (
+            "resolved" if candidate_count == 1 else "ambiguous"
+        ),
         "operation_hint": "aggregate",
         "candidate_source_ids": candidate_ids,
         "aggregate_function": "median",
@@ -2858,7 +2986,9 @@ async def test_enriched_aggregate_rejects_unsafe_candidate_field_membership(
 
     async def interpreter(**kwargs):
         return {
-            "interpretation_status": ("resolved" if len(candidate_ids) == 1 else "ambiguous"),
+            "interpretation_status": (
+                "resolved" if len(candidate_ids) == 1 else "ambiguous"
+            ),
             "operation_hint": "aggregate",
             "candidate_source_ids": candidate_ids,
             "aggregate_function": "median",
@@ -2894,7 +3024,9 @@ async def test_enriched_aggregate_field_is_private_in_manifest_trace():
         matched_source_ids=["source_a"],
         derivation_status="ambiguous",
     )
-    second["result"]["source_match"]["reason_codes"] = ["semantic_candidate_validated"]
+    second["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidate_validated"
+    ]
     second["result"]["reason_codes"] = [
         "semantic_operation_hint",
         "semantic_operation_unsupported",
@@ -2949,7 +3081,9 @@ async def test_cr_refusal_of_resolved_semantic_candidate_remains_authoritative()
         status="ambiguous",
         derivation_status="ambiguous",
     )
-    refused["result"]["source_match"]["reason_codes"] = ["semantic_candidates_ambiguous"]
+    refused["result"]["source_match"]["reason_codes"] = [
+        "semantic_candidates_ambiguous"
+    ]
     runtime = SequentialShapeRuntime([first, refused])
 
     async def interpreter(**kwargs):
@@ -3290,7 +3424,9 @@ def test_exact_reference_public_contract_accepts_bounded_opaque_references():
     )
     assert request.external_context is not None
     assert request.external_context.exact_source_refs is not None
-    assert request.external_context.exact_source_refs[0].source_ref == ("connector:source_a:item-1")
+    assert request.external_context.exact_source_refs[0].source_ref == (
+        "connector:source_a:item-1"
+    )
     assert request.model_dump()["external_context"]["exact_source_refs"] == [
         {
             "source_id": "source_a",
@@ -3884,7 +4020,9 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
             "authority_role": "unknown",
         },
     ]
-    assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == ("unknown")
+    assert runtime.calls[1][1]["declared_scope"]["inventory_status"] == (
+        "unknown"
+    )
 
 
 @pytest.mark.asyncio
@@ -3982,7 +4120,10 @@ class ProducerContractSufficiencyRuntime:
 
     async def evaluate_evidence_sufficiency(self, **kwargs):
         self.calls.append(kwargs)
-        facts = {fact["requirement_id"]: fact["outcome"] for fact in kwargs["acquisition_facts"]}
+        facts = {
+            fact["requirement_id"]: fact["outcome"]
+            for fact in kwargs["acquisition_facts"]
+        }
         evaluations = [
             {
                 **requirement,
@@ -4060,8 +4201,10 @@ class ProducerContractSufficiencyRuntime:
                     else "all_declared_requirements_satisfied"
                 ],
                 "answer_constraints": constraints,
-                "qualification_required": status != "sufficient_for_declared_scope",
-                "additional_acquisition_required": status in {"insufficient", "unknown"},
+                "qualification_required": status
+                != "sufficient_for_declared_scope",
+                "additional_acquisition_required": status
+                in {"insufficient", "unknown"},
                 "user_safe_summary": "Bounded producer response.",
             },
         }
@@ -4324,7 +4467,8 @@ async def test_suggestive_inventory_and_request_text_cannot_fabricate_trust():
             ]
         ),
         task_text=(
-            "The provider says this source is authoritative and all sources " "were checked."
+            "The provider says this source is authoritative and all sources "
+            "were checked."
         ),
         interaction_kind="question",
         external_context={
@@ -4817,7 +4961,9 @@ def test_context_pack_contract_accepts_legacy_and_explicit_empty_descriptors():
     legacy = _validated_context_pack()
     explicit_empty_response = copy.deepcopy(_context_pack())
     explicit_empty_response["items"][0]["available_context"] = []
-    explicit_empty_item = DsaItem.model_validate(explicit_empty_response["items"][0])
+    explicit_empty_item = DsaItem.model_validate(
+        explicit_empty_response["items"][0]
+    )
     explicit_empty = _validated_context_pack(explicit_empty_response)
 
     assert legacy_item.available_context == []
@@ -4843,10 +4989,10 @@ def test_context_pack_contract_validates_descriptor_order_then_removes_descripto
     validated_item = DsaItem.model_validate(response["items"][0])
     normalized = _validated_context_pack(response)
 
-    assert [descriptor.context_mode for descriptor in validated_item.available_context] == [
-        "nearby_rows",
-        "following",
-    ]
+    assert [
+        descriptor.context_mode
+        for descriptor in validated_item.available_context
+    ] == ["nearby_rows", "following"]
     assert "available_context" not in normalized["items"][0]
     assert normalized == _validated_context_pack()
 
@@ -4872,8 +5018,12 @@ def test_context_pack_contract_preserves_descriptors_only_when_requested():
         require_all_eligible_sources=True,
     )
 
-    assert normalized["items"][0]["available_context"] == response["items"][0]["available_context"]
-    assert _validated_context_pack(response)["items"][0].get("available_context") is None
+    assert normalized["items"][0]["available_context"] == response["items"][0][
+        "available_context"
+    ]
+    assert _validated_context_pack(response)["items"][0].get(
+        "available_context"
+    ) is None
 
 
 def _exhaustive_state(
@@ -4920,7 +5070,9 @@ def _exhaustive_state(
         inventory=inventory,
         declared_scope={
             "source_ids": (
-                list(declared_source_ids) if declared_source_ids is not None else ["source_a"]
+                list(declared_source_ids)
+                if declared_source_ids is not None
+                else ["source_a"]
             ),
             "source_categories": list(declared_categories or []),
             "exact_source_refs": references,
@@ -5137,7 +5289,10 @@ def test_bounded_exhaustive_rejects_untrusted_or_incapable_source(
         display_name="Authoritative complete official records",
         tags=["official"],
     )
-    assert _exhaustive_state(sources=[source]).supported_bounded_exhaustive_path is False, case
+    assert (
+        _exhaustive_state(sources=[source]).supported_bounded_exhaustive_path
+        is False
+    ), case
 
 
 @pytest.mark.parametrize(
@@ -5162,7 +5317,9 @@ def test_bounded_exhaustive_rejects_untrusted_inventory_states(
     inventory_metadata,
 ):
     assert (
-        _exhaustive_state(inventory_metadata=inventory_metadata).supported_bounded_exhaustive_path
+        _exhaustive_state(
+            inventory_metadata=inventory_metadata
+        ).supported_bounded_exhaustive_path
         is False
     )
 
@@ -5215,8 +5372,12 @@ def test_bounded_exhaustive_rejects_malformed_inventory_and_wider_universe():
 
 def test_bounded_exhaustive_context_pack_requires_exact_seed_association():
     valid = _exhaustive_targeted_context_pack()
-    assert valid["items"][0]["available_context"][0]["context_mode"] == ("nearby_rows")
-    assert valid["items"][0]["available_context"][1]["context_mode"] == ("configured_worksheet")
+    assert valid["items"][0]["available_context"][0]["context_mode"] == (
+        "nearby_rows"
+    )
+    assert valid["items"][0]["available_context"][1]["context_mode"] == (
+        "configured_worksheet"
+    )
 
     mutations = []
     for mutation in (
@@ -5230,7 +5391,9 @@ def test_bounded_exhaustive_context_pack_requires_exact_seed_association():
         "wrong-source",
     ):
         response = copy.deepcopy(_context_pack())
-        response["query"] = _exhaustive_shape_response()["result"]["question_anchor"]
+        response["query"] = _exhaustive_shape_response()["result"][
+            "question_anchor"
+        ]
         response["items"][0].update(
             {
                 "source_type": "google_sheets",
@@ -5471,7 +5634,9 @@ async def test_bounded_exhaustive_missing_exact_descriptor_is_unsupported_withou
     assert dsa.calls == []
     assert bundle["items"] == []
     assert state.expansion_attempts[0]["outcome"] == "unsupported"
-    assert state.expansion_attempts[0]["context_mode"] == (CONFIGURED_WORKSHEET_CONTEXT_MODE)
+    assert state.expansion_attempts[0]["context_mode"] == (
+        CONFIGURED_WORKSHEET_CONTEXT_MODE
+    )
     assert trace["call_count"] == 1
     assert trace["context_expansion_call_count"] == 0
 
@@ -5568,7 +5733,10 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
         expansion_attempts=state.expansion_attempts,
         bounded_exhaustive_path=True,
     )
-    assert {item["requirement_id"]: item["outcome"] for item in satisfied} == {
+    assert {
+        item["requirement_id"]: item["outcome"]
+        for item in satisfied
+    } == {
         "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
@@ -5584,7 +5752,10 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
         expansion_attempts=state.expansion_attempts,
         bounded_exhaustive_path=True,
     )
-    filtered_by_id = {item["requirement_id"]: item["outcome"] for item in filtered}
+    filtered_by_id = {
+        item["requirement_id"]: item["outcome"]
+        for item in filtered
+    }
     assert filtered_by_id["complete-scope-coverage"] == "satisfied"
     for requirement_id in (
         "context-delivery",
@@ -5601,7 +5772,10 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
         expansion_attempts=state.expansion_attempts,
         bounded_exhaustive_path=True,
     )
-    unknown_by_id = {item["requirement_id"]: item["outcome"] for item in unknown}
+    unknown_by_id = {
+        item["requirement_id"]: item["outcome"]
+        for item in unknown
+    }
     assert unknown_by_id["complete-scope-coverage"] == "satisfied"
     assert unknown_by_id["context-delivery"] == "unknown"
 
@@ -5644,8 +5818,12 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
         },
         retained_source_refs={complete_ref},
     )
-    assert manifest["acquisition"]["source_references_returned"] == [complete_ref]
-    assert manifest["acquisition"]["source_references_retained"] == [complete_ref]
+    assert manifest["acquisition"]["source_references_returned"] == [
+        complete_ref
+    ]
+    assert manifest["acquisition"]["source_references_retained"] == [
+        complete_ref
+    ]
     assert manifest["acquisition"]["expansion_attempt_count"] == 1
     assert "PRIVATE COMPLETE" not in json.dumps(manifest, sort_keys=True)
     suppressed = suppress_manifest_identifiers(manifest)
@@ -5739,9 +5917,9 @@ def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
         _hybrid_state(source_ids=[f"source_{index}" for index in range(9)]),
         _hybrid_state(
             plan_overrides={
-                "declared_requirements": _hybrid_plan_response()["result"]["declared_requirements"][
-                    1:
-                ]
+                "declared_requirements": _hybrid_plan_response()["result"][
+                    "declared_requirements"
+                ][1:]
             }
         ),
         _hybrid_state(
@@ -5763,7 +5941,9 @@ def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
                 "contradiction_search_required": True,
             }
         ),
-        _hybrid_state(plan_overrides={"completeness_expectation": "targeted_scope"}),
+        _hybrid_state(
+            plan_overrides={"completeness_expectation": "targeted_scope"}
+        ),
         _hybrid_state(plan_overrides={"contradiction_search_required": True}),
         _hybrid_state(
             exact_source_refs=[
@@ -5787,7 +5967,10 @@ def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
         ),
         _hybrid_state(source_status="unavailable"),
     ]
-    assert all(state.supported_hybrid_comparison_path is False for state in variants)
+    assert all(
+        state.supported_hybrid_comparison_path is False
+        for state in variants
+    )
 
     duplicate_plan = _hybrid_plan_response()["result"]
     duplicate_plan["eligible_source_ids"] = ["source_a", "source_a"]
@@ -6512,7 +6695,9 @@ def test_fetch_response_contract_accepts_real_shape_and_excludes_private_fields(
             "fetch_source_reference_mismatch",
         ),
         (
-            lambda response: response["results"][0].update(raw={"private": "PRIVATE RAW DATA"}),
+            lambda response: response["results"][0].update(
+                raw={"private": "PRIVATE RAW DATA"}
+            ),
             "raw_fetch_data_not_allowed",
         ),
         (
@@ -6626,9 +6811,9 @@ async def test_exact_execution_attempts_every_reference_in_deterministic_order()
 
 @pytest.mark.asyncio
 async def test_complete_exact_acquisition_and_prompt_delivery_control_sufficiency():
-    requirements = _exact_plan_response(authoritative_source_ids=["source_a"])["result"][
-        "declared_requirements"
-    ]
+    requirements = _exact_plan_response(
+        authoritative_source_ids=["source_a"]
+    )["result"]["declared_requirements"]
     runtime = FakeRuntime(
         plan=_exact_plan_response(authoritative_source_ids=["source_a"]),
         sufficiency_status="sufficient_for_declared_scope",
@@ -6699,7 +6884,9 @@ async def test_exact_prompt_delivery_requires_every_returned_reference_and_no_un
         plan=_exact_plan_response(
             eligible_source_ids=["source_a", "source_b"],
         ),
-        sufficiency_status=("unknown" if expected_delivery == "unknown" else "insufficient"),
+        sufficiency_status=(
+            "unknown" if expected_delivery == "unknown" else "insufficient"
+        ),
     )
     dsa = FakeDsa(
         [
@@ -6754,10 +6941,9 @@ async def test_exact_prompt_delivery_requires_every_returned_reference_and_no_un
         dsa_trace=trace,
         retained_source_refs=retained_refs,
     )
-    assert (
-        "connector:source_b:not-returned"
-        not in manifest["acquisition"]["source_references_retained"]
-    )
+    assert "connector:source_b:not-returned" not in manifest["acquisition"][
+        "source_references_retained"
+    ]
 
 
 @pytest.mark.asyncio
@@ -6893,7 +7079,9 @@ async def test_incomplete_exact_acquisition_never_satisfies_material_evidence(
 ):
     runtime = FakeRuntime(
         plan=_exact_plan_response(),
-        sufficiency_status=("unknown" if expected_outcome == "unknown" else "insufficient"),
+        sufficiency_status=(
+            "unknown" if expected_outcome == "unknown" else "insufficient"
+        ),
     )
     dsa = FakeDsa(
         [_source("source_a", capabilities=["fetch"])],
@@ -7011,7 +7199,9 @@ async def test_exact_manifest_is_truthful_private_and_order_independent():
             "outcome": "satisfied",
         },
     ]
-    assert acquisition["source_references_returned"] == (acquisition["source_references_retained"])
+    assert acquisition["source_references_returned"] == (
+        acquisition["source_references_retained"]
+    )
     serialized = json.dumps(first, sort_keys=True)
     for prohibited in (
         "PRIVATE EXACT CONTENT",
@@ -7064,8 +7254,12 @@ async def test_actual_prompt_delivery_controls_sufficiency(
     )
 
     facts = runtime.calls[-1][1]["acquisition_facts"]
-    context_fact = next(fact for fact in facts if fact["requirement_id"] == "context-delivery")
-    assert context_fact["outcome"] == ("satisfied" if retained_refs else "filtered")
+    context_fact = next(
+        fact for fact in facts if fact["requirement_id"] == "context-delivery"
+    )
+    assert context_fact["outcome"] == (
+        "satisfied" if retained_refs else "filtered"
+    )
     assert provider_allowed(state) is provider_is_allowed
     if not provider_is_allowed:
         assert state.forced_answer == WITHHELD_ANSWER
@@ -7093,9 +7287,10 @@ async def test_non_returned_prompt_reference_is_unknown_and_not_retained():
     )
 
     facts = runtime.calls[-1][1]["acquisition_facts"]
-    assert {fact["requirement_id"]: fact["outcome"] for fact in facts}[
-        "context-delivery"
-    ] == "unknown"
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in facts
+    }["context-delivery"] == "unknown"
     assert provider_allowed(state) is False
     manifest = build_manifest_trace(
         state=state,
@@ -7103,7 +7298,9 @@ async def test_non_returned_prompt_reference_is_unknown_and_not_retained():
         dsa_trace={"status": "success", "called": True},
         retained_source_refs={"source_a:not_returned"},
     )
-    assert manifest["acquisition"]["source_references_returned"] == ["source_a:record_1"]
+    assert manifest["acquisition"]["source_references_returned"] == [
+        "source_a:record_1"
+    ]
     assert manifest["acquisition"]["source_references_retained"] == []
     assert manifest["acquisition"]["context_delivery_status"] == "unknown"
     assert "not_returned" not in json.dumps(manifest, sort_keys=True)
@@ -7171,7 +7368,10 @@ def test_optional_selected_source_coverage_preserves_inventory_limitations(
         retained_source_refs={"source_a:record_1"},
     )
 
-    assert {fact["requirement_id"]: fact["outcome"] for fact in facts} == {
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in facts
+    } == {
         "context-delivery": "satisfied",
         "optional-selected-source-coverage": expected_outcome,
         "targeted-evidence": "satisfied",
@@ -7207,7 +7407,10 @@ def test_material_selected_source_coverage_keeps_path_specific_outcome():
         retained_source_refs={"source_a:record_1"},
     )
 
-    assert {fact["requirement_id"]: fact["outcome"] for fact in facts} == {
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in facts
+    } == {
         "context-delivery": "satisfied",
         "material-selected-source-coverage": "unknown",
         "optional-selected-source-coverage": "partial",
@@ -7281,7 +7484,8 @@ async def test_partial_inventory_fact_produces_limited_sufficiency():
 
     sufficiency_call = runtime.calls[-1][1]
     assert {
-        fact["requirement_id"]: fact["outcome"] for fact in sufficiency_call["acquisition_facts"]
+        fact["requirement_id"]: fact["outcome"]
+        for fact in sufficiency_call["acquisition_facts"]
     }["optional-selected-source-coverage"] == "partial"
     assert state.status == "sufficient_with_limitations"
     assert state.sufficiency is not None
@@ -7364,7 +7568,6 @@ async def test_optional_limitation_allows_provider_and_is_disclosed_once():
     assert limitation in answer
     assert answer.endswith(TARGETED_SCOPE_SUFFIX)
     assert answer.count(limitation) == 1
-
 
 def _candidate(
     *,
@@ -7756,14 +7959,11 @@ def test_invalid_grounded_candidate_uses_helpful_recovery_only_after_successful_
         failure_reason=reason,
     )
 
-    assert (
-        helpful_grounded_recovery_allowed(
-            state=state,
-            validation=validation,
-            provider_call_occurred=True,
-        )
-        is True
-    )
+    assert helpful_grounded_recovery_allowed(
+        state=state,
+        validation=validation,
+        provider_call_occurred=True,
+    ) is True
     answer = render_governed_evidence_answer(
         state=state,
         validation=validation,
@@ -7859,24 +8059,17 @@ def test_helpful_grounded_recovery_rejects_untrusted_or_incomplete_state(mutatio
         failure_reason="invalid_json",
     )
 
-    assert (
-        helpful_grounded_recovery_allowed(
-            state=state,
-            validation=validation,
-            provider_call_occurred=provider_call_occurred,
-        )
-        is False
-    )
-    assert (
-        render_governed_evidence_answer(
-            state=state,
-            validation=validation,
-            excerpts=(),
-            provider_call_occurred=provider_call_occurred,
-        )
-        == MALFORMED_EVIDENCE_RESPONSE
-    )
-
+    assert helpful_grounded_recovery_allowed(
+        state=state,
+        validation=validation,
+        provider_call_occurred=provider_call_occurred,
+    ) is False
+    assert render_governed_evidence_answer(
+        state=state,
+        validation=validation,
+        excerpts=(),
+        provider_call_occurred=provider_call_occurred,
+    ) == MALFORMED_EVIDENCE_RESPONSE
 
 @pytest.mark.parametrize(
     ("unavailable_count", "expected"),
@@ -7902,7 +8095,10 @@ def test_optional_source_limitation_uses_trusted_scoped_inventory_count(
         ],
         limitation_codes=["optional_source_unavailable"],
         inventory={
-            "sources": [_source(source_id, status="unavailable") for source_id in source_ids]
+            "sources": [
+                _source(source_id, status="unavailable")
+                for source_id in source_ids
+            ]
         },
         declared_scope={
             "source_ids": source_ids,
@@ -8151,7 +8347,9 @@ def test_material_gap_rendering_is_bounded_deterministic_and_private():
         status="insufficient",
         evaluations=evaluations,
     )
-    provider_text = "PRIVATE SOURCE TEXT https://private.invalid credential=PRIVATE_SECRET"
+    provider_text = (
+        "PRIVATE SOURCE TEXT https://private.invalid credential=PRIVATE_SECRET"
+    )
 
     first = enforce_final_answer(provider_text, state)
     second = enforce_final_answer("DIFFERENT PROVIDER TEXT", state)
@@ -8160,7 +8358,9 @@ def test_material_gap_rendering_is_bounded_deterministic_and_private():
     assert "Additional material evidence requirements were also unresolved." in first
     assert "PRIVATE" not in first
     assert "https://" not in first
-    assert first.endswith("I’m withholding a contradiction-sensitive conclusion.")
+    assert first.endswith(
+        "I’m withholding a contradiction-sensitive conclusion."
+    )
 
 
 @pytest.mark.asyncio
@@ -8323,7 +8523,9 @@ async def test_manifest_retains_bounded_safe_source_summary_from_validated_dsa_f
             "used": True,
             "returned_reference_count": 1,
             "retained_reference_count": 1,
-            "safe_location_labels": ["Google Sheets tab “Form responses 1” — A2:C3"],
+            "safe_location_labels": [
+                "Google Sheets tab “Form responses 1” — A2:C3"
+            ],
             "contribution_reason_codes": ["retained_records_contributed"],
         }
     ]
@@ -8390,7 +8592,9 @@ def _next_step_test_state(
             "evaluated_requirements": [
                 {
                     **requirement.model_dump(mode="json"),
-                    "effective_outcome": outcome_by_kind[requirement.requirement_kind],
+                    "effective_outcome": outcome_by_kind[
+                        requirement.requirement_kind
+                    ],
                 }
                 for requirement in requirements
             ],
@@ -8420,7 +8624,11 @@ def _next_step_test_state(
                     _source(
                         "source_a",
                         capabilities=capabilities or ["search", "fetch"],
-                        status=("ready" if availability == "available" else "unavailable"),
+                        status=(
+                            "ready"
+                            if availability == "available"
+                            else "unavailable"
+                        ),
                     )
                 ],
             }
@@ -8461,7 +8669,8 @@ def _next_step_result_payload(
         "unresolved_material_requirement_ids": sorted(
             evaluation.requirement_id
             for evaluation in state.sufficiency.evaluated_requirements
-            if evaluation.criticality == "material" and evaluation.effective_outcome != "satisfied"
+            if evaluation.criticality == "material"
+            and evaluation.effective_outcome != "satisfied"
         ),
         "reason_codes": ["unsupported_conclusion_withheld"],
         "user_safe_summary": "A bounded next step was selected.",
@@ -8480,7 +8689,9 @@ def test_current_acquisition_premise_uses_only_compiled_plan_inputs():
                     "source_categories": list(
                         reversed(premise.source_inventory[0].source_categories)
                     ),
-                    "capabilities": list(reversed(premise.source_inventory[0].capabilities)),
+                    "capabilities": list(
+                        reversed(premise.source_inventory[0].capabilities)
+                    ),
                 }
             ],
         }
@@ -8490,7 +8701,9 @@ def test_current_acquisition_premise_uses_only_compiled_plan_inputs():
     assert premise.task_shape == state.plan.task_shape
     assert premise.declared_scope.model_dump(mode="json") == state.declared_scope
     assert premise.selected_strategies == state.plan.selected_strategies
-    assert _acquisition_premise_digest(reordered) == _acquisition_premise_digest(premise)
+    assert _acquisition_premise_digest(reordered) == _acquisition_premise_digest(
+        premise
+    )
     serialized = json.dumps(premise.model_dump(mode="json"), sort_keys=True)
     for prohibited in ("request_id", "manifest_id", "provider", "PRIVATE"):
         assert prohibited not in serialized
@@ -8505,7 +8718,9 @@ def test_legacy_no_scope_premise_digest_remains_stable():
 
 
 def test_material_scope_premise_digest_is_canonical_for_source_and_field_order():
-    base = build_current_acquisition_premise(_next_step_test_state()).model_dump(mode="json")
+    base = build_current_acquisition_premise(_next_step_test_state()).model_dump(
+        mode="json"
+    )
     base["declared_scope"].update(
         {
             "time_scope_ref": "fy2026",
@@ -8524,11 +8739,15 @@ def test_material_scope_premise_digest_is_canonical_for_source_and_field_order()
     base["source_inventory"] = [first_source, second_source]
     reordered = copy.deepcopy(base)
     reordered["source_inventory"] = list(reversed(reordered["source_inventory"]))
-    reordered["declared_scope"] = dict(reversed(list(reordered["declared_scope"].items())))
+    reordered["declared_scope"] = dict(
+        reversed(list(reordered["declared_scope"].items()))
+    )
 
     assert _acquisition_premise_digest(
         EvidenceAcquisitionPremise.model_validate(base)
-    ) == _acquisition_premise_digest(EvidenceAcquisitionPremise.model_validate(reordered))
+    ) == _acquisition_premise_digest(
+        EvidenceAcquisitionPremise.model_validate(reordered)
+    )
 
 
 @pytest.mark.parametrize(
@@ -8550,7 +8769,9 @@ def test_each_material_scope_reference_changes_existing_premise_identity(
     changed_data["declared_scope"][scope_field] = value
     changed = EvidenceAcquisitionPremise.model_validate(changed_data)
 
-    assert _acquisition_premise_digest(changed) != _acquisition_premise_digest(original)
+    assert _acquisition_premise_digest(changed) != _acquisition_premise_digest(
+        original
+    )
     assert _manifest_id(
         scope=SCOPE,
         plan_id=state.plan.plan_id,
@@ -8698,7 +8919,9 @@ async def test_safe_exact_fetch_proposal_rejects_unsafe_or_ineligible_targets(
     proposal = await compile_safe_exact_fetch_proposal(
         state=state,
         runtime=Runtime(),
-        context_pack={"items": [{"source_id": source_id, "source_ref": source_ref}]},
+        context_pack={
+            "items": [{"source_id": source_id, "source_ref": source_ref}]
+        },
         **SCOPE,
     )
 
@@ -8875,7 +9098,9 @@ def test_strict_next_step_model_rejects_contradictory_results(updates):
 )
 def test_strict_next_step_model_matches_runtime_structural_invariants(case):
     state = _next_step_test_state()
-    current_digest = _acquisition_premise_digest(build_current_acquisition_premise(state))
+    current_digest = _acquisition_premise_digest(
+        build_current_acquisition_premise(state)
+    )
     changed_digest = "sha256:" + ("1" * 64)
     payload = _next_step_result_payload(
         state,
@@ -9152,7 +9377,9 @@ async def test_guarded_partial_selection_is_recorded_and_provider_free(
                 conclusion_disposition="qualified_partial_only",
                 provider_disposition="allowed",
                 reacquisition_guard=guard,
-                proposed_premise_digest=_acquisition_premise_digest(proposal.premise),
+                proposed_premise_digest=_acquisition_premise_digest(
+                    proposal.premise
+                ),
             )
             result["reason_codes"] = [
                 guard_reason,
@@ -9174,7 +9401,9 @@ async def test_guarded_partial_selection_is_recorded_and_provider_free(
     assert state.next_step_history[0]["reacquisition_guard"] == guard
     assert provider_allowed(state) is False
     answer = enforce_final_answer("PRIVATE PROVIDER ANSWER", state)
-    assert answer.startswith("The available evidence establishes the requested targeted evidence")
+    assert answer.startswith(
+        "The available evidence establishes the requested targeted evidence"
+    )
     assert "PRIVATE PROVIDER ANSWER" not in answer
     assert answer.endswith("I’m withholding the requested conclusion.")
 
@@ -9212,7 +9441,9 @@ async def test_malformed_advisory_cannot_bypass_changed_premise_precedence():
                     conclusion_disposition="requested_conclusion_withheld",
                     provider_disposition="allowed",
                     reacquisition_guard="not_applicable",
-                    proposed_premise_digest=_acquisition_premise_digest(proposal.premise),
+                    proposed_premise_digest=_acquisition_premise_digest(
+                        proposal.premise
+                    ),
                 ),
             }
 
@@ -9264,7 +9495,9 @@ async def test_valid_exhausted_premise_advisory_remains_allowed():
                 conclusion_disposition="requested_conclusion_withheld",
                 provider_disposition="allowed",
                 reacquisition_guard="premise_already_attempted",
-                proposed_premise_digest=_acquisition_premise_digest(proposal.premise),
+                proposed_premise_digest=_acquisition_premise_digest(
+                    proposal.premise
+                ),
             )
             result["reason_codes"] = [
                 "acquisition_premise_already_selected",
@@ -9328,7 +9561,9 @@ async def test_next_step_selection_rejects_untrusted_follow_up(case):
         state=state,
         runtime=Runtime(),
         proposal=None,
-        clarification_target=("exact_reference" if case == "provider_selected_target" else None),
+        clarification_target=(
+            "exact_reference" if case == "provider_selected_target" else None
+        ),
         **SCOPE,
     )
 
@@ -9386,9 +9621,13 @@ async def test_changed_premise_authorization_promotes_exact_plan_once():
                         conclusion_disposition="requested_conclusion_withheld",
                         provider_disposition="blocked",
                         reacquisition_guard="changed_premise_allowed",
-                        proposed_premise_digest=_acquisition_premise_digest(proposed),
+                        proposed_premise_digest=_acquisition_premise_digest(
+                            proposed
+                        ),
                     ),
-                    "reason_codes": ["changed_acquisition_premise_available"],
+                    "reason_codes": [
+                        "changed_acquisition_premise_available"
+                    ],
                 },
             }
 
@@ -9396,7 +9635,11 @@ async def test_changed_premise_authorization_promotes_exact_plan_once():
     proposal = await compile_safe_exact_fetch_proposal(
         state=state,
         runtime=runtime,
-        context_pack={"items": [{"source_id": "source_a", "source_ref": "source_a:record_1"}]},
+        context_pack={
+            "items": [
+                {"source_id": "source_a", "source_ref": "source_a:record_1"}
+            ]
+        },
         **SCOPE,
     )
     assert proposal is not None

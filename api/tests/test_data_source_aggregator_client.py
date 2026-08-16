@@ -264,7 +264,7 @@ async def test_context_source_posts_exact_bounded_payload_and_override():
         },
     )
     await client.context_source(
-        source_ref="connector:source-c:item-3",
+        source_id="source-c",
         context_mode="configured_field_values",
         field_name="Reading",
         request_id="request-aggregate-1",
@@ -299,7 +299,7 @@ async def test_context_source_posts_exact_bounded_payload_and_override():
         (
             "/v1/sources/context",
             {
-                "source_ref": "connector:source-c:item-3",
+                "source_id": "source-c",
                 "context_mode": "configured_field_values",
                 "budget": {
                     "max_rows": 5,

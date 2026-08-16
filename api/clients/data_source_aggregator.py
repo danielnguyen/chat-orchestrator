@@ -152,7 +152,8 @@ class DataSourceAggregatorClient:
     ) -> None:
         fields: list[object] = [request_id or "absent", method, path]
         message = (
-            "dsa_request_completed component=chat-orchestrator " "request_id=%s method=%s path=%s"
+            "dsa_request_completed component=chat-orchestrator "
+            "request_id=%s method=%s path=%s"
         )
         if status_code is not None:
             message += " status=%d"
@@ -222,14 +223,14 @@ class DataSourceAggregatorClient:
     async def context_source(
         self,
         *,
-        source_ref: str,
+        source_ref: str | None = None,
+        source_id: str | None = None,
         context_mode: str,
         field_name: str | None = None,
         budget: dict[str, int] | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "source_ref": source_ref,
             "context_mode": context_mode,
             "budget": budget
             or {
@@ -238,6 +239,10 @@ class DataSourceAggregatorClient:
                 "max_text_chars": 12000,
             },
         }
+        if source_ref is not None:
+            payload["source_ref"] = source_ref
+        if source_id is not None:
+            payload["source_id"] = source_id
         if field_name is not None:
             payload["field_name"] = field_name
         return await self._post(
