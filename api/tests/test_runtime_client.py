@@ -1274,6 +1274,70 @@ async def test_evidence_runtime_methods_send_exact_scope_and_endpoint(
 
 
 @pytest.mark.asyncio
+async def test_compile_evidence_plan_forwards_optional_aggregate_spec_only_when_given():
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+    scope = {
+        "request_id": "rid",
+        "owner_id": "owner",
+        "conversation_id": "conv",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+    }
+    common = {
+        **scope,
+        "question_anchor": "Verify the record.",
+        "task_shape": "targeted_lookup",
+        "declared_scope": {
+            "source_ids": ["source_a"],
+            "source_categories": [],
+            "exact_source_refs": [],
+            "inventory_status": "complete_for_declared_scope",
+        },
+        "source_inventory": [
+            {
+                "source_id": "source_a",
+                "source_categories": ["records"],
+                "capabilities": ["targeted_retrieval"],
+                "availability": "available",
+                "authority_role": "authoritative",
+            }
+        ],
+    }
+
+    async def fake_post(path, *, json):
+        calls.append((path, json))
+        return {**scope, "result": {}}
+
+    client._post = fake_post  # type: ignore[method-assign]
+    await client.compile_evidence_plan(**common)
+
+    aggregate = deepcopy(common)
+    aggregate["task_shape"] = "aggregate"
+    aggregate["source_inventory"][0]["content_fields"] = [
+        "Date",
+        "Fuel (L)",
+        "Odometer",
+    ]
+    aggregate_spec = {"function": "median", "field_name": "Fuel (L)"}
+    await client.compile_evidence_plan(
+        **aggregate,
+        aggregate_spec=aggregate_spec,
+    )
+
+    assert calls[0] == (
+        "/v1/runtime/evidence-plans/compile",
+        common,
+    )
+    assert "aggregate_spec" not in calls[0][1]
+    assert calls[1] == (
+        "/v1/runtime/evidence-plans/compile",
+        {**aggregate, "aggregate_spec": aggregate_spec},
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "expected_error"),
     [

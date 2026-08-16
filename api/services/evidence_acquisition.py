@@ -16,6 +16,7 @@ from pydantic import (
     StrictStr,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -43,6 +44,7 @@ TaskShape = Literal[
     "absence_or_coverage_check",
     "historical_reconstruction",
     "recommendation_or_decision_support",
+    "aggregate",
 ]
 InteractionKind = Literal[
     "question",
@@ -115,6 +117,7 @@ PlanLimitationCode = Literal[
     "historical_sequence_not_supported",
     "decision_support_scope_insufficient",
     "optional_source_unavailable",
+    "aggregate_field_unavailable",
 ]
 RequirementKind = Literal[
     "authoritative_inventory",
@@ -165,6 +168,7 @@ AcquisitionStrategy = Literal[
     "bounded_full_context",
     "structured_query",
     "hybrid",
+    "structured_field_values",
 ]
 NextStep = Literal[
     "answer_within_declared_scope",
@@ -337,6 +341,9 @@ _PLAN_LIMITATION_DESCRIPTIONS = {
     "decision_support_scope_insufficient": (
         "optional decision-support evidence remained incomplete"
     ),
+    "aggregate_field_unavailable": (
+        "the configured aggregate field was unavailable"
+    ),
 }
 _SOURCE_AVAILABILITY_LIMITATIONS = {
     "authoritative_source_unavailable",
@@ -442,6 +449,20 @@ AggregateFunction = Literal[
 AggregateFieldName = Annotated[StrictStr, Field(min_length=1, max_length=120)]
 
 
+class AggregateSpec(StrictModel):
+    function: AggregateFunction
+    field_name: AggregateFieldName
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("aggregate_field_name_has_outer_whitespace")
+        if re.search(r"[\x00-\x1f\x7f]", value):
+            raise ValueError("aggregate_field_name_has_control_character")
+        return value
+
+
 class EvidenceInterpreterOutput(StrictModel):
     interpretation_status: SemanticInterpretationStatus
     operation_hint: SemanticOperationHint
@@ -538,9 +559,18 @@ class ShapeResult(StrictModel):
     reason_codes: list[ShapeReasonCode] = Field(max_length=17)
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
     source_match: SourceMatchResult | None = None
+    aggregate_spec: AggregateSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_spec(self, handler):
+        serialized = handler(self)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_outcome(self) -> ShapeResult:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
         if len(set(self.candidate_task_shapes)) != len(self.candidate_task_shapes):
             raise ValueError("duplicate_candidate_task_shape")
         if len(set(self.reason_codes)) != len(self.reason_codes):
@@ -560,6 +590,11 @@ class ShapeResult(StrictModel):
                 raise ValueError("invalid_ambiguous_shape")
             if not self.evidence_scope_material or not self.clarification_required:
                 raise ValueError("invalid_ambiguous_shape_flags")
+        if self.derivation_status == "derived" and self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_shape_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_derived_aggregate_shape")
         return self
 
 
@@ -622,14 +657,24 @@ class PlanResult(StrictModel):
             "bounded_full_context",
             "structured_query",
             "hybrid",
+            "structured_field_values",
         ]
     ] = Field(max_length=5)
     declared_requirements: list[Requirement] = Field(min_length=1, max_length=32)
     limitation_codes: list[PlanLimitationCode] = Field(max_length=16)
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+    aggregate_spec: AggregateSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_spec(self, handler):
+        serialized = handler(self)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_collections(self) -> PlanResult:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
         collections = (
             self.eligible_source_ids,
             self.authoritative_source_ids,
@@ -651,6 +696,11 @@ class PlanResult(StrictModel):
             item.criticality == "optional" for item in self.declared_requirements
         ):
             raise ValueError("limited_plan_requires_optional_requirement")
+        if self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_plan_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_aggregate_plan")
         return self
 
 
@@ -802,6 +852,34 @@ class EvidenceSourceDescriptor(StrictModel):
     ] = Field(max_length=5)
     availability: Literal["available", "unavailable", "disabled", "unknown"]
     authority_role: Literal["authoritative", "supplemental", "unknown"]
+    content_fields: list[
+        Annotated[StrictStr, Field(min_length=1, max_length=120)]
+    ] | None = Field(default=None, max_length=24)
+
+    @model_serializer(mode="wrap")
+    def omit_absent_content_fields(self, handler):
+        serialized = handler(self)
+        if self.content_fields is None:
+            serialized.pop("content_fields", None)
+        return serialized
+
+    @field_validator("content_fields")
+    @classmethod
+    def validate_content_fields(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is None:
+            return value
+        if any(not item.strip() for item in value):
+            raise ValueError("blank_source_content_field")
+        if any(re.search(r"[\x00-\x1f\x7f]", item) for item in value):
+            raise ValueError("unsafe_source_content_field")
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate_source_content_field")
+        if value != sorted(value):
+            raise ValueError("source_content_fields_not_sorted")
+        return value
 
     @model_validator(mode="after")
     def validate_unique_source_values(self) -> EvidenceSourceDescriptor:
@@ -809,6 +887,8 @@ class EvidenceSourceDescriptor(StrictModel):
             raise ValueError("duplicate_source_category")
         if len(set(self.capabilities)) != len(self.capabilities):
             raise ValueError("duplicate_source_capability")
+        if "content_fields" in self.model_fields_set and self.content_fields is None:
+            raise ValueError("source_content_fields_null")
         return self
 
 
@@ -1792,7 +1872,11 @@ def _manifest_id(
     return f"evidence_manifest_{hashlib.sha256(encoded.encode()).hexdigest()[:32]}"
 
 
-def _adapt_inventory(source_list: DsaSourceListResponse) -> list[dict[str, Any]]:
+def _adapt_inventory(
+    source_list: DsaSourceListResponse,
+    *,
+    include_content_fields: bool = False,
+) -> list[dict[str, Any]]:
     capability_map = {
         "search": "targeted_retrieval",
         "fetch": "exact_fetch",
@@ -1808,21 +1892,22 @@ def _adapt_inventory(source_list: DsaSourceListResponse) -> list[dict[str, Any]]
             availability = "unavailable"
         else:
             availability = "unknown"
-        inventory.append(
-            {
-                "source_id": source.source_id,
-                "source_categories": sorted(source.domain_tags),
-                "capabilities": sorted(
-                    {
-                        capability_map[capability]
-                        for capability in source.capabilities
-                        if capability in capability_map
-                    }
-                ),
-                "availability": availability,
-                "authority_role": source.authority_role,
-            }
-        )
+        descriptor = {
+            "source_id": source.source_id,
+            "source_categories": sorted(source.domain_tags),
+            "capabilities": sorted(
+                {
+                    capability_map[capability]
+                    for capability in source.capabilities
+                    if capability in capability_map
+                }
+            ),
+            "availability": availability,
+            "authority_role": source.authority_role,
+        }
+        if include_content_fields and source.content_fields is not None:
+            descriptor["content_fields"] = sorted(source.content_fields)
+        inventory.append(descriptor)
     return inventory
 
 
@@ -3033,7 +3118,19 @@ async def begin_evidence_acquisition(
             question_anchor=state.shape.question_anchor,
             task_shape=state.shape.task_shape,
             declared_scope=state.declared_scope,
-            source_inventory=_adapt_inventory(state.inventory),
+            source_inventory=_adapt_inventory(
+                state.inventory,
+                include_content_fields=state.shape.task_shape == "aggregate",
+            ),
+            **(
+                {
+                    "aggregate_spec": state.shape.aggregate_spec.model_dump(
+                        mode="json"
+                    )
+                }
+                if state.shape.aggregate_spec is not None
+                else {}
+            ),
         )
         plan_response = PlanResponse.model_validate(plan_raw)
         _validate_scope_echo(plan_response, scope)
@@ -3044,6 +3141,8 @@ async def begin_evidence_acquisition(
             or plan_response.result.task_shape != state.shape.task_shape
         ):
             raise ValueError("plan_shape_mismatch")
+        if plan_response.result.aggregate_spec != state.shape.aggregate_spec:
+            raise ValueError("plan_aggregate_spec_mismatch")
         state.plan = plan_response.result
     except Exception:
         state.status = "plan_dependency_failed"
