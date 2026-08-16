@@ -3640,7 +3640,7 @@ run_evidence_scope_reference_scenarios() {
   assert_jq "scope.producer.inventory" "$inventory" '
     .inventory_scope == "configured_sources"
     and .inventory_status == "complete"
-    and (.sources | length) == 6
+    and (.sources | length) == 7
     and ([.sources[] | select(
       .source_id == "records_primary"
       and .scope_refs == {
@@ -3952,7 +3952,7 @@ run_evidence_scope_reference_scenarios() {
   restart_dsa
   inventory="$(fetch_dsa_inventory)"
   assert_jq "scope.malformed.restored" "$inventory" \
-    '.inventory_status == "complete" and (.sources | length) == 6'
+    '.inventory_status == "complete" and (.sources | length) == 7'
   echo "Scope reference case passed: malformed"
 
   owner="owner-scope-mismatch"
@@ -4065,7 +4065,7 @@ run_evidence_scope_reference_scenarios() {
   echo "Scope reference case passed: privacy"
 
   assert_jq "scope.summary.producer" "$inventory" \
-    '.inventory_status == "complete" and (.sources | length) == 6'
+    '.inventory_status == "complete" and (.sources | length) == 7'
   assert_jq "scope.summary.selector" "$declared_scope" \
     '.source_ids == ["records_primary"]'
   echo "Evidence scope references: producer=1 requested=1 derived=1 missing=1 malformed=1 mismatched=1 privacy=1 selector_sources=1 mismatch_acquisition=0 mismatch_provider=0"
