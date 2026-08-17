@@ -2253,10 +2253,18 @@ def parse_evidence_interpreter_completion(
         "object",
         "created",
         "model",
+        "service_tier",
         "system_fingerprint",
     }
     if not isinstance(value, dict) or set(value) - allowed_fields:
         raise ValueError("semantic_completion_invalid")
+    service_tier = value.get("service_tier")
+    if service_tier is not None and (
+        not isinstance(service_tier, str)
+        or not 1 <= len(service_tier) <= 120
+        or re.search(r"[\x00-\x1f\x7f]", service_tier)
+    ):
+        raise ValueError("semantic_service_tier_invalid")
     choices = value.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise ValueError("semantic_choices_invalid")
@@ -2266,15 +2274,35 @@ def parse_evidence_interpreter_completion(
         "message",
         "finish_reason",
         "logprobs",
+        "provider_specific_fields",
     }:
         raise ValueError("semantic_choice_invalid")
+    if choice.get("provider_specific_fields") is not None and not isinstance(
+        choice.get("provider_specific_fields"), dict
+    ):
+        raise ValueError("semantic_choice_provider_metadata_invalid")
     message = choice.get("message")
     if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
         raise ValueError("semantic_tool_call_forbidden")
     if message.get("refusal") not in (None, ""):
         raise ValueError("semantic_refusal_invalid")
-    if set(message) - {"role", "content", "refusal", "tool_calls"}:
+    if set(message) - {
+        "annotations",
+        "content",
+        "provider_specific_fields",
+        "refusal",
+        "role",
+        "tool_calls",
+    }:
         raise ValueError("semantic_message_invalid")
+    if message.get("annotations") is not None and not isinstance(
+        message.get("annotations"), list
+    ):
+        raise ValueError("semantic_message_annotations_invalid")
+    if message.get("provider_specific_fields") is not None and not isinstance(
+        message.get("provider_specific_fields"), dict
+    ):
+        raise ValueError("semantic_message_provider_metadata_invalid")
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("semantic_content_invalid")

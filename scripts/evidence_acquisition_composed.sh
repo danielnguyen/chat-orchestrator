@@ -652,12 +652,14 @@ assert_semantic_interpreter_calls() {
         == ["interpretation_status", "operation_hint", "candidate_source_ids",
             "aggregate_function", "aggregate_field_name"]
       and .tool_count == 0
-      and .max_completion_tokens == 120
+      and .max_completion_tokens == 512
+      and .reasoning_effort == "minimal"
       and .status == "ok"
       and ((keys - [
         "kind",
         "max_completion_tokens",
         "model",
+        "reasoning_effort",
         "request_id",
         "response_format_type",
         "response_schema_additional_properties",
