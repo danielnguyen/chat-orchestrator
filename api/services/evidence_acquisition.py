@@ -2157,7 +2157,6 @@ def evidence_interpreter_response_format() -> dict[str, Any]:
                     "candidate_source_ids": {
                         "type": "array",
                         "maxItems": 3,
-                        "uniqueItems": True,
                         "items": {
                             "type": "string",
                             "minLength": 1,

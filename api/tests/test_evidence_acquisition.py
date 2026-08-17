@@ -1875,7 +1875,16 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
 
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
-    assert schema["schema"]["properties"]["candidate_source_ids"]["maxItems"] == 3
+    candidate_schema = schema["schema"]["properties"]["candidate_source_ids"]
+    assert candidate_schema["type"] == "array"
+    assert candidate_schema["maxItems"] == 3
+    assert "uniqueItems" not in candidate_schema
+    assert candidate_schema["items"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 120,
+        "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    }
     assert schema["schema"]["required"] == [
         "interpretation_status",
         "operation_hint",
@@ -1956,6 +1965,22 @@ def test_evidence_interpreter_output_preserves_legacy_and_nullable_contracts():
     assert legacy_lookup.aggregate_function is None
     assert legacy_aggregate.aggregate_field_name is None
     assert nullable_lookup.aggregate_function is None
+
+
+def test_evidence_interpreter_output_rejects_duplicate_candidates():
+    with pytest.raises(
+        ValidationError,
+        match="duplicate_semantic_candidate_source_id",
+    ):
+        EvidenceInterpreterOutput.model_validate(
+            {
+                "interpretation_status": "ambiguous",
+                "operation_hint": "lookup",
+                "candidate_source_ids": ["source_a", "source_a"],
+                "aggregate_function": None,
+                "aggregate_field_name": None,
+            }
+        )
 
 
 @pytest.mark.parametrize(
