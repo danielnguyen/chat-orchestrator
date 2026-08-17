@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -198,6 +199,14 @@ _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
 _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 120
+_EVIDENCE_LOGGER = logging.getLogger("uvicorn.error.chat_orchestrator.evidence")
+_STRUCTURAL_PROVIDER_ERROR_PARAMS = {
+    "max_completion_tokens",
+    "model",
+    "response_format",
+}
+_PROVIDER_ERROR_FIELD_MAX_LENGTH = 120
+_PROVIDER_ERROR_DETAIL_MAX_LENGTH = 400
 _COMPOUND_VERIFICATION_BOUNDARY_REPLACEMENT = (
     "The governed new evidence check completed, but I withheld the generated "
     "explanation because it conflicted with the verification response boundary."
@@ -6369,6 +6378,139 @@ def _classifier_cloud_allowed(
     return True
 
 
+def _bounded_provider_error_string(value: Any, *, max_length: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()
+    if not value:
+        return None
+    return value[:max_length]
+
+
+def _provider_http_error_fields(exc: httpx.HTTPStatusError) -> dict[str, str]:
+    try:
+        payload = exc.response.json()
+    except Exception:
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return {}
+    error = payload["error"]
+    fields: dict[str, str] = {}
+    error_type = _bounded_provider_error_string(
+        error.get("type"),
+        max_length=_PROVIDER_ERROR_FIELD_MAX_LENGTH,
+    )
+    error_param = _bounded_provider_error_string(
+        error.get("param"),
+        max_length=_PROVIDER_ERROR_FIELD_MAX_LENGTH,
+    )
+    error_code_raw = error.get("code")
+    error_code = (
+        _bounded_provider_error_string(
+            error_code_raw,
+            max_length=_PROVIDER_ERROR_FIELD_MAX_LENGTH,
+        )
+        if isinstance(error_code_raw, str)
+        else (
+            str(error_code_raw)
+            if isinstance(error_code_raw, (int, float, bool))
+            else None
+        )
+    )
+    if error_type is not None:
+        fields["provider_error_type"] = error_type
+    if error_param is not None:
+        fields["provider_error_param"] = error_param
+    if error_code is not None and len(error_code) <= _PROVIDER_ERROR_FIELD_MAX_LENGTH:
+        fields["provider_error_code"] = error_code
+    if error_param in _STRUCTURAL_PROVIDER_ERROR_PARAMS:
+        detail = _bounded_provider_error_string(
+            error.get("message"),
+            max_length=_PROVIDER_ERROR_DETAIL_MAX_LENGTH,
+        )
+        if detail is not None:
+            detail = detail.encode("ascii", errors="replace").decode("ascii")
+            fields["provider_detail"] = json.dumps(detail, ensure_ascii=True)
+    return fields
+
+
+def _log_semantic_interpreter_failure(
+    *,
+    request_id: str,
+    reason: str,
+    failure_class: str,
+    route: dict[str, str] | None = None,
+    elapsed_ms: int | None = None,
+    timeout_ms: int | None = None,
+    exception_type: str | None = None,
+    extra_fields: dict[str, str | int] | None = None,
+) -> None:
+    fields = [
+        "semantic_interpreter_failed",
+        "event=semantic_interpreter_failed",
+        "component=chat-orchestrator",
+        f"request_id={request_id}",
+        f"logical_route={_EVIDENCE_INTERPRETER_ROUTE}",
+        f"reason={reason}",
+        f"failure_class={failure_class}",
+    ]
+    if route is not None:
+        fields.extend(
+            [f"model={route['model']}", f"provider={route['provider']}"]
+        )
+    if elapsed_ms is not None:
+        fields.append(f"elapsed_ms={elapsed_ms}")
+    if timeout_ms is not None:
+        fields.append(f"timeout_ms={timeout_ms}")
+    if exception_type is not None:
+        fields.append(f"exception_type={exception_type}")
+    if extra_fields:
+        fields.extend(f"{key}={value}" for key, value in extra_fields.items())
+    _EVIDENCE_LOGGER.warning("%s", " ".join(fields))
+
+
+def _log_evidence_acquisition_checkpoint(
+    *,
+    request_id: str,
+    state: EvidenceAcquisitionState,
+) -> None:
+    shape = state.shape
+    source_match = shape.source_match if shape is not None else None
+    plan = state.plan
+    inventory_status = state.inventory_discovery.get("inventory_status")
+    source_count = state.inventory_discovery.get("source_count", 0)
+    semantic_status = state.semantic_interpreter.get("status", "not_called")
+    semantic_reason = state.semantic_interpreter.get("reason", "not_eligible")
+    candidate_count = state.semantic_interpreter.get("candidate_count", 0)
+    strategies = list(plan.selected_strategies) if plan is not None else []
+    message = (
+        "evidence_acquisition_checkpoint "
+        "event=evidence_acquisition_checkpoint "
+        f"component=chat-orchestrator request_id={request_id} "
+        f"status={state.status} "
+        f"inventory_status={inventory_status or 'unavailable'} "
+        f"inventory_source_count={source_count} "
+        f"semantic_interpreter_status={semantic_status} "
+        f"semantic_interpreter_reason={semantic_reason} "
+        f"task_shape={shape.task_shape if shape and shape.task_shape else 'none'} "
+        f"source_match_status={source_match.status if source_match else 'none'} "
+        f"candidate_count={candidate_count} "
+        "clarification_required="
+        f"{str(bool(shape and shape.clarification_required)).lower()} "
+        f"plan_status={plan.plan_status if plan else 'not_compiled'} "
+        f"selected_strategy_count={len(strategies)} "
+        f"selected_strategies={','.join(strategies) if strategies else 'none'}"
+    )
+    log = (
+        _EVIDENCE_LOGGER.warning
+        if "failed" in state.status
+        or state.inventory_discovery.get("outcome")
+        in {"dependency_failure", "malformed_response"}
+        else _EVIDENCE_LOGGER.info
+    )
+    log("%s", message)
+
+
 async def _classify_history_followup(
     *,
     current_user_text: str,
@@ -6431,6 +6573,11 @@ async def _interpret_evidence_request(
 ) -> dict[str, Any]:
     route = _load_logical_route(model_registry_path, _EVIDENCE_INTERPRETER_ROUTE)
     if route is None:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="route_unavailable",
+            failure_class="route_unavailable",
+        )
         raise SemanticInterpreterFailure("route_unavailable")
     if not _classifier_cloud_allowed(
         provider=route["provider"],
@@ -6438,30 +6585,139 @@ async def _interpret_evidence_request(
         routing_policy=routing_policy,
         effective_payload=effective_payload,
     ):
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="provider_disallowed",
+            failure_class="provider_disallowed",
+            route=route,
+        )
         raise SemanticInterpreterFailure("provider_disallowed")
     if litellm is None or not callable(getattr(litellm, "chat", None)):
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="client_unavailable",
+            failure_class="client_unavailable",
+            route=route,
+        )
         raise SemanticInterpreterFailure("client_unavailable")
+    try:
+        messages = evidence_interpreter_messages(
+            task_text=task_text,
+            source_list=source_list,
+        )
+        response_format = evidence_interpreter_response_format()
+        schema_name = response_format.get("json_schema", {}).get("name", "unknown")
+    except Exception as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="dependency_failure",
+            failure_class="unexpected_error",
+            route=route,
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+        )
+        raise SemanticInterpreterFailure("dependency_failure") from exc
+    started_at = perf_counter()
+    _EVIDENCE_LOGGER.info(
+        "semantic_interpreter_started event=semantic_interpreter_started "
+        "component=chat-orchestrator request_id=%s logical_route=%s model=%s "
+        "provider=%s timeout_ms=%s max_completion_tokens=%s schema=%s",
+        request_id,
+        _EVIDENCE_INTERPRETER_ROUTE,
+        route["model"],
+        route["provider"],
+        timeout_ms,
+        _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS,
+        schema_name,
+    )
     try:
         completion = await litellm.chat(
             request_id=request_id,
             model=route["model"],
-            messages=evidence_interpreter_messages(
-                task_text=task_text,
-                source_list=source_list,
-            ),
-            response_format=evidence_interpreter_response_format(),
+            messages=messages,
+            response_format=response_format,
             max_completion_tokens=_EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS,
             timeout_ms=timeout_ms,
         )
+    except httpx.TimeoutException as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="dependency_failure",
+            failure_class="timeout",
+            route=route,
+            elapsed_ms=int((perf_counter() - started_at) * 1000),
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+        )
+        raise SemanticInterpreterFailure("dependency_failure") from exc
+    except httpx.HTTPStatusError as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="dependency_failure",
+            failure_class="http_error",
+            route=route,
+            elapsed_ms=int((perf_counter() - started_at) * 1000),
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+            extra_fields={
+                "http_status": exc.response.status_code,
+                **_provider_http_error_fields(exc),
+            },
+        )
+        raise SemanticInterpreterFailure("dependency_failure") from exc
+    except httpx.TransportError as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="dependency_failure",
+            failure_class="transport_error",
+            route=route,
+            elapsed_ms=int((perf_counter() - started_at) * 1000),
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+        )
+        raise SemanticInterpreterFailure("dependency_failure") from exc
     except Exception as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="dependency_failure",
+            failure_class="unexpected_error",
+            route=route,
+            elapsed_ms=int((perf_counter() - started_at) * 1000),
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+        )
         raise SemanticInterpreterFailure("dependency_failure") from exc
     try:
-        return parse_evidence_interpreter_completion(
+        result = parse_evidence_interpreter_completion(
             completion,
             inventory_source_ids={source.source_id for source in source_list.sources},
         )
     except Exception as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="malformed_response",
+            failure_class="malformed_response",
+            route=route,
+            elapsed_ms=int((perf_counter() - started_at) * 1000),
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+        )
         raise SemanticInterpreterFailure("malformed_response") from exc
+    _EVIDENCE_LOGGER.info(
+        "semantic_interpreter_completed event=semantic_interpreter_completed "
+        "component=chat-orchestrator request_id=%s logical_route=%s model=%s "
+        "provider=%s elapsed_ms=%s interpretation_status=%s operation_hint=%s "
+        "candidate_count=%s",
+        request_id,
+        _EVIDENCE_INTERPRETER_ROUTE,
+        route["model"],
+        route["provider"],
+        int((perf_counter() - started_at) * 1000),
+        result["interpretation_status"],
+        result["operation_hint"],
+        len(result["candidate_source_ids"]),
+    )
+    return result
 
 
 async def _resolve_history_policy(
@@ -8368,6 +8624,10 @@ async def orchestrate_chat(
                     interaction_kind=interaction_governance["interaction_kind"],
                     external_context=external_config,
                     semantic_interpreter=semantic_interpreter,
+                )
+                _log_evidence_acquisition_checkpoint(
+                    request_id=request_id,
+                    state=evidence_acquisition,
                 )
                 if evidence_acquisition.follow_existing_path:
                     external_context_pack = None

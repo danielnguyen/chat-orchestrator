@@ -42,13 +42,16 @@ from services.evidence_acquisition import (
     HELPFUL_GROUNDED_RECOVERY_RESPONSE,
     NEXT_STEP_DEPENDENCY_ANSWER,
     TARGETED_SCOPE_SUFFIX,
+    DsaSourceListResponse,
     EvidenceAcquisitionPremise,
+    SemanticInterpreterFailure,
     _acquisition_premise_digest,
 )
 from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_retrieval_debug,
+    _interpret_evidence_request,
     _load_logical_route,
     _registry_allows_exact_capability,
     _relationship_projection_allows,
@@ -14011,6 +14014,51 @@ def _evidence_interpreter_completion(
     return {"choices": [{"message": {"content": json.dumps(payload)}}]}
 
 
+def _operator_diagnostic_source_list(
+    *,
+    source_id="PRIVATE_SOURCE_ID_SENTINEL",
+    field_name="PRIVATE_FIELD_SENTINEL",
+):
+    source = _neutral_schedule_sources()[0]
+    source["source_id"] = source_id
+    source["display_name"] = "PRIVATE_SOURCE_NAME_SENTINEL"
+    source["domain_tags"] = ["private-domain-sentinel"]
+    source["content_fields"] = [field_name]
+    return DsaSourceListResponse.model_validate(
+        {
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [source],
+        }
+    )
+
+
+async def _call_evidence_interpreter(
+    *,
+    tmp_path,
+    litellm,
+    request_id="rid-evidence-operator-diagnostics",
+    local_only=False,
+    include_route=True,
+):
+    _, models = (
+        _write_evidence_interpreter_route_files(tmp_path)
+        if include_route
+        else _write_default_route_files(tmp_path)
+    )
+    return await _interpret_evidence_request(
+        request_id=request_id,
+        task_text="PRIVATE_USER_PROMPT_SENTINEL",
+        source_list=_operator_diagnostic_source_list(),
+        litellm=litellm,
+        model_registry_path=str(models),
+        timeout_ms=3000,
+        local_only=local_only,
+        routing_policy={},
+        effective_payload={},
+    )
+
+
 def _first_party_chat_payload(
     user_text: str,
     **overrides,
@@ -18685,6 +18733,231 @@ def _neutral_schedule_sources():
 
 
 @pytest.mark.asyncio
+async def test_evidence_interpreter_http_error_logs_bounded_structural_detail(
+    tmp_path,
+    caplog,
+):
+    request = httpx.Request("POST", "https://provider.invalid/v1/chat/completions")
+    response = httpx.Response(
+        400,
+        request=request,
+        json={
+            "error": {
+                "message": (
+                    "Invalid schema for response_format "
+                    "'evidence_source_interpretation': 'uniqueItems' is not permitted."
+                ),
+                "type": "invalid_request_error",
+                "param": "response_format",
+                "code": "invalid_schema",
+            },
+            "PRIVATE_PROVIDER_BODY_SENTINEL": "MUST_NOT_APPEAR",
+        },
+    )
+    failure = httpx.HTTPStatusError(
+        "PRIVATE_EXCEPTION_SENTINEL",
+        request=request,
+        response=response,
+    )
+    litellm = SequenceLiteLLM([failure])
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+
+    with pytest.raises(SemanticInterpreterFailure) as exc_info:
+        await _call_evidence_interpreter(tmp_path=tmp_path, litellm=litellm)
+
+    assert exc_info.value.reason == "dependency_failure"
+    logs = caplog.text
+    assert "event=semantic_interpreter_started" in logs
+    assert "event=semantic_interpreter_failed" in logs
+    assert "request_id=rid-evidence-operator-diagnostics" in logs
+    assert "failure_class=http_error" in logs
+    assert "http_status=400" in logs
+    assert "provider_error_type=invalid_request_error" in logs
+    assert "provider_error_param=response_format" in logs
+    assert "provider_error_code=invalid_schema" in logs
+    assert "Invalid schema for response_format" in logs
+    assert "uniqueItems" in logs
+    assert next(
+        record
+        for record in caplog.records
+        if "event=semantic_interpreter_started" in record.getMessage()
+    ).levelno == logging.INFO
+    assert next(
+        record
+        for record in caplog.records
+        if "event=semantic_interpreter_failed" in record.getMessage()
+    ).levelno == logging.WARNING
+    for private_value in (
+        "PRIVATE_PROVIDER_BODY_SENTINEL",
+        "MUST_NOT_APPEAR",
+        "PRIVATE_EXCEPTION_SENTINEL",
+        "PRIVATE_USER_PROMPT_SENTINEL",
+        "PRIVATE_SOURCE_ID_SENTINEL",
+        "PRIVATE_FIELD_SENTINEL",
+    ):
+        assert private_value not in logs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "failure_class"),
+    [
+        (
+            httpx.ReadTimeout(
+                "PRIVATE_TIMEOUT_SENTINEL",
+                request=httpx.Request("POST", "https://provider.invalid"),
+            ),
+            "timeout",
+        ),
+        (
+            httpx.ConnectError(
+                "PRIVATE_TRANSPORT_SENTINEL",
+                request=httpx.Request("POST", "https://provider.invalid"),
+            ),
+            "transport_error",
+        ),
+        (RuntimeError("PRIVATE_UNEXPECTED_SENTINEL"), "unexpected_error"),
+    ],
+)
+async def test_evidence_interpreter_dependency_failures_are_classified_privately(
+    tmp_path,
+    caplog,
+    failure,
+    failure_class,
+):
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+
+    with pytest.raises(SemanticInterpreterFailure) as exc_info:
+        await _call_evidence_interpreter(
+            tmp_path=tmp_path,
+            litellm=SequenceLiteLLM([failure]),
+        )
+
+    assert exc_info.value.reason == "dependency_failure"
+    assert f"failure_class={failure_class}" in caplog.text
+    assert "request_id=rid-evidence-operator-diagnostics" in caplog.text
+    assert "timeout_ms=3000" in caplog.text
+    assert "provider_detail" not in caplog.text
+    assert "PRIVATE_" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_evidence_interpreter_malformed_completion_omits_provider_content(
+    tmp_path,
+    caplog,
+):
+    completion = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "interpretation_status": "resolved",
+                            "operation_hint": "lookup",
+                            "candidate_source_ids": ["PRIVATE_SOURCE_ID_SENTINEL"],
+                            "PRIVATE_PROVIDER_BODY_SENTINEL": "MUST_NOT_APPEAR",
+                        }
+                    )
+                }
+            }
+        ]
+    }
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+
+    with pytest.raises(SemanticInterpreterFailure) as exc_info:
+        await _call_evidence_interpreter(
+            tmp_path=tmp_path,
+            litellm=SequenceLiteLLM([completion]),
+        )
+
+    assert exc_info.value.reason == "malformed_response"
+    assert "failure_class=malformed_response" in caplog.text
+    assert "exception_type=ValidationError" in caplog.text
+    assert "PRIVATE_" not in caplog.text
+    assert "MUST_NOT_APPEAR" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_evidence_interpreter_success_logs_only_structural_result(
+    tmp_path,
+    caplog,
+):
+    completion = _evidence_interpreter_completion(
+        "resolved",
+        "aggregate",
+        ["PRIVATE_SOURCE_ID_SENTINEL"],
+        aggregate_function="median",
+        aggregate_field_name="PRIVATE_FIELD_SENTINEL",
+    )
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+
+    result = await _call_evidence_interpreter(
+        tmp_path=tmp_path,
+        litellm=SequenceLiteLLM([completion]),
+    )
+
+    assert result == {
+        "interpretation_status": "resolved",
+        "operation_hint": "aggregate",
+        "candidate_source_ids": ["PRIVATE_SOURCE_ID_SENTINEL"],
+        "aggregate_function": "median",
+        "aggregate_field_name": "PRIVATE_FIELD_SENTINEL",
+    }
+    logs = caplog.text
+    assert "event=semantic_interpreter_started" in logs
+    assert "event=semantic_interpreter_completed" in logs
+    assert "request_id=rid-evidence-operator-diagnostics" in logs
+    assert "logical_route=evidence_interpreter" in logs
+    assert "model=gpt-5-mini" in logs
+    assert "provider=cloud" in logs
+    assert "interpretation_status=resolved" in logs
+    assert "operation_hint=aggregate" in logs
+    assert "candidate_count=1" in logs
+    assert "elapsed_ms=" in logs
+    assert all(
+        record.levelno == logging.INFO
+        for record in caplog.records
+        if "event=semantic_interpreter_" in record.getMessage()
+    )
+    assert "PRIVATE_" not in logs
+    assert "aggregate_function" not in logs
+    assert "median" not in logs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_class", "call_kwargs"),
+    [
+        ("route_unavailable", {"include_route": False}),
+        ("provider_disallowed", {"local_only": True}),
+        ("client_unavailable", {"litellm": None}),
+    ],
+)
+async def test_evidence_interpreter_early_failures_log_without_provider_call(
+    tmp_path,
+    caplog,
+    failure_class,
+    call_kwargs,
+):
+    litellm = call_kwargs.pop("litellm", SequenceLiteLLM([]))
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+
+    with pytest.raises(SemanticInterpreterFailure) as exc_info:
+        await _call_evidence_interpreter(
+            tmp_path=tmp_path,
+            litellm=litellm,
+            **call_kwargs,
+        )
+
+    assert exc_info.value.reason == failure_class
+    assert f"failure_class={failure_class}" in caplog.text
+    assert "event=semantic_interpreter_failed" in caplog.text
+    assert "event=semantic_interpreter_started" not in caplog.text
+    if litellm is not None:
+        assert litellm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(tmp_path):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
     question = "How are you today?"
@@ -18853,6 +19126,7 @@ async def test_ordinary_chat_survives_semantic_interpreter_failure(tmp_path):
 )
 async def test_material_unresolved_classifier_failure_is_safe_and_provider_free(
     tmp_path,
+    caplog,
     classifier_result,
 ):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
@@ -18883,10 +19157,11 @@ async def test_material_unresolved_classifier_failure_is_safe_and_provider_free(
         }
     )
     memory_store = FakeMemoryStore()
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
-            "Verify the relevant owner record.",
+            "PRIVATE_USER_PROMPT_SENTINEL",
             external_context_enabled=True,
         ),
         memory_store=memory_store,
@@ -18912,6 +19187,25 @@ async def test_material_unresolved_classifier_failure_is_safe_and_provider_free(
     ]
     assert semantic_trace["status"] == "failed"
     assert semantic_trace["candidate_count"] == 0
+    checkpoint = next(
+        record
+        for record in caplog.records
+        if "event=evidence_acquisition_checkpoint" in record.getMessage()
+    )
+    assert checkpoint.levelno == logging.WARNING
+    checkpoint = checkpoint.getMessage()
+    assert "request_id=rid-semantic-material-failure" in checkpoint
+    assert "status=semantic_interpreter_failed" in checkpoint
+    assert "semantic_interpreter_status=failed" in checkpoint
+    assert "plan_status=not_compiled" in checkpoint
+    for private_value in (
+        "PRIVATE_USER_PROMPT_SENTINEL",
+        "personal_schedule",
+        "household_schedule",
+        "public_holidays",
+        "fabricated_source",
+    ):
+        assert private_value not in checkpoint
 
 
 @pytest.mark.asyncio
@@ -19171,6 +19465,7 @@ async def test_semantic_ambiguity_and_aggregate_are_provider_free(
 @pytest.mark.parametrize("block_policy", [False, True])
 async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy_gated(
     tmp_path,
+    caplog,
     block_policy,
 ):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
@@ -19220,6 +19515,7 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
         ]
     )
     memory_store = FakeMemoryStore()
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(question, external_context_enabled=True),
@@ -19268,6 +19564,37 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
         {"requirement_id": "context-delivery", "outcome": "satisfied"},
         {"requirement_id": "no-truncation", "outcome": "satisfied"},
     ]
+    checkpoint = next(
+        record
+        for record in caplog.records
+        if "event=evidence_acquisition_checkpoint" in record.getMessage()
+    )
+    assert checkpoint.levelno == logging.INFO
+    checkpoint = checkpoint.getMessage()
+    assert f"request_id={request_id}" in checkpoint
+    assert "status=acquisition_ready" in checkpoint
+    assert "inventory_status=complete" in checkpoint
+    assert "inventory_source_count=1" in checkpoint
+    assert "semantic_interpreter_status=accepted" in checkpoint
+    assert "task_shape=aggregate" in checkpoint
+    assert "source_match_status=matched" in checkpoint
+    assert "candidate_count=1" in checkpoint
+    assert "clarification_required=false" in checkpoint
+    assert "plan_status=ready" in checkpoint
+    assert "selected_strategy_count=1" in checkpoint
+    assert "selected_strategies=structured_field_values" in checkpoint
+    for private_value in (
+        question,
+        "metrics_archive",
+        "Configured Metrics Archive",
+        "metrics",
+        "archive",
+        "Reading",
+        "Entry",
+        "10.125",
+        "55.75",
+    ):
+        assert private_value not in checkpoint
     premise = runtime.evidence_next_step_calls[0]["current_premise"]
     assert premise["aggregate_spec"] == {
         "function": "median",
