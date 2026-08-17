@@ -1418,7 +1418,12 @@ class DsaContextItem(StrictModel):
     @field_validator("source_ref")
     @classmethod
     def validate_opaque_source_ref(cls, value: str) -> str:
-        if re.search(r"\s|://|\?", value):
+        if (
+            value != value.strip()
+            or re.search(r"[\x00-\x1f\x7f]", value)
+            or "://" in value
+            or "?" in value
+        ):
             raise ValueError("unsafe_source_reference")
         return value
 

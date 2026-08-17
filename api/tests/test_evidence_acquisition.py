@@ -1443,6 +1443,44 @@ def test_structured_field_value_contract_is_strict_and_counted():
     assert serialized_structured["structured_data"]["kind"] == "field_values"
 
 
+def test_structured_response_accepts_and_preserves_internal_space_source_ref():
+    source_ref = "google_sheets:metrics_archive:'Measurements Archive'!A2:F23"
+    response = _structured_field_response(
+        ["10", None, "20"],
+        source_id="metrics_archive",
+    )
+    response["results"][0]["source_ref"] = source_ref
+
+    validated = DsaContextItem.model_validate(response["results"][0])
+    assert validated.source_ref == source_ref
+
+    validated_response, outcome = validate_structured_field_values_response(
+        response,
+        expected_source_id="metrics_archive",
+        expected_field_name="Reading",
+    )
+    assert outcome == "satisfied"
+    assert validated_response.results[0].source_ref == source_ref
+
+
+@pytest.mark.parametrize(
+    "source_ref",
+    [
+        " google_sheets:source_a:Measurements!A2:C6",
+        "google_sheets:source_a:Measurements!A2:C6 ",
+        "google_sheets:source_a:Measurements\n!A2:C6",
+        "google_sheets://source_a/Measurements!A2:C6",
+        "google_sheets:source_a:Measurements!A2:C6?range=other",
+    ],
+)
+def test_context_item_rejects_unsafe_source_reference(source_ref):
+    item = _structured_field_response(["10"])["results"][0]
+    item["source_ref"] = source_ref
+
+    with pytest.raises(ValidationError, match="unsafe_source_reference"):
+        DsaContextItem.model_validate(item)
+
+
 def test_structured_response_requires_exact_source_field_and_shape():
     valid, outcome = validate_structured_field_values_response(
         _structured_field_response(["10", None, "20"]),
