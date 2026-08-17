@@ -102,7 +102,8 @@ async def test_litellm_chat_supports_strict_bounded_classifier_request(monkeypat
         model="gpt-5-mini",
         messages=[{"role": "user", "content": "Where did that come from?"}],
         response_format=response_format,
-        max_completion_tokens=120,
+        max_completion_tokens=512,
+        reasoning_effort="minimal",
         timeout_ms=3000,
     )
 
@@ -113,7 +114,8 @@ async def test_litellm_chat_supports_strict_bounded_classifier_request(monkeypat
                 {"role": "user", "content": "Where did that come from?"}
             ],
             "response_format": response_format,
-            "max_completion_tokens": 120,
+            "max_completion_tokens": 512,
+            "reasoning_effort": "minimal",
         },
         "headers": {
             "Content-Type": "application/json",

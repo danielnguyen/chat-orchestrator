@@ -198,7 +198,8 @@ _RETIREMENT_POLICY_UNAVAILABLE = (
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
 _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
-_EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 120
+_EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 512
+_EVIDENCE_INTERPRETER_REASONING_EFFORT = "minimal"
 _EVIDENCE_LOGGER = logging.getLogger("uvicorn.error.chat_orchestrator.evidence")
 _STRUCTURAL_PROVIDER_ERROR_PARAMS = {
     "max_completion_tokens",
@@ -6621,13 +6622,15 @@ async def _interpret_evidence_request(
     _EVIDENCE_LOGGER.info(
         "semantic_interpreter_started event=semantic_interpreter_started "
         "component=chat-orchestrator request_id=%s logical_route=%s model=%s "
-        "provider=%s timeout_ms=%s max_completion_tokens=%s schema=%s",
+        "provider=%s timeout_ms=%s max_completion_tokens=%s reasoning_effort=%s "
+        "schema=%s",
         request_id,
         _EVIDENCE_INTERPRETER_ROUTE,
         route["model"],
         route["provider"],
         timeout_ms,
         _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS,
+        _EVIDENCE_INTERPRETER_REASONING_EFFORT,
         schema_name,
     )
     try:
@@ -6637,6 +6640,7 @@ async def _interpret_evidence_request(
             messages=messages,
             response_format=response_format,
             max_completion_tokens=_EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS,
+            reasoning_effort=_EVIDENCE_INTERPRETER_REASONING_EFFORT,
             timeout_ms=timeout_ms,
         )
     except httpx.TimeoutException as exc:

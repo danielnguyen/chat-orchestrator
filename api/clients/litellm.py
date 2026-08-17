@@ -20,6 +20,7 @@ class LiteLLMClient:
         tools: list[dict[str, Any]] | None = None,
         response_format: dict[str, Any] | None = None,
         max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
         timeout_ms: int | None = None,
     ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
@@ -36,6 +37,8 @@ class LiteLLMClient:
             payload["response_format"] = response_format
         if max_completion_tokens is not None:
             payload["max_completion_tokens"] = max_completion_tokens
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
         timeout = self.timeout if timeout_ms is None else timeout_ms / 1000
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(

@@ -18775,6 +18775,8 @@ async def test_evidence_interpreter_http_error_logs_bounded_structural_detail(
     assert "provider_error_type=invalid_request_error" in logs
     assert "provider_error_param=response_format" in logs
     assert "provider_error_code=invalid_schema" in logs
+    assert "max_completion_tokens=512" in logs
+    assert "reasoning_effort=minimal" in logs
     assert "Invalid schema for response_format" in logs
     assert "uniqueItems" in logs
     assert next(
@@ -18891,9 +18893,10 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     )
     caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
 
+    litellm = SequenceLiteLLM([completion])
     result = await _call_evidence_interpreter(
         tmp_path=tmp_path,
-        litellm=SequenceLiteLLM([completion]),
+        litellm=litellm,
     )
 
     assert result == {
@@ -18910,6 +18913,9 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "logical_route=evidence_interpreter" in logs
     assert "model=gpt-5-mini" in logs
     assert "provider=cloud" in logs
+    assert "timeout_ms=3000" in logs
+    assert "max_completion_tokens=512" in logs
+    assert "reasoning_effort=minimal" in logs
     assert "interpretation_status=resolved" in logs
     assert "operation_hint=aggregate" in logs
     assert "candidate_count=1" in logs
@@ -18922,6 +18928,16 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "PRIVATE_" not in logs
     assert "aggregate_function" not in logs
     assert "median" not in logs
+    assert litellm.calls[0]["model"] == "gpt-5-mini"
+    assert litellm.calls[0]["timeout_ms"] == 3000
+    assert litellm.calls[0]["max_completion_tokens"] == 512
+    assert litellm.calls[0]["reasoning_effort"] == "minimal"
+    response_format = litellm.calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == (
+        "evidence_source_interpretation"
+    )
+    assert response_format["json_schema"]["strict"] is True
 
 
 @pytest.mark.asyncio
@@ -30832,6 +30848,8 @@ async def test_natural_history_paraphrase_matrix_calls_classifier_and_bms_once(
     )
     assert result["selected_model"] == "not_called"
     assert len(litellm.calls) == 1
+    assert litellm.calls[0]["max_completion_tokens"] == 120
+    assert "reasoning_effort" not in litellm.calls[0]
     assert len(runtime.interaction_governance_calls) == 2
     assert len(memory_store.immediate_history_calls) == 1
     assert memory_store.retrieve_calls == []

@@ -276,21 +276,26 @@ async def chat_completions(
                 "request_id": x_request_id,
                 "model": model,
                 "tool_count": tool_count,
+                "reasoning_effort": body.get("reasoning_effort"),
                 **classifier_diagnostics,
                 "status": "ok",
             }
         )
         return {
             "id": "completion-smoke",
+            "service_tier": "default",
             "choices": [
                 {
                     "index": 0,
+                    "provider_specific_fields": {},
                     "message": {
                         "role": "assistant",
                         "content": json.dumps(
                             semantic_result,
                             separators=(",", ":"),
                         ),
+                        "annotations": [],
+                        "provider_specific_fields": {},
                     },
                     "finish_reason": "stop",
                 }

@@ -1790,6 +1790,34 @@ def _semantic_completion(payload):
     return {"choices": [{"message": {"content": json.dumps(payload)}}]}
 
 
+def _live_semantic_completion(payload):
+    return {
+        "id": "completion-live-compatible",
+        "object": "chat.completion",
+        "created": 1786930000,
+        "model": "gpt-5-mini",
+        "service_tier": "default",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "provider_specific_fields": {},
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(payload),
+                    "annotations": [],
+                    "provider_specific_fields": {},
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 937,
+            "completion_tokens": 114,
+            "total_tokens": 1051,
+        },
+    }
+
+
 def test_dsa_source_inventory_accepts_optional_bounded_content_fields():
     current = DsaSourceListResponse.model_validate({"sources": [_source("source_a")]})
     enriched_source = _source("source_a")
@@ -2127,6 +2155,66 @@ def test_evidence_interpreter_parser_canonicalizes_candidate_ids():
     )
 
     assert parsed["candidate_source_ids"] == ["source_a", "source_b"]
+
+
+def test_evidence_interpreter_parser_accepts_live_litellm_envelope_metadata():
+    parsed = parse_evidence_interpreter_completion(
+        _live_semantic_completion(
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "aggregate",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": "median",
+                "aggregate_field_name": "Fuel (L)",
+            }
+        ),
+        inventory_source_ids={"source_a"},
+    )
+
+    assert parsed == {
+        "interpretation_status": "resolved",
+        "operation_hint": "aggregate",
+        "candidate_source_ids": ["source_a"],
+        "aggregate_function": "median",
+        "aggregate_field_name": "Fuel (L)",
+    }
+
+
+@pytest.mark.parametrize(
+    ("level", "value"),
+    [
+        ("top", {"unknown_transport_field": True}),
+        ("choice", {"unknown_choice_field": True}),
+        ("message", {"unknown_message_field": True}),
+        ("top", {"service_tier": 1}),
+        ("choice", {"provider_specific_fields": []}),
+        ("message", {"annotations": {}}),
+        ("message", {"provider_specific_fields": []}),
+    ],
+)
+def test_evidence_interpreter_parser_rejects_unknown_or_malformed_metadata(
+    level,
+    value,
+):
+    completion = _live_semantic_completion(
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "lookup",
+            "candidate_source_ids": ["source_a"],
+        }
+    )
+    target = completion
+    if level == "choice":
+        target = completion["choices"][0]
+    elif level == "message":
+        target = completion["choices"][0]["message"]
+    target.update(value)
+
+    with pytest.raises(ValueError):
+        parse_evidence_interpreter_completion(
+            completion,
+            inventory_source_ids={"source_a"},
+        )
 
 
 def test_evidence_interpreter_parser_omits_provider_nulls_from_cr_advisory():
