@@ -22,6 +22,7 @@ models:
     cost_per_1k_tokens: 0
   chat_voice_openai:
     provider: cloud
+    structured_output: json_schema
     vision: false
     code: medium
     max_context_tokens: 128000
@@ -29,6 +30,7 @@ models:
     cost_per_1k_tokens: 0.003
   chat_deep_openai:
     provider: cloud
+    structured_output: json_schema
     vision: false
     code: strong
     max_context_tokens: 200000

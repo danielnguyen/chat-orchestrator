@@ -305,6 +305,14 @@ restart_orchestrator_with_reserve() {
   wait_for_http "http://127.0.0.1:14361/healthz"
 }
 
+restart_orchestrator_with_manual_override() {
+  COMPOSED_ALLOW_MANUAL_OVERRIDE=true
+  COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE=2048
+  export COMPOSED_ALLOW_MANUAL_OVERRIDE COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+}
+
 restart_orchestrator_for_changed_premise() {
   COMPOSED_ALLOW_MANUAL_OVERRIDE=true
   COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE=14744
@@ -635,6 +643,23 @@ assert_advisory_provider_calls() {
     and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
       | select(.content | startswith("Governed evidence response contract:"))]
       | length) == 0
+  ' <<<"$provider_calls" >/dev/null
+}
+
+assert_grounded_structured_provider_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(.kind == "chat")] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .tool_count == 0
+      and .response_format_type == "json_schema"
+      and .response_schema_name == "grounded_evidence_response"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required
+        == ["conclusion_disposition", "evidence_excerpts"]
+    ))
   ' <<<"$provider_calls" >/dev/null
 }
 
@@ -1849,6 +1874,7 @@ run_evidence_adversarial_provider_scenario() {
   reset_source_fixture
   reset_dsa_audit
   queue_provider_answer "Every possible source was fully examined, and no evidence exists outside this result."
+  queue_provider_answer "Every possible source was fully examined, and no evidence exists outside this result."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-adversarial")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1880,7 +1906,7 @@ run_evidence_adversarial_provider_scenario() {
     and .inventory.declared_source_count == 1
   '
   assert_jq "adversarial.malformed_freeform.provider_calls" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 1'
+    '([.calls[] | select(.kind == "chat")] | length) == 2'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
     echo "Assertion failed: adversarial.malformed_freeform.dsa" >&2
     return 1
@@ -1897,7 +1923,9 @@ run_evidence_adversarial_provider_scenario() {
   fi
   assert_jq "adversarial.malformed_freeform.dispatch" "$trace" \
     '.fallback.triggered == false
-    and (.model_calls | length) == 1
+    and (.model_calls | length) == 2
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 1
+    and .retrieval.prompt_assembly.evidence_response.repair_outcome == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
     and .retrieval.prompt_assembly.evidence_response.failure_reason == "invalid_json"
@@ -1997,6 +2025,7 @@ run_evidence_adversarial_provider_scenario() {
   reset_source_fixture
   reset_dsa_audit
   queue_provider_answer "$forged_candidate"
+  queue_provider_answer "$forged_candidate"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-adversarial-endorsed")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -2027,7 +2056,7 @@ run_evidence_adversarial_provider_scenario() {
     and .inventory.declared_source_count == 1
   '
   assert_jq "adversarial.forged_reference.provider_calls" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 1'
+    '([.calls[] | select(.kind == "chat")] | length) == 2'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
     echo "Assertion failed: adversarial.forged_reference.dsa" >&2
     return 1
@@ -2044,7 +2073,9 @@ run_evidence_adversarial_provider_scenario() {
   fi
   assert_jq "adversarial.forged_reference.dispatch" "$trace" \
     '.fallback.triggered == false
-    and (.model_calls | length) == 1
+    and (.model_calls | length) == 2
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 1
+    and .retrieval.prompt_assembly.evidence_response.repair_outcome == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
     and .retrieval.prompt_assembly.evidence_response.failure_reason == "reference_not_retained"
@@ -3449,6 +3480,7 @@ run_evidence_compound_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   queue_provider_answer $'## Original acquisition:\nPRIVATE-LABEL-SENTINEL\n\nNew verification unavailable:\nNo fresh check occurred.'
+  queue_provider_answer $'## Original acquisition:\nPRIVATE-LABEL-SENTINEL\n\nNew verification unavailable:\nNo fresh check occurred.'
   response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
@@ -3508,14 +3540,16 @@ run_evidence_compound_scenarios() {
   assert_jq "compound.label_conflict.trace_fallback" "$trace" \
     '.fallback.triggered == false'
   assert_jq "compound.label_conflict.trace_model_count" "$trace" \
-    '(.model_calls | length) == 1'
+    '(.model_calls | length) == 2'
   assert_jq "compound.label_conflict.recovery" "$trace" '
     .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.failure_reason == "invalid_json"
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 1
+    and .retrieval.prompt_assembly.evidence_response.repair_outcome == "invalid"
     and .retrieval.prompt_assembly.evidence_response.recovery_status == "deterministic_helpful_fallback"
   '
   assert_jq "compound.label_conflict.provider_calls" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 1'
+    '([.calls[] | select(.kind == "chat")] | length) == 2'
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
     echo "Assertion failed: compound.label_conflict.dsa" >&2
     return 1
@@ -4111,6 +4145,7 @@ run_structured_answer_failure_case() {
   reset_source_fixture
   reset_dsa_audit
   queue_provider_answer "$candidate"
+  queue_provider_answer "$candidate"
   conversation_id="$(resolve_conversation "$owner" "$client" "structured-${case_name}")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
     "Verify the migration record." \
@@ -4138,11 +4173,18 @@ run_structured_answer_failure_case() {
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
   assert_jq "structured.${case_name}.provider" "$provider_calls" '
-    ([.calls[] | select(.kind == "chat")] | length) == 1
+    ([.calls[] | select(.kind == "chat")] | length) == 2
     and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
   '
+  assert_grounded_structured_provider_calls "$provider_calls" 2
   assert_jq "structured.${case_name}.validation" "$trace" \
-    '.retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
+    '.retrieval.prompt_assembly.evidence_response.initial_validation_status == "invalid"
+    and .retrieval.prompt_assembly.evidence_response.initial_failure_reason == $reason
+    and .retrieval.prompt_assembly.evidence_response.repair_eligible == true
+    and .retrieval.prompt_assembly.evidence_response.repair_attempted == true
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 1
+    and .retrieval.prompt_assembly.evidence_response.repair_outcome == "invalid"
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "invalid"
     and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 0
     and .retrieval.prompt_assembly.evidence_response.failure_reason == $reason
     and .retrieval.prompt_assembly.evidence_response.recovery_status == "deterministic_helpful_fallback"' \
@@ -4206,19 +4248,25 @@ run_evidence_structured_answer_recovery_scenarios() {
     and (.answer | contains("source_ref") | not)
   '
   assert_jq "structured.supports.validation" "$trace" '
-    .retrieval.prompt_assembly.evidence_response == {
-      contract_active:true,
-      validation_status:"valid",
-      validated_excerpt_count:1,
-      failure_reason:null,
-      provider_tool_count:0,
-      recovery_status:"not_needed"
-    }
+    .retrieval.prompt_assembly.evidence_response.contract_active == true
+    and .retrieval.prompt_assembly.evidence_response.structured_transport_required == true
+    and .retrieval.prompt_assembly.evidence_response.primary_structured_capability == "supported"
+    and .retrieval.prompt_assembly.evidence_response.response_format_mode == "json_schema"
+    and .retrieval.prompt_assembly.evidence_response.initial_validation_status == "valid"
+    and .retrieval.prompt_assembly.evidence_response.repair_attempted == false
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 0
+    and .retrieval.prompt_assembly.evidence_response.repair_outcome == "not_needed"
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "valid"
+    and .retrieval.prompt_assembly.evidence_response.validated_excerpt_count == 1
+    and .retrieval.prompt_assembly.evidence_response.failure_reason == null
+    and .retrieval.prompt_assembly.evidence_response.provider_tool_count == 0
+    and .retrieval.prompt_assembly.evidence_response.recovery_status == "not_needed"
   '
   assert_jq "structured.supports.provider" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 1
     and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
   '
+  assert_grounded_structured_provider_calls "$provider_calls" 1
   assert_jq "structured.supports.manifest" "$manifest" '
     .acquisition.sources_selected == ["records_primary"]
     and .acquisition.prompt_retained_item_count == 2
@@ -4283,6 +4331,7 @@ run_evidence_structured_answer_recovery_scenarios() {
     ([.calls[] | select(.kind == "chat")] | length) == 1
     and all(.calls[] | select(.kind == "chat"); .tool_count == 0)
   '
+  assert_grounded_structured_provider_calls "$provider_calls" 1
   response_digest="sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
   assert_jq "structured.does_not_support.digest" "$manifest" \
     '.response_digest == $digest' --arg digest "$response_digest"
@@ -4293,6 +4342,134 @@ run_evidence_structured_answer_recovery_scenarios() {
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 1
   echo "Structured answer case passed: valid_does_not_support"
+
+  owner="owner-structured-fallback"
+  client="client-structured-fallback"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  provider_post "/fixture/fail-next-primary" '{}'
+  queue_evidence_candidate "supports" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
+  conversation_id="$(resolve_conversation "$owner" "$client" "structured-fallback")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Verify the migration record." \
+    '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  assert_jq "structured.fallback.response" "$response" '
+    .status == "degraded"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+  '
+  assert_grounded_structured_provider_calls "$provider_calls" 2
+  assert_jq "structured.fallback.provider" "$provider_calls" '
+    [.calls[] | select(.kind == "chat")] as $calls
+    | $calls[0].status == "failed"
+    and $calls[1].status == "ok"
+    and $calls[0].model == "chat_voice_openai"
+    and $calls[1].model == "chat_deep_openai"
+    and $calls[0].response_schema_name == $calls[1].response_schema_name
+  '
+  assert_jq "structured.fallback.trace" "$trace" '
+    .fallback.triggered == true
+    and .retrieval.prompt_assembly.evidence_response.primary_structured_capability == "supported"
+    and .retrieval.prompt_assembly.evidence_response.fallback_structured_capability == "supported"
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "valid"
+    and .retrieval.prompt_assembly.evidence_response.repair_attempted == false
+  '
+  echo "Structured answer case passed: supported_fallback"
+
+  owner="owner-structured-unsupported"
+  client="client-structured-unsupported"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  restart_orchestrator_with_manual_override
+  conversation_id="$(resolve_conversation "$owner" "$client" "structured-unsupported")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Verify the migration record." \
+    '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}' \
+    "chat_local_fast")"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  claims="$(list_claim_records "$owner" "$conversation_id")"
+  assert_jq "structured.unsupported.response" "$response" '
+    .status == "degraded"
+    and .selected_model == "not_called"
+    and (.answer | startswith("The evidence acquisition completed and returned usable material, but the selected answer route could not produce the required structured grounded response"))
+    and .sources == []
+  '
+  assert_jq "structured.unsupported.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 0
+  '
+  assert_jq "structured.unsupported.trace" "$trace" '
+    .retrieval.prompt_assembly.evidence_response.primary_structured_capability == "unsupported"
+    and .retrieval.prompt_assembly.evidence_response.response_format_mode == "none"
+    and .retrieval.prompt_assembly.evidence_response.initial_validation_status == "not_attempted"
+    and .retrieval.prompt_assembly.evidence_response.repair_attempted == false
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 0
+    and .retrieval.prompt_assembly.evidence_response.transport_failure_reason == "structured_output_unsupported"
+  '
+  assert_jq "structured.unsupported.claims" "$claims" '(.records | length) == 0'
+  restart_orchestrator_with_reserve 2048
+  echo "Structured answer case passed: unsupported_route"
+
+  owner="owner-structured-repair-success"
+  client="client-structured-repair-success"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  candidate='REJECTED-GROUNDED-CANDIDATE-SENTINEL'
+  provider_post "/fixture/sentinels" \
+    "$(jq -nc --arg sentinel "$candidate" '{sentinels:{rejected_candidate:$sentinel}}')"
+  queue_provider_answer "$candidate"
+  queue_evidence_candidate "supports" \
+    "google_sheets:records_primary:Records!A2:C2" \
+    "The migration record confirms the bounded setting."
+  conversation_id="$(resolve_conversation "$owner" "$client" "structured-repair-success")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Verify the migration record." \
+    '{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  assert_jq "structured.repair_success.response" "$response" '
+    .status == "degraded"
+    and (.answer | startswith("The retained evidence supports the requested conclusion."))
+    and (.answer | contains("REJECTED-GROUNDED-CANDIDATE-SENTINEL") | not)
+  '
+  assert_grounded_structured_provider_calls "$provider_calls" 2
+  assert_jq "structured.repair_success.provider" "$provider_calls" '
+    [.calls[] | select(.kind == "chat")] as $calls
+    | $calls[0].model == $calls[1].model
+    and $calls[0].status == "ok"
+    and $calls[1].status == "ok"
+    and $calls[1].sentinel_presence.rejected_candidate == false
+    and ($calls[1].normalized_messages | any(.content | contains("invalid_json")))
+    and ($calls[1].normalized_messages | any(.content | contains("google_sheets:records_primary:Records!A2:C2")))
+  '
+  assert_jq "structured.repair_success.trace" "$trace" '
+    .retrieval.prompt_assembly.evidence_response.initial_failure_reason == "invalid_json"
+    and .retrieval.prompt_assembly.evidence_response.repair_eligible == true
+    and .retrieval.prompt_assembly.evidence_response.repair_attempted == true
+    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 1
+    and .retrieval.prompt_assembly.evidence_response.repair_outcome == "valid"
+    and .retrieval.prompt_assembly.evidence_response.validation_status == "valid"
+    and .retrieval.prompt_assembly.capabilities.provider_call_count == 2
+  '
+  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")"
+  case "$serialized" in
+    *REJECTED-GROUNDED-CANDIDATE-SENTINEL*)
+      echo "Assertion failed: structured.repair_success.durable_privacy" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "Structured answer case passed: repair_success"
 
   candidate='{"conclusion_disposition":"supports","evidence_excerpts":[{"source_ref":"google_sheets:records_primary:Records!A2:C2","excerpt":"The migration record confirms the bounded setting."}],"aggressive_claim":"Complete across all obligations."}'
   run_structured_answer_failure_case \
@@ -4350,7 +4527,7 @@ run_evidence_structured_answer_recovery_scenarios() {
 
   test "${EVIDENCE_ADVERSARIAL_FREEFORM_REJECTED:-0}" = "1"
   test "${EVIDENCE_ADVERSARIAL_FORGED_REJECTED:-0}" = "1"
-  echo "Evidence structured answer recovery: valid_supports=1 valid_does_not_support=1 freeform_rejected=1 extra_field_rejected=1 forged_reference_rejected=1 non_extractive_rejected=1 universal_rejected=1 absence_rejected=1 contradiction_rejected=1 full_compliance_rejected=1 repair_calls=0 content_fallbacks=0"
+  echo "Evidence structured answer recovery: structured_primary=1 structured_fallback=1 unsupported_route=1 repair_success=1 repair_exhausted=6 freeform_rejected=1 forged_reference_rejected=1 content_fallbacks=0"
 }
 
 readonly HISTORY_FOLLOWUP_CLARIFICATION="Are you asking what supported the immediately previous answer, what I checked, what may have been missed, or whether you want a new verification?"

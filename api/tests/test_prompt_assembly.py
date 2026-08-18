@@ -6,6 +6,7 @@ from services.prompt_assembly import (
     EVIDENCE_ADVISORY_GUIDANCE,
     EVIDENCE_RESPONSE_CONTRACT,
     assemble_prompt,
+    grounded_evidence_repair_instruction,
 )
 
 
@@ -353,6 +354,85 @@ def test_governed_evidence_contract_is_required_before_external_evidence():
         },
     }
     assert evidence_text not in str(contract_layer)
+
+
+def test_grounded_repair_instruction_is_closed_mandatory_and_contains_no_candidate():
+    rejected_sentinel = "REJECTED PROVIDER CONTENT MUST NOT RETURN"
+    evidence_text = "The retained record states a bounded fact."
+    out = assemble_prompt(
+        profile={"prompt_overlay": ""},
+        retrieval_bundle={"bundle": {"recent": [], "semantic": [], "artifact_refs": []}},
+        current_messages=[{"role": "user", "content": "Check the retained fact."}],
+        evidence_response_contract=True,
+        evidence_repair_failure_reason="excerpt_not_extractive",
+        external_context_pack={
+            "sources_used": ["neutral_archive"],
+            "items": [
+                {
+                    "source_ref": "neutral_archive:item_1",
+                    "source_name": "Neutral archive",
+                    "title": "Entry",
+                    "text": evidence_text,
+                }
+            ],
+        },
+    )
+
+    contents = [message["content"] for message in out.messages]
+    repair = grounded_evidence_repair_instruction("excerpt_not_extractive")
+    assert repair in contents
+    assert evidence_text in "\n".join(contents)
+    assert rejected_sentinel not in "\n".join(contents)
+    assert "evidence_repair_instruction" in out.trace["included_layers"]
+    layer = next(
+        layer
+        for layer in out.trace["layers"]
+        if layer["name"] == "evidence_repair_instruction"
+    )
+    assert layer["metadata"] == {
+        "contract_active": True,
+        "failure_reason": "excerpt_not_extractive",
+        "schema_version": "governed-evidence-repair.v1",
+    }
+
+
+def test_grounded_repair_requires_contract_and_closed_failure_reason():
+    base = {
+        "profile": {"prompt_overlay": ""},
+        "retrieval_bundle": {
+            "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+        },
+        "current_messages": [{"role": "user", "content": "question"}],
+    }
+    with pytest.raises(ValueError, match="evidence_repair_requires_response_contract"):
+        assemble_prompt(**base, evidence_repair_failure_reason="invalid_json")
+    with pytest.raises(ValueError, match="invalid_evidence_repair_failure_reason"):
+        assemble_prompt(
+            **base,
+            evidence_response_contract=True,
+            evidence_repair_failure_reason="provider_prose",
+        )
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    [
+        "invalid_json",
+        "invalid_candidate",
+        "reference_not_retained",
+        "reference_not_unique",
+        "excerpt_not_extractive",
+        "excerpt_token_boundary_invalid",
+    ],
+)
+def test_every_closed_grounded_failure_reason_has_bounded_repair_instruction(
+    failure_reason,
+):
+    instruction = grounded_evidence_repair_instruction(failure_reason)
+    assert failure_reason in instruction
+    assert "fresh candidate" in instruction
+    assert "prior candidate" in instruction
+    assert "use tools" in instruction
 
 
 def test_advisory_guidance_is_mandatory_natural_language_and_mutually_exclusive():

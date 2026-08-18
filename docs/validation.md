@@ -88,8 +88,10 @@ cd api
 These tests prove CR shape admission without client opt-in, zero DSA operations
 for not-applicable turns, strict local advisory-result validation, mutually
 exclusive grounded and advisory prompt contracts, mandatory advisory-layer
-budget survival, fixed wrapping and persistence, fallback prompt parity, and no
-advisory tools, actions, claims, callbacks, or supported sources.
+budget survival, exact grounded JSON-schema capability checks, mandatory repair
+layer budgeting, one-repair maximum, rejected-content isolation, structured
+fallback prompt parity, and no advisory tools, actions, claims, callbacks, or
+supported sources.
 
 These suites also cover omitted-conversation acquisition and enforcement:
 zero, eight, and nine-row Basic Memory Store pages; cursor-independent
@@ -228,9 +230,10 @@ EVIDENCE_ACQUISITION_ONLY=1 EVIDENCE_SCENARIO=structured-answer-recovery make co
 `scope-references` exercises requested conjunctive narrowing, unanimous
 unrequested derivation, missing material time scope, disabled malformed producer
 metadata, selector mismatch, and privacy suppression through the real DSA and CR
-contracts. `structured-answer-recovery` first retains the existing adversarial
-provider family, then proves valid supports and does-not-support candidates plus
-strict rejection of extra fields, non-extractive excerpts, and semantically
+contracts. `structured-answer-recovery` retains the existing adversarial
+provider family, then proves structured primary and fallback success, a
+provider-free unsupported route, successful one-call repair, exhausted repair,
+and strict rejection of extra fields, non-extractive excerpts, and semantically
 distinct universal, absence, contradiction, and full-compliance attempts. Its
 history checks confirm that provider JSON, excerpts, malformed wording, validation
 internals, and hidden scope metadata are not reconstructed.
