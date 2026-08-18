@@ -860,6 +860,16 @@ run_evidence_source_scope_scenarios() {
   client="client-source-scope-natural"
   conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-natural")"
   question="What is recorded in Configured Review Register?"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" \
+    '{
+      expected_request_text:$request_text,
+      expected_source_id:"complete_register",
+      expected_content_fields:["Entry","Required","Status"],
+      interpretation_status:"resolved",
+      operation_hint:"lookup",
+      candidate_source_ids:["complete_register"]
+    }')"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -880,14 +890,32 @@ run_evidence_source_scope_scenarios() {
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
   '
+  assert_jq "source_scope.natural.semantic_trace" "$trace" '
+    .prompt.semantic_interpreter == {
+      called:true,
+      status:"accepted",
+      reason:"validated",
+      interpretation_status:"resolved",
+      operation_hint:"lookup",
+      candidate_count:1
+    }
+  '
   if ! jq -e --arg request_id "$request_id" '
     [.events[] | select(
       .event_type == "evidence_shape_derived"
       and .event_payload_json.request_id == $request_id
     ) | .event_payload_json] as $events
-    | ($events | length) == 1
+    | ($events | length) == 2
     and $events[0].source_match_status == "matched"
     and $events[0].matched_source_ids == ["complete_register"]
+    and $events[0].task_shape == "targeted_lookup"
+    and ($events[0] | has("semantic_operation_hint") | not)
+    and $events[1].source_match_status == "matched"
+    and $events[1].matched_source_ids == ["complete_register"]
+    and $events[1].task_shape == "targeted_lookup"
+    and $events[1].semantic_interpretation_status == "resolved"
+    and $events[1].semantic_operation_hint == "lookup"
+    and $events[1].semantic_candidate_count == 1
   ' <<<"$diagnostics" >/dev/null; then
     echo "Assertion failed: source_scope.natural.runtime_match" >&2
     return 1
@@ -898,7 +926,7 @@ run_evidence_source_scope_scenarios() {
       | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
       | length) == 0
   '
-  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_jq "source_scope.natural.fixture_decoys" "$fixture_calls" '
     ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
       | length) == 0
@@ -909,7 +937,7 @@ run_evidence_source_scope_scenarios() {
     and $calls[0].source_ids == ["complete_register"]
   '
   assert_single_inventory_request 1
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
@@ -5492,6 +5520,133 @@ run_evidence_aggregate_scenario() {
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   echo "Evidence aggregate: semantic=1 answer_provider=0 search=0 structured_context=1 records=5 non_empty=4 median=27.875"
+
+  owner="owner-evidence-aggregate-operation"
+  client="client-evidence-aggregate-operation"
+  question="What is the median Reading in the Configured Metrics Archive?"
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "aggregate-operation-refinement")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"median",
+      aggregate_field_name:"Reading"
+    }')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  serialized="$(jq -c . <<<"$trace")"
+
+  assert_jq "aggregate.operation_refinement.response" "$response" '
+    .status == "ok"
+    and .answer == "Median for \"Reading\": 27.875 (4 non-empty values across 5 records)."
+    and .sources == []
+    and .pending_action == null
+  '
+  assert_jq "aggregate.operation_refinement.manifest" "$manifest" '
+    .shape.derivation_status == "derived"
+    and .shape.task_shape == "aggregate"
+    and .shape.source_match.status == "matched"
+    and .shape.source_match.matched_source_ids == ["metrics_archive"]
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["structured_field_values"]
+    and .acquisition.strategy_attempted == "structured_field_values"
+    and .acquisition.aggregate_execution.outcome == "satisfied"
+    and .acquisition.aggregate_execution.structured_context_call_count == 1
+    and .acquisition.aggregate_execution.record_count == 5
+    and .acquisition.aggregate_execution.non_empty_value_count == 4
+  '
+  assert_jq "aggregate.operation_refinement.semantic_trace" "$trace" '
+    .prompt.semantic_interpreter == {
+      called:true,
+      status:"accepted",
+      reason:"validated",
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_count:1
+    }
+    and (.prompt.semantic_interpreter | has("candidate_source_ids") | not)
+    and ((.prompt.evidence_acquisition | tostring) | contains("semantic_advisory") | not)
+  '
+  assert_provider_free_trace "$trace"
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_jq "aggregate.operation_refinement.provider_accounting" "$provider_calls" '
+    ([.calls[] | select(.kind == "semantic_interpreter")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")] | length) == 0
+  '
+  assert_jq "aggregate.operation_refinement.fixture_scope" "$fixture_calls" '
+    [.calls[] | select(.operation == "google_values")] as $calls
+    | ($calls | length) == 1
+    and ($calls | all(.source == "measurement-sheet"))
+    and ($calls | all(.returned_row_count == 6))
+  '
+  assert_jq "aggregate.operation_refinement.dsa_operations" "$audit" '
+    [.[] | select(.operation == "context_pack")] as $search
+    | [.[] | select(.operation == "context")] as $context
+    | ($search | length) == 0
+    and ($context | length) == 1
+    and $context[0].source_ids == ["metrics_archive"]
+    and (($context[0].source_ref // null) == null)
+    and $context[0].result_count == 1
+    and $context[0].status == "success"
+  '
+  assert_dsa_operation_counts "$audit" 0 1 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
+  assert_jq "aggregate.operation_refinement.runtime" "$diagnostics" '
+    [.events[]
+      | select(.event_type == "evidence_shape_derived")
+      | select(.event_payload_json.request_id == $request_id)
+      | .event_payload_json] as $shapes
+    | ([.events[]
+      | select(.event_type == "evidence_plan_compiled")
+      | select(.event_payload_json.request_id == $request_id)
+      | .event_payload_json][0]) as $plan
+    | ($shapes | length) == 2
+    and $shapes[0].derivation_status == "derived"
+    and $shapes[0].task_shape == "targeted_lookup"
+    and $shapes[0].source_match_status == "matched"
+    and $shapes[0].matched_source_ids == ["metrics_archive"]
+    and ($shapes[0] | has("semantic_operation_hint") | not)
+    and $shapes[1].derivation_status == "derived"
+    and $shapes[1].task_shape == "aggregate"
+    and $shapes[1].source_match_status == "matched"
+    and $shapes[1].matched_source_ids == ["metrics_archive"]
+    and $shapes[1].semantic_interpretation_status == "resolved"
+    and $shapes[1].semantic_operation_hint == "aggregate"
+    and $shapes[1].semantic_candidate_count == 1
+    and $plan.task_shape == "aggregate"
+    and $plan.plan_status == "ready"
+    and $plan.selected_strategies == ["structured_field_values"]
+  ' --arg request_id "$request_id"
+  case "$serialized" in
+    *PRIVATE_AGGREGATE_SECRET_*|*55.75*|*content_fields*|*structured_data*|*semantic_advisory*|*candidate_source_ids*)
+      echo "Operation-refinement aggregate trace exposed private semantic or structured data" >&2
+      return 1
+      ;;
+  esac
+  case "$(jq -c . <<<"$provider_calls")" in
+    *PRIVATE_AGGREGATE_SECRET_*|*55.75*)
+      echo "Operation-refinement provider call exposed private structured acquisition data" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "Evidence aggregate operation refinement: first_shape=targeted_lookup source_match=matched semantic=1 second_shape=aggregate answer_provider=0 search=0 structured_context=1"
 }
 
 run_evidence_acquisition_composed_suite() {

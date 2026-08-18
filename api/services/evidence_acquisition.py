@@ -3101,6 +3101,21 @@ async def begin_evidence_acquisition(
         return state
 
     first_shape = state.shape
+    unresolved_source_scope = bool(
+        first_shape.source_match is not None
+        and first_shape.source_match.status != "matched"
+    )
+    operation_refinement = bool(
+        first_shape.source_match is not None
+        and first_shape.source_match.status == "matched"
+        and first_shape.derivation_status == "derived"
+        and first_shape.task_shape == "targeted_lookup"
+    )
+    semantic_eligibility_reason = None
+    if unresolved_source_scope:
+        semantic_eligibility_reason = "unresolved_source_scope"
+    elif operation_refinement:
+        semantic_eligibility_reason = "operation_refinement"
     semantic_eligible = bool(
         not explicit_selector
         and semantic_interpreter is not None
@@ -3108,32 +3123,66 @@ async def begin_evidence_acquisition(
         and source_discovery is not None
         and source_discovery["inventory_status"] in {"complete", "partial"}
         and source_discovery["sources"]
-        and first_shape.source_match is not None
-        and first_shape.source_match.status != "matched"
+        and semantic_eligibility_reason is not None
         and interaction_kind not in {"joke_or_playful", "vent_or_expression"}
     )
     if semantic_eligible:
         state.semantic_interpreter = {
             "called": True,
             "status": "requested",
-            "reason": "unresolved_source_scope",
+            "reason": semantic_eligibility_reason,
             "interpretation_status": None,
             "operation_hint": None,
             "candidate_count": 0,
         }
+        semantic_source_list = state.inventory
+        allowed_candidate_ids = {
+            source.source_id for source in state.inventory.sources
+        }
+        if operation_refinement:
+            allowed_candidate_ids = set(
+                first_shape.source_match.matched_source_ids
+            )
+            semantic_source_list = state.inventory.model_copy(
+                update={
+                    "sources": [
+                        source
+                        for source in state.inventory.sources
+                        if source.source_id in allowed_candidate_ids
+                    ]
+                }
+            )
         try:
             advisory_raw = await semantic_interpreter(
                 request_id=request_id,
                 task_text=task_text,
-                source_list=state.inventory,
+                source_list=semantic_source_list,
             )
             advisory = EvidenceInterpreterOutput.model_validate(advisory_raw)
-            inventory_source_ids = {
-                source.source_id for source in state.inventory.sources
-            }
-            if not set(advisory.candidate_source_ids).issubset(inventory_source_ids):
+            if not set(advisory.candidate_source_ids).issubset(
+                allowed_candidate_ids
+            ):
                 raise ValueError("semantic_candidate_source_not_in_inventory")
-            _validate_aggregate_advisory_inventory(advisory, state.inventory)
+            _validate_aggregate_advisory_inventory(
+                advisory,
+                semantic_source_list,
+            )
+            if operation_refinement and (
+                advisory.operation_hint == "unknown"
+                or not advisory.candidate_source_ids
+            ):
+                state.semantic_interpreter.update(
+                    {"status": "failed", "reason": "unresolved_operation"}
+                )
+                state.status = "semantic_interpreter_failed"
+                state.forced_answer = AMBIGUOUS_ANSWER
+                state.manifest_id = _manifest_id(
+                    scope=scope,
+                    plan_id=None,
+                    selected_strategies=[],
+                    declared_scope=None,
+                )
+                return state
             advisory_payload = advisory.model_dump(exclude_none=True)
             advisory_payload["candidate_source_ids"] = sorted(
                 advisory.candidate_source_ids
