@@ -10223,7 +10223,7 @@ async def orchestrate_chat(
                                         prompt_fingerprint=repair_fingerprint,
                                         prompt_trace=repair_prompt.trace,
                                     ),
-                                    "grounded_candidate_phase": "repair",
+                                    "grounded_candidate_attempt": "repair",
                                     "capability_descriptor_fingerprint": None,
                                     "capability_descriptor_count": 0,
                                 }
@@ -10246,7 +10246,7 @@ async def orchestrate_chat(
                                         prompt_fingerprint=repair_fingerprint,
                                         prompt_trace=repair_prompt.trace,
                                     ),
-                                    "grounded_candidate_phase": "repair",
+                                    "grounded_candidate_attempt": "repair",
                                     "capability_descriptor_fingerprint": None,
                                     "capability_descriptor_count": 0,
                                 }
