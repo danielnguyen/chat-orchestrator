@@ -4158,6 +4158,14 @@ run_structured_answer_failure_case() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   claims="$(list_claim_records "$owner" "$conversation_id")"
+  printf 'Structured failure diagnostics: case=%s response=%s calls=%s initial=%s repair=%s final=%s claims=%s\n' \
+    "$case_name" \
+    "$(jq -r '.status' <<<"$response")" \
+    "$(jq -r '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_calls")" \
+    "$(jq -r '.retrieval.prompt_assembly.evidence_response.initial_failure_reason' <<<"$trace")" \
+    "$(jq -r '.retrieval.prompt_assembly.evidence_response.repair_outcome' <<<"$trace")" \
+    "$(jq -r '.retrieval.prompt_assembly.evidence_response.failure_reason' <<<"$trace")" \
+    "$(jq -r '.records | length' <<<"$claims")"
   assert_jq "structured.${case_name}.response" "$response" '
     .status == "degraded"
     and .answer == "The evidence acquisition completed and returned usable material, but I couldn’t validate the generated grounded answer, so I’m not presenting a substantive conclusion from it. Please try again."
