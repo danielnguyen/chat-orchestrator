@@ -491,10 +491,10 @@ assert_runtime_scope_plan() {
 }
 
 assert_governed_dispatch_boundary() {
-  local trace="$1"
-  jq -e '
+  local trace="$1" expected_model_calls="${2:-1}"
+  jq -e --argjson expected_model_calls "$expected_model_calls" '
     .fallback.triggered == false
-    and (.model_calls | length) == 1
+    and (.model_calls | length) == $expected_model_calls
     and .retrieval.prompt_assembly.evidence_response.provider_tool_count == 0
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
     and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
@@ -4200,7 +4200,7 @@ run_structured_answer_failure_case() {
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  assert_governed_dispatch_boundary "$trace"
+  assert_governed_dispatch_boundary "$trace" 2
   assert_jq "structured.${case_name}.claims" "$claims" '(.records | length) == 0'
   serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c . <<<"$claims")"
   case "$serialized" in
