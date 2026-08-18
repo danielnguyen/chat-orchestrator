@@ -17557,7 +17557,7 @@ async def test_evidence_acquisition_optional_scope_allows_one_provider_call_and_
 
 @pytest.mark.asyncio
 async def test_partial_inventory_remains_limited_through_governed_answer(tmp_path):
-    rules, models = _write_default_route_files(tmp_path)
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
     question = "Verify the maintenance record."
     request_id = "rid-evidence-partial-inventory"
     runtime = FakeRuntime(
@@ -17583,13 +17583,28 @@ async def test_partial_inventory_remains_limited_through_governed_answer(tmp_pat
         response=_governed_context_pack(question),
         source_response=source_response,
     )
-    provider = FakeLiteLLM(
-        content=_evidence_candidate(
-            (
-                "vehicle_log_primary:record_1",
-                "The maintenance record lists 2025-07-12.",
-            )
-        )
+    provider = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved",
+                "lookup",
+                ["vehicle_log_primary"],
+            ),
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": _evidence_candidate(
+                                (
+                                    "vehicle_log_primary:record_1",
+                                    "The maintenance record lists 2025-07-12.",
+                                )
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
     )
     memory_store = FakeMemoryStore()
 
@@ -17623,7 +17638,7 @@ async def test_partial_inventory_remains_limited_through_governed_answer(tmp_pat
     assert result["answer"].count(TARGETED_SCOPE_SUFFIX) == 1
     assert result["answer"].endswith(TARGETED_SCOPE_SUFFIX)
     assert "conclusion_disposition" not in result["answer"]
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2
     assert len(runtime.evidence_sufficiency_calls) == 1
     assert len(runtime.evidence_next_step_calls) == 1
     assert {
@@ -18597,14 +18612,31 @@ def _semantic_test_shape(call, *, second_status="resolved"):
     return response
 
 
-def _aggregate_test_shape(call):
+def _aggregate_test_shape(call, *, initial_source_matched=False):
     response = _not_applicable_shape_response(call)
     advisory = call["task_context"].get("semantic_advisory")
     if advisory is None:
+        if initial_source_matched:
+            response["result"].update(
+                {
+                    "derivation_status": "derived",
+                    "task_shape": "targeted_lookup",
+                    "candidate_task_shapes": ["targeted_lookup"],
+                    "evidence_scope_material": True,
+                    "clarification_required": False,
+                    "reason_codes": ["targeted_lookup_derived"],
+                }
+            )
         response["result"]["source_match"] = {
-            "status": "no_match",
-            "matched_source_ids": [],
-            "reason_codes": ["no_source_specific_match"],
+            "status": "matched" if initial_source_matched else "no_match",
+            "matched_source_ids": (
+                ["metrics_archive"] if initial_source_matched else []
+            ),
+            "reason_codes": [
+                "source_id_match"
+                if initial_source_matched
+                else "no_source_specific_match"
+            ],
         }
         return response
     response["result"].update(
@@ -18624,7 +18656,11 @@ def _aggregate_test_shape(call):
     response["result"]["source_match"] = {
         "status": "matched",
         "matched_source_ids": list(advisory["candidate_source_ids"]),
-        "reason_codes": ["semantic_candidate_validated"],
+        "reason_codes": [
+            "source_id_match"
+            if initial_source_matched
+            else "semantic_candidate_validated"
+        ],
     }
     return response
 
@@ -19044,11 +19080,7 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("explicit", [True, False])
-async def test_explicit_and_deterministic_source_fast_paths_skip_interpreter(
-    tmp_path,
-    explicit,
-):
+async def test_explicit_source_fast_path_skips_interpreter(tmp_path):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
     question = "Verify the maintenance record."
     runtime = FakeRuntime()
@@ -19061,7 +19093,7 @@ async def test_explicit_and_deterministic_source_fast_paths_skip_interpreter(
             )
         )
     )
-    external_context = {"source_ids": ["vehicle_log_primary"]} if explicit else None
+    external_context = {"source_ids": ["vehicle_log_primary"]}
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -19079,7 +19111,7 @@ async def test_explicit_and_deterministic_source_fast_paths_skip_interpreter(
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
-        request_id=f"rid-semantic-fast-{explicit}",
+        request_id="rid-semantic-fast-explicit",
     )
 
     assert out["status"] == "ok"
@@ -19489,16 +19521,29 @@ async def test_semantic_ambiguity_and_aggregate_are_provider_free(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("block_policy", [False, True])
+@pytest.mark.parametrize(
+    "initial_source_matched",
+    [False, True],
+    ids=["semantic-source-discovery", "deterministic-source-operation-refinement"],
+)
 async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy_gated(
     tmp_path,
     caplog,
     block_policy,
+    initial_source_matched,
 ):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
-    question = "What is the median reading in my measurements?"
-    request_id = f"rid-aggregate-{block_policy}"
+    question = (
+        "What is the median Reading in the Configured Metrics Archive?"
+        if initial_source_matched
+        else "What is the median reading in my measurements?"
+    )
+    request_id = f"rid-aggregate-{initial_source_matched}-{block_policy}"
     runtime = FakeRuntime(
-        evidence_shape_response=_aggregate_test_shape,
+        evidence_shape_response=lambda call: _aggregate_test_shape(
+            call,
+            initial_source_matched=initial_source_matched,
+        ),
         evidence_plan_response=_aggregate_plan_response(
             request_id=request_id,
             question=question,
@@ -19525,7 +19570,21 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
                     "last_checked_at": "2026-08-16T00:00:00Z",
                     "last_error": None,
                     "content_fields": ["Entry", "Reading"],
-                }
+                },
+                {
+                    "source_id": "weather_archive",
+                    "display_name": "Configured Weather Archive",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["weather", "archive"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-08-16T00:00:00Z",
+                    "last_error": None,
+                    "content_fields": ["Entry", "Temperature"],
+                },
             ],
         },
     )
@@ -19563,6 +19622,10 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
     assert out["status"] == ("degraded" if block_policy else "ok")
     assert len(litellm.calls) == 1
     assert len(runtime.evidence_shape_calls) == 2
+    semantic_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert ("Configured Weather Archive" not in semantic_messages) is (
+        initial_source_matched
+    )
     assert len(runtime.evidence_plan_calls) == 1
     assert runtime.evidence_plan_calls[0]["aggregate_spec"] == {
         "function": "median",
@@ -19600,7 +19663,7 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
     assert f"request_id={request_id}" in checkpoint
     assert "status=acquisition_ready" in checkpoint
     assert "inventory_status=complete" in checkpoint
-    assert "inventory_source_count=1" in checkpoint
+    assert "inventory_source_count=2" in checkpoint
     assert "semantic_interpreter_status=accepted" in checkpoint
     assert "task_shape=aggregate" in checkpoint
     assert "source_match_status=matched" in checkpoint
@@ -19617,6 +19680,9 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
         "archive",
         "Reading",
         "Entry",
+        "weather_archive",
+        "Configured Weather Archive",
+        "Temperature",
         "10.125",
         "55.75",
     ):
@@ -19630,6 +19696,8 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
     serialized_trace = json.dumps(memory_store.trace_calls[-1]["payload"], sort_keys=True)
     assert "55.75" not in serialized_trace
     assert "content_fields" not in serialized_trace
+    assert "semantic_advisory" not in serialized_trace
+    assert "candidate_source_ids" not in serialized_trace
     if block_policy:
         assert "27.875" not in serialized_trace
 
@@ -29933,7 +30001,13 @@ async def test_orchestrate_malformed_required_bundle_still_fails(tmp_path):
     assert memory_store.trace_calls == []
 
 
-def _write_history_route_files(tmp_path, *, model="gpt-5-mini", provider="cloud"):
+def _write_history_route_files(
+    tmp_path,
+    *,
+    model="gpt-5-mini",
+    provider="cloud",
+    include_evidence_interpreter=False,
+):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
         "models:\n"
@@ -29943,7 +30017,14 @@ def _write_history_route_files(tmp_path, *, model="gpt-5-mini", provider="cloud"
         "logical_routes:\n"
         "  intent_classifier:\n"
         f"    model: {model}\n"
-        f"    provider: {provider}\n",
+        f"    provider: {provider}\n"
+        + (
+            "  evidence_interpreter:\n"
+            "    model: gpt-5-mini\n"
+            "    provider: cloud\n"
+            if include_evidence_interpreter
+            else ""
+        ),
         encoding="utf-8",
     )
     return rules, models
@@ -30249,7 +30330,10 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
 async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followup(
     tmp_path,
 ):
-    rules, models = _write_history_route_files(tmp_path)
+    rules, models = _write_history_route_files(
+        tmp_path,
+        include_evidence_interpreter=True,
+    )
     original_request_id = "request-ordinary-dsa-original"
     question = "What service was performed on the Jeep?"
     runtime = HistoryPolicyRuntime()
@@ -30306,7 +30390,16 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         )
     )
     memory_store = PersistedOrdinaryAcquisitionMemoryStore()
-    provider = FakeLiteLLM(content=provider_candidate)
+    provider = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved",
+                "lookup",
+                ["vehicle_log_primary"],
+            ),
+            {"choices": [{"message": {"content": provider_candidate}}]},
+        ]
+    )
     dsa = FakeDSA(
         response=context_pack,
         source_response={
@@ -30452,7 +30545,7 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         assert prohibited not in follow_up["answer"]
     assert len(memory_store.immediate_history_calls) == 1
     assert len(candidate_calls) == 1
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2
     assert history_trace["bms_resolution_status"] == "resolved"
     assert follow_up_prompt_trace["claim_explanation"][
         "manifest_projection_status"
