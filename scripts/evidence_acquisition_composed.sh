@@ -315,7 +315,7 @@ restart_orchestrator_with_manual_override() {
 
 restart_orchestrator_for_changed_premise() {
   COMPOSED_ALLOW_MANUAL_OVERRIDE=true
-  COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE=14744
+  COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE=126744
   export COMPOSED_ALLOW_MANUAL_OVERRIDE COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE
   docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
@@ -1716,7 +1716,7 @@ run_evidence_changed_premise_scenarios() {
     "google_sheets:followup_records:Followup!A2:C2" \
     "Record: follow-up-1"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-followup")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_voice_openai")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
@@ -1725,15 +1725,15 @@ run_evidence_changed_premise_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   jq -e '
-    .router_decision.selected_model == "chat_local_fast"
-    and .router_decision.routing_contract.manual_override_requested == "chat_local_fast"
+    .router_decision.selected_model == "chat_voice_openai"
+    and .router_decision.routing_contract.manual_override_requested == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_applied == true
     and .router_decision.routing_contract.manual_override_rejection_reason == null
-    and .manual_override.requested_model == "chat_local_fast"
+    and .manual_override.requested_model == "chat_voice_openai"
     and .manual_override.applied == true
     and .manual_override.rejection_reason == null
-    and .retrieval.prompt_assembly.prompt_budget.effective_min_context_limit == 16000
-    and .retrieval.prompt_assembly.prompt_budget.output_token_reserve == 14744
+    and .retrieval.prompt_assembly.prompt_budget.effective_min_context_limit == 128000
+    and .retrieval.prompt_assembly.prompt_budget.output_token_reserve == 126744
     and .retrieval.prompt_assembly.prompt_budget.context_safety_margin == 256
     and .retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget == 1000
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.supplied == false
@@ -1788,7 +1788,7 @@ run_evidence_changed_premise_scenarios() {
   reset_dsa_audit
   guidance="Compare the exact record identifier and version with the authoritative record that controls the requested conclusion."
   queue_provider_answer "$guidance"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_local_fast")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_voice_openai")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -1798,25 +1798,25 @@ run_evidence_changed_premise_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   jq -e '
-    .router_decision.selected_model == "chat_local_fast"
-    and .router_decision.provider == "local"
-    and .router_decision.routing_contract.selected_model == "chat_local_fast"
-    and .router_decision.routing_contract.selected_provider == "local"
-    and .router_decision.routing_contract.manual_override_requested == "chat_local_fast"
+    .router_decision.selected_model == "chat_voice_openai"
+    and .router_decision.provider == "cloud"
+    and .router_decision.routing_contract.selected_model == "chat_voice_openai"
+    and .router_decision.routing_contract.selected_provider == "cloud"
+    and .router_decision.routing_contract.manual_override_requested == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_applied == true
     and .router_decision.routing_contract.manual_override_rejection_reason == null
-    and .manual_override.requested_model == "chat_local_fast"
+    and .manual_override.requested_model == "chat_voice_openai"
     and .manual_override.applied == true
     and .manual_override.rejection_reason == null
-    and .retrieval.prompt_assembly.prompt_budget.effective_min_context_limit == 16000
-    and .retrieval.prompt_assembly.prompt_budget.output_token_reserve == 14744
+    and .retrieval.prompt_assembly.prompt_budget.effective_min_context_limit == 128000
+    and .retrieval.prompt_assembly.prompt_budget.output_token_reserve == 126744
     and .retrieval.prompt_assembly.prompt_budget.context_safety_margin == 256
     and .retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget == 1000
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.supplied == false
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.applied == false
-    and .retrieval.prompt_assembly.prompt_budget.attempts[0].model == "chat_local_fast"
-    and .retrieval.prompt_assembly.prompt_budget.attempts[0].provider == "local"
-    and .retrieval.prompt_assembly.prompt_budget.attempts[0].max_context_tokens == 16000
+    and .retrieval.prompt_assembly.prompt_budget.attempts[0].model == "chat_voice_openai"
+    and .retrieval.prompt_assembly.prompt_budget.attempts[0].provider == "cloud"
+    and .retrieval.prompt_assembly.prompt_budget.attempts[0].max_context_tokens == 128000
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].role == "primary"
     and .model_call.status == "ok"
     and (.model_calls | length) == 1
@@ -1862,7 +1862,7 @@ run_evidence_changed_premise_scenarios() {
     test "$ALLOW_MANUAL_OVERRIDE" = "false"
     test "$PROMPT_OUTPUT_TOKEN_RESERVE" = "2048"
   '
-  echo "Evidence changed premise: model=chat_local_fast effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=1"
+  echo "Evidence changed premise: model=chat_voice_openai effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=1"
 }
 
 run_evidence_adversarial_provider_scenario() {
