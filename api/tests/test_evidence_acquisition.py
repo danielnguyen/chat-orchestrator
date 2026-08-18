@@ -66,6 +66,7 @@ from services.evidence_acquisition import (
     execute_exact_fetches,
     execute_hybrid_comparison,
     finalize_aggregate_conclusion,
+    grounded_evidence_response_format,
     helpful_grounded_recovery_allowed,
     parse_evidence_interpreter_completion,
     promote_exact_fetch_proposal,
@@ -1980,6 +1981,42 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
             },
             {"type": "null"},
         ]
+    }
+
+
+def test_grounded_evidence_response_format_matches_strict_candidate_boundary():
+    response_format = grounded_evidence_response_format()
+    assert response_format["type"] == "json_schema"
+    descriptor = response_format["json_schema"]
+    assert descriptor["name"] == "grounded_evidence_response"
+    assert descriptor["strict"] is True
+    schema = descriptor["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == [
+        "conclusion_disposition",
+        "evidence_excerpts",
+    ]
+    assert schema["properties"]["conclusion_disposition"]["enum"] == [
+        "supports",
+        "does_not_support",
+        "mixed",
+        "descriptive",
+    ]
+    excerpts = schema["properties"]["evidence_excerpts"]
+    assert (excerpts["minItems"], excerpts["maxItems"]) == (1, 8)
+    item = excerpts["items"]
+    assert item["additionalProperties"] is False
+    assert item["required"] == ["source_ref", "excerpt"]
+    assert item["properties"]["source_ref"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 240,
+    }
+    assert item["properties"]["excerpt"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500,
     }
 
 

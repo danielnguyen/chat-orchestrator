@@ -331,6 +331,32 @@ def test_advisory_guidance_survives_optional_reduction_and_remains_mandatory():
     assert exc.value.reason == "required_prompt_content_exceeds_budget"
 
 
+def test_grounded_repair_layer_survives_reduction_and_fails_when_budget_impossible():
+    inputs = {
+        "profile": {"prompt_overlay": ""},
+        "retrieval_bundle": {
+            "bundle": {"recent": [], "semantic": [], "artifact_refs": []}
+        },
+        "current_messages": [{"role": "user", "content": "Check the retained fact."}],
+        "evidence_response_contract": True,
+        "evidence_repair_failure_reason": "reference_not_retained",
+    }
+    out = assemble_prompt(
+        **inputs,
+        style_guidance="optional style " * 100,
+        prompt_budget_contract=_contract(500),
+    )
+    assert "evidence_response_contract" in out.trace["included_layers"]
+    assert "evidence_repair_instruction" in out.trace["included_layers"]
+    assert "reference_not_retained" in "\n".join(
+        message["content"] for message in out.messages
+    )
+
+    with pytest.raises(PromptBudgetError) as exc:
+        assemble_prompt(**inputs, prompt_budget_contract=_contract(20))
+    assert exc.value.reason == "required_prompt_content_exceeds_budget"
+
+
 @pytest.mark.parametrize("limit", [0, -1, True])
 def test_invalid_model_context_limit_blocks_budgeting(limit):
     with pytest.raises(PromptBudgetError) as exc:

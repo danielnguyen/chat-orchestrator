@@ -41,6 +41,7 @@ from services.evidence_acquisition import (
     EXHAUSTIVE_SCOPE_SUFFIX,
     HELPFUL_GROUNDED_RECOVERY_RESPONSE,
     NEXT_STEP_DEPENDENCY_ANSWER,
+    STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
     TARGETED_SCOPE_SUFFIX,
     DsaSourceListResponse,
     EvidenceAcquisitionPremise,
@@ -59,6 +60,7 @@ from services.orchestrate import (
     _select_capability_claim_refs,
     orchestrate_chat,
 )
+from services.prompt_budget import estimate_messages_tokens
 
 BANNED_TRACE_TOKENS = [
     "R26",
@@ -2226,7 +2228,11 @@ def _write_router_files(tmp_path):
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    structured_output: json_schema\n"
+        "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     return rules, models
@@ -4071,6 +4077,8 @@ async def test_orchestrate_chat_happy_path(tmp_path):
         allow_manual_override=True,
         request_id="rid-test-1",
     )
+
+    assert "response_format" not in litellm.calls[0]
 
     assert out["conversation_id"] == "conv-1"
     assert out["request_id"] == "rid-test-1"
@@ -13975,7 +13983,11 @@ def _write_default_route_files(tmp_path):
         encoding="utf-8",
     )
     models.write_text(
-        "models:\n" "  gpt-4o-mini:\n" "    provider: cloud\n" "    max_context_tokens: 128000\n",
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    structured_output: json_schema\n"
+        "    max_context_tokens: 128000\n",
         encoding="utf-8",
     )
     return rules, models
@@ -14308,6 +14320,10 @@ def _rendered_evidence_answer(
             boundary,
         ]
     )
+
+
+def _provider_completion(content: str) -> dict[str, object]:
+    return {"choices": [{"message": {"content": content}}]}
 
 
 def _hybrid_context_response(
@@ -16958,7 +16974,7 @@ async def test_hybrid_comparison_provider_overclaim_gets_helpful_fail_closed_rec
         provider_answer="All relevant maintenance history is fully covered.",
     )
 
-    assert len(litellm.calls) == 1
+    assert len(litellm.calls) == 2
     assert out["status"] == "degraded"
     assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["sources"] == []
@@ -17185,7 +17201,7 @@ async def test_source_match_ambiguity_is_inventory_only_and_provider_free(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_governed_evidence_free_form_provider_content_is_degraded_without_retry(
+async def test_governed_evidence_free_form_provider_content_exhausts_one_repair(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -17216,8 +17232,14 @@ async def test_governed_evidence_free_form_provider_content_is_degraded_without_
 
     replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["status"] == "degraded"
-    assert len(litellm.calls) == 1
-    assert litellm.calls[0]["tools"] == []
+    assert len(litellm.calls) == 2
+    assert all(call["tools"] == [] for call in litellm.calls)
+    assert litellm.calls[0]["response_format"] == litellm.calls[1]["response_format"]
+    repair_prompt_text = "\n".join(
+        message["content"] for message in litellm.calls[1]["messages"]
+    )
+    assert "invalid_json" in repair_prompt_text
+    assert provider_answer not in repair_prompt_text
     assert provider_answer not in out["answer"]
     assert out["answer"] == replacement
     assert out["sources"] == []
@@ -17227,15 +17249,20 @@ async def test_governed_evidence_free_form_provider_content_is_degraded_without_
     assert manifest["shape"]["task_shape"] == "targeted_lookup"
     assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
     assert trace["fallback"]["triggered"] is False
-    assert len(trace["model_calls"]) == 1
-    assert trace["retrieval"]["prompt_assembly"]["evidence_response"] == {
-        "contract_active": True,
-        "validation_status": "invalid",
-        "validated_excerpt_count": 0,
-        "failure_reason": "invalid_json",
-        "provider_tool_count": 0,
-        "recovery_status": "deterministic_helpful_fallback",
-    }
+    assert len(trace["model_calls"]) == 2
+    response_trace = trace["retrieval"]["prompt_assembly"]["evidence_response"]
+    assert response_trace["structured_transport_required"] is True
+    assert response_trace["primary_structured_capability"] == "supported"
+    assert response_trace["response_format_mode"] == "json_schema"
+    assert response_trace["initial_validation_status"] == "invalid"
+    assert response_trace["initial_failure_reason"] == "invalid_json"
+    assert response_trace["repair_eligible"] is True
+    assert response_trace["repair_attempted"] is True
+    assert response_trace["repair_call_count"] == 1
+    assert response_trace["repair_outcome"] == "invalid"
+    assert response_trace["validation_status"] == "invalid"
+    assert response_trace["failure_reason"] == "invalid_json"
+    assert response_trace["recovery_status"] == "deterministic_helpful_fallback"
     assert runtime.claim_calibration_calls == []
     assert memory_store.claim_record_calls == []
     assert provider_answer not in json.dumps(trace, sort_keys=True)
@@ -17268,9 +17295,11 @@ async def test_governed_evidence_transport_fallback_reuses_structured_contract(t
         "models:\n"
         "  gpt-4o-mini:\n"
         "    provider: cloud\n"
+        "    structured_output: json_schema\n"
         "    max_context_tokens: 128000\n"
         "  local-llm:\n"
         "    provider: local\n"
+        "    structured_output: json_schema\n"
         "    max_context_tokens: 16000\n",
         encoding="utf-8",
     )
@@ -17311,10 +17340,323 @@ async def test_governed_evidence_transport_fallback_reuses_structured_contract(t
     assert len(litellm.calls) == 2
     assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
     assert litellm.calls[0]["tools"] == litellm.calls[1]["tools"] == []
+    assert litellm.calls[0]["response_format"] == litellm.calls[1]["response_format"]
     assert any(
         "Governed evidence response contract:" in message["content"]
         for message in litellm.calls[0]["messages"]
     )
+
+
+@pytest.mark.parametrize(
+    ("model_info", "expected"),
+    [
+        ({"provider": "cloud", "structured_output": "json_schema"}, "supported"),
+        ({"provider": "cloud"}, "unsupported"),
+        ({"provider": "cloud", "structured_output": None}, "unsupported"),
+        ({"provider": "cloud", "structured_output": "JSON_SCHEMA"}, "unsupported"),
+        ({"provider": "cloud", "structured_output": True}, "unsupported"),
+    ],
+)
+def test_grounded_structured_capability_is_exact_and_explicit(model_info, expected):
+    assert (
+        orchestrate_service._grounded_structured_capability(
+            {"neutral-model": model_info},
+            "neutral-model",
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_grounded_unsupported_primary_is_provider_free_and_fail_closed(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    max_context_tokens: 128000\n",
+        encoding="utf-8",
+    )
+    memory_store = ClaimCaptureMemoryStore()
+    litellm = FakeLiteLLM(content="UNSUPPORTED ROUTE PROVIDER SENTINEL")
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="rid-grounded-structured-unsupported",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["selected_model"] == "not_called"
+    assert out["answer"] == (
+        f"{STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE}\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert out["sources"] == []
+    assert litellm.calls == []
+    assert memory_store.claim_record_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]
+    response_trace = trace["retrieval"]["prompt_assembly"]["evidence_response"]
+    assert response_trace["primary_structured_capability"] == "unsupported"
+    assert response_trace["response_format_mode"] == "none"
+    assert response_trace["repair_attempted"] is False
+    assert response_trace["repair_call_count"] == 0
+    assert response_trace["transport_failure_reason"] == "structured_output_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_grounded_transport_failure_does_not_call_unsupported_fallback(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    rules.write_text(
+        "rules:\n"
+        "  - id: default\n"
+        "    when: {}\n"
+        "    then:\n"
+        "      selected_model: gpt-4o-mini\n"
+        "      provider: cloud\n"
+        "      rationale: default\n"
+        "      fallbacks:\n"
+        "        - selected_model: local-llm\n"
+        "          provider: local\n",
+        encoding="utf-8",
+    )
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    structured_output: json_schema\n"
+        "    max_context_tokens: 128000\n"
+        "  local-llm:\n"
+        "    provider: local\n"
+        "    max_context_tokens: 16000\n",
+        encoding="utf-8",
+    )
+    memory_store = FakeMemoryStore()
+    litellm = FailingLiteLLM()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-grounded-fallback-unsupported",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == (
+        f"{STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE}\n\n{TARGETED_SCOPE_SUFFIX}"
+    )
+    assert len(litellm.calls) == 1
+    assert litellm.calls[0]["model"] == "gpt-4o-mini"
+    assert litellm.calls[0]["tools"] == []
+    assert litellm.calls[0]["response_format"]["json_schema"]["strict"] is True
+    response_trace = memory_store.trace_calls[-1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["evidence_response"]
+    assert response_trace["primary_structured_capability"] == "supported"
+    assert response_trace["fallback_structured_capability"] == "unsupported"
+    assert response_trace["response_format_mode"] == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_grounded_invalid_candidate_repairs_once_with_same_route_and_no_feedback(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    rejected = "REJECTED PROVIDER CONTENT SENTINEL"
+    repaired_excerpt = "The maintenance record lists 2025-07-12."
+    litellm = SequenceLiteLLM(
+        [
+            _provider_completion(rejected),
+            _provider_completion(
+                _evidence_candidate(
+                    ("vehicle_log_primary:record_1", repaired_excerpt)
+                )
+            ),
+        ]
+    )
+    memory_store = ClaimCaptureMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        claim_record_capture_enabled=True,
+        request_id="rid-grounded-repair-success",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == _rendered_evidence_answer(repaired_excerpt)
+    assert rejected not in json.dumps(out, sort_keys=True)
+    assert len(litellm.calls) == 2
+    assert {call["model"] for call in litellm.calls} == {"gpt-4o-mini"}
+    assert all(call["tools"] == [] for call in litellm.calls)
+    assert litellm.calls[0]["response_format"] == litellm.calls[1]["response_format"]
+    repair_messages = "\n".join(
+        message["content"] for message in litellm.calls[1]["messages"]
+    )
+    assert "invalid_json" in repair_messages
+    assert rejected not in repair_messages
+    assert "vehicle_log_primary:record_1" in repair_messages
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert rejected not in json.dumps(trace, sort_keys=True)
+    response_trace = trace["retrieval"]["prompt_assembly"]["evidence_response"]
+    assert response_trace["initial_failure_reason"] == "invalid_json"
+    assert response_trace["repair_attempted"] is True
+    assert response_trace["repair_call_count"] == 1
+    assert response_trace["repair_outcome"] == "valid"
+    assert response_trace["validation_status"] == "valid"
+    assert len(trace["model_calls"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_grounded_repair_transport_failure_has_no_fallback_or_third_call(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    rejected = "REJECTED REPAIR TRANSPORT SENTINEL"
+    litellm = SequenceLiteLLM(
+        [_provider_completion(rejected), RuntimeError("PRIVATE REPAIR ERROR")]
+    )
+    memory_store = FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-grounded-repair-transport-failed",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
+    assert out["sources"] == []
+    assert len(litellm.calls) == 2
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert rejected not in json.dumps(trace, sort_keys=True)
+    assert "PRIVATE REPAIR ERROR" not in json.dumps(trace, sort_keys=True)
+    response_trace = trace["retrieval"]["prompt_assembly"]["evidence_response"]
+    assert response_trace["repair_attempted"] is True
+    assert response_trace["repair_call_count"] == 1
+    assert response_trace["repair_outcome"] == "transport_failed"
+    assert response_trace["validation_status"] == "invalid"
+    assert len(trace["model_calls"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_grounded_repair_prompt_budget_failure_makes_no_repair_call(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    rejected = "REJECTED BUDGET SENTINEL"
+    calibration_provider = SequenceLiteLLM(
+        [
+            _provider_completion(rejected),
+            _provider_completion(
+                _evidence_candidate(
+                    (
+                        "vehicle_log_primary:record_1",
+                        "The maintenance record lists 2025-07-12.",
+                    )
+                )
+            ),
+        ]
+    )
+    await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=FakeMemoryStore(),
+        litellm=calibration_provider,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-grounded-repair-budget-calibration",
+    )
+    initial_tokens = estimate_messages_tokens(
+        calibration_provider.calls[0]["messages"]
+    )
+    repair_tokens = estimate_messages_tokens(calibration_provider.calls[1]["messages"])
+    assert repair_tokens > initial_tokens
+    models.write_text(
+        "models:\n"
+        "  gpt-4o-mini:\n"
+        "    provider: cloud\n"
+        "    structured_output: json_schema\n"
+        f"    max_context_tokens: {initial_tokens + 2048 + 256}\n",
+        encoding="utf-8",
+    )
+    provider = FakeLiteLLM(content=rejected)
+    memory_store = FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify the maintenance record.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-grounded-repair-budget-failed",
+    )
+
+    assert out["status"] == "degraded"
+    assert out["answer"] == HELPFUL_GROUNDED_RECOVERY_RESPONSE
+    assert len(provider.calls) == 1
+    response_trace = memory_store.trace_calls[-1]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["evidence_response"]
+    assert response_trace["repair_eligible"] is True
+    assert response_trace["repair_attempted"] is False
+    assert response_trace["repair_call_count"] == 0
+    assert response_trace["repair_outcome"] == "prompt_budget_failed"
 
 
 @pytest.mark.asyncio
@@ -17366,7 +17708,7 @@ async def test_governed_evidence_rejects_structurally_malformed_provider_content
 
     replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["status"] == "degraded"
-    assert len(litellm.calls) == 1
+    assert len(litellm.calls) == 2
     assert provider_answer not in out["answer"]
     assert out["answer"] == replacement
     assert out["answer"].count(replacement) == 1
@@ -17376,7 +17718,7 @@ async def test_governed_evidence_rejects_structurally_malformed_provider_content
     assert manifest["shape"]["task_shape"] == "targeted_lookup"
     assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
     assert trace["fallback"]["triggered"] is False
-    assert len(trace["model_calls"]) == 1
+    assert len(trace["model_calls"]) == 2
     assistant_write = next(
         item for item in memory_store.added_messages if item["role"] == "assistant"
     )
@@ -17432,7 +17774,7 @@ async def test_governed_evidence_never_surfaces_non_contract_provider_prose(
 
     replacement = HELPFUL_GROUNDED_RECOVERY_RESPONSE
     assert out["status"] == "degraded"
-    assert len(litellm.calls) == 1
+    assert len(litellm.calls) == 2
     assert out["answer"] == replacement
     assert provider_answer not in out["answer"]
     assert out["sources"] == []
@@ -17443,7 +17785,7 @@ async def test_governed_evidence_never_surfaces_non_contract_provider_prose(
     assert manifest["acquisition"]["sources_selected"] == ["vehicle_log_primary"]
     assert manifest["sufficiency"]["status"] == "sufficient_for_declared_scope"
     assert trace["fallback"]["triggered"] is False
-    assert len(trace["model_calls"]) == 1
+    assert len(trace["model_calls"]) == 2
     assistant_write = next(
         item for item in memory_store.added_messages if item["role"] == "assistant"
     )
@@ -19117,7 +19459,9 @@ async def test_explicit_source_fast_path_skips_interpreter(tmp_path):
     assert out["status"] == "ok"
     assert len(runtime.evidence_shape_calls) == 1
     assert len(litellm.calls) == 1
-    assert "response_format" not in litellm.calls[0]
+    assert litellm.calls[0]["response_format"]["json_schema"]["name"] == (
+        "grounded_evidence_response"
+    )
     assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == [
         "vehicle_log_primary"
     ]
@@ -20834,6 +21178,7 @@ async def test_advisory_empty_provider_body_uses_deterministic_guidance(
     )
 
     assert len(provider.calls) == 1
+    assert "response_format" not in provider.calls[0]
     assert "Unverified guidance:\nThe next useful step is to compare the exact " in result[
         "answer"
     ]
@@ -22468,7 +22813,7 @@ async def test_orchestrate_compound_policy_label_boundary_fails_closed(
     assert "New verification unavailable:" not in result["answer"]
     assert result["answer"].endswith(f"New verification:\n{expected_replacement}")
     assert "PRIVATE-LABEL-CONTENT" not in result["answer"]
-    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["provider"].calls) == 2
     assert len(outcome["dsa"].calls) == 1
     assert outcome["dsa"].fetch_calls == []
     assert outcome["memory_store"].claim_record_calls == []
@@ -22521,7 +22866,7 @@ async def test_orchestrate_compound_free_form_prose_is_malformed(
     assert HELPFUL_GROUNDED_RECOVERY_RESPONSE in result["answer"]
     assert result["answer"].count("Original acquisition:") == 1
     assert result["answer"].count("New verification:") == 1
-    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["provider"].calls) == 2
     assert len(outcome["dsa"].calls) == 1
     assert outcome["memory_store"].claim_record_calls == []
 
@@ -22546,7 +22891,7 @@ async def test_orchestrate_compound_limited_policy_label_boundary_fails_closed(
     ]
     assert HELPFUL_GROUNDED_RECOVERY_RESPONSE in result["answer"]
     assert TARGETED_SCOPE_SUFFIX not in result["answer"]
-    assert len(outcome["provider"].calls) == 1
+    assert len(outcome["provider"].calls) == 2
     assert len(outcome["dsa"].calls) == 1
     assert outcome["memory_store"].claim_record_calls == []
 
@@ -30013,6 +30358,7 @@ def _write_history_route_files(
         "models:\n"
         "  gpt-4o-mini:\n"
         "    provider: cloud\n"
+        "    structured_output: json_schema\n"
         "    max_context_tokens: 128000\n"
         "logical_routes:\n"
         "  intent_classifier:\n"

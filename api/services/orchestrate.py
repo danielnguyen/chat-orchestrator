@@ -63,6 +63,7 @@ from services.claim_explanation import (
 from services.companion_presentation import build_companion_presentation
 from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
+    STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
     EvidenceAcquisitionState,
     SemanticInterpreterFailure,
     advisory_provider_allowed,
@@ -82,6 +83,7 @@ from services.evidence_acquisition import (
     execute_hybrid_comparison,
     finalize_aggregate_conclusion,
     governed_evidence_claim_anchor,
+    grounded_evidence_response_format,
     grounded_provider_allowed,
     helpful_grounded_recovery_allowed,
     ineligible_exact_evidence_state,
@@ -6283,6 +6285,19 @@ def _load_model_registry(path: str) -> dict[str, Any]:
         return {}
 
 
+def _grounded_structured_capability(
+    registry: dict[str, Any],
+    model: str,
+) -> str:
+    model_info = registry.get(model) if isinstance(registry, dict) else None
+    return (
+        "supported"
+        if isinstance(model_info, dict)
+        and model_info.get("structured_output") == "json_schema"
+        else "unsupported"
+    )
+
+
 def _load_logical_route(path: str, route_name: str) -> dict[str, str] | None:
     try:
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -9781,6 +9796,19 @@ async def orchestrate_chat(
         )
         governed_validation = None
         validated_governed_excerpts = ()
+        grounded_structured_unavailable = False
+        grounded_response_format = (
+            grounded_evidence_response_format()
+            if grounded_evidence_provider_call
+            else None
+        )
+        primary_structured_capability = (
+            _grounded_structured_capability(registry, selected_model)
+            if grounded_evidence_provider_call
+            else "not_applicable"
+        )
+        fallback_structured_capability = "not_applicable"
+        structured_transport_failure_reason = None
         capability_dispatch_blocked_by_evidence = bool(
             evidence_acquisition is not None
             and not evidence_acquisition.follow_existing_path
@@ -9799,15 +9827,36 @@ async def orchestrate_chat(
                     and evidence_acquisition.forced_answer == evidence_acquisition.aggregate_result
                     else "degraded"
                 )
+            elif (
+                grounded_evidence_provider_call
+                and primary_structured_capability != "supported"
+            ):
+                completion = {"choices": [{"message": {"content": ""}}]}
+                grounded_structured_unavailable = True
+                structured_transport_failure_reason = (
+                    "structured_output_unsupported"
+                )
+                selected_model = "not_called"
+                selected_provider = "none"
+                status = "degraded"
             elif pending_continuation is not None:
                 completion = {"choices": [{"message": {"content": ""}}]}
             else:
-                completion = await litellm.chat(
-                    request_id=request_id,
-                    model=selected_model,
-                    messages=messages,
-                    tools=provider_tools,
-                )
+                if grounded_evidence_provider_call:
+                    completion = await litellm.chat(
+                        request_id=request_id,
+                        model=selected_model,
+                        messages=messages,
+                        tools=provider_tools,
+                        response_format=grounded_response_format,
+                    )
+                else:
+                    completion = await litellm.chat(
+                        request_id=request_id,
+                        model=selected_model,
+                        messages=messages,
+                        tools=provider_tools,
+                    )
                 model_calls.append(
                     {
                         **_model_attempt(
@@ -9849,7 +9898,15 @@ async def orchestrate_chat(
                 }
             )
             fallback_attempt = provider_attempt_plan[1] if len(provider_attempt_plan) > 1 else None
-            if fallback_attempt:
+            if grounded_evidence_provider_call and fallback_attempt is not None:
+                fallback_structured_capability = _grounded_structured_capability(
+                    registry,
+                    fallback_attempt.model,
+                )
+            if fallback_attempt and (
+                not grounded_evidence_provider_call
+                or fallback_structured_capability == "supported"
+            ):
                 fallback_used = True
                 status = "degraded"
                 prompt.trace["provider_fallback_context"] = {
@@ -9869,12 +9926,21 @@ async def orchestrate_chat(
                 selected_provider = fallback_attempt.provider
                 fallback_started = perf_counter()
                 try:
-                    completion = await litellm.chat(
-                        request_id=request_id,
-                        model=selected_model,
-                        messages=messages,
-                        tools=provider_tools,
-                    )
+                    if grounded_evidence_provider_call:
+                        completion = await litellm.chat(
+                            request_id=request_id,
+                            model=selected_model,
+                            messages=messages,
+                            tools=provider_tools,
+                            response_format=grounded_response_format,
+                        )
+                    else:
+                        completion = await litellm.chat(
+                            request_id=request_id,
+                            model=selected_model,
+                            messages=messages,
+                            tools=provider_tools,
+                        )
                     model_calls.append(
                         {
                             **_model_attempt(
@@ -9945,6 +10011,15 @@ async def orchestrate_chat(
                         privacy_policy=privacy_context,
                     )
                     raise
+            elif grounded_evidence_provider_call:
+                completion = {"choices": [{"message": {"content": ""}}]}
+                grounded_structured_unavailable = True
+                structured_transport_failure_reason = (
+                    "structured_output_unsupported"
+                    if fallback_attempt is not None
+                    else "structured_output_unavailable"
+                )
+                status = "degraded"
             else:
                 final_attempt = dict(model_calls[-1])
                 await _create_error_trace(
@@ -9982,14 +10057,220 @@ async def orchestrate_chat(
                 raise
 
         prompt.trace["capabilities"]["provider_call_count"] = len(model_calls)
-        if grounded_evidence_provider_call and evidence_acquisition is not None:
-            governed_validation, validated_governed_excerpts = (
-                validate_evidence_response_candidate(
-                    provider_text(completion),
-                    context_pack=external_context_pack,
-                    retained_source_refs=retained_external_refs,
-                )
+        if grounded_structured_unavailable and evidence_acquisition is not None:
+            raw_answer = STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE
+            prompt.trace["evidence_response"] = {
+                "contract_active": True,
+                "structured_transport_required": True,
+                "primary_structured_capability": primary_structured_capability,
+                "fallback_structured_capability": fallback_structured_capability,
+                "response_format_mode": (
+                    "json_schema"
+                    if primary_structured_capability == "supported"
+                    else "none"
+                ),
+                "transport_failure_reason": structured_transport_failure_reason,
+                "initial_validation_status": "not_attempted",
+                "initial_failure_reason": None,
+                "repair_eligible": False,
+                "repair_attempted": False,
+                "repair_call_count": 0,
+                "repair_outcome": "not_needed",
+                "validation_status": "not_attempted",
+                "validated_excerpt_count": 0,
+                "failure_reason": None,
+                "provider_tool_count": 0,
+                "recovery_status": "structured_output_unsupported",
+            }
+        elif grounded_evidence_provider_call and evidence_acquisition is not None:
+            governed_validation, validated_governed_excerpts = validate_evidence_response_candidate(
+                provider_text(completion),
+                context_pack=external_context_pack,
+                retained_source_refs=retained_external_refs,
             )
+            initial_validation = governed_validation
+            repair_eligible = bool(
+                governed_validation.validation_status == "invalid"
+                and governed_validation.failure_reason is not None
+            )
+            repair_attempted = False
+            repair_call_count = 0
+            repair_outcome = "not_needed"
+            repair_prompt_status = "not_needed"
+            repair_prompt_fingerprint = None
+            if repair_eligible and governed_validation.failure_reason is not None:
+                successful_attempt = next(
+                    (
+                        attempt
+                        for attempt in provider_attempt_plan
+                        if attempt.model == selected_model
+                        and attempt.provider == selected_provider
+                    ),
+                    provider_attempt_plan[0],
+                )
+                try:
+                    repair_prompt = assemble_prompt(
+                        profile=profile,
+                        retrieval_bundle=provider_retrieval_bundle,
+                        current_messages=[
+                            *capability_registry_messages,
+                            *effective_payload["messages"],
+                        ],
+                        handoff=handoff,
+                        presentation=presentation,
+                        style_guidance=style_guidance,
+                        style_trace=style_trace,
+                        response_shape_guidance=response_shape_guidance,
+                        response_shape_trace=response_shape_trace,
+                        surface_presence_trace=surface_presence_trace,
+                        companion_overlays=companion_overlays,
+                        companion_trace=companion_trace,
+                        interaction_governance=interaction_governance,
+                        interaction_governance_trace_data=(
+                            interaction_governance_trace
+                        ),
+                        persona_containment=persona_containment,
+                        persona_containment_trace_data=persona_containment_trace,
+                        restraint=restraint,
+                        restraint_trace_data=restraint_trace,
+                        situated_presence=situated_presence,
+                        situated_presence_trace_data=situated_presence_trace,
+                        memory_hygiene_trace_data=(
+                            memory_hygiene_result.trace
+                            if memory_hygiene_result is not None
+                            else disabled_memory_hygiene_trace(retrieval_bundle)
+                        ),
+                        privacy_context=privacy_context,
+                        privacy_context_trace_data=privacy_context_trace,
+                        runtime_identity=runtime_identity,
+                        runtime_identity_trace=runtime_identity_trace,
+                        world_state=world_state,
+                        world_state_trace=world_state_trace,
+                        relationship_context=relationship_context,
+                        relationship_context_trace=relationship_context_trace,
+                        runtime_overlay=runtime_overlay,
+                        runtime_trace=runtime_trace,
+                        interrupt_trace=interrupt_trace,
+                        external_context_pack=external_context_pack,
+                        evidence_response_contract=True,
+                        evidence_repair_failure_reason=(
+                            governed_validation.failure_reason
+                        ),
+                        dsa_trace=dsa_trace,
+                        memory_recall_messages=provider_memory_recall_messages,
+                        memory_recall_trace=provider_memory_recall_trace,
+                        prompt_budget_contract=PromptBudgetContract(
+                            attempts=[successful_attempt],
+                            output_token_reserve=prompt_output_token_reserve,
+                            context_safety_margin=prompt_context_safety_margin,
+                            profile_prompt_budget=(
+                                profile.get("prompt_budget")
+                                if isinstance(profile, dict)
+                                else None
+                            ),
+                        ),
+                    )
+                except PromptBudgetError:
+                    repair_outcome = "prompt_budget_failed"
+                    repair_prompt_status = "prompt_budget_failed"
+                else:
+                    repair_retained_refs = _retained_external_source_refs(
+                        repair_prompt.trace
+                    )
+                    repair_layer_present = (
+                        "evidence_repair_instruction"
+                        in repair_prompt.trace.get("included_layers", [])
+                    )
+                    if (
+                        not repair_layer_present
+                        or repair_retained_refs is None
+                        or repair_retained_refs != retained_external_refs
+                    ):
+                        repair_outcome = "prompt_budget_failed"
+                        repair_prompt_status = "prompt_budget_failed"
+                    else:
+                        repair_attempted = True
+                        repair_call_count = 1
+                        repair_prompt_status = "ready"
+                        repair_fingerprint = _prompt_fingerprint(
+                            repair_prompt.messages
+                        )
+                        repair_prompt_fingerprint = repair_fingerprint[
+                            "fingerprint"
+                        ]
+                        repair_started = perf_counter()
+                        try:
+                            repair_completion = await litellm.chat(
+                                request_id=request_id,
+                                model=selected_model,
+                                messages=repair_prompt.messages,
+                                tools=[],
+                                response_format=grounded_response_format,
+                            )
+                            model_calls.append(
+                                {
+                                    **_model_attempt(
+                                        provider=selected_provider,
+                                        model=selected_model,
+                                        status="ok",
+                                        latency_ms=int(
+                                            (perf_counter() - repair_started)
+                                            * 1000
+                                        ),
+                                    ),
+                                    **_provider_attempt_evidence(
+                                        ordinal=len(model_calls) + 1,
+                                        prompt_fingerprint=repair_fingerprint,
+                                        prompt_trace=repair_prompt.trace,
+                                    ),
+                                    "grounded_candidate_attempt": "repair",
+                                    "capability_descriptor_fingerprint": None,
+                                    "capability_descriptor_count": 0,
+                                }
+                            )
+                        except Exception as repair_error:
+                            model_calls.append(
+                                {
+                                    **_model_attempt(
+                                        provider=selected_provider,
+                                        model=selected_model,
+                                        status="failed",
+                                        latency_ms=int(
+                                            (perf_counter() - repair_started)
+                                            * 1000
+                                        ),
+                                        error=repair_error,
+                                    ),
+                                    **_provider_attempt_evidence(
+                                        ordinal=len(model_calls) + 1,
+                                        prompt_fingerprint=repair_fingerprint,
+                                        prompt_trace=repair_prompt.trace,
+                                    ),
+                                    "grounded_candidate_attempt": "repair",
+                                    "capability_descriptor_fingerprint": None,
+                                    "capability_descriptor_count": 0,
+                                }
+                            )
+                            repair_outcome = "transport_failed"
+                        else:
+                            (
+                                governed_validation,
+                                validated_governed_excerpts,
+                            ) = validate_evidence_response_candidate(
+                                provider_text(repair_completion),
+                                context_pack=external_context_pack,
+                                retained_source_refs=repair_retained_refs,
+                            )
+                            repair_outcome = (
+                                "valid"
+                                if governed_validation.validation_status
+                                == "valid"
+                                else "invalid"
+                            )
+                        status = "degraded"
+                prompt.trace["capabilities"]["provider_call_count"] = len(
+                    model_calls
+                )
             successful_provider_call = any(
                 attempt.get("status") == "ok" for attempt in model_calls
             )
@@ -10006,6 +10287,19 @@ async def orchestrate_chat(
             )
             prompt.trace["evidence_response"] = {
                 "contract_active": True,
+                "structured_transport_required": True,
+                "primary_structured_capability": primary_structured_capability,
+                "fallback_structured_capability": fallback_structured_capability,
+                "response_format_mode": "json_schema",
+                "transport_failure_reason": None,
+                "initial_validation_status": initial_validation.validation_status,
+                "initial_failure_reason": initial_validation.failure_reason,
+                "repair_eligible": repair_eligible,
+                "repair_attempted": repair_attempted,
+                "repair_call_count": repair_call_count,
+                "repair_outcome": repair_outcome,
+                "repair_prompt_status": repair_prompt_status,
+                "repair_prompt_fingerprint": repair_prompt_fingerprint,
                 "validation_status": governed_validation.validation_status,
                 "validated_excerpt_count": (
                     governed_validation.validated_excerpt_count
@@ -10324,8 +10618,11 @@ async def orchestrate_chat(
             artifact_refs_for_sources = []
         answer_sources = _public_answer_sources(artifact_refs_for_sources)
         if (
-            governed_validation is not None
-            and governed_validation.validation_status == "invalid"
+            grounded_structured_unavailable
+            or (
+                governed_validation is not None
+                and governed_validation.validation_status == "invalid"
+            )
         ):
             artifact_refs_for_sources = []
             answer_sources = []

@@ -248,6 +248,11 @@ HELPFUL_GROUNDED_RECOVERY_RESPONSE = (
     "couldn’t validate the generated grounded answer, so I’m not presenting a "
     "substantive conclusion from it. Please try again."
 )
+STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE = (
+    "The evidence acquisition completed and returned usable material, but the "
+    "selected answer route could not produce the required structured grounded "
+    "response, so I’m not presenting a substantive conclusion from it."
+)
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 CONFIGURED_FIELD_VALUES_CONTEXT_MODE = "configured_field_values"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
@@ -2203,6 +2208,57 @@ def evidence_interpreter_response_format() -> dict[str, Any]:
                     "candidate_source_ids",
                     "aggregate_function",
                     "aggregate_field_name",
+                ],
+            },
+        },
+    }
+
+
+def grounded_evidence_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "grounded_evidence_response",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "conclusion_disposition": {
+                        "type": "string",
+                        "enum": [
+                            "supports",
+                            "does_not_support",
+                            "mixed",
+                            "descriptive",
+                        ],
+                    },
+                    "evidence_excerpts": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "source_ref": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 240,
+                                },
+                                "excerpt": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 500,
+                                },
+                            },
+                            "required": ["source_ref", "excerpt"],
+                        },
+                    },
+                },
+                "required": [
+                    "conclusion_disposition",
+                    "evidence_excerpts",
                 ],
             },
         },

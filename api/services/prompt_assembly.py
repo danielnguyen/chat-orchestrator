@@ -88,6 +88,29 @@ EVIDENCE_ADVISORY_GUIDANCE = (
     "- Return natural user-facing prose, not JSON.\n"
     "- Do not add a verified or unverified wrapper; the system owns that boundary."
 )
+EVIDENCE_REPAIR_FAILURE_REASONS = {
+    "invalid_json",
+    "invalid_candidate",
+    "reference_not_retained",
+    "reference_not_unique",
+    "excerpt_not_extractive",
+    "excerpt_token_boundary_invalid",
+}
+
+
+def grounded_evidence_repair_instruction(failure_reason: str) -> str:
+    if failure_reason not in EVIDENCE_REPAIR_FAILURE_REASONS:
+        raise ValueError("invalid_evidence_repair_failure_reason")
+    return (
+        "Grounded evidence response repair:\n"
+        "- The prior candidate failed strict local grounded-response validation "
+        f"with reason code: {failure_reason}.\n"
+        "- Generate a fresh candidate under the same governed evidence response "
+        "contract.\n"
+        "- Use only exact retained source_ref values and extractive text already "
+        "present in the supplied external evidence.\n"
+        "- Do not discuss the prior candidate and do not request or use tools."
+    )
 
 
 @dataclass(frozen=True)
@@ -393,6 +416,7 @@ def _apply_prompt_budget(
     relationship_context_messages: list[dict[str, str]],
     runtime_messages: list[dict[str, str]],
     evidence_response_contract_messages: list[dict[str, str]],
+    evidence_repair_instruction_messages: list[dict[str, str]],
     evidence_advisory_guidance_messages: list[dict[str, str]],
     retrieval_bundle: dict[str, Any],
     external_context_pack: dict[str, Any] | None,
@@ -466,6 +490,16 @@ def _apply_prompt_budget(
                     },
                 ),
                 (
+                    "evidence_repair_instruction",
+                    evidence_repair_instruction_messages,
+                    {
+                        "contract_active": bool(
+                            evidence_repair_instruction_messages
+                        ),
+                        "schema_version": "governed-evidence-repair.v1",
+                    },
+                ),
+                (
                     "evidence_advisory_guidance",
                     evidence_advisory_guidance_messages,
                     {
@@ -501,6 +535,7 @@ def _apply_prompt_budget(
         for name, layer_messages, metadata in ordered:
             if name in {
                 "evidence_response_contract",
+                "evidence_repair_instruction",
                 "evidence_advisory_guidance",
             } and not layer_messages:
                 continue
@@ -1172,6 +1207,7 @@ def assemble_prompt(
     interrupt_trace: dict[str, Any] | None = None,
     external_context_pack: dict[str, Any] | None = None,
     evidence_response_contract: bool = False,
+    evidence_repair_failure_reason: str | None = None,
     evidence_advisory_guidance: bool = False,
     dsa_trace: dict[str, Any] | None = None,
     memory_recall_messages: list[dict[str, str]] | None = None,
@@ -1180,6 +1216,8 @@ def assemble_prompt(
 ) -> PromptAssembly:
     if evidence_response_contract and evidence_advisory_guidance:
         raise ValueError("conflicting_evidence_provider_contracts")
+    if evidence_repair_failure_reason is not None and not evidence_response_contract:
+        raise ValueError("evidence_repair_requires_response_contract")
     messages: list[dict[str, str]] = []
     layers: list[dict[str, Any]] = []
 
@@ -1739,6 +1777,32 @@ def assemble_prompt(
             )
         )
 
+    evidence_repair_instruction_messages = (
+        [
+            {
+                "role": "system",
+                "content": grounded_evidence_repair_instruction(
+                    evidence_repair_failure_reason
+                ),
+            }
+        ]
+        if evidence_repair_failure_reason is not None
+        else []
+    )
+    if evidence_repair_instruction_messages:
+        messages.extend(evidence_repair_instruction_messages)
+        layers.append(
+            _layer_trace(
+                "evidence_repair_instruction",
+                evidence_repair_instruction_messages,
+                metadata={
+                    "contract_active": True,
+                    "schema_version": "governed-evidence-repair.v1",
+                    "failure_reason": evidence_repair_failure_reason,
+                },
+            )
+        )
+
     evidence_advisory_guidance_messages = (
         [{"role": "system", "content": EVIDENCE_ADVISORY_GUIDANCE}]
         if evidence_advisory_guidance
@@ -1823,6 +1887,9 @@ def assemble_prompt(
                 runtime_messages=runtime_messages,
                 evidence_response_contract_messages=(
                     evidence_response_contract_messages
+                ),
+                evidence_repair_instruction_messages=(
+                    evidence_repair_instruction_messages
                 ),
                 evidence_advisory_guidance_messages=(
                     evidence_advisory_guidance_messages

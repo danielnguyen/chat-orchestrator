@@ -356,24 +356,37 @@ bounded response names actual material requirement gaps and distinguishes failed
 filtered, truncated, unsupported, unavailable, unknown, missing, partial,
 excluded, not-attempted, and unresolved-contradiction outcomes.
 
-A sufficient result enters grounded evidence mode and permits one governed provider call with no capability
-tools. That call receives a required prompt-budgeted response contract and must
-return only a strict JSON object containing a closed conclusion disposition and
-one to eight distinct source references with exact extractive excerpts. Each
-reference must identify one prompt-retained external item, and each
-whitespace-normalized excerpt must be a case-preserving, token-bounded substring
-of that item. Returned-but-not-retained references, forged references,
-paraphrases, case changes, reordered text, duplicate references, and malformed
-JSON fail validation. There is no content repair, retry, or content-triggered
-fallback call.
+A sufficient result enters grounded evidence mode with no capability tools. The
+selected answer model must explicitly declare `structured_output: json_schema`
+in the model registry; provider identity and model naming do not imply support.
+An unsupported selected route is not called and fails closed without an
+unstructured downgrade. A supported call receives both the required
+prompt-budgeted response contract and a strict JSON-schema response format. Its
+candidate contains a closed conclusion disposition and one to eight distinct
+source references with exact extractive excerpts. Each reference must identify
+one prompt-retained external item, and each whitespace-normalized excerpt must
+be a case-preserving, token-bounded substring of that item. Returned-but-not-
+retained references, forged references, paraphrases, case changes, reordered
+text, duplicate references, and malformed JSON fail the unchanged local
+validator.
+
+After a successfully returned candidate fails that validator, Chat Orchestrator
+may make exactly one repair call with the same model, evidence scope, strict
+response format, and zero tools. The repair prompt is rebuilt through prompt
+budgeting, contains only the closed validation reason and the original governed
+evidence, and never contains the rejected candidate. It has no fallback and
+cannot trigger another repair, acquisition, or Cognitive Runtime call. Transport
+failure before any candidate retains the existing single fallback policy only
+when that fallback also explicitly supports `json_schema`; otherwise the route
+fails closed.
 
 Chat Orchestrator renders the conclusion, neutral excerpt attribution,
 limitation disclosure, and task-specific scope boundary from deterministic
 templates. Arbitrary provider prose is never part of a governed evidence
-answer. A malformed candidate produces a degraded, user-safe response without
-raw provider content while retaining the truthful acquisition manifest and
-provider-call count. Transport failures retain their existing fallback behavior
-and reuse the same structured contract and prompt. A
+answer. A final invalid candidate produces a degraded, user-safe response
+without raw provider content while retaining the truthful acquisition manifest
+and provider-call count. This does not add generic acquisition or execution
+failure-cause rendering. A
 `sufficient_with_limitations` result adds a deterministic disclosure derived
 from optional requirement evaluations, plan limitations, and bounded trusted
 inventory counts when those counts are established. Distinct causes are
