@@ -68,6 +68,12 @@ class Settings(BaseSettings):
         ge=100,
         le=30000,
     )
+    evidence_interpreter_timeout_ms: int = Field(
+        default=5000,
+        alias="EVIDENCE_INTERPRETER_TIMEOUT_MS",
+        ge=100,
+        le=30000,
+    )
     dsa_base_url: str = Field(default="http://localhost:5174", alias="DSA_BASE_URL")
     dsa_timeout_ms: int = Field(default=5000, alias="DSA_TIMEOUT_MS", ge=100, le=30000)
     dsa_enabled: bool = Field(default=False, alias="DSA_ENABLED")

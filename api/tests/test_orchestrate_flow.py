@@ -14040,6 +14040,7 @@ async def _call_evidence_interpreter(
     request_id="rid-evidence-operator-diagnostics",
     local_only=False,
     include_route=True,
+    timeout_ms=5000,
 ):
     _, models = (
         _write_evidence_interpreter_route_files(tmp_path)
@@ -14052,7 +14053,7 @@ async def _call_evidence_interpreter(
         source_list=_operator_diagnostic_source_list(),
         litellm=litellm,
         model_registry_path=str(models),
-        timeout_ms=3000,
+        timeout_ms=timeout_ms,
         local_only=local_only,
         routing_policy={},
         effective_payload={},
@@ -18838,7 +18839,13 @@ async def test_evidence_interpreter_dependency_failures_are_classified_privately
     assert exc_info.value.reason == "dependency_failure"
     assert f"failure_class={failure_class}" in caplog.text
     assert "request_id=rid-evidence-operator-diagnostics" in caplog.text
-    assert "timeout_ms=3000" in caplog.text
+    for event in ("semantic_interpreter_started", "semantic_interpreter_failed"):
+        record = next(
+            record
+            for record in caplog.records
+            if f"event={event}" in record.getMessage()
+        )
+        assert "timeout_ms=5000" in record.getMessage()
     assert "provider_detail" not in caplog.text
     assert "PRIVATE_" not in caplog.text
 
@@ -18913,7 +18920,7 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "logical_route=evidence_interpreter" in logs
     assert "model=gpt-5-mini" in logs
     assert "provider=cloud" in logs
-    assert "timeout_ms=3000" in logs
+    assert "timeout_ms=5000" in logs
     assert "max_completion_tokens=512" in logs
     assert "reasoning_effort=minimal" in logs
     assert "interpretation_status=resolved" in logs
@@ -18929,7 +18936,7 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "aggregate_function" not in logs
     assert "median" not in logs
     assert litellm.calls[0]["model"] == "gpt-5-mini"
-    assert litellm.calls[0]["timeout_ms"] == 3000
+    assert litellm.calls[0]["timeout_ms"] == 5000
     assert litellm.calls[0]["max_completion_tokens"] == 512
     assert litellm.calls[0]["reasoning_effort"] == "minimal"
     response_format = litellm.calls[0]["response_format"]
@@ -19017,6 +19024,9 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
     assert out["answer"] == "Doing well."
     assert len(runtime.evidence_shape_calls) == 2
     assert len(litellm.calls) == 2
+    assert litellm.calls[0]["timeout_ms"] == 5000
+    assert litellm.calls[0]["max_completion_tokens"] == 512
+    assert litellm.calls[0]["reasoning_effort"] == "minimal"
     assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert runtime.evidence_plan_calls == []
@@ -30481,6 +30491,8 @@ async def _run_history_followup(
     routing_policy=None,
     litellm_override=None,
     memory_store_override=None,
+    intent_classifier_timeout_ms=3000,
+    evidence_interpreter_timeout_ms=5000,
 ):
     rules, models = _write_history_route_files(
         tmp_path,
@@ -30509,6 +30521,8 @@ async def _run_history_followup(
         interaction_governance_enabled=True,
         claim_record_capture_enabled=True,
         history_followup_enabled=True,
+        intent_classifier_timeout_ms=intent_classifier_timeout_ms,
+        evidence_interpreter_timeout_ms=evidence_interpreter_timeout_ms,
         request_id="request-history-followup",
     )
     return result, memory_store, runtime, litellm
@@ -30848,11 +30862,45 @@ async def test_natural_history_paraphrase_matrix_calls_classifier_and_bms_once(
     )
     assert result["selected_model"] == "not_called"
     assert len(litellm.calls) == 1
+    assert litellm.calls[0]["timeout_ms"] == 3000
     assert litellm.calls[0]["max_completion_tokens"] == 120
     assert "reasoning_effort" not in litellm.calls[0]
     assert len(runtime.interaction_governance_calls) == 2
     assert len(memory_store.immediate_history_calls) == 1
     assert memory_store.retrieve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_paths_use_independent_nondefault_timeouts(tmp_path):
+    evidence_litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved",
+                "lookup",
+                ["PRIVATE_SOURCE_ID_SENTINEL"],
+            )
+        ]
+    )
+    await _call_evidence_interpreter(
+        tmp_path=tmp_path,
+        litellm=evidence_litellm,
+        timeout_ms=4321,
+    )
+
+    _, _, _, history_litellm = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion("support_explanation"),
+        intent_classifier_timeout_ms=1111,
+        evidence_interpreter_timeout_ms=4321,
+    )
+
+    assert evidence_litellm.calls[0]["timeout_ms"] == 4321
+    assert evidence_litellm.calls[0]["max_completion_tokens"] == 512
+    assert evidence_litellm.calls[0]["reasoning_effort"] == "minimal"
+    assert history_litellm.calls[0]["timeout_ms"] == 1111
+    assert history_litellm.calls[0]["max_completion_tokens"] == 120
+    assert "reasoning_effort" not in history_litellm.calls[0]
 
 
 @pytest.mark.asyncio

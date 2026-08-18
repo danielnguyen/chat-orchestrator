@@ -112,6 +112,52 @@ async def test_chat_endpoint_preserves_request_level_external_context_contract(
 
 
 @pytest.mark.asyncio
+async def test_chat_endpoint_passes_independent_classifier_timeouts(monkeypatch):
+    monkeypatch.setenv("INTENT_CLASSIFIER_TIMEOUT_MS", "1111")
+    monkeypatch.setenv("EVIDENCE_INTERPRETER_TIMEOUT_MS", "4321")
+    main = _load_main(monkeypatch)
+    captured_kwargs = []
+
+    async def fake_orchestrate_chat(**kwargs):
+        captured_kwargs.append(kwargs)
+        return {
+            "request_id": "rid-chat-api",
+            "conversation_id": "conv-1",
+            "profile_name": "default",
+            "selected_model": "gpt-4o-mini",
+            "answer": "ok",
+            "status": "ok",
+            "sources": [],
+        }
+
+    monkeypatch.setattr(main, "orchestrate_chat", fake_orchestrate_chat)
+
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/v1/chat",
+            headers={"X-API-Key": "orch-test"},
+            json=_full_chat_payload(),
+        )
+
+    assert response.status_code == 200
+    assert main.settings.intent_classifier_timeout_ms == 1111
+    assert main.settings.evidence_interpreter_timeout_ms == 4321
+    assert captured_kwargs[0]["intent_classifier_timeout_ms"] == 1111
+    assert captured_kwargs[0]["evidence_interpreter_timeout_ms"] == 4321
+
+
+def test_classifier_timeout_defaults_are_independent(monkeypatch):
+    main = _load_main(monkeypatch)
+
+    assert main.settings.intent_classifier_timeout_ms == 3000
+    assert main.settings.evidence_interpreter_timeout_ms == 5000
+
+
+@pytest.mark.asyncio
 async def test_chat_endpoint_does_not_expose_orchestration_exception_text(monkeypatch):
     main = _load_main(monkeypatch)
 
