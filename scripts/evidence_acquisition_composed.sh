@@ -860,6 +860,16 @@ run_evidence_source_scope_scenarios() {
   client="client-source-scope-natural"
   conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-natural")"
   question="What is recorded in Configured Review Register?"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" \
+    '{
+      expected_request_text:$request_text,
+      expected_source_id:"complete_register",
+      expected_content_fields:["Entry","Required","Status"],
+      interpretation_status:"resolved",
+      operation_hint:"lookup",
+      candidate_source_ids:["complete_register"]
+    }')"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -880,14 +890,32 @@ run_evidence_source_scope_scenarios() {
     and .acquisition.inventory_discovery.called == true
     and .acquisition.inventory_discovery.outcome == "success"
   '
+  assert_jq "source_scope.natural.semantic_trace" "$trace" '
+    .prompt.semantic_interpreter == {
+      called:true,
+      status:"accepted",
+      reason:"validated",
+      interpretation_status:"resolved",
+      operation_hint:"lookup",
+      candidate_count:1
+    }
+  '
   if ! jq -e --arg request_id "$request_id" '
     [.events[] | select(
       .event_type == "evidence_shape_derived"
       and .event_payload_json.request_id == $request_id
     ) | .event_payload_json] as $events
-    | ($events | length) == 1
+    | ($events | length) == 2
     and $events[0].source_match_status == "matched"
     and $events[0].matched_source_ids == ["complete_register"]
+    and $events[0].task_shape == "targeted_lookup"
+    and ($events[0] | has("semantic_operation_hint") | not)
+    and $events[1].source_match_status == "matched"
+    and $events[1].matched_source_ids == ["complete_register"]
+    and $events[1].task_shape == "targeted_lookup"
+    and $events[1].semantic_interpretation_status == "resolved"
+    and $events[1].semantic_operation_hint == "lookup"
+    and $events[1].semantic_candidate_count == 1
   ' <<<"$diagnostics" >/dev/null; then
     echo "Assertion failed: source_scope.natural.runtime_match" >&2
     return 1
@@ -898,7 +926,7 @@ run_evidence_source_scope_scenarios() {
       | select(.content | contains("calendar_alpha") or contains("calendar_beta"))]
       | length) == 0
   '
-  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_semantic_interpreter_calls "$provider_calls" 1
   assert_jq "source_scope.natural.fixture_decoys" "$fixture_calls" '
     ([.calls[] | select(.source == "calendar-alpha" or .source == "calendar-beta")]
       | length) == 0
@@ -909,7 +937,7 @@ run_evidence_source_scope_scenarios() {
     and $calls[0].source_ids == ["complete_register"]
   '
   assert_single_inventory_request 1
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
