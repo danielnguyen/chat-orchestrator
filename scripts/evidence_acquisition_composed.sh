@@ -5909,7 +5909,7 @@ run_step13_diagnostic_scenarios() {
 
   assert_jq "step13.http.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 502"))
+    and (.answer | contains("source service request failed with HTTP 500"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
     and (.answer | contains("Median for") | not)
@@ -5939,10 +5939,14 @@ run_step13_diagnostic_scenarios() {
       | select(.content | contains("trusted_process_facts"))] | length) == 1
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
-      | select(.content | contains("source_unavailable"))] | length) == 1
+      | select(.content | contains("chat-orchestrator"))] | length) == 1
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
-      | select(.content | contains("503"))] | length) == 1
+      | select(.content | contains("500"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("source_unavailable") or contains("503"))]
+      | length) == 0
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
       | select(.content | contains("measurements"))] | length) == 0
@@ -6044,7 +6048,7 @@ run_step13_diagnostic_scenarios() {
       ;;
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Step-13 diagnostics: composed_dsa_http=502 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+  echo "Step-13 diagnostics: composed_dsa_http=500 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
 }
 
 run_evidence_acquisition_composed_suite() {
