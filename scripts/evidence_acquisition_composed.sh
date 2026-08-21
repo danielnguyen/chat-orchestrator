@@ -1381,6 +1381,9 @@ run_evidence_hybrid_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "calendar-beta" "unavailable_after_first"
+  queue_diagnostic_advisory \
+    "The source dependency may be unavailable." \
+    "Consider trying the comparison again later."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-hybrid-failure")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1391,7 +1394,9 @@ run_evidence_hybrid_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   jq -e '
     .status == "degraded"
-    and (.answer | contains("requested conclusion") or contains("selected-source comparison"))
+    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
   ' <<<"$response" >/dev/null
   jq -e '
     .acquisition.sources_considered == ["calendar_alpha","calendar_beta"]
@@ -1402,7 +1407,13 @@ run_evidence_hybrid_scenarios() {
       or .next_steps.selections[0].selected_next_step == "withhold_unsupported_conclusion"
     )
   ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  jq -e '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.render_mode == "advisory"
+  ' <<<"$manifest" >/dev/null
   assert_provider_free_trace "$trace"
   jq -e '
     ([.calls[] | select(.source == "calendar-beta" and .operation == "ics_get")] | length) == 2
@@ -1464,6 +1475,9 @@ run_evidence_exhaustive_scenarios() {
   reset_dsa_audit
   configure_source_fixture "complete-sheet" "large"
   restart_orchestrator_with_reserve 180000
+  queue_diagnostic_advisory \
+    "The bounded acquisition may have ended before full coverage." \
+    "Consider narrowing the request or increasing the permitted retrieval scope."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exhaustive-truncation")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1473,8 +1487,9 @@ run_evidence_exhaustive_scenarios() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   jq -e '
     .status == "degraded"
-    and (.answer | contains("reasoning context"))
-    and (.answer | contains("withholding a complete-scope conclusion"))
+    and (.answer | contains("retrieval limit"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
   ' <<<"$response" >/dev/null
   jq -e '
     .acquisition.expansion_successful_count == 1
@@ -1482,7 +1497,13 @@ run_evidence_exhaustive_scenarios() {
     and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "unknown"
   ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  jq -e '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["retrieval_limit"]
+    and .diagnostic.render_mode == "advisory"
+  ' <<<"$manifest" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   restart_orchestrator_with_reserve 2048
   configure_source_fixture "complete-sheet" "ready"
@@ -1580,8 +1601,9 @@ run_evidence_limitation_and_failure_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "calendar-alpha" "unavailable"
-  guidance="Compare the exact record identifier with the authoritative record that controls the requested conclusion."
-  queue_provider_answer "$guidance"
+  queue_diagnostic_advisory \
+    "The source dependency may be unavailable." \
+    "Consider trying the lookup again later."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-failure")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1592,15 +1614,25 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  assert_advisory_response_boundary "$response" "$guidance"
-  assert_advisory_manifest "$manifest" "insufficient" "not_applicable"
-  assert_advisory_trace "$trace" "$answer"
-  assert_advisory_provider_calls "$provider_calls"
+  jq -e '
+    .status == "degraded"
+    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.render_mode == "advisory"
+  ' <<<"$manifest" >/dev/null
+  assert_provider_free_trace "$trace"
+  assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
     and .retrieval.prompt_assembly.dsa.status == "error"
-    and .retrieval.prompt_assembly.dsa.error_code == "http_502"
+    and .retrieval.prompt_assembly.dsa.error_code == "http_500"
   ' <<<"$trace" >/dev/null
   jq -e '
     ([.calls[] | select(
@@ -1628,8 +1660,9 @@ run_evidence_limitation_and_failure_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "targeted-sheet" "malformed"
-  guidance="Compare the exact record identifier with the authoritative record that controls the requested conclusion."
-  queue_provider_answer "$guidance"
+  queue_diagnostic_advisory \
+    "The source response may not match the required structure." \
+    "Consider checking the source response configuration."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-malformed")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1640,13 +1673,20 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  assert_advisory_response_boundary "$response" "$guidance"
   jq -e '
-    (.acquisition.dsa_error_codes | length) > 0
+    .status == "degraded"
+    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.render_mode == "advisory"
   ' <<<"$manifest" >/dev/null
-  assert_advisory_manifest "$manifest" "insufficient" "not_applicable"
-  assert_advisory_trace "$trace" "$answer"
-  assert_advisory_provider_calls "$provider_calls"
+  assert_provider_free_trace "$trace"
+  assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
