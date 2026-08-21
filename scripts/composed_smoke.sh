@@ -1419,9 +1419,58 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_jq \
     "high_impact" "acquisition_failure_recorded" "$trace" \
     '(.prompt.evidence_acquisition.acquisition.dsa_error_codes | length) > 0'
+  assert_evidence_advisory_jq \
+    "high_impact" "diagnostic_trace" "$trace" '
+      .prompt.evidence_acquisition.diagnostic.eligible == true
+      and .prompt.evidence_acquisition.diagnostic.attempted == true
+      and .prompt.evidence_acquisition.diagnostic.call_count == 1
+      and .prompt.evidence_acquisition.diagnostic.status == "failed"
+      and .prompt.evidence_acquisition.diagnostic.failure_reason == "malformed_response"
+      and .prompt.evidence_acquisition.diagnostic.observation_count == 1
+      and .prompt.evidence_acquisition.diagnostic.observation_categories == ["http_status"]
+      and .prompt.evidence_acquisition.diagnostic.render_mode == "facts_only"
+    '
   assert_evidence_advisory_equal \
-    "high_impact" "provider_chat_count" "0" \
+    "high_impact" "diagnostic_provider_call_count" "1" \
+    "$(jq -r '[.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
+    )] | length' <<<"$provider_calls")"
+  if ! assert_diagnostic_advisory_calls "$provider_calls" 1; then
+    evidence_advisory_assertion_failed \
+      "high_impact" "diagnostic_provider_contract" "true" "false"
+  fi
+  assert_evidence_advisory_equal \
+    "high_impact" "total_provider_chat_count" "1" \
     "$(jq -r '[.calls[] | select(.kind == "chat")] | length' <<<"$provider_calls")"
+  assert_evidence_advisory_equal \
+    "high_impact" "non_diagnostic_answer_provider_count" "0" \
+    "$(jq -r '[.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name != "process_failure_diagnostic_advisory"
+    )] | length' <<<"$provider_calls")"
+  assert_evidence_advisory_equal \
+    "high_impact" "legacy_advisory_provider_count" "0" \
+    "$(jq -r '[.calls[] | select(.kind == "chat") | .normalized_messages[]?
+      | select(
+        .role == "system"
+        and (.content | startswith("Evidence advisory guidance:"))
+      )] | length' <<<"$provider_calls")"
+  assert_evidence_advisory_equal \
+    "high_impact" "grounded_answer_provider_count" "0" \
+    "$(jq -r '[.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "grounded_evidence_response"
+    )] | length' <<<"$provider_calls")"
+  assert_evidence_advisory_jq \
+    "high_impact" "facts_only_response_boundary" "$response" '
+      .pending_action == null
+      and (.answer | contains("source service request failed with HTTP 500"))
+      and (.answer | contains("Unverified guidance:") | not)
+      and (.answer | contains("supports version 3.14") | not)
+      and (.answer | contains("does not support version 3.14") | not)
+      and (.answer | contains("action was performed") | not)
+    '
   assert_evidence_advisory_runtime_events \
     "high_impact" "$diagnostics" "$request_id" 1 1 1 1
   assert_evidence_advisory_dsa_counts "high_impact" "$audit" 0 0 0
@@ -1438,11 +1487,14 @@ run_evidence_advisory_scenario() {
     '$response + $trace + $provider')"
   assert_evidence_advisory_jq \
     "high_impact" "malformed_private_content_absent" "$private_projection" \
-    'contains("PRIVATE MALFORMED CELL SENTINEL") | not'
+    '(contains("PRIVATE MALFORMED CELL SENTINEL") | not)
+      and (contains("credentials") | not)
+      and (contains("Traceback") | not)
+      and (contains("neutral smoke response") | not)'
   assert_evidence_advisory_persistence \
     "high_impact" "$owner" "$conversation" "$request_id" "$high_impact_answer" 0
   configure_source_fixture "targeted-sheet" "ready"
-  echo "Evidence high-impact block: governance=high_impact_decision provider_calls=0 advisory_layer=0 claims=0"
+  echo "Evidence high-impact block: governance=high_impact_decision diagnostic_calls=1 answer_provider_calls=0 executor_calls=0 actions=0 source_attempts=1 retries=0 advisory_layer=0 claims=0"
 
   run_evidence_targeted_scenario
   grounded_request_id="$(psql_exec -At -c "SELECT metadata->>'request_id' FROM messages WHERE owner_id='owner-evidence-targeted' AND role='assistant' ORDER BY created_at DESC LIMIT 1;")"
