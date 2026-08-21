@@ -1394,7 +1394,7 @@ run_evidence_hybrid_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   assert_jq "hybrid.failure.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("source service request failed with HTTP 502"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   '
@@ -1616,7 +1616,7 @@ run_evidence_limitation_and_failure_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   jq -e '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("source service request failed with HTTP 502"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   ' <<<"$response" >/dev/null
@@ -1632,7 +1632,7 @@ run_evidence_limitation_and_failure_scenarios() {
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
     and .retrieval.prompt_assembly.dsa.status == "error"
-    and .retrieval.prompt_assembly.dsa.error_code == "http_500"
+    and .retrieval.prompt_assembly.dsa.error_code == "http_502"
   ' <<<"$trace" >/dev/null
   jq -e '
     ([.calls[] | select(
