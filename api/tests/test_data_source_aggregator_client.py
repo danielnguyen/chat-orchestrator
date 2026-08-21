@@ -8,7 +8,10 @@ from pathlib import Path
 
 import httpx
 import pytest
-from clients.data_source_aggregator import DataSourceAggregatorClient
+from clients.data_source_aggregator import (
+    DataSourceAggregatorClient,
+    DataSourceAggregatorFailure,
+)
 
 
 @pytest.mark.asyncio
@@ -188,7 +191,7 @@ async def test_fetch_source_preserves_headers_timeout_and_http_boundary(monkeypa
         api_key="dsa-secret",
     )
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(DataSourceAggregatorFailure) as error_info:
         await client.fetch_source(
             source_ref="connector:source-a:item-1",
             request_id="request-fetch-1",
@@ -201,6 +204,9 @@ async def test_fetch_source_preserves_headers_timeout_and_http_boundary(monkeypa
         "X-Request-ID": "request-fetch-1",
     }
     assert captured["json"]["include_raw"] is False
+    assert error_info.value.service_status_code == 503
+    assert error_info.value.service_error_code is None
+    assert error_info.value.diagnostic is None
 
 
 @pytest.mark.asyncio
@@ -341,7 +347,7 @@ async def test_context_source_preserves_headers_timeout_and_http_boundary(monkey
         api_key="dsa-secret",
     )
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(DataSourceAggregatorFailure):
         await client.context_source(
             source_ref="connector:source-a:item-1",
             context_mode="configured_field_values",
@@ -365,6 +371,186 @@ async def test_context_source_preserves_headers_timeout_and_http_boundary(monkey
         },
         "field_name": "Reading",
     }
+
+
+@pytest.mark.asyncio
+async def test_client_strictly_consumes_bounded_dsa_source_access_failure(monkeypatch):
+    private_payload = {
+        "error": {
+            "code": "source_unavailable",
+            "message": "PRIVATE-DSA-MESSAGE-SENTINEL",
+            "details": {
+                "url": "https://PRIVATE-DSA-URL-SENTINEL.invalid/feed",
+                "credential": "PRIVATE-DSA-CREDENTIAL-SENTINEL",
+            },
+            "diagnostic": {
+                "component": "data-source-aggregator",
+                "stage": "source_access",
+                "category": "http_status",
+                "upstream_status_code": 503,
+            },
+        },
+        "body": "PRIVATE-DSA-BODY-SENTINEL",
+    }
+
+    async def fake_post(self, url, *, json=None, headers=None, **kwargs):
+        return httpx.Response(
+            502,
+            json=private_payload,
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    client = DataSourceAggregatorClient("http://dsa.local")
+
+    with pytest.raises(DataSourceAggregatorFailure) as error_info:
+        await client.context_pack(query="neutral request")
+
+    error = error_info.value
+    assert str(error) == "Data Source Aggregator request failed."
+    assert error.service_status_code == 502
+    assert error.service_error_code == "source_unavailable"
+    assert error.diagnostic is not None
+    assert error.diagnostic.model_dump(mode="json", exclude_none=True) == {
+        "component": "data-source-aggregator",
+        "stage": "source_access",
+        "category": "http_status",
+        "upstream_status_code": 503,
+    }
+    retained = repr(
+        {
+            "args": error.args,
+            "service_status_code": error.service_status_code,
+            "service_error_code": error.service_error_code,
+            "diagnostic": error.diagnostic.model_dump(mode="json"),
+        }
+    )
+    for sentinel in (
+        "PRIVATE-DSA-MESSAGE-SENTINEL",
+        "PRIVATE-DSA-URL-SENTINEL",
+        "PRIVATE-DSA-CREDENTIAL-SENTINEL",
+        "PRIVATE-DSA-BODY-SENTINEL",
+    ):
+        assert sentinel not in retained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "http_status",
+            "upstream_status_code": 503,
+            "extra": "PRIVATE-EXTRA-SENTINEL",
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "unknown",
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "http_status",
+            "upstream_status_code": "503",
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "http_status",
+            "upstream_status_code": True,
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "http_status",
+            "upstream_status_code": 99,
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "http_status",
+            "upstream_status_code": 600,
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "http_status",
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "timeout",
+            "upstream_status_code": 503,
+        },
+        {
+            "component": "data-source-aggregator",
+            "stage": "source_access",
+            "category": "dependency_failure",
+            "upstream_status_code": 503,
+        },
+    ],
+)
+async def test_client_rejects_malformed_dsa_diagnostic_but_keeps_transport_status(
+    monkeypatch,
+    diagnostic,
+):
+    async def fake_post(self, url, *, json=None, headers=None, **kwargs):
+        return httpx.Response(
+            502,
+            json={
+                "error": {
+                    "code": "source_unavailable",
+                    "message": "PRIVATE-MALFORMED-MESSAGE-SENTINEL",
+                    "details": {"private": "PRIVATE-DETAILS-SENTINEL"},
+                    "diagnostic": diagnostic,
+                },
+                "body": "PRIVATE-MALFORMED-BODY-SENTINEL",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with pytest.raises(DataSourceAggregatorFailure) as error_info:
+        await DataSourceAggregatorClient("http://dsa.local").context_pack(
+            query="neutral request"
+        )
+
+    error = error_info.value
+    assert error.service_status_code == 502
+    assert error.service_error_code == "source_unavailable"
+    assert error.diagnostic is None
+    assert "PRIVATE" not in str(error)
+    assert "PRIVATE" not in repr(error.__dict__)
+
+
+@pytest.mark.asyncio
+async def test_client_represents_legacy_dsa_error_without_diagnostic(monkeypatch):
+    async def fake_get(self, url, *, headers=None, **kwargs):
+        return httpx.Response(
+            503,
+            json={
+                "error": {
+                    "code": "dependency_unavailable",
+                    "message": "PRIVATE-LEGACY-MESSAGE-SENTINEL",
+                }
+            },
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    with pytest.raises(DataSourceAggregatorFailure) as error_info:
+        await DataSourceAggregatorClient("http://dsa.local").list_sources()
+
+    error = error_info.value
+    assert error.service_status_code == 503
+    assert error.service_error_code == "dependency_unavailable"
+    assert error.diagnostic is None
+    assert "PRIVATE-LEGACY-MESSAGE-SENTINEL" not in str(error)
 
 
 @pytest.mark.asyncio

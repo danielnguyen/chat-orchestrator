@@ -284,6 +284,19 @@ queue_evidence_candidate() {
     '{conclusion_disposition:$disposition,evidence_excerpts:[{source_ref:$source_ref,excerpt:$excerpt}]}')"
 }
 
+queue_diagnostic_advisory() {
+  local hypothesis="$1" next_step="$2"
+  queue_provider_answer "$(jq -nc \
+    --arg hypothesis "$hypothesis" \
+    --arg next_step "$next_step" '
+    {
+      diagnosis_status:"hypothesis_available",
+      confidence:"moderate",
+      hypotheses:[{text:$hypothesis,fact_ids:["fact_1"]}],
+      next_step:{text:$next_step,fact_ids:["fact_1"]}
+    }')"
+}
+
 wait_for_http() {
   local url="$1"
   local attempt
@@ -694,6 +707,28 @@ assert_semantic_interpreter_calls() {
         "status",
         "tool_count"
       ]) | length) == 0
+    ))
+  ' <<<"$provider_calls" >/dev/null
+}
+
+assert_diagnostic_advisory_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
+    )] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .tool_count == 0
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required
+        == ["diagnosis_status", "confidence", "hypotheses", "next_step"]
+      and .max_completion_tokens == 512
+      and .reasoning_effort == "minimal"
+      and .status == "ok"
     ))
   ' <<<"$provider_calls" >/dev/null
 }
@@ -5834,12 +5869,191 @@ run_evidence_aggregate_scenario() {
   echo "Evidence aggregate operation refinement: first_shape=targeted_lookup source_match=matched semantic=1 second_shape=aggregate answer_provider=0 search=0 structured_context=1"
 }
 
+run_step13_diagnostic_scenarios() {
+  local owner client conversation_id question external response request_id answer
+  local trace manifest provider_calls fixture_calls audit serialized
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+
+  owner="owner-step13-http"
+  client="client-step13-http"
+  question="What is the median reading in my measurements?"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  configure_source_fixture "measurement-sheet" "unavailable"
+  conversation_id="$(resolve_conversation "$owner" "$client" "step13-http")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"median",
+      aggregate_field_name:"Reading"
+    }')"
+  queue_diagnostic_advisory \
+    "The upstream dependency may be unavailable." \
+    "Consider trying the lookup again later."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  serialized="$(jq -c . <<<"$trace")"
+
+  assert_jq "step13.http.response" "$response" '
+    .status == "degraded"
+    and (.answer | contains("upstream HTTP 503"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains("Median for") | not)
+    and .sources == []
+    and .pending_action == null
+  '
+  assert_jq "step13.http.trace" "$manifest" '
+    .diagnostic.eligible == true
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_count == 1
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.diagnosis_status == "hypothesis_available"
+    and .diagnostic.confidence == "moderate"
+    and .diagnostic.hypothesis_count == 1
+    and .diagnostic.render_mode == "advisory"
+    and .acquisition.aggregate_execution.structured_context_call_count == 1
+    and .acquisition.aggregate_execution.outcome == "failed"
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "step13.http.provider_accounting" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("trusted_process_facts"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("source_unavailable"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("503"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("measurements"))] | length) == 0
+  '
+  assert_jq "step13.http.fixture" "$fixture_calls" '
+    ([.calls[] | select(
+      .source == "measurement-sheet" and .operation == "google_values"
+    )] | length) == 1
+  '
+  assert_jq "step13.http.dsa" "$audit" '
+    ([.[] | select(.operation == "context" and .status == "source_unavailable")]
+      | length) == 1
+  '
+  case "$serialized" in
+    *"The upstream dependency may be unavailable"*|*"Consider trying the lookup again later"*|*"source unavailable"*|*"http://source-fixture"*)
+      echo "Step-13 HTTP trace exposed advisory or source-private material" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  configure_source_fixture "measurement-sheet" "ready"
+
+  owner="owner-step13-invalid"
+  client="client-step13-invalid"
+  question="What is the median Entry in the Configured Metrics Archive?"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "step13-invalid")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"median",
+      aggregate_field_name:"Entry"
+    }')"
+  queue_diagnostic_advisory \
+    "A formatting or data-entry issue may be present." \
+    "Consider checking the values that require numeric input."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  serialized="$(jq -c . <<<"$trace")"
+
+  assert_jq "step13.invalid.response" "$response" '
+    .status == "degraded"
+    and (.answer | contains("5 values failed the required numeric validation"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains("Median for") | not)
+    and (.answer | contains("alpha") | not)
+    and .sources == []
+    and .pending_action == null
+  '
+  assert_jq "step13.invalid.trace" "$manifest" '
+    .diagnostic.eligible == true
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["invalid_value"]
+    and .diagnostic.render_mode == "advisory"
+    and .acquisition.aggregate_execution.outcome == "invalid_numeric_values"
+    and .acquisition.aggregate_execution.invalid_numeric_count == 5
+    and .acquisition.aggregate_execution.numeric_value_count == 0
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "step13.invalid.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("\"invalid_value_count\":5"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("alpha") or contains("beta")
+        or contains("gamma") or contains("delta") or contains("epsilon"))]
+      | length) == 0
+  '
+  assert_jq "step13.invalid.fixture" "$fixture_calls" '
+    ([.calls[] | select(
+      .source == "measurement-sheet" and .operation == "google_values"
+    )] | length) == 1
+  '
+  assert_dsa_operation_counts "$audit" 0 1 0
+  case "$serialized" in
+    *PRIVATE_AGGREGATE_SECRET_*|*"A formatting or data-entry issue may be present"*|*"Consider checking the values"*|*structured_data*)
+      echo "Step-13 invalid-value trace exposed raw values or advisory prose" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "Step-13 diagnostics: http_observation=503 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+}
+
 run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
     ""|all)
       run_evidence_source_scope_scenarios
       run_evidence_aggregate_scenario
+      run_step13_diagnostic_scenarios
       run_evidence_targeted_scenario
       run_evidence_exact_scenario
       run_evidence_hybrid_scenarios
@@ -5861,6 +6075,10 @@ run_evidence_acquisition_composed_suite() {
     aggregate)
       run_evidence_aggregate_scenario
       echo "Evidence acquisition composed smoke passed: scenarios=aggregate"
+      ;;
+    step13-diagnostic)
+      run_step13_diagnostic_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=step13-diagnostic"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario

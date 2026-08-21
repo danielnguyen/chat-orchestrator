@@ -12,6 +12,10 @@ import httpx
 import pytest
 import services.capabilities as capability_service
 import services.orchestrate as orchestrate_service
+from clients.data_source_aggregator import (
+    DataSourceAggregatorFailure,
+    DsaSourceAccessDiagnostic,
+)
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import RuntimeClient
 from models import ChatRequest, ChatResponse
@@ -14006,6 +14010,24 @@ def _write_evidence_interpreter_route_files(tmp_path):
     return rules, models
 
 
+def _write_diagnostic_route_files(tmp_path, *, include_interpreter=False):
+    rules, models = _write_default_route_files(tmp_path)
+    routes = (
+        "logical_routes:\n"
+        "  diagnostic_advisory:\n"
+        "    model: gpt-5-mini\n"
+        "    provider: cloud\n"
+    )
+    if include_interpreter:
+        routes += (
+            "  evidence_interpreter:\n"
+            "    model: gpt-5-mini\n"
+            "    provider: local\n"
+        )
+    models.write_text(models.read_text(encoding="utf-8") + routes, encoding="utf-8")
+    return rules, models
+
+
 def _evidence_interpreter_completion(
     interpretation_status,
     operation_hint,
@@ -14324,6 +14346,34 @@ def _rendered_evidence_answer(
 
 def _provider_completion(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"content": content}}]}
+
+
+def _diagnostic_completion(
+    *,
+    status="hypothesis_available",
+    confidence="moderate",
+    hypotheses=None,
+):
+    if hypotheses is None:
+        hypotheses = [
+            {
+                "text": "The dependency may be temporarily unavailable.",
+                "fact_ids": ["fact_1"],
+            }
+        ]
+    return _provider_completion(
+        json.dumps(
+            {
+                "diagnosis_status": status,
+                "confidence": confidence,
+                "hypotheses": hypotheses,
+                "next_step": {
+                    "text": "Consider trying the lookup again later.",
+                    "fact_ids": ["fact_1"],
+                },
+            }
+        )
+    )
 
 
 def _hybrid_context_response(
@@ -15491,12 +15541,18 @@ async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
         "filtered": "filtered or omitted before reasoning",
         "failed": "acquisition failed",
     }[expected_outcome]
-    _assert_material_gap_answer(
-        out["answer"],
-        fragments=["complete declared source scope", expected_fragment],
-        withholding="I’m withholding a complete-scope conclusion.",
-        unknown=expected_outcome == "unknown",
-    )
+    if expected_outcome == "truncated":
+        assert out["answer"] == (
+            "I hit the retrieval limit before I could get the complete data needed "
+            "for the request."
+        )
+    else:
+        _assert_material_gap_answer(
+            out["answer"],
+            fragments=["complete declared source scope", expected_fragment],
+            withholding="I’m withholding a complete-scope conclusion.",
+            unknown=expected_outcome == "unknown",
+        )
     assert len(dsa.context_calls) == 1
     assert dsa.fetch_calls == []
     assert litellm.calls == []
@@ -16881,10 +16937,16 @@ async def test_hybrid_comparison_context_failure_is_bounded_and_never_retried(
             "filtered": "filtered or omitted before reasoning",
             "truncated": "material evidence was truncated",
         }[expected_outcome]
-        _assert_material_gap_answer(
-            out["answer"],
-            fragments=["coverage of every selected source", expected_fragment],
-        )
+        if expected_outcome == "truncated":
+            assert out["answer"] == (
+                "I hit the retrieval limit before I could get the complete data "
+                "needed for the request."
+            )
+        else:
+            _assert_material_gap_answer(
+                out["answer"],
+                fragments=["coverage of every selected source", expected_fragment],
+            )
     assert len(dsa.context_calls) == 2
     assert litellm.calls == []
     facts = {
@@ -18237,13 +18299,10 @@ async def test_evidence_acquisition_dependency_failure_is_withheld_without_provi
         request_id="rid-evidence-dsa-failure",
     )
 
-    _assert_material_gap_answer(
-        out["answer"],
-        fragments=[
-            "requested targeted evidence",
-            "acquisition failed",
-            "reasoning context",
-        ],
+    assert out["answer"] == (
+        "The source lookup timed out before it completed."
+        if isinstance(dsa_failure, httpx.TimeoutException)
+        else "The source service request failed before it completed."
     )
     assert litellm.calls == []
     assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
@@ -18252,6 +18311,246 @@ async def test_evidence_acquisition_dependency_failure_is_withheld_without_provi
     ]
     serialized = json.dumps(runtime.evidence_sufficiency_calls[0])
     assert "PRIVATE DEPENDENCY ERROR" not in serialized
+
+
+def _trusted_dsa_http_failure():
+    return DataSourceAggregatorFailure(
+        service_status_code=502,
+        service_error_code="source_unavailable",
+        diagnostic=DsaSourceAccessDiagnostic.model_validate(
+            {
+                "component": "data-source-aggregator",
+                "stage": "source_access",
+                "category": "http_status",
+                "upstream_status_code": 503,
+            }
+        ),
+    )
+
+
+def _neutral_diagnostic_source_response():
+    return {
+        "inventory_scope": "configured_sources",
+        "inventory_status": "complete",
+        "sources": [
+            {
+                "source_id": "records_primary",
+                "display_name": "Configured Records",
+                "connector": "neutral_connector",
+                "domain_tags": ["records"],
+                "sensitivity": "medium",
+                "access_mode": "read_only",
+                "capabilities": ["profile", "search"],
+                "enabled": True,
+                "status": "ready",
+                "last_checked_at": "2026-08-20T00:00:00Z",
+                "last_error": None,
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_step13_dsa_failure_uses_one_bounded_advisory_and_no_answer_provider(
+    tmp_path,
+):
+    rules, models = _write_diagnostic_route_files(tmp_path, include_interpreter=True)
+    memory_store = FakeMemoryStore()
+    runtime = FakeRuntime()
+    dsa = FakeDSA(
+        error=_trusted_dsa_http_failure(),
+        source_response=_neutral_diagnostic_source_response(),
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved", "lookup", ["records_primary"]
+            ),
+            _diagnostic_completion(),
+        ]
+    )
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify a record in Configured Records.",
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-step13-dsa-advisory",
+    )
+
+    assert out["status"] == "degraded"
+    assert "HTTP 503" in out["answer"]
+    assert "My best guess is" in out["answer"]
+    assert "A useful next step would be" in out["answer"]
+    assert "configured record is" not in out["answer"].lower()
+    assert len(litellm.calls) == 2
+    diagnostic_call = litellm.calls[1]
+    assert diagnostic_call["tools"] == []
+    assert diagnostic_call["response_format"]["type"] == "json_schema"
+    assert diagnostic_call["model"] == "gpt-5-mini"
+    assert len(dsa.calls) == 1
+    diagnostic_input = json.dumps(diagnostic_call["messages"], sort_keys=True)
+    assert "fact_1" in diagnostic_input
+    assert "source_unavailable" in diagnostic_input
+    assert "503" in diagnostic_input
+    for private_material in (
+        "PRIVATE DSA MESSAGE",
+        "PRIVATE DSA DETAILS",
+        "https://private.invalid",
+        "configured record.",
+    ):
+        assert private_material not in diagnostic_input
+    retained_trace = memory_store.trace_calls[-1]["payload"]
+    trace = retained_trace["prompt"][
+        "evidence_acquisition"
+    ]
+    assert trace["diagnostic"] == {
+        "eligible": True,
+        "attempted": True,
+        "call_count": 1,
+        "status": "accepted",
+        "failure_reason": None,
+        "observation_count": 1,
+        "observation_categories": ["http_status"],
+        "diagnosis_status": "hypothesis_available",
+        "confidence": "moderate",
+        "hypothesis_count": 1,
+        "render_mode": "advisory",
+    }
+    serialized_trace = json.dumps(trace, sort_keys=True)
+    assert "temporarily unavailable" not in serialized_trace
+    assert "trying the lookup" not in serialized_trace
+    assert retained_trace["retrieval"]["prompt_assembly"]["response_review"] == {
+        "status": "not_requested",
+        "reason": "diagnostic_process_response",
+    }
+    assert retained_trace["retrieval"]["prompt_assembly"]["claim_capture"][
+        "enabled"
+    ] is False
+    retained_dsa = retained_trace["dsa"]
+    assert retained_dsa["source_access_diagnostic"] == {
+        "component": "data-source-aggregator",
+        "stage": "source_access",
+        "category": "http_status",
+        "upstream_status_code": 503,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "completion",
+    [
+        _provider_completion("{"),
+        RuntimeError("PRIVATE DIAGNOSTIC PROVIDER FAILURE"),
+    ],
+    ids=["malformed", "provider-failure"],
+)
+async def test_step13_diagnostic_failure_renders_facts_without_retry_or_fallback(
+    tmp_path,
+    completion,
+):
+    rules, models = _write_diagnostic_route_files(tmp_path, include_interpreter=True)
+    memory_store = FakeMemoryStore()
+    dsa = FakeDSA(
+        error=_trusted_dsa_http_failure(),
+        source_response=_neutral_diagnostic_source_response(),
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved", "lookup", ["records_primary"]
+            ),
+            completion,
+        ]
+    )
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Verify a record in Configured Records.", external_context_enabled=True
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-step13-diagnostic-failure",
+    )
+
+    assert out["answer"] == "The source lookup failed with an upstream HTTP 503."
+    assert len(litellm.calls) == 2
+    assert len(dsa.calls) == 1
+    assert "diagnostic" not in out["answer"].lower()
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert trace["diagnostic"]["call_count"] == 1
+    assert trace["diagnostic"]["status"] == "failed"
+    assert trace["diagnostic"]["failure_reason"] == (
+        "provider_failure"
+        if isinstance(completion, BaseException)
+        else "malformed_response"
+    )
+    assert trace["diagnostic"]["render_mode"] == "facts_only"
+
+
+@pytest.mark.asyncio
+async def test_step13_diagnostic_cloud_policy_gate_renders_facts_without_call(
+    tmp_path,
+):
+    rules, models = _write_diagnostic_route_files(tmp_path, include_interpreter=True)
+    memory_store = FakeMemoryStore()
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved", "lookup", ["records_primary"]
+            )
+        ]
+    )
+    payload = _first_party_chat_payload(
+        "Verify a record in Configured Records.", external_context_enabled=True
+    )
+    payload["surface_context"]["sensitivity_level"] = "restricted"
+
+    out = await orchestrate_chat(
+        payload=payload,
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=FakeRuntime(),
+        dsa=FakeDSA(
+            error=_trusted_dsa_http_failure(),
+            source_response=_neutral_diagnostic_source_response(),
+        ),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-step13-policy-gate",
+    )
+
+    assert out["answer"] == "The source lookup failed with an upstream HTTP 503."
+    assert len(litellm.calls) == 1
+    diagnostic = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["diagnostic"]
+    assert diagnostic["status"] == "provider_disallowed"
+    assert diagnostic["call_count"] == 0
+    assert diagnostic["render_mode"] == "facts_only"
 
 
 @pytest.mark.asyncio
@@ -20046,6 +20345,161 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
         assert "27.875" not in serialized_trace
 
 
+async def _run_step13_aggregate_failure(
+    *,
+    tmp_path,
+    response,
+    diagnostic_completion,
+    request_id,
+):
+    rules, models = _write_diagnostic_route_files(
+        tmp_path, include_interpreter=True
+    )
+    question = "What is the median Reading in the Configured Metrics Archive?"
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _aggregate_test_shape(
+            call, initial_source_matched=True
+        ),
+        evidence_plan_response=_aggregate_plan_response(
+            request_id=request_id,
+            question=question,
+        ),
+        auto_source_match=False,
+    )
+    dsa = FakeDSA(
+        context_responses=[response],
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "metrics_archive",
+                    "display_name": "Configured Metrics Archive",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["metrics", "archive"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-08-20T00:00:00Z",
+                    "last_error": None,
+                    "content_fields": ["Entry", "Reading"],
+                }
+            ],
+        },
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "resolved",
+                "aggregate",
+                ["metrics_archive"],
+                aggregate_function="median",
+                aggregate_field_name="Reading",
+            ),
+            diagnostic_completion,
+        ]
+    )
+    memory_store = FakeMemoryStore()
+    result = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return result, runtime, dsa, litellm, memory_store
+
+
+@pytest.mark.asyncio
+async def test_step13_invalid_value_advisory_uses_count_without_normalizing_value(
+    tmp_path,
+):
+    raw_invalid_value = "malformed-value-sentinel"
+    response = _aggregate_structured_response()
+    response["results"][0]["structured_data"]["values"][0] = raw_invalid_value
+    completion = _diagnostic_completion(
+        hypotheses=[
+            {
+                "text": "A formatting or data-entry issue may be present.",
+                "fact_ids": ["fact_1"],
+            }
+        ]
+    )
+
+    out, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=completion,
+        request_id="rid-step13-invalid-value",
+    )
+
+    assert "1 value failed the required numeric validation" in out["answer"]
+    assert "My best guess is" in out["answer"]
+    assert 'Median for "Reading"' not in out["answer"]
+    assert raw_invalid_value not in out["answer"]
+    assert len(litellm.calls) == 2
+    diagnostic_input = json.dumps(litellm.calls[1]["messages"], sort_keys=True)
+    diagnostic_payload = json.loads(litellm.calls[1]["messages"][1]["content"])
+    assert diagnostic_payload["trusted_process_facts"][0]["invalid_value_count"] == 1
+    assert raw_invalid_value not in diagnostic_input
+    assert len(dsa.context_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert trace["diagnostic"]["observation_categories"] == ["invalid_value"]
+    assert raw_invalid_value not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_step13_retrieval_limit_advisory_does_not_claim_source_absence_or_retry(
+    tmp_path,
+):
+    response = _aggregate_structured_response()
+    response["budget"]["truncated"] = True
+    completion = _diagnostic_completion(
+        hypotheses=[
+            {
+                "text": "The bounded acquisition may have ended before full coverage.",
+                "fact_ids": ["fact_1"],
+            }
+        ]
+    )
+
+    out, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=completion,
+        request_id="rid-step13-retrieval-limit",
+    )
+
+    assert "retrieval limit" in out["answer"]
+    assert "complete data needed" in out["answer"]
+    assert "source lacks" not in out["answer"].lower()
+    assert 'Median for "Reading"' not in out["answer"]
+    assert len(litellm.calls) == 2
+    assert len(dsa.context_calls) == 1
+    assert len(runtime.evidence_plan_calls) == 1
+    diagnostic_payload = json.loads(litellm.calls[1]["messages"][1]["content"])
+    assert diagnostic_payload["trusted_process_facts"][0]["category"] == (
+        "retrieval_limit"
+    )
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert trace["diagnostic"]["call_count"] == 1
+    assert trace["diagnostic"]["observation_categories"] == ["retrieval_limit"]
+
+
 @pytest.mark.asyncio
 async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_manifest(
     tmp_path,
@@ -20345,11 +20799,17 @@ async def test_evidence_acquisition_exact_fetch_failures_withhold_without_fallba
         "truncated": "material evidence was truncated",
         "failed": "acquisition failed",
     }[expected_outcome]
-    _assert_material_gap_answer(
-        out["answer"],
-        fragments=["requested targeted evidence", expected_fragment],
-        unknown=expected_outcome == "unknown",
-    )
+    if expected_outcome == "truncated":
+        assert out["answer"] == (
+            "I hit the retrieval limit before I could get the complete data needed "
+            "for the request."
+        )
+    else:
+        _assert_material_gap_answer(
+            out["answer"],
+            fragments=["requested targeted evidence", expected_fragment],
+            unknown=expected_outcome == "unknown",
+        )
     assert len(dsa.fetch_calls) == 1
     assert dsa.calls == []
     assert litellm.calls == []
