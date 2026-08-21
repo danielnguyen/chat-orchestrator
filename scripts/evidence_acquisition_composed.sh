@@ -1616,23 +1616,41 @@ run_evidence_limitation_and_failure_scenarios() {
     and .diagnostic.observation_categories == ["http_status"]
     and .diagnostic.render_mode == "advisory"
   '
-  assert_provider_free_trace "$trace"
-  assert_diagnostic_advisory_calls "$provider_calls" 1
-  assert_dsa_operation_counts "$audit" 0 0 0
-  jq -e '
+  if ! assert_provider_free_trace "$trace"; then
+    echo "Assertion failed: failure.unavailable.answer_provider" >&2
+    return 1
+  fi
+  if ! assert_diagnostic_advisory_calls "$provider_calls" 1; then
+    echo "Assertion failed: failure.unavailable.provider" >&2
+    return 1
+  fi
+  if ! assert_dsa_operation_counts "$audit" 0 0 0; then
+    echo "Assertion failed: failure.unavailable.dsa_audit" >&2
+    return 1
+  fi
+  assert_jq "failure.unavailable.transport_trace" "$trace" '
     .retrieval.prompt_assembly.dsa.called == true
     and .retrieval.prompt_assembly.dsa.status == "error"
     and .retrieval.prompt_assembly.dsa.error_code == "http_502"
-  ' <<<"$trace" >/dev/null
-  jq -e '
+  '
+  assert_jq "failure.unavailable.fixture" "$source_calls" '
     ([.calls[] | select(
       .source == "calendar-alpha" and .operation == "ics_get"
     )] | length) == 1
-  ' <<<"$source_calls" >/dev/null
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  '
+  if ! assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1; then
+    echo "Assertion failed: failure.unavailable.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events "$diagnostics" "$request_id" 0; then
+    echo "Assertion failed: failure.unavailable.claims" >&2
+    return 1
+  fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  if ! assert_request_persistence_counts "$conversation_id" "$request_id" 0; then
+    echo "Assertion failed: failure.unavailable.persistence" >&2
+    return 1
+  fi
   case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c '[.calls[] | select(.kind == "chat") | .normalized_messages]' <<<"$provider_calls")" in
     *PRIVATE*|*fixture-source-failure*|*credentials*|*Traceback*)
       echo "unavailable source diagnostics exposed private dependency data" >&2
