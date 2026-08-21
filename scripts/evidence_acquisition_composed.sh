@@ -1631,7 +1631,9 @@ run_evidence_limitation_and_failure_scenarios() {
   assert_jq "failure.unavailable.transport_trace" "$trace" '
     .retrieval.prompt_assembly.dsa.called == true
     and .retrieval.prompt_assembly.dsa.status == "error"
-    and .retrieval.prompt_assembly.dsa.error_code == "http_502"
+    and .retrieval.prompt_assembly.dsa.error_code == "source_unavailable"
+    and .retrieval.prompt_assembly.dsa.service_error_code == "source_unavailable"
+    and .retrieval.prompt_assembly.dsa.service_http_status == 502
   '
   assert_jq "failure.unavailable.fixture" "$source_calls" '
     ([.calls[] | select(
