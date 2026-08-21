@@ -5909,7 +5909,7 @@ run_step13_diagnostic_scenarios() {
 
   assert_jq "step13.http.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("upstream HTTP 503"))
+    and (.answer | contains("source service request failed with HTTP 502"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
     and (.answer | contains("Median for") | not)
@@ -6044,7 +6044,7 @@ run_step13_diagnostic_scenarios() {
       ;;
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Step-13 diagnostics: http_observation=503 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+  echo "Step-13 diagnostics: composed_dsa_http=502 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
 }
 
 run_evidence_acquisition_composed_suite() {
