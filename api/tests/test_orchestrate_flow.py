@@ -18397,6 +18397,7 @@ async def test_step13_dsa_failure_uses_one_bounded_advisory_and_no_answer_provid
     assert diagnostic_call["tools"] == []
     assert diagnostic_call["response_format"]["type"] == "json_schema"
     assert diagnostic_call["model"] == "gpt-5-mini"
+    assert diagnostic_call["reasoning_effort"] == "minimal"
     assert len(dsa.calls) == 1
     diagnostic_input = json.dumps(diagnostic_call["messages"], sort_keys=True)
     assert "fact_1" in diagnostic_input

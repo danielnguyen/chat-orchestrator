@@ -727,7 +727,6 @@ assert_diagnostic_advisory_calls() {
       and .response_schema_required
         == ["diagnosis_status", "confidence", "hypotheses", "next_step"]
       and .max_completion_tokens == 512
-      and .reasoning_effort == "minimal"
       and .status == "ok"
     ))
   ' <<<"$provider_calls" >/dev/null
