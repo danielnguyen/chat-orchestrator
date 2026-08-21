@@ -6014,7 +6014,8 @@ run_step13_diagnostic_scenarios() {
     and .diagnostic.status == "accepted"
     and .diagnostic.observation_categories == ["invalid_value"]
     and .diagnostic.render_mode == "advisory"
-    and .acquisition.aggregate_execution.outcome == "invalid_numeric_values"
+    and .acquisition.aggregate_execution.outcome == "filtered"
+    and .acquisition.aggregate_execution.numeric_validation_failed == true
     and .acquisition.aggregate_execution.invalid_numeric_count == 5
     and .acquisition.aggregate_execution.numeric_value_count == 0
   '
