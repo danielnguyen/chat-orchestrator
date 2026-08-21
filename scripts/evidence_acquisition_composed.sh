@@ -1392,13 +1392,13 @@ run_evidence_hybrid_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   fixture_calls="$(fetch_source_fixture_calls)"
-  jq -e '
+  assert_jq "hybrid.failure.response" "$response" '
     .status == "degraded"
     and (.answer | contains("source service request failed with HTTP 500"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "hybrid.failure.manifest" "$manifest" '
     .acquisition.sources_considered == ["calendar_alpha","calendar_beta"]
     and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
     and (
@@ -1406,14 +1406,14 @@ run_evidence_hybrid_scenarios() {
       or .next_steps.selections[0].selected_next_step == "disclose_unexamined_scope"
       or .next_steps.selections[0].selected_next_step == "withhold_unsupported_conclusion"
     )
-  ' <<<"$manifest" >/dev/null
+  '
   assert_diagnostic_advisory_calls "$provider_calls" 1
-  jq -e '
+  assert_jq "hybrid.failure.diagnostic" "$manifest" '
     .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
     and .diagnostic.observation_categories == ["http_status"]
     and .diagnostic.render_mode == "advisory"
-  ' <<<"$manifest" >/dev/null
+  '
   assert_provider_free_trace "$trace"
   jq -e '
     ([.calls[] | select(.source == "calendar-beta" and .operation == "ics_get")] | length) == 2
