@@ -1604,18 +1604,18 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  jq -e '
+  assert_jq "failure.unavailable.response" "$response" '
     .status == "degraded"
     and (.answer | contains("source service request failed with HTTP 502"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "failure.unavailable.diagnostic" "$manifest" '
     .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
     and .diagnostic.observation_categories == ["http_status"]
     and .diagnostic.render_mode == "advisory"
-  ' <<<"$manifest" >/dev/null
+  '
   assert_provider_free_trace "$trace"
   assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
