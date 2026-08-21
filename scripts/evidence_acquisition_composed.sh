@@ -1808,7 +1808,7 @@ run_evidence_changed_premise_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
-  jq -e '
+  assert_jq "changed_premise.initial.trace" "$trace" '
     .router_decision.selected_model == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_requested == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_applied == true
@@ -1822,12 +1822,12 @@ run_evidence_changed_premise_scenarios() {
     and .retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget == 1000
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.supplied == false
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.applied == false
-  ' <<<"$trace" >/dev/null
-  jq -e '
+  '
+  assert_jq "changed_premise.initial.response" "$response" '
     .status == "ok"
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "changed_premise.initial.manifest" "$manifest" '
     .plan.selected_strategies == ["exact_fetch"]
     and .acquisition.strategy_attempted == "exact_fetch"
     and .acquisition.exact_reference_attempt_count == 1
@@ -1843,7 +1843,7 @@ run_evidence_changed_premise_scenarios() {
     and [.next_steps.selections[].selected_next_step] == ["perform_additional_acquisition","answer_within_declared_scope"]
     and .next_steps.selections[0].reacquisition_guard == "changed_premise_allowed"
     and .next_steps.selections[0].additional_acquisition_executed == true
-  ' <<<"$manifest" >/dev/null
+  '
   if ! assert_dsa_operation_counts "$audit" 1 0 1 >/dev/null 2>&1; then
     echo "Assertion failed: changed_premise.initial.dsa" >&2
     return 1
