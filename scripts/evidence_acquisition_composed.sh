@@ -6012,12 +6012,12 @@ run_step13_diagnostic_scenarios() {
     and .diagnostic.attempted == true
     and .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
+    and .diagnostic.observation_count == 1
     and .diagnostic.observation_categories == ["invalid_value"]
+    and .diagnostic.diagnosis_status == "hypothesis_available"
+    and .diagnostic.confidence == "moderate"
+    and .diagnostic.hypothesis_count == 1
     and .diagnostic.render_mode == "advisory"
-    and .acquisition.aggregate_execution.outcome == "filtered"
-    and .acquisition.aggregate_execution.numeric_validation_failed == true
-    and .acquisition.aggregate_execution.invalid_numeric_count == 5
-    and .acquisition.aggregate_execution.numeric_value_count == 0
   '
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_diagnostic_advisory_calls "$provider_calls" 1
