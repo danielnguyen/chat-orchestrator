@@ -1784,7 +1784,7 @@ run_evidence_clarification_scenario() {
 
 run_evidence_changed_premise_scenarios() {
   local owner client conversation_id question external response request_id trace
-  local manifest provider_calls diagnostics audit source_calls guidance answer
+  local manifest provider_calls diagnostics audit source_calls answer
   owner="owner-evidence-followup"
   client="client-evidence-followup"
   question="Verify the follow-up records."
@@ -1870,8 +1870,9 @@ run_evidence_changed_premise_scenarios() {
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
 
   reset_dsa_audit
-  guidance="Compare the exact record identifier and version with the authoritative record that controls the requested conclusion."
-  queue_provider_answer "$guidance"
+  queue_diagnostic_advisory \
+    "The bounded acquisition may have ended before full coverage." \
+    "Consider narrowing the request or changing the evidence scope before trying again."
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_voice_openai")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
@@ -1881,11 +1882,11 @@ run_evidence_changed_premise_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
-  jq -e '
-    .router_decision.selected_model == "chat_voice_openai"
-    and .router_decision.provider == "cloud"
-    and .router_decision.routing_contract.selected_model == "chat_voice_openai"
-    and .router_decision.routing_contract.selected_provider == "cloud"
+  assert_jq "changed_premise.repeated.trace" "$trace" '
+    .router_decision.selected_model == "not_called"
+    and .router_decision.provider == "none"
+    and .router_decision.routing_contract.selected_model == "not_called"
+    and .router_decision.routing_contract.selected_provider == "none"
     and .router_decision.routing_contract.manual_override_requested == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_applied == true
     and .router_decision.routing_contract.manual_override_rejection_reason == null
@@ -1902,27 +1903,60 @@ run_evidence_changed_premise_scenarios() {
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].provider == "cloud"
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].max_context_tokens == 128000
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].role == "primary"
-    and .model_call.status == "ok"
-    and (.model_calls | length) == 1
+    and .model_call.status == "not_called"
+    and .model_calls == []
     and .fallback.triggered == false
-  ' <<<"$trace" >/dev/null
-  assert_advisory_response_boundary "$response" "$guidance"
-  jq -e '(.answer | contains("exact follow-up record confirms") | not)' \
-    <<<"$response" >/dev/null
-  jq -e '
+    and .retrieval.prompt_assembly.evidence_provider_mode.mode == "blocked"
+    and .retrieval.prompt_assembly.evidence_provider_mode.advisory_rebuild_count == 0
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+  '
+  assert_jq "changed_premise.repeated.response" "$response" '
+    .status == "degraded"
+    and .sources == []
+    and .pending_action == null
+    and (.answer | contains(
+      "I hit the retrieval limit before I could get the complete data needed for the request."
+    ))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("The bounded acquisition may have ended before full coverage"))
+    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains(
+      "Consider narrowing the request or changing the evidence scope before trying again"
+    ))
+    and (.answer | contains("exact follow-up record confirms") | not)
+    and (.answer | contains("The retained evidence supports the requested conclusion") | not)
+    and (.answer | contains("Unverified guidance:") | not)
+  '
+  assert_jq "changed_premise.repeated.manifest" "$manifest" '
     .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
     and .next_steps.selection_count == 1
+    and .next_steps.selections[0].selected_next_step == "withhold_unsupported_conclusion"
+    and .next_steps.selections[0].conclusion_disposition == "requested_conclusion_withheld"
+    and .next_steps.selections[0].provider_disposition == "allowed"
     and .next_steps.selections[0].reacquisition_guard == "premise_already_attempted"
     and .next_steps.selections[0].additional_acquisition_executed == false
-  ' <<<"$manifest" >/dev/null
-  assert_advisory_manifest "$manifest" "insufficient" "premise_already_attempted"
-  assert_advisory_trace "$trace" "$answer"
+    and .acquisition.source_references_retained == []
+  '
+  assert_jq "changed_premise.repeated.diagnostic" "$manifest" '
+    .diagnostic.eligible == true
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_count == 1
+    and .diagnostic.observation_categories == ["retrieval_limit"]
+    and .diagnostic.diagnosis_status == "hypothesis_available"
+    and .diagnostic.confidence == "moderate"
+    and .diagnostic.hypothesis_count == 1
+    and .diagnostic.render_mode == "advisory"
+  '
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
-    echo "Assertion failed: changed_premise.repeated.dsa" >&2
+    echo "Assertion failed: changed_premise.repeated.acquisition" >&2
     return 1
   fi
-  jq -e '
+  assert_jq "changed_premise.repeated.fixture" "$source_calls" '
     [.calls[] | select(
       .source == "followup-sheet" and .operation == "google_values"
     )] as $calls
@@ -1934,19 +1968,50 @@ run_evidence_changed_premise_scenarios() {
       > $calls[1].returned_cell_character_count)
     and ($calls[0].returned_cell_character_count
       == $calls[2].returned_cell_character_count)
-  ' <<<"$source_calls" >/dev/null
-  assert_advisory_provider_calls "$provider_calls"
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  '
+  if ! assert_diagnostic_advisory_calls "$provider_calls" 1; then
+    echo "Assertion failed: changed_premise.repeated.provider" >&2
+    return 1
+  fi
+  assert_jq "changed_premise.repeated.answer_provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
+    )] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "grounded_evidence_response"
+    )] | length) == 0
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]?
+      | select(
+        .role == "system"
+        and (.content | startswith("Evidence advisory guidance:"))
+      )] | length) == 0
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]?
+      | select(.content | startswith("Governed evidence response contract:"))]
+      | length) == 0
+  '
+  if ! assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 1 1; then
+    echo "Assertion failed: changed_premise.repeated.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events "$diagnostics" "$request_id" 0; then
+    echo "Assertion failed: changed_premise.repeated.claims" >&2
+    return 1
+  fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  if ! assert_request_persistence_counts "$conversation_id" "$request_id" 0; then
+    echo "Assertion failed: changed_premise.repeated.persistence" >&2
+    return 1
+  fi
   configure_source_fixture "followup-sheet" "ready"
   restart_orchestrator_with_reserve 2048
   docker compose -f "$COMPOSE" exec -T orchestrator /bin/sh -c '
     test "$ALLOW_MANUAL_OVERRIDE" = "false"
     test "$PROMPT_OUTPUT_TOKEN_RESERVE" = "2048"
   '
-  echo "Evidence changed premise: model=chat_voice_openai effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=1"
+  echo "Evidence changed premise: model=chat_voice_openai effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_diagnostic=1 repeated_answer_provider=0 diagnostic_retry=0 diagnostic_reacquisition=0"
 }
 
 run_evidence_adversarial_provider_scenario() {
