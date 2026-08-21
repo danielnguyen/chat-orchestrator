@@ -1475,9 +1475,6 @@ run_evidence_exhaustive_scenarios() {
   reset_dsa_audit
   configure_source_fixture "complete-sheet" "large"
   restart_orchestrator_with_reserve 180000
-  queue_diagnostic_advisory \
-    "The bounded acquisition may have ended before full coverage." \
-    "Consider narrowing the request or increasing the permitted retrieval scope."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exhaustive-truncation")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1487,9 +1484,8 @@ run_evidence_exhaustive_scenarios() {
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   jq -e '
     .status == "degraded"
-    and (.answer | contains("retrieval limit"))
-    and (.answer | contains("My best guess is"))
-    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains("reasoning context"))
+    and (.answer | contains("withholding a complete-scope conclusion"))
   ' <<<"$response" >/dev/null
   jq -e '
     .acquisition.expansion_successful_count == 1
@@ -1497,13 +1493,7 @@ run_evidence_exhaustive_scenarios() {
     and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "unknown"
   ' <<<"$manifest" >/dev/null
-  assert_diagnostic_advisory_calls "$provider_calls" 1
-  jq -e '
-    .diagnostic.call_count == 1
-    and .diagnostic.status == "accepted"
-    and .diagnostic.observation_categories == ["retrieval_limit"]
-    and .diagnostic.render_mode == "advisory"
-  ' <<<"$manifest" >/dev/null
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   restart_orchestrator_with_reserve 2048
   configure_source_fixture "complete-sheet" "ready"
