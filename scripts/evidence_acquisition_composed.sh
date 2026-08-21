@@ -5955,10 +5955,7 @@ run_step13_diagnostic_scenarios() {
       .source == "measurement-sheet" and .operation == "google_values"
     )] | length) == 1
   '
-  assert_jq "step13.http.dsa" "$audit" '
-    ([.[] | select(.operation == "context" and .status == "source_unavailable")]
-      | length) == 1
-  '
+  assert_dsa_operation_counts "$audit" 0 0 0
   case "$serialized" in
     *"The upstream dependency may be unavailable"*|*"Consider trying the lookup again later"*|*"source unavailable"*|*"http://source-fixture"*)
       echo "Step-13 HTTP trace exposed advisory or source-private material" >&2
