@@ -6194,28 +6194,42 @@ run_step13_diagnostic_scenarios() {
 
 run_general_evidence_reasoning_shadow_scenario() {
   local owner client conversation_id question external response request_id answer
-  local trace manifest provider_calls audit diagnostics claim_records proposal
-  local source_ref="google_sheets:records_primary:Records!A2:C2"
+  local trace manifest provider_calls audit diagnostics claim_records proposal history
+  local source_ref="google_sheets:metrics_archive:Measurements!A2:C6"
   local evidence_ref_id
   evidence_ref_id="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
   owner="owner-general-reasoning-shadow"
   client="client-general-reasoning-shadow"
-  question="Verify the migration record."
-  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
+  question="What is the mean Entry in the Configured Metrics Archive?"
+  external='{"enabled":true,"source_ids":["metrics_archive"],"allowed_sensitivity":"medium","max_results":5}'
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_evidence_candidate \
-    "supports" \
-    "$source_ref" \
-    "The migration record confirms the bounded setting."
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"mean",
+      aggregate_field_name:"Entry"
+    }')"
+  queue_diagnostic_advisory \
+    "A formatting or data-entry issue may be present." \
+    "Consider checking the entries that require numeric input."
   proposal="$(jq -nc --arg ref "$evidence_ref_id" '
     {
       proposed_claim:"A mean was mechanically computed over model-interpreted operands.",
       supporting_evidence_ref_ids:[$ref],
       counterevidence_ref_ids:[],
-      material_exclusions:[],
+      material_exclusions:[{
+        evidence_ref_id:$ref,
+        reason:"One entry was ambiguous and excluded."
+      }],
       derivation_requests:[
         {
           derivation_id:"ratio_1",
@@ -6236,11 +6250,21 @@ run_general_evidence_reasoning_shadow_scenario() {
           supporting_evidence_ref_ids:[$ref]
         },
         {
+          derivation_id:"ratio_3",
+          operation:"divide",
+          operands:[
+            {value:"5",derivation_ref:null},
+            {value:"8",derivation_ref:null}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        },
+        {
           derivation_id:"mean_1",
           operation:"mean",
           operands:[
             {value:null,derivation_ref:"ratio_1"},
-            {value:null,derivation_ref:"ratio_2"}
+            {value:null,derivation_ref:"ratio_2"},
+            {value:null,derivation_ref:"ratio_3"}
           ],
           supporting_evidence_ref_ids:[$ref]
         }
@@ -6259,7 +6283,7 @@ run_general_evidence_reasoning_shadow_scenario() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   claim_records="$(list_claim_records "$owner" "$conversation_id")"
 
-  if ! jq -e '.status == "ok"' <<<"$response" >/dev/null; then
+  if ! jq -e '.status == "degraded"' <<<"$response" >/dev/null; then
     jq -c '{status,selected_model,sources_count:(.sources | length)}' \
       <<<"$response" >&2
     jq -c '{status,error,model_call,prompt:{general_evidence_reasoning:.prompt.general_evidence_reasoning,evidence_provider_mode:.prompt.evidence_provider_mode}}' \
@@ -6267,15 +6291,16 @@ run_general_evidence_reasoning_shadow_scenario() {
     jq -c '{status,shape:.shape,plan:.plan,inventory:.inventory,acquisition_outcome:.acquisition.dsa_outcome,sufficiency_status:.sufficiency.status,next_step:.next_steps.selections[-1].selected_next_step,diagnostic:.diagnostic}' \
       <<<"$manifest" >&2
   fi
-  assert_jq "general_reasoning.response.status" "$response" '.status == "ok"'
+  assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
   assert_jq "general_reasoning.response.boundary" "$response" '
-    .answer | startswith("The retained evidence supports the requested conclusion.")
-  '
-  assert_jq "general_reasoning.response.excerpt" "$response" '
-    .answer | contains("Retained evidence excerpt 1: The migration record confirms the bounded setting.")
+    (.answer | contains("5 values failed the required numeric validation"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
   '
   assert_jq "general_reasoning.response.shadow_absent" "$response" '
-    .answer | contains("mechanically computed") | not
+    (.answer | contains("mechanically computed") | not)
+    and (.answer | contains("Mean for") | not)
+    and .sources == []
   '
   assert_jq "general_reasoning.response.action" "$response" '.pending_action == null'
   if ! jq -e '
@@ -6289,8 +6314,8 @@ run_general_evidence_reasoning_shadow_scenario() {
     and .prompt.general_evidence_reasoning.attempted == true
     and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.validation_status == "accepted"
-    and .prompt.general_evidence_reasoning.derivation_request_count == 3
-    and .prompt.general_evidence_reasoning.derivation_executed_count == 3
+    and .prompt.general_evidence_reasoning.derivation_request_count == 4
+    and .prompt.general_evidence_reasoning.derivation_executed_count == 4
     and .prompt.general_evidence_reasoning.cr_call_count == 1
     and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
     and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
@@ -6303,24 +6328,38 @@ run_general_evidence_reasoning_shadow_scenario() {
     and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
   '
   assert_jq "general_reasoning.manifest" "$manifest" '
-    .sufficiency.status == "sufficient_for_declared_scope"
+    .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
-    and (.diagnostic.attempted // false) == false
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.observation_categories == ["invalid_value"]
   '
   assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_jq "general_reasoning.provider" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length) == 2
     and ([.calls[] | select(
       .kind == "chat"
-      and .response_schema_name == "grounded_evidence_response"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
       and .response_format_type == "json_schema"
       and .response_schema_strict == true
       and .response_schema_additional_properties == false
       and .tool_count == 0
     )] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat" and .response_schema_name == "grounded_evidence_response"
+    )] | length) == 0
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "general_evidence_reasoning_proposal"
+      and ([.normalized_messages[].content
+        | select(contains("structured_field_values")
+          and contains("alpha") and contains("epsilon"))] | length) == 1
+    )] | length) == 1
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
   '
-  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_dsa_operation_counts "$audit" 0 1 0
   assert_jq "general_reasoning.runtime" "$diagnostics" '
       ([.events[] | select(
         .event_payload_json.request_id == $request_id
@@ -6334,19 +6373,40 @@ run_general_evidence_reasoning_shadow_scenario() {
     and $records[0].support.calibration_status == "limited"
     and $records[0].support.conclusion_disposition == "qualified"
     and $records[0].support.qualification_required == true
+    and ($records[0].support.material_exclusions | length) == 1
     and ($records[0].support.executed_derivations
-      | map(.canonical_result)) == ["0.5","0.75","0.625"]
+      | map(.canonical_result)) == ["0.5","0.75","0.625","0.625"]
     and ($records[0].support.executed_derivations
       | all(.input_basis == "model_interpreted"))
+    and $records[0].claim_class == "runtime_inference"
+    and $records[0].confidence == "unknown"
+    and $records[0].strongest_authority == "unknown"
+    and $records[0].freshness_summary == "unknown"
+    and ($records[0].validated_evidence_references
+      | all(.support_kind == "contextual"
+        and .authority == "unknown"
+        and .freshness_state == "unknown_freshness"))
   '
   case "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" in
-    *"The migration record confirms"*|*"mechanically computed"*|*"provider prompt"*|*scratchpad*)
+    *alpha*|*beta*|*gamma*|*delta*|*epsilon*|*"mechanically computed"*|*"provider prompt"*|*scratchpad*)
       echo "General evidence reasoning trace exposed semantic/source prose" >&2
       return 1
       ;;
   esac
+  history="$(curl -fsS \
+    -X POST "http://127.0.0.1:14321/v1/internal/immediate-history/resolve" \
+    -H "X-API-Key: smoke-memory-key" \
+    -H "X-Request-ID: general-reasoning-shadow-history" \
+    -H "Content-Type: application/json" \
+    -d "{\"schema_version\":\"immediate-history-resolution.v2\",\"request_id\":\"general-reasoning-shadow-history\",\"owner_id\":\"$owner\",\"conversation_id\":\"$conversation_id\",\"surface\":\"chat\",\"explanation_kind\":\"support\"}")"
+  assert_jq "general_reasoning.history" "$history" '
+    .resolution_status == "no_record"
+    and .match_count == 0
+    and .reason_code == "direct_record_absent_lineage_absent"
+    and .record == null
+  '
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "General evidence reasoning shadow: provider=1 dsa=1 derivations=3 cr=1 bms_v2=1 actions=0 retries=0 visible_authority=unchanged"
+  echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
 }
 
 run_evidence_acquisition_composed_suite() {

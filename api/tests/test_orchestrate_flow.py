@@ -40,6 +40,7 @@ from services.capabilities import (
     Revalidator,
     RevalidatorEntry,
 )
+from services.claim_capture import governed_external_reference_id
 from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
@@ -59,6 +60,7 @@ from services.evidence_acquisition import (
 from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
     _apply_persona_containment_result_boundary,
+    _bounded_reasoning_evidence,
     _bounded_retrieval_debug,
     _interpret_evidence_request,
     _load_logical_route,
@@ -1770,12 +1772,20 @@ class FakeRuntime:
             "consequence_policy_allows_claim"
         ]
         unsupported = incomplete_scope or policy_blocked
-        limited = interpreted and not unsupported
+        has_exclusions = bool(proposal["material_exclusions"])
+        material_limited = authority["material_acquisition_limited"] is True
+        limited = (
+            interpreted or has_exclusions or material_limited
+        ) and not unsupported
         limitations = []
         if incomplete_scope:
             limitations.append("complete_scope_not_established")
         if interpreted:
             limitations.append("interpretation_dependent_derivation")
+        if has_exclusions:
+            limitations.append("material_exclusion")
+        if material_limited:
+            limitations.append("material_acquisition_limited")
         if policy_blocked:
             limitations.append("consequence_policy_restricts_claim")
         return {
@@ -14091,7 +14101,12 @@ def _write_evidence_interpreter_route_files(tmp_path):
     return rules, models
 
 
-def _write_diagnostic_route_files(tmp_path, *, include_interpreter=False):
+def _write_diagnostic_route_files(
+    tmp_path,
+    *,
+    include_interpreter=False,
+    include_reasoning=False,
+):
     rules, models = _write_default_route_files(tmp_path)
     routes = (
         "logical_routes:\n"
@@ -14104,6 +14119,12 @@ def _write_diagnostic_route_files(tmp_path, *, include_interpreter=False):
             "  evidence_interpreter:\n"
             "    model: gpt-5-mini\n"
             "    provider: local\n"
+        )
+    if include_reasoning:
+        routes += (
+            "  evidence_reasoning:\n"
+            "    model: gpt-5-mini\n"
+            "    provider: cloud\n"
         )
     models.write_text(models.read_text(encoding="utf-8") + routes, encoding="utf-8")
     return rules, models
@@ -14455,6 +14476,7 @@ def _general_reasoning_completion(
     proposed_claim: str,
     evidence_ref_id: str,
     derivation_requests: list[dict[str, object]] | None = None,
+    material_exclusions: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     return _provider_completion(
         json.dumps(
@@ -14462,7 +14484,7 @@ def _general_reasoning_completion(
                 "proposed_claim": proposed_claim,
                 "supporting_evidence_ref_ids": [evidence_ref_id],
                 "counterevidence_ref_ids": [],
-                "material_exclusions": [],
+                "material_exclusions": material_exclusions or [],
                 "derivation_requests": derivation_requests or [],
             },
             separators=(",", ":"),
@@ -16133,6 +16155,29 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
     assert proposed_claim not in serialized_trace
 
 
+def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed():
+    items = [
+        {
+            "source_ref": f"neutral-source:item-{index}",
+            "source_id": "neutral-source",
+            "text": "x" * (5000 if index == 0 else 20),
+        }
+        for index in range(9)
+    ]
+    retained = [item["source_ref"] for item in items]
+
+    evidence, metadata, limited = _bounded_reasoning_evidence(
+        context_pack={"items": items},
+        retained_source_refs=retained,
+        structured_items=[],
+    )
+
+    assert len(evidence) == 8
+    assert len(evidence[0]["text"]) == 4000
+    assert len(metadata) == 8
+    assert limited is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "shadow_completion",
@@ -16267,6 +16312,7 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
         attempted=True,
         status="sufficient_with_limitations",
         request_id="rid-completeness",
+        manifest_id="manifest-completeness",
         plan=PlanResult.model_validate(plan_data),
         sufficiency=SufficiencyResult.model_validate(
             {
@@ -16317,8 +16363,14 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
         ],
     )
     completion = _general_reasoning_completion(
-        proposed_claim="The declared scope has complete coverage.",
+        proposed_claim="The usable records support a bounded estimate.",
         evidence_ref_id=ref_id,
+        material_exclusions=[
+            {
+                "evidence_ref_id": ref_id,
+                "reason": "One part of the bounded record was ambiguous.",
+            }
+        ],
     )
     limited_runtime = FakeRuntime()
 
@@ -16346,60 +16398,72 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
     )
 
     authority = limited_runtime.claim_support_calls[0]["authority_context"]
-    assert authority["complete_declared_scope_required"] is True
-    assert authority["complete_declared_scope_established"] is False
+    assert authority["complete_declared_scope_required"] is False
+    assert authority["complete_declared_scope_established"] is None
     assert authority["material_acquisition_limited"] is True
-    assert limited["cr_result"]["calibration_status"] == "unsupported"
-    assert limited["cr_result"]["conclusion_disposition"] == "withheld"
+    assert limited["cr_result"]["calibration_status"] == "limited"
+    assert limited["cr_result"]["conclusion_disposition"] == "qualified"
 
-    ordinary_plan = plan_data.copy()
-    ordinary_plan["completeness_expectation"] = "targeted_scope"
-    ordinary_plan["declared_requirements"] = ordinary_plan[
-        "declared_requirements"
-    ][:2]
-    ordinary_state = EvidenceAcquisitionState(
+    exhaustive_plan = _bounded_exhaustive_plan_response(
+        request_id="rid-exhaustive",
+        question=question,
+    )["result"]
+    exhaustive_state = EvidenceAcquisitionState(
         enabled=True,
         attempted=True,
-        status="sufficient_for_declared_scope",
-        request_id="rid-ordinary",
-        plan=PlanResult.model_validate(ordinary_plan),
+        status="insufficient",
+        request_id="rid-exhaustive",
+        manifest_id="manifest-exhaustive",
+        plan=PlanResult.model_validate(exhaustive_plan),
         sufficiency=SufficiencyResult.model_validate(
             {
                 "evaluation_id": "evaluation_2",
-                "task_shape": "targeted_lookup",
-                "sufficiency_status": "sufficient_for_declared_scope",
+                "task_shape": "bounded_exhaustive_review",
+                "sufficiency_status": "insufficient",
                 "evaluated_requirements": [
                     {
                         "requirement_id": item["requirement_id"],
                         "requirement_kind": item["requirement_kind"],
                         "criticality": item["criticality"],
-                        "effective_outcome": "satisfied",
+                        "effective_outcome": (
+                            "partial"
+                            if item["requirement_kind"]
+                            == "complete_scope_coverage"
+                            else "satisfied"
+                        ),
                     }
-                    for item in ordinary_plan["declared_requirements"]
+                    for item in exhaustive_plan["declared_requirements"]
                 ],
-                "reason_codes": ["all_declared_requirements_satisfied"],
-                "answer_constraints": [],
-                "qualification_required": False,
-                "additional_acquisition_required": False,
-                "user_safe_summary": "The bounded evidence is sufficient.",
+                "reason_codes": ["exhaustive_scope_incomplete"],
+                "answer_constraints": [
+                    "qualify_conclusion",
+                    "disclose_limitations",
+                    "identify_unexamined_scope",
+                    "additional_acquisition_or_clarification_required",
+                    "withhold_unqualified_conclusion",
+                    "withhold_exhaustive_conclusion",
+                ],
+                "qualification_required": True,
+                "additional_acquisition_required": True,
+                "user_safe_summary": "The exhaustive scope remains incomplete.",
             }
         ),
     )
-    ordinary_runtime = FakeRuntime()
-    ordinary = await _run_general_evidence_reasoning(
+    exhaustive_runtime = FakeRuntime()
+    exhaustive = await _run_general_evidence_reasoning(
         enabled=True,
-        request_id="rid-ordinary",
+        request_id="rid-exhaustive",
         request_text=question,
         owner_id="owner",
         conversation_id="conv-1",
         surface="node_red",
         runtime_session_id="rtsession_1",
         runtime_turn_id="rtturn_1",
-        state=ordinary_state,
+        state=exhaustive_state,
         context_pack=context_pack,
         retained_source_refs=[ref_id],
         litellm=SequenceLiteLLM([completion]),
-        runtime=ordinary_runtime,
+        runtime=exhaustive_runtime,
         model_registry_path=str(models),
         timeout_ms=5000,
         local_only=False,
@@ -16409,11 +16473,13 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
         consequence_policy_allows_claim=True,
     )
 
-    ordinary_authority = ordinary_runtime.claim_support_calls[0]["authority_context"]
-    assert ordinary_authority["complete_declared_scope_required"] is False
-    assert ordinary_authority["complete_declared_scope_established"] is None
-    assert ordinary["cr_result"]["calibration_status"] == "supported"
-    assert ordinary["cr_result"]["conclusion_disposition"] == "allowed"
+    exhaustive_authority = exhaustive_runtime.claim_support_calls[0][
+        "authority_context"
+    ]
+    assert exhaustive_authority["complete_declared_scope_required"] is True
+    assert exhaustive_authority["complete_declared_scope_established"] is False
+    assert exhaustive["cr_result"]["calibration_status"] == "unsupported"
+    assert exhaustive["cr_result"]["conclusion_disposition"] == "withheld"
 
 
 @pytest.mark.asyncio
@@ -20942,9 +21008,12 @@ async def _run_step13_aggregate_failure(
     response,
     diagnostic_completion,
     request_id,
+    reasoning_completion=None,
 ):
     rules, models = _write_diagnostic_route_files(
-        tmp_path, include_interpreter=True
+        tmp_path,
+        include_interpreter=True,
+        include_reasoning=reasoning_completion is not None,
     )
     question = "What is the median Reading in the Configured Metrics Archive?"
     runtime = FakeRuntime(
@@ -20980,19 +21049,24 @@ async def _run_step13_aggregate_failure(
             ],
         },
     )
-    litellm = SequenceLiteLLM(
-        [
-            _evidence_interpreter_completion(
-                "resolved",
-                "aggregate",
-                ["metrics_archive"],
-                aggregate_function="median",
-                aggregate_field_name="Reading",
-            ),
-            diagnostic_completion,
-        ]
+    completions = [
+        _evidence_interpreter_completion(
+            "resolved",
+            "aggregate",
+            ["metrics_archive"],
+            aggregate_function="median",
+            aggregate_field_name="Reading",
+        ),
+        diagnostic_completion,
+    ]
+    if reasoning_completion is not None:
+        completions.append(reasoning_completion)
+    litellm = SequenceLiteLLM(completions)
+    memory_store = (
+        ClaimCaptureMemoryStore()
+        if reasoning_completion is not None
+        else FakeMemoryStore()
     )
-    memory_store = FakeMemoryStore()
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(question, external_context_enabled=True),
         memory_store=memory_store,
@@ -21002,6 +21076,9 @@ async def _run_step13_aggregate_failure(
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
+        claim_record_capture_enabled=reasoning_completion is not None,
+        general_evidence_reasoning_enabled=reasoning_completion is not None,
+        general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -21049,6 +21126,159 @@ async def test_step13_invalid_value_advisory_uses_count_without_normalizing_valu
     ]
     assert trace["diagnostic"]["observation_categories"] == ["invalid_value"]
     assert raw_invalid_value not in json.dumps(trace, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_structured_representation_failure_reaches_qualified_shadow_reasoning(
+    tmp_path,
+):
+    response = _aggregate_structured_response()
+    structured = response["results"][0]["structured_data"]
+    structured["record_count"] = 4
+    structured["non_empty_value_count"] = 4
+    structured["values"] = ["1/2", "3/4", "unclear-entry", "5/8"]
+    source_ref = response["results"][0]["source_ref"]
+    evidence_ref_id = governed_external_reference_id(source_ref)
+    derivations = [
+        {
+            "derivation_id": derivation_id,
+            "operation": "divide",
+            "operands": [
+                {"value": numerator, "derivation_ref": None},
+                {"value": denominator, "derivation_ref": None},
+            ],
+            "supporting_evidence_ref_ids": [evidence_ref_id],
+        }
+        for derivation_id, numerator, denominator in (
+            ("ratio_1", "1", "2"),
+            ("ratio_2", "3", "4"),
+            ("ratio_3", "5", "8"),
+        )
+    ]
+    derivations.append(
+        {
+            "derivation_id": "mean_1",
+            "operation": "mean",
+            "operands": [
+                {"value": None, "derivation_ref": derivation_id}
+                for derivation_id in ("ratio_1", "ratio_2", "ratio_3")
+            ],
+            "supporting_evidence_ref_ids": [evidence_ref_id],
+        }
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim="The usable interpreted entries support a bounded estimate.",
+        evidence_ref_id=evidence_ref_id,
+        material_exclusions=[
+            {
+                "evidence_ref_id": evidence_ref_id,
+                "reason": "One entry was ambiguous and excluded.",
+            }
+        ],
+        derivation_requests=derivations,
+    )
+    diagnostic_completion = _diagnostic_completion(
+        hypotheses=[
+            {
+                "text": "A formatting or data-entry issue may be present.",
+                "fact_ids": ["fact_1"],
+            }
+        ]
+    )
+
+    out, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=diagnostic_completion,
+        reasoning_completion=reasoning_completion,
+        request_id="rid-structured-shadow-reasoning",
+    )
+
+    assert "4 values failed the required numeric validation" in out["answer"]
+    assert "bounded estimate" not in out["answer"]
+    assert 'Median for "Reading"' not in out["answer"]
+    assert out.get("pending_action") is None
+    assert len(litellm.calls) == 3
+    reasoning_calls = [
+        call
+        for call in litellm.calls
+        if call.get("response_format", {})
+        .get("json_schema", {})
+        .get("name")
+        == "general_evidence_reasoning_proposal"
+    ]
+    assert len(reasoning_calls) == 1
+    reasoning_input = json.loads(reasoning_calls[0]["messages"][1]["content"])
+    supplied = reasoning_input["authorized_evidence"]
+    assert supplied == [
+        {
+            "evidence_ref_id": evidence_ref_id,
+            "content_type": "structured_field_values",
+            "structured_data": structured,
+        }
+    ]
+    assert len(dsa.context_calls) == 1
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert len(runtime.claim_support_calls) == 1
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    assert authority["complete_declared_scope_required"] is False
+    assert authority["complete_declared_scope_established"] is None
+    assert authority["material_acquisition_limited"] is False
+    assert [item["canonical_result"] for item in authority["executed_derivations"]] == [
+        "0.5",
+        "0.75",
+        "0.625",
+        "0.625",
+    ]
+    assert {item["input_basis"] for item in authority["executed_derivations"]} == {
+        "model_interpreted"
+    }
+    cr_result = runtime.claim_support_calls[0]
+    assert cr_result["proposal"]["supporting_evidence_ref_ids"] == [evidence_ref_id]
+    assert cr_result["proposal"]["material_exclusions"][0][
+        "evidence_ref_id"
+    ] == evidence_ref_id
+    final_prompt = memory_store.trace_calls[-1]["payload"]["prompt"]
+    assert final_prompt["evidence_acquisition"]["sufficiency"]["status"] == (
+        "insufficient"
+    )
+    assert final_prompt["general_evidence_reasoning"]["eligibility_status"] == (
+        "eligible"
+    )
+    assert final_prompt["general_evidence_reasoning"][
+        "reasoning_provider_call_count"
+    ] == 1
+    assert final_prompt["general_evidence_reasoning"]["cr_call_count"] == 1
+    v2_calls = [
+        call
+        for call in memory_store.claim_record_calls
+        if call["payload"]["schema_version"] == "claim-record.v2"
+    ]
+    assert len(v2_calls) == 1
+    record = v2_calls[0]["payload"]
+    assert record["support"]["calibration_status"] == "limited"
+    assert record["support"]["conclusion_disposition"] == "qualified"
+    assert record["support"]["material_exclusions"][0]["evidence_ref_id"] == (
+        evidence_ref_id
+    )
+    assert {item["input_basis"] for item in record["support"]["executed_derivations"]} == {
+        "model_interpreted"
+    }
+    assert record["calibration_result"]["strongest_authority"] == "unknown"
+    assert record["calibration_result"]["validated_evidence_references"][0] == {
+        "ref_type": "external_source",
+        "ref_id": evidence_ref_id,
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "support_kind": "contextual",
+        "authority": "unknown",
+        "freshness_state": "unknown_freshness",
+    }
+    trace_serialized = json.dumps(memory_store.trace_calls, sort_keys=True)
+    for value in structured["values"]:
+        assert value not in trace_serialized
+    assert "scratchpad" not in trace_serialized
 
 
 @pytest.mark.asyncio

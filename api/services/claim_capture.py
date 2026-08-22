@@ -712,27 +712,16 @@ def shadow_claim_record_payload(
         if not isinstance(reference, dict):
             return None
         ref_id = reference.get("ref_id")
-        if ref_id in supporting:
-            support_kind = "direct"
-        elif ref_id in counter:
-            support_kind = "contradictory"
-        elif ref_id in exclusions:
-            support_kind = "contextual"
-        else:
+        if ref_id not in supporting | counter | exclusions:
             continue
-        source_authority = reference.get("source_authority")
         evidence_references.append(
             {
                 "ref_type": "external_source",
                 "ref_id": ref_id,
                 "owner_id": owner_id,
                 "conversation_id": conversation_id,
-                "support_kind": support_kind,
-                "authority": (
-                    "trusted_integration"
-                    if source_authority in {"established", "limited"}
-                    else "unknown"
-                ),
+                "support_kind": "contextual",
+                "authority": "unknown",
                 "freshness_state": "unknown_freshness",
             }
         )
@@ -801,21 +790,11 @@ def shadow_claim_record_payload(
             "claim_anchor_digest": claim_digest,
             "claim_class": "runtime_inference",
             "calibration_status": status,
-            "evidence_strength": (
-                "moderate"
-                if status == "supported"
-                else "weak"
-                if status == "limited"
-                else "none"
-            ),
+            "evidence_strength": "weak" if evidence_references else "none",
             "confidence": "unknown",
-            "strongest_authority": (
-                "trusted_integration" if supporting else "unknown"
-            ),
+            "strongest_authority": "unknown",
             "freshness_summary": "unknown",
-            "uncertainty_disclosure_required": bool(
-                cr_result.get("qualification_required")
-            ),
+            "uncertainty_disclosure_required": True,
             "validated_evidence_references": evidence_references,
             "limitation_codes": scalar_limitations,
             "user_safe_summary": cr_result.get("user_safe_summary"),

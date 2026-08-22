@@ -224,6 +224,20 @@ def test_general_reasoning_rejects_scope_widening_tools_and_role_conflicts():
             authorized_evidence_ref_ids={"evidence-1"},
         )
 
+    partial = _reasoning_proposal()
+    partial["material_exclusions"] = [
+        {
+            "evidence_ref_id": "evidence-1",
+            "reason": "One part of the bounded evidence was ambiguous.",
+        }
+    ]
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(partial),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+    assert proposal.supporting_evidence_ref_ids == ["evidence-1"]
+    assert proposal.material_exclusions[0].evidence_ref_id == "evidence-1"
+
 
 def _shape_response(*, status="derived", shape="targeted_lookup"):
     result = {

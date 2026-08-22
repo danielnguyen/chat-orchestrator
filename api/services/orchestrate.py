@@ -6923,6 +6923,7 @@ def _general_evidence_reasoning_trace(*, enabled: bool) -> dict[str, Any]:
         "runtime_session_id": None,
         "runtime_turn_id": None,
         "presented_to_user": False,
+        "reasoning_context_limited": False,
     }
 
 
@@ -6930,15 +6931,15 @@ def _bounded_reasoning_evidence(
     *,
     context_pack: dict[str, Any] | None,
     retained_source_refs: list[str] | None,
-) -> tuple[list[dict[str, str]], dict[str, dict[str, Any]]]:
+    structured_items: list[Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], bool]:
     retained = set(retained_source_refs or [])
     items = context_pack.get("items") if isinstance(context_pack, dict) else None
-    if not retained or not isinstance(items, list):
-        return [], {}
-    evidence: list[dict[str, str]] = []
+    evidence: list[dict[str, Any]] = []
     metadata: dict[str, dict[str, Any]] = {}
     seen_source_refs: set[str] = set()
-    for item in items:
+    reasoning_context_limited = False
+    for item in items if retained and isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
         source_ref = item.get("source_ref")
@@ -6953,18 +6954,86 @@ def _bounded_reasoning_evidence(
         ):
             continue
         if source_ref in seen_source_refs:
-            return [], {}
+            return [], {}, False
         seen_source_refs.add(source_ref)
         ref_id = governed_external_reference_id(source_ref)
         if ref_id in metadata:
-            return [], {}
-        evidence.append({"evidence_ref_id": ref_id, "text": text[:4000]})
+            return [], {}, False
+        if len(evidence) >= 8:
+            reasoning_context_limited = True
+            continue
+        bounded_text = text[:4000]
+        reasoning_context_limited = reasoning_context_limited or len(text) > 4000
+        evidence.append({"evidence_ref_id": ref_id, "text": bounded_text})
         metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
-        if len(evidence) > 8:
-            return [], {}
     if seen_source_refs != retained:
-        return [], {}
-    return evidence, metadata
+        return [], {}, False
+
+    for item in structured_items or []:
+        structured = getattr(item, "structured_data", None)
+        source_ref = getattr(item, "source_ref", None)
+        source_id = getattr(item, "source_id", None)
+        if structured is None or not isinstance(source_ref, str) or not isinstance(
+            source_id, str
+        ):
+            continue
+        if source_ref in seen_source_refs:
+            return [], {}, False
+        seen_source_refs.add(source_ref)
+        ref_id = governed_external_reference_id(source_ref)
+        if ref_id in metadata:
+            return [], {}, False
+        if len(evidence) >= 8:
+            reasoning_context_limited = True
+            continue
+        structured_payload = structured.model_dump(mode="json")
+        serialized = json.dumps(
+            structured_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        if len(serialized) > 12000:
+            bounded_values: list[str | None] = []
+            structured_payload = {
+                "kind": "field_values",
+                "field_name": structured.field_name,
+                "record_count": 0,
+                "non_empty_value_count": 0,
+                "values": [],
+            }
+            for value in structured.values:
+                candidate = [*bounded_values, value]
+                candidate_payload = {
+                    "kind": "field_values",
+                    "field_name": structured.field_name,
+                    "record_count": len(candidate),
+                    "non_empty_value_count": sum(
+                        item is not None for item in candidate
+                    ),
+                    "values": candidate,
+                }
+                if len(
+                    json.dumps(
+                        candidate_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                ) > 12000:
+                    break
+                bounded_values = candidate
+                structured_payload = candidate_payload
+            reasoning_context_limited = True
+        evidence.append(
+            {
+                "evidence_ref_id": ref_id,
+                "content_type": "structured_field_values",
+                "structured_data": structured_payload,
+            }
+        )
+        metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
+    return evidence, metadata, reasoning_context_limited
 
 
 async def _run_general_evidence_reasoning(
@@ -6996,10 +7065,11 @@ async def _run_general_evidence_reasoning(
         return output
     if (
         state is None
-        or not state.supported_governed_path
+        or not state.attempted
+        or state.plan is None
         or state.sufficiency is None
-        or state.sufficiency.sufficiency_status
-        not in {"sufficient_for_declared_scope", "sufficient_with_limitations"}
+        or not isinstance(state.manifest_id, str)
+        or not state.manifest_id
         or not isinstance(runtime_session_id, str)
         or not runtime_session_id
         or not isinstance(runtime_turn_id, str)
@@ -7018,9 +7088,10 @@ async def _run_general_evidence_reasoning(
             }
         )
         return output
-    evidence, evidence_metadata = _bounded_reasoning_evidence(
+    evidence, evidence_metadata, reasoning_context_limited = _bounded_reasoning_evidence(
         context_pack=context_pack,
         retained_source_refs=retained_source_refs,
+        structured_items=state.reasoning_structured_evidence,
     )
     if not evidence:
         trace.update(
@@ -7056,6 +7127,7 @@ async def _run_general_evidence_reasoning(
             "reasoning_provider_call_count": 1,
             "runtime_session_id": runtime_session_id,
             "runtime_turn_id": runtime_turn_id,
+            "reasoning_context_limited": reasoning_context_limited,
         }
     )
     authorized_ref_ids = set(evidence_metadata)
@@ -7111,16 +7183,11 @@ async def _run_general_evidence_reasoning(
                 "material_role": "neutral",
             }
         )
-    complete_required = bool(
-        state.plan is not None
-        and state.plan.completeness_expectation
-        in {
-            "complete_for_declared_scope",
-            "complete_for_selected_sources",
-            "complete_for_time_window",
-        }
-    )
-    material_limited = any(
+    complete_required = state.plan.task_shape in {
+        "bounded_exhaustive_review",
+        "absence_or_coverage_check",
+    }
+    material_limited = reasoning_context_limited or any(
         item.category == "retrieval_limit"
         for item in state.process_failure_observations
     )

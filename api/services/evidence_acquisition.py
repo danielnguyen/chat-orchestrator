@@ -468,16 +468,12 @@ class EvidenceReasoningProposal(StrictModel):
         )
         if any(len(values) != len(set(values)) for values in collections):
             raise ValueError("duplicate_evidence_reasoning_reference")
-        evidence_roles = (
-            set(self.supporting_evidence_ref_ids),
-            set(self.counterevidence_ref_ids),
-            {item.evidence_ref_id for item in self.material_exclusions},
-        )
-        if any(
-            left & right
-            for index, left in enumerate(evidence_roles)
-            for right in evidence_roles[index + 1 :]
-        ):
+        support_ids = set(self.supporting_evidence_ref_ids)
+        counter_ids = set(self.counterevidence_ref_ids)
+        exclusion_ids = {
+            item.evidence_ref_id for item in self.material_exclusions
+        }
+        if support_ids & counter_ids or counter_ids & exclusion_ids:
             raise ValueError("conflicting_evidence_reasoning_role")
         derivation_ids = [item.derivation_id for item in self.derivation_requests]
         if len(derivation_ids) != len(set(derivation_ids)):
@@ -1740,6 +1736,9 @@ class EvidenceAcquisitionState:
     aggregate_execution: dict[str, Any] | None = None
     aggregate_delivery_identity: dict[str, Any] | None = None
     aggregate_result: str | None = None
+    reasoning_structured_evidence: list[DsaContextItem] = dataclass_field(
+        default_factory=list
+    )
     process_failure_observations: list[ProcessFailureObservation] = dataclass_field(
         default_factory=list
     )
@@ -2654,7 +2653,7 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
 def evidence_reasoning_messages(
     *,
     request_text: str,
-    evidence: list[dict[str, str]],
+    evidence: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     bounded_input = json.dumps(
         {
@@ -4520,6 +4519,7 @@ async def execute_aggregate_values(
                 outcome = "filtered"
                 error_code = "malformed_response"
             else:
+                state.reasoning_structured_evidence = [item]
                 record_count = structured.record_count
                 non_empty_value_count = structured.non_empty_value_count
                 canonical_structured = json.dumps(

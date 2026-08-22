@@ -177,6 +177,23 @@ def test_shadow_claim_payload_is_v2_unpresented_bounded_and_interpretation_safe(
         "model_interpreted"
     )
     assert payload["support"]["conclusion_disposition"] == "qualified"
+    compatibility = payload["calibration_result"]
+    assert compatibility["claim_class"] == "runtime_inference"
+    assert compatibility["confidence"] == "unknown"
+    assert compatibility["strongest_authority"] == "unknown"
+    assert compatibility["freshness_summary"] == "unknown"
+    assert compatibility["uncertainty_disclosure_required"] is True
+    assert compatibility["validated_evidence_references"] == [
+        {
+            "ref_type": "external_source",
+            "ref_id": "evidence-1",
+            "owner_id": "owner",
+            "conversation_id": "conversation-1",
+            "support_kind": "contextual",
+            "authority": "unknown",
+            "freshness_state": "unknown_freshness",
+        }
+    ]
     assert "derivation_requests" not in payload["support"]
     serialized = str(payload)
     assert "PRIVATE-SOURCE-CONTENT" not in serialized
