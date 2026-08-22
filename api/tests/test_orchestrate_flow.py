@@ -48,6 +48,7 @@ from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
     TARGETED_SCOPE_SUFFIX,
+    DsaContextItem,
     DsaSourceListResponse,
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
@@ -16176,6 +16177,32 @@ def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed(
     assert len(evidence[0]["text"]) == 4000
     assert len(metadata) == 8
     assert limited is True
+
+    structured_payload = _aggregate_structured_response()["results"][0]
+    structured_payload["structured_data"]["record_count"] = 4
+    structured_payload["structured_data"]["non_empty_value_count"] = 4
+    structured_payload["structured_data"]["values"] = [
+        "1/2",
+        "3/4",
+        "unclear-entry",
+        "5/8",
+    ]
+    structured_item = DsaContextItem.model_validate(structured_payload)
+    structured_evidence, structured_metadata, structured_limited = (
+        _bounded_reasoning_evidence(
+            context_pack=None,
+            retained_source_refs=[structured_item.source_ref],
+            structured_items=[structured_item],
+        )
+    )
+    assert structured_evidence[0]["structured_data"]["values"] == [
+        "1/2",
+        "3/4",
+        "unclear-entry",
+        "5/8",
+    ]
+    assert len(structured_metadata) == 1
+    assert structured_limited is False
 
 
 @pytest.mark.asyncio

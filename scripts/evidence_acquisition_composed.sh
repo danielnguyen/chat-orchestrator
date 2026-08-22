@@ -6292,11 +6292,23 @@ run_general_evidence_reasoning_shadow_scenario() {
       <<<"$manifest" >&2
   fi
   assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
-  assert_jq "general_reasoning.response.boundary" "$response" '
+  if ! assert_jq "general_reasoning.response.boundary" "$response" '
     (.answer | contains("5 values failed the required numeric validation"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
-  '
+  '; then
+    jq -c '{
+      status,
+      answer_length:(.answer | length),
+      has_invalid_observation:(.answer | contains("5 values failed the required numeric validation")),
+      has_records:(.answer | contains("records")),
+      has_numeric:(.answer | contains("numeric")),
+      has_validation:(.answer | contains("validation")),
+      has_modal_inference:(.answer | contains("My best guess is")),
+      has_suggested_next_step:(.answer | contains("A useful next step would be"))
+    }' <<<"$response" >&2
+    return 1
+  fi
   assert_jq "general_reasoning.response.shadow_absent" "$response" '
     (.answer | contains("mechanically computed") | not)
     and (.answer | contains("Mean for") | not)

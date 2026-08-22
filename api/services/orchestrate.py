@@ -6966,9 +6966,6 @@ def _bounded_reasoning_evidence(
         reasoning_context_limited = reasoning_context_limited or len(text) > 4000
         evidence.append({"evidence_ref_id": ref_id, "text": bounded_text})
         metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
-    if seen_source_refs != retained:
-        return [], {}, False
-
     for item in structured_items or []:
         structured = getattr(item, "structured_data", None)
         source_ref = getattr(item, "source_ref", None)
@@ -7033,6 +7030,8 @@ def _bounded_reasoning_evidence(
             }
         )
         metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
+    if retained and not retained.issubset(seen_source_refs):
+        return [], {}, False
     return evidence, metadata, reasoning_context_limited
 
 
