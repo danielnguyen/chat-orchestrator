@@ -1419,7 +1419,7 @@ run_evidence_hybrid_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   assert_jq "hybrid.failure.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 502"))
+    and (.answer | contains("source lookup failed with an upstream HTTP 503"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   '
@@ -1631,7 +1631,7 @@ run_evidence_limitation_and_failure_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   assert_jq "failure.unavailable.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 502"))
+    and (.answer | contains("source lookup failed with an upstream HTTP 503"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   '
@@ -1710,14 +1710,14 @@ run_evidence_limitation_and_failure_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   jq -e '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("source lookup failed at its dependency boundary"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   ' <<<"$response" >/dev/null
   jq -e '
     .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
-    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.observation_categories == ["dependency_failure"]
     and .diagnostic.render_mode == "advisory"
   ' <<<"$manifest" >/dev/null
   assert_provider_free_trace "$trace"
@@ -1726,7 +1726,9 @@ run_evidence_limitation_and_failure_scenarios() {
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
     and .retrieval.prompt_assembly.dsa.status == "error"
-    and .retrieval.prompt_assembly.dsa.error_code == "http_500"
+    and .retrieval.prompt_assembly.dsa.error_code == "source_unavailable"
+    and .retrieval.prompt_assembly.dsa.service_error_code == "source_unavailable"
+    and .retrieval.prompt_assembly.dsa.service_http_status == 502
   ' <<<"$trace" >/dev/null
   jq -e '
     ([.calls[] | select(
@@ -6052,7 +6054,7 @@ run_step13_diagnostic_scenarios() {
 
   assert_jq "step13.http.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("source lookup failed at its dependency boundary"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
     and (.answer | contains("Median for") | not)
@@ -6065,7 +6067,7 @@ run_step13_diagnostic_scenarios() {
     and .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
     and .diagnostic.observation_count == 1
-    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.observation_categories == ["dependency_failure"]
     and .diagnostic.diagnosis_status == "hypothesis_available"
     and .diagnostic.confidence == "moderate"
     and .diagnostic.hypothesis_count == 1
@@ -6082,13 +6084,17 @@ run_step13_diagnostic_scenarios() {
       | select(.content | contains("trusted_process_facts"))] | length) == 1
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
-      | select(.content | contains("chat-orchestrator"))] | length) == 1
+      | select(.content | contains("data-source-aggregator"))] | length) == 1
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
-      | select(.content | contains("500"))] | length) == 1
+      | select(.content | contains("dependency_failure"))] | length) == 1
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
-      | select(.content | contains("source_unavailable") or contains("503"))]
+      | select(.content | contains("source_unavailable"))]
+      | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("500") or contains("503"))]
       | length) == 0
     and ([.calls[] | select(.kind == "chat")
       | .normalized_messages[]
@@ -6099,7 +6105,7 @@ run_step13_diagnostic_scenarios() {
       .source == "measurement-sheet" and .operation == "google_values"
     )] | length) == 1
   '
-  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_dsa_operation_counts "$audit" 0 1 0
   case "$serialized" in
     *"The upstream dependency may be unavailable"*|*"Consider trying the lookup again later"*|*"source unavailable"*|*"http://source-fixture"*)
       echo "Step-13 HTTP trace exposed advisory or source-private material" >&2
@@ -6189,7 +6195,7 @@ run_step13_diagnostic_scenarios() {
       ;;
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Step-13 diagnostics: composed_dsa_http=500 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+  echo "Step-13 diagnostics: composed_dsa_dependency_failure=1 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
 }
 
 run_general_evidence_reasoning_shadow_scenario() {
@@ -6201,7 +6207,7 @@ run_general_evidence_reasoning_shadow_scenario() {
   owner="owner-general-reasoning-shadow"
   client="client-general-reasoning-shadow"
   question="What is the mean Entry in the Configured Metrics Archive?"
-  external='{"enabled":true,"source_ids":["metrics_archive"],"allowed_sensitivity":"medium","max_results":5}'
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
 
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
