@@ -14,7 +14,10 @@ from uuid import UUID, uuid4
 
 import httpx
 import yaml
-from clients.data_source_aggregator import DataSourceAggregatorClient
+from clients.data_source_aggregator import (
+    DataSourceAggregatorClient,
+    DataSourceAggregatorFailure,
+)
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import validate_history_followup_policy_response
@@ -70,9 +73,13 @@ from services.evidence_acquisition import (
     begin_evidence_acquisition,
     bind_manifest_response,
     build_manifest_trace,
+    collect_process_failure_observations,
     compile_safe_exact_fetch_proposal,
     deterministic_clarification_target,
+    diagnostic_advisory_messages,
+    diagnostic_advisory_response_format,
     disabled_evidence_trace,
+    dsa_failure_trace_fields,
     enforce_final_answer,
     evaluate_acquisition_sufficiency,
     evidence_interpreter_messages,
@@ -87,10 +94,13 @@ from services.evidence_acquisition import (
     grounded_provider_allowed,
     helpful_grounded_recovery_allowed,
     ineligible_exact_evidence_state,
+    parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
+    process_failure_diagnosis_eligible,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
+    render_process_failure_response,
     retain_initial_attempt_summary,
     select_evidence_next_step,
     suppress_manifest_identifiers,
@@ -202,6 +212,10 @@ _HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
 _EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
 _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 512
 _EVIDENCE_INTERPRETER_REASONING_EFFORT = "minimal"
+_DIAGNOSTIC_ADVISORY_ROUTE = "diagnostic_advisory"
+_DIAGNOSTIC_ADVISORY_MAX_COMPLETION_TOKENS = 512
+_DIAGNOSTIC_ADVISORY_REASONING_EFFORT = "minimal"
+_DIAGNOSTIC_ADVISORY_TIMEOUT_MS = 5000
 _EVIDENCE_LOGGER = logging.getLogger("uvicorn.error.chat_orchestrator.evidence")
 _STRUCTURAL_PROVIDER_ERROR_PARAMS = {
     "max_completion_tokens",
@@ -4792,6 +4806,18 @@ async def _resolve_external_context(
             "reason": "timeout",
             "error_code": "timeout",
         }
+    except DataSourceAggregatorFailure as exc:
+        return None, {
+            **dsa_trace_base,
+            "called": True,
+            "status": "error",
+            "reason": "http_failure",
+            "error_code": (
+                exc.service_error_code
+                or f"http_{exc.service_status_code}"
+            ),
+            **dsa_failure_trace_fields(exc),
+        }
     except httpx.HTTPError as exc:
         error_code = "http_error"
         if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
@@ -6739,6 +6765,128 @@ async def _interpret_evidence_request(
     return result
 
 
+async def _diagnose_process_failure(
+    *,
+    request_id: str,
+    state: EvidenceAcquisitionState,
+    litellm: Any,
+    model_registry_path: str,
+    local_only: bool,
+    routing_policy: dict[str, Any],
+    effective_payload: dict[str, Any],
+) -> str | None:
+    trace = state.diagnostic_trace
+    eligible = process_failure_diagnosis_eligible(state)
+    trace["eligible"] = eligible
+    if not eligible:
+        return None
+
+    route = _load_logical_route(model_registry_path, _DIAGNOSTIC_ADVISORY_ROUTE)
+    if route is None:
+        trace.update(
+            {
+                "status": "route_unavailable",
+                "failure_reason": "route_unavailable",
+                "render_mode": "facts_only",
+            }
+        )
+    elif not _classifier_cloud_allowed(
+        provider=route["provider"],
+        local_only=local_only,
+        routing_policy=routing_policy,
+        effective_payload=effective_payload,
+    ):
+        trace.update(
+            {
+                "status": "provider_disallowed",
+                "failure_reason": "provider_disallowed",
+                "render_mode": "facts_only",
+            }
+        )
+    elif litellm is None or not callable(getattr(litellm, "chat", None)):
+        trace.update(
+            {
+                "status": "client_unavailable",
+                "failure_reason": "client_unavailable",
+                "render_mode": "facts_only",
+            }
+        )
+    else:
+        trace["attempted"] = True
+        trace["call_count"] = 1
+        try:
+            completion = await litellm.chat(
+                request_id=request_id,
+                model=route["model"],
+                messages=diagnostic_advisory_messages(
+                    observations=state.process_failure_observations,
+                    task_shape=(state.plan.task_shape if state.plan else None),
+                ),
+                tools=[],
+                response_format=diagnostic_advisory_response_format(),
+                max_completion_tokens=_DIAGNOSTIC_ADVISORY_MAX_COMPLETION_TOKENS,
+                reasoning_effort=_DIAGNOSTIC_ADVISORY_REASONING_EFFORT,
+                timeout_ms=_DIAGNOSTIC_ADVISORY_TIMEOUT_MS,
+            )
+        except httpx.TimeoutException:
+            trace.update(
+                {
+                    "status": "failed",
+                    "failure_reason": "timeout",
+                    "render_mode": "facts_only",
+                }
+            )
+        except Exception:
+            trace.update(
+                {
+                    "status": "failed",
+                    "failure_reason": "provider_failure",
+                    "render_mode": "facts_only",
+                }
+            )
+        else:
+            try:
+                advisory = parse_diagnostic_advisory_completion(
+                    completion,
+                    observations=state.process_failure_observations,
+                )
+            except Exception:
+                trace.update(
+                    {
+                        "status": "failed",
+                        "failure_reason": "malformed_response",
+                        "render_mode": "facts_only",
+                    }
+                )
+            else:
+                state.diagnostic_advisory = advisory
+                trace.update(
+                    {
+                        "status": "accepted",
+                        "failure_reason": None,
+                        "diagnosis_status": advisory.diagnosis_status,
+                        "confidence": advisory.confidence,
+                        "hypothesis_count": len(advisory.hypotheses),
+                        "render_mode": (
+                            "facts_only"
+                            if advisory.diagnosis_status == "no_useful_hypothesis"
+                            else "advisory"
+                        ),
+                    }
+                )
+
+    rendered = render_process_failure_response(
+        observations=state.process_failure_observations,
+        advisory=(
+            state.diagnostic_advisory
+            if trace.get("render_mode") == "advisory"
+            else None
+        ),
+    )
+    state.diagnostic_rendered_answer = rendered
+    return rendered
+
+
 async def _resolve_history_policy(
     *,
     runtime: Any,
@@ -7808,6 +7956,7 @@ async def orchestrate_chat(
         privacy_context = None
         privacy_context_trace = _privacy_context_disabled_trace()
         evidence_acquisition: EvidenceAcquisitionState | None = None
+        diagnostic_response: str | None = None
         evidence_manifest: dict[str, Any] | None = None
         evidence_path_deferred = False
         compound_verification_requested = False
@@ -9549,7 +9698,23 @@ async def orchestrate_chat(
                     )
             if evidence_acquisition.supported_aggregate_path:
                 finalize_aggregate_conclusion(evidence_acquisition)
-            if advisory_provider_allowed(evidence_acquisition):
+            collect_process_failure_observations(
+                state=evidence_acquisition,
+                dsa_trace=dsa_trace,
+            )
+            diagnostic_response = await _diagnose_process_failure(
+                request_id=request_id,
+                state=evidence_acquisition,
+                litellm=litellm,
+                model_registry_path=model_registry_path,
+                local_only=local_only,
+                routing_policy=routing_policy,
+                effective_payload=effective_payload,
+            )
+            if (
+                diagnostic_response is None
+                and advisory_provider_allowed(evidence_acquisition)
+            ):
                 capability_descriptors = []
                 capability_exposure_trace = {
                     "schema_version": "capability-exposure.v1",
@@ -9733,7 +9898,8 @@ async def orchestrate_chat(
             and evidence_acquisition.supported_governed_path
         )
         evidence_provider_allowed = bool(
-            provider_allowed(evidence_acquisition)
+            diagnostic_response is None
+            and provider_allowed(evidence_acquisition)
             and (
                 not compound_verification_requested
                 or compound_governed_acquisition_established
@@ -9779,7 +9945,7 @@ async def orchestrate_chat(
                 ),
             },
         )
-        if advisory_evidence_provider_call:
+        if advisory_evidence_provider_call or diagnostic_response is not None:
             status = "degraded"
         provider_tools = (
             [] if evidence_provider_call else capability_descriptors
@@ -10057,7 +10223,15 @@ async def orchestrate_chat(
                 raise
 
         prompt.trace["capabilities"]["provider_call_count"] = len(model_calls)
-        if grounded_structured_unavailable and evidence_acquisition is not None:
+        if diagnostic_response is not None and evidence_acquisition is not None:
+            raw_answer = diagnostic_response
+            prompt.trace["evidence_response"] = {
+                "contract_active": False,
+                "diagnostic_process_response": True,
+                "provider_tool_count": 0,
+                "conclusion_authority": "withheld",
+            }
+        elif grounded_structured_unavailable and evidence_acquisition is not None:
             raw_answer = STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE
             prompt.trace["evidence_response"] = {
                 "contract_active": True,
@@ -10498,7 +10672,11 @@ async def orchestrate_chat(
             prompt.trace["capabilities"]["dispatch_completed"] = False
             prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
-        if evidence_provider_call or capability_dispatch_blocked_by_evidence:
+        if (
+            evidence_provider_call
+            or diagnostic_response is not None
+            or capability_dispatch_blocked_by_evidence
+        ):
             action_summary_trace, action_summary_answer = (
                 _action_summary_empty_trace(),
                 None,
@@ -10525,18 +10703,23 @@ async def orchestrate_chat(
         if pending_action is not None:
             raw_answer = execution_result.response_text
         if (
-            evidence_acquisition is not None
+            diagnostic_response is None and evidence_acquisition is not None
             and evidence_acquisition.forced_answer is not None
         ):
             raw_answer = evidence_acquisition.forced_answer
-        if evidence_provider_call:
+        if evidence_provider_call or diagnostic_response is not None:
+            response_reason = (
+                "diagnostic_process_response"
+                if diagnostic_response is not None
+                else "evidence_provider_response"
+            )
             prompt.trace["response_review"] = {
                 "status": "not_requested",
-                "reason": "evidence_provider_response",
+                "reason": response_reason,
             }
             prompt.trace["response_action"] = {
                 "status": "not_requested",
-                "reason": "evidence_provider_response",
+                "reason": response_reason,
             }
             candidate_answer = raw_answer
         else:
@@ -10560,6 +10743,7 @@ async def orchestrate_chat(
             candidate_answer = response_action.candidate_text
         if (
             not evidence_provider_call
+            and diagnostic_response is None
             and memory_recall_composition.explicit_callbacks
             and not privacy_prompt_suppressed
         ):
@@ -10573,6 +10757,7 @@ async def orchestrate_chat(
         brief_metadata = {"enabled": False}
         if (
             not evidence_provider_call
+            and diagnostic_response is None
             and effective_payload.get("response_mode") == "brief"
         ):
             brief_grounding = _merge_brief_grounding(
@@ -10629,6 +10814,9 @@ async def orchestrate_chat(
         if advisory_evidence_provider_call:
             artifact_refs_for_sources = []
             answer_sources = []
+        if diagnostic_response is not None:
+            artifact_refs_for_sources = []
+            answer_sources = []
         if privacy_context_enabled and privacy_context is not None:
             privacy_boundary = apply_privacy_boundary(
                 policy=privacy_context,
@@ -10682,6 +10870,7 @@ async def orchestrate_chat(
         claim_capture_trace_enabled = (
             claim_record_capture_enabled
             and not advisory_evidence_provider_call
+            and diagnostic_response is None
             and (
                 evidence_provider_allowed
                 or compound_verification_requested

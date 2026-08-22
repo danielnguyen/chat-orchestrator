@@ -1,11 +1,77 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import re
+from typing import Annotated, Any, Literal
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 
 _request_logger = logging.getLogger("uvicorn.error.chat_orchestrator.dsa")
+
+
+class DsaSourceAccessDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    component: Literal["data-source-aggregator"]
+    stage: Literal["source_access"]
+    category: Literal["http_status", "timeout", "dependency_failure"]
+    upstream_status_code: Annotated[StrictInt, Field(ge=100, le=599)] | None = None
+
+    @model_validator(mode="after")
+    def validate_status_category(self) -> DsaSourceAccessDiagnostic:
+        status_supplied = "upstream_status_code" in self.model_fields_set
+        if self.category == "http_status" and (
+            not status_supplied or self.upstream_status_code is None
+        ):
+            raise ValueError("http_status_requires_upstream_status")
+        if self.category != "http_status" and status_supplied:
+            raise ValueError("upstream_status_requires_http_status")
+        return self
+
+
+class DataSourceAggregatorFailure(Exception):
+    """Bounded non-sensitive representation of a DSA HTTP failure."""
+
+    def __init__(
+        self,
+        *,
+        service_status_code: int,
+        service_error_code: str | None,
+        diagnostic: DsaSourceAccessDiagnostic | None,
+    ) -> None:
+        super().__init__("Data Source Aggregator request failed.")
+        self.service_status_code = service_status_code
+        self.service_error_code = service_error_code
+        self.diagnostic = diagnostic
+
+
+def _bounded_dsa_failure(response: httpx.Response) -> DataSourceAggregatorFailure:
+    service_error_code = None
+    diagnostic = None
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, str) and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}",
+            code,
+        ):
+            service_error_code = code
+        raw_diagnostic = error.get("diagnostic")
+        if isinstance(raw_diagnostic, dict):
+            try:
+                diagnostic = DsaSourceAccessDiagnostic.model_validate(raw_diagnostic)
+            except ValidationError:
+                diagnostic = None
+    return DataSourceAggregatorFailure(
+        service_status_code=response.status_code,
+        service_error_code=service_error_code,
+        diagnostic=diagnostic,
+    )
 
 
 class DataSourceAggregatorClient:
@@ -51,7 +117,7 @@ class DataSourceAggregatorClient:
                     status_code=error.response.status_code,
                     error_category="http_status",
                 )
-                raise
+                raise _bounded_dsa_failure(error.response) from None
             except httpx.TimeoutException:
                 self._log_request(
                     request_id=request_id,
@@ -107,7 +173,7 @@ class DataSourceAggregatorClient:
                     status_code=error.response.status_code,
                     error_category="http_status",
                 )
-                raise
+                raise _bounded_dsa_failure(error.response) from None
             except httpx.TimeoutException:
                 self._log_request(
                     request_id=request_id,

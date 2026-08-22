@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import yaml
 from router.engine import evaluate_route
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,3 +15,14 @@ def test_router_selects_local_for_local_only():
     )
     assert out["rule_id"] == "local-only"
     assert out["selected_model"] == "chat_local_fast"
+
+
+def test_diagnostic_advisory_uses_bounded_logical_route():
+    registry = yaml.safe_load(
+        (ROOT / "router" / "model_registry.yaml").read_text(encoding="utf-8")
+    )
+
+    assert registry["logical_routes"]["diagnostic_advisory"] == {
+        "model": "gpt-5-mini",
+        "provider": "cloud",
+    }

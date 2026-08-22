@@ -21,6 +21,8 @@ from services.evidence_acquisition import (
     WITHHELD_ANSWER,
     AggregateNumericValidationError,
     AggregateSpec,
+    DiagnosticAdvisory,
+    DiagnosticHypothesis,
     DsaContextItem,
     DsaItem,
     DsaSourceEntry,
@@ -34,6 +36,8 @@ from services.evidence_acquisition import (
     ExactFetchProposal,
     NextStepResult,
     PlanResult,
+    ProcessFailureObservation,
+    ProcessFailureObservations,
     RequirementEvaluation,
     SemanticInterpreterFailure,
     ShapeResult,
@@ -68,10 +72,12 @@ from services.evidence_acquisition import (
     finalize_aggregate_conclusion,
     grounded_evidence_response_format,
     helpful_grounded_recovery_allowed,
+    parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
+    render_process_failure_response,
     retain_initial_attempt_summary,
     select_evidence_next_step,
     suppress_manifest_identifiers,
@@ -10087,3 +10093,246 @@ async def test_changed_premise_authorization_promotes_exact_plan_once():
     assert state.next_step_history[0]["additional_acquisition_executed"] is True
     with pytest.raises(ValueError, match="additional_acquisition_limit_reached"):
         promote_exact_fetch_proposal(state, proposal)
+
+
+def _process_fact(**overrides):
+    payload = {
+        "fact_id": "fact_1",
+        "component": "data-source-aggregator",
+        "operation": "targeted_retrieval",
+        "stage": "source_access",
+        "category": "http_status",
+        "service_error_code": "source_unavailable",
+        "upstream_status_code": 503,
+    }
+    payload.update(overrides)
+    payload = {key: value for key, value in payload.items() if value is not None}
+    return ProcessFailureObservation.model_validate(payload)
+
+
+def _diagnostic_advisory(**overrides):
+    payload = {
+        "diagnosis_status": "hypothesis_available",
+        "confidence": "moderate",
+        "hypotheses": [
+            {
+                "text": "The dependency may be unavailable.",
+                "fact_ids": ["fact_1"],
+            }
+        ],
+        "next_step": {
+            "text": "Consider trying the lookup again later.",
+            "fact_ids": ["fact_1"],
+        },
+    }
+    payload.update(overrides)
+    return DiagnosticAdvisory.model_validate(payload)
+
+
+@pytest.mark.parametrize("category", ["timeout", "dependency_failure"])
+def test_process_failure_observation_accepts_closed_dsa_categories(category):
+    fact = _process_fact(category=category, upstream_status_code=None)
+    assert fact.category == category
+
+
+def test_process_failure_observation_accepts_retrieval_and_invalid_value_facts():
+    retrieval = _process_fact(
+        component="chat-orchestrator",
+        operation="targeted_retrieval",
+        stage="acquisition",
+        category="retrieval_limit",
+        service_error_code=None,
+        upstream_status_code=None,
+    )
+    invalid = _process_fact(
+        component="chat-orchestrator",
+        operation="structured_field_values",
+        stage="validation",
+        category="invalid_value",
+        service_error_code=None,
+        upstream_status_code=None,
+        invalid_value_count=2,
+    )
+    assert retrieval.category == "retrieval_limit"
+    assert invalid.invalid_value_count == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"category": "timeout"},
+        {"upstream_status_code": None},
+        {"upstream_status_code": "503"},
+        {"upstream_status_code": True},
+        {"category": "invalid_value", "invalid_value_count": None},
+        {"category": "timeout", "invalid_value_count": 1},
+        {"category": "unknown"},
+        {"fact_id": "fact_100"},
+        {"unexpected": "field"},
+    ],
+)
+def test_process_failure_observation_rejects_incoherent_or_open_values(mutation):
+    with pytest.raises(ValidationError):
+        _process_fact(**mutation)
+
+
+def test_process_failure_observation_collection_rejects_duplicate_fact_ids():
+    with pytest.raises(ValidationError, match="duplicate_process_failure_fact_id"):
+        ProcessFailureObservations.model_validate(
+            {"facts": [_process_fact(), _process_fact()]}
+        )
+
+
+def test_diagnostic_advisory_accepts_all_closed_statuses():
+    available = _diagnostic_advisory()
+    ambiguous = _diagnostic_advisory(
+        diagnosis_status="ambiguous",
+        hypotheses=[
+            DiagnosticHypothesis(
+                text="The dependency may be unavailable.", fact_ids=["fact_1"]
+            ),
+            DiagnosticHypothesis(
+                text="The request may have been rejected.", fact_ids=["fact_1"]
+            ),
+        ],
+    )
+    unavailable = _diagnostic_advisory(
+        diagnosis_status="no_useful_hypothesis",
+        confidence="low",
+        hypotheses=[],
+    )
+    assert available.diagnosis_status == "hypothesis_available"
+    assert len(ambiguous.hypotheses) == 2
+    assert unavailable.hypotheses == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"diagnosis_status": "unknown"},
+        {"confidence": "certain"},
+        {"unexpected": "authority"},
+        {"conclusion_permission": True},
+        {"hypotheses": []},
+        {
+            "hypotheses": [
+                {"text": "a", "fact_ids": ["fact_1"]},
+                {"text": "b", "fact_ids": ["fact_1"]},
+                {"text": "c", "fact_ids": ["fact_1"]},
+            ]
+        },
+        {
+            "hypotheses": [
+                {"text": "The cause is unclear.", "fact_ids": ["fact_1", "fact_1"]}
+            ]
+        },
+        {"diagnosis_status": "no_useful_hypothesis", "confidence": "low"},
+        {
+            "hypotheses": [
+                {"text": "x" * 401, "fact_ids": ["fact_1"]}
+            ]
+        },
+    ],
+)
+def test_diagnostic_advisory_rejects_invalid_contracts(mutation):
+    with pytest.raises(ValidationError):
+        _diagnostic_advisory(**mutation)
+
+
+def test_diagnostic_advisory_parser_rejects_unknown_fact_reference():
+    completion = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "diagnosis_status": "hypothesis_available",
+                            "confidence": "moderate",
+                            "hypotheses": [
+                                {
+                                    "text": "The dependency may be unavailable.",
+                                    "fact_ids": ["fact_2"],
+                                }
+                            ],
+                            "next_step": {
+                                "text": "Consider checking the dependency.",
+                                "fact_ids": ["fact_1"],
+                            },
+                        }
+                    )
+                }
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="unknown_fact_reference"):
+        parse_diagnostic_advisory_completion(
+            completion, observations=[_process_fact()]
+        )
+
+
+@pytest.mark.parametrize(
+    ("fact", "expected"),
+    [
+        (_process_fact(), "HTTP 503"),
+        (_process_fact(category="timeout", upstream_status_code=None), "timed out"),
+        (
+            _process_fact(
+                component="chat-orchestrator",
+                stage="acquisition",
+                category="retrieval_limit",
+                service_error_code=None,
+                upstream_status_code=None,
+            ),
+            "retrieval limit",
+        ),
+        (
+            _process_fact(
+                component="chat-orchestrator",
+                operation="structured_field_values",
+                stage="validation",
+                category="invalid_value",
+                service_error_code=None,
+                upstream_status_code=None,
+                invalid_value_count=1,
+            ),
+            "1 value failed",
+        ),
+    ],
+)
+def test_process_failure_facts_only_rendering_is_deterministic(fact, expected):
+    rendered = render_process_failure_response(
+        observations=[fact], advisory=None
+    )
+    assert expected in rendered
+    assert "probably" not in rendered.lower()
+    assert "retried" not in rendered.lower()
+    assert "normalized" not in rendered.lower()
+
+
+def test_advisory_rendering_modalizes_high_confidence_and_suggests_without_action():
+    advisory = _diagnostic_advisory(confidence="high")
+    rendered = render_process_failure_response(
+        observations=[_process_fact()], advisory=advisory
+    )
+    assert "HTTP 503" in rendered
+    assert "My best guess is" in rendered
+    assert advisory.hypotheses[0].text in rendered
+    assert "A useful next step would be" in rendered
+    assert "I retried" not in rendered
+
+
+def test_ambiguous_advisory_rendering_preserves_uncertainty():
+    advisory = _diagnostic_advisory(
+        diagnosis_status="ambiguous",
+        confidence="moderate",
+        hypotheses=[
+            {"text": "The dependency may be unavailable.", "fact_ids": ["fact_1"]},
+            {"text": "The request may have been rejected.", "fact_ids": ["fact_1"]},
+        ],
+    )
+    rendered = render_process_failure_response(
+        observations=[_process_fact()], advisory=advisory
+    )
+    assert "possible explanations" in rendered.lower()
+    assert "can't tell which" in rendered
+    assert all(item.text.rstrip(".?!") in rendered for item in advisory.hypotheses)

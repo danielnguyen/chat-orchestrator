@@ -284,6 +284,19 @@ queue_evidence_candidate() {
     '{conclusion_disposition:$disposition,evidence_excerpts:[{source_ref:$source_ref,excerpt:$excerpt}]}')"
 }
 
+queue_diagnostic_advisory() {
+  local hypothesis="$1" next_step="$2"
+  queue_provider_answer "$(jq -nc \
+    --arg hypothesis "$hypothesis" \
+    --arg next_step "$next_step" '
+    {
+      diagnosis_status:"hypothesis_available",
+      confidence:"moderate",
+      hypotheses:[{text:$hypothesis,fact_ids:["fact_1"]}],
+      next_step:{text:$next_step,fact_ids:["fact_1"]}
+    }')"
+}
+
 wait_for_http() {
   local url="$1"
   local attempt
@@ -694,6 +707,27 @@ assert_semantic_interpreter_calls() {
         "status",
         "tool_count"
       ]) | length) == 0
+    ))
+  ' <<<"$provider_calls" >/dev/null
+}
+
+assert_diagnostic_advisory_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
+    )] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .tool_count == 0
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required
+        == ["diagnosis_status", "confidence", "hypotheses", "next_step"]
+      and .max_completion_tokens == 512
+      and .status == "ok"
     ))
   ' <<<"$provider_calls" >/dev/null
 }
@@ -1347,6 +1381,9 @@ run_evidence_hybrid_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "calendar-beta" "unavailable_after_first"
+  queue_diagnostic_advisory \
+    "The source dependency may be unavailable." \
+    "Consider trying the comparison again later."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-hybrid-failure")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1355,11 +1392,13 @@ run_evidence_hybrid_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   fixture_calls="$(fetch_source_fixture_calls)"
-  jq -e '
+  assert_jq "hybrid.failure.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("requested conclusion") or contains("selected-source comparison"))
-  ' <<<"$response" >/dev/null
-  jq -e '
+    and (.answer | contains("source service request failed with HTTP 502"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+  '
+  assert_jq "hybrid.failure.manifest" "$manifest" '
     .acquisition.sources_considered == ["calendar_alpha","calendar_beta"]
     and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
     and (
@@ -1367,8 +1406,14 @@ run_evidence_hybrid_scenarios() {
       or .next_steps.selections[0].selected_next_step == "disclose_unexamined_scope"
       or .next_steps.selections[0].selected_next_step == "withhold_unsupported_conclusion"
     )
-  ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  '
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "hybrid.failure.diagnostic" "$manifest" '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.render_mode == "advisory"
+  '
   assert_provider_free_trace "$trace"
   jq -e '
     ([.calls[] | select(.source == "calendar-beta" and .operation == "ics_get")] | length) == 2
@@ -1546,8 +1591,9 @@ run_evidence_limitation_and_failure_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "calendar-alpha" "unavailable"
-  guidance="Compare the exact record identifier with the authoritative record that controls the requested conclusion."
-  queue_provider_answer "$guidance"
+  queue_diagnostic_advisory \
+    "The source dependency may be unavailable." \
+    "Consider trying the lookup again later."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-failure")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1558,25 +1604,55 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  assert_advisory_response_boundary "$response" "$guidance"
-  assert_advisory_manifest "$manifest" "insufficient" "not_applicable"
-  assert_advisory_trace "$trace" "$answer"
-  assert_advisory_provider_calls "$provider_calls"
-  assert_dsa_operation_counts "$audit" 0 0 0
-  jq -e '
+  assert_jq "failure.unavailable.response" "$response" '
+    .status == "degraded"
+    and (.answer | contains("source service request failed with HTTP 502"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+  '
+  assert_jq "failure.unavailable.diagnostic" "$manifest" '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.render_mode == "advisory"
+  '
+  if ! assert_provider_free_trace "$trace"; then
+    echo "Assertion failed: failure.unavailable.answer_provider" >&2
+    return 1
+  fi
+  if ! assert_diagnostic_advisory_calls "$provider_calls" 1; then
+    echo "Assertion failed: failure.unavailable.provider" >&2
+    return 1
+  fi
+  if ! assert_dsa_operation_counts "$audit" 0 0 0; then
+    echo "Assertion failed: failure.unavailable.dsa_audit" >&2
+    return 1
+  fi
+  assert_jq "failure.unavailable.transport_trace" "$trace" '
     .retrieval.prompt_assembly.dsa.called == true
     and .retrieval.prompt_assembly.dsa.status == "error"
-    and .retrieval.prompt_assembly.dsa.error_code == "http_502"
-  ' <<<"$trace" >/dev/null
-  jq -e '
+    and .retrieval.prompt_assembly.dsa.error_code == "source_unavailable"
+    and .retrieval.prompt_assembly.dsa.service_error_code == "source_unavailable"
+    and .retrieval.prompt_assembly.dsa.service_http_status == 502
+  '
+  assert_jq "failure.unavailable.fixture" "$source_calls" '
     ([.calls[] | select(
       .source == "calendar-alpha" and .operation == "ics_get"
     )] | length) == 1
-  ' <<<"$source_calls" >/dev/null
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  '
+  if ! assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1; then
+    echo "Assertion failed: failure.unavailable.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events "$diagnostics" "$request_id" 0; then
+    echo "Assertion failed: failure.unavailable.claims" >&2
+    return 1
+  fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  if ! assert_request_persistence_counts "$conversation_id" "$request_id" 0; then
+    echo "Assertion failed: failure.unavailable.persistence" >&2
+    return 1
+  fi
   case "$(jq -c . <<<"$response")$(jq -c . <<<"$trace")$(jq -c '[.calls[] | select(.kind == "chat") | .normalized_messages]' <<<"$provider_calls")" in
     *PRIVATE*|*fixture-source-failure*|*credentials*|*Traceback*)
       echo "unavailable source diagnostics exposed private dependency data" >&2
@@ -1594,8 +1670,9 @@ run_evidence_limitation_and_failure_scenarios() {
   reset_source_fixture
   reset_dsa_audit
   configure_source_fixture "targeted-sheet" "malformed"
-  guidance="Compare the exact record identifier with the authoritative record that controls the requested conclusion."
-  queue_provider_answer "$guidance"
+  queue_diagnostic_advisory \
+    "The source response may not match the required structure." \
+    "Consider checking the source response configuration."
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-malformed")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1606,13 +1683,20 @@ run_evidence_limitation_and_failure_scenarios() {
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
   answer="$(jq -r '.answer' <<<"$response")"
-  assert_advisory_response_boundary "$response" "$guidance"
   jq -e '
-    (.acquisition.dsa_error_codes | length) > 0
+    .status == "degraded"
+    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+  ' <<<"$response" >/dev/null
+  jq -e '
+    .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.render_mode == "advisory"
   ' <<<"$manifest" >/dev/null
-  assert_advisory_manifest "$manifest" "insufficient" "not_applicable"
-  assert_advisory_trace "$trace" "$answer"
-  assert_advisory_provider_calls "$provider_calls"
+  assert_provider_free_trace "$trace"
+  assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
   jq -e '
     .retrieval.prompt_assembly.dsa.called == true
@@ -1700,7 +1784,7 @@ run_evidence_clarification_scenario() {
 
 run_evidence_changed_premise_scenarios() {
   local owner client conversation_id question external response request_id trace
-  local manifest provider_calls diagnostics audit source_calls guidance answer
+  local manifest provider_calls diagnostics audit source_calls answer
   owner="owner-evidence-followup"
   client="client-evidence-followup"
   question="Verify the follow-up records."
@@ -1724,7 +1808,7 @@ run_evidence_changed_premise_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
-  jq -e '
+  assert_jq "changed_premise.initial.trace" "$trace" '
     .router_decision.selected_model == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_requested == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_applied == true
@@ -1738,12 +1822,12 @@ run_evidence_changed_premise_scenarios() {
     and .retrieval.prompt_assembly.prompt_budget.effective_hard_input_budget == 1000
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.supplied == false
     and .retrieval.prompt_assembly.prompt_budget.profile_clamp.applied == false
-  ' <<<"$trace" >/dev/null
-  jq -e '
+  '
+  assert_jq "changed_premise.initial.response" "$response" '
     .status == "ok"
     and (.answer | endswith("This reflects only the targeted sources checked, not a complete search of every possible source."))
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "changed_premise.initial.manifest" "$manifest" '
     .plan.selected_strategies == ["exact_fetch"]
     and .acquisition.strategy_attempted == "exact_fetch"
     and .acquisition.exact_reference_attempt_count == 1
@@ -1759,7 +1843,7 @@ run_evidence_changed_premise_scenarios() {
     and [.next_steps.selections[].selected_next_step] == ["perform_additional_acquisition","answer_within_declared_scope"]
     and .next_steps.selections[0].reacquisition_guard == "changed_premise_allowed"
     and .next_steps.selections[0].additional_acquisition_executed == true
-  ' <<<"$manifest" >/dev/null
+  '
   if ! assert_dsa_operation_counts "$audit" 1 0 1 >/dev/null 2>&1; then
     echo "Assertion failed: changed_premise.initial.dsa" >&2
     return 1
@@ -1786,8 +1870,9 @@ run_evidence_changed_premise_scenarios() {
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
 
   reset_dsa_audit
-  guidance="Compare the exact record identifier and version with the authoritative record that controls the requested conclusion."
-  queue_provider_answer "$guidance"
+  queue_diagnostic_advisory \
+    "The bounded acquisition may have ended before full coverage." \
+    "Consider narrowing the request or changing the evidence scope before trying again."
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_voice_openai")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
@@ -1797,11 +1882,11 @@ run_evidence_changed_premise_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   source_calls="$(fetch_source_fixture_calls)"
-  jq -e '
-    .router_decision.selected_model == "chat_voice_openai"
-    and .router_decision.provider == "cloud"
-    and .router_decision.routing_contract.selected_model == "chat_voice_openai"
-    and .router_decision.routing_contract.selected_provider == "cloud"
+  assert_jq "changed_premise.repeated.trace" "$trace" '
+    .router_decision.selected_model == "not_called"
+    and .router_decision.provider == "none"
+    and .router_decision.routing_contract.selected_model == "not_called"
+    and .router_decision.routing_contract.selected_provider == "none"
     and .router_decision.routing_contract.manual_override_requested == "chat_voice_openai"
     and .router_decision.routing_contract.manual_override_applied == true
     and .router_decision.routing_contract.manual_override_rejection_reason == null
@@ -1818,27 +1903,60 @@ run_evidence_changed_premise_scenarios() {
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].provider == "cloud"
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].max_context_tokens == 128000
     and .retrieval.prompt_assembly.prompt_budget.attempts[0].role == "primary"
-    and .model_call.status == "ok"
-    and (.model_calls | length) == 1
+    and .model_call.status == "not_called"
+    and .model_calls == []
     and .fallback.triggered == false
-  ' <<<"$trace" >/dev/null
-  assert_advisory_response_boundary "$response" "$guidance"
-  jq -e '(.answer | contains("exact follow-up record confirms") | not)' \
-    <<<"$response" >/dev/null
-  jq -e '
+    and .retrieval.prompt_assembly.evidence_provider_mode.mode == "blocked"
+    and .retrieval.prompt_assembly.evidence_provider_mode.advisory_rebuild_count == 0
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+  '
+  assert_jq "changed_premise.repeated.response" "$response" '
+    .status == "degraded"
+    and .sources == []
+    and .pending_action == null
+    and (.answer | contains(
+      "I hit the retrieval limit before I could get the complete data needed for the request."
+    ))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("The bounded acquisition may have ended before full coverage"))
+    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains(
+      "Consider narrowing the request or changing the evidence scope before trying again"
+    ))
+    and (.answer | contains("exact follow-up record confirms") | not)
+    and (.answer | contains("The retained evidence supports the requested conclusion") | not)
+    and (.answer | contains("Unverified guidance:") | not)
+  '
+  assert_jq "changed_premise.repeated.manifest" "$manifest" '
     .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
     and .next_steps.selection_count == 1
+    and .next_steps.selections[0].selected_next_step == "withhold_unsupported_conclusion"
+    and .next_steps.selections[0].conclusion_disposition == "requested_conclusion_withheld"
+    and .next_steps.selections[0].provider_disposition == "allowed"
     and .next_steps.selections[0].reacquisition_guard == "premise_already_attempted"
     and .next_steps.selections[0].additional_acquisition_executed == false
-  ' <<<"$manifest" >/dev/null
-  assert_advisory_manifest "$manifest" "insufficient" "premise_already_attempted"
-  assert_advisory_trace "$trace" "$answer"
+    and .acquisition.source_references_retained == []
+  '
+  assert_jq "changed_premise.repeated.diagnostic" "$manifest" '
+    .diagnostic.eligible == true
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_count == 1
+    and .diagnostic.observation_categories == ["retrieval_limit"]
+    and .diagnostic.diagnosis_status == "hypothesis_available"
+    and .diagnostic.confidence == "moderate"
+    and .diagnostic.hypothesis_count == 1
+    and .diagnostic.render_mode == "advisory"
+  '
   if ! assert_dsa_operation_counts "$audit" 1 0 0 >/dev/null 2>&1; then
-    echo "Assertion failed: changed_premise.repeated.dsa" >&2
+    echo "Assertion failed: changed_premise.repeated.acquisition" >&2
     return 1
   fi
-  jq -e '
+  assert_jq "changed_premise.repeated.fixture" "$source_calls" '
     [.calls[] | select(
       .source == "followup-sheet" and .operation == "google_values"
     )] as $calls
@@ -1850,19 +1968,50 @@ run_evidence_changed_premise_scenarios() {
       > $calls[1].returned_cell_character_count)
     and ($calls[0].returned_cell_character_count
       == $calls[2].returned_cell_character_count)
-  ' <<<"$source_calls" >/dev/null
-  assert_advisory_provider_calls "$provider_calls"
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 1 1
-  assert_claim_calibration_events "$diagnostics" "$request_id" 0
+  '
+  if ! assert_diagnostic_advisory_calls "$provider_calls" 1; then
+    echo "Assertion failed: changed_premise.repeated.provider" >&2
+    return 1
+  fi
+  assert_jq "changed_premise.repeated.answer_provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
+    )] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "grounded_evidence_response"
+    )] | length) == 0
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]?
+      | select(
+        .role == "system"
+        and (.content | startswith("Evidence advisory guidance:"))
+      )] | length) == 0
+    and ([.calls[] | select(.kind == "chat") | .normalized_messages[]?
+      | select(.content | startswith("Governed evidence response contract:"))]
+      | length) == 0
+  '
+  if ! assert_evidence_runtime_events "$diagnostics" "$request_id" 1 2 1 1; then
+    echo "Assertion failed: changed_premise.repeated.runtime" >&2
+    return 1
+  fi
+  if ! assert_claim_calibration_events "$diagnostics" "$request_id" 0; then
+    echo "Assertion failed: changed_premise.repeated.claims" >&2
+    return 1
+  fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  if ! assert_request_persistence_counts "$conversation_id" "$request_id" 0; then
+    echo "Assertion failed: changed_premise.repeated.persistence" >&2
+    return 1
+  fi
   configure_source_fixture "followup-sheet" "ready"
   restart_orchestrator_with_reserve 2048
   docker compose -f "$COMPOSE" exec -T orchestrator /bin/sh -c '
     test "$ALLOW_MANUAL_OVERRIDE" = "false"
     test "$PROMPT_OUTPUT_TOKEN_RESERVE" = "2048"
   '
-  echo "Evidence changed premise: model=chat_voice_openai effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_provider=1"
+  echo "Evidence changed premise: model=chat_voice_openai effective_budget=1000 targeted_results=2 targeted_retained=0 changed_premise_authorizations=1 exact_fetch=1 exact_retained=1 selections=2 provider=1 fixture_variants=large,compact,large repeated_targeted=1 repeated_guard=premise_already_attempted repeated_fetch=0 repeated_diagnostic=1 repeated_answer_provider=0 diagnostic_retry=0 diagnostic_reacquisition=0"
 }
 
 run_evidence_adversarial_provider_scenario() {
@@ -5834,12 +5983,193 @@ run_evidence_aggregate_scenario() {
   echo "Evidence aggregate operation refinement: first_shape=targeted_lookup source_match=matched semantic=1 second_shape=aggregate answer_provider=0 search=0 structured_context=1"
 }
 
+run_step13_diagnostic_scenarios() {
+  local owner client conversation_id question external response request_id answer
+  local trace manifest provider_calls fixture_calls audit serialized
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+
+  owner="owner-step13-http"
+  client="client-step13-http"
+  question="What is the median reading in my measurements?"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  configure_source_fixture "measurement-sheet" "unavailable"
+  conversation_id="$(resolve_conversation "$owner" "$client" "step13-http")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"median",
+      aggregate_field_name:"Reading"
+    }')"
+  queue_diagnostic_advisory \
+    "The upstream dependency may be unavailable." \
+    "Consider trying the lookup again later."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  serialized="$(jq -c . <<<"$trace")"
+
+  assert_jq "step13.http.response" "$response" '
+    .status == "degraded"
+    and (.answer | contains("source service request failed with HTTP 500"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains("Median for") | not)
+    and .sources == []
+    and .pending_action == null
+  '
+  assert_jq "step13.http.trace" "$manifest" '
+    .diagnostic.eligible == true
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_count == 1
+    and .diagnostic.observation_categories == ["http_status"]
+    and .diagnostic.diagnosis_status == "hypothesis_available"
+    and .diagnostic.confidence == "moderate"
+    and .diagnostic.hypothesis_count == 1
+    and .diagnostic.render_mode == "advisory"
+    and .acquisition.aggregate_execution.structured_context_call_count == 1
+    and .acquisition.aggregate_execution.outcome == "failed"
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "step13.http.provider_accounting" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("trusted_process_facts"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("chat-orchestrator"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("500"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("source_unavailable") or contains("503"))]
+      | length) == 0
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("measurements"))] | length) == 0
+  '
+  assert_jq "step13.http.fixture" "$fixture_calls" '
+    ([.calls[] | select(
+      .source == "measurement-sheet" and .operation == "google_values"
+    )] | length) == 1
+  '
+  assert_dsa_operation_counts "$audit" 0 0 0
+  case "$serialized" in
+    *"The upstream dependency may be unavailable"*|*"Consider trying the lookup again later"*|*"source unavailable"*|*"http://source-fixture"*)
+      echo "Step-13 HTTP trace exposed advisory or source-private material" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  configure_source_fixture "measurement-sheet" "ready"
+
+  owner="owner-step13-invalid"
+  client="client-step13-invalid"
+  question="What is the median Entry in the Configured Metrics Archive?"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "step13-invalid")"
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"median",
+      aggregate_field_name:"Entry"
+    }')"
+  queue_diagnostic_advisory \
+    "A formatting or data-entry issue may be present." \
+    "Consider checking the values that require numeric input."
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  serialized="$(jq -c . <<<"$trace")"
+
+  assert_jq "step13.invalid.response" "$response" '
+    .status == "degraded"
+    and (.answer | contains("5 values failed the required numeric validation"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+    and (.answer | contains("Median for") | not)
+    and (.answer | contains("alpha") | not)
+    and .sources == []
+    and .pending_action == null
+  '
+  assert_jq "step13.invalid.trace" "$manifest" '
+    .diagnostic.eligible == true
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.status == "accepted"
+    and .diagnostic.observation_count == 1
+    and .diagnostic.observation_categories == ["invalid_value"]
+    and .diagnostic.diagnosis_status == "hypothesis_available"
+    and .diagnostic.confidence == "moderate"
+    and .diagnostic.hypothesis_count == 1
+    and .diagnostic.render_mode == "advisory"
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "step13.invalid.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("\"invalid_value_count\":5"))] | length) == 1
+    and ([.calls[] | select(.kind == "chat")
+      | .normalized_messages[]
+      | select(.content | contains("alpha") or contains("beta")
+        or contains("gamma") or contains("delta") or contains("epsilon"))]
+      | length) == 0
+  '
+  assert_jq "step13.invalid.fixture" "$fixture_calls" '
+    ([.calls[] | select(
+      .source == "measurement-sheet" and .operation == "google_values"
+    )] | length) == 1
+  '
+  assert_dsa_operation_counts "$audit" 0 1 0
+  case "$serialized" in
+    *PRIVATE_AGGREGATE_SECRET_*|*"A formatting or data-entry issue may be present"*|*"Consider checking the values"*|*structured_data*)
+      echo "Step-13 invalid-value trace exposed raw values or advisory prose" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "Step-13 diagnostics: composed_dsa_http=500 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+}
+
 run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
     ""|all)
       run_evidence_source_scope_scenarios
       run_evidence_aggregate_scenario
+      run_step13_diagnostic_scenarios
       run_evidence_targeted_scenario
       run_evidence_exact_scenario
       run_evidence_hybrid_scenarios
@@ -5861,6 +6191,10 @@ run_evidence_acquisition_composed_suite() {
     aggregate)
       run_evidence_aggregate_scenario
       echo "Evidence acquisition composed smoke passed: scenarios=aggregate"
+      ;;
+    step13-diagnostic)
+      run_step13_diagnostic_scenarios
+      echo "Evidence acquisition composed smoke passed: scenarios=step13-diagnostic"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario

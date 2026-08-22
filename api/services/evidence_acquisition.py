@@ -9,11 +9,13 @@ from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, Rounded, localcontext
 from typing import Annotated, Any, Literal
 
+from clients.data_source_aggregator import DataSourceAggregatorFailure
 from models import MaterialScopeReferences
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     StrictStr,
     ValidationError,
     field_validator,
@@ -441,6 +443,160 @@ class EvidenceCandidateValidation:
     validated_excerpt_count: int
     validated_source_references: tuple[str, ...]
     failure_reason: EvidenceCandidateFailureReason | None
+
+
+ProcessFailureComponent = Literal["data-source-aggregator", "chat-orchestrator"]
+ProcessFailureOperation = Literal[
+    "targeted_retrieval",
+    "exact_fetch",
+    "context_expansion",
+    "structured_field_values",
+]
+ProcessFailureStage = Literal["source_access", "acquisition", "validation"]
+ProcessFailureCategory = Literal[
+    "http_status",
+    "timeout",
+    "transport_failure",
+    "dependency_failure",
+    "retrieval_limit",
+    "invalid_value",
+]
+DiagnosisStatus = Literal[
+    "hypothesis_available",
+    "ambiguous",
+    "no_useful_hypothesis",
+]
+DiagnosisConfidence = Literal["low", "moderate", "high"]
+
+
+class ProcessFailureObservation(StrictModel):
+    fact_id: Annotated[
+        StrictStr,
+        Field(pattern=r"^fact_[1-9][0-9]?$", min_length=6, max_length=7),
+    ]
+    component: ProcessFailureComponent
+    operation: ProcessFailureOperation
+    stage: ProcessFailureStage
+    category: ProcessFailureCategory
+    service_error_code: Identifier | None = None
+    upstream_status_code: Annotated[StrictInt, Field(ge=100, le=599)] | None = None
+    invalid_value_count: Annotated[StrictInt, Field(ge=0, le=1000)] | None = None
+
+    @model_validator(mode="after")
+    def validate_failure_shape(self) -> ProcessFailureObservation:
+        status_supplied = "upstream_status_code" in self.model_fields_set
+        count_supplied = "invalid_value_count" in self.model_fields_set
+        service_code_supplied = "service_error_code" in self.model_fields_set
+        if self.category == "http_status":
+            if not status_supplied or self.upstream_status_code is None:
+                raise ValueError("http_status_requires_status")
+        elif status_supplied:
+            raise ValueError("status_requires_http_category")
+        if self.category == "invalid_value":
+            if not count_supplied or self.invalid_value_count is None:
+                raise ValueError("invalid_value_requires_count")
+        elif count_supplied:
+            raise ValueError("count_requires_invalid_value_category")
+        if service_code_supplied and self.component != "data-source-aggregator":
+            raise ValueError("service_error_code_requires_service_component")
+        if self.component == "data-source-aggregator" and (
+            self.stage != "source_access"
+            or self.category
+            not in {"http_status", "timeout", "dependency_failure"}
+        ):
+            raise ValueError("invalid_service_observation")
+        if self.category == "retrieval_limit" and self.stage != "acquisition":
+            raise ValueError("retrieval_limit_requires_acquisition_stage")
+        if self.category == "invalid_value" and self.stage != "validation":
+            raise ValueError("invalid_value_requires_validation_stage")
+        if self.category in {"http_status", "timeout", "transport_failure"} and (
+            self.stage != "source_access"
+        ):
+            raise ValueError("transport_observation_requires_source_access_stage")
+        return self
+
+
+class ProcessFailureObservations(StrictModel):
+    facts: list[ProcessFailureObservation] = Field(min_length=1, max_length=8)
+
+    @field_validator("facts")
+    @classmethod
+    def reject_duplicate_fact_ids(
+        cls,
+        value: list[ProcessFailureObservation],
+    ) -> list[ProcessFailureObservation]:
+        fact_ids = [item.fact_id for item in value]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("duplicate_process_failure_fact_id")
+        return value
+
+
+class DiagnosticHypothesis(StrictModel):
+    text: Annotated[StrictStr, Field(min_length=1, max_length=400)]
+    fact_ids: list[
+        Annotated[StrictStr, Field(pattern=r"^fact_[1-9][0-9]?$", max_length=7)]
+    ] = Field(min_length=1, max_length=8)
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if value != value.strip() or re.search(r"[\x00-\x1f\x7f]", value):
+            raise ValueError("unsafe_diagnostic_text")
+        return value
+
+    @field_validator("fact_ids")
+    @classmethod
+    def reject_duplicate_fact_references(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("duplicate_diagnostic_fact_reference")
+        return value
+
+
+class DiagnosticNextStep(StrictModel):
+    text: Annotated[StrictStr, Field(min_length=1, max_length=400)]
+    fact_ids: list[
+        Annotated[StrictStr, Field(pattern=r"^fact_[1-9][0-9]?$", max_length=7)]
+    ] = Field(min_length=1, max_length=8)
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if value != value.strip() or re.search(r"[\x00-\x1f\x7f]", value):
+            raise ValueError("unsafe_diagnostic_next_step")
+        return value
+
+    @field_validator("fact_ids")
+    @classmethod
+    def reject_duplicate_fact_references(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("duplicate_diagnostic_next_step_fact_reference")
+        return value
+
+
+class DiagnosticAdvisory(StrictModel):
+    diagnosis_status: DiagnosisStatus
+    confidence: DiagnosisConfidence
+    hypotheses: list[DiagnosticHypothesis] = Field(max_length=2)
+    next_step: DiagnosticNextStep
+
+    @model_validator(mode="after")
+    def validate_coherence(self) -> DiagnosticAdvisory:
+        hypothesis_count = len(self.hypotheses)
+        if self.diagnosis_status == "hypothesis_available" and hypothesis_count not in {
+            1,
+            2,
+        }:
+            raise ValueError("diagnostic_hypothesis_required")
+        if self.diagnosis_status == "ambiguous" and hypothesis_count != 2:
+            raise ValueError("ambiguous_diagnostic_requires_two_hypotheses")
+        if self.diagnosis_status == "no_useful_hypothesis" and (
+            hypothesis_count != 0 or self.confidence != "low"
+        ):
+            raise ValueError("no_useful_hypothesis_requires_empty_low_confidence")
+        normalized = [item.text.casefold() for item in self.hypotheses]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("duplicate_diagnostic_hypothesis")
+        return self
 
 
 SemanticInterpretationStatus = Literal["resolved", "ambiguous", "no_match"]
@@ -1529,6 +1685,26 @@ class EvidenceAcquisitionState:
     aggregate_execution: dict[str, Any] | None = None
     aggregate_delivery_identity: dict[str, Any] | None = None
     aggregate_result: str | None = None
+    process_failure_observations: list[ProcessFailureObservation] = dataclass_field(
+        default_factory=list
+    )
+    diagnostic_advisory: DiagnosticAdvisory | None = None
+    diagnostic_rendered_answer: str | None = None
+    diagnostic_trace: dict[str, Any] = dataclass_field(
+        default_factory=lambda: {
+            "eligible": False,
+            "attempted": False,
+            "call_count": 0,
+            "status": "not_applicable",
+            "failure_reason": None,
+            "observation_count": 0,
+            "observation_categories": [],
+            "diagnosis_status": None,
+            "confidence": None,
+            "hypothesis_count": 0,
+            "render_mode": "not_applicable",
+        }
+    )
     inventory_discovery: dict[str, Any] = dataclass_field(
         default_factory=lambda: {
             "called": False,
@@ -2263,6 +2439,175 @@ def grounded_evidence_response_format() -> dict[str, Any]:
             },
         },
     }
+
+
+def diagnostic_advisory_response_format() -> dict[str, Any]:
+    linked_text = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 400},
+            "fact_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "string",
+                    "pattern": r"^fact_[1-9][0-9]?$",
+                    "maxLength": 7,
+                },
+            },
+        },
+        "required": ["text", "fact_ids"],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "process_failure_diagnostic_advisory",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "diagnosis_status": {
+                        "type": "string",
+                        "enum": [
+                            "hypothesis_available",
+                            "ambiguous",
+                            "no_useful_hypothesis",
+                        ],
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["low", "moderate", "high"],
+                    },
+                    "hypotheses": {
+                        "type": "array",
+                        "maxItems": 2,
+                        "items": linked_text,
+                    },
+                    "next_step": linked_text,
+                },
+                "required": [
+                    "diagnosis_status",
+                    "confidence",
+                    "hypotheses",
+                    "next_step",
+                ],
+            },
+        },
+    }
+
+
+def diagnostic_advisory_messages(
+    *,
+    observations: list[ProcessFailureObservation],
+    task_shape: TaskShape | None,
+) -> list[dict[str, str]]:
+    bounded_input = json.dumps(
+        {
+            "task_shape": task_shape,
+            "trusted_process_facts": [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in observations
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Interpret only the supplied trusted process-failure facts. "
+                "Hypotheses are uncertain inferences, never known facts. Do not "
+                "infer source contents or answer the original factual question. "
+                "Do not decide evidence authority, source scope, sufficiency, "
+                "conclusion permission, retries, actions, or value normalization. "
+                "Do not recommend ignoring malformed evidence. Reference only "
+                "supplied fact_id values and return exactly one JSON object matching "
+                "the supplied schema."
+            ),
+        },
+        {"role": "user", "content": bounded_input},
+    ]
+
+
+def validate_diagnostic_advisory(
+    advisory: DiagnosticAdvisory,
+    *,
+    observations: list[ProcessFailureObservation],
+) -> DiagnosticAdvisory:
+    supplied_fact_ids = {item.fact_id for item in observations}
+    referenced_fact_ids = {
+        fact_id
+        for hypothesis in advisory.hypotheses
+        for fact_id in hypothesis.fact_ids
+    } | set(advisory.next_step.fact_ids)
+    if not referenced_fact_ids.issubset(supplied_fact_ids):
+        raise ValueError("diagnostic_unknown_fact_reference")
+    return advisory
+
+
+def parse_diagnostic_advisory_completion(
+    value: Any,
+    *,
+    observations: list[ProcessFailureObservation],
+) -> DiagnosticAdvisory:
+    allowed_fields = {
+        "choices",
+        "usage",
+        "id",
+        "object",
+        "created",
+        "model",
+        "service_tier",
+        "system_fingerprint",
+    }
+    if not isinstance(value, dict) or set(value) - allowed_fields:
+        raise ValueError("diagnostic_completion_invalid")
+    choices = value.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError("diagnostic_choices_invalid")
+    choice = choices[0]
+    if not isinstance(choice, dict) or set(choice) - {
+        "index",
+        "message",
+        "finish_reason",
+        "logprobs",
+        "provider_specific_fields",
+    }:
+        raise ValueError("diagnostic_choice_invalid")
+    message = choice.get("message")
+    if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
+        raise ValueError("diagnostic_tool_call_forbidden")
+    if message.get("refusal") not in (None, ""):
+        raise ValueError("diagnostic_refusal_invalid")
+    if set(message) - {
+        "annotations",
+        "content",
+        "provider_specific_fields",
+        "refusal",
+        "role",
+        "tool_calls",
+    }:
+        raise ValueError("diagnostic_message_invalid")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("diagnostic_content_invalid")
+    try:
+        decoded = json.loads(
+            content,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("diagnostic_json_invalid") from exc
+    advisory = DiagnosticAdvisory.model_validate(decoded)
+    return validate_diagnostic_advisory(
+        advisory,
+        observations=observations,
+    )
 
 
 def evidence_interpreter_messages(
@@ -3646,6 +3991,22 @@ class AggregateNumericValidationError(ValueError):
         self.invalid_count = invalid_count
 
 
+def dsa_failure_trace_fields(error: Exception) -> dict[str, Any]:
+    if not isinstance(error, DataSourceAggregatorFailure):
+        return {}
+    fields: dict[str, Any] = {
+        "service_http_status": error.service_status_code,
+    }
+    if error.service_error_code is not None:
+        fields["service_error_code"] = error.service_error_code
+    if error.diagnostic is not None:
+        fields["source_access_diagnostic"] = error.diagnostic.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+    return fields
+
+
 def _canonical_decimal(value: Decimal) -> str:
     if value.is_zero():
         return "0"
@@ -3855,6 +4216,7 @@ async def execute_aggregate_values(
     context_call_count = 1
     outcome: AggregateExecutionOutcome
     error_code: str | None = None
+    failure_trace: dict[str, Any] = {}
     try:
         response_raw = await dsa.context_source(
             request_id=state.request_id,
@@ -3877,6 +4239,7 @@ async def execute_aggregate_values(
     except Exception as exc:
         response = None
         outcome = _aggregate_transport_outcome(exc)
+        failure_trace = dsa_failure_trace_fields(exc)
         error_code = (
             "budget_truncated"
             if outcome == "truncated"
@@ -3972,16 +4335,19 @@ async def execute_aggregate_values(
         "non_empty_value_count": non_empty_value_count,
         "outcome": outcome,
     }
-    return None, _aggregate_trace(
-        base=dsa_trace,
-        outcome=outcome,
-        context_call_count=context_call_count,
-        record_count=record_count,
-        non_empty_value_count=non_empty_value_count,
-        numeric_value_count=numeric_value_count,
-        invalid_numeric_count=invalid_numeric_count,
-        error_code=error_code,
-    )
+    return None, {
+        **_aggregate_trace(
+            base=dsa_trace,
+            outcome=outcome,
+            context_call_count=context_call_count,
+            record_count=record_count,
+            non_empty_value_count=non_empty_value_count,
+            numeric_value_count=numeric_value_count,
+            invalid_numeric_count=invalid_numeric_count,
+            error_code=error_code,
+        ),
+        **failure_trace,
+    }
 
 
 def _exact_bundle_id(
@@ -4186,6 +4552,7 @@ async def execute_bounded_exhaustive_review(
     raw_expanded_item_count = 0
     expansion_estimated_bytes = 0
     expansion_truncated = False
+    failure_trace: dict[str, Any] = {}
 
     if targeted_context_pack is None:
         attempt["outcome"] = (
@@ -4233,9 +4600,11 @@ async def execute_bounded_exhaustive_review(
         except (ValueError, TypeError):
             attempt["outcome"] = "filtered"
             aggregate_error_codes.add("malformed_response")
-        except Exception:
+        except Exception as exc:
             attempt["outcome"] = "failed"
             aggregate_error_codes.add("dependency_failure")
+            if not failure_trace:
+                failure_trace = dsa_failure_trace_fields(exc)
 
     state.expansion_attempts = [attempt]
     targeted_query_id = (
@@ -4308,6 +4677,7 @@ async def execute_bounded_exhaustive_review(
     )
     return bundle, {
         **dsa_trace,
+        **failure_trace,
         "called": True,
         "call_count": 1 + context_call_count,
         "context_pack_call_count": 1,
@@ -4371,6 +4741,7 @@ async def execute_hybrid_comparison(
         if isinstance(item, dict)
     ]
     attempts: list[dict[str, Any]] = []
+    failure_trace: dict[str, Any] = {}
     expanded_items_by_source: dict[str, list[dict[str, Any]]] = {}
     aggregate_error_codes = {
         code
@@ -4483,9 +4854,11 @@ async def execute_hybrid_comparison(
         except ValueError:
             attempt["outcome"] = "filtered"
             aggregate_error_codes.add("malformed_response")
-        except Exception:
+        except Exception as exc:
             attempt["outcome"] = "failed"
             aggregate_error_codes.add("dependency_failure")
+            if not failure_trace:
+                failure_trace = dsa_failure_trace_fields(exc)
         attempts.append(attempt)
 
     state.expansion_attempts = attempts
@@ -4561,6 +4934,7 @@ async def execute_hybrid_comparison(
     }
     return bundle, {
         **dsa_trace,
+        **failure_trace,
         "called": True,
         "call_count": 1 + context_call_count,
         "context_pack_call_count": 1,
@@ -4604,6 +4978,7 @@ async def execute_exact_fetches(
     attempts: list[dict[str, Any]] = []
     safe_items: list[dict[str, Any]] = []
     aggregate_errors: set[str] = set()
+    failure_trace: dict[str, Any] = {}
     for reference in state.exact_source_refs or []:
         attempt: dict[str, Any] = {
             "source_id": reference["source_id"],
@@ -4654,9 +5029,11 @@ async def execute_exact_fetches(
         except ValueError:
             attempt["outcome"] = "filtered"
             aggregate_errors.add("malformed_response")
-        except Exception:
+        except Exception as exc:
             attempt["outcome"] = "failed"
             aggregate_errors.add("dependency_failure")
+            if not failure_trace:
+                failure_trace = dsa_failure_trace_fields(exc)
         attempts.append(attempt)
 
     state.exact_attempts = attempts
@@ -4714,6 +5091,7 @@ async def execute_exact_fetches(
         else "empty"
     )
     return bundle, {
+        **failure_trace,
         "enabled": True,
         "called": bool(attempts),
         "call_count": len(attempts),
@@ -5262,6 +5640,227 @@ async def evaluate_acquisition_sufficiency(
         state.forced_answer = WITHHELD_ANSWER
 
 
+def _process_failure_operation(state: EvidenceAcquisitionState) -> ProcessFailureOperation:
+    if state.supported_aggregate_path:
+        return "structured_field_values"
+    if state.supported_exact_path:
+        return "exact_fetch"
+    if state.supported_hybrid_comparison_path or state.supported_bounded_exhaustive_path:
+        return "context_expansion"
+    return "targeted_retrieval"
+
+
+def collect_process_failure_observations(
+    *,
+    state: EvidenceAcquisitionState,
+    dsa_trace: dict[str, Any] | None,
+) -> list[ProcessFailureObservation]:
+    trace = dsa_trace if isinstance(dsa_trace, dict) else {}
+    operation = _process_failure_operation(state)
+    payloads: list[dict[str, Any]] = []
+    diagnostic = trace.get("source_access_diagnostic")
+    trusted_service_diagnostic = False
+    if isinstance(diagnostic, dict):
+        service_error_code = trace.get("service_error_code")
+        payload: dict[str, Any] = {
+            "component": diagnostic.get("component"),
+            "operation": operation,
+            "stage": diagnostic.get("stage"),
+            "category": diagnostic.get("category"),
+        }
+        if isinstance(service_error_code, str) and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}",
+            service_error_code,
+        ):
+            payload["service_error_code"] = service_error_code
+        if "upstream_status_code" in diagnostic:
+            payload["upstream_status_code"] = diagnostic.get(
+                "upstream_status_code"
+            )
+        try:
+            ProcessFailureObservation.model_validate(
+                {"fact_id": "fact_1", **payload}
+            )
+        except ValidationError:
+            pass
+        else:
+            payloads.append(payload)
+            trusted_service_diagnostic = True
+
+    service_http_status = trace.get("service_http_status")
+    if (
+        not trusted_service_diagnostic
+        and isinstance(service_http_status, int)
+        and not isinstance(service_http_status, bool)
+        and 100 <= service_http_status <= 599
+    ):
+        payloads.append(
+            {
+                "component": "chat-orchestrator",
+                "operation": operation,
+                "stage": "source_access",
+                "category": "http_status",
+                "upstream_status_code": service_http_status,
+            }
+        )
+    elif not trusted_service_diagnostic and (
+        trace.get("reason") in {"timeout", "http_failure", "unexpected_failure"}
+        or trace.get("error_code") in {"timeout", "http_error", "unexpected_error"}
+    ):
+        if trace.get("reason") == "timeout" or trace.get("error_code") == "timeout":
+            category = "timeout"
+        else:
+            category = "transport_failure"
+        payloads.append(
+            {
+                "component": "chat-orchestrator",
+                "operation": operation,
+                "stage": "source_access",
+                "category": category,
+            }
+        )
+
+    aggregate_execution = state.aggregate_execution or {}
+    exact_truncated = any(
+        attempt.get("outcome") == "truncated"
+        for attempt in (state.exact_attempts or [])
+    )
+    expansion_truncated = any(
+        attempt.get("outcome") == "truncated"
+        for attempt in (state.expansion_attempts or [])
+    )
+    targeted_truncated = bool(
+        state.supported_targeted_path
+        and (trace.get("budget_truncated") or trace.get("candidate_truncated"))
+    )
+    if (
+        targeted_truncated
+        or exact_truncated
+        or expansion_truncated
+        or aggregate_execution.get("outcome") == "truncated"
+    ):
+        payloads.append(
+            {
+                "component": "chat-orchestrator",
+                "operation": operation,
+                "stage": "acquisition",
+                "category": "retrieval_limit",
+            }
+        )
+    invalid_count = aggregate_execution.get("invalid_numeric_count")
+    if (
+        aggregate_execution.get("numeric_validation_failed") is True
+        and isinstance(invalid_count, int)
+        and not isinstance(invalid_count, bool)
+        and 0 <= invalid_count <= 1000
+    ):
+        payloads.append(
+            {
+                "component": "chat-orchestrator",
+                "operation": operation,
+                "stage": "validation",
+                "category": "invalid_value",
+                "invalid_value_count": invalid_count,
+            }
+        )
+    observations = ProcessFailureObservations.model_validate(
+        {
+            "facts": [
+                {"fact_id": f"fact_{index}", **payload}
+                for index, payload in enumerate(payloads[:8], start=1)
+            ]
+        }
+    ).facts if payloads else []
+    state.process_failure_observations = observations
+    state.diagnostic_trace.update(
+        {
+            "observation_count": len(observations),
+            "observation_categories": sorted(
+                {item.category for item in observations}
+            ),
+        }
+    )
+    return observations
+
+
+def process_failure_diagnosis_eligible(state: EvidenceAcquisitionState | None) -> bool:
+    if (
+        state is None
+        or state.follow_existing_path
+        or not state.supported_governed_path
+        or not state.process_failure_observations
+    ):
+        return False
+    if state.supported_aggregate_path:
+        return bool(
+            isinstance(state.aggregate_execution, dict)
+            and state.aggregate_execution.get("outcome") != "satisfied"
+            and state.aggregate_result is None
+        )
+    return bool(
+        state.sufficiency is not None
+        and state.sufficiency.sufficiency_status in {"insufficient", "unknown"}
+    )
+
+
+def _render_process_observation(observation: ProcessFailureObservation) -> str:
+    if observation.category == "http_status":
+        if observation.component == "data-source-aggregator":
+            return (
+                "The source lookup failed with an upstream HTTP "
+                f"{observation.upstream_status_code}."
+            )
+        return (
+            "The source service request failed with HTTP "
+            f"{observation.upstream_status_code}."
+        )
+    if observation.category == "timeout":
+        return "The source lookup timed out before it completed."
+    if observation.category == "transport_failure":
+        return "The source service request failed before it completed."
+    if observation.category == "dependency_failure":
+        return "The source lookup failed at its dependency boundary."
+    if observation.category == "retrieval_limit":
+        return (
+            "I hit the retrieval limit before I could get the complete data "
+            "needed for the request."
+        )
+    if observation.category == "invalid_value":
+        count = observation.invalid_value_count or 0
+        noun = "value" if count == 1 else "values"
+        return (
+            f"I received the records, but {count} {noun} failed the required "
+            "numeric validation."
+        )
+    raise ValueError("unsupported_process_failure_category")
+
+
+def render_process_failure_response(
+    *,
+    observations: list[ProcessFailureObservation],
+    advisory: DiagnosticAdvisory | None,
+) -> str:
+    observed = " ".join(_render_process_observation(item) for item in observations)
+    if advisory is None or advisory.diagnosis_status == "no_useful_hypothesis":
+        return observed
+    if advisory.diagnosis_status == "ambiguous":
+        hypothesis_text = "; or ".join(
+            item.text.rstrip(".?!") for item in advisory.hypotheses
+        )
+        inference = (
+            f"Possible explanations are: {hypothesis_text}. I can't tell which "
+            "explanation applies from the available failure information."
+        )
+    else:
+        hypothesis_text = "; or ".join(
+            item.text.rstrip(".?!") for item in advisory.hypotheses
+        )
+        inference = f"My best guess is: {hypothesis_text}."
+    next_step = advisory.next_step.text.rstrip(".?!")
+    suggestion = f"A useful next step would be: {next_step}."
+    return f"{observed} {inference} {suggestion}"
+
+
 def _advisory_provider_allowed(state: EvidenceAcquisitionState | None) -> bool:
     return bool(
         state is not None
@@ -5388,6 +5987,11 @@ def enforce_final_answer(
     state: EvidenceAcquisitionState | None,
 ) -> str:
     if state is None or state.follow_existing_path:
+        return answer
+    if (
+        state.diagnostic_rendered_answer is not None
+        and answer == state.diagnostic_rendered_answer
+    ):
         return answer
     if answer.startswith(HELPFUL_GROUNDED_RECOVERY_RESPONSE):
         return answer
@@ -6595,6 +7199,23 @@ def build_manifest_trace(
             ),
         },
     }
+    if state.diagnostic_trace.get("observation_count", 0) > 0:
+        manifest["diagnostic"] = {
+            key: state.diagnostic_trace.get(key)
+            for key in (
+                "eligible",
+                "attempted",
+                "call_count",
+                "status",
+                "failure_reason",
+                "observation_count",
+                "observation_categories",
+                "diagnosis_status",
+                "confidence",
+                "hypothesis_count",
+                "render_mode",
+            )
+        }
     if aggregate_path and isinstance(state.aggregate_execution, dict):
         manifest["acquisition"]["aggregate_execution"] = {
             key: state.aggregate_execution.get(key)
