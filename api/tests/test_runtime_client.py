@@ -239,6 +239,120 @@ async def test_runtime_client_lifecycle_is_explicit_idempotent_and_final():
 
 
 @pytest.mark.asyncio
+async def test_claim_support_client_posts_split_authority_and_validates_response():
+    authority = {
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "surface": "web",
+        "runtime_session_id": "session-1",
+        "runtime_turn_id": "turn-1",
+        "evidence_references": [],
+        "complete_declared_scope_required": False,
+        "complete_declared_scope_established": None,
+        "material_acquisition_limited": False,
+        "privacy_policy_allows_claim": True,
+        "consequence_policy_allows_claim": True,
+        "executed_derivations": [],
+    }
+    proposal = {
+        "proposed_claim": "A bounded claim.",
+        "supporting_evidence_ref_ids": [],
+        "counterevidence_ref_ids": [],
+        "material_exclusions": [],
+        "executed_derivation_ref_ids": [],
+    }
+    response = {
+        "request_id": "request-1",
+        **{key: authority[key] for key in (
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "runtime_session_id",
+            "runtime_turn_id",
+        )},
+        "result": {
+            "claim_id": "claim-1",
+            "claim_digest": "sha256:" + "1" * 64,
+            "calibration_status": "unsupported",
+            "conclusion_disposition": "withheld",
+            "qualification_required": True,
+            "limitation_codes": ["no_supporting_evidence"],
+            "validated_supporting_evidence_ref_ids": [],
+            "validated_counterevidence_ref_ids": [],
+            "validated_material_exclusions": [],
+            "validated_executed_derivation_ref_ids": [],
+            "user_safe_summary": "The claim was withheld.",
+        },
+    }
+    fake = _FakeAsyncClient([response])
+    client = RuntimeClient(
+        "http://runtime.local",
+        "runtime-key",
+        client_factory=_ClientFactory([fake]),
+    )
+    await client.open()
+
+    validated = await client.evaluate_claim_support(
+        request_id="request-1",
+        authority_context=authority,
+        proposal=proposal,
+    )
+
+    assert validated == response
+    assert fake.posts == [
+        (
+            "/v1/runtime/claim-support/evaluate",
+            {
+                "request_id": "request-1",
+                "authority_context": authority,
+                "proposal": proposal,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claim_support_client_rejects_extra_or_mismatched_response_fields():
+    authority = {
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "surface": "web",
+        "runtime_session_id": "session-1",
+        "runtime_turn_id": "turn-1",
+    }
+    invalid = {
+        "request_id": "request-1",
+        **authority,
+        "result": {
+            "claim_id": "claim-1",
+            "claim_digest": "sha256:" + "1" * 64,
+            "calibration_status": "supported",
+            "conclusion_disposition": "allowed",
+            "qualification_required": False,
+            "limitation_codes": [],
+            "validated_supporting_evidence_ref_ids": [],
+            "validated_counterevidence_ref_ids": [],
+            "validated_material_exclusions": [],
+            "validated_executed_derivation_ref_ids": [],
+            "user_safe_summary": "Bounded.",
+            "provider_confidence": "high",
+        },
+    }
+    client = RuntimeClient(
+        "http://runtime.local",
+        "runtime-key",
+        client_factory=_ClientFactory([_FakeAsyncClient([invalid])]),
+    )
+    await client.open()
+
+    with pytest.raises(RuntimeError, match="claim_support_response_invalid"):
+        await client.evaluate_claim_support(
+            request_id="request-1",
+            authority_context=authority,
+            proposal={"proposed_claim": "Bounded."},
+        )
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("api_key", "expected_headers"),
     [

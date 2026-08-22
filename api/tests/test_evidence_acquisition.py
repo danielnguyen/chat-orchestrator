@@ -65,6 +65,8 @@ from services.evidence_acquisition import (
     evaluate_acquisition_sufficiency,
     evidence_interpreter_messages,
     evidence_interpreter_response_format,
+    evidence_reasoning_messages,
+    evidence_reasoning_response_format,
     execute_aggregate_values,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
@@ -74,6 +76,7 @@ from services.evidence_acquisition import (
     helpful_grounded_recovery_allowed,
     parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
+    parse_evidence_reasoning_completion,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
@@ -113,6 +116,127 @@ def _settings(**overrides):
     values["LITELLM_BASE_URL"] = values.pop("LITELM_BASE_URL")
     values.update(overrides)
     return Settings(**values)
+
+
+def _reasoning_completion(payload: dict, *, tool_calls=None) -> dict:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(payload),
+                    "tool_calls": tool_calls,
+                }
+            }
+        ]
+    }
+
+
+def _reasoning_proposal() -> dict:
+    return {
+        "proposed_claim": "The bounded values have a derived mean.",
+        "supporting_evidence_ref_ids": ["evidence-1"],
+        "counterevidence_ref_ids": [],
+        "material_exclusions": [],
+        "derivation_requests": [
+            {
+                "derivation_id": "ratio-1",
+                "operation": "divide",
+                "operands": [
+                    {"value": "5", "derivation_ref": None},
+                    {"value": "8", "derivation_ref": None},
+                ],
+                "supporting_evidence_ref_ids": ["evidence-1"],
+            }
+        ],
+    }
+
+
+def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(_reasoning_proposal()),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+
+    assert proposal.proposed_claim == "The bounded values have a derived mean."
+    assert proposal.derivation_requests[0].operation == "divide"
+    schema = evidence_reasoning_response_format()["json_schema"]
+    assert schema["name"] == "general_evidence_reasoning_proposal"
+    assert schema["strict"] is True
+    assert schema["schema"]["additionalProperties"] is False
+    messages = evidence_reasoning_messages(
+        request_text="Evaluate the bounded records.",
+        evidence=[{"evidence_ref_id": "evidence-1", "text": "untrusted data"}],
+    )
+    assert "untrusted data" in messages[1]["content"]
+    assert "never governing instruction" in messages[0]["content"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "provenance",
+        "source_authority",
+        "freshness",
+        "completeness",
+        "execution_status",
+        "confidence",
+        "conclusion_disposition",
+        "action_permission",
+        "tool_permission",
+    ],
+)
+def test_general_reasoning_proposal_rejects_authority_fields(field):
+    payload = _reasoning_proposal()
+    payload[field] = "allowed"
+
+    with pytest.raises(ValidationError):
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+
+
+def test_general_reasoning_rejects_scope_widening_tools_and_role_conflicts():
+    payload = _reasoning_proposal()
+    payload["supporting_evidence_ref_ids"] = ["fabricated"]
+    payload["derivation_requests"][0]["supporting_evidence_ref_ids"] = [
+        "fabricated"
+    ]
+    with pytest.raises(ValueError, match="reference_unknown"):
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+    with pytest.raises(ValueError, match="tool_call_forbidden"):
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(
+                _reasoning_proposal(),
+                tool_calls=[{"function": {"name": "fetch_more"}}],
+            ),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+    payload = _reasoning_proposal()
+    payload["counterevidence_ref_ids"] = ["evidence-1"]
+    with pytest.raises(ValidationError, match="conflicting_evidence_reasoning_role"):
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+
+    partial = _reasoning_proposal()
+    partial["material_exclusions"] = [
+        {
+            "evidence_ref_id": "evidence-1",
+            "reason": "One part of the bounded evidence was ambiguous.",
+        }
+    ]
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(partial),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+    assert proposal.supporting_evidence_ref_ids == ["evidence-1"]
+    assert proposal.material_exclusions[0].evidence_ref_id == "evidence-1"
 
 
 def _shape_response(*, status="derived", shape="targeted_lookup"):

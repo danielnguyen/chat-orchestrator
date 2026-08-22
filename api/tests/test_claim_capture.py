@@ -13,6 +13,8 @@ from services.claim_capture import (
     claim_record_payload,
     finish_claim_record_persistence,
     prepare_claim_capture,
+    shadow_claim_record_payload,
+    shadow_claim_record_response_valid,
 )
 from settings import Settings
 
@@ -48,6 +50,21 @@ def test_claim_capture_is_disabled_by_default_and_needs_runtime_configuration():
         COGNITIVE_RUNTIME_BASE_URL="http://runtime",
     )
     assert configured.claim_record_capture_enabled is True
+
+
+def test_general_evidence_reasoning_is_default_off_and_requires_governed_dependencies():
+    assert _settings().general_evidence_reasoning_enabled is False
+    with pytest.raises(ValueError, match="requires evidence acquisition"):
+        _settings(GENERAL_EVIDENCE_REASONING_ENABLED=True)
+    configured = _settings(
+        GENERAL_EVIDENCE_REASONING_ENABLED=True,
+        CLAIM_RECORD_CAPTURE_ENABLED=True,
+        EVIDENCE_ACQUISITION_ENABLED=True,
+        COGNITIVE_RUNTIME_BASE_URL="http://runtime",
+        COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=True,
+        DSA_ENABLED=True,
+    )
+    assert configured.general_evidence_reasoning_enabled is True
 
 
 def _public_source(*, ref_id: str = "derived-text-1"):
@@ -88,6 +105,142 @@ def _prepare(**overrides):
 
 def _digest(anchor: str) -> str:
     return f"sha256:{hashlib.sha256(anchor.encode()).hexdigest()}"
+
+
+def _shadow_result() -> dict:
+    claim = "The bounded values have a derived mean."
+    digest = _digest(claim)
+    return {
+        "proposal": {
+            "proposed_claim": claim,
+            "supporting_evidence_ref_ids": ["evidence-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "derivation_requests": [],
+        },
+        "executions": [
+            {
+                "derivation_id": "mean-1",
+                "operation": "mean",
+                "canonical_inputs": ["0.5", "0.75"],
+                "canonical_result": "0.625",
+                "execution_digest": "sha256:" + "2" * 64,
+                "executor_version": "bounded-decimal-v1",
+                "supporting_evidence_ref_ids": ["evidence-1"],
+                "input_basis": "model_interpreted",
+            }
+        ],
+        "authority_context": {
+            "evidence_references": [
+                {
+                    "ref_id": "evidence-1",
+                    "source_authority": "established",
+                }
+            ],
+            "complete_declared_scope_required": False,
+            "complete_declared_scope_established": None,
+            "material_acquisition_limited": False,
+        },
+        "cr_result": {
+            "claim_id": "claim-shadow-1",
+            "claim_digest": digest,
+            "calibration_status": "limited",
+            "conclusion_disposition": "qualified",
+            "qualification_required": True,
+            "limitation_codes": ["interpretation_dependent_derivation"],
+            "validated_supporting_evidence_ref_ids": ["evidence-1"],
+            "validated_counterevidence_ref_ids": [],
+            "validated_material_exclusions": [],
+            "validated_executed_derivation_ref_ids": ["mean-1"],
+            "user_safe_summary": "The claim requires qualification.",
+        },
+    }
+
+
+def test_shadow_claim_payload_is_v2_unpresented_bounded_and_interpretation_safe():
+    payload = shadow_claim_record_payload(
+        shadow_result=_shadow_result(),
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        assistant_message_id="message-1",
+        surface="desktop_private",
+        runtime_session_id="session-1",
+        runtime_turn_id="turn-1",
+        acquisition_manifest_id="manifest-1",
+    )
+
+    assert payload is not None
+    assert payload["schema_version"] == "claim-record.v2"
+    assert payload["presented_to_user"] is False
+    assert payload["support"]["executed_derivations"][0]["input_basis"] == (
+        "model_interpreted"
+    )
+    assert payload["support"]["conclusion_disposition"] == "qualified"
+    compatibility = payload["calibration_result"]
+    assert compatibility["claim_class"] == "runtime_inference"
+    assert compatibility["confidence"] == "unknown"
+    assert compatibility["strongest_authority"] == "unknown"
+    assert compatibility["freshness_summary"] == "unknown"
+    assert compatibility["uncertainty_disclosure_required"] is True
+    assert compatibility["validated_evidence_references"] == [
+        {
+            "ref_type": "external_source",
+            "ref_id": "evidence-1",
+            "owner_id": "owner",
+            "conversation_id": "conversation-1",
+            "support_kind": "contextual",
+            "authority": "unknown",
+            "freshness_state": "unknown_freshness",
+        }
+    ]
+    assert "derivation_requests" not in payload["support"]
+    serialized = str(payload)
+    assert "PRIVATE-SOURCE-CONTENT" not in serialized
+    assert "scratchpad" not in serialized
+
+
+def test_shadow_claim_response_validation_is_exact_and_v1_payload_unchanged():
+    payload = shadow_claim_record_payload(
+        shadow_result=_shadow_result(),
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        assistant_message_id="message-1",
+        surface="desktop_private",
+        runtime_session_id="session-1",
+        runtime_turn_id="turn-1",
+        acquisition_manifest_id=None,
+    )
+    assert payload is not None
+    record = {
+        "claim_id": payload["calibration_result"]["claim_id"],
+        "schema_version": "claim-record.v2",
+        "owner_id": payload["owner_id"],
+        "conversation_id": payload["conversation_id"],
+        "request_id": payload["request_id"],
+        "assistant_message_id": payload["assistant_message_id"],
+        "surface": payload["surface"],
+        "runtime_session_id": payload["runtime_session_id"],
+        "runtime_turn_id": payload["runtime_turn_id"],
+        "presented_to_user": False,
+        **{
+            key: value
+            for key, value in payload["calibration_result"].items()
+            if key != "claim_id"
+        },
+        "support": payload["support"],
+        "created_at": "2026-08-22T12:00:00+00:00",
+    }
+    assert shadow_claim_record_response_valid(
+        expected_payload=payload,
+        response={"created": True, "record": record},
+    )
+    record["support"] = {**record["support"], "qualification_required": False}
+    assert not shadow_claim_record_response_valid(
+        expected_payload=payload,
+        response={"created": False, "record": record},
+    )
 
 
 def _manifest(state, *, final_answer=None, **overrides):

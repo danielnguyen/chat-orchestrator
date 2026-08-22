@@ -47,7 +47,9 @@ git -C "$ROOT" merge-base --is-ancestor "$CO_COMMIT" HEAD || {
 
 docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
 
-COMPOSED_SMOKE_TMP="$(mktemp -d /tmp/chat-orchestrator-composed-smoke.XXXXXX)"
+composed_tmp_root="${COMPOSED_SMOKE_TMP_ROOT:-/tmp}"
+mkdir -p "$composed_tmp_root"
+COMPOSED_SMOKE_TMP="$(mktemp -d "$composed_tmp_root/chat-orchestrator-composed-smoke.XXXXXX")"
 export COMPOSED_SMOKE_TMP
 evidence_prepare_fixture_config
 
@@ -73,7 +75,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker compose -f "$COMPOSE" up -d --build --wait
+compose_up_args=(-d --wait)
+if [ "${COMPOSED_SKIP_BUILD:-}" != "1" ]; then
+  compose_up_args+=(--build)
+fi
+docker compose -f "$COMPOSE" up "${compose_up_args[@]}"
+
+if [ "${COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED:-}" = "1" ]; then
+  docker compose -f "$COMPOSE" stop orchestrator >/dev/null
+  docker compose -f "$COMPOSE" run -d --no-deps --service-ports \
+    -e GENERAL_EVIDENCE_REASONING_ENABLED=true \
+    -e GENERAL_EVIDENCE_REASONING_TIMEOUT_MS=5000 \
+    orchestrator >/dev/null
+  for attempt in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:14361/healthz" >/dev/null 2>&1; then
+      break
+    fi
+    if [ "$attempt" -eq 60 ]; then
+      echo "feature-enabled orchestrator did not become ready" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+fi
 
 provider_post() {
   local body

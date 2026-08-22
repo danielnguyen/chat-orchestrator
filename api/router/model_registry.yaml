@@ -47,3 +47,6 @@ logical_routes:
   diagnostic_advisory:
     model: gpt-5-mini
     provider: cloud
+  evidence_reasoning:
+    model: gpt-5-mini
+    provider: cloud

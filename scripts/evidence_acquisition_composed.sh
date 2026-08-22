@@ -732,6 +732,31 @@ assert_diagnostic_advisory_calls() {
   ' <<<"$provider_calls" >/dev/null
 }
 
+assert_general_evidence_reasoning_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "general_evidence_reasoning_proposal"
+    )] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .tool_count == 0
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required == [
+        "proposed_claim",
+        "supporting_evidence_ref_ids",
+        "counterevidence_ref_ids",
+        "material_exclusions",
+        "derivation_requests"
+      ]
+      and .status == "ok"
+    ))
+  ' <<<"$provider_calls" >/dev/null
+}
+
 assert_history_request_boundaries() {
   local conversation_id="$1" response="$2" expected_resolution="$3"
   local request_id trace provider_calls diagnostics audit
@@ -1394,7 +1419,10 @@ run_evidence_hybrid_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   assert_jq "hybrid.failure.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 502"))
+    and (
+      (.answer | contains("source lookup failed with an upstream HTTP 503"))
+      or (.answer | contains("source service request failed with HTTP 502"))
+    )
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   '
@@ -1606,7 +1634,10 @@ run_evidence_limitation_and_failure_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   assert_jq "failure.unavailable.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 502"))
+    and (
+      (.answer | contains("source lookup failed with an upstream HTTP 503"))
+      or (.answer | contains("source service request failed with HTTP 502"))
+    )
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   '
@@ -1685,24 +1716,41 @@ run_evidence_limitation_and_failure_scenarios() {
   answer="$(jq -r '.answer' <<<"$response")"
   jq -e '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 500"))
+    and (
+      (.answer | contains("source lookup failed at its dependency boundary"))
+      or (.answer | contains("source service request failed with HTTP 500"))
+    )
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
   ' <<<"$response" >/dev/null
   jq -e '
     .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
-    and .diagnostic.observation_categories == ["http_status"]
+    and (
+      .diagnostic.observation_categories == ["dependency_failure"]
+      or .diagnostic.observation_categories == ["http_status"]
+    )
     and .diagnostic.render_mode == "advisory"
   ' <<<"$manifest" >/dev/null
   assert_provider_free_trace "$trace"
   assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_dsa_operation_counts "$audit" 0 0 0
-  jq -e '
-    .retrieval.prompt_assembly.dsa.called == true
-    and .retrieval.prompt_assembly.dsa.status == "error"
-    and .retrieval.prompt_assembly.dsa.error_code == "http_500"
-  ' <<<"$trace" >/dev/null
+  if jq -e '.diagnostic.observation_categories == ["dependency_failure"]' \
+    <<<"$manifest" >/dev/null; then
+    jq -e '
+      .retrieval.prompt_assembly.dsa.called == true
+      and .retrieval.prompt_assembly.dsa.status == "error"
+      and .retrieval.prompt_assembly.dsa.error_code == "source_unavailable"
+      and .retrieval.prompt_assembly.dsa.service_error_code == "source_unavailable"
+      and .retrieval.prompt_assembly.dsa.service_http_status == 502
+    ' <<<"$trace" >/dev/null
+  else
+    jq -e '
+      .retrieval.prompt_assembly.dsa.called == true
+      and .retrieval.prompt_assembly.dsa.status == "error"
+      and .retrieval.prompt_assembly.dsa.error_code == "http_500"
+    ' <<<"$trace" >/dev/null
+  fi
   jq -e '
     ([.calls[] | select(
       .source == "targeted-sheet" and .operation == "google_values"
@@ -4246,7 +4294,9 @@ run_evidence_scope_reference_scenarios() {
   serialized="$(jq -c . <<<"$response")$(jq -c '
     del(
       .prompt.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
-      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition
+      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
+      .prompt.general_evidence_reasoning.cr_conclusion_disposition,
+      .retrieval.prompt_assembly.general_evidence_reasoning.cr_conclusion_disposition
     )
   ' <<<"$trace")"
   case "$serialized" in
@@ -4265,7 +4315,9 @@ run_evidence_scope_reference_scenarios() {
   serialized="$(jq -c . <<<"$history")$(jq -c '
     del(
       .prompt.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
-      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition
+      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
+      .prompt.general_evidence_reasoning.cr_conclusion_disposition,
+      .retrieval.prompt_assembly.general_evidence_reasoning.cr_conclusion_disposition
     )
   ' <<<"$history_trace")"
   case "$serialized" in
@@ -6023,7 +6075,10 @@ run_step13_diagnostic_scenarios() {
 
   assert_jq "step13.http.response" "$response" '
     .status == "degraded"
-    and (.answer | contains("source service request failed with HTTP 500"))
+    and (
+      (.answer | contains("source lookup failed at its dependency boundary"))
+      or (.answer | contains("source service request failed with HTTP 500"))
+    )
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
     and (.answer | contains("Median for") | not)
@@ -6036,7 +6091,10 @@ run_step13_diagnostic_scenarios() {
     and .diagnostic.call_count == 1
     and .diagnostic.status == "accepted"
     and .diagnostic.observation_count == 1
-    and .diagnostic.observation_categories == ["http_status"]
+    and (
+      .diagnostic.observation_categories == ["dependency_failure"]
+      or .diagnostic.observation_categories == ["http_status"]
+    )
     and .diagnostic.diagnosis_status == "hypothesis_available"
     and .diagnostic.confidence == "moderate"
     and .diagnostic.hypothesis_count == 1
@@ -6046,31 +6104,57 @@ run_step13_diagnostic_scenarios() {
   '
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_diagnostic_advisory_calls "$provider_calls" 1
-  assert_jq "step13.http.provider_accounting" "$provider_calls" '
-    ([.calls[] | select(.kind == "chat")] | length) == 1
-    and ([.calls[] | select(.kind == "chat")
-      | .normalized_messages[]
-      | select(.content | contains("trusted_process_facts"))] | length) == 1
-    and ([.calls[] | select(.kind == "chat")
-      | .normalized_messages[]
-      | select(.content | contains("chat-orchestrator"))] | length) == 1
-    and ([.calls[] | select(.kind == "chat")
-      | .normalized_messages[]
-      | select(.content | contains("500"))] | length) == 1
-    and ([.calls[] | select(.kind == "chat")
-      | .normalized_messages[]
-      | select(.content | contains("source_unavailable") or contains("503"))]
-      | length) == 0
-    and ([.calls[] | select(.kind == "chat")
-      | .normalized_messages[]
-      | select(.content | contains("measurements"))] | length) == 0
-  '
+  if jq -e '.diagnostic.observation_categories == ["dependency_failure"]' \
+    <<<"$manifest" >/dev/null; then
+    assert_jq "step13.http.provider_accounting" "$provider_calls" '
+      ([.calls[] | select(.kind == "chat")] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("trusted_process_facts"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("data-source-aggregator"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("dependency_failure"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("source_unavailable"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("500") or contains("503"))] | length) == 0
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("measurements"))] | length) == 0
+    '
+    assert_dsa_operation_counts "$audit" 0 1 0
+  else
+    assert_jq "step13.http.provider_accounting" "$provider_calls" '
+      ([.calls[] | select(.kind == "chat")] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("trusted_process_facts"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("chat-orchestrator"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("500"))] | length) == 1
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("source_unavailable") or contains("503"))]
+        | length) == 0
+      and ([.calls[] | select(.kind == "chat")
+        | .normalized_messages[]
+        | select(.content | contains("measurements"))] | length) == 0
+    '
+    assert_dsa_operation_counts "$audit" 0 0 0
+  fi
   assert_jq "step13.http.fixture" "$fixture_calls" '
     ([.calls[] | select(
       .source == "measurement-sheet" and .operation == "google_values"
     )] | length) == 1
   '
-  assert_dsa_operation_counts "$audit" 0 0 0
   case "$serialized" in
     *"The upstream dependency may be unavailable"*|*"Consider trying the lookup again later"*|*"source unavailable"*|*"http://source-fixture"*)
       echo "Step-13 HTTP trace exposed advisory or source-private material" >&2
@@ -6160,7 +6244,236 @@ run_step13_diagnostic_scenarios() {
       ;;
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Step-13 diagnostics: composed_dsa_http=500 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+  echo "Step-13 diagnostics: typed_or_transport_failure=1 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
+}
+
+run_general_evidence_reasoning_shadow_scenario() {
+  local owner client conversation_id question external response request_id answer
+  local trace manifest provider_calls audit diagnostics claim_records proposal history
+  local source_ref="google_sheets:metrics_archive:Measurements!A2:C6"
+  local evidence_ref_id
+  evidence_ref_id="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
+  owner="owner-general-reasoning-shadow"
+  client="client-general-reasoning-shadow"
+  question="What is the mean Entry in the Configured Metrics Archive?"
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_semantic_interpretation "$(jq -nc \
+    --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"metrics_archive",
+      expected_content_fields:["Entry","Reading"],
+      interpretation_status:"resolved",
+      operation_hint:"aggregate",
+      candidate_source_ids:["metrics_archive"],
+      aggregate_function:"mean",
+      aggregate_field_name:"Entry"
+    }')"
+  queue_diagnostic_advisory \
+    "A formatting or data-entry issue may be present." \
+    "Consider checking the entries that require numeric input."
+  proposal="$(jq -nc --arg ref "$evidence_ref_id" '
+    {
+      proposed_claim:"A mean was mechanically computed over model-interpreted operands.",
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[{
+        evidence_ref_id:$ref,
+        reason:"One entry was ambiguous and excluded."
+      }],
+      derivation_requests:[
+        {
+          derivation_id:"ratio_1",
+          operation:"divide",
+          operands:[
+            {value:"1",derivation_ref:null},
+            {value:"2",derivation_ref:null}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        },
+        {
+          derivation_id:"ratio_2",
+          operation:"divide",
+          operands:[
+            {value:"3",derivation_ref:null},
+            {value:"4",derivation_ref:null}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        },
+        {
+          derivation_id:"ratio_3",
+          operation:"divide",
+          operands:[
+            {value:"5",derivation_ref:null},
+            {value:"8",derivation_ref:null}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        },
+        {
+          derivation_id:"mean_1",
+          operation:"mean",
+          operands:[
+            {value:null,derivation_ref:"ratio_1"},
+            {value:null,derivation_ref:"ratio_2"},
+            {value:null,derivation_ref:"ratio_3"}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        }
+      ]
+    }')"
+  queue_provider_answer "$proposal"
+
+  conversation_id="$(resolve_conversation "$owner" "$client" "general-reasoning-shadow")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  claim_records="$(list_claim_records "$owner" "$conversation_id")"
+
+  if ! jq -e '.status == "degraded"' <<<"$response" >/dev/null; then
+    jq -c '{status,selected_model,sources_count:(.sources | length)}' \
+      <<<"$response" >&2
+    jq -c '{status,error,model_call,prompt:{general_evidence_reasoning:.prompt.general_evidence_reasoning,evidence_provider_mode:.prompt.evidence_provider_mode}}' \
+      <<<"$trace" >&2
+    jq -c '{status,shape:.shape,plan:.plan,inventory:.inventory,acquisition_outcome:.acquisition.dsa_outcome,sufficiency_status:.sufficiency.status,next_step:.next_steps.selections[-1].selected_next_step,diagnostic:.diagnostic}' \
+      <<<"$manifest" >&2
+  fi
+  assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
+  if ! assert_jq "general_reasoning.response.boundary" "$response" '
+    (.answer | contains("5 values failed the required numeric validation"))
+    and (.answer | contains("My best guess is"))
+    and (.answer | contains("A useful next step would be"))
+  '; then
+    jq -c '{
+      status,
+      answer_length:(.answer | length),
+      has_invalid_observation:(.answer | contains("5 values failed the required numeric validation")),
+      has_records:(.answer | contains("records")),
+      has_numeric:(.answer | contains("numeric")),
+      has_validation:(.answer | contains("validation")),
+      has_modal_inference:(.answer | contains("My best guess is")),
+      has_suggested_next_step:(.answer | contains("A useful next step would be"))
+    }' <<<"$response" >&2
+    return 1
+  fi
+  assert_jq "general_reasoning.response.shadow_absent" "$response" '
+    (.answer | contains("mechanically computed") | not)
+    and (.answer | contains("Mean for") | not)
+    and .sources == []
+  '
+  assert_jq "general_reasoning.response.action" "$response" '.pending_action == null'
+  if ! jq -e '
+    .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+  ' <<<"$trace" >/dev/null; then
+    jq -c '.prompt.general_evidence_reasoning' <<<"$trace" >&2
+  fi
+  assert_jq "general_reasoning.trace" "$trace" '
+    .prompt.general_evidence_reasoning.enabled == true
+    and .prompt.general_evidence_reasoning.eligibility_status == "eligible"
+    and .prompt.general_evidence_reasoning.attempted == true
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.validation_status == "accepted"
+    and .prompt.general_evidence_reasoning.derivation_request_count == 4
+    and .prompt.general_evidence_reasoning.derivation_executed_count == 4
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.qualification_required == true
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and (.prompt.general_evidence_reasoning.claim_digest | test("^sha256:[0-9a-f]{64}$"))
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+  '
+  assert_jq "general_reasoning.manifest" "$manifest" '
+    .sufficiency.status == "insufficient"
+    and .next_steps.additional_acquisition_count == 0
+    and .diagnostic.attempted == true
+    and .diagnostic.call_count == 1
+    and .diagnostic.observation_categories == ["invalid_value"]
+  '
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "general_reasoning.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 2
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "process_failure_diagnostic_advisory"
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .tool_count == 0
+    )] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat" and .response_schema_name == "grounded_evidence_response"
+    )] | length) == 0
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "general_evidence_reasoning_proposal"
+      and ([.normalized_messages[].content
+        | select(contains("structured_field_values")
+          and contains("alpha") and contains("epsilon"))] | length) == 1
+    )] | length) == 1
+    and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 0 1 0
+  assert_jq "general_reasoning.runtime" "$diagnostics" '
+      ([.events[] | select(
+        .event_payload_json.request_id == $request_id
+        and .event_type == "claim_support_evaluated"
+      )] | length) == 1
+    ' --arg request_id "$request_id"
+  assert_jq "general_reasoning.claim_record" "$claim_records" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == false
+    and $records[0].support.calibration_status == "limited"
+    and $records[0].support.conclusion_disposition == "qualified"
+    and $records[0].support.qualification_required == true
+    and ($records[0].support.material_exclusions | length) == 1
+    and ($records[0].support.executed_derivations
+      | map(.canonical_result)) == ["0.5","0.75","0.625","0.625"]
+    and ($records[0].support.executed_derivations
+      | all(.input_basis == "model_interpreted"))
+    and $records[0].claim_class == "runtime_inference"
+    and $records[0].confidence == "unknown"
+    and $records[0].strongest_authority == "unknown"
+    and $records[0].freshness_summary == "unknown"
+    and ($records[0].validated_evidence_references
+      | all(.support_kind == "contextual"
+        and .authority == "unknown"
+        and .freshness_state == "unknown_freshness"))
+  '
+  case "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" in
+    *alpha*|*beta*|*gamma*|*delta*|*epsilon*|*"mechanically computed"*|*"provider prompt"*|*scratchpad*)
+      echo "General evidence reasoning trace exposed semantic/source prose" >&2
+      return 1
+      ;;
+  esac
+  history="$(curl -fsS \
+    -X POST "http://127.0.0.1:14321/v1/internal/immediate-history/resolve" \
+    -H "X-API-Key: smoke-memory-key" \
+    -H "X-Request-ID: general-reasoning-shadow-history" \
+    -H "Content-Type: application/json" \
+    -d "{\"schema_version\":\"immediate-history-resolution.v2\",\"request_id\":\"general-reasoning-shadow-history\",\"owner_id\":\"$owner\",\"conversation_id\":\"$conversation_id\",\"surface\":\"chat\",\"explanation_kind\":\"support\"}")"
+  assert_jq "general_reasoning.history" "$history" '
+    .resolution_status == "no_record"
+    and .match_count == 0
+    and .reason_code == "direct_record_absent_lineage_absent"
+    and .record == null
+  '
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
 }
 
 run_evidence_acquisition_composed_suite() {
@@ -6195,6 +6508,10 @@ run_evidence_acquisition_composed_suite() {
     step13-diagnostic)
       run_step13_diagnostic_scenarios
       echo "Evidence acquisition composed smoke passed: scenarios=step13-diagnostic"
+      ;;
+    general-reasoning-shadow)
+      run_general_evidence_reasoning_shadow_scenario
+      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-shadow"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario
