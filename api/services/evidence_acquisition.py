@@ -2673,9 +2673,13 @@ def evidence_reasoning_messages(
                 "Do not widen source scope, call tools, authorize actions, or decide "
                 "provenance, authority, freshness, completeness, confidence, or "
                 "conclusion permission. Propose one shallow claim with exact supplied "
-                "evidence_ref_id values. Request only bounded divide or mean arithmetic "
-                "when useful; do not claim it executed. Return exactly the schema object "
-                "without reasoning transcripts."
+                "evidence_ref_id values. Write the proposed claim as a direct answer in "
+                "ordinary domain language suitable for a user-visible first paragraph. "
+                "Avoid control-plane, component, and schema terminology unless the user "
+                "asked about those internals, and avoid unsupported certainty when the "
+                "claim depends on interpretation, approximation, exclusion, or ambiguity. "
+                "Request only bounded divide or mean arithmetic when useful; do not claim "
+                "it executed. Return exactly the schema object without reasoning transcripts."
             ),
         },
         {"role": "user", "content": bounded_input},

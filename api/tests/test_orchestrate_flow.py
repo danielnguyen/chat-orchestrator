@@ -71,6 +71,7 @@ from services.orchestrate import (
     _resolve_capability_continuation_policy,
     _run_general_evidence_reasoning,
     _select_capability_claim_refs,
+    _select_claim_support_presentation,
     orchestrate_chat,
 )
 from services.prompt_budget import estimate_messages_tokens
@@ -8092,6 +8093,22 @@ def test_runtime_timeout_setting_is_separate_from_request_timeout(monkeypatch):
     assert settings.cognitive_runtime_restraint_enabled is False
     assert settings.cognitive_runtime_privacy_context_enabled is False
     assert settings.cognitive_runtime_capability_registry_enabled is False
+    assert settings.general_evidence_reasoning_enabled is False
+    assert settings.general_evidence_reasoning_presentation_enabled is False
+
+
+def test_presentation_setting_requires_general_evidence_reasoning(monkeypatch):
+    from pydantic import ValidationError
+    from settings import Settings
+
+    monkeypatch.setenv("ORCH_API_KEY", "orch")
+    monkeypatch.setenv("MEMORY_STORE_BASE_URL", "http://memory")
+    monkeypatch.setenv("MEMORY_STORE_API_KEY", "memory")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm")
+    monkeypatch.setenv("GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="presentation requires general evidence"):
+        Settings()
 
 
 @pytest.mark.asyncio
@@ -16223,12 +16240,22 @@ def test_authority_decision_comparison_is_deterministic_and_privacy_safe():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "semantic_case",
-    ["rational_values", "operational_prose", "unsupported_speculation"],
+    ("semantic_case", "presentation_enabled", "persistence_fails"),
+    [
+        ("rational_values", False, False),
+        ("operational_prose", False, False),
+        ("unsupported_speculation", False, False),
+        ("rational_values", True, False),
+        ("operational_prose", True, False),
+        ("unsupported_speculation", True, False),
+        ("rational_values", True, True),
+    ],
 )
-async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
+async def test_general_evidence_reasoning_activation_across_semantic_cases(
     tmp_path,
     semantic_case,
+    presentation_enabled,
+    persistence_fails,
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -16325,7 +16352,13 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
         ]
     )
     dsa = FakeDSA(response=context_pack, source_response=source_response)
-    memory_store = ClaimCaptureMemoryStore()
+    memory_store = ClaimCaptureMemoryStore(
+        claim_record_error=(
+            RuntimeError("PRIVATE SUPPORT STORAGE FAILURE")
+            if persistence_fails
+            else None
+        )
+    )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(question, external_context_enabled=True),
@@ -16338,6 +16371,7 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
         interaction_governance_enabled=True,
         claim_record_capture_enabled=True,
         general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=presentation_enabled,
         general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
@@ -16345,7 +16379,17 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
         request_id=f"rid-shadow-{semantic_case}",
     )
 
-    assert out["answer"] == _rendered_evidence_answer(safe_excerpt)
+    should_present = presentation_enabled and semantic_case != "unsupported_speculation"
+    if should_present and semantic_case == "rational_values":
+        assert out["answer"] == (
+            f"{proposed_claim}\n\nTreat this as qualified rather than exact because "
+            "some evidence required interpretation."
+        )
+    elif should_present:
+        assert out["answer"] == proposed_claim
+    else:
+        assert out["answer"] == _rendered_evidence_answer(safe_excerpt)
+    assert out["status"] == ("degraded" if persistence_fails else "ok")
     assert out.get("pending_action") is None
     assert len(provider.calls) == 2
     reasoning_call = provider.calls[1]
@@ -16388,7 +16432,7 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
         if call["payload"]["schema_version"] == "claim-record.v2"
     ]
     assert len(v2_calls) == 1
-    assert v2_calls[0]["payload"]["presented_to_user"] is False
+    assert v2_calls[0]["payload"]["presented_to_user"] is should_present
     assert v2_calls[0]["payload"]["support"]["claim_digest"].startswith("sha256:")
     reasoning_traces = [
         call["payload"]["prompt"]["general_evidence_reasoning"]
@@ -16398,8 +16442,25 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
     trace = reasoning_traces[-1]
     assert trace["reasoning_provider_call_count"] == 1
     assert trace["cr_call_count"] == 1
-    assert trace["bms_persistence_status"] == "persisted"
-    assert trace["presented_to_user"] is False
+    assert trace["bms_persistence_status"] == (
+        "failed" if persistence_fails else "persisted"
+    )
+    assert trace["presented_to_user"] is should_present
+    assert trace["presentation"]["enabled"] is presentation_enabled
+    assert trace["presentation"]["status"] == (
+        "presented"
+        if should_present
+        else "disabled"
+        if not presentation_enabled
+        else "ineligible"
+    )
+    visible_v1_calls = [
+        call
+        for call in memory_store.claim_record_calls
+        if call["payload"]["schema_version"] == "claim-record.v1"
+    ]
+    if should_present:
+        assert visible_v1_calls == []
     comparison = trace["decision_comparison"]
     assert comparison["status"] == "compared"
     if semantic_case == "rational_values":
@@ -16428,6 +16489,141 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
         assert prohibited not in serialized_trace
         assert prohibited not in serialized_v2
     assert proposed_claim not in serialized_trace
+
+
+def _presentation_reasoning_result(
+    *,
+    disposition="allowed",
+    qualification_required=False,
+    supporting=True,
+    limitations=None,
+    exclusions=None,
+):
+    claim = "The bounded records support a useful conclusion."
+    return {
+        "proposal": {"proposed_claim": claim},
+        "cr_result": {
+            "conclusion_disposition": disposition,
+            "qualification_required": qualification_required,
+            "validated_supporting_evidence_ref_ids": ["evidence-1"] if supporting else [],
+            "validated_executed_derivation_ref_ids": [],
+            "validated_counterevidence_ref_ids": [],
+            "validated_material_exclusions": exclusions or [],
+            "limitation_codes": limitations or [],
+        },
+        "authority_context": {
+            "privacy_policy_allows_claim": True,
+            "consequence_policy_allows_claim": True,
+            "material_acquisition_limited": False,
+            "evidence_references": [{"ref_id": "evidence-1"}],
+        },
+        "executions": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("enabled", "mutation", "expected_status", "expected_reason"),
+    [
+        (False, None, "disabled", "disabled"),
+        (True, "unavailable", "not_available", "generic_result_unavailable"),
+        (True, "withheld", "ineligible", "claim_support_withheld"),
+        (True, "incoherent", "ineligible", "claim_support_incoherent"),
+        (True, "privacy", "ineligible", "privacy_suppressed"),
+        (True, "consequence", "ineligible", "consequence_disallowed"),
+        (True, "action", "ineligible", "action_related"),
+        (True, "unsupported", "ineligible", "validated_support_absent"),
+    ],
+)
+def test_claim_support_presentation_fails_closed_on_structural_ineligibility(
+    enabled,
+    mutation,
+    expected_status,
+    expected_reason,
+):
+    reasoning = _presentation_reasoning_result()
+    privacy_suppressed = False
+    consequence_allowed = True
+    action_related = False
+    if mutation == "unavailable":
+        reasoning = {}
+    elif mutation == "withheld":
+        reasoning["cr_result"].update(
+            conclusion_disposition="withheld", qualification_required=True
+        )
+    elif mutation == "incoherent":
+        reasoning["cr_result"]["qualification_required"] = True
+    elif mutation == "privacy":
+        privacy_suppressed = True
+    elif mutation == "consequence":
+        consequence_allowed = False
+    elif mutation == "action":
+        action_related = True
+    elif mutation == "unsupported":
+        reasoning["cr_result"]["validated_supporting_evidence_ref_ids"] = []
+
+    trace, answer = _select_claim_support_presentation(
+        enabled=enabled,
+        reasoning_result=reasoning,
+        privacy_suppressed=privacy_suppressed,
+        consequence_policy_allows_claim=consequence_allowed,
+        action_related=action_related,
+    )
+
+    assert answer is None
+    assert trace == {
+        "enabled": enabled,
+        "status": expected_status,
+        "reason_code": expected_reason,
+        "qualification_applied": False,
+    }
+    assert "The bounded records" not in json.dumps(trace)
+
+
+def test_claim_support_qualified_presentation_is_deterministic_and_user_safe():
+    reasoning = _presentation_reasoning_result(
+        disposition="qualified",
+        qualification_required=True,
+        limitations=["interpretation-dependent-derivation", "unknown_freshness"],
+        exclusions=[{"evidence_ref_id": "evidence-1", "reason": "PRIVATE REASON"}],
+    )
+    reasoning["executions"] = [
+        {
+            "derivation_id": "derivation-1",
+            "input_basis": "model_interpreted",
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        }
+    ]
+
+    first = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+    second = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=copy.deepcopy(reasoning),
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert first == second
+    trace, answer = first
+    assert trace == {
+        "enabled": True,
+        "status": "presented",
+        "reason_code": "claim_support_qualified",
+        "qualification_applied": True,
+    }
+    assert answer.startswith(reasoning["proposal"]["proposed_claim"] + "\n\n")
+    assert "some evidence required interpretation" in answer
+    assert "some relevant evidence was conflicting or excluded" in answer
+    assert "available source support or freshness was limited" in answer
+    assert "interpretation-dependent-derivation" not in answer
+    assert "PRIVATE REASON" not in answer
+    assert reasoning["proposal"]["proposed_claim"] not in json.dumps(trace)
 
 
 def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed():
@@ -16670,6 +16866,7 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
         interaction_governance_enabled=True,
         claim_record_capture_enabled=True,
         general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=True,
         general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
@@ -16776,6 +16973,7 @@ async def test_general_evidence_reasoning_cannot_override_consequence_authority(
         interaction_governance_enabled=True,
         claim_record_capture_enabled=True,
         general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=True,
         general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
@@ -16802,6 +17000,13 @@ async def test_general_evidence_reasoning_cannot_override_consequence_authority(
         "general_evidence_reasoning"
     ]
     assert trace["cr_conclusion_disposition"] == "withheld"
+    assert trace["presented_to_user"] is False
+    assert trace["presentation"] == {
+        "enabled": True,
+        "status": "ineligible",
+        "reason_code": "claim_support_withheld",
+        "qualification_applied": False,
+    }
     assert trace["decision_comparison"] == {
         "status": "compared",
         "existing_disposition": "allowed",

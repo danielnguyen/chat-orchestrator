@@ -586,6 +586,40 @@ does not judge semantic truth, inspect source meaning, or score support. The
 comparison telemetry stores no claim text, source values or bodies, request
 text, prompts, provider output, or model reasoning.
 
+Generic evidence-reasoning presentation has a separate default-off switch,
+`GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED`. It may be enabled only while
+general evidence reasoning, governed evidence acquisition, and claim-record
+capture are enabled. Turning presentation off while leaving reasoning on keeps
+the shadow evaluator, decision comparison, and unpresented v2 support record
+active while restoring the legacy-visible answer.
+
+Presentation is limited to a system-owned read-only risk class. The reasoning
+proposal and Cognitive Runtime result must both validate; the CR disposition
+must be `allowed` or coherently `qualified`; validated supporting evidence or an
+executed derivation backed by authorized evidence must exist; privacy and
+consequence policy must permit presentation; and no capability or action may be
+requested, pending, confirmed, dispatched, or executed. The selector does not
+use task shape, operation, source, field, domain, evidence representation, or
+decision-comparison category. It does not rescore support or judge semantic
+truth.
+
+An allowed result is presented as the exact governed proposed claim. A qualified
+result keeps that exact claim as its first paragraph and adds one deterministic
+plain-language qualification derived from broad CR limitation families. Raw
+limitation codes, exclusion prose, service names, schemas, prompts, and reasoning
+are not exposed. Generic-presented answers return no public source list unless a
+separately proven exact mapping exists. The trace records only bounded
+presentation enablement, status, reason code, qualification application, and the
+existing `presented_to_user` truth.
+
+When generic presentation wins, legacy v1 capture is skipped for that assistant
+message and the existing bounded v2 support record is stored as presented. When
+presentation does not win, legacy behavior and the unpresented v2 shadow record
+remain unchanged. Presentation itself adds no provider, Cognitive Runtime, data
+source, acquisition, retry, repair, fallback, or action call. A later v2 storage
+failure leaves the already-presented trace truth intact and marks the response
+degraded rather than rewriting history.
+
 Cognitive Runtime owns deterministic evidence next-step selection. After each
 governed sufficiency evaluation, Chat Orchestrator submits the exact current
 premise reconstructed from the compiled plan: its question-anchor digest, task

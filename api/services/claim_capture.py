@@ -671,9 +671,10 @@ def claim_record_payload(
     return payload
 
 
-def shadow_claim_record_payload(
+def claim_support_record_payload(
     *,
-    shadow_result: dict[str, Any],
+    reasoning_result: dict[str, Any],
+    presented_to_user: bool,
     request_id: str,
     owner_id: str,
     conversation_id: str,
@@ -683,10 +684,10 @@ def shadow_claim_record_payload(
     runtime_turn_id: str,
     acquisition_manifest_id: str | None,
 ) -> dict[str, Any] | None:
-    proposal = shadow_result.get("proposal")
-    executions = shadow_result.get("executions")
-    authority = shadow_result.get("authority_context")
-    cr_result = shadow_result.get("cr_result")
+    proposal = reasoning_result.get("proposal")
+    executions = reasoning_result.get("executions")
+    authority = reasoning_result.get("authority_context")
+    cr_result = reasoning_result.get("cr_result")
     if not all(
         isinstance(value, dict)
         for value in (proposal, authority, cr_result)
@@ -783,7 +784,7 @@ def shadow_claim_record_payload(
         "surface": surface,
         "runtime_session_id": runtime_session_id,
         "runtime_turn_id": runtime_turn_id,
-        "presented_to_user": False,
+        "presented_to_user": presented_to_user,
         "calibration_result": {
             "claim_id": cr_result.get("claim_id"),
             "claim_anchor": claim,
@@ -806,7 +807,7 @@ def shadow_claim_record_payload(
     return payload
 
 
-def shadow_claim_record_response_valid(
+def claim_support_record_response_valid(
     *,
     expected_payload: dict[str, Any],
     response: Any,
@@ -828,7 +829,7 @@ def shadow_claim_record_response_valid(
         "surface": expected_payload["surface"],
         "runtime_session_id": expected_payload["runtime_session_id"],
         "runtime_turn_id": expected_payload["runtime_turn_id"],
-        "presented_to_user": False,
+        "presented_to_user": expected_payload["presented_to_user"],
         **{
             key: value
             for key, value in expected_payload["calibration_result"].items()
@@ -841,6 +842,43 @@ def shadow_claim_record_response_valid(
             "acquisition_manifest_id"
         ]
     return all(record.get(key) == value for key, value in expected.items())
+
+
+def shadow_claim_record_payload(
+    *,
+    shadow_result: dict[str, Any],
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    assistant_message_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    acquisition_manifest_id: str | None,
+) -> dict[str, Any] | None:
+    return claim_support_record_payload(
+        reasoning_result=shadow_result,
+        presented_to_user=False,
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        assistant_message_id=assistant_message_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        acquisition_manifest_id=acquisition_manifest_id,
+    )
+
+
+def shadow_claim_record_response_valid(
+    *,
+    expected_payload: dict[str, Any],
+    response: Any,
+) -> bool:
+    return claim_support_record_response_valid(
+        expected_payload=expected_payload,
+        response=response,
+    )
 
 
 def finish_claim_record_persistence(
