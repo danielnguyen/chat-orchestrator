@@ -223,6 +223,28 @@ _EVIDENCE_INTERPRETER_REASONING_EFFORT = "minimal"
 _DIAGNOSTIC_ADVISORY_ROUTE = "diagnostic_advisory"
 _EVIDENCE_REASONING_ROUTE = "evidence_reasoning"
 _EVIDENCE_REASONING_MAX_COMPLETION_TOKENS = 1200
+_AUTHORITY_DISPOSITION_LEVEL = {"withheld": 0, "qualified": 1, "allowed": 2}
+_EXISTING_AUTHORITY_DISPOSITIONS = {
+    "bounded_conclusion_allowed": "allowed",
+    "qualified_partial_only": "qualified",
+    "requested_conclusion_withheld": "withheld",
+}
+_PROVENANCE_SUPPORT_LIMITATIONS = {
+    "no_supporting_evidence",
+    "limited_source_authority",
+    "unknown_source_authority",
+    "stale_evidence",
+    "unknown_freshness",
+    "complete_scope_not_established",
+    "material_acquisition_limited",
+    "material_evidence_omitted",
+    "material_counterevidence_present",
+    "material_counterevidence_excluded",
+    "material_counterevidence_misclassified",
+    "material_support_excluded",
+    "declared_counterevidence",
+    "material_exclusion",
+}
 _DIAGNOSTIC_ADVISORY_MAX_COMPLETION_TOKENS = 512
 _DIAGNOSTIC_ADVISORY_REASONING_EFFORT = "minimal"
 _DIAGNOSTIC_ADVISORY_TIMEOUT_MS = 5000
@@ -6901,6 +6923,141 @@ async def _diagnose_process_failure(
     return rendered
 
 
+def _compare_authority_decisions(
+    *,
+    existing_conclusion_disposition: str | None,
+    claim_support_result: dict[str, Any] | None,
+    authority_context: dict[str, Any] | None,
+    aggregate_execution: dict[str, Any] | None,
+    shape_reason_codes: list[str] | None,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    existing = _EXISTING_AUTHORITY_DISPOSITIONS.get(
+        existing_conclusion_disposition or ""
+    )
+    claim_support = (
+        claim_support_result.get("conclusion_disposition")
+        if isinstance(claim_support_result, dict)
+        else None
+    )
+    if claim_support not in _AUTHORITY_DISPOSITION_LEVEL:
+        claim_support = None
+    comparison = {
+        "status": "not_available" if enabled else "disabled",
+        "existing_disposition": existing,
+        "claim_support_disposition": claim_support,
+        "relation": "unavailable",
+        "categories": [],
+        "reason_codes": [],
+    }
+    if not enabled:
+        comparison["reason_codes"] = ["general_reasoning_disabled"]
+        return comparison
+    unavailable_reasons = []
+    if existing is None:
+        unavailable_reasons.append("existing_decision_unavailable")
+    if claim_support is None:
+        unavailable_reasons.append("claim_support_decision_unavailable")
+    if unavailable_reasons:
+        comparison["reason_codes"] = sorted(unavailable_reasons)
+        return comparison
+
+    existing_level = _AUTHORITY_DISPOSITION_LEVEL[existing]
+    claim_support_level = _AUTHORITY_DISPOSITION_LEVEL[claim_support]
+    if existing_level == claim_support_level:
+        relation = "equivalent"
+    elif claim_support_level > existing_level:
+        relation = "claim_support_more_permissive"
+    else:
+        relation = "claim_support_more_conservative"
+
+    authority = authority_context if isinstance(authority_context, dict) else {}
+    limitations = {
+        value
+        for value in claim_support_result.get("limitation_codes", [])
+        if isinstance(value, str)
+    }
+    supporting_refs = claim_support_result.get(
+        "validated_supporting_evidence_ref_ids", []
+    )
+    executed_ids = {
+        value
+        for value in claim_support_result.get(
+            "validated_executed_derivation_ref_ids", []
+        )
+        if isinstance(value, str)
+    }
+    executions = authority.get("executed_derivations", [])
+    interpretation_dependent = isinstance(executions, list) and any(
+        isinstance(record, dict)
+        and record.get("derivation_id") in executed_ids
+        and record.get("input_basis") == "model_interpreted"
+        for record in executions
+    )
+    numeric_representation_blocked = bool(
+        isinstance(aggregate_execution, dict)
+        and aggregate_execution.get("numeric_validation_failed") is True
+    )
+    semantic_operation_blocked = "semantic_operation_unsupported" in set(
+        shape_reason_codes or []
+    )
+    enumeration_blocked = numeric_representation_blocked or semantic_operation_blocked
+
+    hard_blockers = set()
+    if authority.get("privacy_policy_allows_claim") is False:
+        hard_blockers.add("privacy_policy_disallows_claim")
+    if authority.get("consequence_policy_allows_claim") is False:
+        hard_blockers.add("consequence_policy_disallows_claim")
+    if authority.get("complete_declared_scope_required") is True and (
+        authority.get("complete_declared_scope_established") is not True
+    ):
+        hard_blockers.add("complete_scope_not_established")
+    if (
+        relation == "claim_support_more_permissive"
+        and existing == "withheld"
+        and not supporting_refs
+    ):
+        hard_blockers.add("supporting_evidence_absent")
+
+    categories: set[str] = set()
+    reasons: set[str] = set(hard_blockers)
+    if relation == "equivalent":
+        categories.add("equivalent_decision")
+    if enumeration_blocked and existing == "withheld":
+        categories.add("existing_enumeration_blocked")
+        if numeric_representation_blocked:
+            reasons.add("numeric_representation_rejected")
+        if semantic_operation_blocked:
+            reasons.add("semantic_operation_unsupported")
+    if relation == "claim_support_more_permissive":
+        if hard_blockers:
+            categories.update(
+                {
+                    "claim_support_overpermissive",
+                    "existing_policy_correctly_more_conservative",
+                }
+            )
+        elif enumeration_blocked:
+            categories.add("claim_support_more_useful")
+    if enumeration_blocked and interpretation_dependent:
+        categories.add("interpretation_disagreement")
+        reasons.add("model_interpreted_derivation")
+    provenance_limitations = limitations & _PROVENANCE_SUPPORT_LIMITATIONS
+    if relation != "equivalent" and provenance_limitations:
+        categories.add("provenance_support_disagreement")
+        reasons.update(provenance_limitations)
+
+    comparison.update(
+        {
+            "status": "compared",
+            "relation": relation,
+            "categories": sorted(categories),
+            "reason_codes": sorted(reasons),
+        }
+    )
+    return comparison
+
+
 def _general_evidence_reasoning_trace(*, enabled: bool) -> dict[str, Any]:
     return {
         "enabled": enabled,
@@ -6924,6 +7081,14 @@ def _general_evidence_reasoning_trace(*, enabled: bool) -> dict[str, Any]:
         "runtime_turn_id": None,
         "presented_to_user": False,
         "reasoning_context_limited": False,
+        "decision_comparison": _compare_authority_decisions(
+            existing_conclusion_disposition=None,
+            claim_support_result=None,
+            authority_context=None,
+            aggregate_execution=None,
+            shape_reason_codes=None,
+            enabled=enabled,
+        ),
     }
 
 
@@ -7062,6 +7227,21 @@ async def _run_general_evidence_reasoning(
     output: dict[str, Any] = {"trace": trace}
     if not enabled:
         return output
+    trace["decision_comparison"] = _compare_authority_decisions(
+        existing_conclusion_disposition=(
+            state.next_step.conclusion_disposition
+            if state is not None and state.next_step is not None
+            else None
+        ),
+        claim_support_result=None,
+        authority_context=None,
+        aggregate_execution=(state.aggregate_execution if state is not None else None),
+        shape_reason_codes=(
+            list(state.shape.reason_codes)
+            if state is not None and state.shape is not None
+            else None
+        ),
+    )
     if (
         state is None
         or not state.attempted
@@ -7284,6 +7464,19 @@ async def _run_general_evidence_reasoning(
             "qualification_required": result["qualification_required"],
             "reason_code": "cr_evaluated",
         }
+    )
+    trace["decision_comparison"] = _compare_authority_decisions(
+        existing_conclusion_disposition=(
+            state.next_step.conclusion_disposition
+            if state.next_step is not None
+            else None
+        ),
+        claim_support_result=result,
+        authority_context=authority_context,
+        aggregate_execution=state.aggregate_execution,
+        shape_reason_codes=(
+            list(state.shape.reason_codes) if state.shape is not None else None
+        ),
     )
     output.update(
         {

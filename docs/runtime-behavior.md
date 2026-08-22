@@ -558,6 +558,34 @@ historical explanation remains separate work and is never reconstructed by a
 provider.
 The public chat response fields are unchanged.
 
+When general evidence reasoning is enabled, its shadow trace also contains a
+bounded `decision_comparison`. This compares the existing evidence next-step
+disposition with Cognitive Runtime's validated generic claim-support
+disposition for the same governed turn. It records only comparison status,
+normalized dispositions, their structural relation, sorted category names, and
+sorted reason codes. An unavailable generic result is recorded as unavailable;
+no generic decision is inferred from provider prose or a failed call.
+
+The comparison is diagnostic only. It cannot change either authority decision,
+the visible response, source scope, acquisition, retries, provider routing,
+claim persistence, process-failure diagnosis, or tool and action execution.
+`equivalent_decision` means only that both mechanisms reached the same terminal
+authority level. `claim_support_more_useful` identifies a more permissive
+generic result when an existing typed representation or operation boundary
+blocked the old path and no system-owned hard authority constraint is present.
+`claim_support_overpermissive` and
+`existing_policy_correctly_more_conservative` expose a more permissive generic
+result in the presence of a system-owned privacy, consequence, required-scope,
+or absent-support constraint; they do not silently select or rewrite either
+result. `existing_enumeration_blocked`, `interpretation_disagreement`, and
+`provenance_support_disagreement` describe differences established from typed
+aggregate, derivation-basis, and CR limitation metadata.
+
+Classification uses only existing structural authority and process facts. It
+does not judge semantic truth, inspect source meaning, or score support. The
+comparison telemetry stores no claim text, source values or bodies, request
+text, prompts, provider output, or model reasoning.
+
 Cognitive Runtime owns deterministic evidence next-step selection. After each
 governed sufficiency evaluation, Chat Orchestrator submits the exact current
 premise reconstructed from the compiled plan: its question-anchor digest, task
