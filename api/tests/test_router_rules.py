@@ -26,3 +26,14 @@ def test_diagnostic_advisory_uses_bounded_logical_route():
         "model": "gpt-5-mini",
         "provider": "cloud",
     }
+
+
+def test_general_evidence_reasoning_uses_bounded_logical_route():
+    registry = yaml.safe_load(
+        (ROOT / "router" / "model_registry.yaml").read_text(encoding="utf-8")
+    )
+
+    assert registry["logical_routes"]["evidence_reasoning"] == {
+        "model": "gpt-5-mini",
+        "provider": "cloud",
+    }

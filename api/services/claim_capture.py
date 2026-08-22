@@ -671,6 +671,199 @@ def claim_record_payload(
     return payload
 
 
+def shadow_claim_record_payload(
+    *,
+    shadow_result: dict[str, Any],
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    assistant_message_id: str,
+    surface: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    acquisition_manifest_id: str | None,
+) -> dict[str, Any] | None:
+    proposal = shadow_result.get("proposal")
+    executions = shadow_result.get("executions")
+    authority = shadow_result.get("authority_context")
+    cr_result = shadow_result.get("cr_result")
+    if not all(
+        isinstance(value, dict)
+        for value in (proposal, authority, cr_result)
+    ) or not isinstance(executions, list):
+        return None
+    claim = proposal.get("proposed_claim")
+    claim_digest = cr_result.get("claim_digest")
+    if (
+        not isinstance(claim, str)
+        or not isinstance(claim_digest, str)
+        or claim_digest != _anchor_digest(claim)
+    ):
+        return None
+    supporting = set(cr_result.get("validated_supporting_evidence_ref_ids") or [])
+    counter = set(cr_result.get("validated_counterevidence_ref_ids") or [])
+    exclusions = {
+        item.get("evidence_ref_id")
+        for item in cr_result.get("validated_material_exclusions") or []
+        if isinstance(item, dict)
+    }
+    evidence_references = []
+    for reference in authority.get("evidence_references") or []:
+        if not isinstance(reference, dict):
+            return None
+        ref_id = reference.get("ref_id")
+        if ref_id in supporting:
+            support_kind = "direct"
+        elif ref_id in counter:
+            support_kind = "contradictory"
+        elif ref_id in exclusions:
+            support_kind = "contextual"
+        else:
+            continue
+        source_authority = reference.get("source_authority")
+        evidence_references.append(
+            {
+                "ref_type": "external_source",
+                "ref_id": ref_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "support_kind": support_kind,
+                "authority": (
+                    "trusted_integration"
+                    if source_authority in {"established", "limited"}
+                    else "unknown"
+                ),
+                "freshness_state": "unknown_freshness",
+            }
+        )
+    status = cr_result.get("calibration_status")
+    scalar_limitations: list[str] = []
+    if status in {"limited", "unsupported"}:
+        scalar_limitations.append("inference_dominant")
+    if not supporting:
+        scalar_limitations.append("no_supporting_evidence")
+    if counter:
+        scalar_limitations.append("contradictory_evidence")
+    support = {
+        "claim_digest": claim_digest,
+        "supporting_evidence_ref_ids": sorted(supporting),
+        "counterevidence_ref_ids": sorted(counter),
+        "material_exclusions": cr_result.get("validated_material_exclusions") or [],
+        "executed_derivations": [
+            {
+                key: record[key]
+                for key in (
+                    "derivation_id",
+                    "operation",
+                    "canonical_inputs",
+                    "canonical_result",
+                    "execution_digest",
+                    "executor_version",
+                    "supporting_evidence_ref_ids",
+                    "input_basis",
+                )
+            }
+            for record in executions
+        ],
+        "material_scope_limitations": sorted(
+            {
+                *(
+                    ["complete_scope_not_established"]
+                    if authority.get("complete_declared_scope_required") is True
+                    and authority.get("complete_declared_scope_established") is not True
+                    else []
+                ),
+                *(
+                    ["material_acquisition_limited"]
+                    if authority.get("material_acquisition_limited") is True
+                    else []
+                ),
+            }
+        ),
+        "calibration_status": status,
+        "conclusion_disposition": cr_result.get("conclusion_disposition"),
+        "qualification_required": cr_result.get("qualification_required"),
+        "limitation_codes": cr_result.get("limitation_codes") or [],
+    }
+    payload = {
+        "schema_version": "claim-record.v2",
+        "request_id": request_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "assistant_message_id": assistant_message_id,
+        "surface": surface,
+        "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+        "presented_to_user": False,
+        "calibration_result": {
+            "claim_id": cr_result.get("claim_id"),
+            "claim_anchor": claim,
+            "claim_anchor_digest": claim_digest,
+            "claim_class": "runtime_inference",
+            "calibration_status": status,
+            "evidence_strength": (
+                "moderate"
+                if status == "supported"
+                else "weak"
+                if status == "limited"
+                else "none"
+            ),
+            "confidence": "unknown",
+            "strongest_authority": (
+                "trusted_integration" if supporting else "unknown"
+            ),
+            "freshness_summary": "unknown",
+            "uncertainty_disclosure_required": bool(
+                cr_result.get("qualification_required")
+            ),
+            "validated_evidence_references": evidence_references,
+            "limitation_codes": scalar_limitations,
+            "user_safe_summary": cr_result.get("user_safe_summary"),
+        },
+        "support": support,
+    }
+    if acquisition_manifest_id is not None:
+        payload["acquisition_manifest_id"] = acquisition_manifest_id
+    return payload
+
+
+def shadow_claim_record_response_valid(
+    *,
+    expected_payload: dict[str, Any],
+    response: Any,
+) -> bool:
+    if not isinstance(response, dict) or set(response) != {"created", "record"}:
+        return False
+    if not isinstance(response.get("created"), bool):
+        return False
+    record = response.get("record")
+    if not isinstance(record, dict) or not isinstance(record.get("created_at"), str):
+        return False
+    expected = {
+        "claim_id": expected_payload["calibration_result"]["claim_id"],
+        "schema_version": "claim-record.v2",
+        "owner_id": expected_payload["owner_id"],
+        "conversation_id": expected_payload["conversation_id"],
+        "request_id": expected_payload["request_id"],
+        "assistant_message_id": expected_payload["assistant_message_id"],
+        "surface": expected_payload["surface"],
+        "runtime_session_id": expected_payload["runtime_session_id"],
+        "runtime_turn_id": expected_payload["runtime_turn_id"],
+        "presented_to_user": False,
+        **{
+            key: value
+            for key, value in expected_payload["calibration_result"].items()
+            if key != "claim_id"
+        },
+        "support": expected_payload["support"],
+    }
+    if "acquisition_manifest_id" in expected_payload:
+        expected["acquisition_manifest_id"] = expected_payload[
+            "acquisition_manifest_id"
+        ]
+    return all(record.get(key) == value for key, value in expected.items())
+
+
 def finish_claim_record_persistence(
     *,
     state: ClaimCaptureState,

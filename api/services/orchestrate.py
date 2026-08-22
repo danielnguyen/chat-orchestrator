@@ -21,6 +21,7 @@ from clients.data_source_aggregator import (
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import validate_history_followup_policy_response
+from pydantic import ValidationError
 from router.engine import evaluate_route
 from services.action_connectors import ActionConnectorRegistry
 from services.assistant_handoff import build_assistant_handoff
@@ -52,6 +53,8 @@ from services.claim_capture import (
     governed_external_reference_id,
     mark_trace_status_update_failed,
     prepare_claim_capture,
+    shadow_claim_record_payload,
+    shadow_claim_record_response_valid,
 )
 from services.claim_explanation import (
     ClaimExplanationOutcome,
@@ -64,6 +67,7 @@ from services.claim_explanation import (
     resolve_immediate_claim_explanation,
 )
 from services.companion_presentation import build_companion_presentation
+from services.deterministic_derivation import execute_derivations
 from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
@@ -84,6 +88,8 @@ from services.evidence_acquisition import (
     evaluate_acquisition_sufficiency,
     evidence_interpreter_messages,
     evidence_interpreter_response_format,
+    evidence_reasoning_messages,
+    evidence_reasoning_response_format,
     execute_aggregate_values,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
@@ -96,6 +102,7 @@ from services.evidence_acquisition import (
     ineligible_exact_evidence_state,
     parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
+    parse_evidence_reasoning_completion,
     process_failure_diagnosis_eligible,
     promote_exact_fetch_proposal,
     provider_allowed,
@@ -148,6 +155,7 @@ from services.style_envelope import (
     resolve_style_envelope,
 )
 from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
+from settings import get_settings
 
 _HISTORY_CLARIFICATION = (
     "Are you asking what supported the immediately previous answer, what I checked, "
@@ -213,6 +221,8 @@ _EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
 _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 512
 _EVIDENCE_INTERPRETER_REASONING_EFFORT = "minimal"
 _DIAGNOSTIC_ADVISORY_ROUTE = "diagnostic_advisory"
+_EVIDENCE_REASONING_ROUTE = "evidence_reasoning"
+_EVIDENCE_REASONING_MAX_COMPLETION_TOKENS = 1200
 _DIAGNOSTIC_ADVISORY_MAX_COMPLETION_TOKENS = 512
 _DIAGNOSTIC_ADVISORY_REASONING_EFFORT = "minimal"
 _DIAGNOSTIC_ADVISORY_TIMEOUT_MS = 5000
@@ -4197,6 +4207,10 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         summary["semantic_interpreter"] = trace["semantic_interpreter"]
     if isinstance(trace.get("claim_explanation"), dict):
         summary["claim_explanation"] = trace["claim_explanation"]
+    if isinstance(trace.get("general_evidence_reasoning"), dict):
+        summary["general_evidence_reasoning"] = trace[
+            "general_evidence_reasoning"
+        ]
     if isinstance(trace.get("history_followup"), dict):
         summary["history_followup"] = trace["history_followup"]
     return summary
@@ -6887,6 +6901,336 @@ async def _diagnose_process_failure(
     return rendered
 
 
+def _general_evidence_reasoning_trace(*, enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "eligibility_status": "not_evaluated" if enabled else "disabled",
+        "attempted": False,
+        "reasoning_provider_call_count": 0,
+        "validation_status": "not_attempted",
+        "reason_code": "not_evaluated" if enabled else "disabled",
+        "supporting_ref_count": 0,
+        "counter_ref_count": 0,
+        "exclusion_count": 0,
+        "derivation_request_count": 0,
+        "derivation_executed_count": 0,
+        "claim_digest": None,
+        "cr_call_count": 0,
+        "cr_calibration_status": None,
+        "cr_conclusion_disposition": None,
+        "qualification_required": None,
+        "bms_persistence_status": "not_attempted",
+        "runtime_session_id": None,
+        "runtime_turn_id": None,
+        "presented_to_user": False,
+    }
+
+
+def _bounded_reasoning_evidence(
+    *,
+    context_pack: dict[str, Any] | None,
+    retained_source_refs: list[str] | None,
+) -> tuple[list[dict[str, str]], dict[str, dict[str, Any]]]:
+    retained = set(retained_source_refs or [])
+    items = context_pack.get("items") if isinstance(context_pack, dict) else None
+    if not retained or not isinstance(items, list):
+        return [], {}
+    evidence: list[dict[str, str]] = []
+    metadata: dict[str, dict[str, Any]] = {}
+    seen_source_refs: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_ref = item.get("source_ref")
+        text = item.get("text")
+        source_id = item.get("source_id")
+        if (
+            source_ref not in retained
+            or not isinstance(source_ref, str)
+            or not isinstance(text, str)
+            or not text
+            or not isinstance(source_id, str)
+        ):
+            continue
+        if source_ref in seen_source_refs:
+            return [], {}
+        seen_source_refs.add(source_ref)
+        ref_id = governed_external_reference_id(source_ref)
+        if ref_id in metadata:
+            return [], {}
+        evidence.append({"evidence_ref_id": ref_id, "text": text[:4000]})
+        metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
+        if len(evidence) > 8:
+            return [], {}
+    if seen_source_refs != retained:
+        return [], {}
+    return evidence, metadata
+
+
+async def _run_general_evidence_reasoning(
+    *,
+    enabled: bool,
+    request_id: str,
+    request_text: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    runtime_turn_id: str | None,
+    state: EvidenceAcquisitionState | None,
+    context_pack: dict[str, Any] | None,
+    retained_source_refs: list[str] | None,
+    litellm: Any,
+    runtime: Any,
+    model_registry_path: str,
+    timeout_ms: int,
+    local_only: bool,
+    routing_policy: dict[str, Any],
+    effective_payload: dict[str, Any],
+    privacy_suppressed: bool,
+    consequence_policy_allows_claim: bool,
+) -> dict[str, Any]:
+    trace = _general_evidence_reasoning_trace(enabled=enabled)
+    output: dict[str, Any] = {"trace": trace}
+    if not enabled:
+        return output
+    if (
+        state is None
+        or not state.supported_governed_path
+        or state.sufficiency is None
+        or state.sufficiency.sufficiency_status
+        not in {"sufficient_for_declared_scope", "sufficient_with_limitations"}
+        or not isinstance(runtime_session_id, str)
+        or not runtime_session_id
+        or not isinstance(runtime_turn_id, str)
+        or not runtime_turn_id
+        or runtime is None
+        or privacy_suppressed
+    ):
+        trace.update(
+            {
+                "eligibility_status": "ineligible",
+                "reason_code": (
+                    "privacy_suppressed"
+                    if privacy_suppressed
+                    else "authorized_evidence_unavailable"
+                ),
+            }
+        )
+        return output
+    evidence, evidence_metadata = _bounded_reasoning_evidence(
+        context_pack=context_pack,
+        retained_source_refs=retained_source_refs,
+    )
+    if not evidence:
+        trace.update(
+            {
+                "eligibility_status": "ineligible",
+                "reason_code": "authorized_evidence_unavailable",
+            }
+        )
+        return output
+    route = _load_logical_route(model_registry_path, _EVIDENCE_REASONING_ROUTE)
+    if route is None:
+        trace.update(
+            {"eligibility_status": "ineligible", "reason_code": "route_unavailable"}
+        )
+        return output
+    if not _classifier_cloud_allowed(
+        provider=route["provider"],
+        local_only=local_only,
+        routing_policy=routing_policy,
+        effective_payload=effective_payload,
+    ):
+        trace.update(
+            {
+                "eligibility_status": "ineligible",
+                "reason_code": "provider_disallowed",
+            }
+        )
+        return output
+    trace.update(
+        {
+            "eligibility_status": "eligible",
+            "attempted": True,
+            "reasoning_provider_call_count": 1,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }
+    )
+    authorized_ref_ids = set(evidence_metadata)
+    try:
+        completion = await litellm.chat(
+            request_id=request_id,
+            model=route["model"],
+            messages=evidence_reasoning_messages(
+                request_text=request_text,
+                evidence=evidence,
+            ),
+            tools=[],
+            response_format=evidence_reasoning_response_format(),
+            max_completion_tokens=_EVIDENCE_REASONING_MAX_COMPLETION_TOKENS,
+            timeout_ms=timeout_ms,
+        )
+        proposal = parse_evidence_reasoning_completion(
+            completion,
+            authorized_evidence_ref_ids=authorized_ref_ids,
+        )
+        executions = execute_derivations(
+            proposal.derivation_requests,
+            authorized_evidence_ref_ids=authorized_ref_ids,
+        )
+    except Exception:
+        trace.update(
+            {"validation_status": "failed", "reason_code": "proposal_invalid"}
+        )
+        return output
+
+    inventory = {
+        item.source_id: item
+        for item in (state.inventory.sources if state.inventory is not None else [])
+    }
+    evidence_authority = []
+    for ref_id in sorted(authorized_ref_ids):
+        source = inventory.get(evidence_metadata[ref_id]["source_id"])
+        authority_role = source.authority_role if source is not None else "unknown"
+        evidence_authority.append(
+            {
+                "ref_id": ref_id,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "source_authority": (
+                    "established"
+                    if authority_role == "authoritative"
+                    else "limited"
+                    if authority_role == "supplemental"
+                    else "unknown"
+                ),
+                "freshness": "unknown",
+                "material_disclosure_required": False,
+                "material_role": "neutral",
+            }
+        )
+    complete_required = bool(
+        state.plan is not None
+        and state.plan.completeness_expectation
+        in {
+            "complete_for_declared_scope",
+            "complete_for_selected_sources",
+            "complete_for_time_window",
+        }
+    )
+    material_limited = any(
+        item.category == "retrieval_limit"
+        for item in state.process_failure_observations
+    )
+    authority_context = {
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "surface": surface,
+        "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+        "evidence_references": evidence_authority,
+        "complete_declared_scope_required": complete_required,
+        "complete_declared_scope_established": (
+            state.sufficiency.sufficiency_status == "sufficient_for_declared_scope"
+            and not material_limited
+            if complete_required
+            else None
+        ),
+        "material_acquisition_limited": material_limited,
+        "privacy_policy_allows_claim": True,
+        "consequence_policy_allows_claim": consequence_policy_allows_claim,
+        "executed_derivations": [
+            {
+                **record,
+                "owner_id": owner_id,
+                "conversation_id": conversation_id,
+                "runtime_session_id": runtime_session_id,
+                "runtime_turn_id": runtime_turn_id,
+                "execution_status": "executed",
+            }
+            for record in executions
+        ],
+    }
+    cr_proposal = {
+        "proposed_claim": proposal.proposed_claim,
+        "supporting_evidence_ref_ids": proposal.supporting_evidence_ref_ids,
+        "counterevidence_ref_ids": proposal.counterevidence_ref_ids,
+        "material_exclusions": [
+            item.model_dump(mode="json") for item in proposal.material_exclusions
+        ],
+        "executed_derivation_ref_ids": [
+            record["derivation_id"] for record in executions
+        ],
+    }
+    trace.update(
+        {
+            "validation_status": "accepted",
+            "reason_code": "proposal_accepted",
+            "supporting_ref_count": len(proposal.supporting_evidence_ref_ids),
+            "counter_ref_count": len(proposal.counterevidence_ref_ids),
+            "exclusion_count": len(proposal.material_exclusions),
+            "derivation_request_count": len(proposal.derivation_requests),
+            "derivation_executed_count": len(executions),
+            "cr_call_count": 1,
+        }
+    )
+    try:
+        cr_response = await runtime.evaluate_claim_support(
+            request_id=request_id,
+            authority_context=authority_context,
+            proposal=cr_proposal,
+        )
+    except Exception:
+        trace.update(
+            {"reason_code": "cr_unavailable", "validation_status": "shadow_failed"}
+        )
+        return output
+    result = cr_response.get("result") if isinstance(cr_response, dict) else None
+    expected_digest = "sha256:" + hashlib.sha256(
+        proposal.proposed_claim.encode()
+    ).hexdigest()
+    expected_exclusions = sorted(
+        (item.model_dump(mode="json") for item in proposal.material_exclusions),
+        key=lambda item: (item["evidence_ref_id"], item["reason"]),
+    )
+    if (
+        not isinstance(result, dict)
+        or result.get("claim_digest") != expected_digest
+        or result.get("validated_supporting_evidence_ref_ids")
+        != sorted(proposal.supporting_evidence_ref_ids)
+        or result.get("validated_counterevidence_ref_ids")
+        != sorted(proposal.counterevidence_ref_ids)
+        or result.get("validated_material_exclusions") != expected_exclusions
+        or result.get("validated_executed_derivation_ref_ids")
+        != sorted(record["derivation_id"] for record in executions)
+    ):
+        trace.update(
+            {"reason_code": "cr_response_invalid", "validation_status": "shadow_failed"}
+        )
+        return output
+    trace.update(
+        {
+            "claim_digest": result["claim_digest"],
+            "cr_calibration_status": result["calibration_status"],
+            "cr_conclusion_disposition": result["conclusion_disposition"],
+            "qualification_required": result["qualification_required"],
+            "reason_code": "cr_evaluated",
+        }
+    )
+    output.update(
+        {
+            "proposal": proposal.model_dump(mode="json"),
+            "executions": executions,
+            "authority_context": authority_context,
+            "cr_result": result,
+            "evidence_metadata": evidence_metadata,
+        }
+    )
+    return output
+
+
 async def _resolve_history_policy(
     *,
     runtime: Any,
@@ -7374,6 +7718,8 @@ async def orchestrate_chat(
     capability_registry_enabled: bool = False,
     claim_record_capture_enabled: bool = False,
     evidence_acquisition_enabled: bool = False,
+    general_evidence_reasoning_enabled: bool | None = None,
+    general_evidence_reasoning_timeout_ms: int | None = None,
     history_followup_enabled: bool = False,
     intent_classifier_timeout_ms: int = 3000,
     evidence_interpreter_timeout_ms: int = 5000,
@@ -7388,6 +7734,26 @@ async def orchestrate_chat(
     action_connector_registry: ActionConnectorRegistry | None = None,
     message_id_factory: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
+    if (
+        general_evidence_reasoning_enabled is None
+        or general_evidence_reasoning_timeout_ms is None
+    ):
+        try:
+            configured_settings = get_settings()
+        except ValidationError:
+            configured_settings = None
+        if general_evidence_reasoning_enabled is None:
+            general_evidence_reasoning_enabled = (
+                configured_settings.general_evidence_reasoning_enabled
+                if configured_settings is not None
+                else False
+            )
+        if general_evidence_reasoning_timeout_ms is None:
+            general_evidence_reasoning_timeout_ms = (
+                configured_settings.general_evidence_reasoning_timeout_ms
+                if configured_settings is not None
+                else 5000
+            )
     started = perf_counter()
     evaluated_at = datetime.now(UTC)
     retirement_before = evaluated_at - timedelta(
@@ -10852,6 +11218,43 @@ async def orchestrate_chat(
         }
 
         references = _trace_references(retrieval_bundle)
+        general_evidence_reasoning = await _run_general_evidence_reasoning(
+            enabled=bool(general_evidence_reasoning_enabled),
+            request_id=request_id,
+            request_text=last_user_text,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            state=evidence_acquisition,
+            context_pack=external_context_pack,
+            retained_source_refs=(
+                retained_external_refs
+                if evidence_acquisition is not None
+                else None
+            ),
+            litellm=litellm,
+            runtime=runtime,
+            model_registry_path=model_registry_path,
+            timeout_ms=int(general_evidence_reasoning_timeout_ms),
+            local_only=local_only,
+            routing_policy=routing_policy,
+            effective_payload=effective_payload,
+            privacy_suppressed=privacy_prompt_suppressed,
+            consequence_policy_allows_claim=(
+                interaction_kind != "high_impact_decision"
+            ),
+        )
+        prompt.trace["general_evidence_reasoning"] = general_evidence_reasoning[
+            "trace"
+        ]
+        for ref_id in sorted(
+            general_evidence_reasoning.get("evidence_metadata", {})
+        ):
+            reference_identity = {"ref_type": "external_source", "ref_id": ref_id}
+            if reference_identity not in references:
+                references.append(reference_identity)
         trusted_governed_claim = None
         if (
             governed_validation is not None
@@ -11221,6 +11624,67 @@ async def orchestrate_chat(
                 )
             except Exception:
                 claim_capture = mark_trace_status_update_failed(claim_capture)
+
+        assistant_message_id = (
+            assistant_message_ack.get("message_id")
+            if isinstance(assistant_message_ack, dict)
+            else None
+        )
+        shadow_record_payload = (
+            shadow_claim_record_payload(
+                shadow_result=general_evidence_reasoning,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                assistant_message_id=assistant_message_id,
+                surface=surface,
+                runtime_session_id=(
+                    runtime_session_trace.get("runtime_session_id") or ""
+                ),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
+                acquisition_manifest_id=(
+                    evidence_manifest.get("manifest_id")
+                    if isinstance(evidence_manifest, dict)
+                    else None
+                ),
+            )
+            if isinstance(assistant_message_id, str)
+            else None
+        )
+        if shadow_record_payload is not None:
+            try:
+                shadow_record_response = await memory_store.create_claim_record(
+                    request_id=request_id,
+                    payload=shadow_record_payload,
+                )
+                shadow_persisted = shadow_claim_record_response_valid(
+                    expected_payload=shadow_record_payload,
+                    response=shadow_record_response,
+                )
+            except Exception:
+                shadow_persisted = False
+            general_evidence_reasoning["trace"]["bms_persistence_status"] = (
+                "persisted" if shadow_persisted else "failed"
+            )
+            prompt.trace["general_evidence_reasoning"] = (
+                general_evidence_reasoning["trace"]
+            )
+            if isinstance(persisted_prompt_trace, dict):
+                persisted_prompt_trace["general_evidence_reasoning"] = (
+                    general_evidence_reasoning["trace"]
+                )
+            persisted_retrieval["prompt_assembly"] = persisted_prompt_trace
+            trace_payload["retrieval"] = persisted_retrieval
+            trace_payload["prompt"] = _trace_prompt(persisted_prompt_trace)
+            try:
+                await memory_store.create_trace(
+                    request_id=request_id,
+                    payload=trace_payload,
+                )
+            except Exception:
+                general_evidence_reasoning["trace"]["bms_persistence_status"] = (
+                    "trace_update_failed"
+                )
 
         result = {
             "request_id": request_id,

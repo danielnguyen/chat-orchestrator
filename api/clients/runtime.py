@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import httpx
@@ -74,6 +74,75 @@ _CONTINUATION_DECLINE_REASONS = (
     "unavailable_thread_present",
     "runtime_state_inconsistent",
 )
+
+
+class _ClaimSupportExclusion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_ref_id: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=1, max_length=240)
+
+
+_ClaimSupportIdentifier = Annotated[
+    str,
+    Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
+_ClaimSupportLimitation = Annotated[
+    str,
+    Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$"),
+]
+
+
+class _ClaimSupportResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str = Field(min_length=1, max_length=120)
+    claim_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    calibration_status: Literal["supported", "limited", "unsupported"]
+    conclusion_disposition: Literal["allowed", "qualified", "withheld"]
+    qualification_required: bool
+    limitation_codes: list[_ClaimSupportLimitation] = Field(max_length=17)
+    validated_supporting_evidence_ref_ids: list[_ClaimSupportIdentifier] = Field(
+        max_length=16
+    )
+    validated_counterevidence_ref_ids: list[_ClaimSupportIdentifier] = Field(
+        max_length=16
+    )
+    validated_material_exclusions: list[_ClaimSupportExclusion] = Field(max_length=16)
+    validated_executed_derivation_ref_ids: list[_ClaimSupportIdentifier] = Field(
+        max_length=16
+    )
+    user_safe_summary: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_bounded_sets(self):
+        collections = (
+            self.limitation_codes,
+            self.validated_supporting_evidence_ref_ids,
+            self.validated_counterevidence_ref_ids,
+            self.validated_executed_derivation_ref_ids,
+        )
+        if any(len(items) != len(set(items)) for items in collections):
+            raise ValueError("claim_support_duplicate_reference")
+        if set(self.validated_supporting_evidence_ref_ids) & set(
+            self.validated_counterevidence_ref_ids
+        ):
+            raise ValueError("claim_support_conflicting_reference_role")
+        return self
+
+
+class _ClaimSupportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    owner_id: str
+    conversation_id: str
+    surface: str
+    runtime_session_id: str
+    runtime_turn_id: str
+    result: _ClaimSupportResult
+
+
 _RETIREMENT_REASONS = {
     "safe_idle_retirement_reserved",
     "existing_retirement_reservation",
@@ -861,6 +930,38 @@ class RuntimeClient:
         ):
             raise RuntimeError("claim_calibration_response_invalid")
         return response
+
+    async def evaluate_claim_support(
+        self,
+        *,
+        request_id: str,
+        authority_context: dict[str, Any],
+        proposal: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/v1/runtime/claim-support/evaluate",
+            json={
+                "request_id": request_id,
+                "authority_context": authority_context,
+                "proposal": proposal,
+            },
+        )
+        try:
+            validated = _ClaimSupportResponse.model_validate(response)
+        except Exception as exc:
+            raise RuntimeError("claim_support_response_invalid") from exc
+        expected_scope = {
+            "request_id": request_id,
+            "owner_id": authority_context.get("owner_id"),
+            "conversation_id": authority_context.get("conversation_id"),
+            "surface": authority_context.get("surface"),
+            "runtime_session_id": authority_context.get("runtime_session_id"),
+            "runtime_turn_id": authority_context.get("runtime_turn_id"),
+        }
+        payload = validated.model_dump(mode="json")
+        if any(payload.get(field) != value for field, value in expected_scope.items()):
+            raise RuntimeError("claim_support_response_invalid")
+        return payload
 
     async def derive_evidence_shape(
         self,

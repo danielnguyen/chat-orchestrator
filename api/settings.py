@@ -58,6 +58,16 @@ class Settings(BaseSettings):
         default=False,
         alias="EVIDENCE_ACQUISITION_ENABLED",
     )
+    general_evidence_reasoning_enabled: bool = Field(
+        default=False,
+        alias="GENERAL_EVIDENCE_REASONING_ENABLED",
+    )
+    general_evidence_reasoning_timeout_ms: int = Field(
+        default=5000,
+        alias="GENERAL_EVIDENCE_REASONING_TIMEOUT_MS",
+        ge=100,
+        le=30000,
+    )
     history_followup_enabled: bool = Field(
         default=False,
         alias="HISTORY_FOLLOWUP_ENABLED",
@@ -127,6 +137,11 @@ class Settings(BaseSettings):
                 raise ValueError("evidence acquisition requires interaction governance")
             if not self.dsa_enabled:
                 raise ValueError("evidence acquisition requires Data Source Aggregator")
+        if self.general_evidence_reasoning_enabled:
+            if not self.evidence_acquisition_enabled:
+                raise ValueError("general evidence reasoning requires evidence acquisition")
+            if not self.claim_record_capture_enabled:
+                raise ValueError("general evidence reasoning requires claim record capture")
         if self.history_followup_enabled:
             if not self.cognitive_runtime_base_url:
                 raise ValueError("history follow-up requires Cognitive Runtime")

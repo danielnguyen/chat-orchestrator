@@ -732,6 +732,31 @@ assert_diagnostic_advisory_calls() {
   ' <<<"$provider_calls" >/dev/null
 }
 
+assert_general_evidence_reasoning_calls() {
+  local provider_calls="$1" expected_count="$2"
+  jq -e --argjson expected_count "$expected_count" '
+    [.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "general_evidence_reasoning_proposal"
+    )] as $calls
+    | ($calls | length) == $expected_count
+    and ($calls | all(
+      .tool_count == 0
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .response_schema_required == [
+        "proposed_claim",
+        "supporting_evidence_ref_ids",
+        "counterevidence_ref_ids",
+        "material_exclusions",
+        "derivation_requests"
+      ]
+      and .status == "ok"
+    ))
+  ' <<<"$provider_calls" >/dev/null
+}
+
 assert_history_request_boundaries() {
   local conversation_id="$1" response="$2" expected_resolution="$3"
   local request_id trace provider_calls diagnostics audit
@@ -6163,6 +6188,163 @@ run_step13_diagnostic_scenarios() {
   echo "Step-13 diagnostics: composed_dsa_http=500 invalid_value_count=5 diagnostic_calls=1_each answer_provider=0 retries=0"
 }
 
+run_general_evidence_reasoning_shadow_scenario() {
+  local owner client conversation_id question external response request_id answer
+  local trace manifest provider_calls audit diagnostics claim_records proposal
+  local source_ref="google_sheets:records_primary:Records!A2:C2"
+  local evidence_ref_id
+  evidence_ref_id="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
+  owner="owner-general-reasoning-shadow"
+  client="client-general-reasoning-shadow"
+  question="Verify the migration record."
+  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_evidence_candidate \
+    "supports" \
+    "$source_ref" \
+    "The migration record confirms the bounded setting."
+  proposal="$(jq -nc --arg ref "$evidence_ref_id" '
+    {
+      proposed_claim:"A mean was mechanically computed over model-interpreted operands.",
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[
+        {
+          derivation_id:"ratio_1",
+          operation:"divide",
+          operands:[
+            {value:"1",derivation_ref:null},
+            {value:"2",derivation_ref:null}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        },
+        {
+          derivation_id:"ratio_2",
+          operation:"divide",
+          operands:[
+            {value:"3",derivation_ref:null},
+            {value:"4",derivation_ref:null}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        },
+        {
+          derivation_id:"mean_1",
+          operation:"mean",
+          operands:[
+            {value:null,derivation_ref:"ratio_1"},
+            {value:null,derivation_ref:"ratio_2"}
+          ],
+          supporting_evidence_ref_ids:[$ref]
+        }
+      ]
+    }')"
+  queue_provider_answer "$proposal"
+
+  conversation_id="$(resolve_conversation "$owner" "$client" "general-reasoning-shadow")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  answer="$(jq -er '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  claim_records="$(list_claim_records "$owner" "$conversation_id")"
+
+  if ! jq -e '.status == "ok"' <<<"$response" >/dev/null; then
+    jq -c '{status,selected_model,sources_count:(.sources | length)}' \
+      <<<"$response" >&2
+    jq -c '{status,error,model_call,prompt:{general_evidence_reasoning:.prompt.general_evidence_reasoning,evidence_provider_mode:.prompt.evidence_provider_mode}}' \
+      <<<"$trace" >&2
+    jq -c '{status,shape:.shape,plan:.plan,inventory:.inventory,acquisition_outcome:.acquisition.dsa_outcome,sufficiency_status:.sufficiency.status,next_step:.next_steps.selections[-1].selected_next_step,diagnostic:.diagnostic}' \
+      <<<"$manifest" >&2
+  fi
+  assert_jq "general_reasoning.response.status" "$response" '.status == "ok"'
+  assert_jq "general_reasoning.response.boundary" "$response" '
+    .answer | startswith("The retained evidence supports the requested conclusion.")
+  '
+  assert_jq "general_reasoning.response.excerpt" "$response" '
+    .answer | contains("Retained evidence excerpt 1: The migration record confirms the bounded setting.")
+  '
+  assert_jq "general_reasoning.response.shadow_absent" "$response" '
+    .answer | contains("mechanically computed") | not
+  '
+  assert_jq "general_reasoning.response.action" "$response" '.pending_action == null'
+  if ! jq -e '
+    .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+  ' <<<"$trace" >/dev/null; then
+    jq -c '.prompt.general_evidence_reasoning' <<<"$trace" >&2
+  fi
+  assert_jq "general_reasoning.trace" "$trace" '
+    .prompt.general_evidence_reasoning.enabled == true
+    and .prompt.general_evidence_reasoning.eligibility_status == "eligible"
+    and .prompt.general_evidence_reasoning.attempted == true
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.validation_status == "accepted"
+    and .prompt.general_evidence_reasoning.derivation_request_count == 3
+    and .prompt.general_evidence_reasoning.derivation_executed_count == 3
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.qualification_required == true
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and (.prompt.general_evidence_reasoning.claim_digest | test("^sha256:[0-9a-f]{64}$"))
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+  '
+  assert_jq "general_reasoning.manifest" "$manifest" '
+    .sufficiency.status == "sufficient_for_declared_scope"
+    and .next_steps.additional_acquisition_count == 0
+    and (.diagnostic.attempted // false) == false
+  '
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_jq "general_reasoning.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 2
+    and ([.calls[] | select(
+      .kind == "chat"
+      and .response_schema_name == "grounded_evidence_response"
+      and .response_format_type == "json_schema"
+      and .response_schema_strict == true
+      and .response_schema_additional_properties == false
+      and .tool_count == 0
+    )] | length) == 1
+    and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_jq "general_reasoning.runtime" "$diagnostics" '
+      ([.events[] | select(
+        .event_payload_json.request_id == $request_id
+        and .event_type == "claim_support_evaluated"
+      )] | length) == 1
+    ' --arg request_id "$request_id"
+  assert_jq "general_reasoning.claim_record" "$claim_records" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == false
+    and $records[0].support.calibration_status == "limited"
+    and $records[0].support.conclusion_disposition == "qualified"
+    and $records[0].support.qualification_required == true
+    and ($records[0].support.executed_derivations
+      | map(.canonical_result)) == ["0.5","0.75","0.625"]
+    and ($records[0].support.executed_derivations
+      | all(.input_basis == "model_interpreted"))
+  '
+  case "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" in
+    *"The migration record confirms"*|*"mechanically computed"*|*"provider prompt"*|*scratchpad*)
+      echo "General evidence reasoning trace exposed semantic/source prose" >&2
+      return 1
+      ;;
+  esac
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  echo "General evidence reasoning shadow: provider=1 dsa=1 derivations=3 cr=1 bms_v2=1 actions=0 retries=0 visible_authority=unchanged"
+}
+
 run_evidence_acquisition_composed_suite() {
   local scenario="${EVIDENCE_SCENARIO:-all}"
   case "$scenario" in
@@ -6195,6 +6377,10 @@ run_evidence_acquisition_composed_suite() {
     step13-diagnostic)
       run_step13_diagnostic_scenarios
       echo "Evidence acquisition composed smoke passed: scenarios=step13-diagnostic"
+      ;;
+    general-reasoning-shadow)
+      run_general_evidence_reasoning_shadow_scenario
+      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-shadow"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario
