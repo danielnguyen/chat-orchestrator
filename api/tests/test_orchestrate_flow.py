@@ -63,6 +63,7 @@ from services.orchestrate import (
     _apply_persona_containment_result_boundary,
     _bounded_reasoning_evidence,
     _bounded_retrieval_debug,
+    _compare_authority_decisions,
     _interpret_evidence_request,
     _load_logical_route,
     _registry_allows_exact_capability,
@@ -1772,19 +1773,27 @@ class FakeRuntime:
         policy_blocked = not authority["privacy_policy_allows_claim"] or not authority[
             "consequence_policy_allows_claim"
         ]
-        unsupported = incomplete_scope or policy_blocked
+        no_support = not proposal["supporting_evidence_ref_ids"] and not proposal[
+            "executed_derivation_ref_ids"
+        ]
+        unsupported = incomplete_scope or policy_blocked or no_support
         has_exclusions = bool(proposal["material_exclusions"])
+        has_counterevidence = bool(proposal["counterevidence_ref_ids"])
         material_limited = authority["material_acquisition_limited"] is True
         limited = (
-            interpreted or has_exclusions or material_limited
+            interpreted or has_exclusions or has_counterevidence or material_limited
         ) and not unsupported
         limitations = []
+        if no_support:
+            limitations.append("no_supporting_evidence")
         if incomplete_scope:
             limitations.append("complete_scope_not_established")
         if interpreted:
             limitations.append("interpretation_dependent_derivation")
         if has_exclusions:
             limitations.append("material_exclusion")
+        if has_counterevidence:
+            limitations.append("declared_counterevidence")
         if material_limited:
             limitations.append("material_acquisition_limited")
         if policy_blocked:
@@ -14478,13 +14487,19 @@ def _general_reasoning_completion(
     evidence_ref_id: str,
     derivation_requests: list[dict[str, object]] | None = None,
     material_exclusions: list[dict[str, str]] | None = None,
+    counterevidence_ref_ids: list[str] | None = None,
+    supporting_evidence_ref_ids: list[str] | None = None,
 ) -> dict[str, object]:
     return _provider_completion(
         json.dumps(
             {
                 "proposed_claim": proposed_claim,
-                "supporting_evidence_ref_ids": [evidence_ref_id],
-                "counterevidence_ref_ids": [],
+                "supporting_evidence_ref_ids": (
+                    [evidence_ref_id]
+                    if supporting_evidence_ref_ids is None
+                    else supporting_evidence_ref_ids
+                ),
+                "counterevidence_ref_ids": counterevidence_ref_ids or [],
                 "material_exclusions": material_exclusions or [],
                 "derivation_requests": derivation_requests or [],
             },
@@ -15971,8 +15986,246 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         assert prohibited not in public_response
 
 
+def _authority_comparison_result(
+    disposition,
+    *,
+    limitations=None,
+    supporting_refs=None,
+    executed_refs=None,
+):
+    return {
+        "conclusion_disposition": disposition,
+        "limitation_codes": limitations or [],
+        "validated_supporting_evidence_ref_ids": (
+            ["evidence_1"] if supporting_refs is None else supporting_refs
+        ),
+        "validated_executed_derivation_ref_ids": executed_refs or [],
+    }
+
+
+def _authority_comparison_context(**overrides):
+    context = {
+        "privacy_policy_allows_claim": True,
+        "consequence_policy_allows_claim": True,
+        "complete_declared_scope_required": False,
+        "complete_declared_scope_established": None,
+        "executed_derivations": [],
+    }
+    context.update(overrides)
+    return context
+
+
+@pytest.mark.parametrize(
+    ("existing", "claim_support", "expected_relation"),
+    [
+        ("bounded_conclusion_allowed", "allowed", "equivalent"),
+        ("qualified_partial_only", "qualified", "equivalent"),
+        ("requested_conclusion_withheld", "withheld", "equivalent"),
+    ],
+)
+def test_authority_decision_comparison_equivalent_dispositions(
+    existing,
+    claim_support,
+    expected_relation,
+):
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition=existing,
+        claim_support_result=_authority_comparison_result(claim_support),
+        authority_context=_authority_comparison_context(),
+        aggregate_execution=None,
+        shape_reason_codes=[],
+    )
+
+    assert comparison == {
+        "status": "compared",
+        "existing_disposition": claim_support,
+        "claim_support_disposition": claim_support,
+        "relation": expected_relation,
+        "categories": ["equivalent_decision"],
+        "reason_codes": [],
+    }
+
+
+def test_authority_decision_comparison_unavailable_is_bounded():
+    disabled = _compare_authority_decisions(
+        existing_conclusion_disposition=None,
+        claim_support_result=None,
+        authority_context=None,
+        aggregate_execution=None,
+        shape_reason_codes=None,
+        enabled=False,
+    )
+    unavailable = _compare_authority_decisions(
+        existing_conclusion_disposition="requested_conclusion_withheld",
+        claim_support_result=None,
+        authority_context=None,
+        aggregate_execution=None,
+        shape_reason_codes=None,
+    )
+
+    assert disabled["status"] == "disabled"
+    assert disabled["relation"] == "unavailable"
+    assert disabled["reason_codes"] == ["general_reasoning_disabled"]
+    assert unavailable["status"] == "not_available"
+    assert unavailable["existing_disposition"] == "withheld"
+    assert unavailable["reason_codes"] == ["claim_support_decision_unavailable"]
+
+
+def test_authority_decision_comparison_classifies_useful_interpretation():
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition="requested_conclusion_withheld",
+        claim_support_result=_authority_comparison_result(
+            "qualified",
+            limitations=["interpretation_dependent_derivation"],
+            executed_refs=["derivation_1"],
+        ),
+        authority_context=_authority_comparison_context(
+            executed_derivations=[
+                {
+                    "derivation_id": "derivation_1",
+                    "input_basis": "model_interpreted",
+                }
+            ]
+        ),
+        aggregate_execution={"numeric_validation_failed": True},
+        shape_reason_codes=["semantic_operation_unsupported"],
+    )
+
+    assert comparison["relation"] == "claim_support_more_permissive"
+    assert comparison["categories"] == [
+        "claim_support_more_useful",
+        "existing_enumeration_blocked",
+        "interpretation_disagreement",
+    ]
+    assert comparison["reason_codes"] == [
+        "model_interpreted_derivation",
+        "numeric_representation_rejected",
+        "semantic_operation_unsupported",
+    ]
+
+
+def test_authority_decision_comparison_surfaces_provenance_difference():
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition="bounded_conclusion_allowed",
+        claim_support_result=_authority_comparison_result(
+            "qualified",
+            limitations=["unknown_freshness", "limited_source_authority"],
+        ),
+        authority_context=_authority_comparison_context(),
+        aggregate_execution=None,
+        shape_reason_codes=[],
+    )
+
+    assert comparison["relation"] == "claim_support_more_conservative"
+    assert comparison["categories"] == ["provenance_support_disagreement"]
+    assert comparison["reason_codes"] == [
+        "limited_source_authority",
+        "unknown_freshness",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("authority_override", "expected_reason"),
+    [
+        ({"privacy_policy_allows_claim": False}, "privacy_policy_disallows_claim"),
+        (
+            {"consequence_policy_allows_claim": False},
+            "consequence_policy_disallows_claim",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": False,
+            },
+            "complete_scope_not_established",
+        ),
+    ],
+)
+def test_authority_decision_comparison_detects_overpermissive_result(
+    authority_override,
+    expected_reason,
+):
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition="requested_conclusion_withheld",
+        claim_support_result=_authority_comparison_result("qualified"),
+        authority_context=_authority_comparison_context(**authority_override),
+        aggregate_execution=None,
+        shape_reason_codes=[],
+    )
+
+    assert comparison["relation"] == "claim_support_more_permissive"
+    assert comparison["categories"] == [
+        "claim_support_overpermissive",
+        "existing_policy_correctly_more_conservative",
+    ]
+    assert comparison["reason_codes"] == [expected_reason]
+
+
+def test_authority_decision_comparison_detects_missing_support_overpermissiveness():
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition="requested_conclusion_withheld",
+        claim_support_result=_authority_comparison_result(
+            "allowed",
+            supporting_refs=[],
+        ),
+        authority_context=_authority_comparison_context(),
+        aggregate_execution=None,
+        shape_reason_codes=[],
+    )
+
+    assert "claim_support_overpermissive" in comparison["categories"]
+    assert comparison["reason_codes"] == ["supporting_evidence_absent"]
+
+
+def test_authority_decision_comparison_is_deterministic_and_privacy_safe():
+    kwargs = {
+        "existing_conclusion_disposition": "bounded_conclusion_allowed",
+        "claim_support_result": _authority_comparison_result(
+            "withheld",
+            limitations=[
+                "unknown_freshness",
+                "material_counterevidence_present",
+                "unknown_freshness",
+            ],
+        ),
+        "authority_context": _authority_comparison_context(),
+        "aggregate_execution": {"numeric_validation_failed": False},
+        "shape_reason_codes": ["source_context_present"],
+    }
+    first = _compare_authority_decisions(**kwargs)
+    second = _compare_authority_decisions(**kwargs)
+
+    assert first == second
+    assert first["relation"] == "claim_support_more_conservative"
+    assert first["categories"] == ["provenance_support_disagreement"]
+    assert first["reason_codes"] == [
+        "material_counterevidence_present",
+        "unknown_freshness",
+    ]
+    assert set(first) == {
+        "status",
+        "existing_disposition",
+        "claim_support_disposition",
+        "relation",
+        "categories",
+        "reason_codes",
+    }
+    serialized = json.dumps(first, sort_keys=True)
+    for prohibited in (
+        "PRIVATE CLAIM SENTINEL",
+        "PRIVATE SOURCE VALUE",
+        "provider prompt",
+        "user message",
+        "scratchpad",
+    ):
+        assert prohibited not in serialized
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("semantic_case", ["rational_values", "operational_prose"])
+@pytest.mark.parametrize(
+    "semantic_case",
+    ["rational_values", "operational_prose", "unsupported_speculation"],
+)
 async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
     tmp_path,
     semantic_case,
@@ -16065,6 +16318,9 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
                 proposed_claim=proposed_claim,
                 evidence_ref_id=ref_id,
                 derivation_requests=derivations,
+                supporting_evidence_ref_ids=(
+                    [] if semantic_case == "unsupported_speculation" else None
+                ),
             ),
         ]
     )
@@ -16144,6 +16400,24 @@ async def test_general_evidence_reasoning_is_shadow_only_across_semantic_cases(
     assert trace["cr_call_count"] == 1
     assert trace["bms_persistence_status"] == "persisted"
     assert trace["presented_to_user"] is False
+    comparison = trace["decision_comparison"]
+    assert comparison["status"] == "compared"
+    if semantic_case == "rational_values":
+        assert comparison["existing_disposition"] == "allowed"
+        assert comparison["claim_support_disposition"] == "qualified"
+        assert comparison["relation"] == "claim_support_more_conservative"
+        assert comparison["categories"] == []
+    elif semantic_case == "operational_prose":
+        assert comparison["existing_disposition"] == "allowed"
+        assert comparison["claim_support_disposition"] == "allowed"
+        assert comparison["relation"] == "equivalent"
+        assert comparison["categories"] == ["equivalent_decision"]
+    else:
+        assert comparison["existing_disposition"] == "allowed"
+        assert comparison["claim_support_disposition"] == "withheld"
+        assert comparison["relation"] == "claim_support_more_conservative"
+        assert comparison["categories"] == ["provenance_support_disagreement"]
+        assert comparison["reason_codes"] == ["no_supporting_evidence"]
     serialized_trace = json.dumps(memory_store.trace_calls, sort_keys=True)
     serialized_v2 = json.dumps(v2_calls[0], sort_keys=True)
     for prohibited in (
@@ -16203,6 +16477,123 @@ def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed(
     ]
     assert len(structured_metadata) == 1
     assert structured_limited is False
+
+
+@pytest.mark.asyncio
+async def test_general_evidence_reasoning_combines_structured_and_prose_with_conflict(
+    tmp_path,
+):
+    _, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_reasoning:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    question = "Assess the bounded rollout record."
+    text_ref = "neutral_records:item_1"
+    context_pack = _neutral_reasoning_context_pack(
+        query=question,
+        text="The rollout started Monday and was paused Tuesday.",
+    )
+    structured_payload = _aggregate_structured_response()["results"][0]
+    structured_payload["structured_data"]["field_name"] = "Status"
+    structured_payload["structured_data"]["values"] = ["started", "paused"]
+    structured_payload["structured_data"]["record_count"] = 2
+    structured_payload["structured_data"]["non_empty_value_count"] = 2
+    structured_item = DsaContextItem.model_validate(structured_payload)
+    structured_ref = governed_external_reference_id(structured_item.source_ref)
+    plan = PlanResult.model_validate(
+        _targeted_plan_response(
+            request_id="rid-mixed-reasoning",
+            question=question,
+            eligible_source_ids=["neutral_records"],
+        )["result"]
+    )
+    state = EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="sufficient_for_declared_scope",
+        request_id="rid-mixed-reasoning",
+        manifest_id="manifest-mixed-reasoning",
+        plan=plan,
+        sufficiency=SufficiencyResult.model_validate(
+            {
+                "evaluation_id": "evaluation-mixed-reasoning",
+                "task_shape": "targeted_lookup",
+                "sufficiency_status": "sufficient_for_declared_scope",
+                "evaluated_requirements": [
+                    {
+                        "requirement_id": item.requirement_id,
+                        "requirement_kind": item.requirement_kind,
+                        "criticality": item.criticality,
+                        "effective_outcome": "satisfied",
+                    }
+                    for item in plan.declared_requirements
+                ],
+                "reason_codes": ["all_declared_requirements_satisfied"],
+                "answer_constraints": [],
+                "qualification_required": False,
+                "additional_acquisition_required": False,
+                "user_safe_summary": "The bounded evidence is sufficient.",
+            }
+        ),
+        reasoning_structured_evidence=[structured_item],
+    )
+    completion = _general_reasoning_completion(
+        proposed_claim="The bounded records show a start followed by a pause.",
+        evidence_ref_id=text_ref,
+        counterevidence_ref_ids=[structured_ref],
+    )
+    provider = SequenceLiteLLM([completion])
+    runtime = FakeRuntime()
+
+    result = await _run_general_evidence_reasoning(
+        enabled=True,
+        request_id="rid-mixed-reasoning",
+        request_text=question,
+        owner_id="owner",
+        conversation_id="conv-1",
+        surface="node_red",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        state=state,
+        context_pack=context_pack,
+        retained_source_refs=[text_ref],
+        litellm=provider,
+        runtime=runtime,
+        model_registry_path=str(models),
+        timeout_ms=5000,
+        local_only=False,
+        routing_policy={},
+        effective_payload={},
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+    )
+
+    supplied = json.loads(provider.calls[0]["messages"][1]["content"])[
+        "authorized_evidence"
+    ]
+    assert {item["evidence_ref_id"] for item in supplied} == {
+        text_ref,
+        structured_ref,
+    }
+    assert {item.get("content_type", "text") for item in supplied} == {
+        "text",
+        "structured_field_values",
+    }
+    assert runtime.claim_support_calls[0]["proposal"][
+        "counterevidence_ref_ids"
+    ] == [structured_ref]
+    assert result["cr_result"]["calibration_status"] == "limited"
+    assert result["cr_result"]["conclusion_disposition"] == "qualified"
+    assert result["cr_result"]["limitation_codes"] == [
+        "declared_counterevidence"
+    ]
+    assert result["trace"]["reasoning_provider_call_count"] == 1
+    assert result["trace"]["cr_call_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -16303,8 +16694,129 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
     assert trace["reasoning_provider_call_count"] == 1
     assert trace["validation_status"] == "failed"
     assert trace["bms_persistence_status"] == "not_attempted"
+    assert trace["decision_comparison"] == {
+        "status": "not_available",
+        "existing_disposition": "allowed",
+        "claim_support_disposition": None,
+        "relation": "unavailable",
+        "categories": [],
+        "reason_codes": ["claim_support_decision_unavailable"],
+    }
     assert "PRIVATE SHADOW TIMEOUT" not in json.dumps(
         memory_store.trace_calls, sort_keys=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_general_evidence_reasoning_cannot_override_consequence_authority(
+    tmp_path,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_reasoning:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    question = "Should the controlled deployment be approved?"
+    excerpt = "The bounded deployment record was retained."
+    runtime = FakeRuntime(
+        evidence_plan_response=_targeted_plan_response(
+            request_id="rid-consequence-shadow",
+            question=question,
+            eligible_source_ids=["neutral_records"],
+        )
+    )
+    runtime.interaction_governance_response["result"][
+        "interaction_kind"
+    ] = "high_impact_decision"
+    provider = SequenceLiteLLM(
+        [
+            _provider_completion(
+                _evidence_candidate(("neutral_records:item_1", excerpt))
+            ),
+            _general_reasoning_completion(
+                proposed_claim="The deployment should be approved.",
+                evidence_ref_id="neutral_records:item_1",
+            )
+        ]
+    )
+    dsa = FakeDSA(
+        response=_neutral_reasoning_context_pack(query=question, text=excerpt),
+        source_response={
+            "sources": [
+                {
+                    "source_id": "neutral_records",
+                    "display_name": "Neutral records",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["neutral"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["search"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-08-20T00:00:00Z",
+                    "last_error": None,
+                }
+            ]
+        },
+    )
+    memory_store = ClaimCaptureMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=provider,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_timeout_ms=5000,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-consequence-shadow",
+    )
+
+    assert out["status"] == "ok"
+    assert "deployment should be approved" not in out["answer"].lower()
+    assert out.get("pending_action") is None
+    reasoning_calls = [
+        call
+        for call in provider.calls
+        if call.get("response_format", {}).get("json_schema", {}).get("name")
+        == "general_evidence_reasoning_proposal"
+    ]
+    assert len(reasoning_calls) == 1
+    assert reasoning_calls[0]["tools"] == []
+    assert len(dsa.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    assert authority["consequence_policy_allows_claim"] is False
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert trace["cr_conclusion_disposition"] == "withheld"
+    assert trace["decision_comparison"] == {
+        "status": "compared",
+        "existing_disposition": "allowed",
+        "claim_support_disposition": "withheld",
+        "relation": "claim_support_more_conservative",
+        "categories": [],
+        "reason_codes": ["consequence_policy_disallows_claim"],
+    }
+    assert trace["decision_comparison"]["categories"] != [
+        "claim_support_overpermissive"
+    ]
+    assert all(
+        call["payload"]["presented_to_user"] is False
+        for call in memory_store.claim_record_calls
+        if call["payload"]["schema_version"] == "claim-record.v2"
     )
 
 
@@ -21277,6 +21789,22 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
         "reasoning_provider_call_count"
     ] == 1
     assert final_prompt["general_evidence_reasoning"]["cr_call_count"] == 1
+    comparison = final_prompt["general_evidence_reasoning"]["decision_comparison"]
+    assert comparison["status"] == "compared"
+    assert comparison["existing_disposition"] == "withheld"
+    assert comparison["claim_support_disposition"] == "qualified"
+    assert comparison["relation"] == "claim_support_more_permissive"
+    assert comparison["categories"] == [
+        "claim_support_more_useful",
+        "existing_enumeration_blocked",
+        "interpretation_disagreement",
+        "provenance_support_disagreement",
+    ]
+    assert comparison["reason_codes"] == [
+        "material_exclusion",
+        "model_interpreted_derivation",
+        "numeric_representation_rejected",
+    ]
     v2_calls = [
         call
         for call in memory_store.claim_record_calls
@@ -21306,6 +21834,74 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
     for value in structured["values"]:
         assert value not in trace_serialized
     assert "scratchpad" not in trace_serialized
+
+
+@pytest.mark.asyncio
+async def test_unfamiliar_structured_values_remain_available_for_shadow_reasoning(
+    tmp_path,
+):
+    response = _aggregate_structured_response()
+    structured = response["results"][0]["structured_data"]
+    structured["record_count"] = 4
+    structured["non_empty_value_count"] = 4
+    structured["values"] = ["half", "three quarters", "full", "unclear"]
+    evidence_ref_id = governed_external_reference_id(
+        response["results"][0]["source_ref"]
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim="The usable entries support a qualified bounded summary.",
+        evidence_ref_id=evidence_ref_id,
+        material_exclusions=[
+            {
+                "evidence_ref_id": evidence_ref_id,
+                "reason": "One entry remained ambiguous.",
+            }
+        ],
+    )
+
+    out, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=reasoning_completion,
+        request_id="rid-unfamiliar-structured-shadow",
+    )
+
+    assert "4 values failed the required numeric validation" in out["answer"]
+    assert "qualified bounded summary" not in out["answer"]
+    reasoning_call = next(
+        call
+        for call in litellm.calls
+        if call.get("response_format", {}).get("json_schema", {}).get("name")
+        == "general_evidence_reasoning_proposal"
+    )
+    reasoning_input = json.loads(reasoning_call["messages"][1]["content"])
+    assert reasoning_input["authorized_evidence"][0]["structured_data"][
+        "values"
+    ] == structured["values"]
+    assert len(dsa.context_calls) == 1
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert len(runtime.claim_support_calls) == 1
+    assert runtime.claim_support_calls[0]["proposal"][
+        "executed_derivation_ref_ids"
+    ] == []
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert trace["cr_conclusion_disposition"] == "qualified"
+    assert trace["decision_comparison"]["relation"] == (
+        "claim_support_more_permissive"
+    )
+    assert trace["decision_comparison"]["categories"] == [
+        "claim_support_more_useful",
+        "existing_enumeration_blocked",
+        "provenance_support_disagreement",
+    ]
+    assert trace["reasoning_provider_call_count"] == 1
+    assert trace["cr_call_count"] == 1
+    assert trace["derivation_executed_count"] == 0
+    assert out.get("pending_action") is None
 
 
 @pytest.mark.asyncio
