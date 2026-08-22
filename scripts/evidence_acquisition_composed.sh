@@ -4271,7 +4271,9 @@ run_evidence_scope_reference_scenarios() {
   serialized="$(jq -c . <<<"$response")$(jq -c '
     del(
       .prompt.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
-      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition
+      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
+      .prompt.general_evidence_reasoning.cr_conclusion_disposition,
+      .retrieval.prompt_assembly.general_evidence_reasoning.cr_conclusion_disposition
     )
   ' <<<"$trace")"
   case "$serialized" in
@@ -4290,7 +4292,9 @@ run_evidence_scope_reference_scenarios() {
   serialized="$(jq -c . <<<"$history")$(jq -c '
     del(
       .prompt.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
-      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition
+      .retrieval.prompt_assembly.evidence_acquisition.next_steps.selections[]?.conclusion_disposition,
+      .prompt.general_evidence_reasoning.cr_conclusion_disposition,
+      .retrieval.prompt_assembly.general_evidence_reasoning.cr_conclusion_disposition
     )
   ' <<<"$history_trace")"
   case "$serialized" in
