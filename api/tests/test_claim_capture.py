@@ -11,6 +11,8 @@ from services.claim_capture import (
     bind_assistant_message,
     calibrate_claim_capture,
     claim_record_payload,
+    claim_support_record_payload,
+    claim_support_record_response_valid,
     finish_claim_record_persistence,
     prepare_claim_capture,
     shadow_claim_record_payload,
@@ -54,6 +56,9 @@ def test_claim_capture_is_disabled_by_default_and_needs_runtime_configuration():
 
 def test_general_evidence_reasoning_is_default_off_and_requires_governed_dependencies():
     assert _settings().general_evidence_reasoning_enabled is False
+    assert _settings().general_evidence_reasoning_presentation_enabled is False
+    with pytest.raises(ValueError, match="presentation requires general evidence"):
+        _settings(GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED=True)
     with pytest.raises(ValueError, match="requires evidence acquisition"):
         _settings(GENERAL_EVIDENCE_REASONING_ENABLED=True)
     configured = _settings(
@@ -65,6 +70,20 @@ def test_general_evidence_reasoning_is_default_off_and_requires_governed_depende
         DSA_ENABLED=True,
     )
     assert configured.general_evidence_reasoning_enabled is True
+
+
+def test_general_evidence_reasoning_presentation_requires_complete_dependencies():
+    configured = _settings(
+        GENERAL_EVIDENCE_REASONING_ENABLED=True,
+        GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED=True,
+        CLAIM_RECORD_CAPTURE_ENABLED=True,
+        EVIDENCE_ACQUISITION_ENABLED=True,
+        COGNITIVE_RUNTIME_BASE_URL="http://runtime",
+        COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=True,
+        DSA_ENABLED=True,
+    )
+
+    assert configured.general_evidence_reasoning_presentation_enabled is True
 
 
 def _public_source(*, ref_id: str = "derived-text-1"):
@@ -241,6 +260,40 @@ def test_shadow_claim_response_validation_is_exact_and_v1_payload_unchanged():
         expected_payload=payload,
         response={"created": False, "record": record},
     )
+
+
+def test_presented_claim_support_payload_and_response_preserve_same_v2_contract():
+    payload = claim_support_record_payload(
+        reasoning_result=_shadow_result(),
+        presented_to_user=True,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        assistant_message_id="message-1",
+        surface="desktop_private",
+        runtime_session_id="session-1",
+        runtime_turn_id="turn-1",
+        acquisition_manifest_id="manifest-1",
+    )
+
+    assert payload is not None
+    assert payload["presented_to_user"] is True
+    record = {
+        "claim_id": payload["calibration_result"]["claim_id"],
+        **{key: value for key, value in payload.items() if key != "calibration_result"},
+        **{
+            key: value
+            for key, value in payload["calibration_result"].items()
+            if key != "claim_id"
+        },
+        "created_at": "2026-08-22T12:00:00+00:00",
+    }
+    assert claim_support_record_response_valid(
+        expected_payload=payload,
+        response={"created": True, "record": record},
+    )
+    assert payload["support"]["conclusion_disposition"] == "qualified"
+    assert payload["calibration_result"]["strongest_authority"] == "unknown"
 
 
 def _manifest(state, *, final_answer=None, **overrides):

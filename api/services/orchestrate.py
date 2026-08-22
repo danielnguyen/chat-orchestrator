@@ -49,12 +49,12 @@ from services.claim_capture import (
     bind_assistant_message,
     calibrate_claim_capture,
     claim_record_payload,
+    claim_support_record_payload,
+    claim_support_record_response_valid,
     finish_claim_record_persistence,
     governed_external_reference_id,
     mark_trace_status_update_failed,
     prepare_claim_capture,
-    shadow_claim_record_payload,
-    shadow_claim_record_response_valid,
 )
 from services.claim_explanation import (
     ClaimExplanationOutcome,
@@ -7058,7 +7058,167 @@ def _compare_authority_decisions(
     return comparison
 
 
-def _general_evidence_reasoning_trace(*, enabled: bool) -> dict[str, Any]:
+def _render_claim_support_qualification(
+    *,
+    reasoning_result: dict[str, Any],
+) -> str:
+    result = reasoning_result.get("cr_result")
+    authority = reasoning_result.get("authority_context")
+    executions = reasoning_result.get("executions")
+    if not isinstance(result, dict):
+        result = {}
+    if not isinstance(authority, dict):
+        authority = {}
+    if not isinstance(executions, list):
+        executions = []
+    limitations = {
+        value for value in result.get("limitation_codes", []) if isinstance(value, str)
+    }
+    reasons: list[str] = []
+    if "interpretation-dependent-derivation" in limitations or any(
+        isinstance(record, dict)
+        and record.get("input_basis") == "model_interpreted"
+        for record in executions
+    ):
+        reasons.append("some evidence required interpretation")
+    if (
+        result.get("validated_counterevidence_ref_ids")
+        or result.get("validated_material_exclusions")
+        or limitations
+        & {
+            "material_counterevidence",
+            "material_evidence_omission",
+            "support_exclusion",
+        }
+    ):
+        reasons.append("some relevant evidence was conflicting or excluded")
+    if authority.get("material_acquisition_limited") is True or limitations & {
+        "complete_scope_not_established",
+        "material_acquisition_limitation",
+        "material_acquisition_limited",
+    }:
+        reasons.append("the available evidence was bounded or incomplete")
+    if limitations & {
+        "limited_source_authority",
+        "unknown_source_authority",
+        "stale_evidence",
+        "unknown_freshness",
+    }:
+        reasons.append("the available source support or freshness was limited")
+    if not reasons:
+        reasons.append("the available support has material limitations")
+    return "Treat this as qualified rather than exact because " + "; ".join(reasons) + "."
+
+
+def _select_claim_support_presentation(
+    *,
+    enabled: bool,
+    reasoning_result: dict[str, Any],
+    privacy_suppressed: bool,
+    consequence_policy_allows_claim: bool,
+    action_related: bool,
+    response_composition_supported: bool = True,
+) -> tuple[dict[str, Any], str | None]:
+    presentation = {
+        "enabled": enabled,
+        "status": "disabled" if not enabled else "not_available",
+        "reason_code": "disabled" if not enabled else "generic_result_unavailable",
+        "qualification_applied": False,
+    }
+    if not enabled:
+        return presentation, None
+    proposal = reasoning_result.get("proposal")
+    result = reasoning_result.get("cr_result")
+    authority = reasoning_result.get("authority_context")
+    executions = reasoning_result.get("executions")
+    if not all(isinstance(value, dict) for value in (proposal, result, authority)):
+        return presentation, None
+    if not isinstance(executions, list):
+        return presentation, None
+    disposition = result.get("conclusion_disposition")
+    qualification_required = result.get("qualification_required")
+    if disposition not in {"allowed", "qualified"}:
+        presentation.update(
+            {"status": "ineligible", "reason_code": "claim_support_withheld"}
+        )
+        return presentation, None
+    if qualification_required is not (disposition == "qualified"):
+        presentation.update(
+            {"status": "ineligible", "reason_code": "claim_support_incoherent"}
+        )
+        return presentation, None
+    if privacy_suppressed or authority.get("privacy_policy_allows_claim") is not True:
+        presentation.update(
+            {"status": "ineligible", "reason_code": "privacy_suppressed"}
+        )
+        return presentation, None
+    if (
+        not consequence_policy_allows_claim
+        or authority.get("consequence_policy_allows_claim") is not True
+    ):
+        presentation.update(
+            {"status": "ineligible", "reason_code": "consequence_disallowed"}
+        )
+        return presentation, None
+    if action_related:
+        presentation.update(
+            {"status": "ineligible", "reason_code": "action_related"}
+        )
+        return presentation, None
+    if not response_composition_supported:
+        presentation.update(
+            {"status": "ineligible", "reason_code": "response_composition_ineligible"}
+        )
+        return presentation, None
+    supporting_refs = {
+        value
+        for value in result.get("validated_supporting_evidence_ref_ids", [])
+        if isinstance(value, str)
+    }
+    authorized_refs = {
+        item.get("ref_id")
+        for item in authority.get("evidence_references", [])
+        if isinstance(item, dict) and isinstance(item.get("ref_id"), str)
+    }
+    executed_ids = {
+        value
+        for value in result.get("validated_executed_derivation_ref_ids", [])
+        if isinstance(value, str)
+    }
+    derivation_support = any(
+        isinstance(record, dict)
+        and record.get("derivation_id") in executed_ids
+        and bool(record.get("supporting_evidence_ref_ids"))
+        and set(record["supporting_evidence_ref_ids"]) <= authorized_refs
+        for record in executions
+    )
+    if not supporting_refs and not derivation_support:
+        presentation.update(
+            {"status": "ineligible", "reason_code": "validated_support_absent"}
+        )
+        return presentation, None
+    claim = proposal.get("proposed_claim")
+    if not isinstance(claim, str) or not claim:
+        return presentation, None
+    answer = claim
+    if disposition == "qualified":
+        qualification = _render_claim_support_qualification(
+            reasoning_result=reasoning_result
+        )
+        answer = f"{claim}\n\n{qualification}"
+    presentation.update(
+        {
+            "status": "presented",
+            "reason_code": f"claim_support_{disposition}",
+            "qualification_applied": disposition == "qualified",
+        }
+    )
+    return presentation, answer
+
+
+def _general_evidence_reasoning_trace(
+    *, enabled: bool, presentation_enabled: bool = False
+) -> dict[str, Any]:
     return {
         "enabled": enabled,
         "eligibility_status": "not_evaluated" if enabled else "disabled",
@@ -7080,6 +7240,14 @@ def _general_evidence_reasoning_trace(*, enabled: bool) -> dict[str, Any]:
         "runtime_session_id": None,
         "runtime_turn_id": None,
         "presented_to_user": False,
+        "presentation": {
+            "enabled": presentation_enabled,
+            "status": "disabled" if not presentation_enabled else "not_available",
+            "reason_code": (
+                "disabled" if not presentation_enabled else "generic_result_unavailable"
+            ),
+            "qualification_applied": False,
+        },
         "reasoning_context_limited": False,
         "decision_comparison": _compare_authority_decisions(
             existing_conclusion_disposition=None,
@@ -7203,6 +7371,7 @@ def _bounded_reasoning_evidence(
 async def _run_general_evidence_reasoning(
     *,
     enabled: bool,
+    presentation_enabled: bool = False,
     request_id: str,
     request_text: str,
     owner_id: str,
@@ -7223,7 +7392,10 @@ async def _run_general_evidence_reasoning(
     privacy_suppressed: bool,
     consequence_policy_allows_claim: bool,
 ) -> dict[str, Any]:
-    trace = _general_evidence_reasoning_trace(enabled=enabled)
+    trace = _general_evidence_reasoning_trace(
+        enabled=enabled,
+        presentation_enabled=presentation_enabled,
+    )
     output: dict[str, Any] = {"trace": trace}
     if not enabled:
         return output
@@ -7978,6 +8150,7 @@ async def orchestrate_chat(
     claim_record_capture_enabled: bool = False,
     evidence_acquisition_enabled: bool = False,
     general_evidence_reasoning_enabled: bool | None = None,
+    general_evidence_reasoning_presentation_enabled: bool | None = None,
     general_evidence_reasoning_timeout_ms: int | None = None,
     history_followup_enabled: bool = False,
     intent_classifier_timeout_ms: int = 3000,
@@ -7995,6 +8168,7 @@ async def orchestrate_chat(
 ) -> dict[str, Any]:
     if (
         general_evidence_reasoning_enabled is None
+        or general_evidence_reasoning_presentation_enabled is None
         or general_evidence_reasoning_timeout_ms is None
     ):
         try:
@@ -8012,6 +8186,12 @@ async def orchestrate_chat(
                 configured_settings.general_evidence_reasoning_timeout_ms
                 if configured_settings is not None
                 else 5000
+            )
+        if general_evidence_reasoning_presentation_enabled is None:
+            general_evidence_reasoning_presentation_enabled = (
+                configured_settings.general_evidence_reasoning_presentation_enabled
+                if configured_settings is not None
+                else False
             )
     started = perf_counter()
     evaluated_at = datetime.now(UTC)
@@ -11479,6 +11659,9 @@ async def orchestrate_chat(
         references = _trace_references(retrieval_bundle)
         general_evidence_reasoning = await _run_general_evidence_reasoning(
             enabled=bool(general_evidence_reasoning_enabled),
+            presentation_enabled=bool(
+                general_evidence_reasoning_presentation_enabled
+            ),
             request_id=request_id,
             request_text=last_user_text,
             owner_id=payload["owner_id"],
@@ -11514,6 +11697,48 @@ async def orchestrate_chat(
             reference_identity = {"ref_type": "external_source", "ref_id": ref_id}
             if reference_identity not in references:
                 references.append(reference_identity)
+        capability_execution = prompt.trace.get("capabilities", {}).get(
+            "execution", {}
+        )
+        capability_match = capability_registry_trace.get("match", {})
+        action_related = any(
+            (
+                pending_action is not None,
+                pending_continuation is not None,
+                pending_capability_request is not None,
+                capability_request is not None,
+                isinstance(capability_execution, dict)
+                and (
+                    capability_execution.get("executor_called") is True
+                    or capability_execution.get("dispatch_completed") is True
+                ),
+                isinstance(capability_match, dict)
+                and capability_match.get("matched") is True,
+            )
+        )
+        presentation_trace, generic_presented_answer = (
+            _select_claim_support_presentation(
+                enabled=bool(general_evidence_reasoning_presentation_enabled),
+                reasoning_result=general_evidence_reasoning,
+                privacy_suppressed=(
+                    privacy_prompt_suppressed or privacy_boundary.enforced
+                ),
+                consequence_policy_allows_claim=(
+                    interaction_kind != "high_impact_decision"
+                ),
+                action_related=action_related,
+                response_composition_supported=(
+                    not compound_verification_requested
+                    and brief_metadata.get("enabled") is not True
+                ),
+            )
+        )
+        generic_presented = generic_presented_answer is not None
+        general_evidence_reasoning["trace"]["presentation"] = presentation_trace
+        general_evidence_reasoning["trace"]["presented_to_user"] = generic_presented
+        prompt.trace["general_evidence_reasoning"] = general_evidence_reasoning[
+            "trace"
+        ]
         trusted_governed_claim = None
         if (
             governed_validation is not None
@@ -11531,6 +11756,7 @@ async def orchestrate_chat(
                 )
         claim_capture_trace_enabled = (
             claim_record_capture_enabled
+            and not generic_presented
             and not advisory_evidence_provider_call
             and diagnostic_response is None
             and (
@@ -11607,6 +11833,10 @@ async def orchestrate_chat(
                 evidence_acquisition,
             )
         )
+        if generic_presented_answer is not None:
+            answer = generic_presented_answer
+            answer_sources = []
+            artifact_refs_for_sources = []
         if compound_verification_requested:
             if history_followup_enabled:
                 history_followup_trace["fresh_verification_entry_status"] = (
@@ -11889,9 +12119,10 @@ async def orchestrate_chat(
             if isinstance(assistant_message_ack, dict)
             else None
         )
-        shadow_record_payload = (
-            shadow_claim_record_payload(
-                shadow_result=general_evidence_reasoning,
+        support_record_payload = (
+            claim_support_record_payload(
+                reasoning_result=general_evidence_reasoning,
+                presented_to_user=generic_presented,
                 request_id=request_id,
                 owner_id=payload["owner_id"],
                 conversation_id=conversation_id,
@@ -11910,21 +12141,24 @@ async def orchestrate_chat(
             if isinstance(assistant_message_id, str)
             else None
         )
-        if shadow_record_payload is not None:
+        if support_record_payload is not None:
             try:
-                shadow_record_response = await memory_store.create_claim_record(
+                support_record_response = await memory_store.create_claim_record(
                     request_id=request_id,
-                    payload=shadow_record_payload,
+                    payload=support_record_payload,
                 )
-                shadow_persisted = shadow_claim_record_response_valid(
-                    expected_payload=shadow_record_payload,
-                    response=shadow_record_response,
+                support_persisted = claim_support_record_response_valid(
+                    expected_payload=support_record_payload,
+                    response=support_record_response,
                 )
             except Exception:
-                shadow_persisted = False
+                support_persisted = False
             general_evidence_reasoning["trace"]["bms_persistence_status"] = (
-                "persisted" if shadow_persisted else "failed"
+                "persisted" if support_persisted else "failed"
             )
+            if generic_presented and not support_persisted:
+                status = "degraded"
+                trace_payload["status"] = "degraded"
             prompt.trace["general_evidence_reasoning"] = (
                 general_evidence_reasoning["trace"]
             )

@@ -6250,11 +6250,17 @@ run_step13_diagnostic_scenarios() {
 run_general_evidence_reasoning_shadow_scenario() {
   local owner client conversation_id question external response request_id answer
   local trace manifest provider_calls audit diagnostics claim_records proposal history
+  local presentation_expected="${1:-false}"
   local source_ref="google_sheets:metrics_archive:Measurements!A2:C6"
   local evidence_ref_id
   evidence_ref_id="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
-  owner="owner-general-reasoning-shadow"
-  client="client-general-reasoning-shadow"
+  if [[ "$presentation_expected" == "true" ]]; then
+    owner="owner-general-reasoning-presentation"
+    client="client-general-reasoning-presentation"
+  else
+    owner="owner-general-reasoning-shadow"
+    client="client-general-reasoning-shadow"
+  fi
   question="What is the mean Entry in the Configured Metrics Archive?"
   external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
 
@@ -6327,7 +6333,7 @@ run_general_evidence_reasoning_shadow_scenario() {
     }')"
   queue_provider_answer "$proposal"
 
-  conversation_id="$(resolve_conversation "$owner" "$client" "general-reasoning-shadow")"
+  conversation_id="$(resolve_conversation "$owner" "$client" "general-reasoning-$presentation_expected")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
   answer="$(jq -er '.answer' <<<"$response")"
@@ -6347,7 +6353,17 @@ run_general_evidence_reasoning_shadow_scenario() {
       <<<"$manifest" >&2
   fi
   assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
-  if ! assert_jq "general_reasoning.response.boundary" "$response" '
+  if [[ "$presentation_expected" == "true" ]]; then
+    assert_jq "general_reasoning.response.presentation" "$response" '
+      (.answer | startswith("A mean was mechanically computed over model-interpreted operands.\n\n"))
+      and (.answer | contains("Treat this as qualified rather than exact because"))
+      and (.answer | contains("some evidence required interpretation"))
+      and (.answer | contains("some relevant evidence was conflicting or excluded"))
+      and (.answer | contains("5 values failed the required numeric validation") | not)
+      and (.answer | contains("My best guess is") | not)
+      and .sources == []
+    '
+  elif ! assert_jq "general_reasoning.response.boundary" "$response" '
     (.answer | contains("5 values failed the required numeric validation"))
     and (.answer | contains("My best guess is"))
     and (.answer | contains("A useful next step would be"))
@@ -6364,11 +6380,13 @@ run_general_evidence_reasoning_shadow_scenario() {
     }' <<<"$response" >&2
     return 1
   fi
-  assert_jq "general_reasoning.response.shadow_absent" "$response" '
-    (.answer | contains("mechanically computed") | not)
-    and (.answer | contains("Mean for") | not)
-    and .sources == []
-  '
+  if [[ "$presentation_expected" == "false" ]]; then
+    assert_jq "general_reasoning.response.shadow_absent" "$response" '
+      (.answer | contains("mechanically computed") | not)
+      and (.answer | contains("Mean for") | not)
+      and .sources == []
+    '
+  fi
   assert_jq "general_reasoning.response.action" "$response" '.pending_action == null'
   if ! jq -e '
     .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
@@ -6404,12 +6422,17 @@ run_general_evidence_reasoning_shadow_scenario() {
       "unknown_freshness"
     ]
     and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
-    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and .prompt.general_evidence_reasoning.presented_to_user == $presented
+    and .prompt.general_evidence_reasoning.presentation.enabled == $presented
+    and .prompt.general_evidence_reasoning.presentation.status
+      == (if $presented then "presented" else "disabled" end)
+    and .prompt.general_evidence_reasoning.presentation.qualification_applied
+      == $presented
     and (.prompt.general_evidence_reasoning.claim_digest | test("^sha256:[0-9a-f]{64}$"))
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
     and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
     and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
-  '
+  ' --argjson presented "$presentation_expected"
   assert_jq "general_reasoning.manifest" "$manifest" '
     .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
@@ -6452,7 +6475,12 @@ run_general_evidence_reasoning_shadow_scenario() {
   assert_jq "general_reasoning.claim_record" "$claim_records" '
     [.records[] | select(.schema_version == "claim-record.v2")] as $records
     | ($records | length) == 1
-    and $records[0].presented_to_user == false
+    and ([.records[] | select(.schema_version == "claim-record.v1")] | length) == 0
+    and $records[0].presented_to_user == $presented
+    and (($presented | not) or (
+      $records[0].claim_anchor == ($answer | split("\n\n")[0])
+      and $records[0].claim_anchor_digest == $digest
+    ))
     and $records[0].support.calibration_status == "limited"
     and $records[0].support.conclusion_disposition == "qualified"
     and $records[0].support.qualification_required == true
@@ -6469,7 +6497,9 @@ run_general_evidence_reasoning_shadow_scenario() {
       | all(.support_kind == "contextual"
         and .authority == "unknown"
         and .freshness_state == "unknown_freshness"))
-  '
+  ' --argjson presented "$presentation_expected" \
+    --arg answer "$answer" \
+    --arg digest "$(jq -r '.prompt.general_evidence_reasoning.claim_digest' <<<"$trace")"
   case "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" in
     *alpha*|*beta*|*gamma*|*delta*|*epsilon*|*"mechanically computed"*|*"provider prompt"*|*scratchpad*)
       echo "General evidence reasoning trace exposed semantic/source prose" >&2
@@ -6482,14 +6512,29 @@ run_general_evidence_reasoning_shadow_scenario() {
     -H "X-Request-ID: general-reasoning-shadow-history" \
     -H "Content-Type: application/json" \
     -d "{\"schema_version\":\"immediate-history-resolution.v2\",\"request_id\":\"general-reasoning-shadow-history\",\"owner_id\":\"$owner\",\"conversation_id\":\"$conversation_id\",\"surface\":\"chat\",\"explanation_kind\":\"support\"}")"
-  assert_jq "general_reasoning.history" "$history" '
-    .resolution_status == "no_record"
-    and .match_count == 0
-    and .reason_code == "direct_record_absent_lineage_absent"
-    and .record == null
-  '
+  if [[ "$presentation_expected" == "true" ]]; then
+    assert_jq "general_reasoning.history.presented" "$history" '
+      .resolution_status == "resolved"
+      and .match_count == 1
+      and .reason_code == "support_record_resolved"
+      and .record.support_record.schema_version == "claim-record.v2"
+      and .record.support_record.presented_to_user == true
+      and .record.support_record.support.conclusion_disposition == "qualified"
+    '
+  else
+    assert_jq "general_reasoning.history.shadow" "$history" '
+      .resolution_status == "no_record"
+      and .match_count == 0
+      and .reason_code == "direct_record_absent_lineage_absent"
+      and .record == null
+    '
+  fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
+  if [[ "$presentation_expected" == "true" ]]; then
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=4 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+  else
+    echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
+  fi
 }
 
 run_authority_comparison_incomplete_scope_case() {
@@ -6872,6 +6917,12 @@ run_evidence_acquisition_composed_suite() {
     general-reasoning-shadow)
       run_authority_decision_comparison_corpus
       echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-shadow"
+      ;;
+    general-reasoning-presentation)
+      run_general_evidence_reasoning_shadow_scenario true
+      run_authority_comparison_consequence_case
+      run_authority_comparison_failure_case
+      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-presentation,consequence,failure"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario
