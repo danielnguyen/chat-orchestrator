@@ -48,5 +48,5 @@ logical_routes:
     model: gpt-5-mini
     provider: cloud
   evidence_reasoning:
-    model: gpt-5-mini
+    model: gpt-5.6-sol
     provider: cloud

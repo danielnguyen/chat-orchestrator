@@ -14153,7 +14153,7 @@ def _write_diagnostic_route_files(
     if include_reasoning:
         routes += (
             "  evidence_reasoning:\n"
-            "    model: gpt-5-mini\n"
+            "    model: gpt-5.6-sol\n"
             "    provider: cloud\n"
         )
     models.write_text(models.read_text(encoding="utf-8") + routes, encoding="utf-8")
@@ -22236,8 +22236,11 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
         == "general_evidence_reasoning_proposal"
     ]
     assert len(reasoning_calls) == 1
-    assert reasoning_calls[0]["reasoning_effort"] == "minimal"
-    assert reasoning_calls[0]["max_completion_tokens"] == 1200
+    assert reasoning_calls[0]["model"] == "gpt-5.6-sol"
+    assert reasoning_calls[0]["reasoning_effort"] == "medium"
+    assert reasoning_calls[0]["max_completion_tokens"] == 2048
+    assert reasoning_calls[0]["timeout_ms"] == 5000
+    assert reasoning_calls[0]["tools"] == []
     assert reasoning_calls[0]["response_format"] == (
         evidence_reasoning_response_format()
     )

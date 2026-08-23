@@ -34,6 +34,21 @@ def test_general_evidence_reasoning_uses_bounded_logical_route():
     )
 
     assert registry["logical_routes"]["evidence_reasoning"] == {
+        "model": "gpt-5.6-sol",
+        "provider": "cloud",
+    }
+
+
+def test_simpler_bounded_roles_remain_on_minimal_model_routes():
+    registry = yaml.safe_load(
+        (ROOT / "router" / "model_registry.yaml").read_text(encoding="utf-8")
+    )
+
+    assert registry["logical_routes"]["intent_classifier"] == {
+        "model": "gpt-5-mini",
+        "provider": "cloud",
+    }
+    assert registry["logical_routes"]["evidence_interpreter"] == {
         "model": "gpt-5-mini",
         "provider": "cloud",
     }
