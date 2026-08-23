@@ -605,6 +605,19 @@ retaining its existing bounded completion-token budget and timeout. This route
 parameter does not change conclusion authority, retries, fallback behavior, or
 user-visible permission.
 
+When a proposed claim materially uses a requested deterministic derivation,
+the provider places a structural derivation placeholder in the claim instead
+of authoring the mechanical result. The orchestrator resolves each placeholder
+only from the matching executed derivation record's `canonical_result`, then
+sends the materialized claim to Cognitive Runtime. Claim-support persistence
+and presentation use that same materialized claim. Every terminal derivation
+must be bound exactly once; unknown, duplicate, missing, or unresolved bindings
+fail closed without another provider call.
+
+This binding proves only that the substituted text came from deterministic
+execution. Evidence interpretation and the surrounding domain prose remain
+probabilistic; deterministic execution does not become a semantic truth oracle.
+
 The comparison is diagnostic only. It cannot change either authority decision,
 the visible response, source scope, acquisition, retries, provider routing,
 claim persistence, process-failure diagnosis, or tool and action execution.

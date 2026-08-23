@@ -102,6 +102,7 @@ from services.evidence_acquisition import (
     grounded_provider_allowed,
     helpful_grounded_recovery_allowed,
     ineligible_exact_evidence_state,
+    materialize_evidence_reasoning_claim,
     parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
     parse_evidence_reasoning_completion,
@@ -7571,6 +7572,20 @@ async def _run_general_evidence_reasoning(
                 "validation_status": "failed",
                 "reason_code": "proposal_invalid",
                 "failure_code": "derivation_contract_invalid",
+            }
+        )
+        return output
+    try:
+        proposal = materialize_evidence_reasoning_claim(proposal, executions)
+    except ValueError:
+        trace.update(
+            {
+                "validation_status": "failed",
+                "reason_code": "proposal_invalid",
+                "failure_code": "proposal_self_consistency_invalid",
+                "failure_detail_code": (
+                    "evidence_reasoning_derivation_claim_binding_invalid"
+                ),
             }
         )
         return output
