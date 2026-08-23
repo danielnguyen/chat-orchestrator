@@ -53,7 +53,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: 1e4b0d3ac83199520c0165db037a1436eec47370
+          ref: 20401b665e91ec4ffb1709f12b0fc175be5ff87b
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -61,7 +61,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/data-source-aggregator
-          ref: 342b731d8c239dad78ec77bfd6ace41916c20704
+          ref: 1fbe608477be9251419f5085162e4c5b7099afde
           path: data-source-aggregator
           fetch-depth: 0
 
@@ -69,15 +69,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553
+          ref: 8a08737653cd55e17e755fa9e3fa260253369e81
           path: basic-memory-store
           fetch-depth: 0
 
       - name: Establish pinned local main refs
         run: |
-          git -C cognitive-runtime branch --force main 1e4b0d3ac83199520c0165db037a1436eec47370
-          git -C data-source-aggregator branch --force main 342b731d8c239dad78ec77bfd6ace41916c20704
-          git -C basic-memory-store branch --force main e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553
+          git -C cognitive-runtime branch --force main 20401b665e91ec4ffb1709f12b0fc175be5ff87b
+          git -C data-source-aggregator branch --force main 1fbe608477be9251419f5085162e4c5b7099afde
+          git -C basic-memory-store branch --force main 8a08737653cd55e17e755fa9e3fa260253369e81
           git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD
 
       - name: Validate Compose configuration
@@ -103,6 +103,16 @@ jobs:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
           EVIDENCE_ACQUISITION_ONLY: "1"
           EVIDENCE_SCENARIO: ${{ github.event_name == 'workflow_dispatch' && inputs.evidence_scenario || 'all' }}
+        run: make composed-smoke
+
+      - name: Run formatted presentation persistence proof
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+          EVIDENCE_ACQUISITION_ONLY: "1"
+          EVIDENCE_SCENARIO: general-reasoning-presentation
+          COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED: "true"
+          COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED: "true"
         run: make composed-smoke
 
       - name: Run policy-admitted advisory evidence proof

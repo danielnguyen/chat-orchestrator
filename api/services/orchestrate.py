@@ -7140,6 +7140,7 @@ def _render_claim_support_qualification(
 _DERIVATION_PRESENTATION_PLACEHOLDER = re.compile(
     r"\{\{derivation:([a-z][a-z0-9_-]{0,63})\}\}"
 )
+_PRESENTATION_PARAGRAPH_SEPARATOR = re.compile(r"\r?\n[ \t]*\r?\n")
 _PRESENTATION_SIGNIFICANT_DIGITS = 4
 
 
@@ -7162,6 +7163,14 @@ def _format_deterministic_decimal_for_presentation(value: str) -> str:
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return "0" if rendered == "-0" else rendered
+
+
+def _visible_claim_digest(answer: str) -> str | None:
+    first_paragraph = _PRESENTATION_PARAGRAPH_SEPARATOR.split(answer, maxsplit=1)[0]
+    normalized = " ".join(first_paragraph.split())
+    if not normalized:
+        return None
+    return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _render_claim_for_presentation(
@@ -7319,11 +7328,17 @@ def _select_claim_support_presentation(
             reasoning_result=reasoning_result
         )
         answer = f"{answer}\n\n{qualification}"
+    visible_claim_digest = _visible_claim_digest(answer)
     presentation.update(
         {
             "status": "presented",
             "reason_code": f"claim_support_{disposition}",
             "qualification_applied": disposition == "qualified",
+            **(
+                {"visible_claim_digest": visible_claim_digest}
+                if visible_claim_digest is not None
+                else {}
+            ),
         }
     )
     return presentation, answer

@@ -1420,7 +1420,7 @@ run_evidence_advisory_scenario() {
     "high_impact" "dsa_status" "error" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.status // "missing"' <<<"$trace")"
   assert_evidence_advisory_equal \
-    "high_impact" "dsa_error_code" "http_500" \
+    "high_impact" "dsa_error_code" "source_unavailable" \
     "$(jq -r '.retrieval.prompt_assembly.dsa.error_code // "missing"' <<<"$trace")"
   assert_evidence_advisory_jq \
     "high_impact" "acquisition_failure_recorded" "$trace" \
@@ -1433,7 +1433,7 @@ run_evidence_advisory_scenario() {
       and .prompt.evidence_acquisition.diagnostic.status == "failed"
       and .prompt.evidence_acquisition.diagnostic.failure_reason == "malformed_response"
       and .prompt.evidence_acquisition.diagnostic.observation_count == 1
-      and .prompt.evidence_acquisition.diagnostic.observation_categories == ["http_status"]
+      and .prompt.evidence_acquisition.diagnostic.observation_categories == ["dependency_failure"]
       and .prompt.evidence_acquisition.diagnostic.render_mode == "facts_only"
     '
   assert_evidence_advisory_equal \
@@ -1471,7 +1471,7 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_jq \
     "high_impact" "facts_only_response_boundary" "$response" '
       .pending_action == null
-      and (.answer | contains("source service request failed with HTTP 500"))
+      and (.answer | contains("source lookup failed at its dependency boundary"))
       and (.answer | contains("Unverified guidance:") | not)
       and (.answer | contains("supports version 3.14") | not)
       and (.answer | contains("does not support version 3.14") | not)

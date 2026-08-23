@@ -78,6 +78,7 @@ from services.orchestrate import (
     _run_general_evidence_reasoning,
     _select_capability_claim_refs,
     _select_claim_support_presentation,
+    _visible_claim_digest,
     orchestrate_chat,
 )
 from services.prompt_budget import estimate_messages_tokens
@@ -16489,6 +16490,26 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         if not presentation_enabled
         else "ineligible"
     )
+    if should_present:
+        visible_first_paragraph = out["answer"].split("\n\n", maxsplit=1)[0]
+        visible_digest = (
+            "sha256:"
+            + hashlib.sha256(visible_first_paragraph.encode("utf-8")).hexdigest()
+        )
+        assert trace["presentation"]["visible_claim_digest"] == visible_digest
+        initial_reasoning_trace = next(
+            call["payload"]["prompt"]["general_evidence_reasoning"]
+            for call in memory_store.trace_calls
+            if "general_evidence_reasoning" in call["payload"].get("prompt", {})
+        )
+        assert initial_reasoning_trace["presentation"][
+            "visible_claim_digest"
+        ] == visible_digest
+        assert memory_store.events.index("trace:1") < memory_store.events.index(
+            "claim_record"
+        )
+    else:
+        assert "visible_claim_digest" not in trace["presentation"]
     visible_v1_calls = [
         call
         for call in memory_store.claim_record_calls
@@ -16496,6 +16517,9 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     ]
     if should_present:
         assert visible_v1_calls == []
+    serialized_support_payload = json.dumps(v2_calls[0]["payload"], sort_keys=True)
+    assert "visible_claim_digest" not in serialized_support_payload
+    assert "_presentation_claim_template" not in serialized_support_payload
     comparison = trace["decision_comparison"]
     assert comparison["status"] == "compared"
     if semantic_case == "rational_values":
@@ -16661,6 +16685,10 @@ def test_claim_support_qualified_presentation_is_deterministic_and_user_safe():
         "status": "presented",
         "reason_code": "claim_support_qualified",
         "qualification_applied": True,
+        "visible_claim_digest": "sha256:"
+        + hashlib.sha256(
+            reasoning["proposal"]["proposed_claim"].encode("utf-8")
+        ).hexdigest(),
     }
     assert answer.startswith(reasoning["proposal"]["proposed_claim"] + "\n\n")
     assert "some source values had to be interpreted" in answer
@@ -16825,6 +16853,10 @@ def test_neutral_rational_mean_presentation_uses_executor_canonical_result():
     assert reasoning["cr_result"]["claim_digest"] == exact_digest
     assert answer == "The bounded mean is 0.4635."
     assert trace["status"] == "presented"
+    assert trace["visible_claim_digest"] == (
+        "sha256:"
+        + hashlib.sha256("The bounded mean is 0.4635.".encode("utf-8")).hexdigest()
+    )
     assert "{{derivation:" not in answer
     persisted = claim_support_record_payload(
         reasoning_result=reasoning,
@@ -16846,7 +16878,42 @@ def test_neutral_rational_mean_presentation_uses_executor_canonical_result():
         "canonical_result"
     ] == "0.4635416666666666666666666667"
     assert "_presentation_claim_template" not in json.dumps(persisted, sort_keys=True)
+    assert "visible_claim_digest" not in json.dumps(persisted, sort_keys=True)
+    assert "The bounded mean is 0.4635." not in json.dumps(persisted, sort_keys=True)
     assert "{{derivation:" not in json.dumps(persisted, sort_keys=True)
+
+
+def test_visible_claim_digest_normalizes_only_the_first_paragraph():
+    reasoning = _presentation_reasoning_result(
+        disposition="qualified",
+        qualification_required=True,
+    )
+    reasoning["proposal"]["proposed_claim"] = (
+        "The bounded   records\nsupport\ta useful conclusion."
+    )
+
+    trace, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert answer is not None
+    assert "\n\nThis result has some uncertainty" in answer
+    normalized = "The bounded records support a useful conclusion."
+    assert trace["visible_claim_digest"] == (
+        "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    )
+    assert trace["visible_claim_digest"] != (
+        "sha256:" + hashlib.sha256(answer.encode("utf-8")).hexdigest()
+    )
+    crlf_answer = "  A bounded\tclaim. \r\n \t\r\nPRIVATE SECOND PARAGRAPH"
+    assert _visible_claim_digest(crlf_answer) == (
+        "sha256:"
+        + hashlib.sha256("A bounded claim.".encode("utf-8")).hexdigest()
+    )
 
 
 @pytest.mark.parametrize("canonical_result", ["5", "16.5", "0.625", "40"])
