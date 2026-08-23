@@ -600,10 +600,15 @@ normalized dispositions, their structural relation, sorted category names, and
 sorted reason codes. An unavailable generic result is recorded as unavailable;
 no generic decision is inferred from provider prose or a failed call.
 
-General evidence reasoning requests minimal provider reasoning effort while
-retaining its existing bounded completion-token budget and timeout. This route
-parameter does not change conclusion authority, retries, fallback behavior, or
-user-visible permission.
+General evidence reasoning is routed to GPT-5.6 Sol through its existing
+logical provider route. It requests medium provider reasoning effort with a
+bounded maximum of 2048 completion tokens and retains its existing timeout.
+Semantic interpretation remains probabilistic, while deterministic derivation
+and Cognitive Runtime conclusion authority remain unchanged. Simpler bounded
+provider roles remain on cheaper models. Generic reasoning and its
+user-visible presentation remain separately controlled and default off; these
+route parameters do not change retries, fallback behavior, or presentation
+permission.
 
 When a proposed claim materially uses a requested deterministic derivation,
 the provider places a structural derivation placeholder in the claim instead
