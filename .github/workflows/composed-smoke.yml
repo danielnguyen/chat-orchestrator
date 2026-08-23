@@ -113,7 +113,6 @@ jobs:
           EVIDENCE_SCENARIO: general-reasoning-presentation
           COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED: "true"
           COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED: "true"
-          COMPOSED_HISTORY_FOLLOWUP_ENABLED: "true"
         run: make composed-smoke
 
       - name: Run policy-admitted advisory evidence proof
