@@ -16794,10 +16794,78 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("shadow_completion", "expected_failure_code"),
+    (
+        "shadow_completion",
+        "expected_failure_code",
+        "expected_failure_detail_code",
+    ),
     [
-        (_provider_completion("not-json"), "completion_json_invalid"),
-        (TimeoutError("PRIVATE SHADOW TIMEOUT"), "completion_dependency_failed"),
+        (
+            {"PRIVATE_PROVIDER_SENTINEL": "MUST_NOT_APPEAR"},
+            "completion_envelope_invalid",
+            "evidence_reasoning_completion_invalid",
+        ),
+        (
+            {
+                "choices": [],
+                "usage": {"sentinel": "PRIVATE_PROVIDER_SENTINEL"},
+            },
+            "completion_envelope_invalid",
+            "evidence_reasoning_choices_invalid",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "{}"},
+                        "PRIVATE_PROVIDER_SENTINEL": "MUST_NOT_APPEAR",
+                    }
+                ]
+            },
+            "completion_envelope_invalid",
+            "evidence_reasoning_choice_invalid",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "{}",
+                            "PRIVATE_PROVIDER_SENTINEL": "MUST_NOT_APPEAR",
+                        }
+                    }
+                ]
+            },
+            "completion_envelope_invalid",
+            "evidence_reasoning_message_invalid",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": {
+                                "PRIVATE_PROVIDER_SENTINEL": "MUST_NOT_APPEAR"
+                            },
+                        }
+                    }
+                ]
+            },
+            "completion_envelope_invalid",
+            "evidence_reasoning_content_invalid",
+        ),
+        (
+            _provider_completion("not-json"),
+            "completion_json_invalid",
+            "evidence_reasoning_json_invalid",
+        ),
+        (
+            TimeoutError("PRIVATE SHADOW TIMEOUT"),
+            "completion_dependency_failed",
+            None,
+        ),
         (
             _general_reasoning_completion(
                 proposed_claim="The bounded record supports a claim.",
@@ -16805,6 +16873,7 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
                 counterevidence_ref_ids=["neutral_records:item_1"],
             ),
             "proposal_self_consistency_invalid",
+            None,
         ),
     ],
 )
@@ -16812,6 +16881,7 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
     tmp_path,
     shadow_completion,
     expected_failure_code,
+    expected_failure_detail_code,
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -16900,6 +16970,10 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
     assert trace["reasoning_provider_call_count"] == 1
     assert trace["validation_status"] == "failed"
     assert trace["failure_code"] == expected_failure_code
+    if expected_failure_detail_code is None:
+        assert "failure_detail_code" not in trace
+    else:
+        assert trace["failure_detail_code"] == expected_failure_detail_code
     assert trace["bms_persistence_status"] == "not_attempted"
     assert trace["decision_comparison"] == {
         "status": "not_available",
@@ -16909,9 +16983,10 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
         "categories": [],
         "reason_codes": ["claim_support_decision_unavailable"],
     }
-    assert "PRIVATE SHADOW TIMEOUT" not in json.dumps(
-        memory_store.trace_calls, sort_keys=True
-    )
+    serialized_traces = json.dumps(memory_store.trace_calls, sort_keys=True)
+    assert "PRIVATE SHADOW TIMEOUT" not in serialized_traces
+    assert "PRIVATE_PROVIDER_SENTINEL" not in serialized_traces
+    assert "MUST_NOT_APPEAR" not in serialized_traces
 
 
 @pytest.mark.asyncio
@@ -20995,7 +21070,15 @@ async def test_evidence_interpreter_self_consistency_failure_is_bounded(
 
     assert exc_info.value.reason == "malformed_response"
     assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
+    assert (
+        exc_info.value.failure_detail_code
+        == "ambiguous_semantic_candidates_required"
+    )
     assert "failure_class=proposal_self_consistency_invalid" in caplog.text
+    assert (
+        "failure_detail_code=ambiguous_semantic_candidates_required"
+        in caplog.text
+    )
     assert "PRIVATE_" not in caplog.text
 
 

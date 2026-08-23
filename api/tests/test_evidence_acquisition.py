@@ -153,6 +153,23 @@ def _reasoning_proposal() -> dict:
     }
 
 
+def test_provider_output_validation_error_retains_safe_detail_code():
+    error = ProviderOutputValidationError(
+        "completion_envelope_invalid",
+        "evidence_reasoning_message_invalid",
+    )
+
+    assert error.failure_code == "completion_envelope_invalid"
+    assert error.detail_code == "evidence_reasoning_message_invalid"
+    assert str(error) == "evidence_reasoning_message_invalid"
+
+    with pytest.raises(ValueError, match="provider_output_detail_code_invalid"):
+        ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "PRIVATE_PROVIDER_DETAIL_SENTINEL",  # type: ignore[arg-type]
+        )
+
+
 def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     proposal = parse_evidence_reasoning_completion(
         _reasoning_completion(_reasoning_proposal()),
@@ -3278,6 +3295,7 @@ async def test_semantic_self_consistency_failure_reaches_bounded_trace():
         "operation_hint": None,
         "candidate_count": 0,
         "failure_code": "proposal_self_consistency_invalid",
+        "failure_detail_code": "ambiguous_semantic_candidates_required",
     }
     assert [name for name, _ in runtime.calls] == ["shape"]
     assert dsa.calls == ["list_sources"]

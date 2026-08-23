@@ -571,14 +571,16 @@ execution, and Cognitive Runtime conclusion authority remain independent local
 checks and cannot be relaxed by provider output.
 
 Rejected provider output retains the existing bounded failure behavior and may
-add a privacy-safe `failure_code` to the semantic-interpreter or general-
-reasoning trace. The closed codes distinguish completion dependency, envelope,
-refusal, or JSON failures; proposal schema or self-consistency failures;
-unauthorized references or scope; forbidden capability output; and invalid
-derivation contracts. They never contain response content, claim or source
-text, prompts, credentials, or model reasoning, and they are not rendered to
-the user. These checks add no retry, repair, fallback model, acquisition, or
-provider call.
+add privacy-safe `failure_code` and `failure_detail_code` fields to the
+semantic-interpreter or general-reasoning trace. Both fields use closed,
+system-authored structural identifiers. The coarse codes distinguish completion
+dependency, envelope, refusal, or JSON failures; proposal schema or
+self-consistency failures; unauthorized references or scope; forbidden
+capability output; and invalid derivation contracts. Detail codes identify the
+specific parser boundary when one is safely known. Neither field contains
+response content, claim or source text, prompts, credentials, or model
+reasoning, and neither is rendered to the user. These checks add no retry,
+repair, fallback model, acquisition, or provider call.
 
 When general evidence reasoning is enabled, its shadow trace also contains a
 bounded `decision_comparison`. This compares the existing evidence next-step
