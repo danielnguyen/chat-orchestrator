@@ -225,6 +225,7 @@ _EVIDENCE_INTERPRETER_REASONING_EFFORT = "minimal"
 _DIAGNOSTIC_ADVISORY_ROUTE = "diagnostic_advisory"
 _EVIDENCE_REASONING_ROUTE = "evidence_reasoning"
 _EVIDENCE_REASONING_MAX_COMPLETION_TOKENS = 1200
+_EVIDENCE_REASONING_REASONING_EFFORT = "minimal"
 _AUTHORITY_DISPOSITION_LEVEL = {"withheld": 0, "qualified": 1, "allowed": 2}
 _EXISTING_AUTHORITY_DISPOSITIONS = {
     "bounded_conclusion_allowed": "allowed",
@@ -7519,6 +7520,7 @@ async def _run_general_evidence_reasoning(
             tools=[],
             response_format=evidence_reasoning_response_format(),
             max_completion_tokens=_EVIDENCE_REASONING_MAX_COMPLETION_TOKENS,
+            reasoning_effort=_EVIDENCE_REASONING_REASONING_EFFORT,
             timeout_ms=timeout_ms,
         )
     except Exception:
