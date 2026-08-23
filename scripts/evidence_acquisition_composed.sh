@@ -6589,6 +6589,7 @@ run_general_evidence_reasoning_shadow_scenario() {
     HISTORY_ORIGINAL_REQUEST_ID="$request_id"
     HISTORY_ORIGINAL_MANIFEST="$manifest"
     followup_question="What was that based on?"
+    provider_post "/fixture/reset" '{}'
     reset_dsa_audit
     restart_orchestrator_with_history_followup true
     followup_response="$(run_history_current_turn \
