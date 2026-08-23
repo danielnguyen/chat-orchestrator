@@ -77,6 +77,7 @@ from services.evidence_acquisition import (
     advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
+    bounded_evidence_reasoning_completion_metadata,
     build_manifest_trace,
     collect_process_failure_observations,
     compile_safe_exact_fetch_proposal,
@@ -7542,6 +7543,10 @@ async def _run_general_evidence_reasoning(
         }
         if exc.detail_code is not None:
             failure["failure_detail_code"] = exc.detail_code
+        if exc.detail_code == "evidence_reasoning_content_invalid":
+            failure.update(
+                bounded_evidence_reasoning_completion_metadata(completion)
+            )
         trace.update(failure)
         return output
     except Exception:

@@ -57,6 +57,7 @@ from services.evidence_acquisition import (
     advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
+    bounded_evidence_reasoning_completion_metadata,
     build_current_acquisition_premise,
     build_manifest_trace,
     compile_safe_exact_fetch_proposal,
@@ -168,6 +169,119 @@ def test_provider_output_validation_error_retains_safe_detail_code():
             "completion_envelope_invalid",
             "PRIVATE_PROVIDER_DETAIL_SENTINEL",  # type: ignore[arg-type]
         )
+
+
+def test_bounded_reasoning_completion_metadata_reports_null_length_and_usage():
+    metadata = bounded_evidence_reasoning_completion_metadata(
+        {
+            "choices": [
+                {
+                    "message": {"content": None},
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {
+                "completion_tokens": 1200,
+                "completion_tokens_details": {"reasoning_tokens": 1190},
+            },
+        }
+    )
+
+    assert metadata == {
+        "completion_content_state": "null",
+        "completion_finish_reason": "length",
+        "completion_tokens": 1200,
+        "reasoning_tokens": 1190,
+    }
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_state"),
+    [
+        ({}, "missing"),
+        ({"content": ""}, "empty_string"),
+        ({"content": " \n\t"}, "whitespace_string"),
+        (
+            {"content": {"PRIVATE_CONTENT_SENTINEL": "MUST_NOT_APPEAR"}},
+            "non_string",
+        ),
+    ],
+)
+def test_bounded_reasoning_completion_metadata_classifies_content_privately(
+    message,
+    expected_state,
+):
+    metadata = bounded_evidence_reasoning_completion_metadata(
+        {"choices": [{"message": message}]}
+    )
+
+    assert metadata["completion_content_state"] == expected_state
+    assert "PRIVATE_" not in json.dumps(metadata, sort_keys=True)
+    assert "MUST_NOT_APPEAR" not in json.dumps(metadata, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"),
+    [
+        ("stop", "stop"),
+        ("length", "length"),
+        ("content_filter", "content_filter"),
+        ("tool_calls", "tool_calls"),
+        ("function_call", "function_call"),
+        (None, "missing"),
+        ("PRIVATE_PROVIDER_FINISH_REASON_SENTINEL", "other"),
+        ({"PRIVATE_FINISH_SENTINEL": True}, "invalid"),
+    ],
+)
+def test_bounded_reasoning_completion_metadata_normalizes_finish_reason(
+    finish_reason,
+    expected,
+):
+    choice = {"message": {"content": None}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+
+    metadata = bounded_evidence_reasoning_completion_metadata(
+        {"choices": [choice]}
+    )
+
+    assert metadata["completion_finish_reason"] == expected
+    assert "PRIVATE_" not in json.dumps(metadata, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "retained"),
+    [
+        (0, True),
+        (1200, True),
+        (True, False),
+        (-1, False),
+        ("1200", False),
+        (12.0, False),
+        (1_000_001, False),
+    ],
+)
+def test_bounded_reasoning_completion_metadata_validates_token_counts(
+    value,
+    retained,
+):
+    metadata = bounded_evidence_reasoning_completion_metadata(
+        {
+            "choices": [{"message": {"content": None}}],
+            "usage": {
+                "completion_tokens": value,
+                "completion_tokens_details": {
+                    "reasoning_tokens": value,
+                    "PRIVATE_USAGE_SENTINEL": "MUST_NOT_APPEAR",
+                },
+            },
+        }
+    )
+
+    assert ("completion_tokens" in metadata) is retained
+    assert ("reasoning_tokens" in metadata) is retained
+    assert "PRIVATE_" not in json.dumps(metadata, sort_keys=True)
+    assert "MUST_NOT_APPEAR" not in json.dumps(metadata, sort_keys=True)
 
 
 def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():

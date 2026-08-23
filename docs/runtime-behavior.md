@@ -582,6 +582,16 @@ response content, claim or source text, prompts, credentials, or model
 reasoning, and neither is rendered to the user. These checks add no retry,
 repair, fallback model, acquisition, or provider call.
 
+When generic reasoning rejects a returned completion specifically because its
+message content is unusable, the failure trace may also include
+`completion_content_state`, `completion_finish_reason`, `completion_tokens`,
+and `reasoning_tokens`. Content state and finish reason use closed local
+taxonomies; unknown provider finish strings are reduced to `other`. Token
+counts are retained only as validated bounded non-negative integers. Raw
+response content, unknown provider strings, and usage objects are never
+recorded. These diagnostics do not change provider acceptance, retries,
+authority, or user-visible behavior.
+
 When general evidence reasoning is enabled, its shadow trace also contains a
 bounded `decision_comparison`. This compares the existing evidence next-step
 disposition with Cognitive Runtime's validated generic claim-support

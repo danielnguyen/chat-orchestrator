@@ -16846,12 +16846,18 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
                     {
                         "message": {
                             "role": "assistant",
-                            "content": {
-                                "PRIVATE_PROVIDER_SENTINEL": "MUST_NOT_APPEAR"
-                            },
-                        }
+                            "content": None,
+                        },
+                        "finish_reason": "length",
                     }
-                ]
+                ],
+                "usage": {
+                    "completion_tokens": 1200,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 1190,
+                        "PRIVATE_PROVIDER_SENTINEL": "MUST_NOT_APPEAR",
+                    },
+                },
             },
             "completion_envelope_invalid",
             "evidence_reasoning_content_invalid",
@@ -16882,6 +16888,7 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
     shadow_completion,
     expected_failure_code,
     expected_failure_detail_code,
+    caplog,
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -16974,6 +16981,23 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
         assert "failure_detail_code" not in trace
     else:
         assert trace["failure_detail_code"] == expected_failure_detail_code
+    completion_metadata_fields = {
+        "completion_content_state",
+        "completion_finish_reason",
+        "completion_tokens",
+        "reasoning_tokens",
+    }
+    if expected_failure_detail_code == "evidence_reasoning_content_invalid":
+        assert {
+            key: trace[key] for key in completion_metadata_fields
+        } == {
+            "completion_content_state": "null",
+            "completion_finish_reason": "length",
+            "completion_tokens": 1200,
+            "reasoning_tokens": 1190,
+        }
+    else:
+        assert completion_metadata_fields.isdisjoint(trace)
     assert trace["bms_persistence_status"] == "not_attempted"
     assert trace["decision_comparison"] == {
         "status": "not_available",
@@ -16987,6 +17011,7 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
     assert "PRIVATE SHADOW TIMEOUT" not in serialized_traces
     assert "PRIVATE_PROVIDER_SENTINEL" not in serialized_traces
     assert "MUST_NOT_APPEAR" not in serialized_traces
+    assert "PRIVATE_" not in caplog.text
 
 
 @pytest.mark.asyncio
