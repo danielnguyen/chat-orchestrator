@@ -6515,11 +6515,16 @@ run_general_evidence_reasoning_shadow_scenario() {
   if [[ "$presentation_expected" == "true" ]]; then
     assert_jq "general_reasoning.history.presented" "$history" '
       .resolution_status == "resolved"
+      and .resolution_source == "direct_record"
+      and .lineage_dereference_count == 0
       and .match_count == 1
-      and .reason_code == "support_record_resolved"
+      and .reason_code == "direct_support_record_resolved"
+      and .record.record_kind == "support"
       and .record.support_record.schema_version == "claim-record.v2"
       and .record.support_record.presented_to_user == true
       and .record.support_record.support.conclusion_disposition == "qualified"
+      and .history_root_lineage.schema_version == "history-root-lineage.v1"
+      and .history_root_lineage.record_kind == "support"
     '
   else
     assert_jq "general_reasoning.history.shadow" "$history" '
