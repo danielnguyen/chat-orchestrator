@@ -72,6 +72,7 @@ from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
     EvidenceAcquisitionState,
+    ProviderOutputValidationError,
     SemanticInterpreterFailure,
     advisory_provider_allowed,
     begin_evidence_acquisition,
@@ -6773,17 +6774,34 @@ async def _interpret_evidence_request(
             completion,
             inventory_source_ids={source.source_id for source in source_list.sources},
         )
-    except Exception as exc:
+    except ProviderOutputValidationError as exc:
         _log_semantic_interpreter_failure(
             request_id=request_id,
             reason="malformed_response",
-            failure_class="malformed_response",
+            failure_class=exc.failure_code,
             route=route,
             elapsed_ms=int((perf_counter() - started_at) * 1000),
             timeout_ms=timeout_ms,
             exception_type=type(exc).__name__,
         )
-        raise SemanticInterpreterFailure("malformed_response") from exc
+        raise SemanticInterpreterFailure(
+            "malformed_response",
+            failure_code=exc.failure_code,
+        ) from exc
+    except Exception as exc:
+        _log_semantic_interpreter_failure(
+            request_id=request_id,
+            reason="malformed_response",
+            failure_class="proposal_schema_invalid",
+            route=route,
+            elapsed_ms=int((perf_counter() - started_at) * 1000),
+            timeout_ms=timeout_ms,
+            exception_type=type(exc).__name__,
+        )
+        raise SemanticInterpreterFailure(
+            "malformed_response",
+            failure_code="proposal_schema_invalid",
+        ) from exc
     _EVIDENCE_LOGGER.info(
         "semantic_interpreter_completed event=semantic_interpreter_completed "
         "component=chat-orchestrator request_id=%s logical_route=%s model=%s "
@@ -7495,17 +7513,50 @@ async def _run_general_evidence_reasoning(
             max_completion_tokens=_EVIDENCE_REASONING_MAX_COMPLETION_TOKENS,
             timeout_ms=timeout_ms,
         )
+    except Exception:
+        trace.update(
+            {
+                "validation_status": "failed",
+                "reason_code": "proposal_invalid",
+                "failure_code": "completion_dependency_failed",
+            }
+        )
+        return output
+    try:
         proposal = parse_evidence_reasoning_completion(
             completion,
             authorized_evidence_ref_ids=authorized_ref_ids,
         )
+    except ProviderOutputValidationError as exc:
+        trace.update(
+            {
+                "validation_status": "failed",
+                "reason_code": "proposal_invalid",
+                "failure_code": exc.failure_code,
+            }
+        )
+        return output
+    except Exception:
+        trace.update(
+            {
+                "validation_status": "failed",
+                "reason_code": "proposal_invalid",
+                "failure_code": "proposal_schema_invalid",
+            }
+        )
+        return output
+    try:
         executions = execute_derivations(
             proposal.derivation_requests,
             authorized_evidence_ref_ids=authorized_ref_ids,
         )
     except Exception:
         trace.update(
-            {"validation_status": "failed", "reason_code": "proposal_invalid"}
+            {
+                "validation_status": "failed",
+                "reason_code": "proposal_invalid",
+                "failure_code": "derivation_contract_invalid",
+            }
         )
         return output
 

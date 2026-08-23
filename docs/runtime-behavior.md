@@ -558,6 +558,28 @@ historical explanation remains separate work and is never reconstructed by a
 provider.
 The public chat response fields are unchanged.
 
+The semantic evidence interpreter and generic evidence reasoner use strict
+provider JSON schemas plus deterministic local validation. Machine-expressible
+model-owned derivation structure, including divide arity and exactly one value
+or prior-derivation reference per operand, is part of the provider schema.
+Cross-field interpreter relationships that the supported schema subset cannot
+express are handled only in a conservative direction: multiple candidates
+cannot remain resolved, no-match candidates and unusable aggregate detail are
+discarded, and an unusable ambiguity remains rejected. Candidate source IDs,
+aggregate field scope, evidence references, capability exclusion, deterministic
+execution, and Cognitive Runtime conclusion authority remain independent local
+checks and cannot be relaxed by provider output.
+
+Rejected provider output retains the existing bounded failure behavior and may
+add a privacy-safe `failure_code` to the semantic-interpreter or general-
+reasoning trace. The closed codes distinguish completion dependency, envelope,
+refusal, or JSON failures; proposal schema or self-consistency failures;
+unauthorized references or scope; forbidden capability output; and invalid
+derivation contracts. They never contain response content, claim or source
+text, prompts, credentials, or model reasoning, and they are not rendered to
+the user. These checks add no retry, repair, fallback model, acquisition, or
+provider call.
+
 When general evidence reasoning is enabled, its shadow trace also contains a
 bounded `decision_comparison`. This compares the existing evidence next-step
 disposition with Cognitive Runtime's validated generic claim-support

@@ -16794,15 +16794,24 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "shadow_completion",
+    ("shadow_completion", "expected_failure_code"),
     [
-        _provider_completion("not-json"),
-        TimeoutError("PRIVATE SHADOW TIMEOUT"),
+        (_provider_completion("not-json"), "completion_json_invalid"),
+        (TimeoutError("PRIVATE SHADOW TIMEOUT"), "completion_dependency_failed"),
+        (
+            _general_reasoning_completion(
+                proposed_claim="The bounded record supports a claim.",
+                evidence_ref_id="neutral_records:item_1",
+                counterevidence_ref_ids=["neutral_records:item_1"],
+            ),
+            "proposal_self_consistency_invalid",
+        ),
     ],
 )
 async def test_general_evidence_reasoning_failure_preserves_visible_path(
     tmp_path,
     shadow_completion,
+    expected_failure_code,
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -16890,6 +16899,7 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
     trace = reasoning_traces[-1]
     assert trace["reasoning_provider_call_count"] == 1
     assert trace["validation_status"] == "failed"
+    assert trace["failure_code"] == expected_failure_code
     assert trace["bms_persistence_status"] == "not_attempted"
     assert trace["decision_comparison"] == {
         "status": "not_available",
@@ -20958,10 +20968,35 @@ async def test_evidence_interpreter_malformed_completion_omits_provider_content(
         )
 
     assert exc_info.value.reason == "malformed_response"
-    assert "failure_class=malformed_response" in caplog.text
-    assert "exception_type=ValidationError" in caplog.text
+    assert exc_info.value.failure_code == "proposal_schema_invalid"
+    assert "failure_class=proposal_schema_invalid" in caplog.text
+    assert "exception_type=ProviderOutputValidationError" in caplog.text
     assert "PRIVATE_" not in caplog.text
     assert "MUST_NOT_APPEAR" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_evidence_interpreter_self_consistency_failure_is_bounded(
+    tmp_path,
+    caplog,
+):
+    completion = _evidence_interpreter_completion(
+        "ambiguous",
+        "lookup",
+        ["PRIVATE_SOURCE_ID_SENTINEL"],
+    )
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+
+    with pytest.raises(SemanticInterpreterFailure) as exc_info:
+        await _call_evidence_interpreter(
+            tmp_path=tmp_path,
+            litellm=SequenceLiteLLM([completion]),
+        )
+
+    assert exc_info.value.reason == "malformed_response"
+    assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
+    assert "failure_class=proposal_self_consistency_invalid" in caplog.text
+    assert "PRIVATE_" not in caplog.text
 
 
 @pytest.mark.asyncio

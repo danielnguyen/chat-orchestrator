@@ -481,6 +481,32 @@ class EvidenceReasoningProposal(StrictModel):
         return self
 
 
+ProviderOutputFailureCode = Literal[
+    "completion_dependency_failed",
+    "completion_envelope_invalid",
+    "completion_refusal",
+    "completion_json_invalid",
+    "proposal_schema_invalid",
+    "proposal_self_consistency_invalid",
+    "proposal_reference_unauthorized",
+    "proposal_scope_unauthorized",
+    "proposal_capability_forbidden",
+    "derivation_contract_invalid",
+]
+
+
+class ProviderOutputValidationError(ValueError):
+    """A bounded provider-output rejection without provider-controlled detail."""
+
+    def __init__(
+        self,
+        failure_code: ProviderOutputFailureCode,
+        detail_code: str | None = None,
+    ) -> None:
+        super().__init__(detail_code or failure_code)
+        self.failure_code = failure_code
+
+
 @dataclass(frozen=True)
 class ValidatedEvidenceExcerpt:
     source_ref: str
@@ -709,35 +735,78 @@ class EvidenceInterpreterOutput(StrictModel):
             raise ValueError("aggregate_field_name_has_control_character")
         return value
 
-    @model_validator(mode="after")
-    def validate_candidate_set(self) -> EvidenceInterpreterOutput:
-        aggregate_details = (
-            self.aggregate_function is not None,
-            self.aggregate_field_name is not None,
+
+
+def _normalize_evidence_interpreter_output(
+    output: EvidenceInterpreterOutput,
+    *,
+    authorized_source_ids: set[str],
+) -> EvidenceInterpreterOutput:
+    """Conservatively resolve model-owned conflicts after authority validation."""
+
+    candidates = output.candidate_source_ids
+    if not set(candidates).issubset(authorized_source_ids):
+        raise ProviderOutputValidationError(
+            "proposal_reference_unauthorized",
+            "semantic_candidate_source_not_in_inventory",
         )
-        if self.operation_hint != "aggregate" and any(aggregate_details):
-            raise ValueError("aggregate_details_require_aggregate_operation")
-        if aggregate_details[0] != aggregate_details[1]:
-            raise ValueError("aggregate_details_must_be_supplied_together")
-        candidate_count = len(self.candidate_source_ids)
-        if len(set(self.candidate_source_ids)) != candidate_count:
-            raise ValueError("duplicate_semantic_candidate_source_id")
-        if self.interpretation_status == "resolved" and candidate_count != 1:
-            raise ValueError("resolved_semantic_candidate_required")
-        if self.interpretation_status == "ambiguous" and candidate_count not in {
-            2,
-            3,
-        }:
-            raise ValueError("ambiguous_semantic_candidates_required")
-        if self.interpretation_status == "no_match" and candidate_count != 0:
-            raise ValueError("semantic_no_match_candidates_not_allowed")
-        return self
+    if len(candidates) != len(set(candidates)):
+        raise ProviderOutputValidationError(
+            "proposal_self_consistency_invalid",
+            "duplicate_semantic_candidate_source_id",
+        )
+
+    status = output.interpretation_status
+    candidate_count = len(candidates)
+    if status == "resolved" and candidate_count in {2, 3}:
+        status = "ambiguous"
+    elif status == "resolved" and candidate_count != 1:
+        raise ProviderOutputValidationError(
+            "proposal_self_consistency_invalid",
+            "resolved_semantic_candidate_required",
+        )
+    elif status == "ambiguous" and candidate_count not in {2, 3}:
+        raise ProviderOutputValidationError(
+            "proposal_self_consistency_invalid",
+            "ambiguous_semantic_candidates_required",
+        )
+    elif status == "no_match":
+        candidates = []
+
+    aggregate_function = output.aggregate_function
+    aggregate_field_name = output.aggregate_field_name
+    aggregate_details = (
+        aggregate_function is not None,
+        aggregate_field_name is not None,
+    )
+    if (
+        output.operation_hint != "aggregate"
+        or status == "no_match"
+        or aggregate_details[0] != aggregate_details[1]
+    ):
+        aggregate_function = None
+        aggregate_field_name = None
+
+    return output.model_copy(
+        update={
+            "interpretation_status": status,
+            "candidate_source_ids": candidates,
+            "aggregate_function": aggregate_function,
+            "aggregate_field_name": aggregate_field_name,
+        }
+    )
 
 
 class SemanticInterpreterFailure(RuntimeError):
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        failure_code: ProviderOutputFailureCode | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.failure_code = failure_code
 
 
 class SourceMatchResult(StrictModel):
@@ -2560,14 +2629,70 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
         "maxLength": 120,
         "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     }
-    nullable_identifier = {"anyOf": [identifier, {"type": "null"}]}
-    nullable_number = {
-        "anyOf": [
-            {"type": "string", "minLength": 1, "maxLength": 64},
-            {"type": "null"},
-        ]
+    decimal_value = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
     }
     evidence_ids = {"type": "array", "maxItems": 16, "items": identifier}
+    derivation_evidence_ids = {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 16,
+        "items": identifier,
+    }
+    operand = {
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "value": decimal_value,
+                    "derivation_ref": {"type": "null"},
+                },
+                "required": ["value", "derivation_ref"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "value": {"type": "null"},
+                    "derivation_ref": identifier,
+                },
+                "required": ["value", "derivation_ref"],
+            },
+        ]
+    }
+
+    def derivation_schema(
+        operation: str,
+        *,
+        min_operands: int,
+        max_operands: int,
+    ) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "derivation_id": identifier,
+                "operation": {"type": "string", "enum": [operation]},
+                "operands": {
+                    "type": "array",
+                    "minItems": min_operands,
+                    "maxItems": max_operands,
+                    "items": operand,
+                },
+                "supporting_evidence_ref_ids": derivation_evidence_ids,
+            },
+            "required": [
+                "derivation_id",
+                "operation",
+                "operands",
+                "supporting_evidence_ref_ids",
+            ],
+        }
+
     return {
         "type": "json_schema",
         "json_schema": {
@@ -2605,36 +2730,18 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
                         "type": "array",
                         "maxItems": 16,
                         "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "derivation_id": identifier,
-                                "operation": {
-                                    "type": "string",
-                                    "enum": ["divide", "mean"],
-                                },
-                                "operands": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "maxItems": 16,
-                                    "items": {
-                                        "type": "object",
-                                        "additionalProperties": False,
-                                        "properties": {
-                                            "value": nullable_number,
-                                            "derivation_ref": nullable_identifier,
-                                        },
-                                        "required": ["value", "derivation_ref"],
-                                    },
-                                },
-                                "supporting_evidence_ref_ids": evidence_ids,
-                            },
-                            "required": [
-                                "derivation_id",
-                                "operation",
-                                "operands",
-                                "supporting_evidence_ref_ids",
-                            ],
+                            "anyOf": [
+                                derivation_schema(
+                                    "divide",
+                                    min_operands=2,
+                                    max_operands=2,
+                                ),
+                                derivation_schema(
+                                    "mean",
+                                    min_operands=1,
+                                    max_operands=16,
+                                ),
+                            ]
                         },
                     },
                 },
@@ -2702,10 +2809,16 @@ def parse_evidence_reasoning_completion(
         "system_fingerprint",
     }
     if not isinstance(value, dict) or set(value) - allowed_fields:
-        raise ValueError("evidence_reasoning_completion_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "evidence_reasoning_completion_invalid",
+        )
     choices = value.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
-        raise ValueError("evidence_reasoning_choices_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "evidence_reasoning_choices_invalid",
+        )
     choice = choices[0]
     if not isinstance(choice, dict) or set(choice) - {
         "index",
@@ -2714,12 +2827,21 @@ def parse_evidence_reasoning_completion(
         "logprobs",
         "provider_specific_fields",
     }:
-        raise ValueError("evidence_reasoning_choice_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "evidence_reasoning_choice_invalid",
+        )
     message = choice.get("message")
     if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
-        raise ValueError("evidence_reasoning_tool_call_forbidden")
+        raise ProviderOutputValidationError(
+            "proposal_capability_forbidden",
+            "evidence_reasoning_tool_call_forbidden",
+        )
     if message.get("refusal") not in (None, ""):
-        raise ValueError("evidence_reasoning_refusal_invalid")
+        raise ProviderOutputValidationError(
+            "completion_refusal",
+            "evidence_reasoning_refusal_invalid",
+        )
     if set(message) - {
         "annotations",
         "content",
@@ -2728,25 +2850,67 @@ def parse_evidence_reasoning_completion(
         "role",
         "tool_calls",
     }:
-        raise ValueError("evidence_reasoning_message_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "evidence_reasoning_message_invalid",
+        )
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("evidence_reasoning_content_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "evidence_reasoning_content_invalid",
+        )
     try:
         decoded = json.loads(content, object_pairs_hook=_reject_duplicate_json_keys)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError("evidence_reasoning_json_invalid") from exc
-    proposal = EvidenceReasoningProposal.model_validate(decoded)
+        raise ProviderOutputValidationError(
+            "completion_json_invalid",
+            "evidence_reasoning_json_invalid",
+        ) from exc
+    try:
+        proposal = EvidenceReasoningProposal.model_validate(decoded)
+    except ValidationError as exc:
+        derivation_error = any(
+            error.get("loc", ())[:1] == ("derivation_requests",)
+            for error in exc.errors()
+        )
+        consistency_markers = {
+            "duplicate_evidence_reasoning_reference",
+            "conflicting_evidence_reasoning_role",
+            "duplicate_derivation_id",
+        }
+        self_consistency_error = any(
+            any(
+                marker in str(error.get("ctx", {}).get("error", ""))
+                for marker in consistency_markers
+            )
+            for error in exc.errors()
+        )
+        raise ProviderOutputValidationError(
+            (
+                "derivation_contract_invalid"
+                if derivation_error
+                else "proposal_self_consistency_invalid"
+                if self_consistency_error
+                else "proposal_schema_invalid"
+            )
+        ) from exc
     supplied = set(proposal.supporting_evidence_ref_ids)
     supplied.update(proposal.counterevidence_ref_ids)
     supplied.update(item.evidence_ref_id for item in proposal.material_exclusions)
     proposal_evidence_ids = set(supplied)
     for request in proposal.derivation_requests:
         if not set(request.supporting_evidence_ref_ids) <= proposal_evidence_ids:
-            raise ValueError("derivation_evidence_reference_not_proposed")
+            raise ProviderOutputValidationError(
+                "proposal_self_consistency_invalid",
+                "derivation_evidence_reference_not_proposed",
+            )
         supplied.update(request.supporting_evidence_ref_ids)
     if not supplied <= authorized_evidence_ref_ids:
-        raise ValueError("evidence_reasoning_reference_unknown")
+        raise ProviderOutputValidationError(
+            "proposal_reference_unauthorized",
+            "evidence_reasoning_reference_unknown",
+        )
     return proposal
 
 
@@ -2914,17 +3078,26 @@ def parse_evidence_interpreter_completion(
         "system_fingerprint",
     }
     if not isinstance(value, dict) or set(value) - allowed_fields:
-        raise ValueError("semantic_completion_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_completion_invalid",
+        )
     service_tier = value.get("service_tier")
     if service_tier is not None and (
         not isinstance(service_tier, str)
         or not 1 <= len(service_tier) <= 120
         or re.search(r"[\x00-\x1f\x7f]", service_tier)
     ):
-        raise ValueError("semantic_service_tier_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_service_tier_invalid",
+        )
     choices = value.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
-        raise ValueError("semantic_choices_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_choices_invalid",
+        )
     choice = choices[0]
     if not isinstance(choice, dict) or set(choice) - {
         "index",
@@ -2933,16 +3106,28 @@ def parse_evidence_interpreter_completion(
         "logprobs",
         "provider_specific_fields",
     }:
-        raise ValueError("semantic_choice_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_choice_invalid",
+        )
     if choice.get("provider_specific_fields") is not None and not isinstance(
         choice.get("provider_specific_fields"), dict
     ):
-        raise ValueError("semantic_choice_provider_metadata_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_choice_provider_metadata_invalid",
+        )
     message = choice.get("message")
     if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
-        raise ValueError("semantic_tool_call_forbidden")
+        raise ProviderOutputValidationError(
+            "proposal_capability_forbidden",
+            "semantic_tool_call_forbidden",
+        )
     if message.get("refusal") not in (None, ""):
-        raise ValueError("semantic_refusal_invalid")
+        raise ProviderOutputValidationError(
+            "completion_refusal",
+            "semantic_refusal_invalid",
+        )
     if set(message) - {
         "annotations",
         "content",
@@ -2951,27 +3136,50 @@ def parse_evidence_interpreter_completion(
         "role",
         "tool_calls",
     }:
-        raise ValueError("semantic_message_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_message_invalid",
+        )
     if message.get("annotations") is not None and not isinstance(
         message.get("annotations"), list
     ):
-        raise ValueError("semantic_message_annotations_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_message_annotations_invalid",
+        )
     if message.get("provider_specific_fields") is not None and not isinstance(
         message.get("provider_specific_fields"), dict
     ):
-        raise ValueError("semantic_message_provider_metadata_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_message_provider_metadata_invalid",
+        )
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("semantic_content_invalid")
+        raise ProviderOutputValidationError(
+            "completion_envelope_invalid",
+            "semantic_content_invalid",
+        )
     try:
-        decoded = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("semantic_json_invalid") from exc
+        decoded = json.loads(content, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ProviderOutputValidationError(
+            "completion_json_invalid",
+            "semantic_json_invalid",
+        ) from exc
     if not isinstance(decoded, dict):
-        raise ValueError("semantic_json_object_required")
-    output = EvidenceInterpreterOutput.model_validate(decoded)
-    if not set(output.candidate_source_ids).issubset(inventory_source_ids):
-        raise ValueError("semantic_candidate_source_not_in_inventory")
+        raise ProviderOutputValidationError(
+            "completion_json_invalid",
+            "semantic_json_object_required",
+        )
+    try:
+        output = EvidenceInterpreterOutput.model_validate(decoded)
+    except ValidationError as exc:
+        raise ProviderOutputValidationError("proposal_schema_invalid") from exc
+    output = _normalize_evidence_interpreter_output(
+        output,
+        authorized_source_ids=inventory_source_ids,
+    )
     projected = output.model_dump(exclude_none=True)
     projected["candidate_source_ids"] = sorted(output.candidate_source_ids)
     return projected
@@ -2990,11 +3198,20 @@ def _validate_aggregate_advisory_inventory(
     for source_id in advisory.candidate_source_ids:
         source = sources_by_id.get(source_id)
         if source is None:
-            raise ValueError("semantic_candidate_source_not_in_inventory")
+            raise ProviderOutputValidationError(
+                "proposal_reference_unauthorized",
+                "semantic_candidate_source_not_in_inventory",
+            )
         if source.content_fields is None:
-            raise ValueError("aggregate_candidate_content_fields_required")
+            raise ProviderOutputValidationError(
+                "proposal_scope_unauthorized",
+                "aggregate_candidate_content_fields_required",
+            )
         if advisory.aggregate_field_name not in source.content_fields:
-            raise ValueError("aggregate_field_not_configured_for_candidate")
+            raise ProviderOutputValidationError(
+                "proposal_scope_unauthorized",
+                "aggregate_field_not_configured_for_candidate",
+            )
 
 
 def _adapt_inventory_status(source_list: DsaSourceListResponse) -> str:
@@ -3811,10 +4028,10 @@ async def begin_evidence_acquisition(
                 source_list=semantic_source_list,
             )
             advisory = EvidenceInterpreterOutput.model_validate(advisory_raw)
-            if not set(advisory.candidate_source_ids).issubset(
-                allowed_candidate_ids
-            ):
-                raise ValueError("semantic_candidate_source_not_in_inventory")
+            advisory = _normalize_evidence_interpreter_output(
+                advisory,
+                authorized_source_ids=allowed_candidate_ids,
+            )
             _validate_aggregate_advisory_inventory(
                 advisory,
                 semantic_source_list,
@@ -3840,8 +4057,27 @@ async def begin_evidence_acquisition(
                 advisory.candidate_source_ids
             )
         except SemanticInterpreterFailure as exc:
+            failure = {"status": "failed", "reason": exc.reason}
+            if exc.failure_code is not None:
+                failure["failure_code"] = exc.failure_code
+            state.semantic_interpreter.update(failure)
+            if first_shape.derivation_status != "not_applicable":
+                state.status = "semantic_interpreter_failed"
+                state.forced_answer = AMBIGUOUS_ANSWER
+                state.manifest_id = _manifest_id(
+                    scope=scope,
+                    plan_id=None,
+                    selected_strategies=[],
+                    declared_scope=None,
+                )
+                return state
+        except ProviderOutputValidationError as exc:
             state.semantic_interpreter.update(
-                {"status": "failed", "reason": exc.reason}
+                {
+                    "status": "failed",
+                    "reason": "malformed_response",
+                    "failure_code": exc.failure_code,
+                }
             )
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
@@ -3855,7 +4091,11 @@ async def begin_evidence_acquisition(
                 return state
         except (ValidationError, ValueError, TypeError):
             state.semantic_interpreter.update(
-                {"status": "failed", "reason": "malformed_response"}
+                {
+                    "status": "failed",
+                    "reason": "malformed_response",
+                    "failure_code": "proposal_schema_invalid",
+                }
             )
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
