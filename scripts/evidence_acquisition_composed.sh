@@ -6251,6 +6251,7 @@ run_general_evidence_reasoning_shadow_scenario() {
   local owner client conversation_id question external response request_id answer
   local trace manifest provider_calls audit diagnostics claim_records proposal history
   local presentation_expected="${1:-false}"
+  local expected_derivations exact_claim exact_result visible_first visible_digest
   local source_ref="google_sheets:metrics_archive:Measurements!A2:C6"
   local evidence_ref_id
   evidence_ref_id="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
@@ -6282,9 +6283,38 @@ run_general_evidence_reasoning_shadow_scenario() {
   queue_diagnostic_advisory \
     "A formatting or data-entry issue may be present." \
     "Consider checking the entries that require numeric input."
-  proposal="$(jq -nc --arg ref "$evidence_ref_id" '
+  if [[ "$presentation_expected" == "true" ]]; then
+    expected_derivations=1
+    exact_result="0.4635416666666666666666666667"
+    exact_claim="The bounded mean is ${exact_result}."
+    visible_first="The bounded mean is 0.4635."
+    visible_digest="sha256:$(printf '%s' "$visible_first" | sha256sum | cut -d' ' -f1)"
+    proposal="$(jq -nc --arg ref "$evidence_ref_id" '
     {
-      proposed_claim:"A mean was mechanically computed over model-interpreted operands.",
+      proposed_claim:"The bounded mean is {{derivation:mean_1}}.",
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[{
+        evidence_ref_id:$ref,
+        reason:"One entry was ambiguous and excluded."
+      }],
+      derivation_requests:[{
+        derivation_id:"mean_1",
+        operation:"mean",
+        operands:["0.625","0.5625","0.375","0.25","0.5","0.5","0.5","0.25","0.625","0.5","0.125","0.75"]
+          | map({value:.,derivation_ref:null}),
+        supporting_evidence_ref_ids:[$ref]
+      }]
+    }')"
+  else
+    expected_derivations=4
+    exact_result="0.625"
+    exact_claim="A mean was mechanically computed over model-interpreted operands: ${exact_result}."
+    visible_first=""
+    visible_digest=""
+    proposal="$(jq -nc --arg ref "$evidence_ref_id" '
+    {
+      proposed_claim:"A mean was mechanically computed over model-interpreted operands: {{derivation:mean_1}}.",
       supporting_evidence_ref_ids:[$ref],
       counterevidence_ref_ids:[],
       material_exclusions:[{
@@ -6331,6 +6361,7 @@ run_general_evidence_reasoning_shadow_scenario() {
         }
       ]
     }')"
+  fi
   queue_provider_answer "$proposal"
 
   conversation_id="$(resolve_conversation "$owner" "$client" "general-reasoning-$presentation_expected")"
@@ -6354,15 +6385,21 @@ run_general_evidence_reasoning_shadow_scenario() {
   fi
   assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
   if [[ "$presentation_expected" == "true" ]]; then
-    assert_jq "general_reasoning.response.presentation" "$response" '
-      (.answer | startswith("A mean was mechanically computed over model-interpreted operands.\n\n"))
-      and (.answer | contains("Treat this as qualified rather than exact because"))
-      and (.answer | contains("some evidence required interpretation"))
-      and (.answer | contains("some relevant evidence was conflicting or excluded"))
+    if ! assert_jq "general_reasoning.response.presentation" "$response" '
+      (.answer | startswith("The bounded mean is 0.4635.\n\n"))
+      and (.answer | contains("This result has some uncertainty because"))
+      and (.answer | contains("some source values had to be interpreted"))
+      and (.answer | contains("some records were excluded"))
+      and (.answer | contains("some evidence conflicts") | not)
       and (.answer | contains("5 values failed the required numeric validation") | not)
       and (.answer | contains("My best guess is") | not)
       and .sources == []
-    '
+    '; then
+      jq -c '{status,answer,sources,pending_action}' <<<"$response" >&2
+      jq -c '{general_evidence_reasoning:.prompt.general_evidence_reasoning}' \
+        <<<"$trace" >&2
+      return 1
+    fi
   elif ! assert_jq "general_reasoning.response.boundary" "$response" '
     (.answer | contains("5 values failed the required numeric validation"))
     and (.answer | contains("My best guess is"))
@@ -6399,8 +6436,8 @@ run_general_evidence_reasoning_shadow_scenario() {
     and .prompt.general_evidence_reasoning.attempted == true
     and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.validation_status == "accepted"
-    and .prompt.general_evidence_reasoning.derivation_request_count == 4
-    and .prompt.general_evidence_reasoning.derivation_executed_count == 4
+    and .prompt.general_evidence_reasoning.derivation_request_count == $derivations
+    and .prompt.general_evidence_reasoning.derivation_executed_count == $derivations
     and .prompt.general_evidence_reasoning.cr_call_count == 1
     and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
     and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
@@ -6428,11 +6465,17 @@ run_general_evidence_reasoning_shadow_scenario() {
       == (if $presented then "presented" else "disabled" end)
     and .prompt.general_evidence_reasoning.presentation.qualification_applied
       == $presented
+    and ((if $presented
+      then .prompt.general_evidence_reasoning.presentation.visible_claim_digest == $visible_digest
+      else (.prompt.general_evidence_reasoning.presentation | has("visible_claim_digest") | not)
+      end))
     and (.prompt.general_evidence_reasoning.claim_digest | test("^sha256:[0-9a-f]{64}$"))
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
     and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
     and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
-  ' --argjson presented "$presentation_expected"
+  ' --argjson presented "$presentation_expected" \
+    --argjson derivations "$expected_derivations" \
+    --arg visible_digest "$visible_digest"
   assert_jq "general_reasoning.manifest" "$manifest" '
     .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
@@ -6477,16 +6520,17 @@ run_general_evidence_reasoning_shadow_scenario() {
     | ($records | length) == 1
     and ([.records[] | select(.schema_version == "claim-record.v1")] | length) == 0
     and $records[0].presented_to_user == $presented
+    and ($records[0] | has("visible_claim_digest") | not)
     and (($presented | not) or (
-      $records[0].claim_anchor == ($answer | split("\n\n")[0])
+      $records[0].claim_anchor == $exact_claim
       and $records[0].claim_anchor_digest == $digest
     ))
     and $records[0].support.calibration_status == "limited"
     and $records[0].support.conclusion_disposition == "qualified"
     and $records[0].support.qualification_required == true
     and ($records[0].support.material_exclusions | length) == 1
-    and ($records[0].support.executed_derivations
-      | map(.canonical_result)) == ["0.5","0.75","0.625","0.625"]
+    and ($records[0].support.executed_derivations | length) == $derivations
+    and $records[0].support.executed_derivations[-1].canonical_result == $exact_result
     and ($records[0].support.executed_derivations
       | all(.input_basis == "model_interpreted"))
     and $records[0].claim_class == "runtime_inference"
@@ -6498,8 +6542,10 @@ run_general_evidence_reasoning_shadow_scenario() {
         and .authority == "unknown"
         and .freshness_state == "unknown_freshness"))
   ' --argjson presented "$presentation_expected" \
-    --arg answer "$answer" \
-    --arg digest "$(jq -r '.prompt.general_evidence_reasoning.claim_digest' <<<"$trace")"
+    --arg digest "$(jq -r '.prompt.general_evidence_reasoning.claim_digest' <<<"$trace")" \
+    --arg exact_claim "$exact_claim" \
+    --arg exact_result "$exact_result" \
+    --argjson derivations "$expected_derivations"
   case "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" in
     *alpha*|*beta*|*gamma*|*delta*|*epsilon*|*"mechanically computed"*|*"provider prompt"*|*scratchpad*)
       echo "General evidence reasoning trace exposed semantic/source prose" >&2
@@ -6522,10 +6568,12 @@ run_general_evidence_reasoning_shadow_scenario() {
       and .record.record_kind == "support"
       and .record.support_record.schema_version == "claim-record.v2"
       and .record.support_record.presented_to_user == true
+      and .record.support_record.claim_anchor == $exact_claim
+      and .record.support_record.support.executed_derivations[-1].canonical_result == $exact_result
       and .record.support_record.support.conclusion_disposition == "qualified"
       and .history_root_lineage.schema_version == "history-root-lineage.v1"
       and .history_root_lineage.record_kind == "support"
-    '
+    ' --arg exact_claim "$exact_claim" --arg exact_result "$exact_result"
   else
     assert_jq "general_reasoning.history.shadow" "$history" '
       .resolution_status == "no_record"
@@ -6536,7 +6584,7 @@ run_general_evidence_reasoning_shadow_scenario() {
   fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   if [[ "$presentation_expected" == "true" ]]; then
-    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=4 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
   else
     echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
   fi

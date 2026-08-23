@@ -637,6 +637,14 @@ It does not scan or rewrite other numbers in model-authored prose. If presentati
 is ineligible or cannot safely reproduce the exact derivation binding, the existing
 response path remains unchanged.
 
+When readable display text differs from the exact authoritative claim, the
+system-owned reasoning presentation trace retains only a SHA-256 digest of the
+normalized visible first paragraph. Basic Memory Store independently normalizes
+and hashes the persisted assistant response to validate that association. The
+visible digest grants no claim authority: Cognitive Runtime disposition,
+presentation eligibility, and the exact claim, execution, and support records
+remain unchanged and auditable.
+
 For structured field-value reasoning, each supplied value-array element is one
 source observation. Provider reasoning preserves those observation boundaries:
 lexical components within one value are not independent aggregate observations,
@@ -689,8 +697,9 @@ plain-language qualification derived from broad CR limitation families. Raw
 limitation codes, exclusion prose, service names, schemas, prompts, and reasoning
 are not exposed. Generic-presented answers return no public source list unless a
 separately proven exact mapping exists. The trace records only bounded
-presentation enablement, status, reason code, qualification application, and the
-existing `presented_to_user` truth.
+presentation enablement, status, reason code, qualification application, the
+normalized visible-first-paragraph digest for a presented answer, and the existing
+`presented_to_user` truth. It does not retain the visible claim text.
 
 When generic presentation wins, legacy v1 capture is skipped for that assistant
 message and the existing bounded v2 support record is stored as presented. When
