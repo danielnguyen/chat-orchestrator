@@ -971,6 +971,16 @@ and validates it privately. A rejected lineaged append is not retried without
 lineage and produces a bounded non-durable dependency response rather than a
 false persistence success.
 
+Immediate-history support responses may contain either the existing bounded
+`claim-record.v1` record or the current bounded `claim-record.v2` support record.
+Chat Orchestrator validates the declared version and its complete strict shape
+before using the same deterministic support renderer. A presented v2 explanation
+remains backed by the record Basic Memory Store already associated with the
+immediately preceding answer; parsing it does not reconstruct support with a
+provider or perform new evidence verification. Malformed records and unsupported
+schema versions fail closed. Cognitive Runtime and Basic Memory Store retain
+their existing authority over history policy and record association.
+
 Fresh verification begins only when Cognitive Runtime explicitly permits it after
 one valid immediate record resolves and that record supplies an exact bounded
 target paragraph. Entry does not require client external-context opt-in. The

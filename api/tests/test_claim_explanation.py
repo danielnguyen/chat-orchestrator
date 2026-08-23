@@ -92,6 +92,64 @@ def _record(**overrides):
     return record
 
 
+def _record_v2(**overrides):
+    claim_anchor = overrides.get("claim_anchor", ANCHOR)
+    claim_digest = overrides.get("claim_anchor_digest", _digest(claim_anchor))
+    reference = {
+        "ref_type": "external_source",
+        "ref_id": "external-source:bounded-record",
+        "owner_id": "owner",
+        "conversation_id": "conversation-1",
+        "support_kind": "contextual",
+        "authority": "unknown",
+        "freshness_state": "unknown_freshness",
+    }
+    record = _record(
+        schema_version="claim-record.v2",
+        claim_anchor=claim_anchor,
+        claim_anchor_digest=claim_digest,
+        claim_class="runtime_inference",
+        calibration_status="limited",
+        evidence_strength="weak",
+        confidence="unknown",
+        strongest_authority="unknown",
+        freshness_summary="unknown",
+        validated_evidence_references=[reference],
+        limitation_codes=["unknown_freshness"],
+        presented_to_user=True,
+        support={
+            "claim_digest": claim_digest,
+            "supporting_evidence_ref_ids": [reference["ref_id"]],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [
+                {
+                    "evidence_ref_id": reference["ref_id"],
+                    "reason": "PRIVATE-MATERIAL-EXCLUSION-REASON",
+                }
+            ],
+            "executed_derivations": [
+                {
+                    "derivation_id": "mean-result",
+                    "operation": "mean",
+                    "canonical_inputs": ["0.25", "0.75"],
+                    "canonical_result": "0.5",
+                    "execution_digest": _digest("execution"),
+                    "executor_version": "deterministic-derivation.v1",
+                    "supporting_evidence_ref_ids": [reference["ref_id"]],
+                    "input_basis": "model_interpreted",
+                }
+            ],
+            "material_scope_limitations": ["bounded_scope"],
+            "calibration_status": "limited",
+            "conclusion_disposition": "qualified",
+            "qualification_required": True,
+            "limitation_codes": ["interpretation_dependent"],
+        },
+    )
+    record.update(overrides)
+    return record
+
+
 def _messages(*, prior=ANCHOR, follow_up="How are you sure?"):
     return [
         {"role": "assistant", "content": prior},
@@ -4042,6 +4100,105 @@ async def test_immediate_support_uses_exact_record_and_suppresses_identifiers():
         "claim-1",
     ):
         assert private not in serialized
+
+
+@pytest.mark.asyncio
+async def test_immediate_support_accepts_bounded_v2_without_reconstruction():
+    support = _record_v2(
+        request_id="original-request",
+        assistant_message_id=ROOT_MESSAGE_ID,
+    )
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.status == "ok"
+    assert outcome.trace["provider_call_count"] == 0
+    assert outcome.trace["render_status"] == "completed"
+    assert outcome.answer.endswith(
+        "I didn’t run another search or verification for this explanation."
+    )
+    serialized = json.dumps((outcome.answer, outcome.trace), sort_keys=True)
+    for private in (
+        "claim-record.v2",
+        "mean-result",
+        "PRIVATE-MATERIAL-EXCLUSION-REASON",
+        "external-source:bounded-record",
+    ):
+        assert private not in serialized
+    assert len(store.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_support",
+        "claim_digest_mismatch",
+        "malformed_support",
+        "shadow_record",
+        "unknown_schema_version",
+    ],
+)
+async def test_immediate_support_rejects_invalid_v2_shapes(mutation):
+    support = _record_v2(
+        request_id="original-request",
+        assistant_message_id=ROOT_MESSAGE_ID,
+    )
+    if mutation == "missing_support":
+        support.pop("support")
+    elif mutation == "claim_digest_mismatch":
+        support["support"]["claim_digest"] = _digest("different claim")
+    elif mutation == "malformed_support":
+        support["support"]["private_payload"] = "PRIVATE-V2-SENTINEL"
+    elif mutation == "shadow_record":
+        support["presented_to_user"] = False
+    else:
+        support["schema_version"] = "claim-record.v3"
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.status == "degraded"
+    assert outcome.answer.startswith("I couldn’t access the retained evidence record")
+    assert outcome.history_root_lineage is None
+    assert "PRIVATE-V2-SENTINEL" not in json.dumps(
+        (outcome.answer, outcome.trace), sort_keys=True
+    )
 
 
 @pytest.mark.asyncio

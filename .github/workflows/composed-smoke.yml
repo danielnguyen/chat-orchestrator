@@ -69,7 +69,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: 8a08737653cd55e17e755fa9e3fa260253369e81
+          ref: fded104d17b705524b2a8188f8c6475f27f95819
           path: basic-memory-store
           fetch-depth: 0
 
@@ -77,7 +77,7 @@ jobs:
         run: |
           git -C cognitive-runtime branch --force main 20401b665e91ec4ffb1709f12b0fc175be5ff87b
           git -C data-source-aggregator branch --force main 1fbe608477be9251419f5085162e4c5b7099afde
-          git -C basic-memory-store branch --force main 8a08737653cd55e17e755fa9e3fa260253369e81
+          git -C basic-memory-store branch --force main fded104d17b705524b2a8188f8c6475f27f95819
           git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD
 
       - name: Validate Compose configuration
@@ -113,6 +113,7 @@ jobs:
           EVIDENCE_SCENARIO: general-reasoning-presentation
           COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED: "true"
           COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED: "true"
+          COMPOSED_HISTORY_FOLLOWUP_ENABLED: "true"
         run: make composed-smoke
 
       - name: Run policy-admitted advisory evidence proof
