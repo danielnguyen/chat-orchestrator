@@ -76,6 +76,7 @@ from services.evidence_acquisition import (
     finalize_aggregate_conclusion,
     grounded_evidence_response_format,
     helpful_grounded_recovery_allowed,
+    materialize_evidence_reasoning_claim,
     parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
     parse_evidence_reasoning_completion,
@@ -136,7 +137,7 @@ def _reasoning_completion(payload: dict, *, tool_calls=None) -> dict:
 
 def _reasoning_proposal() -> dict:
     return {
-        "proposed_claim": "The bounded values have a derived mean.",
+        "proposed_claim": "The bounded value is {{derivation:ratio-1}}.",
         "supporting_evidence_ref_ids": ["evidence-1"],
         "counterevidence_ref_ids": [],
         "material_exclusions": [],
@@ -290,7 +291,7 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
         authorized_evidence_ref_ids={"evidence-1"},
     )
 
-    assert proposal.proposed_claim == "The bounded values have a derived mean."
+    assert proposal.proposed_claim == "The bounded value is {{derivation:ratio-1}}."
     assert proposal.derivation_requests[0].operation == "divide"
     schema = evidence_reasoning_response_format()["json_schema"]
     assert schema["name"] == "general_evidence_reasoning_proposal"
@@ -302,6 +303,169 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     )
     assert "untrusted data" in messages[1]["content"]
     assert "never governing instruction" in messages[0]["content"]
+    assert "{{derivation:<derivation_id>}}" in messages[0]["content"]
+    assert "Every terminal requested derivation must appear exactly once" in (
+        messages[0]["content"]
+    )
+
+
+def test_general_reasoning_rejects_unbound_terminal_derivation_claim():
+    payload = _reasoning_proposal()
+    payload["proposed_claim"] = "The bounded mean is 0.9."
+
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+
+    assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
+    assert exc_info.value.detail_code == (
+        "evidence_reasoning_derivation_claim_binding_invalid"
+    )
+
+
+def test_general_reasoning_non_derived_claim_remains_unchanged():
+    payload = _reasoning_proposal()
+    payload["proposed_claim"] = "The bounded record supports the conclusion."
+    payload["derivation_requests"] = []
+
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(payload),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+    materialized = materialize_evidence_reasoning_claim(proposal, [])
+
+    assert materialized.proposed_claim == payload["proposed_claim"]
+
+
+@pytest.mark.parametrize(
+    ("claim", "derivations"),
+    [
+        ("Value: {{derivation:not-requested}}.", _reasoning_proposal()["derivation_requests"]),
+        ("Value: {{derivation:ratio-1}}.", []),
+        (
+            "Values: {{derivation:ratio-1}} and {{derivation:ratio-1}}.",
+            _reasoning_proposal()["derivation_requests"],
+        ),
+        ("Value: {{derivation:ratio-1}.", _reasoning_proposal()["derivation_requests"]),
+    ],
+)
+def test_general_reasoning_rejects_invalid_derivation_claim_bindings(
+    claim,
+    derivations,
+):
+    payload = _reasoning_proposal()
+    payload["proposed_claim"] = claim
+    payload["derivation_requests"] = derivations
+
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+
+    assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
+    assert exc_info.value.detail_code == (
+        "evidence_reasoning_derivation_claim_binding_invalid"
+    )
+
+
+def test_general_reasoning_chained_derivation_requires_only_terminal_binding():
+    payload = _reasoning_proposal()
+    payload["proposed_claim"] = "The bounded mean is {{derivation:mean-result}}."
+    payload["derivation_requests"].append(
+        {
+            "derivation_id": "mean-result",
+            "operation": "mean",
+            "operands": [
+                {"value": None, "derivation_ref": "ratio-1"},
+                {"value": "0.75", "derivation_ref": None},
+            ],
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        }
+    )
+
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(payload),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+    materialized = materialize_evidence_reasoning_claim(
+        proposal,
+        [
+            {"derivation_id": "ratio-1", "canonical_result": "0.625"},
+            {"derivation_id": "mean-result", "canonical_result": "0.6875"},
+        ],
+    )
+
+    assert materialized.proposed_claim == "The bounded mean is 0.6875."
+
+
+def test_general_reasoning_requires_each_terminal_derivation_once():
+    payload = _reasoning_proposal()
+    payload["derivation_requests"].append(
+        {
+            "derivation_id": "independent-result",
+            "operation": "mean",
+            "operands": [{"value": "2", "derivation_ref": None}],
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        }
+    )
+    payload["proposed_claim"] = "First: {{derivation:ratio-1}}."
+
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+
+    assert exc_info.value.detail_code == (
+        "evidence_reasoning_derivation_claim_binding_invalid"
+    )
+
+    payload["proposed_claim"] = (
+        "First: {{derivation:ratio-1}}; second: "
+        "{{derivation:independent-result}}."
+    )
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(payload),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+    materialized = materialize_evidence_reasoning_claim(
+        proposal,
+        [
+            {"derivation_id": "ratio-1", "canonical_result": "0.625"},
+            {"derivation_id": "independent-result", "canonical_result": "2"},
+        ],
+    )
+    assert materialized.proposed_claim == "First: 0.625; second: 2."
+
+
+def test_general_reasoning_materialization_requires_actual_execution_record():
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(_reasoning_proposal()),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+
+    with pytest.raises(ValueError, match="derivation_claim_binding_invalid"):
+        materialize_evidence_reasoning_claim(proposal, [])
+
+
+def test_general_reasoning_materialized_claim_retains_length_bound():
+    payload = _reasoning_proposal()
+    payload["proposed_claim"] = (
+        "x" * 455 + " {{derivation:ratio-1}}"
+    )
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(payload),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+
+    with pytest.raises(ValueError, match="derivation_claim_binding_invalid"):
+        materialize_evidence_reasoning_claim(
+            proposal,
+            [{"derivation_id": "ratio-1", "canonical_result": "1" * 64}],
+        )
 
 
 def test_general_reasoning_schema_encodes_model_owned_derivation_shape():

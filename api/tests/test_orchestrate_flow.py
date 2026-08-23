@@ -52,12 +52,14 @@ from services.evidence_acquisition import (
     DsaSourceListResponse,
     EvidenceAcquisitionPremise,
     EvidenceAcquisitionState,
+    EvidenceReasoningProposal,
     PlanResult,
     ProcessFailureObservation,
     SemanticInterpreterFailure,
     SufficiencyResult,
     _acquisition_premise_digest,
     evidence_reasoning_response_format,
+    materialize_evidence_reasoning_claim,
 )
 from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import (
@@ -16300,7 +16302,10 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     derivations = []
     proposed_claim = "The bounded records have a documented operational status."
     if semantic_case == "rational_values":
-        proposed_claim = "The interpreted ratios have a mechanically computed mean."
+        proposed_claim = (
+            "The interpreted ratios have a mechanically computed mean of "
+            "{{derivation:mean_1}}."
+        )
         derivations = [
             {
                 "derivation_id": "ratio_1",
@@ -16383,7 +16388,8 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     should_present = presentation_enabled and semantic_case != "unsupported_speculation"
     if should_present and semantic_case == "rational_values":
         assert out["answer"] == (
-            f"{proposed_claim}\n\nTreat this as qualified rather than exact because "
+            "The interpreted ratios have a mechanically computed mean of 0.625.\n\n"
+            "Treat this as qualified rather than exact because "
             "some evidence required interpretation."
         )
     elif should_present:
@@ -16423,6 +16429,12 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         assert {item["input_basis"] for item in executions} == {
             "model_interpreted"
         }
+        assert runtime.claim_support_calls[0]["proposal"]["proposed_claim"] == (
+            "The interpreted ratios have a mechanically computed mean of 0.625."
+        )
+        assert "{{derivation:" not in json.dumps(
+            runtime.claim_support_calls[0], sort_keys=True
+        )
     else:
         assert runtime.claim_support_calls[0]["authority_context"][
             "executed_derivations"
@@ -16435,6 +16447,23 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     assert len(v2_calls) == 1
     assert v2_calls[0]["payload"]["presented_to_user"] is should_present
     assert v2_calls[0]["payload"]["support"]["claim_digest"].startswith("sha256:")
+    if semantic_case == "rational_values":
+        materialized_claim = (
+            "The interpreted ratios have a mechanically computed mean of 0.625."
+        )
+        materialized_digest = (
+            "sha256:" + hashlib.sha256(materialized_claim.encode()).hexdigest()
+        )
+        assert v2_calls[0]["payload"]["calibration_result"]["claim_anchor"] == (
+            materialized_claim
+        )
+        assert v2_calls[0]["payload"]["support"]["claim_digest"] == (
+            materialized_digest
+        )
+        assert v2_calls[0]["payload"]["calibration_result"][
+            "claim_anchor_digest"
+        ] == materialized_digest
+        assert "{{derivation:" not in json.dumps(v2_calls[0], sort_keys=True)
     reasoning_traces = [
         call["payload"]["prompt"]["general_evidence_reasoning"]
         for call in memory_store.trace_calls
@@ -16443,6 +16472,8 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     trace = reasoning_traces[-1]
     assert trace["reasoning_provider_call_count"] == 1
     assert trace["cr_call_count"] == 1
+    if semantic_case == "rational_values":
+        assert trace["claim_digest"] == materialized_digest
     assert trace["bms_persistence_status"] == (
         "failed" if persistence_fails else "persisted"
     )
@@ -16625,6 +16656,82 @@ def test_claim_support_qualified_presentation_is_deterministic_and_user_safe():
     assert "interpretation-dependent-derivation" not in answer
     assert "PRIVATE REASON" not in answer
     assert reasoning["proposal"]["proposed_claim"] not in json.dumps(trace)
+
+
+def test_neutral_rational_mean_presentation_uses_executor_canonical_result():
+    evidence_ref_id = "evidence-1"
+    readings = [
+        ("5", "8"),
+        ("9", "16"),
+        ("3", "8"),
+        ("1", "4"),
+        ("1", "2"),
+        ("1", "2"),
+        ("1", "2"),
+        ("1", "4"),
+        ("5", "8"),
+        ("1", "2"),
+        ("1", "8"),
+        ("3", "4"),
+    ]
+    requests = [
+        {
+            "derivation_id": f"ratio-{index}",
+            "operation": "divide",
+            "operands": [
+                {"value": numerator, "derivation_ref": None},
+                {"value": denominator, "derivation_ref": None},
+            ],
+            "supporting_evidence_ref_ids": [evidence_ref_id],
+        }
+        for index, (numerator, denominator) in enumerate(readings, start=1)
+    ]
+    requests.append(
+        {
+            "derivation_id": "mean-result",
+            "operation": "mean",
+            "operands": [
+                {"value": None, "derivation_ref": f"ratio-{index}"}
+                for index in range(1, 13)
+            ],
+            "supporting_evidence_ref_ids": [evidence_ref_id],
+        }
+    )
+    proposal = EvidenceReasoningProposal.model_validate(
+        {
+            "proposed_claim": "The bounded mean is {{derivation:mean-result}}.",
+            "supporting_evidence_ref_ids": [evidence_ref_id],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "derivation_requests": requests,
+        }
+    )
+    executions = orchestrate_service.execute_derivations(
+        proposal.derivation_requests,
+        authorized_evidence_ref_ids={evidence_ref_id},
+    )
+    materialized = materialize_evidence_reasoning_claim(proposal, executions)
+    reasoning = _presentation_reasoning_result()
+    reasoning["proposal"] = materialized.model_dump(mode="json")
+    reasoning["executions"] = executions
+    reasoning["cr_result"]["validated_executed_derivation_ref_ids"] = [
+        record["derivation_id"] for record in executions
+    ]
+
+    trace, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert executions[-1]["canonical_result"] == (
+        "0.4635416666666666666666666667"
+    )
+    assert answer == "The bounded mean is 0.4635416666666666666666666667."
+    assert trace["status"] == "presented"
+    assert "{{derivation:" not in answer
 
 
 def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed():
@@ -16875,9 +16982,42 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
         ),
         (
             _general_reasoning_completion(
-                proposed_claim="The bounded record supports a claim.",
+                proposed_claim="The bounded mean is 0.9.",
+                evidence_ref_id="neutral_records:item_1",
+                derivation_requests=[
+                    {
+                        "derivation_id": "mean-result",
+                        "operation": "mean",
+                        "operands": [
+                            {"value": "0.5", "derivation_ref": None},
+                            {"value": "0.75", "derivation_ref": None},
+                        ],
+                        "supporting_evidence_ref_ids": [
+                            "neutral_records:item_1"
+                        ],
+                    }
+                ],
+            ),
+            "proposal_self_consistency_invalid",
+            "evidence_reasoning_derivation_claim_binding_invalid",
+        ),
+        (
+            _general_reasoning_completion(
+                proposed_claim=(
+                    "The bounded result is {{derivation:mean-result}}."
+                ),
                 evidence_ref_id="neutral_records:item_1",
                 counterevidence_ref_ids=["neutral_records:item_1"],
+                derivation_requests=[
+                    {
+                        "derivation_id": "mean-result",
+                        "operation": "mean",
+                        "operands": [{"value": "0.5", "derivation_ref": None}],
+                        "supporting_evidence_ref_ids": [
+                            "neutral_records:item_1"
+                        ],
+                    }
+                ],
             ),
             "proposal_self_consistency_invalid",
             None,
@@ -22055,7 +22195,7 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
         }
     )
     reasoning_completion = _general_reasoning_completion(
-        proposed_claim="The usable interpreted entries support a bounded estimate.",
+        proposed_claim="The bounded mean is {{derivation:mean_1}}.",
         evidence_ref_id=evidence_ref_id,
         material_exclusions=[
             {
@@ -22128,6 +22268,7 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
         "model_interpreted"
     }
     cr_result = runtime.claim_support_calls[0]
+    assert cr_result["proposal"]["proposed_claim"] == "The bounded mean is 0.625."
     assert cr_result["proposal"]["supporting_evidence_ref_ids"] == [evidence_ref_id]
     assert cr_result["proposal"]["material_exclusions"][0][
         "evidence_ref_id"
@@ -22188,6 +22329,53 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
     for value in structured["values"]:
         assert value not in trace_serialized
     assert "scratchpad" not in trace_serialized
+
+
+@pytest.mark.asyncio
+async def test_missing_bound_derivation_execution_fails_before_cr(
+    tmp_path,
+    monkeypatch,
+):
+    response = _aggregate_structured_response()
+    response["results"][0]["structured_data"].update(
+        record_count=1,
+        non_empty_value_count=1,
+        values=["1/2"],
+    )
+    evidence_ref_id = governed_external_reference_id(
+        response["results"][0]["source_ref"]
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim="The bounded mean is {{derivation:mean-result}}.",
+        evidence_ref_id=evidence_ref_id,
+        derivation_requests=[
+            {
+                "derivation_id": "mean-result",
+                "operation": "mean",
+                "operands": [{"value": "0.5", "derivation_ref": None}],
+                "supporting_evidence_ref_ids": [evidence_ref_id],
+            }
+        ],
+    )
+    monkeypatch.setattr(orchestrate_service, "execute_derivations", lambda *args, **kwargs: [])
+
+    _, runtime, _, _, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=reasoning_completion,
+        request_id="rid-missing-bound-execution",
+    )
+
+    assert runtime.claim_support_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert trace["validation_status"] == "failed"
+    assert trace["failure_code"] == "proposal_self_consistency_invalid"
+    assert trace["failure_detail_code"] == (
+        "evidence_reasoning_derivation_claim_binding_invalid"
+    )
 
 
 @pytest.mark.asyncio

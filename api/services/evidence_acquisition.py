@@ -441,6 +441,12 @@ class EvidenceReasoningExclusion(StrictModel):
         return " ".join(value.split()) if isinstance(value, str) else value
 
 
+_DERIVATION_CLAIM_PLACEHOLDER = re.compile(
+    r"\{\{derivation:([A-Za-z0-9][A-Za-z0-9._:-]*)\}\}"
+)
+_DERIVATION_CLAIM_MARKER = re.compile(r"\{\{\s*derivation\b")
+
+
 class EvidenceReasoningProposal(StrictModel):
     proposed_claim: Annotated[StrictStr, Field(min_length=1, max_length=500)]
     supporting_evidence_ref_ids: list[Identifier] = Field(max_length=16)
@@ -478,7 +484,66 @@ class EvidenceReasoningProposal(StrictModel):
         derivation_ids = [item.derivation_id for item in self.derivation_requests]
         if len(derivation_ids) != len(set(derivation_ids)):
             raise ValueError("duplicate_derivation_id")
+        placeholders = _DERIVATION_CLAIM_PLACEHOLDER.findall(self.proposed_claim)
+        without_placeholders = _DERIVATION_CLAIM_PLACEHOLDER.sub(
+            "", self.proposed_claim
+        )
+        if _DERIVATION_CLAIM_MARKER.search(without_placeholders):
+            raise ValueError("derivation_claim_binding_invalid")
+        if len(placeholders) != len(set(placeholders)):
+            raise ValueError("derivation_claim_binding_invalid")
+        requested_ids = set(derivation_ids)
+        if not set(placeholders) <= requested_ids:
+            raise ValueError("derivation_claim_binding_invalid")
+        referenced_ids = {
+            operand.derivation_ref
+            for request in self.derivation_requests
+            for operand in request.operands
+            if operand.derivation_ref is not None
+        }
+        terminal_ids = requested_ids - referenced_ids
+        if not terminal_ids <= set(placeholders):
+            raise ValueError("derivation_claim_binding_invalid")
         return self
+
+
+def materialize_evidence_reasoning_claim(
+    proposal: EvidenceReasoningProposal,
+    executions: list[dict[str, Any]],
+) -> EvidenceReasoningProposal:
+    """Bind derivation placeholders only to actual executor results."""
+
+    by_id: dict[str, str] = {}
+    for record in executions:
+        if not isinstance(record, dict):
+            raise ValueError("derivation_claim_binding_invalid")
+        derivation_id = record.get("derivation_id")
+        canonical_result = record.get("canonical_result")
+        if (
+            not isinstance(derivation_id, str)
+            or derivation_id in by_id
+            or not isinstance(canonical_result, str)
+            or not canonical_result
+        ):
+            raise ValueError("derivation_claim_binding_invalid")
+        by_id[derivation_id] = canonical_result
+
+    def substitute(match: re.Match[str]) -> str:
+        derivation_id = match.group(1)
+        if derivation_id not in by_id:
+            raise ValueError("derivation_claim_binding_invalid")
+        return by_id[derivation_id]
+
+    materialized_claim = _DERIVATION_CLAIM_PLACEHOLDER.sub(
+        substitute, proposal.proposed_claim
+    )
+    if (
+        _DERIVATION_CLAIM_MARKER.search(materialized_claim)
+        or not materialized_claim
+        or len(materialized_claim) > 500
+    ):
+        raise ValueError("derivation_claim_binding_invalid")
+    return proposal.model_copy(update={"proposed_claim": materialized_claim})
 
 
 ProviderOutputFailureCode = Literal[
@@ -503,6 +568,7 @@ ProviderOutputDetailCode = Literal[
     "evidence_reasoning_choices_invalid",
     "evidence_reasoning_completion_invalid",
     "evidence_reasoning_content_invalid",
+    "evidence_reasoning_derivation_claim_binding_invalid",
     "evidence_reasoning_json_invalid",
     "evidence_reasoning_message_invalid",
     "evidence_reasoning_reference_unknown",
@@ -2847,7 +2913,12 @@ def evidence_reasoning_messages(
                 "asked about those internals, and avoid unsupported certainty when the "
                 "claim depends on interpretation, approximation, exclusion, or ambiguity. "
                 "Request only bounded divide or mean arithmetic when useful; do not claim "
-                "it executed. Return exactly the schema object without reasoning transcripts."
+                "it executed. When the claim materially uses a requested derivation result, "
+                "do not calculate or write that result yourself. Insert exactly "
+                "{{derivation:<derivation_id>}} where the executed result belongs. Every "
+                "terminal requested derivation must appear exactly once; intermediate "
+                "derivations used only as inputs need not appear. Return exactly the schema "
+                "object without reasoning transcripts."
             ),
         },
         {"role": "user", "content": bounded_input},
@@ -2939,12 +3010,18 @@ def parse_evidence_reasoning_completion(
             "duplicate_evidence_reasoning_reference",
             "conflicting_evidence_reasoning_role",
             "duplicate_derivation_id",
+            "derivation_claim_binding_invalid",
         }
         self_consistency_error = any(
             any(
                 marker in str(error.get("ctx", {}).get("error", ""))
                 for marker in consistency_markers
             )
+            for error in exc.errors()
+        )
+        binding_error = any(
+            "derivation_claim_binding_invalid"
+            in str(error.get("ctx", {}).get("error", ""))
             for error in exc.errors()
         )
         raise ProviderOutputValidationError(
@@ -2954,7 +3031,12 @@ def parse_evidence_reasoning_completion(
                 else "proposal_self_consistency_invalid"
                 if self_consistency_error
                 else "proposal_schema_invalid"
-            )
+            ),
+            (
+                "evidence_reasoning_derivation_claim_binding_invalid"
+                if binding_error
+                else None
+            ),
         ) from exc
     supplied = set(proposal.supporting_evidence_ref_ids)
     supplied.update(proposal.counterevidence_ref_ids)
