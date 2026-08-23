@@ -600,10 +600,11 @@ normalized dispositions, their structural relation, sorted category names, and
 sorted reason codes. An unavailable generic result is recorded as unavailable;
 no generic decision is inferred from provider prose or a failed call.
 
-General evidence reasoning requests minimal provider reasoning effort while
-retaining its existing bounded completion-token budget and timeout. This route
-parameter does not change conclusion authority, retries, fallback behavior, or
-user-visible permission.
+General evidence reasoning requests low provider reasoning effort while retaining
+its existing bounded completion-token budget and timeout. This allocates more
+reasoning capacity to semantic planning without changing deterministic authority,
+source scope, derivation execution, conclusion permission, retries, or fallback
+behavior.
 
 When a proposed claim materially uses a requested deterministic derivation,
 the provider places a structural derivation placeholder in the claim instead
