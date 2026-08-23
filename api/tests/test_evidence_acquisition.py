@@ -38,6 +38,7 @@ from services.evidence_acquisition import (
     PlanResult,
     ProcessFailureObservation,
     ProcessFailureObservations,
+    ProviderOutputValidationError,
     RequirementEvaluation,
     SemanticInterpreterFailure,
     ShapeResult,
@@ -172,6 +173,63 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     assert "never governing instruction" in messages[0]["content"]
 
 
+def test_general_reasoning_schema_encodes_model_owned_derivation_shape():
+    schema = evidence_reasoning_response_format()["json_schema"]["schema"]
+    derivation_item = schema["properties"]["derivation_requests"]["items"]
+
+    assert [
+        branch["properties"]["operation"]["enum"]
+        for branch in derivation_item["anyOf"]
+    ] == [["divide"], ["mean"]]
+    divide_operands = derivation_item["anyOf"][0]["properties"]["operands"]
+    assert (divide_operands["minItems"], divide_operands["maxItems"]) == (2, 2)
+    operand_branches = divide_operands["items"]["anyOf"]
+    assert operand_branches[0]["properties"]["derivation_ref"] == {"type": "null"}
+    assert operand_branches[1]["properties"]["value"] == {"type": "null"}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failure_code"),
+    [
+        (
+            lambda payload: payload["supporting_evidence_ref_ids"].append(
+                "evidence-1"
+            ),
+            "proposal_self_consistency_invalid",
+        ),
+        (
+            lambda payload: payload["derivation_requests"][0]["operands"].append(
+                {"value": "1", "derivation_ref": None}
+            ),
+            "derivation_contract_invalid",
+        ),
+        (
+            lambda payload: (
+                payload.update({"supporting_evidence_ref_ids": ["fabricated"]}),
+                payload["derivation_requests"][0].update(
+                    {"supporting_evidence_ref_ids": ["fabricated"]}
+                ),
+            ),
+            "proposal_reference_unauthorized",
+        ),
+    ],
+)
+def test_general_reasoning_validation_failures_are_bounded_and_classified(
+    mutation,
+    failure_code,
+):
+    payload = _reasoning_proposal()
+    mutation(payload)
+
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+
+    assert exc_info.value.failure_code == failure_code
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -190,11 +248,12 @@ def test_general_reasoning_proposal_rejects_authority_fields(field):
     payload = _reasoning_proposal()
     payload[field] = "allowed"
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
         parse_evidence_reasoning_completion(
             _reasoning_completion(payload),
             authorized_evidence_ref_ids={"evidence-1"},
         )
+    assert exc_info.value.failure_code == "proposal_schema_invalid"
 
 
 def test_general_reasoning_rejects_scope_widening_tools_and_role_conflicts():
@@ -218,11 +277,12 @@ def test_general_reasoning_rejects_scope_widening_tools_and_role_conflicts():
         )
     payload = _reasoning_proposal()
     payload["counterevidence_ref_ids"] = ["evidence-1"]
-    with pytest.raises(ValidationError, match="conflicting_evidence_reasoning_role"):
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
         parse_evidence_reasoning_completion(
             _reasoning_completion(payload),
             authorized_evidence_ref_ids={"evidence-1"},
         )
+    assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
 
     partial = _reasoning_proposal()
     partial["material_exclusions"] = [
@@ -2114,6 +2174,115 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
     }
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "comparison",
+                "candidate_source_ids": ["source_a", "source_b"],
+                "aggregate_function": None,
+                "aggregate_field_name": None,
+            },
+            {
+                "interpretation_status": "ambiguous",
+                "operation_hint": "comparison",
+                "candidate_source_ids": ["source_a", "source_b"],
+            },
+        ),
+        (
+            {
+                "interpretation_status": "no_match",
+                "operation_hint": "unknown",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": None,
+                "aggregate_field_name": None,
+            },
+            {
+                "interpretation_status": "no_match",
+                "operation_hint": "unknown",
+                "candidate_source_ids": [],
+            },
+        ),
+        (
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "lookup",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": "mean",
+                "aggregate_field_name": "Reading",
+            },
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "lookup",
+                "candidate_source_ids": ["source_a"],
+            },
+        ),
+        (
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "aggregate",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": "mean",
+                "aggregate_field_name": None,
+            },
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "aggregate",
+                "candidate_source_ids": ["source_a"],
+            },
+        ),
+    ],
+    ids=[
+        "resolved-multiple-degrades-to-ambiguous",
+        "no-match-discards-candidates",
+        "non-aggregate-discards-aggregate-details",
+        "partial-aggregate-details-are-discarded",
+    ],
+)
+def test_evidence_interpreter_conservatively_normalizes_model_owned_conflicts(
+    payload,
+    expected,
+):
+    assert parse_evidence_interpreter_completion(
+        _semantic_completion(payload),
+        inventory_source_ids={"source_a", "source_b"},
+    ) == expected
+
+
+def test_evidence_interpreter_retains_authority_and_unusable_ambiguity_rejections():
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_interpreter_completion(
+            _semantic_completion(
+                {
+                    "interpretation_status": "ambiguous",
+                    "operation_hint": "lookup",
+                    "candidate_source_ids": ["source_a"],
+                    "aggregate_function": None,
+                    "aggregate_field_name": None,
+                }
+            ),
+            inventory_source_ids={"source_a", "source_b"},
+        )
+    assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
+
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_interpreter_completion(
+            _semantic_completion(
+                {
+                    "interpretation_status": "no_match",
+                    "operation_hint": "unknown",
+                    "candidate_source_ids": ["fabricated_source"],
+                    "aggregate_function": None,
+                    "aggregate_field_name": None,
+                }
+            ),
+            inventory_source_ids={"source_a", "source_b"},
+        )
+    assert exc_info.value.failure_code == "proposal_reference_unauthorized"
+
+
 def test_grounded_evidence_response_format_matches_strict_candidate_boundary():
     response_format = grounded_evidence_response_format()
     assert response_format["type"] == "json_schema"
@@ -2202,19 +2371,20 @@ def test_evidence_interpreter_output_preserves_legacy_and_nullable_contracts():
 
 
 def test_evidence_interpreter_output_rejects_duplicate_candidates():
-    with pytest.raises(
-        ValidationError,
-        match="duplicate_semantic_candidate_source_id",
-    ):
-        EvidenceInterpreterOutput.model_validate(
-            {
-                "interpretation_status": "ambiguous",
-                "operation_hint": "lookup",
-                "candidate_source_ids": ["source_a", "source_a"],
-                "aggregate_function": None,
-                "aggregate_field_name": None,
-            }
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_interpreter_completion(
+            _semantic_completion(
+                {
+                    "interpretation_status": "ambiguous",
+                    "operation_hint": "lookup",
+                    "candidate_source_ids": ["source_a", "source_a"],
+                    "aggregate_function": None,
+                    "aggregate_field_name": None,
+                }
+            ),
+            inventory_source_ids={"source_a"},
         )
+    assert exc_info.value.failure_code == "proposal_self_consistency_invalid"
 
 
 @pytest.mark.parametrize(
@@ -2225,25 +2395,6 @@ def test_evidence_interpreter_output_rejects_duplicate_candidates():
             "operation_hint": "aggregate",
             "candidate_source_ids": ["source_a"],
             "aggregate_function": "average",
-            "aggregate_field_name": "Fuel (L)",
-        },
-        {
-            "interpretation_status": "resolved",
-            "operation_hint": "aggregate",
-            "candidate_source_ids": ["source_a"],
-            "aggregate_function": "median",
-        },
-        {
-            "interpretation_status": "resolved",
-            "operation_hint": "aggregate",
-            "candidate_source_ids": ["source_a"],
-            "aggregate_field_name": "Fuel (L)",
-        },
-        {
-            "interpretation_status": "resolved",
-            "operation_hint": "lookup",
-            "candidate_source_ids": ["source_a"],
-            "aggregate_function": "median",
             "aggregate_field_name": "Fuel (L)",
         },
         {
@@ -2270,9 +2421,6 @@ def test_evidence_interpreter_output_rejects_duplicate_candidates():
     ],
     ids=[
         "unknown-function",
-        "function-only",
-        "field-only",
-        "details-on-lookup",
         "outer-whitespace",
         "control-character",
         "overlong-field",
@@ -3074,8 +3222,64 @@ async def test_operation_refinement_rejects_candidate_outside_deterministic_scop
     assert state.status == "semantic_interpreter_failed"
     assert state.forced_answer == AMBIGUOUS_ANSWER
     assert state.semantic_interpreter["reason"] == "malformed_response"
+    assert state.semantic_interpreter["failure_code"] == (
+        "proposal_reference_unauthorized"
+    )
     assert [name for name, _ in runtime.calls] == ["shape"]
     assert state.plan is None
+    assert dsa.calls == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_self_consistency_failure_reaches_bounded_trace():
+    first = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+    )
+    runtime = SequentialShapeRuntime([first])
+    dsa = FakeDsa(
+        [_source("source_a")],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+
+    async def interpreter(**kwargs):
+        return parse_evidence_interpreter_completion(
+            _semantic_completion(
+                {
+                    "interpretation_status": "ambiguous",
+                    "operation_hint": "lookup",
+                    "candidate_source_ids": ["source_a"],
+                    "aggregate_function": None,
+                    "aggregate_field_name": None,
+                }
+            ),
+            inventory_source_ids={"source_a"},
+        )
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "semantic_interpreter_failed"
+    assert state.semantic_interpreter == {
+        "called": True,
+        "status": "failed",
+        "reason": "malformed_response",
+        "interpretation_status": None,
+        "operation_hint": None,
+        "candidate_count": 0,
+        "failure_code": "proposal_self_consistency_invalid",
+    }
+    assert [name for name, _ in runtime.calls] == ["shape"]
     assert dsa.calls == ["list_sources"]
 
 
@@ -3147,7 +3351,10 @@ async def test_operation_refinement_provider_failures_are_safe(failure_mode):
         if failure_mode in {"timeout", "dependency"}:
             raise SemanticInterpreterFailure("dependency_failure")
         if failure_mode == "refusal":
-            raise SemanticInterpreterFailure("malformed_response")
+            raise SemanticInterpreterFailure(
+                "malformed_response",
+                failure_code="completion_refusal",
+            )
         return {"unexpected": "PRIVATE_SEMANTIC_PAYLOAD"}
 
     dsa = FakeDsa(
@@ -3174,6 +3381,8 @@ async def test_operation_refinement_provider_failures_are_safe(failure_mode):
         if failure_mode in {"timeout", "dependency"}
         else "malformed_response"
     )
+    if failure_mode == "refusal":
+        assert state.semantic_interpreter["failure_code"] == "completion_refusal"
     assert [name for name, _ in runtime.calls] == ["shape"]
     assert state.plan is None
     assert dsa.calls == ["list_sources"]
@@ -3562,6 +3771,7 @@ async def test_enriched_aggregate_rejects_unsafe_candidate_field_membership(
 
     assert state.status == "semantic_interpreter_failed"
     assert state.semantic_interpreter["reason"] == "malformed_response"
+    assert state.semantic_interpreter["failure_code"] == "proposal_scope_unauthorized"
     assert [name for name, _ in runtime.calls] == ["shape"]
     assert state.plan is None
     assert dsa.calls == ["list_sources"]
