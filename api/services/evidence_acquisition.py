@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, Rounded, localcontext
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 from clients.data_source_aggregator import DataSourceAggregatorFailure
 from models import MaterialScopeReferences
@@ -493,6 +493,38 @@ ProviderOutputFailureCode = Literal[
     "proposal_capability_forbidden",
     "derivation_contract_invalid",
 ]
+ProviderOutputDetailCode = Literal[
+    "aggregate_candidate_content_fields_required",
+    "aggregate_field_not_configured_for_candidate",
+    "ambiguous_semantic_candidates_required",
+    "derivation_evidence_reference_not_proposed",
+    "duplicate_semantic_candidate_source_id",
+    "evidence_reasoning_choice_invalid",
+    "evidence_reasoning_choices_invalid",
+    "evidence_reasoning_completion_invalid",
+    "evidence_reasoning_content_invalid",
+    "evidence_reasoning_json_invalid",
+    "evidence_reasoning_message_invalid",
+    "evidence_reasoning_reference_unknown",
+    "evidence_reasoning_refusal_invalid",
+    "evidence_reasoning_tool_call_forbidden",
+    "resolved_semantic_candidate_required",
+    "semantic_candidate_source_not_in_inventory",
+    "semantic_choice_invalid",
+    "semantic_choice_provider_metadata_invalid",
+    "semantic_choices_invalid",
+    "semantic_completion_invalid",
+    "semantic_content_invalid",
+    "semantic_json_invalid",
+    "semantic_json_object_required",
+    "semantic_message_annotations_invalid",
+    "semantic_message_invalid",
+    "semantic_message_provider_metadata_invalid",
+    "semantic_refusal_invalid",
+    "semantic_service_tier_invalid",
+    "semantic_tool_call_forbidden",
+]
+_PROVIDER_OUTPUT_DETAIL_CODES = frozenset(get_args(ProviderOutputDetailCode))
 
 
 class ProviderOutputValidationError(ValueError):
@@ -501,10 +533,16 @@ class ProviderOutputValidationError(ValueError):
     def __init__(
         self,
         failure_code: ProviderOutputFailureCode,
-        detail_code: str | None = None,
+        detail_code: ProviderOutputDetailCode | None = None,
     ) -> None:
+        if (
+            detail_code is not None
+            and detail_code not in _PROVIDER_OUTPUT_DETAIL_CODES
+        ):
+            raise ValueError("provider_output_detail_code_invalid")
         super().__init__(detail_code or failure_code)
         self.failure_code = failure_code
+        self.detail_code = detail_code
 
 
 @dataclass(frozen=True)
@@ -803,10 +841,12 @@ class SemanticInterpreterFailure(RuntimeError):
         reason: str,
         *,
         failure_code: ProviderOutputFailureCode | None = None,
+        failure_detail_code: ProviderOutputDetailCode | None = None,
     ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.failure_code = failure_code
+        self.failure_detail_code = failure_detail_code
 
 
 class SourceMatchResult(StrictModel):
@@ -4060,6 +4100,8 @@ async def begin_evidence_acquisition(
             failure = {"status": "failed", "reason": exc.reason}
             if exc.failure_code is not None:
                 failure["failure_code"] = exc.failure_code
+            if exc.failure_detail_code is not None:
+                failure["failure_detail_code"] = exc.failure_detail_code
             state.semantic_interpreter.update(failure)
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
@@ -4072,13 +4114,14 @@ async def begin_evidence_acquisition(
                 )
                 return state
         except ProviderOutputValidationError as exc:
-            state.semantic_interpreter.update(
-                {
-                    "status": "failed",
-                    "reason": "malformed_response",
-                    "failure_code": exc.failure_code,
-                }
-            )
+            failure = {
+                "status": "failed",
+                "reason": "malformed_response",
+                "failure_code": exc.failure_code,
+            }
+            if exc.detail_code is not None:
+                failure["failure_detail_code"] = exc.detail_code
+            state.semantic_interpreter.update(failure)
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
                 state.forced_answer = AMBIGUOUS_ANSWER

@@ -6775,6 +6775,11 @@ async def _interpret_evidence_request(
             inventory_source_ids={source.source_id for source in source_list.sources},
         )
     except ProviderOutputValidationError as exc:
+        extra_fields = (
+            {"failure_detail_code": exc.detail_code}
+            if exc.detail_code is not None
+            else None
+        )
         _log_semantic_interpreter_failure(
             request_id=request_id,
             reason="malformed_response",
@@ -6783,10 +6788,12 @@ async def _interpret_evidence_request(
             elapsed_ms=int((perf_counter() - started_at) * 1000),
             timeout_ms=timeout_ms,
             exception_type=type(exc).__name__,
+            extra_fields=extra_fields,
         )
         raise SemanticInterpreterFailure(
             "malformed_response",
             failure_code=exc.failure_code,
+            failure_detail_code=exc.detail_code,
         ) from exc
     except Exception as exc:
         _log_semantic_interpreter_failure(
@@ -7528,13 +7535,14 @@ async def _run_general_evidence_reasoning(
             authorized_evidence_ref_ids=authorized_ref_ids,
         )
     except ProviderOutputValidationError as exc:
-        trace.update(
-            {
-                "validation_status": "failed",
-                "reason_code": "proposal_invalid",
-                "failure_code": exc.failure_code,
-            }
-        )
+        failure = {
+            "validation_status": "failed",
+            "reason_code": "proposal_invalid",
+            "failure_code": exc.failure_code,
+        }
+        if exc.detail_code is not None:
+            failure["failure_detail_code"] = exc.detail_code
+        trace.update(failure)
         return output
     except Exception:
         trace.update(
