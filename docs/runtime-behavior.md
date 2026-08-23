@@ -623,6 +623,20 @@ This binding proves only that the substituted text came from deterministic
 execution. Evidence interpretation and the surrounding domain prose remain
 probabilistic; deterministic execution does not become a semantic truth oracle.
 
+Cognitive Runtime remains authoritative for whether a generic claim is allowed,
+qualified, or withheld. After that decision, the existing presentation selector
+continues to enforce privacy, consequence, action, validated-support, and response-
+composition boundaries. Qualified results summarize material interpretation,
+exclusion, counterevidence, incomplete-record, and source or freshness limits in
+plain language without exposing source text or internal control-plane terms.
+
+Exact deterministic results remain in the authoritative claim, execution record,
+digest, and persisted support record. For display only, presentation may shorten an
+excessively precise finite decimal substituted from a validated execution result.
+It does not scan or rewrite other numbers in model-authored prose. If presentation
+is ineligible or cannot safely reproduce the exact derivation binding, the existing
+response path remains unchanged.
+
 For structured field-value reasoning, each supplied value-array element is one
 source observation. Provider reasoning preserves those observation boundaries:
 lexical components within one value are not independent aggregate observations,
