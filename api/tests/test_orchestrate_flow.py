@@ -40,7 +40,10 @@ from services.capabilities import (
     Revalidator,
     RevalidatorEntry,
 )
-from services.claim_capture import governed_external_reference_id
+from services.claim_capture import (
+    claim_support_record_payload,
+    governed_external_reference_id,
+)
 from services.evidence_acquisition import (
     COMPARISON_SCOPE_SUFFIX,
     EXHAUSTIVE_SCOPE_SUFFIX,
@@ -16389,8 +16392,8 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     if should_present and semantic_case == "rational_values":
         assert out["answer"] == (
             "The interpreted ratios have a mechanically computed mean of 0.625.\n\n"
-            "Treat this as qualified rather than exact because "
-            "some evidence required interpretation."
+            "This result has some uncertainty because "
+            "some source values had to be interpreted."
         )
     elif should_present:
         assert out["answer"] == proposed_claim
@@ -16564,6 +16567,12 @@ def _presentation_reasoning_result(
         (True, "consequence", "ineligible", "consequence_disallowed"),
         (True, "action", "ineligible", "action_related"),
         (True, "unsupported", "ineligible", "validated_support_absent"),
+        (
+            True,
+            "composition",
+            "ineligible",
+            "response_composition_ineligible",
+        ),
     ],
 )
 def test_claim_support_presentation_fails_closed_on_structural_ineligibility(
@@ -16576,6 +16585,7 @@ def test_claim_support_presentation_fails_closed_on_structural_ineligibility(
     privacy_suppressed = False
     consequence_allowed = True
     action_related = False
+    response_composition_supported = True
     if mutation == "unavailable":
         reasoning = {}
     elif mutation == "withheld":
@@ -16592,6 +16602,8 @@ def test_claim_support_presentation_fails_closed_on_structural_ineligibility(
         action_related = True
     elif mutation == "unsupported":
         reasoning["cr_result"]["validated_supporting_evidence_ref_ids"] = []
+    elif mutation == "composition":
+        response_composition_supported = False
 
     trace, answer = _select_claim_support_presentation(
         enabled=enabled,
@@ -16599,6 +16611,7 @@ def test_claim_support_presentation_fails_closed_on_structural_ineligibility(
         privacy_suppressed=privacy_suppressed,
         consequence_policy_allows_claim=consequence_allowed,
         action_related=action_related,
+        response_composition_supported=response_composition_supported,
     )
 
     assert answer is None
@@ -16650,12 +16663,79 @@ def test_claim_support_qualified_presentation_is_deterministic_and_user_safe():
         "qualification_applied": True,
     }
     assert answer.startswith(reasoning["proposal"]["proposed_claim"] + "\n\n")
-    assert "some evidence required interpretation" in answer
-    assert "some relevant evidence was conflicting or excluded" in answer
-    assert "available source support or freshness was limited" in answer
+    assert "some source values had to be interpreted" in answer
+    assert "some records were excluded" in answer
+    assert "I couldn't fully verify the source or how current it is" in answer
+    assert "conflict" not in answer
     assert "interpretation-dependent-derivation" not in answer
     assert "PRIVATE REASON" not in answer
+    for internal_term in (
+        "qualified rather than exact",
+        "claim support",
+        "calibration",
+        "authority",
+        "conclusion disposition",
+        "source support",
+    ):
+        assert internal_term not in answer.lower()
     assert reasoning["proposal"]["proposed_claim"] not in json.dumps(trace)
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected_text", "forbidden_text"),
+    [
+        ("interpretation", "some source values had to be interpreted", "conflict"),
+        ("exclusion", "some records were excluded", "conflict"),
+        ("counterevidence", "some evidence conflicts with the conclusion", "excluded"),
+        ("incomplete", "the available records may be incomplete", "source support"),
+        (
+            "source_freshness",
+            "I couldn't fully verify the source or how current it is",
+            "source support or freshness",
+        ),
+    ],
+)
+def test_claim_support_qualification_distinguishes_plain_language_limitations(
+    condition,
+    expected_text,
+    forbidden_text,
+):
+    reasoning = _presentation_reasoning_result(
+        disposition="qualified",
+        qualification_required=True,
+    )
+    if condition == "interpretation":
+        reasoning["cr_result"]["limitation_codes"] = [
+            "interpretation-dependent-derivation"
+        ]
+    elif condition == "exclusion":
+        reasoning["cr_result"]["validated_material_exclusions"] = [
+            {
+                "evidence_ref_id": "evidence-1",
+                "reason": "PRIVATE EXCLUSION REASON",
+            }
+        ]
+    elif condition == "counterevidence":
+        reasoning["cr_result"]["validated_counterevidence_ref_ids"] = [
+            "evidence-1"
+        ]
+    elif condition == "incomplete":
+        reasoning["authority_context"]["material_acquisition_limited"] = True
+    else:
+        reasoning["cr_result"]["limitation_codes"] = ["unknown_freshness"]
+
+    _, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert answer is not None
+    assert expected_text in answer
+    assert forbidden_text not in answer.lower()
+    assert "PRIVATE EXCLUSION REASON" not in answer
 
 
 def test_neutral_rational_mean_presentation_uses_executor_canonical_result():
@@ -16714,9 +16794,21 @@ def test_neutral_rational_mean_presentation_uses_executor_canonical_result():
     reasoning = _presentation_reasoning_result()
     reasoning["proposal"] = materialized.model_dump(mode="json")
     reasoning["executions"] = executions
+    reasoning["_presentation_claim_template"] = proposal.proposed_claim
     reasoning["cr_result"]["validated_executed_derivation_ref_ids"] = [
         record["derivation_id"] for record in executions
     ]
+    exact_claim = "The bounded mean is 0.4635416666666666666666666667."
+    exact_digest = "sha256:" + hashlib.sha256(exact_claim.encode()).hexdigest()
+    reasoning["cr_result"].update(
+        {
+            "claim_id": "claim-neutral-mean",
+            "claim_digest": exact_digest,
+            "calibration_status": "limited",
+            "limitation_codes": ["interpretation-dependent-derivation"],
+            "user_safe_summary": "The bounded result requires qualification.",
+        }
+    )
 
     trace, answer = _select_claim_support_presentation(
         enabled=True,
@@ -16729,9 +16821,127 @@ def test_neutral_rational_mean_presentation_uses_executor_canonical_result():
     assert executions[-1]["canonical_result"] == (
         "0.4635416666666666666666666667"
     )
-    assert answer == "The bounded mean is 0.4635416666666666666666666667."
+    assert reasoning["proposal"]["proposed_claim"] == exact_claim
+    assert reasoning["cr_result"]["claim_digest"] == exact_digest
+    assert answer == "The bounded mean is 0.4635."
     assert trace["status"] == "presented"
     assert "{{derivation:" not in answer
+    persisted = claim_support_record_payload(
+        reasoning_result=reasoning,
+        presented_to_user=True,
+        request_id="request-neutral-mean",
+        owner_id="owner",
+        conversation_id="conversation",
+        assistant_message_id="assistant-message",
+        surface="test",
+        runtime_session_id="runtime-session",
+        runtime_turn_id="runtime-turn",
+        acquisition_manifest_id=None,
+    )
+    assert persisted is not None
+    assert persisted["calibration_result"]["claim_anchor"] == exact_claim
+    assert persisted["calibration_result"]["claim_anchor_digest"] == exact_digest
+    assert persisted["support"]["claim_digest"] == exact_digest
+    assert persisted["support"]["executed_derivations"][-1][
+        "canonical_result"
+    ] == "0.4635416666666666666666666667"
+    assert "_presentation_claim_template" not in json.dumps(persisted, sort_keys=True)
+    assert "{{derivation:" not in json.dumps(persisted, sort_keys=True)
+
+
+@pytest.mark.parametrize("canonical_result", ["5", "16.5", "0.625", "40"])
+def test_claim_support_presentation_preserves_concise_derivation_results(
+    canonical_result,
+):
+    template = "The computed result is {{derivation:result-1}}."
+    claim = f"The computed result is {canonical_result}."
+    reasoning = _presentation_reasoning_result()
+    reasoning["proposal"]["proposed_claim"] = claim
+    reasoning["_presentation_claim_template"] = template
+    reasoning["executions"] = [
+        {
+            "derivation_id": "result-1",
+            "canonical_result": canonical_result,
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        }
+    ]
+    reasoning["cr_result"]["validated_executed_derivation_ref_ids"] = [
+        "result-1"
+    ]
+
+    _, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert answer == claim
+
+
+def test_claim_support_presentation_does_not_rewrite_unbound_provider_number():
+    exact = "0.4635416666666666666666666667"
+    template = (
+        "The computed result is {{derivation:result-1}}; "
+        f"the supplied note independently contains {exact}."
+    )
+    authoritative_claim = (
+        f"The computed result is {exact}; "
+        f"the supplied note independently contains {exact}."
+    )
+    reasoning = _presentation_reasoning_result()
+    reasoning["proposal"]["proposed_claim"] = authoritative_claim
+    reasoning["_presentation_claim_template"] = template
+    reasoning["executions"] = [
+        {
+            "derivation_id": "result-1",
+            "canonical_result": exact,
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        }
+    ]
+    reasoning["cr_result"]["validated_executed_derivation_ref_ids"] = [
+        "result-1"
+    ]
+
+    _, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert answer == (
+        "The computed result is 0.4635; "
+        f"the supplied note independently contains {exact}."
+    )
+
+
+def test_claim_support_presentation_does_not_format_unvalidated_derivation():
+    exact = "0.4635416666666666666666666667"
+    reasoning = _presentation_reasoning_result()
+    reasoning["proposal"]["proposed_claim"] = f"The computed result is {exact}."
+    reasoning["_presentation_claim_template"] = (
+        "The computed result is {{derivation:result-1}}."
+    )
+    reasoning["executions"] = [
+        {
+            "derivation_id": "result-1",
+            "canonical_result": exact,
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        }
+    ]
+
+    _, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=reasoning,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+
+    assert answer == f"The computed result is {exact}."
 
 
 def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed():

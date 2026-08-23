@@ -7,6 +7,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
@@ -7108,34 +7109,115 @@ def _render_claim_support_qualification(
         and record.get("input_basis") == "model_interpreted"
         for record in executions
     ):
-        reasons.append("some evidence required interpretation")
-    if (
-        result.get("validated_counterevidence_ref_ids")
-        or result.get("validated_material_exclusions")
-        or limitations
-        & {
-            "material_counterevidence",
-            "material_evidence_omission",
-            "support_exclusion",
-        }
-    ):
-        reasons.append("some relevant evidence was conflicting or excluded")
+        reasons.append("some source values had to be interpreted")
+    if result.get("validated_material_exclusions") or limitations & {
+        "material_evidence_omission",
+        "support_exclusion",
+    }:
+        reasons.append("some records were excluded")
+    if result.get("validated_counterevidence_ref_ids") or limitations & {
+        "material_counterevidence",
+    }:
+        reasons.append("some evidence conflicts with the conclusion")
     if authority.get("material_acquisition_limited") is True or limitations & {
         "complete_scope_not_established",
         "material_acquisition_limitation",
         "material_acquisition_limited",
     }:
-        reasons.append("the available evidence was bounded or incomplete")
+        reasons.append("the available records may be incomplete")
     if limitations & {
         "limited_source_authority",
         "unknown_source_authority",
         "stale_evidence",
         "unknown_freshness",
     }:
-        reasons.append("the available source support or freshness was limited")
+        reasons.append("I couldn't fully verify the source or how current it is")
     if not reasons:
-        reasons.append("the available support has material limitations")
-    return "Treat this as qualified rather than exact because " + "; ".join(reasons) + "."
+        reasons.append("the available evidence has important limitations")
+    return "This result has some uncertainty because " + "; ".join(reasons) + "."
+
+
+_DERIVATION_PRESENTATION_PLACEHOLDER = re.compile(
+    r"\{\{derivation:([a-z][a-z0-9_-]{0,63})\}\}"
+)
+_PRESENTATION_SIGNIFICANT_DIGITS = 4
+
+
+def _format_deterministic_decimal_for_presentation(value: str) -> str:
+    if re.fullmatch(r"-?(?:0|[1-9][0-9]*)\.[0-9]+", value) is None:
+        return value
+    significant = value.lstrip("-").replace(".", "").lstrip("0")
+    if len(significant) <= _PRESENTATION_SIGNIFICANT_DIGITS:
+        return value
+    try:
+        number = Decimal(value)
+        places = _PRESENTATION_SIGNIFICANT_DIGITS - number.copy_abs().adjusted() - 1
+        rounded = number.quantize(
+            Decimal(1).scaleb(-places),
+            rounding=ROUND_HALF_UP,
+        )
+    except (InvalidOperation, ValueError):
+        return value
+    rendered = format(rounded, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return "0" if rendered == "-0" else rendered
+
+
+def _render_claim_for_presentation(
+    *,
+    reasoning_result: dict[str, Any],
+    authoritative_claim: str,
+) -> str:
+    template = reasoning_result.get("_presentation_claim_template")
+    result = reasoning_result.get("cr_result")
+    executions = reasoning_result.get("executions")
+    if not isinstance(template, str) or not isinstance(result, dict):
+        return authoritative_claim
+    if not isinstance(executions, list):
+        return authoritative_claim
+    validated_ids = {
+        value
+        for value in result.get("validated_executed_derivation_ref_ids", [])
+        if isinstance(value, str)
+    }
+    canonical_by_id: dict[str, str] = {}
+    for record in executions:
+        if not isinstance(record, dict):
+            return authoritative_claim
+        derivation_id = record.get("derivation_id")
+        canonical_result = record.get("canonical_result")
+        if (
+            not isinstance(derivation_id, str)
+            or derivation_id not in validated_ids
+            or derivation_id in canonical_by_id
+            or not isinstance(canonical_result, str)
+            or not canonical_result
+        ):
+            return authoritative_claim
+        canonical_by_id[derivation_id] = canonical_result
+
+    def substitute(match: re.Match[str], *, display: bool) -> str:
+        canonical_result = canonical_by_id.get(match.group(1))
+        if canonical_result is None:
+            raise ValueError("presentation_derivation_binding_invalid")
+        if display:
+            return _format_deterministic_decimal_for_presentation(canonical_result)
+        return canonical_result
+
+    try:
+        exact_claim = _DERIVATION_PRESENTATION_PLACEHOLDER.sub(
+            lambda match: substitute(match, display=False),
+            template,
+        )
+        if exact_claim != authoritative_claim:
+            return authoritative_claim
+        return _DERIVATION_PRESENTATION_PLACEHOLDER.sub(
+            lambda match: substitute(match, display=True),
+            template,
+        )
+    except ValueError:
+        return authoritative_claim
 
 
 def _select_claim_support_presentation(
@@ -7228,12 +7310,15 @@ def _select_claim_support_presentation(
     claim = proposal.get("proposed_claim")
     if not isinstance(claim, str) or not claim:
         return presentation, None
-    answer = claim
+    answer = _render_claim_for_presentation(
+        reasoning_result=reasoning_result,
+        authoritative_claim=claim,
+    )
     if disposition == "qualified":
         qualification = _render_claim_support_qualification(
             reasoning_result=reasoning_result
         )
-        answer = f"{claim}\n\n{qualification}"
+        answer = f"{answer}\n\n{qualification}"
     presentation.update(
         {
             "status": "presented",
@@ -7562,6 +7647,7 @@ async def _run_general_evidence_reasoning(
         )
         return output
     try:
+        presentation_claim_template = proposal.proposed_claim
         executions = execute_derivations(
             proposal.derivation_requests,
             authorized_evidence_ref_ids=authorized_ref_ids,
@@ -7738,6 +7824,7 @@ async def _run_general_evidence_reasoning(
             "authority_context": authority_context,
             "cr_result": result,
             "evidence_metadata": evidence_metadata,
+            "_presentation_claim_template": presentation_claim_template,
         }
     )
     return output
