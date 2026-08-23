@@ -6592,7 +6592,7 @@ run_general_evidence_reasoning_shadow_scenario() {
     reset_dsa_audit
     restart_orchestrator_with_history_followup true
     followup_response="$(run_history_current_turn \
-      "$owner" "$client" "$conversation_id" "$followup_question" "medium")"
+      "$owner" "$client" "$conversation_id" "$followup_question" "private")"
     assert_pure_history_case \
       "$owner" "$conversation_id" "$followup_response" "$followup_question" \
       "deterministic" "support_explanation" "support" 0
