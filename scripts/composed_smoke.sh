@@ -81,24 +81,6 @@ if [ "${COMPOSED_SKIP_BUILD:-}" != "1" ]; then
 fi
 docker compose -f "$COMPOSE" up "${compose_up_args[@]}"
 
-if [ "${COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED:-}" = "1" ]; then
-  docker compose -f "$COMPOSE" stop orchestrator >/dev/null
-  docker compose -f "$COMPOSE" run -d --no-deps --service-ports \
-    -e GENERAL_EVIDENCE_REASONING_ENABLED=true \
-    -e GENERAL_EVIDENCE_REASONING_TIMEOUT_MS=5000 \
-    orchestrator >/dev/null
-  for attempt in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:14361/healthz" >/dev/null 2>&1; then
-      break
-    fi
-    if [ "$attempt" -eq 60 ]; then
-      echo "feature-enabled orchestrator did not become ready" >&2
-      exit 1
-    fi
-    sleep 1
-  done
-fi
-
 provider_post() {
   local body
   if [ "$#" -ge 2 ]; then

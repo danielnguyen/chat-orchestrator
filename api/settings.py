@@ -62,6 +62,10 @@ class Settings(BaseSettings):
         default=False,
         alias="GENERAL_EVIDENCE_REASONING_ENABLED",
     )
+    general_evidence_reasoning_presentation_enabled: bool = Field(
+        default=False,
+        alias="GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED",
+    )
     general_evidence_reasoning_timeout_ms: int = Field(
         default=5000,
         alias="GENERAL_EVIDENCE_REASONING_TIMEOUT_MS",
@@ -142,6 +146,13 @@ class Settings(BaseSettings):
                 raise ValueError("general evidence reasoning requires evidence acquisition")
             if not self.claim_record_capture_enabled:
                 raise ValueError("general evidence reasoning requires claim record capture")
+        if (
+            self.general_evidence_reasoning_presentation_enabled
+            and not self.general_evidence_reasoning_enabled
+        ):
+            raise ValueError(
+                "general evidence reasoning presentation requires general evidence reasoning"
+            )
         if self.history_followup_enabled:
             if not self.cognitive_runtime_base_url:
                 raise ValueError("history follow-up requires Cognitive Runtime")
