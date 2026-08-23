@@ -525,6 +525,27 @@ ProviderOutputDetailCode = Literal[
     "semantic_tool_call_forbidden",
 ]
 _PROVIDER_OUTPUT_DETAIL_CODES = frozenset(get_args(ProviderOutputDetailCode))
+EvidenceReasoningCompletionContentState = Literal[
+    "missing",
+    "null",
+    "empty_string",
+    "whitespace_string",
+    "non_string",
+]
+EvidenceReasoningCompletionFinishReason = Literal[
+    "stop",
+    "length",
+    "content_filter",
+    "tool_calls",
+    "function_call",
+    "missing",
+    "other",
+    "invalid",
+]
+_KNOWN_EVIDENCE_REASONING_FINISH_REASONS = frozenset(
+    {"stop", "length", "content_filter", "tool_calls", "function_call"}
+)
+_MAX_BOUNDED_COMPLETION_TOKEN_COUNT = 1_000_000
 
 
 class ProviderOutputValidationError(ValueError):
@@ -2952,6 +2973,73 @@ def parse_evidence_reasoning_completion(
             "evidence_reasoning_reference_unknown",
         )
     return proposal
+
+
+def bounded_evidence_reasoning_completion_metadata(
+    value: Any,
+) -> dict[str, str | int]:
+    """Project unusable completion content into bounded structural metadata."""
+
+    metadata: dict[str, str | int] = {}
+    if not isinstance(value, dict):
+        return metadata
+    choices = value.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return metadata
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return metadata
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return metadata
+
+    if "content" not in message:
+        content_state: EvidenceReasoningCompletionContentState = "missing"
+    else:
+        content = message["content"]
+        if content is None:
+            content_state = "null"
+        elif not isinstance(content, str):
+            content_state = "non_string"
+        elif not content:
+            content_state = "empty_string"
+        elif not content.strip():
+            content_state = "whitespace_string"
+        else:
+            return metadata
+    metadata["completion_content_state"] = content_state
+
+    finish_reason = choice.get("finish_reason")
+    normalized_finish_reason: EvidenceReasoningCompletionFinishReason
+    if finish_reason is None:
+        normalized_finish_reason = "missing"
+    elif not isinstance(finish_reason, str):
+        normalized_finish_reason = "invalid"
+    elif finish_reason in _KNOWN_EVIDENCE_REASONING_FINISH_REASONS:
+        normalized_finish_reason = finish_reason
+    else:
+        normalized_finish_reason = "other"
+    metadata["completion_finish_reason"] = normalized_finish_reason
+
+    usage = value.get("usage")
+    if not isinstance(usage, dict):
+        return metadata
+    completion_tokens = usage.get("completion_tokens")
+    if (
+        type(completion_tokens) is int
+        and 0 <= completion_tokens <= _MAX_BOUNDED_COMPLETION_TOKEN_COUNT
+    ):
+        metadata["completion_tokens"] = completion_tokens
+    completion_token_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_token_details, dict):
+        return metadata
+    reasoning_tokens = completion_token_details.get("reasoning_tokens")
+    if (
+        type(reasoning_tokens) is int
+        and 0 <= reasoning_tokens <= _MAX_BOUNDED_COMPLETION_TOKEN_COUNT
+    ):
+        metadata["reasoning_tokens"] = reasoning_tokens
+    return metadata
 
 
 def diagnostic_advisory_messages(
