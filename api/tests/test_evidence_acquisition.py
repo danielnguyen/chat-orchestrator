@@ -309,6 +309,38 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     )
 
 
+def test_general_reasoning_preserves_structured_observation_boundaries():
+    values = ["segment 2/5", "range 10-20", "level ~0.4"]
+    messages = evidence_reasoning_messages(
+        request_text="Compute the bounded mean.",
+        evidence=[
+            {
+                "evidence_ref_id": "evidence-1",
+                "content_type": "structured_field_values",
+                "structured_data": {
+                    "kind": "field_values",
+                    "field_name": "Neutral Reading",
+                    "record_count": 3,
+                    "non_empty_value_count": 3,
+                    "values": values,
+                },
+            }
+        ],
+    )
+
+    system_instruction = messages[0]["content"]
+    provider_input = json.loads(messages[1]["content"])
+    assert "each element" in system_instruction
+    assert "one source observation" in system_instruction
+    assert "Preserve each element boundary" in system_instruction
+    assert "numeric substrings" in system_instruction
+    assert "one complete semantic quantity" in system_instruction
+    assert "intermediate derivation" in system_instruction
+    assert provider_input["authorized_evidence"][0]["structured_data"][
+        "values"
+    ] == values
+
+
 def test_general_reasoning_rejects_unbound_terminal_derivation_claim():
     payload = _reasoning_proposal()
     payload["proposed_claim"] = "The bounded mean is 0.9."

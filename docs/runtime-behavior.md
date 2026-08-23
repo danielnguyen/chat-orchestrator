@@ -618,6 +618,15 @@ This binding proves only that the substituted text came from deterministic
 execution. Evidence interpretation and the surrounding domain prose remain
 probabilistic; deterministic execution does not become a semantic truth oracle.
 
+For structured field-value reasoning, each supplied value-array element is one
+source observation. Provider reasoning preserves those observation boundaries:
+lexical components within one value are not independent aggregate observations,
+and each direct mean operand represents one complete interpreted quantity at
+the level being averaged. An observation may first feed a bounded intermediate
+derivation, whose result can then feed the terminal calculation. Interpretation
+remains probabilistic, while deterministic execution and claim-result binding
+remain authoritative for the mechanical result actually used.
+
 The comparison is diagnostic only. It cannot change either authority decision,
 the visible response, source scope, acquisition, retries, provider routing,
 claim persistence, process-failure diagnosis, or tool and action execution.
