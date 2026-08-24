@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 from typing import Any, Literal
@@ -10,7 +11,21 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
 _DECIMAL_PATTERN = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+_DECIMAL_ATOM_PATTERN = re.compile(
+    r"(?<![0-9.])-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?![0-9.])"
+)
 EXECUTOR_VERSION = "bounded-decimal-v1"
+
+
+class SourceObservationBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    evidence_ref_id: str = Field(
+        min_length=1,
+        max_length=120,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    observation_index: int = Field(ge=0, le=249)
 
 
 class DerivationOperand(BaseModel):
@@ -23,11 +38,14 @@ class DerivationOperand(BaseModel):
         max_length=120,
         pattern=_IDENTIFIER_PATTERN,
     )
+    source_observation: SourceObservationBinding | None = None
 
     @model_validator(mode="after")
     def validate_exactly_one_source(self):
         if (self.value is None) == (self.derivation_ref is None):
             raise ValueError("derivation_operand_source_invalid")
+        if self.derivation_ref is not None and self.source_observation is not None:
+            raise ValueError("derivation_reference_observation_binding_invalid")
         return self
 
 
@@ -95,6 +113,15 @@ def _canonical_decimal(value: Decimal) -> str:
     return rendered
 
 
+def _decimal_lexical_atoms(value: str) -> list[Decimal]:
+    atoms: list[Decimal] = []
+    for match in _DECIMAL_ATOM_PATTERN.finditer(value):
+        candidate = match.group(0)
+        if _DECIMAL_PATTERN.fullmatch(candidate):
+            atoms.append(_decimal(candidate))
+    return atoms
+
+
 def _execution_digest(
     *,
     operation: str,
@@ -121,6 +148,10 @@ def execute_derivations(
     requests: list[DerivationRequest | dict[str, Any]],
     *,
     authorized_evidence_ref_ids: set[str],
+    structured_observations_by_evidence_ref: Mapping[
+        str, Sequence[str | None]
+    ]
+    | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(requests, list) or len(requests) > 16:
         raise ValueError("derivation_request_count_invalid")
@@ -131,15 +162,161 @@ def execute_derivations(
     by_id = {item.derivation_id: item for item in parsed}
     if len(by_id) != len(parsed):
         raise ValueError("duplicate_derivation_id")
+    structured_observations = {
+        evidence_ref_id: tuple(observations)
+        for evidence_ref_id, observations in (
+            structured_observations_by_evidence_ref or {}
+        ).items()
+    }
+    if (
+        len(structured_observations) > 8
+        or not set(structured_observations) <= authorized_evidence_ref_ids
+        or any(
+            not isinstance(evidence_ref_id, str)
+            or len(observations) > 250
+            or any(
+                observation is not None and not isinstance(observation, str)
+                for observation in observations
+            )
+            for evidence_ref_id, observations in structured_observations.items()
+        )
+    ):
+        raise ValueError("structured_observation_grounding_invalid")
+
+    def bound_observation(
+        request: DerivationRequest,
+        operand: DerivationOperand,
+    ) -> list[Decimal] | None:
+        binding = operand.source_observation
+        if binding is None:
+            return None
+        if (
+            binding.evidence_ref_id not in authorized_evidence_ref_ids
+            or binding.evidence_ref_id not in request.supporting_evidence_ref_ids
+        ):
+            raise ValueError("derivation_observation_reference_invalid")
+        observations = structured_observations.get(binding.evidence_ref_id)
+        if observations is None or binding.observation_index >= len(observations):
+            raise ValueError("derivation_observation_reference_invalid")
+        observation = observations[binding.observation_index]
+        if not isinstance(observation, str):
+            raise ValueError("derivation_observation_reference_invalid")
+        atoms = _decimal_lexical_atoms(observation)
+        literal = _decimal(str(operand.value))
+        if atoms and literal not in atoms:
+            raise ValueError("derivation_observation_literal_invalid")
+        return atoms
+
     for request in parsed:
         if not set(request.supporting_evidence_ref_ids) <= authorized_evidence_ref_ids:
             raise ValueError("derivation_evidence_reference_unknown")
         for operand in request.operands:
+            if operand.value is not None:
+                bound_observation(request, operand)
             if (
                 operand.derivation_ref is not None
                 and operand.derivation_ref not in by_id
             ):
                 raise ValueError("derivation_reference_unknown")
+
+    grounding_by_derivation: dict[str, frozenset[tuple[str, int]]] = {}
+
+    def structured_grounding_lineage(
+        derivation_id: str,
+        visiting_chain: set[str],
+    ) -> frozenset[tuple[str, int]]:
+        if derivation_id in grounding_by_derivation:
+            return grounding_by_derivation[derivation_id]
+        if derivation_id in visiting_chain:
+            raise ValueError("derivation_cycle")
+        visiting_chain.add(derivation_id)
+        request = by_id[derivation_id]
+        grounded_observations: set[tuple[str, int]] = set()
+        for operand in request.operands:
+            binding = operand.source_observation
+            if binding is not None:
+                grounded_observations.add(
+                    (binding.evidence_ref_id, binding.observation_index)
+                )
+            elif operand.derivation_ref is not None:
+                grounded_observations.update(
+                    structured_grounding_lineage(
+                        operand.derivation_ref,
+                        visiting_chain,
+                    )
+                )
+        visiting_chain.remove(derivation_id)
+        result = frozenset(grounded_observations)
+        grounding_by_derivation[derivation_id] = result
+        return result
+
+    for request in parsed:
+        structured_ref_ids = set(request.supporting_evidence_ref_ids) & set(
+            structured_observations
+        )
+        if not structured_ref_ids:
+            continue
+        grounding_lineage = structured_grounding_lineage(
+            request.derivation_id,
+            set(),
+        )
+        grounded_ref_ids = {
+            evidence_ref_id for evidence_ref_id, _ in grounding_lineage
+        }
+        if not structured_ref_ids <= grounded_ref_ids:
+            raise ValueError("derivation_observation_binding_required")
+
+        if request.operation != "mean":
+            continue
+
+        direct_bindings = [
+            operand.source_observation
+            for operand in request.operands
+            if operand.value is not None
+        ]
+        observation_local_transformation = (
+            len(request.operands) >= 2
+            and len(direct_bindings) == len(request.operands)
+            and all(binding is not None for binding in direct_bindings)
+            and len(
+                {
+                    (binding.evidence_ref_id, binding.observation_index)
+                    for binding in direct_bindings
+                    if binding is not None
+                }
+            )
+            == 1
+        )
+        if observation_local_transformation:
+            continue
+
+        permits_unstructured_premises = bool(
+            set(request.supporting_evidence_ref_ids)
+            - set(structured_observations)
+        )
+        for operand in request.operands:
+            if operand.value is not None:
+                binding = operand.source_observation
+                if binding is None:
+                    if permits_unstructured_premises:
+                        continue
+                    raise ValueError("derivation_observation_binding_required")
+                if binding.evidence_ref_id not in structured_ref_ids:
+                    raise ValueError("derivation_observation_binding_required")
+                atoms = bound_observation(request, operand)
+                if atoms is not None and len(atoms) >= 2:
+                    raise ValueError("derivation_observation_transformation_required")
+            else:
+                child_grounding = structured_grounding_lineage(
+                    str(operand.derivation_ref),
+                    set(),
+                )
+                chain_is_grounded = any(
+                    evidence_ref_id in structured_ref_ids
+                    for evidence_ref_id, _ in child_grounding
+                )
+                if not chain_is_grounded and not permits_unstructured_premises:
+                    raise ValueError("derivation_observation_binding_required")
 
     records: dict[str, DerivationExecutionRecord] = {}
     values: dict[str, Decimal] = {}

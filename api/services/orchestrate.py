@@ -7610,6 +7610,13 @@ async def _run_general_evidence_reasoning(
         }
     )
     authorized_ref_ids = set(evidence_metadata)
+    structured_observations_by_evidence_ref = {
+        item["evidence_ref_id"]: tuple(item["structured_data"]["values"])
+        for item in evidence
+        if item.get("content_type") == "structured_field_values"
+        and isinstance(item.get("structured_data"), dict)
+        and isinstance(item["structured_data"].get("values"), list)
+    }
     try:
         completion = await litellm.chat(
             request_id=request_id,
@@ -7666,6 +7673,9 @@ async def _run_general_evidence_reasoning(
         executions = execute_derivations(
             proposal.derivation_requests,
             authorized_evidence_ref_ids=authorized_ref_ids,
+            structured_observations_by_evidence_ref=(
+                structured_observations_by_evidence_ref
+            ),
         )
     except Exception:
         trace.update(

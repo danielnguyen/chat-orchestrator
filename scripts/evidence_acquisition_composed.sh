@@ -6285,10 +6285,10 @@ run_general_evidence_reasoning_shadow_scenario() {
     "A formatting or data-entry issue may be present." \
     "Consider checking the entries that require numeric input."
   if [[ "$presentation_expected" == "true" ]]; then
-    expected_derivations=1
-    exact_result="0.4635416666666666666666666667"
+    expected_derivations=3
+    exact_result="0.2380952380952380952380952381"
     exact_claim="The bounded mean is ${exact_result}."
-    visible_first="The bounded mean is 0.4635."
+    visible_first="The bounded mean is 0.2381."
     visible_digest="sha256:$(printf '%s' "$visible_first" | sha256sum | cut -d' ' -f1)"
     proposal="$(jq -nc --arg ref "$evidence_ref_id" '
     {
@@ -6299,13 +6299,43 @@ run_general_evidence_reasoning_shadow_scenario() {
         evidence_ref_id:$ref,
         reason:"One entry was ambiguous and excluded."
       }],
-      derivation_requests:[{
-        derivation_id:"mean_1",
-        operation:"mean",
-        operands:["0.625","0.5625","0.375","0.25","0.5","0.5","0.5","0.25","0.625","0.5","0.125","0.75"]
-          | map({value:.,derivation_ref:null}),
-        supporting_evidence_ref_ids:[$ref]
-      }]
+      derivation_requests:(
+        [["1","3",0],["1","7",1]]
+        | to_entries
+        | map({
+            derivation_id:("ratio_" + ((.key + 1) | tostring)),
+            operation:"divide",
+            operands:[
+              {
+                value:.value[0],
+                derivation_ref:null,
+                source_observation:{
+                  evidence_ref_id:$ref,
+                  observation_index:.value[2]
+                }
+              },
+              {
+                value:.value[1],
+                derivation_ref:null,
+                source_observation:{
+                  evidence_ref_id:$ref,
+                  observation_index:.value[2]
+                }
+              }
+            ],
+            supporting_evidence_ref_ids:[$ref]
+          })
+        + [{
+            derivation_id:"mean_1",
+            operation:"mean",
+            operands:[range(1;3) as $index | {
+              value:null,
+              derivation_ref:("ratio_" + ($index | tostring)),
+              source_observation:null
+            }],
+            supporting_evidence_ref_ids:[$ref]
+          }]
+      )
     }')"
   else
     expected_derivations=4
@@ -6327,8 +6357,8 @@ run_general_evidence_reasoning_shadow_scenario() {
           derivation_id:"ratio_1",
           operation:"divide",
           operands:[
-            {value:"1",derivation_ref:null},
-            {value:"2",derivation_ref:null}
+            {value:"1",derivation_ref:null,source_observation:{evidence_ref_id:$ref,observation_index:0}},
+            {value:"2",derivation_ref:null,source_observation:{evidence_ref_id:$ref,observation_index:0}}
           ],
           supporting_evidence_ref_ids:[$ref]
         },
@@ -6336,8 +6366,8 @@ run_general_evidence_reasoning_shadow_scenario() {
           derivation_id:"ratio_2",
           operation:"divide",
           operands:[
-            {value:"3",derivation_ref:null},
-            {value:"4",derivation_ref:null}
+            {value:"3",derivation_ref:null,source_observation:{evidence_ref_id:$ref,observation_index:1}},
+            {value:"4",derivation_ref:null,source_observation:{evidence_ref_id:$ref,observation_index:1}}
           ],
           supporting_evidence_ref_ids:[$ref]
         },
@@ -6345,8 +6375,8 @@ run_general_evidence_reasoning_shadow_scenario() {
           derivation_id:"ratio_3",
           operation:"divide",
           operands:[
-            {value:"5",derivation_ref:null},
-            {value:"8",derivation_ref:null}
+            {value:"5",derivation_ref:null,source_observation:{evidence_ref_id:$ref,observation_index:3}},
+            {value:"8",derivation_ref:null,source_observation:{evidence_ref_id:$ref,observation_index:3}}
           ],
           supporting_evidence_ref_ids:[$ref]
         },
@@ -6354,9 +6384,9 @@ run_general_evidence_reasoning_shadow_scenario() {
           derivation_id:"mean_1",
           operation:"mean",
           operands:[
-            {value:null,derivation_ref:"ratio_1"},
-            {value:null,derivation_ref:"ratio_2"},
-            {value:null,derivation_ref:"ratio_3"}
+            {value:null,derivation_ref:"ratio_1",source_observation:null},
+            {value:null,derivation_ref:"ratio_2",source_observation:null},
+            {value:null,derivation_ref:"ratio_3",source_observation:null}
           ],
           supporting_evidence_ref_ids:[$ref]
         }
@@ -6387,7 +6417,7 @@ run_general_evidence_reasoning_shadow_scenario() {
   assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
   if [[ "$presentation_expected" == "true" ]]; then
     if ! assert_jq "general_reasoning.response.presentation" "$response" '
-      (.answer | startswith("The bounded mean is 0.4635.\n\n"))
+      (.answer | startswith("The bounded mean is 0.2381.\n\n"))
       and (.answer | contains("This result has some uncertainty because"))
       and (.answer | contains("some source values had to be interpreted"))
       and (.answer | contains("some records were excluded"))
@@ -6598,7 +6628,7 @@ run_general_evidence_reasoning_shadow_scenario() {
       "$owner" "$conversation_id" "$followup_response" "$followup_question" \
       "deterministic" "support_explanation" "support" 0
     restart_orchestrator_with_history_followup false
-    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=3 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
   else
     echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
   fi

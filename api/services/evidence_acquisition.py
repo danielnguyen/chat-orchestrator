@@ -2769,6 +2769,19 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
         "maxItems": 16,
         "items": identifier,
     }
+    source_observation = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "evidence_ref_id": identifier,
+            "observation_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 249,
+            },
+        },
+        "required": ["evidence_ref_id", "observation_index"],
+    }
     operand = {
         "anyOf": [
             {
@@ -2777,8 +2790,11 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
                 "properties": {
                     "value": decimal_value,
                     "derivation_ref": {"type": "null"},
+                    "source_observation": {
+                        "anyOf": [source_observation, {"type": "null"}]
+                    },
                 },
-                "required": ["value", "derivation_ref"],
+                "required": ["value", "derivation_ref", "source_observation"],
             },
             {
                 "type": "object",
@@ -2786,8 +2802,9 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
                 "properties": {
                     "value": {"type": "null"},
                     "derivation_ref": identifier,
+                    "source_observation": {"type": "null"},
                 },
-                "required": ["value", "derivation_ref"],
+                "required": ["value", "derivation_ref", "source_observation"],
             },
         ]
     }
@@ -2923,7 +2940,18 @@ def evidence_reasoning_messages(
                 "numeric operand may represent your interpretation of one complete "
                 "observation, but never manufacture aggregate operands from extracted "
                 "fragments; when an observation is not sufficiently interpretable, keep "
-                "the derived claim bounded or do not propose it. "
+                "the derived claim bounded or do not propose it. When a direct numeric "
+                "operand represents a structured_field_values observation, set its "
+                "source_observation.evidence_ref_id to that evidence item and its "
+                "source_observation.observation_index to the zero-based position in "
+                "structured_data.values. "
+                "This identifies the observation you interpreted; it does not make the "
+                "interpretation deterministically true. Bind it even when the literal is "
+                "a semantic interpretation rather than copied numeric text. Set "
+                "source_observation to null for derivation-reference operands and direct "
+                "literals not based on a structured_field_values observation. Bind "
+                "structured-origin direct inputs to intermediate mechanical derivations "
+                "the same way. "
                 "Request only bounded divide or mean arithmetic when useful; do not claim "
                 "it executed. When the claim materially uses a requested derivation result, "
                 "do not calculate or write that result yourself. Insert exactly "
