@@ -183,13 +183,6 @@ def execute_derivations(
     ):
         raise ValueError("structured_observation_grounding_invalid")
 
-    structured_means = {
-        request.derivation_id: set(request.supporting_evidence_ref_ids)
-        & set(structured_observations)
-        for request in parsed
-        if request.operation == "mean"
-    }
-
     def bound_observation(
         request: DerivationRequest,
         operand: DerivationOperand,
@@ -226,44 +219,82 @@ def execute_derivations(
             ):
                 raise ValueError("derivation_reference_unknown")
 
-    def validate_structured_chain(
+    grounding_by_derivation: dict[str, frozenset[tuple[str, int]]] = {}
+
+    def structured_grounding_lineage(
         derivation_id: str,
-        structured_ref_ids: set[str],
         visiting_chain: set[str],
-    ) -> bool:
+    ) -> frozenset[tuple[str, int]]:
+        if derivation_id in grounding_by_derivation:
+            return grounding_by_derivation[derivation_id]
         if derivation_id in visiting_chain:
-            return False
+            raise ValueError("derivation_cycle")
         visiting_chain.add(derivation_id)
         request = by_id[derivation_id]
-        grounded = False
+        grounded_observations: set[tuple[str, int]] = set()
         for operand in request.operands:
-            if operand.value is not None:
-                binding = operand.source_observation
-                if binding is not None and binding.evidence_ref_id in structured_ref_ids:
-                    bound_observation(request, operand)
-                    grounded = True
-            else:
-                grounded = (
-                    validate_structured_chain(
-                        str(operand.derivation_ref),
-                        structured_ref_ids,
+            binding = operand.source_observation
+            if binding is not None:
+                grounded_observations.add(
+                    (binding.evidence_ref_id, binding.observation_index)
+                )
+            elif operand.derivation_ref is not None:
+                grounded_observations.update(
+                    structured_grounding_lineage(
+                        operand.derivation_ref,
                         visiting_chain,
                     )
-                    or grounded
                 )
         visiting_chain.remove(derivation_id)
-        return grounded
+        result = frozenset(grounded_observations)
+        grounding_by_derivation[derivation_id] = result
+        return result
 
-    for derivation_id, structured_ref_ids in structured_means.items():
+    for request in parsed:
+        structured_ref_ids = set(request.supporting_evidence_ref_ids) & set(
+            structured_observations
+        )
         if not structured_ref_ids:
             continue
-        mean_request = by_id[derivation_id]
+        grounding_lineage = structured_grounding_lineage(
+            request.derivation_id,
+            set(),
+        )
+        grounded_ref_ids = {
+            evidence_ref_id for evidence_ref_id, _ in grounding_lineage
+        }
+        if not structured_ref_ids <= grounded_ref_ids:
+            raise ValueError("derivation_observation_binding_required")
+
+        if request.operation != "mean":
+            continue
+
+        direct_bindings = [
+            operand.source_observation
+            for operand in request.operands
+            if operand.value is not None
+        ]
+        observation_local_transformation = (
+            len(request.operands) >= 2
+            and len(direct_bindings) == len(request.operands)
+            and all(binding is not None for binding in direct_bindings)
+            and len(
+                {
+                    (binding.evidence_ref_id, binding.observation_index)
+                    for binding in direct_bindings
+                    if binding is not None
+                }
+            )
+            == 1
+        )
+        if observation_local_transformation:
+            continue
+
         permits_unstructured_premises = bool(
-            set(mean_request.supporting_evidence_ref_ids)
+            set(request.supporting_evidence_ref_ids)
             - set(structured_observations)
         )
-        has_structured_grounding = False
-        for operand in mean_request.operands:
+        for operand in request.operands:
             if operand.value is not None:
                 binding = operand.source_observation
                 if binding is None:
@@ -272,19 +303,20 @@ def execute_derivations(
                     raise ValueError("derivation_observation_binding_required")
                 if binding.evidence_ref_id not in structured_ref_ids:
                     raise ValueError("derivation_observation_binding_required")
-                atoms = bound_observation(mean_request, operand)
-                has_structured_grounding = True
+                atoms = bound_observation(request, operand)
                 if atoms is not None and len(atoms) >= 2:
                     raise ValueError("derivation_observation_transformation_required")
             else:
-                chain_is_grounded = validate_structured_chain(
-                    str(operand.derivation_ref), structured_ref_ids, set()
+                child_grounding = structured_grounding_lineage(
+                    str(operand.derivation_ref),
+                    set(),
                 )
-                has_structured_grounding = chain_is_grounded or has_structured_grounding
+                chain_is_grounded = any(
+                    evidence_ref_id in structured_ref_ids
+                    for evidence_ref_id, _ in child_grounding
+                )
                 if not chain_is_grounded and not permits_unstructured_premises:
                     raise ValueError("derivation_observation_binding_required")
-        if not has_structured_grounding:
-            raise ValueError("derivation_observation_binding_required")
 
     records: dict[str, DerivationExecutionRecord] = {}
     values: dict[str, Decimal] = {}

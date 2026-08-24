@@ -361,6 +361,119 @@ def test_mixed_evidence_mean_preserves_structured_and_prose_premises():
         )
 
 
+def test_structured_grounding_is_enforced_per_derivation_lineage():
+    with pytest.raises(ValueError, match="derivation_observation_binding_required"):
+        execute_derivations(
+            [
+                {
+                    "derivation_id": "grounded",
+                    "operation": "divide",
+                    "operands": [_bound_value("5", 0), _bound_value("8", 0)],
+                    "supporting_evidence_ref_ids": ["fact-1"],
+                },
+                {
+                    "derivation_id": "ungrounded",
+                    "operation": "divide",
+                    "operands": [{"value": "916"}, {"value": "1"}],
+                    "supporting_evidence_ref_ids": ["fact-1"],
+                },
+                {
+                    "derivation_id": "mixed-mean",
+                    "operation": "mean",
+                    "operands": [
+                        {"derivation_ref": "grounded"},
+                        {"derivation_ref": "ungrounded"},
+                    ],
+                    "supporting_evidence_ref_ids": ["fact-1", "fact-2"],
+                },
+            ],
+            authorized_evidence_ref_ids={"fact-1", "fact-2"},
+            structured_observations_by_evidence_ref={
+                "fact-1": ("5/8", "9/16")
+            },
+        )
+
+
+def test_structured_supported_divide_requires_grounding_but_permits_constants():
+    with pytest.raises(ValueError, match="derivation_observation_binding_required"):
+        execute_derivations(
+            [_divide("ungrounded", "58", "1")],
+            authorized_evidence_ref_ids={"fact-1"},
+            structured_observations_by_evidence_ref={"fact-1": ("5/8",)},
+        )
+
+    records = execute_derivations(
+        [
+            {
+                "derivation_id": "scaled",
+                "operation": "divide",
+                "operands": [_bound_value("40", 0), {"value": "100"}],
+                "supporting_evidence_ref_ids": ["fact-1"],
+            }
+        ],
+        authorized_evidence_ref_ids={"fact-1"},
+        structured_observations_by_evidence_ref={"fact-1": ("~40%",)},
+    )
+
+    assert records[0]["canonical_inputs"] == ["40", "100"]
+    assert records[0]["canonical_result"] == "0.4"
+    assert records[0]["input_basis"] == "model_interpreted"
+
+
+def test_mean_can_be_an_observation_local_mechanical_transformation():
+    records = execute_derivations(
+        [
+            {
+                "derivation_id": "local-0",
+                "operation": "mean",
+                "operands": [_bound_value("10", 0), _bound_value("20", 0)],
+                "supporting_evidence_ref_ids": ["fact-1"],
+            },
+            {
+                "derivation_id": "local-1",
+                "operation": "mean",
+                "operands": [_bound_value("30", 1), _bound_value("40", 1)],
+                "supporting_evidence_ref_ids": ["fact-1"],
+            },
+            {
+                "derivation_id": "outer",
+                "operation": "mean",
+                "operands": [
+                    {"derivation_ref": "local-0"},
+                    {"derivation_ref": "local-1"},
+                ],
+                "supporting_evidence_ref_ids": ["fact-1"],
+            },
+        ],
+        authorized_evidence_ref_ids={"fact-1"},
+        structured_observations_by_evidence_ref={"fact-1": ("10-20", "30-40")},
+    )
+
+    assert [record["canonical_result"] for record in records] == ["15", "35", "25"]
+    assert {record["input_basis"] for record in records} == {"model_interpreted"}
+
+
+def test_aggregate_mean_cannot_flatten_compound_observation_fragments():
+    with pytest.raises(
+        ValueError,
+        match="derivation_observation_transformation_required",
+    ):
+        execute_derivations(
+            [
+                {
+                    "derivation_id": "flattened",
+                    "operation": "mean",
+                    "operands": [_bound_value("10", 0), _bound_value("30", 1)],
+                    "supporting_evidence_ref_ids": ["fact-1"],
+                }
+            ],
+            authorized_evidence_ref_ids={"fact-1"},
+            structured_observations_by_evidence_ref={
+                "fact-1": ("10-20", "30-40")
+            },
+        )
+
+
 def test_empty_structured_observations_do_not_break_no_derivation_proposals():
     assert execute_derivations(
         [],
