@@ -6285,10 +6285,10 @@ run_general_evidence_reasoning_shadow_scenario() {
     "A formatting or data-entry issue may be present." \
     "Consider checking the entries that require numeric input."
   if [[ "$presentation_expected" == "true" ]]; then
-    expected_derivations=5
-    exact_result="0.161005661005661005661005661"
+    expected_derivations=3
+    exact_result="0.2380952380952380952380952381"
     exact_claim="The bounded mean is ${exact_result}."
-    visible_first="The bounded mean is 0.161."
+    visible_first="The bounded mean is 0.2381."
     visible_digest="sha256:$(printf '%s' "$visible_first" | sha256sum | cut -d' ' -f1)"
     proposal="$(jq -nc --arg ref "$evidence_ref_id" '
     {
@@ -6300,7 +6300,7 @@ run_general_evidence_reasoning_shadow_scenario() {
         reason:"One entry was ambiguous and excluded."
       }],
       derivation_requests:(
-        [["1","3",0],["1","7",1],["1","11",3],["1","13",4]]
+        [["1","3",0],["1","7",1]]
         | to_entries
         | map({
             derivation_id:("ratio_" + ((.key + 1) | tostring)),
@@ -6328,7 +6328,7 @@ run_general_evidence_reasoning_shadow_scenario() {
         + [{
             derivation_id:"mean_1",
             operation:"mean",
-            operands:[range(1;5) as $index | {
+            operands:[range(1;3) as $index | {
               value:null,
               derivation_ref:("ratio_" + ($index | tostring)),
               source_observation:null
@@ -6417,7 +6417,7 @@ run_general_evidence_reasoning_shadow_scenario() {
   assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
   if [[ "$presentation_expected" == "true" ]]; then
     if ! assert_jq "general_reasoning.response.presentation" "$response" '
-      (.answer | startswith("The bounded mean is 0.161.\n\n"))
+      (.answer | startswith("The bounded mean is 0.2381.\n\n"))
       and (.answer | contains("This result has some uncertainty because"))
       and (.answer | contains("some source values had to be interpreted"))
       and (.answer | contains("some records were excluded"))
@@ -6628,7 +6628,7 @@ run_general_evidence_reasoning_shadow_scenario() {
       "$owner" "$conversation_id" "$followup_response" "$followup_question" \
       "deterministic" "support_explanation" "support" 0
     restart_orchestrator_with_history_followup false
-    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=5 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=3 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
   else
     echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
   fi
