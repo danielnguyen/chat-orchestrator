@@ -2769,6 +2769,19 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
         "maxItems": 16,
         "items": identifier,
     }
+    source_observation = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "evidence_ref_id": identifier,
+            "observation_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 249,
+            },
+        },
+        "required": ["evidence_ref_id", "observation_index"],
+    }
     operand = {
         "anyOf": [
             {
@@ -2777,8 +2790,11 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
                 "properties": {
                     "value": decimal_value,
                     "derivation_ref": {"type": "null"},
+                    "source_observation": {
+                        "anyOf": [source_observation, {"type": "null"}]
+                    },
                 },
-                "required": ["value", "derivation_ref"],
+                "required": ["value", "derivation_ref", "source_observation"],
             },
             {
                 "type": "object",
@@ -2786,8 +2802,9 @@ def evidence_reasoning_response_format() -> dict[str, Any]:
                 "properties": {
                     "value": {"type": "null"},
                     "derivation_ref": identifier,
+                    "source_observation": {"type": "null"},
                 },
-                "required": ["value", "derivation_ref"],
+                "required": ["value", "derivation_ref", "source_observation"],
             },
         ]
     }

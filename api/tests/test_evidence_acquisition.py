@@ -146,8 +146,22 @@ def _reasoning_proposal() -> dict:
                 "derivation_id": "ratio-1",
                 "operation": "divide",
                 "operands": [
-                    {"value": "5", "derivation_ref": None},
-                    {"value": "8", "derivation_ref": None},
+                    {
+                        "value": "5",
+                        "derivation_ref": None,
+                        "source_observation": {
+                            "evidence_ref_id": "evidence-1",
+                            "observation_index": 0,
+                        },
+                    },
+                    {
+                        "value": "8",
+                        "derivation_ref": None,
+                        "source_observation": {
+                            "evidence_ref_id": "evidence-1",
+                            "observation_index": 0,
+                        },
+                    },
                 ],
                 "supporting_evidence_ref_ids": ["evidence-1"],
             }
@@ -513,6 +527,80 @@ def test_general_reasoning_schema_encodes_model_owned_derivation_shape():
     operand_branches = divide_operands["items"]["anyOf"]
     assert operand_branches[0]["properties"]["derivation_ref"] == {"type": "null"}
     assert operand_branches[1]["properties"]["value"] == {"type": "null"}
+    assert operand_branches[0]["required"] == [
+        "value",
+        "derivation_ref",
+        "source_observation",
+    ]
+    binding = operand_branches[0]["properties"]["source_observation"]["anyOf"][0]
+    assert binding["additionalProperties"] is False
+    assert binding["required"] == ["evidence_ref_id", "observation_index"]
+    assert binding["properties"]["observation_index"] == {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 249,
+    }
+    assert operand_branches[1]["properties"]["source_observation"] == {
+        "type": "null"
+    }
+
+
+def test_general_reasoning_source_observation_binding_is_strict_and_bounded():
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(_reasoning_proposal()),
+        authorized_evidence_ref_ids={"evidence-1"},
+    )
+    binding = proposal.derivation_requests[0].operands[0].source_observation
+    assert binding is not None
+    assert binding.evidence_ref_id == "evidence-1"
+    assert binding.observation_index == 0
+
+    for invalid_binding in (
+        {"evidence_ref_id": "evidence-1", "observation_index": "0"},
+        {"evidence_ref_id": "evidence-1", "observation_index": 250},
+        {
+            "evidence_ref_id": "evidence-1",
+            "observation_index": 0,
+            "source_value": "PRIVATE_SOURCE_VALUE",
+        },
+    ):
+        payload = _reasoning_proposal()
+        payload["derivation_requests"][0]["operands"][0][
+            "source_observation"
+        ] = invalid_binding
+        with pytest.raises(ProviderOutputValidationError) as exc_info:
+            parse_evidence_reasoning_completion(
+                _reasoning_completion(payload),
+                authorized_evidence_ref_ids={"evidence-1"},
+            )
+        assert exc_info.value.failure_code == "derivation_contract_invalid"
+
+    payload = _reasoning_proposal()
+    payload["derivation_requests"] = [
+        payload["derivation_requests"][0],
+        {
+            "derivation_id": "mean-1",
+            "operation": "mean",
+            "operands": [
+                {
+                    "value": None,
+                    "derivation_ref": "ratio-1",
+                    "source_observation": {
+                        "evidence_ref_id": "evidence-1",
+                        "observation_index": 0,
+                    },
+                }
+            ],
+            "supporting_evidence_ref_ids": ["evidence-1"],
+        },
+    ]
+    payload["proposed_claim"] = "The result is {{derivation:mean-1}}."
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+    assert exc_info.value.failure_code == "derivation_contract_invalid"
 
 
 @pytest.mark.parametrize(
