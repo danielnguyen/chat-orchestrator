@@ -6250,6 +6250,7 @@ run_step13_diagnostic_scenarios() {
 run_general_evidence_reasoning_shadow_scenario() {
   local owner client conversation_id question external response request_id answer
   local trace manifest provider_calls audit diagnostics claim_records proposal history
+  local followup_response followup_question
   local presentation_expected="${1:-false}"
   local expected_derivations exact_claim exact_result visible_first visible_digest
   local source_ref="google_sheets:metrics_archive:Measurements!A2:C6"
@@ -6584,7 +6585,20 @@ run_general_evidence_reasoning_shadow_scenario() {
   fi
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   if [[ "$presentation_expected" == "true" ]]; then
-    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+    HISTORY_ORIGINAL_ANSWER="$answer"
+    HISTORY_ORIGINAL_REQUEST_ID="$request_id"
+    HISTORY_ORIGINAL_MANIFEST="$manifest"
+    followup_question="What was that based on?"
+    provider_post "/fixture/reset" '{}'
+    reset_dsa_audit
+    restart_orchestrator_with_history_followup true
+    followup_response="$(run_history_current_turn \
+      "$owner" "$client" "$conversation_id" "$followup_question" "private")"
+    assert_pure_history_case \
+      "$owner" "$conversation_id" "$followup_response" "$followup_question" \
+      "deterministic" "support_explanation" "support" 0
+    restart_orchestrator_with_history_followup false
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
   else
     echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
   fi

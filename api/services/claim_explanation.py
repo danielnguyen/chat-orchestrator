@@ -176,7 +176,7 @@ class ClaimEvidenceReference(BaseModel):
     ]
 
 
-class ClaimRecord(BaseModel):
+class ClaimRecordV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_id: Identifier
@@ -230,7 +230,7 @@ class ClaimRecord(BaseModel):
         return normalize_text(value) if isinstance(value, str) else value
 
     @model_validator(mode="after")
-    def validate_collections(self) -> "ClaimRecord":
+    def validate_collections(self) -> "ClaimRecordV1":
         identities = [
             (reference.ref_type, reference.ref_id)
             for reference in self.validated_evidence_references
@@ -240,6 +240,153 @@ class ClaimRecord(BaseModel):
         if len(self.limitation_codes) != len(set(self.limitation_codes)):
             raise ValueError("duplicate_limitation_code")
         return self
+
+
+class ClaimSupportMaterialExclusion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_ref_id: Identifier
+    reason: Annotated[str, Field(min_length=1, max_length=160)]
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: Any) -> Any:
+        return normalize_text(value) if isinstance(value, str) else value
+
+
+class ClaimSupportDerivationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    derivation_id: Identifier
+    operation: Literal["divide", "mean"]
+    canonical_inputs: list[Annotated[str, Field(min_length=1, max_length=160)]] = (
+        Field(min_length=1, max_length=16)
+    )
+    canonical_result: Annotated[str, Field(min_length=1, max_length=160)]
+    execution_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+    executor_version: Identifier
+    supporting_evidence_ref_ids: list[Identifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    input_basis: Literal["system_established", "model_interpreted"]
+
+    @model_validator(mode="after")
+    def validate_reference_uniqueness(self):
+        if len(self.supporting_evidence_ref_ids) != len(
+            set(self.supporting_evidence_ref_ids)
+        ):
+            raise ValueError("duplicate_derivation_evidence_reference")
+        return self
+
+
+class ClaimSupportRecordPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+    supporting_evidence_ref_ids: list[Identifier] = Field(
+        default_factory=list, max_length=16
+    )
+    counterevidence_ref_ids: list[Identifier] = Field(
+        default_factory=list, max_length=16
+    )
+    material_exclusions: list[ClaimSupportMaterialExclusion] = Field(
+        default_factory=list, max_length=16
+    )
+    executed_derivations: list[ClaimSupportDerivationRecord] = Field(
+        default_factory=list, max_length=16
+    )
+    material_scope_limitations: list[Identifier] = Field(
+        default_factory=list, max_length=10
+    )
+    calibration_status: Literal["supported", "limited", "unsupported"]
+    conclusion_disposition: Literal["allowed", "qualified", "withheld"]
+    qualification_required: bool
+    limitation_codes: list[Identifier] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_support_skeleton(self):
+        collections = (
+            self.supporting_evidence_ref_ids,
+            self.counterevidence_ref_ids,
+            [item.evidence_ref_id for item in self.material_exclusions],
+            [item.derivation_id for item in self.executed_derivations],
+            self.material_scope_limitations,
+            self.limitation_codes,
+        )
+        if any(len(values) != len(set(values)) for values in collections):
+            raise ValueError("duplicate_support_metadata")
+        if set(self.supporting_evidence_ref_ids) & set(self.counterevidence_ref_ids):
+            raise ValueError("conflicting_evidence_role")
+        known_refs = (
+            set(self.supporting_evidence_ref_ids)
+            | set(self.counterevidence_ref_ids)
+            | {item.evidence_ref_id for item in self.material_exclusions}
+        )
+        for derivation in self.executed_derivations:
+            if not set(derivation.supporting_evidence_ref_ids) <= known_refs:
+                raise ValueError("derivation_evidence_reference_unknown")
+        if (
+            self.calibration_status == "supported"
+            and self.conclusion_disposition == "withheld"
+        ):
+            raise ValueError("support_disposition_incoherent")
+        if self.conclusion_disposition == "allowed" and self.qualification_required:
+            raise ValueError("support_qualification_incoherent")
+        return self
+
+
+class ClaimRecordV2(ClaimRecordV1):
+    schema_version: Literal["claim-record.v2"]
+    presented_to_user: bool
+    support: ClaimSupportRecordPayload
+
+    @model_validator(mode="after")
+    def validate_v2_support(self):
+        expected_strength = "weak" if self.validated_evidence_references else "none"
+        if (
+            self.claim_class != "runtime_inference"
+            or self.evidence_strength != expected_strength
+            or self.confidence != "unknown"
+            or self.strongest_authority != "unknown"
+            or self.freshness_summary != "unknown"
+            or self.uncertainty_disclosure_required is not True
+        ):
+            raise ValueError("v2_compatibility_projection_not_neutral")
+        if any(
+            reference.support_kind != "contextual"
+            or reference.authority != "unknown"
+            or reference.freshness_state != "unknown_freshness"
+            for reference in self.validated_evidence_references
+        ):
+            raise ValueError("v2_evidence_projection_not_neutral")
+        if self.support.claim_digest != self.claim_anchor_digest:
+            raise ValueError("support_claim_digest_mismatch")
+        if self.support.calibration_status != self.calibration_status:
+            raise ValueError("support_calibration_mismatch")
+        evidence_ids = {
+            reference.ref_id for reference in self.validated_evidence_references
+        }
+        support_ids = (
+            set(self.support.supporting_evidence_ref_ids)
+            | set(self.support.counterevidence_ref_ids)
+            | {
+                exclusion.evidence_ref_id
+                for exclusion in self.support.material_exclusions
+            }
+        )
+        if not support_ids <= evidence_ids:
+            raise ValueError("support_evidence_reference_unknown")
+        return self
+
+
+ImmediateHistoryClaimRecord = Annotated[
+    ClaimRecordV1 | ClaimRecordV2,
+    Field(discriminator="schema_version"),
+]
+
+# The legacy list endpoint remains a v1-only compatibility surface.
+ClaimRecord = ClaimRecordV1
 
 
 class ClaimRecordListResponse(BaseModel):
@@ -338,7 +485,7 @@ class ImmediateHistoryRecord(BaseModel):
     record_kind: Literal["support", "acquisition"]
     assistant_message_id: Identifier
     original_request_id: Identifier
-    support_record: ClaimRecord | None = None
+    support_record: ImmediateHistoryClaimRecord | None = None
     acquisition_record: AcquisitionHistoryResolvedRecord | None = None
 
     @model_validator(mode="after")
@@ -346,6 +493,11 @@ class ImmediateHistoryRecord(BaseModel):
         if self.record_kind == "support":
             if self.support_record is None or self.acquisition_record is not None:
                 raise ValueError("support_immediate_record_invalid")
+            if (
+                isinstance(self.support_record, ClaimRecordV2)
+                and not self.support_record.presented_to_user
+            ):
+                raise ValueError("shadow_support_immediate_record_invalid")
         elif self.acquisition_record is None or self.support_record is not None:
             raise ValueError("acquisition_immediate_record_invalid")
         return self
@@ -888,7 +1040,7 @@ _LIMITATION_WORDING = {
 _LIMITATION_ORDER = tuple(_LIMITATION_WORDING)
 
 
-def _render(record: ClaimRecord) -> str:
+def _render(record: ImmediateHistoryClaimRecord) -> str:
     evidence_type = record.validated_evidence_references[0].ref_type
     evidence_wording = {
         "derived_text": "one retained file excerpt",
@@ -923,7 +1075,7 @@ def _render(record: ClaimRecord) -> str:
 
 
 def _record_support_status(
-    record: ClaimRecord,
+    record: ImmediateHistoryClaimRecord,
     *,
     owner_id: str,
     conversation_id: str,
@@ -932,6 +1084,18 @@ def _record_support_status(
         return "invalid"
     if record.claim_anchor_digest != _digest(record.claim_anchor):
         return "invalid"
+    if isinstance(record, ClaimRecordV2):
+        if (
+            not record.presented_to_user
+            or record.support.conclusion_disposition == "withheld"
+            or record.support.calibration_status == "unsupported"
+            or (
+                not record.support.supporting_evidence_ref_ids
+                and not record.support.executed_derivations
+            )
+        ):
+            return "insufficient"
+        return "supported"
     if (
         record.calibration_status == "unsupported"
         or record.evidence_strength == "none"
@@ -972,7 +1136,7 @@ def _record_support_status(
 
 
 def _record_matches_scope(
-    record: ClaimRecord,
+    record: ImmediateHistoryClaimRecord,
     *,
     owner_id: str,
     conversation_id: str,
