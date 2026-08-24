@@ -173,7 +173,6 @@ def execute_derivations(
         or not set(structured_observations) <= authorized_evidence_ref_ids
         or any(
             not isinstance(evidence_ref_id, str)
-            or not observations
             or len(observations) > 250
             or any(
                 observation is not None and not isinstance(observation, str)
@@ -184,17 +183,11 @@ def execute_derivations(
     ):
         raise ValueError("structured_observation_grounding_invalid")
 
-    referenced_ids = {
-        operand.derivation_ref
-        for request in parsed
-        for operand in request.operands
-        if operand.derivation_ref is not None
-    }
-    terminal_structured_means = {
+    structured_means = {
         request.derivation_id: set(request.supporting_evidence_ref_ids)
         & set(structured_observations)
         for request in parsed
-        if request.operation == "mean" and request.derivation_id not in referenced_ids
+        if request.operation == "mean"
     }
 
     def bound_observation(
@@ -261,26 +254,37 @@ def execute_derivations(
         visiting_chain.remove(derivation_id)
         return grounded
 
-    for derivation_id, structured_ref_ids in terminal_structured_means.items():
+    for derivation_id, structured_ref_ids in structured_means.items():
         if not structured_ref_ids:
             continue
-        terminal = by_id[derivation_id]
-        for operand in terminal.operands:
+        mean_request = by_id[derivation_id]
+        permits_unstructured_premises = bool(
+            set(mean_request.supporting_evidence_ref_ids)
+            - set(structured_observations)
+        )
+        has_structured_grounding = False
+        for operand in mean_request.operands:
             if operand.value is not None:
                 binding = operand.source_observation
-                if (
-                    binding is None
-                    or binding.evidence_ref_id not in structured_ref_ids
-                ):
+                if binding is None:
+                    if permits_unstructured_premises:
+                        continue
                     raise ValueError("derivation_observation_binding_required")
-                atoms = bound_observation(terminal, operand)
+                if binding.evidence_ref_id not in structured_ref_ids:
+                    raise ValueError("derivation_observation_binding_required")
+                atoms = bound_observation(mean_request, operand)
+                has_structured_grounding = True
                 if atoms is not None and len(atoms) >= 2:
                     raise ValueError("derivation_observation_transformation_required")
             else:
-                if not validate_structured_chain(
+                chain_is_grounded = validate_structured_chain(
                     str(operand.derivation_ref), structured_ref_ids, set()
-                ):
+                )
+                has_structured_grounding = chain_is_grounded or has_structured_grounding
+                if not chain_is_grounded and not permits_unstructured_premises:
                     raise ValueError("derivation_observation_binding_required")
+        if not has_structured_grounding:
+            raise ValueError("derivation_observation_binding_required")
 
     records: dict[str, DerivationExecutionRecord] = {}
     values: dict[str, Decimal] = {}

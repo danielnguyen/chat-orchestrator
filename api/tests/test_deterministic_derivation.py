@@ -298,3 +298,86 @@ def test_structured_transformation_chain_rejects_ungrounded_synthetic_literals()
             authorized_evidence_ref_ids={"fact-1", "fact-2"},
             structured_observations_by_evidence_ref={"fact-1": ("5/8",)},
         )
+
+
+def test_structured_mean_grounding_cannot_be_bypassed_by_downstream_wrapper():
+    with pytest.raises(ValueError, match="derivation_observation_binding_required"):
+        execute_derivations(
+            [
+                {
+                    "derivation_id": "bad-mean",
+                    "operation": "mean",
+                    "operands": [{"value": "58"}],
+                    "supporting_evidence_ref_ids": ["fact-1"],
+                },
+                {
+                    "derivation_id": "wrapper",
+                    "operation": "divide",
+                    "operands": [
+                        {"derivation_ref": "bad-mean"},
+                        {"value": "1"},
+                    ],
+                    "supporting_evidence_ref_ids": ["fact-1"],
+                },
+            ],
+            authorized_evidence_ref_ids={"fact-1"},
+            structured_observations_by_evidence_ref={"fact-1": ("5/8",)},
+        )
+
+
+def test_mixed_evidence_mean_preserves_structured_and_prose_premises():
+    records = execute_derivations(
+        [
+            {
+                "derivation_id": "mixed-mean",
+                "operation": "mean",
+                "operands": [
+                    _bound_value("10", 0),
+                    {"value": "20"},
+                ],
+                "supporting_evidence_ref_ids": ["fact-1", "fact-2"],
+            }
+        ],
+        authorized_evidence_ref_ids={"fact-1", "fact-2"},
+        structured_observations_by_evidence_ref={"fact-1": ("10",)},
+    )
+
+    assert records[0]["canonical_inputs"] == ["10", "20"]
+    assert records[0]["canonical_result"] == "15"
+    assert records[0]["input_basis"] == "model_interpreted"
+
+    with pytest.raises(ValueError, match="derivation_observation_binding_required"):
+        execute_derivations(
+            [
+                {
+                    "derivation_id": "ungrounded-mixed-mean",
+                    "operation": "mean",
+                    "operands": [{"value": "10"}, {"value": "20"}],
+                    "supporting_evidence_ref_ids": ["fact-1", "fact-2"],
+                }
+            ],
+            authorized_evidence_ref_ids={"fact-1", "fact-2"},
+            structured_observations_by_evidence_ref={"fact-1": ("10",)},
+        )
+
+
+def test_empty_structured_observations_do_not_break_no_derivation_proposals():
+    assert execute_derivations(
+        [],
+        authorized_evidence_ref_ids={"fact-1"},
+        structured_observations_by_evidence_ref={"fact-1": ()},
+    ) == []
+
+    with pytest.raises(ValueError, match="derivation_observation_reference_invalid"):
+        execute_derivations(
+            [
+                {
+                    "derivation_id": "mean-1",
+                    "operation": "mean",
+                    "operands": [_bound_value("1", 0)],
+                    "supporting_evidence_ref_ids": ["fact-1"],
+                }
+            ],
+            authorized_evidence_ref_ids={"fact-1"},
+            structured_observations_by_evidence_ref={"fact-1": ()},
+        )

@@ -22680,6 +22680,73 @@ async def test_structured_synthetic_aggregate_literals_fail_before_cr(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_structured_synthetic_mean_wrapper_fails_before_cr(tmp_path):
+    response = _aggregate_structured_response()
+    structured = response["results"][0]["structured_data"]
+    structured["record_count"] = 1
+    structured["non_empty_value_count"] = 1
+    structured["values"] = ["5/8"]
+    evidence_ref_id = governed_external_reference_id(
+        response["results"][0]["source_ref"]
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim="The bounded result is {{derivation:wrapper}}.",
+        evidence_ref_id=evidence_ref_id,
+        derivation_requests=[
+            {
+                "derivation_id": "bad_mean",
+                "operation": "mean",
+                "operands": [
+                    {
+                        "value": "58",
+                        "derivation_ref": None,
+                        "source_observation": None,
+                    }
+                ],
+                "supporting_evidence_ref_ids": [evidence_ref_id],
+            },
+            {
+                "derivation_id": "wrapper",
+                "operation": "divide",
+                "operands": [
+                    {
+                        "value": None,
+                        "derivation_ref": "bad_mean",
+                        "source_observation": None,
+                    },
+                    {
+                        "value": "1",
+                        "derivation_ref": None,
+                        "source_observation": None,
+                    },
+                ],
+                "supporting_evidence_ref_ids": [evidence_ref_id],
+            },
+        ],
+    )
+
+    _, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=reasoning_completion,
+        request_id="rid-structured-synthetic-wrapper",
+    )
+
+    assert len(litellm.calls) == 3
+    assert len(dsa.context_calls) == 1
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert runtime.claim_support_calls == []
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert trace["validation_status"] == "failed"
+    assert trace["failure_code"] == "derivation_contract_invalid"
+    assert trace["cr_call_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_missing_bound_derivation_execution_fails_before_cr(
     tmp_path,
     monkeypatch,

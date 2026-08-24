@@ -350,6 +350,29 @@ def test_general_reasoning_preserves_structured_observation_boundaries():
     assert "numeric substrings" in system_instruction
     assert "one complete semantic quantity" in system_instruction
     assert "intermediate derivation" in system_instruction
+    assert "source_observation.evidence_ref_id" in system_instruction
+    assert "source_observation.observation_index" in system_instruction
+    assert "zero-based position" in system_instruction
+    assert "does not make the interpretation deterministically true" in (
+        system_instruction
+    )
+    assert "Bind it even when the literal is a semantic interpretation" in (
+        system_instruction
+    )
+    assert "direct literals not based on a structured_field_values observation" in (
+        system_instruction
+    )
+    assert "source_observation to null" in system_instruction
+    assert "structured-origin direct inputs to intermediate mechanical derivations" in (
+        system_instruction
+    )
+    for format_specific_rule in (
+        "slash means",
+        "percent means",
+        "range means",
+        "unit means",
+    ):
+        assert format_specific_rule not in system_instruction.lower()
     assert provider_input["authorized_evidence"][0]["structured_data"][
         "values"
     ] == values
