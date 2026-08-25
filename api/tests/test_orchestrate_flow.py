@@ -22449,29 +22449,15 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
             "derivation_id": derivation_id,
             "operation": "divide",
             "operands": [
-                {
-                    "value": numerator,
-                    "derivation_ref": None,
-                    "source_observation": {
-                        "evidence_ref_id": evidence_ref_id,
-                        "observation_index": observation_index,
-                    },
-                },
-                {
-                    "value": denominator,
-                    "derivation_ref": None,
-                    "source_observation": {
-                        "evidence_ref_id": evidence_ref_id,
-                        "observation_index": observation_index,
-                    },
-                },
+                {"value": numerator, "derivation_ref": None},
+                {"value": denominator, "derivation_ref": None},
             ],
             "supporting_evidence_ref_ids": [evidence_ref_id],
         }
-        for derivation_id, numerator, denominator, observation_index in (
-            ("ratio_1", "1", "2", 0),
-            ("ratio_2", "3", "4", 1),
-            ("ratio_3", "5", "8", 3),
+        for derivation_id, numerator, denominator in (
+            ("ratio_1", "1", "2"),
+            ("ratio_2", "3", "4"),
+            ("ratio_3", "5", "8"),
         )
     ]
     derivations.append(
@@ -22626,7 +22612,7 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
 
 
 @pytest.mark.asyncio
-async def test_structured_synthetic_aggregate_literals_fail_before_cr(tmp_path):
+async def test_structured_model_interpretation_executes_before_cr_authority(tmp_path):
     response = _aggregate_structured_response()
     structured = response["results"][0]["structured_data"]
     structured["record_count"] = 4
@@ -22643,15 +22629,8 @@ async def test_structured_synthetic_aggregate_literals_fail_before_cr(tmp_path):
                 "derivation_id": "mean_1",
                 "operation": "mean",
                 "operands": [
-                    {
-                        "value": value,
-                        "derivation_ref": None,
-                        "source_observation": {
-                            "evidence_ref_id": evidence_ref_id,
-                            "observation_index": index,
-                        },
-                    }
-                    for index, value in enumerate(["58", "916", "38", "14"])
+                    {"value": value, "derivation_ref": None}
+                    for value in ["0.625", "0.5625", "0.375", "0.25"]
                 ],
                 "supporting_evidence_ref_ids": [evidence_ref_id],
             }
@@ -22663,142 +22642,27 @@ async def test_structured_synthetic_aggregate_literals_fail_before_cr(tmp_path):
         response=response,
         diagnostic_completion=_diagnostic_completion(),
         reasoning_completion=reasoning_completion,
-        request_id="rid-structured-synthetic-aggregate",
+        request_id="rid-structured-model-interpreted-aggregate",
     )
 
     assert len(litellm.calls) == 3
     assert len(dsa.context_calls) == 1
     assert dsa.calls == []
     assert dsa.fetch_calls == []
-    assert runtime.claim_support_calls == []
+    assert len(runtime.claim_support_calls) == 1
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    execution = authority["executed_derivations"][0]
+    assert execution["canonical_inputs"] == ["0.25", "0.375", "0.5625", "0.625"]
+    assert execution["canonical_result"] == "0.453125"
+    assert execution["input_basis"] == "model_interpreted"
+    assert execution["supporting_evidence_ref_ids"] == [evidence_ref_id]
     trace = memory_store.trace_calls[-1]["payload"]["prompt"][
         "general_evidence_reasoning"
     ]
-    assert trace["validation_status"] == "failed"
-    assert trace["failure_code"] == "derivation_contract_invalid"
-    assert trace["cr_call_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_structured_synthetic_mean_wrapper_fails_before_cr(tmp_path):
-    response = _aggregate_structured_response()
-    structured = response["results"][0]["structured_data"]
-    structured["record_count"] = 1
-    structured["non_empty_value_count"] = 1
-    structured["values"] = ["5/8"]
-    evidence_ref_id = governed_external_reference_id(
-        response["results"][0]["source_ref"]
-    )
-    reasoning_completion = _general_reasoning_completion(
-        proposed_claim="The bounded result is {{derivation:wrapper}}.",
-        evidence_ref_id=evidence_ref_id,
-        derivation_requests=[
-            {
-                "derivation_id": "bad_mean",
-                "operation": "mean",
-                "operands": [
-                    {
-                        "value": "58",
-                        "derivation_ref": None,
-                        "source_observation": None,
-                    }
-                ],
-                "supporting_evidence_ref_ids": [evidence_ref_id],
-            },
-            {
-                "derivation_id": "wrapper",
-                "operation": "divide",
-                "operands": [
-                    {
-                        "value": None,
-                        "derivation_ref": "bad_mean",
-                        "source_observation": None,
-                    },
-                    {
-                        "value": "1",
-                        "derivation_ref": None,
-                        "source_observation": None,
-                    },
-                ],
-                "supporting_evidence_ref_ids": [evidence_ref_id],
-            },
-        ],
-    )
-
-    _, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
-        tmp_path=tmp_path,
-        response=response,
-        diagnostic_completion=_diagnostic_completion(),
-        reasoning_completion=reasoning_completion,
-        request_id="rid-structured-synthetic-wrapper",
-    )
-
-    assert len(litellm.calls) == 3
-    assert len(dsa.context_calls) == 1
-    assert dsa.calls == []
-    assert dsa.fetch_calls == []
-    assert runtime.claim_support_calls == []
-    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
-        "general_evidence_reasoning"
-    ]
-    assert trace["validation_status"] == "failed"
-    assert trace["failure_code"] == "derivation_contract_invalid"
-    assert trace["cr_call_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_structured_ungrounded_divide_fails_before_cr(tmp_path):
-    response = _aggregate_structured_response()
-    structured = response["results"][0]["structured_data"]
-    structured["record_count"] = 1
-    structured["non_empty_value_count"] = 1
-    structured["values"] = ["5/8"]
-    evidence_ref_id = governed_external_reference_id(
-        response["results"][0]["source_ref"]
-    )
-    reasoning_completion = _general_reasoning_completion(
-        proposed_claim="The bounded result is {{derivation:bad_divide}}.",
-        evidence_ref_id=evidence_ref_id,
-        derivation_requests=[
-            {
-                "derivation_id": "bad_divide",
-                "operation": "divide",
-                "operands": [
-                    {
-                        "value": "58",
-                        "derivation_ref": None,
-                        "source_observation": None,
-                    },
-                    {
-                        "value": "1",
-                        "derivation_ref": None,
-                        "source_observation": None,
-                    },
-                ],
-                "supporting_evidence_ref_ids": [evidence_ref_id],
-            }
-        ],
-    )
-
-    _, runtime, dsa, litellm, memory_store = await _run_step13_aggregate_failure(
-        tmp_path=tmp_path,
-        response=response,
-        diagnostic_completion=_diagnostic_completion(),
-        reasoning_completion=reasoning_completion,
-        request_id="rid-structured-ungrounded-divide",
-    )
-
-    assert len(litellm.calls) == 3
-    assert len(dsa.context_calls) == 1
-    assert dsa.calls == []
-    assert dsa.fetch_calls == []
-    assert runtime.claim_support_calls == []
-    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
-        "general_evidence_reasoning"
-    ]
-    assert trace["validation_status"] == "failed"
-    assert trace["failure_code"] == "derivation_contract_invalid"
-    assert trace["cr_call_count"] == 0
+    assert trace["validation_status"] == "accepted"
+    assert "failure_code" not in trace
+    assert trace["cr_call_count"] == 1
+    assert trace["reasoning_provider_call_count"] == 1
 
 
 @pytest.mark.asyncio
