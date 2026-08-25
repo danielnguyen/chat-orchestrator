@@ -91,6 +91,23 @@ class _EvidenceReference(BaseModel):
     ]
 
 
+class _ClaimSourceDescriptor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str = Field(min_length=1, max_length=120, pattern=_IDENTIFIER_PATTERN)
+    display_name: str = Field(min_length=1, max_length=120)
+    source_type: str = Field(min_length=1, max_length=64, pattern=_IDENTIFIER_PATTERN)
+
+    @field_validator("source_id", "display_name", "source_type", mode="before")
+    @classmethod
+    def normalize_values(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if re.search(r"[\x00-\x1f\x7f]", value):
+                raise ValueError("unsafe_source_descriptor_value")
+            return " ".join(value.split())
+        return value
+
+
 class _CalibrationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -688,10 +705,15 @@ def claim_support_record_payload(
     executions = reasoning_result.get("executions")
     authority = reasoning_result.get("authority_context")
     cr_result = reasoning_result.get("cr_result")
+    evidence_metadata = reasoning_result.get("evidence_metadata")
     if not all(
         isinstance(value, dict)
         for value in (proposal, authority, cr_result)
     ) or not isinstance(executions, list):
+        return None
+    if evidence_metadata is None:
+        evidence_metadata = {}
+    if not isinstance(evidence_metadata, dict):
         return None
     claim = proposal.get("proposed_claim")
     claim_digest = cr_result.get("claim_digest")
@@ -715,17 +737,31 @@ def claim_support_record_payload(
         ref_id = reference.get("ref_id")
         if ref_id not in supporting | counter | exclusions:
             continue
-        evidence_references.append(
-            {
-                "ref_type": "external_source",
-                "ref_id": ref_id,
-                "owner_id": owner_id,
-                "conversation_id": conversation_id,
-                "support_kind": "contextual",
-                "authority": "unknown",
-                "freshness_state": "unknown_freshness",
-            }
+        evidence_reference = {
+            "ref_type": "external_source",
+            "ref_id": ref_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "support_kind": "contextual",
+            "authority": "unknown",
+            "freshness_state": "unknown_freshness",
+        }
+        metadata = evidence_metadata.get(ref_id)
+        source_descriptor = (
+            metadata.get("source_descriptor")
+            if isinstance(metadata, dict)
+            else None
         )
+        if source_descriptor is not None:
+            try:
+                evidence_reference["source_descriptor"] = (
+                    _ClaimSourceDescriptor.model_validate(
+                        source_descriptor
+                    ).model_dump(mode="json")
+                )
+            except ValidationError:
+                return None
+        evidence_references.append(evidence_reference)
     status = cr_result.get("calibration_status")
     scalar_limitations: list[str] = []
     if status in {"limited", "unsupported"}:

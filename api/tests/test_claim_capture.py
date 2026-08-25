@@ -296,6 +296,80 @@ def test_presented_claim_support_payload_and_response_preserve_same_v2_contract(
     assert payload["calibration_result"]["strongest_authority"] == "unknown"
 
 
+def test_presented_claim_support_uses_only_system_evidence_source_descriptor():
+    reasoning_result = _shadow_result()
+    system_descriptor = {
+        "source_id": "vehicle_records",
+        "display_name": "Vehicle Maintenance Log",
+        "source_type": "google_sheets",
+    }
+    reasoning_result["evidence_metadata"] = {
+        "evidence-1": {
+            "source_id": "vehicle_records",
+            "source_ref": "PRIVATE-INTERNAL-SOURCE-REF",
+            "source_descriptor": system_descriptor,
+        }
+    }
+    reasoning_result["proposal"]["source_descriptor"] = {
+        "display_name": "FORGED MODEL LABEL"
+    }
+    reasoning_result["cr_result"]["source_descriptor"] = {
+        "display_name": "FORGED CR LABEL"
+    }
+
+    payload = claim_support_record_payload(
+        reasoning_result=reasoning_result,
+        presented_to_user=True,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        assistant_message_id="message-1",
+        surface="desktop_private",
+        runtime_session_id="session-1",
+        runtime_turn_id="turn-1",
+        acquisition_manifest_id="manifest-1",
+    )
+
+    assert payload is not None
+    references = payload["calibration_result"]["validated_evidence_references"]
+    assert references[0]["source_descriptor"] == system_descriptor
+    serialized = str(payload)
+    assert "FORGED MODEL LABEL" not in serialized
+    assert "FORGED CR LABEL" not in serialized
+    assert "PRIVATE-INTERNAL-SOURCE-REF" not in serialized
+    assert payload["support"]["conclusion_disposition"] == "qualified"
+
+
+def test_malformed_system_source_descriptor_fails_closed():
+    reasoning_result = _shadow_result()
+    reasoning_result["evidence_metadata"] = {
+        "evidence-1": {
+            "source_descriptor": {
+                "source_id": "vehicle_records",
+                "display_name": "Vehicle Maintenance Log",
+                "source_type": "google_sheets",
+                "source_ref": "PRIVATE-INTERNAL-SOURCE-REF",
+            }
+        }
+    }
+
+    assert (
+        claim_support_record_payload(
+            reasoning_result=reasoning_result,
+            presented_to_user=True,
+            request_id="request-1",
+            owner_id="owner",
+            conversation_id="conversation-1",
+            assistant_message_id="message-1",
+            surface="desktop_private",
+            runtime_session_id="session-1",
+            runtime_turn_id="turn-1",
+            acquisition_manifest_id=None,
+        )
+        is None
+    )
+
+
 def _manifest(state, *, final_answer=None, **overrides):
     final_answer = (
         state.candidate.claim_anchor

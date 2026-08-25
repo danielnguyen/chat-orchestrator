@@ -22314,6 +22314,8 @@ async def _run_step13_aggregate_failure(
     diagnostic_completion,
     request_id,
     reasoning_completion=None,
+    presentation_enabled=False,
+    memory_store=None,
 ):
     rules, models = _write_diagnostic_route_files(
         tmp_path,
@@ -22361,13 +22363,16 @@ async def _run_step13_aggregate_failure(
             ["metrics_archive"],
             aggregate_function="median",
             aggregate_field_name="Reading",
-        ),
-        diagnostic_completion,
+        )
     ]
-    if reasoning_completion is not None:
-        completions.append(reasoning_completion)
+    if reasoning_completion is not None and presentation_enabled:
+        completions.extend([reasoning_completion, diagnostic_completion])
+    else:
+        completions.append(diagnostic_completion)
+        if reasoning_completion is not None:
+            completions.append(reasoning_completion)
     litellm = SequenceLiteLLM(completions)
-    memory_store = (
+    memory_store = memory_store or (
         ClaimCaptureMemoryStore()
         if reasoning_completion is not None
         else FakeMemoryStore()
@@ -22383,6 +22388,7 @@ async def _run_step13_aggregate_failure(
         interaction_governance_enabled=True,
         claim_record_capture_enabled=reasoning_completion is not None,
         general_evidence_reasoning_enabled=reasoning_completion is not None,
+        general_evidence_reasoning_presentation_enabled=presentation_enabled,
         general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
@@ -22390,6 +22396,177 @@ async def _run_step13_aggregate_failure(
         request_id=request_id,
     )
     return result, runtime, dsa, litellm, memory_store
+
+
+@pytest.mark.asyncio
+async def test_winning_generic_presentation_carries_source_and_skips_diagnostic(
+    tmp_path,
+):
+    response = _aggregate_structured_response()
+    structured = response["results"][0]["structured_data"]
+    structured.update(
+        record_count=4,
+        non_empty_value_count=4,
+        values=["5/8", "9/16", "3/8", "1/4"],
+    )
+    evidence_ref_id = governed_external_reference_id(
+        response["results"][0]["source_ref"]
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim="The bounded mean is {{derivation:mean_1}}.",
+        evidence_ref_id=evidence_ref_id,
+        derivation_requests=[
+            {
+                "derivation_id": "mean_1",
+                "operation": "mean",
+                "operands": [
+                    {"value": value, "derivation_ref": None}
+                    for value in ["0.625", "0.5625", "0.375", "0.25"]
+                ],
+                "supporting_evidence_ref_ids": [evidence_ref_id],
+            }
+        ],
+    )
+
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_step13_aggregate_failure(
+            tmp_path=tmp_path,
+            response=response,
+            diagnostic_completion=_diagnostic_completion(),
+            reasoning_completion=reasoning_completion,
+            presentation_enabled=True,
+            request_id="rid-winning-generic-presentation",
+        )
+    )
+
+    assert out["status"] == "ok"
+    assert out["answer"].startswith("The bounded mean is 0.4531.")
+    assert "some source values had to be interpreted" in out["answer"]
+    assert "Configured Metrics Archive" not in out["answer"]
+    assert len(litellm.calls) == 2
+    reasoning_call = litellm.calls[1]
+    assert reasoning_call["response_format"]["json_schema"]["name"] == (
+        "general_evidence_reasoning_proposal"
+    )
+    reasoning_input = json.loads(reasoning_call["messages"][1]["content"])
+    supplied = reasoning_input["authorized_evidence"][0]
+    assert supplied["evidence_ref_id"] == evidence_ref_id
+    assert supplied["source_descriptor"] == {
+        "source_id": "metrics_archive",
+        "display_name": "Configured Metrics Archive",
+        "source_type": "neutral_connector",
+    }
+    assert len(runtime.claim_support_calls) == 1
+    assert len(dsa.context_calls) == 1
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    record = next(
+        call["payload"]
+        for call in memory_store.claim_record_calls
+        if call["payload"]["schema_version"] == "claim-record.v2"
+    )
+    assert record["calibration_result"]["validated_evidence_references"][0][
+        "source_descriptor"
+    ] == supplied["source_descriptor"]
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["status"] == "ok"
+    diagnostic_trace = trace["prompt"]["evidence_acquisition"]["diagnostic"]
+    assert diagnostic_trace["attempted"] is False
+    assert diagnostic_trace["call_count"] == 0
+    assert diagnostic_trace["status"] == "not_needed"
+    assert diagnostic_trace["failure_reason"] == "generic_presentation_selected"
+    reasoning_trace = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning_trace["reasoning_provider_call_count"] == 1
+    assert reasoning_trace["cr_call_count"] == 1
+    assert reasoning_trace["bms_persistence_status"] == "persisted"
+    assert reasoning_trace["presented_to_user"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_generic_presentation_preserves_one_diagnostic_fallback(
+    tmp_path,
+):
+    response = _aggregate_structured_response()
+    response["results"][0]["structured_data"].update(
+        record_count=1,
+        non_empty_value_count=1,
+        values=["uninterpretable-value"],
+    )
+
+    out, runtime, _, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=_provider_completion("not-json"),
+        presentation_enabled=True,
+        request_id="rid-generic-failure-diagnostic-fallback",
+    )
+
+    assert out["status"] == "degraded"
+    assert len(litellm.calls) == 3
+    assert runtime.claim_support_calls == []
+    diagnostic_trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["diagnostic"]
+    assert diagnostic_trace["attempted"] is True
+    assert diagnostic_trace["call_count"] == 1
+    assert diagnostic_trace["status"] == "accepted"
+    reasoning_trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert reasoning_trace["validation_status"] == "failed"
+    assert reasoning_trace["presented_to_user"] is False
+
+
+@pytest.mark.asyncio
+async def test_winning_generic_presentation_stays_degraded_if_support_not_persisted(
+    tmp_path,
+):
+    response = _aggregate_structured_response()
+    response["results"][0]["structured_data"].update(
+        record_count=2,
+        non_empty_value_count=2,
+        values=["half", "three quarters"],
+    )
+    evidence_ref_id = governed_external_reference_id(
+        response["results"][0]["source_ref"]
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim="The bounded mean is {{derivation:mean_1}}.",
+        evidence_ref_id=evidence_ref_id,
+        derivation_requests=[
+            {
+                "derivation_id": "mean_1",
+                "operation": "mean",
+                "operands": [
+                    {"value": "0.5", "derivation_ref": None},
+                    {"value": "0.75", "derivation_ref": None},
+                ],
+                "supporting_evidence_ref_ids": [evidence_ref_id],
+            }
+        ],
+    )
+    memory_store = ClaimCaptureMemoryStore(
+        claim_record_error=RuntimeError("PRIVATE-STORAGE-ERROR")
+    )
+
+    out, _, _, _, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=response,
+        diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=reasoning_completion,
+        presentation_enabled=True,
+        memory_store=memory_store,
+        request_id="rid-generic-presentation-storage-failure",
+    )
+
+    assert out["status"] == "degraded"
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert trace["status"] == "degraded"
+    assert trace["prompt"]["general_evidence_reasoning"][
+        "bms_persistence_status"
+    ] == "failed"
+    assert "PRIVATE-STORAGE-ERROR" not in json.dumps(trace, sort_keys=True)
 
 
 @pytest.mark.asyncio
@@ -22527,6 +22704,11 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
         {
             "evidence_ref_id": evidence_ref_id,
             "content_type": "structured_field_values",
+            "source_descriptor": {
+                "source_id": "metrics_archive",
+                "display_name": "Configured Metrics Archive",
+                "source_type": "neutral_connector",
+            },
             "structured_data": structured,
         }
     ]
@@ -22604,6 +22786,11 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
         "support_kind": "contextual",
         "authority": "unknown",
         "freshness_state": "unknown_freshness",
+        "source_descriptor": {
+            "source_id": "metrics_archive",
+            "display_name": "Configured Metrics Archive",
+            "source_type": "neutral_connector",
+        },
     }
     trace_serialized = json.dumps(memory_store.trace_calls, sort_keys=True)
     for value in structured["values"]:
