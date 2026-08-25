@@ -146,22 +146,8 @@ def _reasoning_proposal() -> dict:
                 "derivation_id": "ratio-1",
                 "operation": "divide",
                 "operands": [
-                    {
-                        "value": "5",
-                        "derivation_ref": None,
-                        "source_observation": {
-                            "evidence_ref_id": "evidence-1",
-                            "observation_index": 0,
-                        },
-                    },
-                    {
-                        "value": "8",
-                        "derivation_ref": None,
-                        "source_observation": {
-                            "evidence_ref_id": "evidence-1",
-                            "observation_index": 0,
-                        },
-                    },
+                    {"value": "5", "derivation_ref": None},
+                    {"value": "8", "derivation_ref": None},
                 ],
                 "supporting_evidence_ref_ids": ["evidence-1"],
             }
@@ -350,22 +336,8 @@ def test_general_reasoning_preserves_structured_observation_boundaries():
     assert "numeric substrings" in system_instruction
     assert "one complete semantic quantity" in system_instruction
     assert "intermediate derivation" in system_instruction
-    assert "source_observation.evidence_ref_id" in system_instruction
-    assert "source_observation.observation_index" in system_instruction
-    assert "zero-based position" in system_instruction
-    assert "does not make the interpretation deterministically true" in (
-        system_instruction
-    )
-    assert "Bind it even when the literal is a semantic interpretation" in (
-        system_instruction
-    )
-    assert "direct literals not based on a structured_field_values observation" in (
-        system_instruction
-    )
-    assert "source_observation to null" in system_instruction
-    assert "structured-origin direct inputs to intermediate mechanical derivations" in (
-        system_instruction
-    )
+    assert "source_observation" not in system_instruction
+    assert "observation_index" not in system_instruction
     for format_specific_rule in (
         "slash means",
         "percent means",
@@ -550,80 +522,47 @@ def test_general_reasoning_schema_encodes_model_owned_derivation_shape():
     operand_branches = divide_operands["items"]["anyOf"]
     assert operand_branches[0]["properties"]["derivation_ref"] == {"type": "null"}
     assert operand_branches[1]["properties"]["value"] == {"type": "null"}
-    assert operand_branches[0]["required"] == [
-        "value",
-        "derivation_ref",
-        "source_observation",
-    ]
-    binding = operand_branches[0]["properties"]["source_observation"]["anyOf"][0]
-    assert binding["additionalProperties"] is False
-    assert binding["required"] == ["evidence_ref_id", "observation_index"]
-    assert binding["properties"]["observation_index"] == {
-        "type": "integer",
-        "minimum": 0,
-        "maximum": 249,
-    }
-    assert operand_branches[1]["properties"]["source_observation"] == {
-        "type": "null"
-    }
+    assert operand_branches[0]["required"] == ["value", "derivation_ref"]
+    assert operand_branches[1]["required"] == ["value", "derivation_ref"]
+    assert all(
+        "source_observation" not in branch["properties"]
+        for branch in operand_branches
+    )
 
 
-def test_general_reasoning_source_observation_binding_is_strict_and_bounded():
+def test_general_reasoning_direct_operands_parse_without_observation_metadata():
     proposal = parse_evidence_reasoning_completion(
         _reasoning_completion(_reasoning_proposal()),
         authorized_evidence_ref_ids={"evidence-1"},
     )
-    binding = proposal.derivation_requests[0].operands[0].source_observation
-    assert binding is not None
-    assert binding.evidence_ref_id == "evidence-1"
-    assert binding.observation_index == 0
-
-    for invalid_binding in (
-        {"evidence_ref_id": "evidence-1", "observation_index": "0"},
-        {"evidence_ref_id": "evidence-1", "observation_index": 250},
-        {
-            "evidence_ref_id": "evidence-1",
-            "observation_index": 0,
-            "source_value": "PRIVATE_SOURCE_VALUE",
-        },
-    ):
-        payload = _reasoning_proposal()
-        payload["derivation_requests"][0]["operands"][0][
-            "source_observation"
-        ] = invalid_binding
-        with pytest.raises(ProviderOutputValidationError) as exc_info:
-            parse_evidence_reasoning_completion(
-                _reasoning_completion(payload),
-                authorized_evidence_ref_ids={"evidence-1"},
-            )
-        assert exc_info.value.failure_code == "derivation_contract_invalid"
+    assert [operand.value for operand in proposal.derivation_requests[0].operands] == [
+        "5",
+        "8",
+    ]
 
     payload = _reasoning_proposal()
-    payload["derivation_requests"] = [
-        payload["derivation_requests"][0],
-        {
-            "derivation_id": "mean-1",
-            "operation": "mean",
-            "operands": [
-                {
-                    "value": None,
-                    "derivation_ref": "ratio-1",
-                    "source_observation": {
-                        "evidence_ref_id": "evidence-1",
-                        "observation_index": 0,
-                    },
-                }
-            ],
-            "supporting_evidence_ref_ids": ["evidence-1"],
-        },
-    ]
-    payload["proposed_claim"] = "The result is {{derivation:mean-1}}."
+    payload["derivation_requests"][0]["operands"][0]["source_observation"] = {
+        "evidence_ref_id": "evidence-1",
+        "observation_index": 0,
+    }
     with pytest.raises(ProviderOutputValidationError) as exc_info:
         parse_evidence_reasoning_completion(
             _reasoning_completion(payload),
             authorized_evidence_ref_ids={"evidence-1"},
         )
     assert exc_info.value.failure_code == "derivation_contract_invalid"
+
+    payload = _reasoning_proposal()
+    payload["supporting_evidence_ref_ids"] = ["evidence-out-of-scope"]
+    payload["derivation_requests"][0]["supporting_evidence_ref_ids"] = [
+        "evidence-out-of-scope"
+    ]
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        parse_evidence_reasoning_completion(
+            _reasoning_completion(payload),
+            authorized_evidence_ref_ids={"evidence-1"},
+        )
+    assert exc_info.value.failure_code == "proposal_reference_unauthorized"
 
 
 @pytest.mark.parametrize(
