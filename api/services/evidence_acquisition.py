@@ -139,6 +139,19 @@ RequirementKind = Literal[
     "context_delivery",
     "no_material_truncation",
 ]
+
+_GENERIC_SCOPE_AUTHORITY_REQUIREMENT_KINDS = frozenset(
+    {
+        "authoritative_inventory",
+        "complete_scope_coverage",
+        "selected_source_coverage",
+        "contradiction_search",
+        "counterevidence_coverage",
+        "historical_scope",
+        "historical_sequence_coverage",
+        "candidate_evidence_coverage",
+    }
+)
 SufficiencyReasonCode = Literal[
     "all_declared_requirements_satisfied",
     "optional_requirement_incomplete",
@@ -1989,6 +2002,7 @@ class EvidenceAcquisitionState:
     def is_authorized_probe(self) -> bool:
         return bool(self.authorized_probe_source_ids)
 
+
     @property
     def supported_targeted_path(self) -> bool:
         return bool(
@@ -2226,6 +2240,52 @@ class ExactFetchProposal:
     declared_scope: dict[str, Any]
     exact_reference: dict[str, str]
     premise: EvidenceAcquisitionPremise
+
+
+def project_generic_scope_authority(
+    state: EvidenceAcquisitionState,
+    *,
+    reasoning_context_limited: bool,
+) -> dict[str, bool | None]:
+    """Project material acquisition coverage into generic claim authority."""
+    plan = state.plan
+    applicable = (
+        [
+            requirement
+            for requirement in plan.declared_requirements
+            if requirement.criticality == "material"
+            and requirement.requirement_kind
+            in _GENERIC_SCOPE_AUTHORITY_REQUIREMENT_KINDS
+        ]
+        if plan is not None
+        else []
+    )
+    material_limited = reasoning_context_limited or any(
+        item.category == "retrieval_limit"
+        for item in state.process_failure_observations
+    )
+    if not applicable:
+        return {
+            "complete_declared_scope_required": False,
+            "complete_declared_scope_established": None,
+            "material_acquisition_limited": material_limited,
+        }
+    facts_by_id = {
+        item.get("requirement_id"): item.get("outcome")
+        for item in state.acquisition_facts or []
+        if isinstance(item, dict)
+    }
+    return {
+        "complete_declared_scope_required": True,
+        "complete_declared_scope_established": (
+            not material_limited
+            and all(
+                facts_by_id.get(requirement.requirement_id) == "satisfied"
+                for requirement in applicable
+            )
+        ),
+        "material_acquisition_limited": material_limited,
+    }
 
 
 def disabled_evidence_trace(*, enabled: bool, reason: str) -> dict[str, Any]:

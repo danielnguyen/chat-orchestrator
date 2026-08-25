@@ -51,6 +51,7 @@ from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
     TARGETED_SCOPE_SUFFIX,
+    WITHHELD_ANSWER,
     DsaContextItem,
     DsaSourceListResponse,
     EvidenceAcquisitionPremise,
@@ -16255,6 +16256,7 @@ def test_authority_decision_comparison_is_deterministic_and_privacy_safe():
         ("rational_values", True, False),
         ("operational_prose", True, False),
         ("unsupported_speculation", True, False),
+        ("cr_failure", True, False),
         ("rational_values", True, True),
     ],
 )
@@ -16344,22 +16346,32 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
             request_id=f"rid-shadow-{semantic_case}",
             question=question,
             eligible_source_ids=["neutral_records"],
-        )
+        ),
+        claim_support_error=(
+            RuntimeError("PRIVATE CR FAILURE")
+            if semantic_case == "cr_failure"
+            else None
+        ),
+    )
+    reasoning_completion = _general_reasoning_completion(
+        proposed_claim=proposed_claim,
+        evidence_ref_id=ref_id,
+        derivation_requests=derivations,
+        supporting_evidence_ref_ids=(
+            [] if semantic_case == "unsupported_speculation" else None
+        ),
     )
     provider = SequenceLiteLLM(
-        [
-            _provider_completion(
-                _evidence_candidate(("neutral_records:item_1", safe_excerpt))
-            ),
-            _general_reasoning_completion(
-                proposed_claim=proposed_claim,
-                evidence_ref_id=ref_id,
-                derivation_requests=derivations,
-                supporting_evidence_ref_ids=(
-                    [] if semantic_case == "unsupported_speculation" else None
+        (
+            [reasoning_completion]
+            if presentation_enabled
+            else [
+                _provider_completion(
+                    _evidence_candidate(("neutral_records:item_1", safe_excerpt))
                 ),
-            ),
-        ]
+                reasoning_completion,
+            ]
+        )
     )
     dsa = FakeDSA(response=context_pack, source_response=source_response)
     memory_store = ClaimCaptureMemoryStore(
@@ -16389,7 +16401,10 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         request_id=f"rid-shadow-{semantic_case}",
     )
 
-    should_present = presentation_enabled and semantic_case != "unsupported_speculation"
+    should_present = presentation_enabled and semantic_case not in {
+        "unsupported_speculation",
+        "cr_failure",
+    }
     if should_present and semantic_case == "rational_values":
         assert out["answer"] == (
             "The interpreted ratios have a mechanically computed mean of 0.625.\n\n"
@@ -16398,12 +16413,16 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         )
     elif should_present:
         assert out["answer"] == proposed_claim
+    elif presentation_enabled:
+        assert out["answer"] == WITHHELD_ANSWER
     else:
         assert out["answer"] == _rendered_evidence_answer(safe_excerpt)
-    assert out["status"] == ("degraded" if persistence_fails else "ok")
+    assert out["status"] == (
+        "degraded" if persistence_fails or semantic_case == "cr_failure" else "ok"
+    )
     assert out.get("pending_action") is None
-    assert len(provider.calls) == 2
-    reasoning_call = provider.calls[1]
+    assert len(provider.calls) == (1 if presentation_enabled else 2)
+    reasoning_call = provider.calls[0 if presentation_enabled else 1]
     assert reasoning_call["tools"] == []
     assert reasoning_call["response_format"]["json_schema"]["name"] == (
         "general_evidence_reasoning_proposal"
@@ -16448,9 +16467,12 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         for call in memory_store.claim_record_calls
         if call["payload"]["schema_version"] == "claim-record.v2"
     ]
-    assert len(v2_calls) == 1
-    assert v2_calls[0]["payload"]["presented_to_user"] is should_present
-    assert v2_calls[0]["payload"]["support"]["claim_digest"].startswith("sha256:")
+    assert len(v2_calls) == (0 if semantic_case == "cr_failure" else 1)
+    if semantic_case != "cr_failure":
+        assert v2_calls[0]["payload"]["presented_to_user"] is should_present
+        assert v2_calls[0]["payload"]["support"]["claim_digest"].startswith(
+            "sha256:"
+        )
     if semantic_case == "rational_values":
         materialized_claim = (
             "The interpreted ratios have a mechanically computed mean of 0.625."
@@ -16479,7 +16501,11 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     if semantic_case == "rational_values":
         assert trace["claim_digest"] == materialized_digest
     assert trace["bms_persistence_status"] == (
-        "failed" if persistence_fails else "persisted"
+        "not_attempted"
+        if semantic_case == "cr_failure"
+        else "failed"
+        if persistence_fails
+        else "persisted"
     )
     assert trace["presented_to_user"] is should_present
     assert trace["presentation"]["enabled"] is presentation_enabled
@@ -16488,6 +16514,8 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         if should_present
         else "disabled"
         if not presentation_enabled
+        else "not_available"
+        if semantic_case == "cr_failure"
         else "ineligible"
     )
     if should_present:
@@ -16517,29 +16545,44 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
     ]
     if should_present:
         assert visible_v1_calls == []
-    serialized_support_payload = json.dumps(v2_calls[0]["payload"], sort_keys=True)
+    serialized_support_payload = json.dumps(
+        v2_calls[0]["payload"] if v2_calls else {}, sort_keys=True
+    )
     assert "visible_claim_digest" not in serialized_support_payload
     assert "_presentation_claim_template" not in serialized_support_payload
     comparison = trace["decision_comparison"]
-    assert comparison["status"] == "compared"
     if semantic_case == "rational_values":
+        assert comparison["status"] == "compared"
         assert comparison["existing_disposition"] == "allowed"
         assert comparison["claim_support_disposition"] == "qualified"
         assert comparison["relation"] == "claim_support_more_conservative"
         assert comparison["categories"] == []
     elif semantic_case == "operational_prose":
+        assert comparison["status"] == "compared"
         assert comparison["existing_disposition"] == "allowed"
         assert comparison["claim_support_disposition"] == "allowed"
         assert comparison["relation"] == "equivalent"
         assert comparison["categories"] == ["equivalent_decision"]
+    elif semantic_case == "cr_failure":
+        assert comparison == {
+            "status": "not_available",
+            "existing_disposition": "allowed",
+            "claim_support_disposition": None,
+            "relation": "unavailable",
+            "categories": [],
+            "reason_codes": ["claim_support_decision_unavailable"],
+        }
+        assert trace["reason_code"] == "cr_unavailable"
+        assert trace["validation_status"] == "shadow_failed"
     else:
+        assert comparison["status"] == "compared"
         assert comparison["existing_disposition"] == "allowed"
         assert comparison["claim_support_disposition"] == "withheld"
         assert comparison["relation"] == "claim_support_more_conservative"
         assert comparison["categories"] == ["provenance_support_disagreement"]
         assert comparison["reason_codes"] == ["no_supporting_evidence"]
     serialized_trace = json.dumps(memory_store.trace_calls, sort_keys=True)
-    serialized_v2 = json.dumps(v2_calls[0], sort_keys=True)
+    serialized_v2 = json.dumps(v2_calls[0] if v2_calls else {}, sort_keys=True)
     for prohibited in (
         source_text,
         "PRIVATE SOURCE INSTRUCTION SENTINEL",
@@ -17301,7 +17344,7 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
         ),
     ],
 )
-async def test_general_evidence_reasoning_failure_preserves_visible_path(
+async def test_general_evidence_reasoning_failure_blocks_legacy_terminal_path(
     tmp_path,
     shadow_completion,
     expected_failure_code,
@@ -17326,14 +17369,7 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
             eligible_source_ids=["neutral_records"],
         )
     )
-    provider = SequenceLiteLLM(
-        [
-            _provider_completion(
-                _evidence_candidate(("neutral_records:item_1", excerpt))
-            ),
-            shadow_completion,
-        ]
-    )
+    provider = SequenceLiteLLM([shadow_completion])
     dsa = FakeDSA(
         response=_neutral_reasoning_context_pack(
             query=question,
@@ -17378,14 +17414,16 @@ async def test_general_evidence_reasoning_failure_preserves_visible_path(
         request_id="rid-shadow-failure",
     )
 
-    assert out["answer"] == _rendered_evidence_answer(excerpt)
-    assert len(provider.calls) == 2
+    assert out["answer"] == WITHHELD_ANSWER
+    assert out["status"] == "degraded"
+    assert len(provider.calls) == 1
     assert len(dsa.calls) == 1
     assert runtime.claim_support_calls == []
-    assert all(
-        call["payload"]["schema_version"] == "claim-record.v1"
+    assert [
+        call
         for call in memory_store.claim_record_calls
-    )
+        if call["payload"]["schema_version"] == "claim-record.v1"
+    ] == []
     reasoning_traces = [
         call["payload"]["prompt"]["general_evidence_reasoning"]
         for call in memory_store.trace_calls
@@ -22717,8 +22755,8 @@ async def test_structured_representation_failure_reaches_qualified_shadow_reason
     assert dsa.fetch_calls == []
     assert len(runtime.claim_support_calls) == 1
     authority = runtime.claim_support_calls[0]["authority_context"]
-    assert authority["complete_declared_scope_required"] is False
-    assert authority["complete_declared_scope_established"] is None
+    assert authority["complete_declared_scope_required"] is True
+    assert authority["complete_declared_scope_established"] is True
     assert authority["material_acquisition_limited"] is False
     assert [item["canonical_result"] for item in authority["executed_derivations"]] == [
         "0.5",
