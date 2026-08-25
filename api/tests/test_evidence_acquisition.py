@@ -86,6 +86,7 @@ from services.evidence_acquisition import (
     render_process_failure_response,
     retain_initial_attempt_summary,
     select_evidence_next_step,
+    source_descriptor_for_inventory_entry,
     suppress_manifest_identifiers,
     validate_bounded_exhaustive_context_pack_response,
     validate_configured_worksheet_response,
@@ -348,6 +349,34 @@ def test_general_reasoning_preserves_structured_observation_boundaries():
     assert provider_input["authorized_evidence"][0]["structured_data"][
         "values"
     ] == values
+
+
+def test_reasoning_source_descriptor_uses_bounded_inventory_metadata():
+    source = DsaSourceEntry.model_validate(
+        {
+            "source_id": "vehicle_records",
+            "display_name": "  Vehicle Maintenance Log  ",
+            "connector": "google_sheets",
+            "domain_tags": ["records"],
+            "sensitivity": "low",
+            "access_mode": "read_only",
+            "capabilities": ["search", "context"],
+            "enabled": True,
+            "status": "ready",
+            "last_checked_at": None,
+            "authority_role": "authoritative",
+        }
+    )
+
+    assert source_descriptor_for_inventory_entry(source) == {
+        "source_id": "vehicle_records",
+        "display_name": "Vehicle Maintenance Log",
+        "source_type": "google_sheets",
+    }
+    unsafe = source.model_copy(
+        update={"display_name": "https://private.invalid/source"}
+    )
+    assert source_descriptor_for_inventory_entry(unsafe) is None
 
 
 def test_general_reasoning_rejects_unbound_terminal_derivation_claim():

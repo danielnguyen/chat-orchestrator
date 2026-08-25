@@ -6281,9 +6281,6 @@ run_general_evidence_reasoning_shadow_scenario() {
       aggregate_function:"mean",
       aggregate_field_name:"Entry"
     }')"
-  queue_diagnostic_advisory \
-    "A formatting or data-entry issue may be present." \
-    "Consider checking the entries that require numeric input."
   if [[ "$presentation_expected" == "true" ]]; then
     expected_derivations=1
     exact_result="0.4635416666666666666666666667"
@@ -6308,6 +6305,9 @@ run_general_evidence_reasoning_shadow_scenario() {
       }]
     }')"
   else
+    queue_diagnostic_advisory \
+      "A formatting or data-entry issue may be present." \
+      "Consider checking the entries that require numeric input."
     expected_derivations=4
     exact_result="0.625"
     exact_claim="A mean was mechanically computed over model-interpreted operands: ${exact_result}."
@@ -6376,7 +6376,9 @@ run_general_evidence_reasoning_shadow_scenario() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   claim_records="$(list_claim_records "$owner" "$conversation_id")"
 
-  if ! jq -e '.status == "degraded"' <<<"$response" >/dev/null; then
+  if ! jq -e --arg expected_status "$(if [[ "$presentation_expected" == "true" ]]; then printf ok; else printf degraded; fi)" '
+    .status == $expected_status
+  ' <<<"$response" >/dev/null; then
     jq -c '{status,selected_model,sources_count:(.sources | length)}' \
       <<<"$response" >&2
     jq -c '{status,error,model_call,prompt:{general_evidence_reasoning:.prompt.general_evidence_reasoning,evidence_provider_mode:.prompt.evidence_provider_mode}}' \
@@ -6384,7 +6386,9 @@ run_general_evidence_reasoning_shadow_scenario() {
     jq -c '{status,shape:.shape,plan:.plan,inventory:.inventory,acquisition_outcome:.acquisition.dsa_outcome,sufficiency_status:.sufficiency.status,next_step:.next_steps.selections[-1].selected_next_step,diagnostic:.diagnostic}' \
       <<<"$manifest" >&2
   fi
-  assert_jq "general_reasoning.response.status" "$response" '.status == "degraded"'
+  assert_jq "general_reasoning.response.status" "$response" '
+    .status == (if $presented then "ok" else "degraded" end)
+  ' --argjson presented "$presentation_expected"
   if [[ "$presentation_expected" == "true" ]]; then
     if ! assert_jq "general_reasoning.response.presentation" "$response" '
       (.answer | startswith("The bounded mean is 0.4635.\n\n"))
@@ -6480,15 +6484,18 @@ run_general_evidence_reasoning_shadow_scenario() {
   assert_jq "general_reasoning.manifest" "$manifest" '
     .sufficiency.status == "insufficient"
     and .next_steps.additional_acquisition_count == 0
-    and .diagnostic.attempted == true
-    and .diagnostic.call_count == 1
+    and .diagnostic.attempted == (if $presented then false else true end)
+    and .diagnostic.call_count == (if $presented then 0 else 1 end)
+    and .diagnostic.status == (if $presented then "not_needed" else "accepted" end)
     and .diagnostic.observation_categories == ["invalid_value"]
-  '
+  ' --argjson presented "$presentation_expected"
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_semantic_interpreter_calls "$provider_calls" 1
-  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" \
+    "$(if [[ "$presentation_expected" == "true" ]]; then printf 0; else printf 1; fi)"
   assert_jq "general_reasoning.provider" "$provider_calls" '
-    ([.calls[] | select(.kind == "chat")] | length) == 2
+    ([.calls[] | select(.kind == "chat")] | length)
+      == (if $presented then 1 else 2 end)
     and ([.calls[] | select(
       .kind == "chat"
       and .response_schema_name == "process_failure_diagnostic_advisory"
@@ -6496,7 +6503,7 @@ run_general_evidence_reasoning_shadow_scenario() {
       and .response_schema_strict == true
       and .response_schema_additional_properties == false
       and .tool_count == 0
-    )] | length) == 1
+    )] | length) == (if $presented then 0 else 1 end)
     and ([.calls[] | select(
       .kind == "chat" and .response_schema_name == "grounded_evidence_response"
     )] | length) == 0
@@ -6505,10 +6512,13 @@ run_general_evidence_reasoning_shadow_scenario() {
       and .response_schema_name == "general_evidence_reasoning_proposal"
       and ([.normalized_messages[].content
         | select(contains("structured_field_values")
-          and contains("alpha") and contains("epsilon"))] | length) == 1
+          and contains("alpha") and contains("epsilon")
+          and contains("source_descriptor")
+          and contains("Configured Metrics Archive")
+          and contains("google_sheets"))] | length) == 1
     )] | length) == 1
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
-  '
+  ' --argjson presented "$presentation_expected"
   assert_dsa_operation_counts "$audit" 0 1 0
   assert_jq "general_reasoning.runtime" "$diagnostics" '
       ([.events[] | select(
@@ -6542,6 +6552,11 @@ run_general_evidence_reasoning_shadow_scenario() {
       | all(.support_kind == "contextual"
         and .authority == "unknown"
         and .freshness_state == "unknown_freshness"))
+    and $records[0].validated_evidence_references[0].source_descriptor == {
+      source_id:"metrics_archive",
+      display_name:"Configured Metrics Archive",
+      source_type:"google_sheets"
+    }
   ' --argjson presented "$presentation_expected" \
     --arg digest "$(jq -r '.prompt.general_evidence_reasoning.claim_digest' <<<"$trace")" \
     --arg exact_claim "$exact_claim" \
@@ -6572,6 +6587,11 @@ run_general_evidence_reasoning_shadow_scenario() {
       and .record.support_record.claim_anchor == $exact_claim
       and .record.support_record.support.executed_derivations[-1].canonical_result == $exact_result
       and .record.support_record.support.conclusion_disposition == "qualified"
+      and .record.support_record.validated_evidence_references[0].source_descriptor == {
+        source_id:"metrics_archive",
+        display_name:"Configured Metrics Archive",
+        source_type:"google_sheets"
+      }
       and .history_root_lineage.schema_version == "history-root-lineage.v1"
       and .history_root_lineage.record_kind == "support"
     ' --arg exact_claim "$exact_claim" --arg exact_result "$exact_result"
@@ -6594,11 +6614,18 @@ run_general_evidence_reasoning_shadow_scenario() {
     restart_orchestrator_with_history_followup true
     followup_response="$(run_history_current_turn \
       "$owner" "$client" "$conversation_id" "$followup_question" "private")"
+    assert_jq "general_reasoning.history.source_descriptor" "$followup_response" '
+      .status == "ok"
+      and (.answer | contains("Configured Metrics Archive"))
+      and (.answer | contains("Google Sheets"))
+      and (.answer | contains("external-source:") | not)
+      and (.answer | contains("google_sheets:metrics_archive") | not)
+    '
     assert_pure_history_case \
       "$owner" "$conversation_id" "$followup_response" "$followup_question" \
       "deterministic" "support_explanation" "support" 0
     restart_orchestrator_with_history_followup false
-    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=0 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 source_descriptor=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
   else
     echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
   fi

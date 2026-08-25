@@ -7361,6 +7361,21 @@ def _safe_source_summary_text(value: Any, *, maximum: int = 160) -> str | None:
     return normalized
 
 
+def source_descriptor_for_inventory_entry(
+    source: DsaSourceEntry | None,
+) -> dict[str, str] | None:
+    if source is None:
+        return None
+    display_name = _safe_source_summary_text(source.display_name, maximum=120)
+    if display_name is None:
+        return None
+    return {
+        "source_id": source.source_id,
+        "display_name": display_name,
+        "source_type": source.connector,
+    }
+
+
 def _fallback_source_display_name(source_id: str) -> str:
     aliases = {
         "vehicle_log_primary": "Primary vehicle maintenance log",

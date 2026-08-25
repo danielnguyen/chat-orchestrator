@@ -174,6 +174,37 @@ class ClaimEvidenceReference(BaseModel):
         "unknown_freshness",
         "not_applicable",
     ]
+    source_descriptor: "ClaimSourceDescriptor | None" = None
+
+    @model_validator(mode="after")
+    def validate_source_descriptor_scope(self):
+        if self.source_descriptor is not None and self.ref_type != "external_source":
+            raise ValueError("source_descriptor_ref_type_invalid")
+        return self
+
+
+class ClaimSourceDescriptor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: Identifier | None = None
+    display_name: Annotated[str, Field(min_length=1, max_length=120)]
+    source_type: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=64,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        ),
+    ]
+
+    @field_validator("source_id", "display_name", "source_type", mode="before")
+    @classmethod
+    def normalize_values(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if re.search(r"[\x00-\x1f\x7f]", value):
+                raise ValueError("unsafe_source_descriptor_value")
+            return " ".join(value.split())
+        return value
 
 
 class ClaimRecordV1(BaseModel):
@@ -231,6 +262,11 @@ class ClaimRecordV1(BaseModel):
 
     @model_validator(mode="after")
     def validate_collections(self) -> "ClaimRecordV1":
+        if self.schema_version == "claim-record.v1" and any(
+            reference.source_descriptor is not None
+            for reference in self.validated_evidence_references
+        ):
+            raise ValueError("v1_source_descriptor_forbidden")
         identities = [
             (reference.ref_type, reference.ref_id)
             for reference in self.validated_evidence_references
@@ -1049,13 +1085,18 @@ def _render(record: ImmediateHistoryClaimRecord) -> str:
         "tool_output": "one retained tool result",
         "integration_event": "one retained integration event",
     }[evidence_type]
-    direct = record.validated_evidence_references[0].support_kind == "direct"
-    sentences = [f"That earlier answer was supported by {evidence_wording}."]
-    sentences.append(
-        "It directly supported the answer."
-        if direct
-        else "It provided background rather than direct support."
-    )
+    source_summary = _render_supporting_source_descriptors(record)
+    sentences = [
+        source_summary
+        or f"That earlier answer was supported by {evidence_wording}."
+    ]
+    if not isinstance(record, ClaimRecordV2):
+        direct = record.validated_evidence_references[0].support_kind == "direct"
+        sentences.append(
+            "It directly supported the answer."
+            if direct
+            else "It provided background rather than direct support."
+        )
     freshness = {
         "current": "It was marked current when the answer was given.",
         "mixed": "Some of it may have been older than other parts.",
@@ -1065,13 +1106,54 @@ def _render(record: ImmediateHistoryClaimRecord) -> str:
     }.get(record.freshness_summary)
     if freshness is not None:
         sentences.append(freshness)
-    sentences.append("The saved support details do not include a safe source name.")
+    if source_summary is None:
+        sentences.append("The saved support details do not include a safe source name.")
     limitations = set(record.limitation_codes)
     sentences.extend(
         _LIMITATION_WORDING[code] for code in _LIMITATION_ORDER if code in limitations
     )
     sentences.append(_NO_NEW_VERIFICATION)
     return " ".join(sentences)
+
+
+def _humanize_source_type(source_type: str) -> str:
+    return " ".join(source_type.replace("_", " ").replace("-", " ").split()).title()
+
+
+def _render_supporting_source_descriptors(
+    record: ImmediateHistoryClaimRecord,
+) -> str | None:
+    if not isinstance(record, ClaimRecordV2):
+        return None
+    supporting_ids = set(record.support.supporting_evidence_ref_ids)
+    sources: list[str] = []
+    seen: set[tuple[str | None, str, str]] = set()
+    for reference in record.validated_evidence_references:
+        descriptor = reference.source_descriptor
+        if reference.ref_id not in supporting_ids or descriptor is None:
+            continue
+        display_name = _safe_source_summary_text(descriptor.display_name, maximum=120)
+        if display_name is None:
+            continue
+        identity = (
+            descriptor.source_id,
+            display_name.casefold(),
+            descriptor.source_type.casefold(),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        source_type = _humanize_source_type(descriptor.source_type)
+        sources.append(f"the {display_name} via {source_type}")
+    if not sources:
+        return None
+    if len(sources) == 1:
+        source_list = sources[0]
+    elif len(sources) == 2:
+        source_list = f"{sources[0]} and {sources[1]}"
+    else:
+        source_list = f"{', '.join(sources[:-1])}, and {sources[-1]}"
+    return f"That earlier answer was based on {source_list}."
 
 
 def _record_support_status(

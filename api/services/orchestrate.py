@@ -114,6 +114,7 @@ from services.evidence_acquisition import (
     render_process_failure_response,
     retain_initial_attempt_summary,
     select_evidence_next_step,
+    source_descriptor_for_inventory_entry,
     suppress_manifest_identifiers,
     validate_bounded_exhaustive_context_pack_response,
     validate_context_pack_response,
@@ -7393,6 +7394,7 @@ def _bounded_reasoning_evidence(
     context_pack: dict[str, Any] | None,
     retained_source_refs: list[str] | None,
     structured_items: list[Any] | None,
+    inventory_sources: list[Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], bool]:
     retained = set(retained_source_refs or [])
     items = context_pack.get("items") if isinstance(context_pack, dict) else None
@@ -7400,6 +7402,11 @@ def _bounded_reasoning_evidence(
     metadata: dict[str, dict[str, Any]] = {}
     seen_source_refs: set[str] = set()
     reasoning_context_limited = False
+    inventory = {
+        source.source_id: source
+        for source in inventory_sources or []
+        if isinstance(getattr(source, "source_id", None), str)
+    }
     for item in items if retained and isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
@@ -7425,8 +7432,18 @@ def _bounded_reasoning_evidence(
             continue
         bounded_text = text[:4000]
         reasoning_context_limited = reasoning_context_limited or len(text) > 4000
-        evidence.append({"evidence_ref_id": ref_id, "text": bounded_text})
-        metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
+        source_descriptor = source_descriptor_for_inventory_entry(
+            inventory.get(source_id)
+        )
+        evidence_item = {"evidence_ref_id": ref_id, "text": bounded_text}
+        if source_descriptor is not None:
+            evidence_item["source_descriptor"] = source_descriptor
+        evidence.append(evidence_item)
+        metadata[ref_id] = {
+            "source_id": source_id,
+            "source_ref": source_ref,
+            "source_descriptor": source_descriptor,
+        }
     for item in structured_items or []:
         structured = getattr(item, "structured_data", None)
         source_ref = getattr(item, "source_ref", None)
@@ -7483,14 +7500,22 @@ def _bounded_reasoning_evidence(
                 bounded_values = candidate
                 structured_payload = candidate_payload
             reasoning_context_limited = True
-        evidence.append(
-            {
-                "evidence_ref_id": ref_id,
-                "content_type": "structured_field_values",
-                "structured_data": structured_payload,
-            }
+        source_descriptor = source_descriptor_for_inventory_entry(
+            inventory.get(source_id)
         )
-        metadata[ref_id] = {"source_id": source_id, "source_ref": source_ref}
+        evidence_item = {
+            "evidence_ref_id": ref_id,
+            "content_type": "structured_field_values",
+            "structured_data": structured_payload,
+        }
+        if source_descriptor is not None:
+            evidence_item["source_descriptor"] = source_descriptor
+        evidence.append(evidence_item)
+        metadata[ref_id] = {
+            "source_id": source_id,
+            "source_ref": source_ref,
+            "source_descriptor": source_descriptor,
+        }
     if retained and not retained.issubset(seen_source_refs):
         return [], {}, False
     return evidence, metadata, reasoning_context_limited
@@ -7571,6 +7596,9 @@ async def _run_general_evidence_reasoning(
         context_pack=context_pack,
         retained_source_refs=retained_source_refs,
         structured_items=state.reasoning_structured_evidence,
+        inventory_sources=(
+            state.inventory.sources if state.inventory is not None else None
+        ),
     )
     if not evidence:
         trace.update(
@@ -8945,6 +8973,8 @@ async def orchestrate_chat(
         privacy_context_trace = _privacy_context_disabled_trace()
         evidence_acquisition: EvidenceAcquisitionState | None = None
         diagnostic_response: str | None = None
+        general_evidence_reasoning: dict[str, Any] | None = None
+        generic_winning_candidate = False
         evidence_manifest: dict[str, Any] | None = None
         evidence_path_deferred = False
         compound_verification_requested = False
@@ -10690,15 +10720,84 @@ async def orchestrate_chat(
                 state=evidence_acquisition,
                 dsa_trace=dsa_trace,
             )
-            diagnostic_response = await _diagnose_process_failure(
-                request_id=request_id,
-                state=evidence_acquisition,
-                litellm=litellm,
-                model_registry_path=model_registry_path,
-                local_only=local_only,
-                routing_policy=routing_policy,
-                effective_payload=effective_payload,
-            )
+            if (
+                general_evidence_reasoning_enabled
+                and general_evidence_reasoning_presentation_enabled
+                and process_failure_diagnosis_eligible(evidence_acquisition)
+            ):
+                general_evidence_reasoning = await _run_general_evidence_reasoning(
+                    enabled=True,
+                    presentation_enabled=True,
+                    request_id=request_id,
+                    request_text=last_user_text,
+                    owner_id=payload["owner_id"],
+                    conversation_id=conversation_id,
+                    surface=surface,
+                    runtime_session_id=runtime_session_trace.get(
+                        "runtime_session_id"
+                    ),
+                    runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                    state=evidence_acquisition,
+                    context_pack=external_context_pack,
+                    retained_source_refs=retained_external_refs,
+                    litellm=litellm,
+                    runtime=runtime,
+                    model_registry_path=model_registry_path,
+                    timeout_ms=int(general_evidence_reasoning_timeout_ms),
+                    local_only=local_only,
+                    routing_policy=routing_policy,
+                    effective_payload=effective_payload,
+                    privacy_suppressed=privacy_prompt_suppressed,
+                    consequence_policy_allows_claim=(
+                        interaction_kind != "high_impact_decision"
+                    ),
+                )
+                capability_match = capability_registry_trace.get("match", {})
+                preliminary_action_related = any(
+                    (
+                        pending_continuation is not None,
+                        pending_capability_request is not None,
+                        isinstance(capability_match, dict)
+                        and capability_match.get("matched") is True,
+                    )
+                )
+                _, preliminary_presented_answer = (
+                    _select_claim_support_presentation(
+                        enabled=True,
+                        reasoning_result=general_evidence_reasoning,
+                        privacy_suppressed=privacy_prompt_suppressed,
+                        consequence_policy_allows_claim=(
+                            interaction_kind != "high_impact_decision"
+                        ),
+                        action_related=preliminary_action_related,
+                        response_composition_supported=(
+                            not compound_verification_requested
+                            and effective_payload.get("response_mode") != "brief"
+                        ),
+                    )
+                )
+                generic_winning_candidate = preliminary_presented_answer is not None
+            if generic_winning_candidate:
+                evidence_acquisition.diagnostic_trace.update(
+                    {
+                        "eligible": True,
+                        "attempted": False,
+                        "call_count": 0,
+                        "status": "not_needed",
+                        "failure_reason": "generic_presentation_selected",
+                        "render_mode": "not_applicable",
+                    }
+                )
+            else:
+                diagnostic_response = await _diagnose_process_failure(
+                    request_id=request_id,
+                    state=evidence_acquisition,
+                    litellm=litellm,
+                    model_registry_path=model_registry_path,
+                    local_only=local_only,
+                    routing_policy=routing_policy,
+                    effective_payload=effective_payload,
+                )
             if (
                 diagnostic_response is None
                 and advisory_provider_allowed(evidence_acquisition)
@@ -10887,6 +10986,7 @@ async def orchestrate_chat(
         )
         evidence_provider_allowed = bool(
             diagnostic_response is None
+            and not generic_winning_candidate
             and provider_allowed(evidence_acquisition)
             and (
                 not compound_verification_requested
@@ -11840,37 +11940,38 @@ async def orchestrate_chat(
         }
 
         references = _trace_references(retrieval_bundle)
-        general_evidence_reasoning = await _run_general_evidence_reasoning(
-            enabled=bool(general_evidence_reasoning_enabled),
-            presentation_enabled=bool(
-                general_evidence_reasoning_presentation_enabled
-            ),
-            request_id=request_id,
-            request_text=last_user_text,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            state=evidence_acquisition,
-            context_pack=external_context_pack,
-            retained_source_refs=(
-                retained_external_refs
-                if evidence_acquisition is not None
-                else None
-            ),
-            litellm=litellm,
-            runtime=runtime,
-            model_registry_path=model_registry_path,
-            timeout_ms=int(general_evidence_reasoning_timeout_ms),
-            local_only=local_only,
-            routing_policy=routing_policy,
-            effective_payload=effective_payload,
-            privacy_suppressed=privacy_prompt_suppressed,
-            consequence_policy_allows_claim=(
-                interaction_kind != "high_impact_decision"
-            ),
-        )
+        if general_evidence_reasoning is None:
+            general_evidence_reasoning = await _run_general_evidence_reasoning(
+                enabled=bool(general_evidence_reasoning_enabled),
+                presentation_enabled=bool(
+                    general_evidence_reasoning_presentation_enabled
+                ),
+                request_id=request_id,
+                request_text=last_user_text,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                state=evidence_acquisition,
+                context_pack=external_context_pack,
+                retained_source_refs=(
+                    retained_external_refs
+                    if evidence_acquisition is not None
+                    else None
+                ),
+                litellm=litellm,
+                runtime=runtime,
+                model_registry_path=model_registry_path,
+                timeout_ms=int(general_evidence_reasoning_timeout_ms),
+                local_only=local_only,
+                routing_policy=routing_policy,
+                effective_payload=effective_payload,
+                privacy_suppressed=privacy_prompt_suppressed,
+                consequence_policy_allows_claim=(
+                    interaction_kind != "high_impact_decision"
+                ),
+            )
         prompt.trace["general_evidence_reasoning"] = general_evidence_reasoning[
             "trace"
         ]
@@ -12342,6 +12443,9 @@ async def orchestrate_chat(
             if generic_presented and not support_persisted:
                 status = "degraded"
                 trace_payload["status"] = "degraded"
+            elif generic_presented and support_persisted:
+                status = "ok"
+                trace_payload["status"] = "ok"
             prompt.trace["general_evidence_reasoning"] = (
                 general_evidence_reasoning["trace"]
             )
@@ -12361,6 +12465,12 @@ async def orchestrate_chat(
                 general_evidence_reasoning["trace"]["bms_persistence_status"] = (
                     "trace_update_failed"
                 )
+                if generic_presented:
+                    status = "degraded"
+                    trace_payload["status"] = "degraded"
+        elif generic_presented:
+            status = "degraded"
+            trace_payload["status"] = "degraded"
 
         result = {
             "request_id": request_id,

@@ -4147,12 +4147,143 @@ async def test_immediate_support_accepts_bounded_v2_without_reconstruction():
 
 
 @pytest.mark.asyncio
+async def test_immediate_v2_support_names_safe_source_descriptor_without_lookup():
+    support = _record_v2(
+        request_id="original-request",
+        assistant_message_id=ROOT_MESSAGE_ID,
+    )
+    support["validated_evidence_references"][0]["source_descriptor"] = {
+        "source_id": "vehicle_records",
+        "display_name": "Vehicle Maintenance Log",
+        "source_type": "google_sheets",
+    }
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.status == "ok"
+    assert "Vehicle Maintenance Log" in outcome.answer
+    assert "Google Sheets" in outcome.answer
+    assert "background rather than direct support" not in outcome.answer
+    assert "external-source:bounded-record" not in outcome.answer
+    assert "vehicle_records" not in outcome.answer
+    assert outcome.trace["provider_call_count"] == 0
+    assert len(store.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_immediate_v2_support_deduplicates_and_names_distinct_sources():
+    support = _record_v2(
+        request_id="original-request",
+        assistant_message_id=ROOT_MESSAGE_ID,
+    )
+    first = support["validated_evidence_references"][0]
+    first["source_descriptor"] = {
+        "source_id": "vehicle_records",
+        "display_name": "Vehicle Maintenance Log",
+        "source_type": "google_sheets",
+    }
+    duplicate = {
+        **first,
+        "ref_id": "external-source:bounded-record-copy",
+    }
+    second = {
+        **first,
+        "ref_id": "external-source:service-history",
+        "source_descriptor": {
+            "source_id": "service_history",
+            "display_name": "Service History Archive",
+            "source_type": "document_archive",
+        },
+    }
+    support["validated_evidence_references"] = [first, duplicate, second]
+    support["support"]["supporting_evidence_ref_ids"] = [
+        first["ref_id"],
+        duplicate["ref_id"],
+        second["ref_id"],
+    ]
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.answer.count("Vehicle Maintenance Log") == 1
+    assert "Service History Archive" in outcome.answer
+    assert "Document Archive" in outcome.answer
+
+
+@pytest.mark.asyncio
+async def test_immediate_v2_without_descriptor_keeps_generic_source_fallback():
+    support = _record_v2(
+        request_id="original-request",
+        assistant_message_id=ROOT_MESSAGE_ID,
+    )
+    store = _ImmediateMemoryStore(
+        _immediate_response(
+            record={
+                "record_kind": "support",
+                "assistant_message_id": ROOT_MESSAGE_ID,
+                "original_request_id": "original-request",
+                "support_record": support,
+                "acquisition_record": None,
+            }
+        )
+    )
+
+    outcome = await resolve_immediate_claim_explanation(
+        policy=_accepted_history_policy(),
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert "one governed external-source record" in outcome.answer
+    assert "do not include a safe source name" in outcome.answer
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
     [
         "missing_support",
         "claim_digest_mismatch",
         "malformed_support",
+        "unsafe_source_descriptor",
         "shadow_record",
         "unknown_schema_version",
     ],
@@ -4168,6 +4299,12 @@ async def test_immediate_support_rejects_invalid_v2_shapes(mutation):
         support["support"]["claim_digest"] = _digest("different claim")
     elif mutation == "malformed_support":
         support["support"]["private_payload"] = "PRIVATE-V2-SENTINEL"
+    elif mutation == "unsafe_source_descriptor":
+        support["validated_evidence_references"][0]["source_descriptor"] = {
+            "source_id": "vehicle_records",
+            "display_name": "Vehicle\nMaintenance Log",
+            "source_type": "google_sheets",
+        }
     elif mutation == "shadow_record":
         support["presented_to_user"] = False
     else:
