@@ -80,6 +80,7 @@ from services.evidence_acquisition import (
     parse_diagnostic_advisory_completion,
     parse_evidence_interpreter_completion,
     parse_evidence_reasoning_completion,
+    project_generic_scope_authority,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
@@ -1524,6 +1525,157 @@ def _future_aggregate_plan(*, function="median", field_name="Fuel (L)"):
         }
     )
     return response
+
+
+def _generic_scope_projection_state(
+    *,
+    task_shape,
+    authority_kinds=(),
+    cognitive_kinds=(),
+    outcomes=None,
+):
+    kinds = [*authority_kinds, *cognitive_kinds]
+    requirements = [
+        {
+            "requirement_id": f"requirement-{index}",
+            "requirement_kind": kind,
+            "criticality": "material",
+        }
+        for index, kind in enumerate(kinds, start=1)
+    ]
+    plan = _plan_response(requirements=requirements)["result"]
+    plan["task_shape"] = task_shape
+    if task_shape == "aggregate":
+        plan["aggregate_spec"] = {"function": "mean", "field_name": "Value"}
+        plan["selected_strategies"] = ["structured_field_values"]
+    outcome_values = outcomes or ["satisfied"] * len(kinds)
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="test",
+        plan=PlanResult.model_validate(plan),
+        acquisition_facts=[
+            {
+                "requirement_id": requirement["requirement_id"],
+                "outcome": outcome,
+            }
+            for requirement, outcome in zip(
+                requirements, outcome_values, strict=True
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "authority_kinds", "cognitive_kinds"),
+    [
+        ("targeted_lookup", (), ("targeted_evidence",)),
+        ("targeted_lookup", (), ("exact_authoritative_fetch",)),
+        ("aggregate", ("complete_scope_coverage",), ("context_delivery",)),
+        (
+            "cross_source_comparison",
+            ("selected_source_coverage",),
+            ("cross_source_comparison",),
+        ),
+        (
+            "bounded_exhaustive_review",
+            (
+                "authoritative_inventory",
+                "complete_scope_coverage",
+                "contradiction_search",
+            ),
+            (),
+        ),
+        (
+            "absence_or_coverage_check",
+            ("authoritative_inventory", "complete_scope_coverage"),
+            ("structured_absence_check",),
+        ),
+        (
+            "contradiction_review",
+            ("contradiction_search", "counterevidence_coverage"),
+            (),
+        ),
+        (
+            "historical_reconstruction",
+            ("historical_scope", "historical_sequence_coverage"),
+            (),
+        ),
+        (
+            "recommendation_or_decision_support",
+            ("candidate_evidence_coverage", "counterevidence_coverage"),
+            (),
+        ),
+    ],
+)
+def test_generic_scope_authority_projects_material_facts_without_task_authority(
+    task_shape,
+    authority_kinds,
+    cognitive_kinds,
+):
+    state = _generic_scope_projection_state(
+        task_shape=task_shape,
+        authority_kinds=authority_kinds,
+        cognitive_kinds=cognitive_kinds,
+        outcomes=["satisfied"] * len(authority_kinds)
+        + ["filtered"] * len(cognitive_kinds),
+    )
+
+    projected = project_generic_scope_authority(
+        state, reasoning_context_limited=False
+    )
+
+    assert projected == {
+        "complete_declared_scope_required": bool(authority_kinds),
+        "complete_declared_scope_established": (
+            True if authority_kinds else None
+        ),
+        "material_acquisition_limited": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "partial",
+        "not_attempted",
+        "unavailable",
+        "failed",
+        "filtered",
+        "unknown",
+        "missing",
+    ],
+)
+def test_generic_scope_authority_fails_closed_for_unsatisfied_material_fact(outcome):
+    state = _generic_scope_projection_state(
+        task_shape="contradiction_review",
+        authority_kinds=("contradiction_search", "counterevidence_coverage"),
+        outcomes=["satisfied", outcome],
+    )
+
+    projected = project_generic_scope_authority(
+        state, reasoning_context_limited=False
+    )
+
+    assert projected["complete_declared_scope_required"] is True
+    assert projected["complete_declared_scope_established"] is False
+
+
+def test_generic_scope_authority_fails_closed_for_actual_context_limitation():
+    state = _generic_scope_projection_state(
+        task_shape="aggregate",
+        authority_kinds=("complete_scope_coverage",),
+    )
+
+    projected = project_generic_scope_authority(
+        state, reasoning_context_limited=True
+    )
+
+    assert projected == {
+        "complete_declared_scope_required": True,
+        "complete_declared_scope_established": False,
+        "material_acquisition_limited": True,
+    }
 
 
 @pytest.mark.parametrize(

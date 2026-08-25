@@ -341,6 +341,13 @@ restart_orchestrator_with_privacy() {
   wait_for_http "http://127.0.0.1:14361/healthz"
 }
 
+restart_orchestrator_with_generic_presentation() {
+  COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED="$1"
+  export COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+}
+
 run_evidence_chat_with_artifacts() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
   local external_context
@@ -6698,7 +6705,8 @@ run_authority_comparison_incomplete_scope_case() {
 run_authority_comparison_equivalent_case() {
   local owner client conversation_id question external response request_id trace
   local provider_calls audit proposal source_ref evidence_ref_id
-  local optional_config optional_backup
+  local optional_config optional_backup presentation_enabled
+  presentation_enabled="${COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED:-false}"
   owner="owner-authority-comparison-equivalent"
   client="client-authority-comparison-equivalent"
   question="Verify the migration record with its limitation."
@@ -6721,8 +6729,10 @@ run_authority_comparison_equivalent_case() {
   cp "$optional_config" "$optional_backup"
   sed -i '/^domain_tags:/a scope_refs:\n  project: null' "$optional_config"
   restart_dsa
-  queue_evidence_candidate "mixed" "$source_ref" \
-    "The migration record confirms the bounded setting."
+  if [[ "$presentation_enabled" != "true" ]]; then
+    queue_evidence_candidate "mixed" "$source_ref" \
+      "The migration record confirms the bounded setting."
+  fi
   queue_provider_answer "$proposal"
   conversation_id="$(resolve_conversation "$owner" "$client" "authority-comparison-equivalent")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
@@ -6757,18 +6767,24 @@ run_authority_comparison_equivalent_case() {
   fi
   assert_jq "authority_comparison.equivalent.response" "$response" '
     .pending_action == null
-  '
+    and (($presented | not) or (
+      .status == "ok"
+      and (.answer | contains("The retained record supports a qualified conclusion."))
+      and (.answer | contains("The migration record confirms the bounded setting.") | not)
+    ))
+  ' --argjson presented "$presentation_enabled"
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_jq "authority_comparison.equivalent.provider" "$provider_calls" '
-    ([.calls[] | select(.kind == "chat")] | length) == 2
+    ([.calls[] | select(.kind == "chat")] | length)
+      == (if $presented then 1 else 2 end)
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
-  '
+  ' --argjson presented "$presentation_enabled"
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
   mv "$optional_backup" "$optional_config"
   restart_dsa
-  echo "Authority comparison equivalent: existing=qualified claim_support=qualified relation=equivalent reasoning_provider=1 cr=1 dsa=1 actions=0"
+  echo "Authority comparison equivalent: existing=qualified claim_support=qualified relation=equivalent reasoning_provider=1 legacy_presentation_provider=$(if [[ "$presentation_enabled" == "true" ]]; then printf 0; else printf 1; fi) dsa=1 actions=0"
 }
 
 run_authority_comparison_adversarial_source_case() {
@@ -6917,7 +6933,8 @@ run_authority_comparison_consequence_case() {
 
 run_authority_comparison_failure_case() {
   local owner client conversation_id question external response request_id trace
-  local provider_calls audit source_ref
+  local provider_calls audit source_ref presentation_enabled
+  presentation_enabled="${COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED:-false}"
   owner="owner-authority-comparison-failure"
   client="client-authority-comparison-failure"
   question="Verify the migration record."
@@ -6927,7 +6944,9 @@ run_authority_comparison_failure_case() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_evidence_candidate "supports" "$source_ref" "The migration record confirms the bounded setting."
+  if [[ "$presentation_enabled" != "true" ]]; then
+    queue_evidence_candidate "supports" "$source_ref" "The migration record confirms the bounded setting."
+  fi
   queue_provider_answer "not-json"
   conversation_id="$(resolve_conversation "$owner" "$client" "authority-comparison-failure")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
@@ -6950,19 +6969,22 @@ run_authority_comparison_failure_case() {
       == ["claim_support_decision_unavailable"]
   '
   assert_jq "authority_comparison.failure.response" "$response" '
-    .status == "ok"
+    .status == (if $presented then "degraded" else "ok" end)
     and .pending_action == null
     and (.answer | contains("The migration record confirms the bounded setting."))
-  '
+      == ($presented | not)
+    and (($presented | not) or (.answer | contains("unsupported conclusion")))
+  ' --argjson presented "$presentation_enabled"
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_jq "authority_comparison.failure.provider" "$provider_calls" '
-    ([.calls[] | select(.kind == "chat")] | length) == 2
+    ([.calls[] | select(.kind == "chat")] | length)
+      == (if $presented then 1 else 2 end)
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
-  '
+  ' --argjson presented "$presentation_enabled"
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
-  echo "Authority comparison failure: existing=allowed claim_support=unavailable reasoning_provider=1 cr=0 bms_v2=0 repairs=0 fallback=0 reacquisition=0 actions=0 visible_authority=unchanged"
+  echo "Authority comparison failure: existing=allowed claim_support=unavailable reasoning_provider=1 cr=0 bms_v2=0 repairs=0 fallback=0 reacquisition=0 actions=0 visible_authority=$(if [[ "$presentation_enabled" == "true" ]]; then printf withheld; else printf legacy; fi)"
 }
 
 run_authority_decision_comparison_corpus() {
@@ -7014,9 +7036,13 @@ run_evidence_acquisition_composed_suite() {
       ;;
     general-reasoning-presentation)
       run_general_evidence_reasoning_shadow_scenario true
+      run_authority_comparison_equivalent_case
       run_authority_comparison_consequence_case
       run_authority_comparison_failure_case
-      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-presentation,consequence,failure"
+      restart_orchestrator_with_generic_presentation false
+      run_general_evidence_reasoning_shadow_scenario false
+      restart_orchestrator_with_generic_presentation true
+      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-presentation,equivalent,consequence,failure,rollback"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario

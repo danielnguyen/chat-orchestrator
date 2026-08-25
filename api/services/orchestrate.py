@@ -72,6 +72,7 @@ from services.deterministic_derivation import execute_derivations
 from services.evidence_acquisition import (
     NEXT_STEP_DEPENDENCY_ANSWER,
     STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE,
+    WITHHELD_ANSWER,
     EvidenceAcquisitionState,
     ProviderOutputValidationError,
     SemanticInterpreterFailure,
@@ -108,6 +109,7 @@ from services.evidence_acquisition import (
     parse_evidence_interpreter_completion,
     parse_evidence_reasoning_completion,
     process_failure_diagnosis_eligible,
+    project_generic_scope_authority,
     promote_exact_fetch_proposal,
     provider_allowed,
     render_governed_evidence_answer,
@@ -7267,28 +7269,29 @@ def _select_claim_support_presentation(
             {"status": "ineligible", "reason_code": "claim_support_incoherent"}
         )
         return presentation, None
-    if privacy_suppressed or authority.get("privacy_policy_allows_claim") is not True:
-        presentation.update(
-            {"status": "ineligible", "reason_code": "privacy_suppressed"}
-        )
-        return presentation, None
-    if (
-        not consequence_policy_allows_claim
-        or authority.get("consequence_policy_allows_claim") is not True
+    authority_privacy_allows = authority.get("privacy_policy_allows_claim") is True
+    authority_consequence_allows = (
+        authority.get("consequence_policy_allows_claim") is True
+    )
+    if not _generic_presentation_structurally_eligible(
+        privacy_suppressed=privacy_suppressed or not authority_privacy_allows,
+        consequence_policy_allows_claim=(
+            consequence_policy_allows_claim and authority_consequence_allows
+        ),
+        action_related=action_related,
+        response_composition_supported=response_composition_supported,
     ):
-        presentation.update(
-            {"status": "ineligible", "reason_code": "consequence_disallowed"}
+        reason_code = (
+            "privacy_suppressed"
+            if privacy_suppressed or not authority_privacy_allows
+            else "consequence_disallowed"
+            if not consequence_policy_allows_claim
+            or not authority_consequence_allows
+            else "action_related"
+            if action_related
+            else "response_composition_ineligible"
         )
-        return presentation, None
-    if action_related:
-        presentation.update(
-            {"status": "ineligible", "reason_code": "action_related"}
-        )
-        return presentation, None
-    if not response_composition_supported:
-        presentation.update(
-            {"status": "ineligible", "reason_code": "response_composition_ineligible"}
-        )
+        presentation.update({"status": "ineligible", "reason_code": reason_code})
         return presentation, None
     supporting_refs = {
         value
@@ -7343,6 +7346,21 @@ def _select_claim_support_presentation(
         }
     )
     return presentation, answer
+
+
+def _generic_presentation_structurally_eligible(
+    *,
+    privacy_suppressed: bool,
+    consequence_policy_allows_claim: bool,
+    action_related: bool,
+    response_composition_supported: bool,
+) -> bool:
+    return bool(
+        not privacy_suppressed
+        and consequence_policy_allows_claim
+        and not action_related
+        and response_composition_supported
+    )
 
 
 def _general_evidence_reasoning_trace(
@@ -7744,13 +7762,9 @@ async def _run_general_evidence_reasoning(
                 "material_role": "neutral",
             }
         )
-    complete_required = state.plan.task_shape in {
-        "bounded_exhaustive_review",
-        "absence_or_coverage_check",
-    }
-    material_limited = reasoning_context_limited or any(
-        item.category == "retrieval_limit"
-        for item in state.process_failure_observations
+    scope_authority = project_generic_scope_authority(
+        state,
+        reasoning_context_limited=reasoning_context_limited,
     )
     authority_context = {
         "owner_id": owner_id,
@@ -7759,14 +7773,7 @@ async def _run_general_evidence_reasoning(
         "runtime_session_id": runtime_session_id,
         "runtime_turn_id": runtime_turn_id,
         "evidence_references": evidence_authority,
-        "complete_declared_scope_required": complete_required,
-        "complete_declared_scope_established": (
-            state.sufficiency.sufficiency_status == "sufficient_for_declared_scope"
-            and not material_limited
-            if complete_required
-            else None
-        ),
-        "material_acquisition_limited": material_limited,
+        **scope_authority,
         "privacy_policy_allows_claim": True,
         "consequence_policy_allows_claim": consequence_policy_allows_claim,
         "executed_derivations": [
@@ -8975,6 +8982,7 @@ async def orchestrate_chat(
         diagnostic_response: str | None = None
         general_evidence_reasoning: dict[str, Any] | None = None
         generic_winning_candidate = False
+        generic_terminal_authority_required = False
         evidence_manifest: dict[str, Any] | None = None
         evidence_path_deferred = False
         compound_verification_requested = False
@@ -10720,11 +10728,32 @@ async def orchestrate_chat(
                 state=evidence_acquisition,
                 dsa_trace=dsa_trace,
             )
-            if (
+            capability_match = capability_registry_trace.get("match", {})
+            preliminary_action_related = any(
+                (
+                    pending_continuation is not None,
+                    pending_capability_request is not None,
+                    isinstance(capability_match, dict)
+                    and capability_match.get("matched") is True,
+                )
+            )
+            generic_terminal_authority_required = bool(
                 general_evidence_reasoning_enabled
                 and general_evidence_reasoning_presentation_enabled
-                and process_failure_diagnosis_eligible(evidence_acquisition)
-            ):
+                and evidence_acquisition.supported_governed_path
+                and _generic_presentation_structurally_eligible(
+                    privacy_suppressed=privacy_prompt_suppressed,
+                    consequence_policy_allows_claim=(
+                        interaction_kind != "high_impact_decision"
+                    ),
+                    action_related=preliminary_action_related,
+                    response_composition_supported=(
+                        not compound_verification_requested
+                        and effective_payload.get("response_mode") != "brief"
+                    ),
+                )
+            )
+            if generic_terminal_authority_required:
                 general_evidence_reasoning = await _run_general_evidence_reasoning(
                     enabled=True,
                     presentation_enabled=True,
@@ -10752,15 +10781,6 @@ async def orchestrate_chat(
                         interaction_kind != "high_impact_decision"
                     ),
                 )
-                capability_match = capability_registry_trace.get("match", {})
-                preliminary_action_related = any(
-                    (
-                        pending_continuation is not None,
-                        pending_capability_request is not None,
-                        isinstance(capability_match, dict)
-                        and capability_match.get("matched") is True,
-                    )
-                )
                 _, preliminary_presented_answer = (
                     _select_claim_support_presentation(
                         enabled=True,
@@ -10777,7 +10797,9 @@ async def orchestrate_chat(
                     )
                 )
                 generic_winning_candidate = preliminary_presented_answer is not None
-            if generic_winning_candidate:
+            if generic_winning_candidate and process_failure_diagnosis_eligible(
+                evidence_acquisition
+            ):
                 evidence_acquisition.diagnostic_trace.update(
                     {
                         "eligible": True,
@@ -10788,7 +10810,7 @@ async def orchestrate_chat(
                         "render_mode": "not_applicable",
                     }
                 )
-            else:
+            elif process_failure_diagnosis_eligible(evidence_acquisition):
                 diagnostic_response = await _diagnose_process_failure(
                     request_id=request_id,
                     state=evidence_acquisition,
@@ -10989,6 +11011,10 @@ async def orchestrate_chat(
             and not generic_winning_candidate
             and provider_allowed(evidence_acquisition)
             and (
+                not generic_terminal_authority_required
+                or advisory_provider_allowed(evidence_acquisition)
+            )
+            and (
                 not compound_verification_requested
                 or compound_governed_acquisition_established
             )
@@ -11075,10 +11101,24 @@ async def orchestrate_chat(
                 selected_provider = "none"
                 status = (
                     "ok"
-                    if evidence_acquisition is not None
-                    and evidence_acquisition.supported_aggregate_path
-                    and evidence_acquisition.aggregate_result is not None
-                    and evidence_acquisition.forced_answer == evidence_acquisition.aggregate_result
+                    if (
+                        evidence_acquisition is not None
+                        and evidence_acquisition.supported_aggregate_path
+                        and evidence_acquisition.aggregate_result is not None
+                        and evidence_acquisition.forced_answer
+                        == evidence_acquisition.aggregate_result
+                    )
+                    or (
+                        generic_terminal_authority_required
+                        and isinstance(general_evidence_reasoning, dict)
+                        and isinstance(
+                            general_evidence_reasoning.get("cr_result"), dict
+                        )
+                        and general_evidence_reasoning["cr_result"].get(
+                            "conclusion_disposition"
+                        )
+                        == "withheld"
+                    )
                     else "degraded"
                 )
             elif (
@@ -12119,6 +12159,14 @@ async def orchestrate_chat(
         )
         if generic_presented_answer is not None:
             answer = generic_presented_answer
+            answer_sources = []
+            artifact_refs_for_sources = []
+        elif (
+            generic_terminal_authority_required
+            and diagnostic_response is None
+            and not advisory_evidence_provider_call
+        ):
+            answer = WITHHELD_ANSWER
             answer_sources = []
             artifact_refs_for_sources = []
         if compound_verification_requested:
