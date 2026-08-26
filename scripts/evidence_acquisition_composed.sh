@@ -6777,6 +6777,9 @@ run_authority_comparison_equivalent_case() {
   assert_jq "authority_comparison.equivalent.provider" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length)
       == (if $presented then 1 else 2 end)
+    and ([.calls[] | select(
+      .kind == "chat" and .response_schema_name == "grounded_evidence_response"
+    )] | length) == (if $presented then 0 else 1 end)
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
   ' --argjson presented "$presentation_enabled"
   assert_dsa_operation_counts "$audit" 1 0 0
@@ -6979,12 +6982,79 @@ run_authority_comparison_failure_case() {
   assert_jq "authority_comparison.failure.provider" "$provider_calls" '
     ([.calls[] | select(.kind == "chat")] | length)
       == (if $presented then 1 else 2 end)
+    and ([.calls[] | select(
+      .kind == "chat" and .response_schema_name == "grounded_evidence_response"
+    )] | length) == (if $presented then 0 else 1 end)
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
   ' --argjson presented "$presentation_enabled"
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_persisted_answer_matches \
     "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
   echo "Authority comparison failure: existing=allowed claim_support=unavailable reasoning_provider=1 cr=0 bms_v2=0 repairs=0 fallback=0 reacquisition=0 actions=0 visible_authority=$(if [[ "$presentation_enabled" == "true" ]]; then printf withheld; else printf legacy; fi)"
+}
+
+run_authority_comparison_withheld_case() {
+  local owner client conversation_id question external response request_id trace
+  local provider_calls audit proposal
+  owner="owner-authority-comparison-withheld"
+  client="client-authority-comparison-withheld"
+  question="Verify the bounded migration record."
+  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium"}'
+  proposal="$(jq -nc '{
+    proposed_claim:"The bounded record proves an unsupported conclusion.",
+    supporting_evidence_ref_ids:[],
+    counterevidence_ref_ids:[],
+    material_exclusions:[],
+    derivation_requests:[]
+  }')"
+
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_provider_answer "$proposal"
+  conversation_id="$(resolve_conversation "$owner" "$client" "authority-comparison-withheld")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+
+  assert_jq "authority_comparison.withheld.response" "$response" '
+    .status == "ok"
+    and .pending_action == null
+    and (.answer | contains("unsupported conclusion"))
+    and (.answer | contains("proves an unsupported conclusion") | not)
+  '
+  assert_jq "authority_comparison.withheld.trace" "$trace" '
+    .prompt.evidence_acquisition.next_steps.selections[-1].conclusion_disposition
+      == "bounded_conclusion_allowed"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.validation_status == "accepted"
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "withheld"
+    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and .prompt.general_evidence_reasoning.decision_comparison.existing_disposition
+      == "allowed"
+    and .prompt.general_evidence_reasoning.decision_comparison.claim_support_disposition
+      == "withheld"
+    and .prompt.general_evidence_reasoning.decision_comparison.relation
+      == "claim_support_more_conservative"
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+  '
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_jq "authority_comparison.withheld.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(
+      .kind == "chat" and .response_schema_name == "grounded_evidence_response"
+    )] | length) == 0
+    and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 1 0 0
+  assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
+  echo "Authority comparison withheld: existing=allowed claim_support=withheld reasoning_provider=1 legacy_presentation_provider=0 cr=1 dsa=1 actions=0"
 }
 
 run_authority_decision_comparison_corpus() {
@@ -7039,6 +7109,7 @@ run_evidence_acquisition_composed_suite() {
       run_authority_comparison_equivalent_case
       run_authority_comparison_consequence_case
       run_authority_comparison_failure_case
+      run_authority_comparison_withheld_case
       restart_orchestrator_with_generic_presentation false
       run_general_evidence_reasoning_shadow_scenario false
       restart_orchestrator_with_generic_presentation true
