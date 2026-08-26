@@ -16262,6 +16262,7 @@ def test_authority_decision_comparison_is_deterministic_and_privacy_safe():
 )
 async def test_general_evidence_reasoning_activation_across_semantic_cases(
     tmp_path,
+    monkeypatch,
     semantic_case,
     presentation_enabled,
     persistence_fails,
@@ -16381,6 +16382,33 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
             else None
         )
     )
+    legacy_terminal_calls = []
+    legacy_terminal_helpers = {
+        helper_name: getattr(orchestrate_service, helper_name)
+        for helper_name in (
+            "provider_allowed",
+            "grounded_provider_allowed",
+            "enforce_final_answer",
+        )
+    }
+
+    def monitor_terminal_call(name):
+        def monitored(*args, **kwargs):
+            legacy_terminal_calls.append(name)
+            if presentation_enabled:
+                raise AssertionError(
+                    f"{name} must not run on the generic terminal path"
+                )
+            return legacy_terminal_helpers[name](*args, **kwargs)
+
+        return monitored
+
+    for helper_name in legacy_terminal_helpers:
+        monkeypatch.setattr(
+            orchestrate_service,
+            helper_name,
+            monitor_terminal_call(helper_name),
+        )
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(question, external_context_enabled=True),
@@ -16421,6 +16449,14 @@ async def test_general_evidence_reasoning_activation_across_semantic_cases(
         "degraded" if persistence_fails or semantic_case == "cr_failure" else "ok"
     )
     assert out.get("pending_action") is None
+    if presentation_enabled:
+        assert legacy_terminal_calls == []
+    else:
+        assert {
+            "provider_allowed",
+            "grounded_provider_allowed",
+            "enforce_final_answer",
+        }.issubset(legacy_terminal_calls)
     assert len(provider.calls) == (1 if presentation_enabled else 2)
     reasoning_call = provider.calls[0 if presentation_enabled else 1]
     assert reasoning_call["tools"] == []
@@ -22439,7 +22475,24 @@ async def _run_step13_aggregate_failure(
 @pytest.mark.asyncio
 async def test_winning_generic_presentation_carries_source_and_skips_diagnostic(
     tmp_path,
+    monkeypatch,
 ):
+    def retired_terminal_call(*args, **kwargs):
+        raise AssertionError(
+            "legacy terminal helpers must not run after generic authority wins"
+        )
+
+    for helper_name in (
+        "provider_allowed",
+        "grounded_provider_allowed",
+        "enforce_final_answer",
+    ):
+        monkeypatch.setattr(
+            orchestrate_service,
+            helper_name,
+            retired_terminal_call,
+        )
+
     response = _aggregate_structured_response()
     structured = response["results"][0]["structured_data"]
     structured.update(
@@ -22523,7 +22576,24 @@ async def test_winning_generic_presentation_carries_source_and_skips_diagnostic(
 @pytest.mark.asyncio
 async def test_failed_generic_presentation_preserves_one_diagnostic_fallback(
     tmp_path,
+    monkeypatch,
 ):
+    def retired_terminal_call(*args, **kwargs):
+        raise AssertionError(
+            "legacy terminal helpers must not authorize the diagnostic fallback"
+        )
+
+    for helper_name in (
+        "provider_allowed",
+        "grounded_provider_allowed",
+        "enforce_final_answer",
+    ):
+        monkeypatch.setattr(
+            orchestrate_service,
+            helper_name,
+            retired_terminal_call,
+        )
+
     response = _aggregate_structured_response()
     response["results"][0]["structured_data"].update(
         record_count=1,
@@ -22554,6 +22624,57 @@ async def test_failed_generic_presentation_preserves_one_diagnostic_fallback(
     ]
     assert reasoning_trace["validation_status"] == "failed"
     assert reasoning_trace["presented_to_user"] is False
+
+
+@pytest.mark.asyncio
+async def test_generic_validation_failure_is_not_rescued_by_legacy_aggregate(
+    tmp_path,
+    monkeypatch,
+):
+    def retired_terminal_call(*args, **kwargs):
+        raise AssertionError(
+            "legacy terminal helpers must not rescue generic validation failure"
+        )
+
+    for helper_name in (
+        "provider_allowed",
+        "grounded_provider_allowed",
+        "enforce_final_answer",
+    ):
+        monkeypatch.setattr(
+            orchestrate_service,
+            helper_name,
+            retired_terminal_call,
+        )
+
+    out, runtime, _, litellm, memory_store = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path,
+        response=_aggregate_structured_response(),
+        diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=_provider_completion("not-json"),
+        presentation_enabled=True,
+        request_id="rid-generic-invalid-legacy-aggregate-allowed",
+    )
+
+    assert out["answer"] == WITHHELD_ANSWER
+    assert out["status"] == "degraded"
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(runtime.evidence_next_step_calls) == 1
+    assert runtime.claim_support_calls == []
+    assert len(litellm.calls) == 2
+    trace = memory_store.trace_calls[-1]["payload"]
+    reasoning_trace = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning_trace["validation_status"] == "failed"
+    assert reasoning_trace["reason_code"] == "proposal_invalid"
+    assert reasoning_trace["decision_comparison"] == {
+        "status": "not_available",
+        "existing_disposition": "allowed",
+        "claim_support_disposition": None,
+        "relation": "unavailable",
+        "categories": [],
+        "reason_codes": ["claim_support_decision_unavailable"],
+    }
+    assert trace["status"] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -23957,6 +24078,8 @@ async def _run_advisory_evidence_case(
     provider_content: str,
     fail_first: bool = False,
     fail_advisory_prompt: bool = False,
+    presentation_enabled: bool = False,
+    question_override: str | None = None,
 ):
     attempt_kind = (
         "prompt-budget"
@@ -23966,12 +24089,21 @@ async def _run_advisory_evidence_case(
         else "primary"
     )
     request_id = f"rid-advisory-{sufficiency_status}-{attempt_kind}"
-    question = "Will this part fit?"
+    question = question_override or "Will this part fit?"
     rules, models = (
         _route_files_with_fallback(tmp_path)
         if fail_first
         else _write_default_route_files(tmp_path)
     )
+    if presentation_enabled:
+        models.write_text(
+            models.read_text(encoding="utf-8")
+            + "logical_routes:\n"
+            + "  evidence_reasoning:\n"
+            + "    model: gpt-5-mini\n"
+            + "    provider: cloud\n",
+            encoding="utf-8",
+        )
     context_pack = _governed_context_pack(question)
     if sufficiency_status == "unknown":
         context_pack["items"] = []
@@ -24059,6 +24191,9 @@ async def _run_advisory_evidence_case(
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
         claim_record_capture_enabled=True,
+        general_evidence_reasoning_enabled=presentation_enabled,
+        general_evidence_reasoning_presentation_enabled=presentation_enabled,
+        general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -24168,6 +24303,62 @@ async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_usefu
     assert manifest["response_digest"] == (
         "sha256:" + hashlib.sha256(expected.encode()).hexdigest()
     )
+
+
+@pytest.mark.asyncio
+async def test_generic_withholding_preserves_bounded_non_authoritative_advisory(
+    tmp_path,
+    monkeypatch,
+):
+    def retired_terminal_call(*args, **kwargs):
+        raise AssertionError(
+            "legacy substantive terminal helpers must not authorize advisory text"
+        )
+
+    for helper_name in (
+        "provider_allowed",
+        "grounded_provider_allowed",
+        "enforce_final_answer",
+    ):
+        monkeypatch.setattr(
+            orchestrate_service,
+            helper_name,
+            retired_terminal_call,
+        )
+
+    advisory_text = "Compare the bounded record with the controlling specification."
+    result, memory_store, runtime, provider, dsa = (
+        await _run_advisory_evidence_case(
+            tmp_path,
+            monkeypatch,
+            sufficiency_status="unknown",
+            provider_content=advisory_text,
+            presentation_enabled=True,
+            question_override="What conclusion does the bounded record support?",
+        )
+    )
+
+    assert result["status"] == "degraded"
+    assert result["answer"] == (
+        "I couldn’t verify the requested conclusion from the available evidence.\n\n"
+        f"Unverified guidance:\n{advisory_text}\n\n"
+        "Treat this as a working direction, not a confirmed result."
+    )
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] == []
+    assert runtime.claim_support_calls == []
+    assert len(dsa.calls) == 1
+    trace = memory_store.trace_calls[-1]["payload"]
+    reasoning_trace = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning_trace["reason_code"] == "authorized_evidence_unavailable"
+    assert reasoning_trace["reasoning_provider_call_count"] == 0
+    assert reasoning_trace["cr_call_count"] == 0
+    assert reasoning_trace["presented_to_user"] is False
+    assert trace["retrieval"]["prompt_assembly"]["evidence_provider_mode"] == {
+        "mode": "advisory",
+        "advisory_rebuild_count": 1,
+        "reason": "runtime_policy_permission",
+    }
 
 
 @pytest.mark.asyncio

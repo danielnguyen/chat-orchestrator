@@ -11006,21 +11006,28 @@ async def orchestrate_chat(
             and evidence_acquisition.attempted
             and evidence_acquisition.supported_governed_path
         )
-        evidence_provider_allowed = bool(
-            diagnostic_response is None
-            and not generic_winning_candidate
-            and provider_allowed(evidence_acquisition)
-            and (
-                not generic_terminal_authority_required
-                or advisory_provider_allowed(evidence_acquisition)
+        if generic_terminal_authority_required:
+            evidence_provider_allowed = bool(
+                diagnostic_response is None
+                and not generic_winning_candidate
+                and advisory_provider_allowed(evidence_acquisition)
+                and (
+                    not compound_verification_requested
+                    or compound_governed_acquisition_established
+                )
             )
-            and (
-                not compound_verification_requested
-                or compound_governed_acquisition_established
+        else:
+            evidence_provider_allowed = bool(
+                diagnostic_response is None
+                and provider_allowed(evidence_acquisition)
+                and (
+                    not compound_verification_requested
+                    or compound_governed_acquisition_established
+                )
             )
-        )
         grounded_evidence_provider_call = bool(
-            evidence_provider_allowed
+            not generic_terminal_authority_required
+            and evidence_provider_allowed
             and evidence_acquisition is not None
             and not evidence_acquisition.follow_existing_path
             and evidence_acquisition.supported_governed_path
@@ -11099,18 +11106,10 @@ async def orchestrate_chat(
                 completion = {"choices": [{"message": {"content": ""}}]}
                 selected_model = "not_called"
                 selected_provider = "none"
-                status = (
-                    "ok"
-                    if (
-                        evidence_acquisition is not None
-                        and evidence_acquisition.supported_aggregate_path
-                        and evidence_acquisition.aggregate_result is not None
-                        and evidence_acquisition.forced_answer
-                        == evidence_acquisition.aggregate_result
-                    )
-                    or (
-                        generic_terminal_authority_required
-                        and isinstance(general_evidence_reasoning, dict)
+                if generic_terminal_authority_required:
+                    status = (
+                        "ok"
+                        if isinstance(general_evidence_reasoning, dict)
                         and isinstance(
                             general_evidence_reasoning.get("cr_result"), dict
                         )
@@ -11118,9 +11117,18 @@ async def orchestrate_chat(
                             "conclusion_disposition"
                         )
                         == "withheld"
+                        else "degraded"
                     )
-                    else "degraded"
-                )
+                else:
+                    status = (
+                        "ok"
+                        if evidence_acquisition is not None
+                        and evidence_acquisition.supported_aggregate_path
+                        and evidence_acquisition.aggregate_result is not None
+                        and evidence_acquisition.forced_answer
+                        == evidence_acquisition.aggregate_result
+                        else "degraded"
+                    )
             elif (
                 grounded_evidence_provider_call
                 and primary_structured_capability != "supported"
@@ -12149,26 +12157,26 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
             runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
         )
-        answer = (
-            _render_advisory_answer(claim_candidate_answer)
-            if advisory_evidence_provider_call
-            else enforce_final_answer(
-                claim_candidate_answer,
-                evidence_acquisition,
+        if generic_terminal_authority_required:
+            if generic_presented_answer is not None:
+                answer = generic_presented_answer
+            elif advisory_evidence_provider_call:
+                answer = _render_advisory_answer(claim_candidate_answer)
+            elif diagnostic_response is not None:
+                answer = claim_candidate_answer
+            else:
+                answer = WITHHELD_ANSWER
+            answer_sources = []
+            artifact_refs_for_sources = []
+        else:
+            answer = (
+                _render_advisory_answer(claim_candidate_answer)
+                if advisory_evidence_provider_call
+                else enforce_final_answer(
+                    claim_candidate_answer,
+                    evidence_acquisition,
+                )
             )
-        )
-        if generic_presented_answer is not None:
-            answer = generic_presented_answer
-            answer_sources = []
-            artifact_refs_for_sources = []
-        elif (
-            generic_terminal_authority_required
-            and diagnostic_response is None
-            and not advisory_evidence_provider_call
-        ):
-            answer = WITHHELD_ANSWER
-            answer_sources = []
-            artifact_refs_for_sources = []
         if compound_verification_requested:
             if history_followup_enabled:
                 history_followup_trace["fresh_verification_entry_status"] = (
