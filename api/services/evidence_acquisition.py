@@ -2014,15 +2014,10 @@ class EvidenceAcquisitionState:
             and plan.selected_strategies == ["targeted_retrieval"]
             and plan.eligible_source_ids
             and not self.exact_source_refs
+            and set(plan.authoritative_source_ids).issubset(
+                plan.eligible_source_ids
+            )
         ):
-            return False
-        requirement_kinds = {
-            requirement.requirement_kind
-            for requirement in plan.declared_requirements
-        }
-        if not {"targeted_evidence", "context_delivery"}.issubset(
-            requirement_kinds
-        ) or "exact_authoritative_fetch" in requirement_kinds:
             return False
         inventory_by_id = {
             source.source_id: source for source in inventory.sources
@@ -2050,23 +2045,12 @@ class EvidenceAcquisitionState:
         }
         eligible_sources = set(self.plan.eligible_source_ids)
         authoritative_sources = set(self.plan.authoritative_source_ids)
-        requirement_kinds = {
-            requirement.requirement_kind
-            for requirement in self.plan.declared_requirements
-        }
         inventory_by_id = {
             source.source_id: source for source in self.inventory.sources
         }
         return bool(
             referenced_sources == eligible_sources
             and authoritative_sources.issubset(eligible_sources)
-            and {"targeted_evidence", "context_delivery"}.issubset(
-                requirement_kinds
-            )
-            and (
-                ("exact_authoritative_fetch" in requirement_kinds)
-                == bool(referenced_sources & authoritative_sources)
-            )
             and all(
                 (source := inventory_by_id.get(source_id)) is not None
                 and source.enabled
@@ -5788,6 +5772,7 @@ async def execute_exact_fetches(
                 for item in response.results:
                     safe_items.append(
                         {
+                            "source_id": reference["source_id"],
                             "source_ref": item.source_ref,
                             "source_name": item.source_name,
                             "title": item.title,

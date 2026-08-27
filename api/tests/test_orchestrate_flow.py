@@ -15379,6 +15379,174 @@ async def _run_hybrid_comparison_case(
     return out, runtime, dsa, litellm, memory_store
 
 
+async def _run_targeted_cross_source_case(
+    *,
+    tmp_path,
+    partial: bool = False,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_reasoning:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    question = "Compare the bounded records from the selected sources."
+    request_id = "rid-evidence-targeted-cross-source"
+    source_ids = ["records_primary", "records_secondary"]
+    plan = _hybrid_plan_response(
+        request_id=request_id,
+        question=question,
+        eligible_source_ids=source_ids,
+    )
+    plan["result"]["selected_strategies"] = ["targeted_retrieval"]
+    runtime = FakeRuntime(
+        evidence_shape_response=_derived_shape_response(
+            request_id=request_id,
+            question=question,
+            task_shape="cross_source_comparison",
+        ),
+        evidence_plan_response=plan,
+    )
+    context_pack = _neutral_multi_source_context_pack(question)
+    if partial:
+        context_pack["items"] = context_pack["items"][:1]
+        context_pack["sources_used"] = [source_ids[0]]
+        context_pack["budget"]["returned_results"] = 1
+        context_pack["diagnostics"]["selected_source_ids"] = [source_ids[0]]
+        context_pack["diagnostics"]["candidate_counts_by_source"] = {
+            source_ids[0]: 1,
+        }
+    dsa = FakeDSA(
+        response=context_pack,
+        source_response={
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "display_name": f"Record Source {index}",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["records"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+                for index, source_id in enumerate(source_ids, start=1)
+            ]
+        },
+    )
+    evidence_refs = [
+        governed_external_reference_id(item["source_ref"])
+        for item in context_pack["items"]
+    ]
+    litellm = SequenceLiteLLM(
+        [
+            _general_reasoning_completion(
+                proposed_claim=(
+                    "The retained bounded records support a qualified comparison."
+                ),
+                evidence_ref_id=evidence_refs[0],
+                supporting_evidence_ref_ids=evidence_refs,
+            )
+        ]
+    )
+    memory_store = ClaimCaptureMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=True,
+        general_evidence_reasoning_timeout_ms=5000,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return out, runtime, dsa, litellm, memory_store
+
+
+@pytest.mark.asyncio
+async def test_targeted_retrieval_runs_cross_source_generic_reasoning(tmp_path):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_targeted_cross_source_case(tmp_path=tmp_path)
+    )
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert out["status"] == "ok"
+    assert "qualified comparison" in out["answer"]
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["source_ids"] == [
+        "records_primary",
+        "records_secondary",
+    ]
+    assert dsa.context_calls == []
+    assert dsa.fetch_calls == []
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    } == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert out.get("pending_action") is None
+    reasoning = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning["reasoning_provider_call_count"] == 1
+    assert reasoning["cr_call_count"] == 1
+    assert reasoning["presented_to_user"] is True
+
+
+@pytest.mark.asyncio
+async def test_targeted_retrieval_partial_cross_source_coverage_is_conservative(
+    tmp_path,
+):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_targeted_cross_source_case(tmp_path=tmp_path, partial=True)
+    )
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["selected-source-coverage"] == "partial"
+    assert facts["cross-source-comparison"] == "partial"
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["source_ids"] == [
+        "records_primary",
+        "records_secondary",
+    ]
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert trace["prompt"]["general_evidence_reasoning"][
+        "presented_to_user"
+    ] is False
+    assert trace["prompt"]["general_evidence_reasoning"][
+        "cr_conclusion_disposition"
+    ] != "allowed"
+    assert "qualified comparison" not in out["answer"]
+    assert out.get("pending_action") is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "task_shape",

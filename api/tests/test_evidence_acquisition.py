@@ -54,6 +54,7 @@ from services.evidence_acquisition import (
     _resolve_declared_scope,
     _source_discovery_projection,
     _source_summaries,
+    _validate_supported_plan,
     advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
@@ -5372,34 +5373,57 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
     )
 
 
-def test_targeted_strategy_admission_is_independent_of_reasoning_shape():
-    shape_data = _shape_response(shape="historical_reconstruction")["result"]
-    plan_data = _plan_response()["result"]
-    plan_data["task_shape"] = "historical_reconstruction"
-    plan_data["completeness_expectation"] = "complete_for_time_window"
+def _cross_source_targeted_state() -> EvidenceAcquisitionState:
+    shape_data = _hybrid_shape_response()["result"]
+    plan_data = _hybrid_plan_response(strategy="targeted_retrieval")["result"]
     state = EvidenceAcquisitionState(
         enabled=True,
         attempted=True,
         status="acquisition_ready",
         shape=ShapeResult.model_validate(shape_data),
         inventory=DsaSourceListResponse.model_validate(
-            {"sources": [_source("source_a", capabilities=["profile", "search"])]}
+            {
+                "sources": [
+                    _source(
+                        source_id,
+                        capabilities=["profile", "search"],
+                    )
+                    for source_id in ("source_a", "source_b")
+                ]
+            }
         ),
         declared_scope={
-            "source_ids": ["source_a"],
+            "source_ids": ["source_a", "source_b"],
             "source_categories": [],
             "exact_source_refs": [],
             "inventory_status": "complete_for_declared_scope",
-            "time_scope_ref": "bounded-window",
+            "time_scope_ref": None,
             "version_scope_ref": None,
             "domain_scope_ref": None,
             "project_scope_ref": None,
         },
         plan=PlanResult.model_validate(plan_data),
     )
+    return state
+
+
+def test_targeted_strategy_admission_is_independent_of_reasoning_shape():
+    state = _cross_source_targeted_state()
 
     assert state.supported_targeted_path is True
     assert state.supported_governed_path is True
+    assert _validate_supported_plan(state) is True
+    assert {
+        requirement.requirement_kind
+        for requirement in state.plan.declared_requirements
+    } == {
+        "selected_source_coverage",
+        "cross_source_comparison",
+        "context_delivery",
+    }
+    unauthorized_authority = copy.deepcopy(state)
+    unauthorized_authority.plan.authoritative_source_ids = ["source_other"]
+    assert unauthorized_authority.supported_targeted_path is False
 
 
 @pytest.mark.asyncio
@@ -7792,6 +7816,39 @@ def test_hybrid_facts_manifest_identity_and_privacy_are_prompt_aware():
         assert prohibited not in serialized
 
 
+def test_targeted_facts_follow_actual_cross_source_coverage():
+    state = _cross_source_targeted_state()
+    context_pack = _targeted_hybrid_context_pack()
+    complete_refs = {
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+    }
+
+    complete = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs=complete_refs,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in complete} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+
+    partial = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs={"connector:source_a:seed-a"},
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in partial} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "partial",
+        "selected-source-coverage": "partial",
+    }
+
+
 def test_hybrid_material_facts_follow_actual_coverage_not_reasoning_shape():
     state = _hybrid_state()
     requirements = [
@@ -8232,6 +8289,148 @@ def test_fetch_response_contract_rejects_malformed_or_unassociated_results(
             expected_source_id="source_a",
             expected_source_ref="connector:source_a:item-1",
         )
+
+
+def _cross_source_exact_state() -> EvidenceAcquisitionState:
+    source_ids = ["source_a", "source_b"]
+    exact_source_refs = [
+        {
+            "source_id": "source_a",
+            "source_ref": "connector:source_a:item-1",
+        },
+        {
+            "source_id": "source_b",
+            "source_ref": "connector:source_b:item-2",
+        },
+    ]
+    plan_data = _hybrid_plan_response(
+        strategy="exact_fetch",
+        eligible_source_ids=source_ids,
+    )["result"]
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        shape=ShapeResult.model_validate(_hybrid_shape_response()["result"]),
+        inventory=DsaSourceListResponse.model_validate(
+            {
+                "sources": [
+                    _source(source_id, capabilities=["profile", "fetch"])
+                    for source_id in source_ids
+                ]
+            }
+        ),
+        declared_scope={
+            "source_ids": source_ids,
+            "source_categories": [],
+            "exact_source_refs": exact_source_refs,
+            "inventory_status": "complete_for_declared_scope",
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        plan=PlanResult.model_validate(plan_data),
+        exact_source_refs=exact_source_refs,
+    )
+
+
+def test_exact_strategy_admission_is_independent_of_reasoning_shape():
+    state = _cross_source_exact_state()
+
+    assert state.supported_exact_path is True
+    assert state.supported_governed_path is True
+    assert _validate_supported_plan(state) is True
+    assert "targeted_evidence" not in {
+        requirement.requirement_kind
+        for requirement in state.plan.declared_requirements
+    }
+
+    mismatched = copy.deepcopy(state)
+    mismatched.exact_source_refs = [state.exact_source_refs[0]]
+    assert mismatched.supported_exact_path is False
+
+    missing_capability = copy.deepcopy(state)
+    missing_capability.inventory.sources[1].capabilities = ["profile"]
+    assert missing_capability.supported_exact_path is False
+
+
+@pytest.mark.asyncio
+async def test_cross_source_exact_evidence_preserves_identity_and_coverage():
+    state = _cross_source_exact_state()
+    dsa = FakeDsa(
+        [],
+        fetch_responses=[
+            _fetch_response(),
+            _fetch_response(
+                source_id="source_b",
+                source_ref="connector:source_b:item-2",
+            ),
+        ],
+    )
+
+    context, trace = await execute_exact_fetches(state=state, dsa=dsa)
+
+    assert context is not None
+    assert [call[1]["source_ref"] for call in dsa.calls] == [
+        "connector:source_a:item-1",
+        "connector:source_b:item-2",
+    ]
+    assert [item["source_id"] for item in context["items"]] == [
+        "source_a",
+        "source_b",
+    ]
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context,
+        dsa_trace=trace,
+        retained_source_refs={
+            "connector:source_a:item-1",
+            "connector:source_b:item-2",
+        },
+        exact_source_refs=state.exact_source_refs,
+        exact_attempts=state.exact_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in facts} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_source_exact_partial_evidence_remains_available():
+    state = _cross_source_exact_state()
+    dsa = FakeDsa(
+        [],
+        fetch_responses=[
+            _fetch_response(),
+            RuntimeError("PRIVATE DEPENDENCY ERROR"),
+        ],
+    )
+
+    context, trace = await execute_exact_fetches(state=state, dsa=dsa)
+
+    assert context is not None
+    assert [call[1]["source_ref"] for call in dsa.calls] == [
+        "connector:source_a:item-1",
+        "connector:source_b:item-2",
+    ]
+    assert context["sources_used"] == ["source_a"]
+    assert context["items"][0]["source_id"] == "source_a"
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context,
+        dsa_trace=trace,
+        retained_source_refs={"connector:source_a:item-1"},
+        exact_source_refs=state.exact_source_refs,
+        exact_attempts=state.exact_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in facts} == {
+        "context-delivery": "unknown",
+        "cross-source-comparison": "partial",
+        "selected-source-coverage": "partial",
+    }
 
 
 @pytest.mark.asyncio
