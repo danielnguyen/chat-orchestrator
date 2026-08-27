@@ -6721,7 +6721,7 @@ contradiction|contradiction_review|Review the selected records for potentially c
 decision|recommendation_or_decision_support|Assess the selected records as bounded evidence for a decision.|The bounded records support a qualified decision synthesis.
 CASES
 
-  question="Review the full configured register and summarize the bounded records."
+  question="$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION"
   claim="The complete configured register supports the bounded synthesis."
   owner="owner-generalized-full-scope"
   client="client-generalized-full-scope"
