@@ -2005,22 +2005,44 @@ class EvidenceAcquisitionState:
 
     @property
     def supported_targeted_path(self) -> bool:
-        return bool(
-            self.plan
-            and self.plan.task_shape == "targeted_lookup"
-            and self.plan.plan_status in {"ready", "ready_with_limitations"}
-            and self.plan.selected_strategies == ["targeted_retrieval"]
+        plan = self.plan
+        inventory = self.inventory
+        if not (
+            plan
+            and inventory
+            and plan.plan_status in {"ready", "ready_with_limitations"}
+            and plan.selected_strategies == ["targeted_retrieval"]
+            and plan.eligible_source_ids
             and not self.exact_source_refs
+        ):
+            return False
+        requirement_kinds = {
+            requirement.requirement_kind
+            for requirement in plan.declared_requirements
+        }
+        if not {"targeted_evidence", "context_delivery"}.issubset(
+            requirement_kinds
+        ) or "exact_authoritative_fetch" in requirement_kinds:
+            return False
+        inventory_by_id = {
+            source.source_id: source for source in inventory.sources
+        }
+        return all(
+            (source := inventory_by_id.get(source_id)) is not None
+            and source.enabled
+            and source.status == "ready"
+            and "search" in source.capabilities
+            for source_id in plan.eligible_source_ids
         )
 
     @property
     def supported_exact_path(self) -> bool:
         if not (
             self.plan
-            and self.plan.task_shape == "targeted_lookup"
             and self.plan.plan_status in {"ready", "ready_with_limitations"}
             and self.plan.selected_strategies == ["exact_fetch"]
             and self.exact_source_refs
+            and self.inventory is not None
         ):
             return False
         referenced_sources = {
@@ -2029,7 +2051,11 @@ class EvidenceAcquisitionState:
         eligible_sources = set(self.plan.eligible_source_ids)
         authoritative_sources = set(self.plan.authoritative_source_ids)
         requirement_kinds = {
-            item.requirement_kind for item in self.plan.declared_requirements
+            requirement.requirement_kind
+            for requirement in self.plan.declared_requirements
+        }
+        inventory_by_id = {
+            source.source_id: source for source in self.inventory.sources
         }
         return bool(
             referenced_sources == eligible_sources
@@ -2041,42 +2067,27 @@ class EvidenceAcquisitionState:
                 ("exact_authoritative_fetch" in requirement_kinds)
                 == bool(referenced_sources & authoritative_sources)
             )
+            and all(
+                (source := inventory_by_id.get(source_id)) is not None
+                and source.enabled
+                and source.status == "ready"
+                and "fetch" in source.capabilities
+                for source_id in eligible_sources
+            )
         )
 
     @property
-    def supported_hybrid_comparison_path(self) -> bool:
+    def supported_hybrid_path(self) -> bool:
         plan = self.plan
         if not (
             plan
-            and plan.task_shape == "cross_source_comparison"
             and plan.plan_status in {"ready", "ready_with_limitations"}
             and plan.selected_strategies == ["hybrid"]
             and not self.exact_source_refs
-            and plan.completeness_expectation == "complete_for_selected_sources"
-            and plan.contradiction_search_required is False
-            and 2 <= len(plan.eligible_source_ids) <= 8
+            and 1 <= len(plan.eligible_source_ids) <= 8
             and len(set(plan.eligible_source_ids)) == len(plan.eligible_source_ids)
             and self.inventory is not None
         ):
-            return False
-        required_material = {
-            "selected_source_coverage",
-            "cross_source_comparison",
-            "context_delivery",
-        }
-        material = {
-            item.requirement_kind
-            for item in plan.declared_requirements
-            if item.criticality == "material"
-        }
-        if material != required_material:
-            return False
-        optional = {
-            item.requirement_kind
-            for item in plan.declared_requirements
-            if item.criticality == "optional"
-        }
-        if optional - {"selected_source_coverage"}:
             return False
         eligible = set(plan.eligible_source_ids)
         if not set(plan.authoritative_source_ids).issubset(eligible):
@@ -2097,41 +2108,31 @@ class EvidenceAcquisitionState:
         return True
 
     @property
-    def supported_bounded_exhaustive_path(self) -> bool:
+    def supported_complete_scope_path(self) -> bool:
         plan = self.plan
         inventory = self.inventory
         declared_scope = self.declared_scope
+        material = {
+            requirement.requirement_kind
+            for requirement in plan.declared_requirements
+            if requirement.criticality == "material"
+        } if plan is not None else set()
         required_material = {
-            "authoritative_inventory",
-            "complete_scope_coverage",
-            "contradiction_search",
-            "context_delivery",
-            "no_material_truncation",
+            "authoritative_inventory", "complete_scope_coverage"
         }
         if not (
             plan
             and inventory
             and isinstance(declared_scope, dict)
-            and plan.task_shape == "bounded_exhaustive_review"
             and plan.plan_status == "ready"
             and plan.completeness_expectation == "complete_for_declared_scope"
-            and plan.contradiction_search_required is True
             and plan.selected_strategies == ["hybrid"]
             and plan.limitation_codes == []
             and not self.exact_source_refs
             and not declared_scope.get("exact_source_refs")
             and len(plan.eligible_source_ids) == 1
             and plan.authoritative_source_ids == plan.eligible_source_ids
-            and len(plan.declared_requirements) == len(required_material)
-            and all(
-                requirement.criticality == "material"
-                for requirement in plan.declared_requirements
-            )
-            and {
-                requirement.requirement_kind
-                for requirement in plan.declared_requirements
-            }
-            == required_material
+            and required_material.issubset(material)
             and inventory.inventory_scope == "configured_sources"
             and inventory.inventory_status == "complete"
             and declared_scope.get("inventory_status")
@@ -2228,8 +2229,7 @@ class EvidenceAcquisitionState:
         return (
             self.supported_targeted_path
             or self.supported_exact_path
-            or self.supported_hybrid_comparison_path
-            or self.supported_bounded_exhaustive_path
+            or self.supported_hybrid_path
             or self.supported_aggregate_path
         )
 
@@ -3324,7 +3324,21 @@ def evidence_interpreter_messages(
             "role": "system",
             "content": (
                 "Interpret which configured sources are plausibly relevant to the "
-                "user request and which closed evidence operation is requested. "
+                "user request and which bounded evidence-acquisition coverage pattern "
+                "is needed. The operation_hint guides acquisition scope; it does not "
+                "limit what downstream reasoning may do with acquired evidence. Use "
+                "lookup or latest when bounded evidence is sufficient, exhaustive_review "
+                "when the full declared source scope is materially required, comparison "
+                "when acquisition must cover multiple distinct source registries, "
+                "contradiction_review when acquisition must expose potential conflicting "
+                "evidence, absence_check when the conclusion depends on complete absence "
+                "coverage, historical_reconstruction when bounded time and sequence "
+                "coverage are required, and decision_support when candidate and "
+                "counterevidence coverage across selected sources is required. Reasoning "
+                "over multiple records in one source is not inherently cross-source "
+                "comparison: use exhaustive_review when full source coverage is material, "
+                "or lookup when bounded evidence is sufficient. Use unknown only when the "
+                "required acquisition coverage itself cannot be determined safely. "
                 "The user may describe desired data with natural paraphrases rather "
                 "than name a source. Choose only source_id values in the supplied "
                 "inventory. Return ambiguous for two or three genuinely plausible "
@@ -4083,41 +4097,20 @@ def _validate_scope_echo(
 
 def _validate_supported_plan(state: EvidenceAcquisitionState) -> bool:
     plan = state.plan
-    if (
-        state.supported_hybrid_comparison_path
-        or state.supported_bounded_exhaustive_path
-        or state.supported_aggregate_path
-    ):
-        return True
-    if plan is None or plan.task_shape != "targeted_lookup":
+    shape = state.shape
+    if plan is None or shape is None:
+        return False
+    if plan.task_shape != shape.task_shape:
         return False
     if plan.plan_status not in {"ready", "ready_with_limitations"}:
         return False
-    requirement_kinds = {requirement.requirement_kind for requirement in plan.declared_requirements}
-    if not {"targeted_evidence", "context_delivery"}.issubset(requirement_kinds):
+    if not plan.eligible_source_ids:
         return False
-    exact_references = state.exact_source_refs or []
-    if exact_references:
-        if plan.selected_strategies != ["exact_fetch"]:
-            return False
-        referenced_sources = {item["source_id"] for item in exact_references}
-        eligible_sources = set(plan.eligible_source_ids)
-        authoritative_sources = set(plan.authoritative_source_ids)
-        if referenced_sources != eligible_sources:
-            return False
-        if not authoritative_sources.issubset(eligible_sources):
-            return False
-        exact_authoritative_declared = (
-            "exact_authoritative_fetch" in requirement_kinds
-        )
-        if exact_authoritative_declared != bool(
-            referenced_sources & authoritative_sources
-        ):
-            return False
-        return True
-    return (
-        plan.selected_strategies == ["targeted_retrieval"]
-        and "exact_authoritative_fetch" not in requirement_kinds
+    return bool(
+        state.supported_targeted_path
+        or state.supported_exact_path
+        or state.supported_hybrid_path
+        or state.supported_aggregate_path
     )
 
 
@@ -5267,7 +5260,7 @@ async def execute_bounded_exhaustive_review(
     dsa_trace: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if (
-        not state.supported_bounded_exhaustive_path
+        not state.supported_complete_scope_path
         or state.plan is None
         or state.shape is None
     ):
@@ -5493,7 +5486,7 @@ async def execute_bounded_exhaustive_review(
     }
 
 
-async def execute_hybrid_comparison(
+async def execute_hybrid_acquisition(
     *,
     state: EvidenceAcquisitionState,
     dsa: Any,
@@ -5501,7 +5494,7 @@ async def execute_hybrid_comparison(
     dsa_trace: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if (
-        not state.supported_hybrid_comparison_path
+        not state.supported_hybrid_path
         or state.plan is None
         or state.shape is None
     ):
@@ -6129,6 +6122,53 @@ def _optional_selected_source_coverage_outcome(
     return "satisfied"
 
 
+def _actual_source_coverage_outcome(
+    *,
+    plan: PlanResult,
+    context_pack: dict[str, Any] | None,
+    dsa_trace: dict[str, Any],
+    retained_source_refs: set[str] | None,
+) -> tuple[str, set[str]]:
+    items = (
+        context_pack.get("items")
+        if isinstance(context_pack, dict)
+        and isinstance(context_pack.get("items"), list)
+        else []
+    )
+    source_by_ref = {
+        item["source_ref"]: item["source_id"]
+        for item in items
+        if isinstance(item, dict)
+        and isinstance(item.get("source_ref"), str)
+        and isinstance(item.get("source_id"), str)
+    }
+    retained_sources = (
+        {
+            source_by_ref[source_ref]
+            for source_ref in retained_source_refs
+            if source_ref in source_by_ref
+        }
+        if retained_source_refs is not None
+        else set()
+    )
+    if dsa_trace.get("budget_truncated") or dsa_trace.get("candidate_truncated"):
+        return "truncated", retained_sources
+    if retained_source_refs is None:
+        return "unknown", retained_sources
+    planned_sources = set(plan.eligible_source_ids)
+    if planned_sources.issubset(retained_sources):
+        return "satisfied", retained_sources
+    if retained_sources:
+        return "partial", retained_sources
+    if dsa_trace.get("status") == "error":
+        return (
+            "filtered"
+            if dsa_trace.get("error_code") == "malformed_response"
+            else "failed"
+        ), retained_sources
+    return "unknown", retained_sources
+
+
 def _build_acquisition_facts(
     *,
     plan: PlanResult,
@@ -6140,15 +6180,13 @@ def _build_acquisition_facts(
     expansion_attempts: list[dict[str, Any]] | None = None,
     bounded_exhaustive_path: bool = False,
     aggregate_execution: dict[str, Any] | None = None,
+    declared_scope: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     status = dsa_trace.get("status")
     error_code = dsa_trace.get("error_code")
     usable_count = len(context_pack.get("items", [])) if isinstance(context_pack, dict) else 0
     exact_path = plan.selected_strategies == ["exact_fetch"]
-    hybrid_path = (
-        plan.task_shape == "cross_source_comparison"
-        and plan.selected_strategies == ["hybrid"]
-    )
+    hybrid_path = plan.selected_strategies == ["hybrid"]
     if exact_path:
         delivery_outcome, _, _ = _exact_delivery_reference_state(
             exact_source_refs=exact_source_refs or [],
@@ -6181,6 +6219,22 @@ def _build_acquisition_facts(
         if bounded_exhaustive_path
         else None
     )
+    coverage_outcome, retained_sources = _actual_source_coverage_outcome(
+        plan=plan,
+        context_pack=context_pack,
+        dsa_trace=dsa_trace,
+        retained_source_refs=retained_source_refs,
+    )
+    no_truncation_outcome = (
+        "truncated"
+        if dsa_trace.get("budget_truncated") or dsa_trace.get("candidate_truncated")
+        else "satisfied"
+    )
+    acquisition_coverage_outcome = (
+        hybrid_outcomes[0]
+        if hybrid_outcomes is not None
+        else coverage_outcome
+    )
     facts: list[dict[str, str]] = []
     for requirement in sorted(
         plan.declared_requirements,
@@ -6208,16 +6262,57 @@ def _build_acquisition_facts(
                 requirement.requirement_kind,
                 "unknown",
             )
-        elif (
-            hybrid_path
-            and requirement.requirement_kind == "selected_source_coverage"
-            and requirement.criticality == "material"
-        ):
-            outcome = hybrid_outcomes[0] if hybrid_outcomes else "unknown"
-        elif hybrid_path and requirement.requirement_kind == "cross_source_comparison":
-            outcome = hybrid_outcomes[1] if hybrid_outcomes else "unknown"
+        elif requirement.requirement_kind in {
+            "selected_source_coverage",
+            "candidate_evidence_coverage",
+        } and requirement.criticality == "material":
+            outcome = acquisition_coverage_outcome
+        elif requirement.requirement_kind == "cross_source_comparison":
+            outcome = (
+                hybrid_outcomes[1]
+                if hybrid_outcomes is not None
+                else "satisfied"
+                if len(retained_sources) >= 2
+                else coverage_outcome
+            )
+        elif requirement.requirement_kind in {
+            "contradiction_search",
+            "counterevidence_coverage",
+            "historical_sequence_coverage",
+        }:
+            outcome = acquisition_coverage_outcome
         elif hybrid_path and requirement.requirement_kind == "context_delivery":
             outcome = hybrid_outcomes[2] if hybrid_outcomes else "unknown"
+        elif requirement.requirement_kind == "complete_scope_coverage":
+            outcome = (
+                exhaustive_outcomes.get("complete_scope_coverage", "unknown")
+                if exhaustive_outcomes is not None
+                else "unknown"
+            )
+        elif requirement.requirement_kind == "authoritative_inventory":
+            outcome = (
+                "satisfied"
+                if plan.authoritative_source_ids
+                and not set(plan.limitation_codes)
+                & {
+                    "source_inventory_unavailable",
+                    "source_inventory_unknown",
+                    "source_inventory_partial",
+                    "authoritative_source_missing",
+                    "authoritative_source_unavailable",
+                }
+                else "unknown"
+            )
+        elif requirement.requirement_kind == "historical_scope":
+            outcome = (
+                "satisfied"
+                if isinstance(declared_scope, dict)
+                and isinstance(declared_scope.get("time_scope_ref"), str)
+                and bool(declared_scope["time_scope_ref"])
+                else "unknown"
+            )
+        elif requirement.requirement_kind == "no_material_truncation":
+            outcome = no_truncation_outcome
         elif requirement.requirement_kind == "targeted_evidence":
             if exact_path:
                 outcome = _aggregate_exact_outcome(exact_attempts or [])
@@ -6290,7 +6385,7 @@ async def evaluate_acquisition_sufficiency(
     delivery_identity = (
         state.aggregate_delivery_identity if state.supported_aggregate_path else None
     )
-    if state.supported_bounded_exhaustive_path:
+    if state.supported_complete_scope_path:
         retention_status, returned_refs, retained_refs = _delivery_reference_state(
             context_pack=context_pack,
             retained_source_refs=retained_source_refs,
@@ -6327,8 +6422,9 @@ async def evaluate_acquisition_sufficiency(
         exact_source_refs=state.exact_source_refs,
         exact_attempts=state.exact_attempts,
         expansion_attempts=state.expansion_attempts,
-        bounded_exhaustive_path=state.supported_bounded_exhaustive_path,
+        bounded_exhaustive_path=state.supported_complete_scope_path,
         aggregate_execution=state.aggregate_execution,
+        declared_scope=state.declared_scope,
     )
     state.acquisition_facts = facts
     try:
@@ -6418,11 +6514,16 @@ async def evaluate_acquisition_sufficiency(
 
 
 def _process_failure_operation(state: EvidenceAcquisitionState) -> ProcessFailureOperation:
-    if state.supported_aggregate_path:
+    strategy = (
+        state.plan.selected_strategies[0]
+        if state.plan is not None and len(state.plan.selected_strategies) == 1
+        else None
+    )
+    if strategy == "structured_field_values":
         return "structured_field_values"
-    if state.supported_exact_path:
+    if strategy == "exact_fetch":
         return "exact_fetch"
-    if state.supported_hybrid_comparison_path or state.supported_bounded_exhaustive_path:
+    if strategy == "hybrid":
         return "context_expansion"
     return "targeted_retrieval"
 
@@ -7640,7 +7741,7 @@ def build_manifest_trace(
         else []
     )
     exact_path = state.supported_exact_path
-    hybrid_path = state.supported_hybrid_comparison_path
+    hybrid_path = state.supported_hybrid_path
     aggregate_path = state.supported_aggregate_path
     if exact_path:
         delivery_outcome, returned_ref_set, retained_ref_set = _exact_delivery_reference_state(
