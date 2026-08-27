@@ -6644,8 +6644,8 @@ run_generalized_acquisition_reasoning_scenarios() {
   local alpha_ref beta_ref alpha_evidence_ref beta_evidence_ref
   alpha_ref="ics_calendar:calendar_alpha:event:alpha-event"
   beta_ref="ics_calendar:calendar_beta:event:beta-event"
-  alpha_evidence_ref="external-source:$(printf '%s' "$alpha_ref" | sha256sum | cut -d' ' -f1)"
-  beta_evidence_ref="external-source:$(printf '%s' "$beta_ref" | sha256sum | cut -d' ' -f1)"
+  alpha_evidence_ref="$alpha_ref"
+  beta_evidence_ref="$beta_ref"
   external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
 
   while IFS='|' read -r case_name expected_shape question claim; do
