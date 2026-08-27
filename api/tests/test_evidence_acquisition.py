@@ -54,6 +54,7 @@ from services.evidence_acquisition import (
     _resolve_declared_scope,
     _source_discovery_projection,
     _source_summaries,
+    _validate_supported_plan,
     advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_manifest_response,
@@ -72,7 +73,7 @@ from services.evidence_acquisition import (
     execute_aggregate_values,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
-    execute_hybrid_comparison,
+    execute_hybrid_acquisition,
     finalize_aggregate_conclusion,
     grounded_evidence_response_format,
     helpful_grounded_recovery_allowed,
@@ -1305,12 +1306,25 @@ def _rendering_state(
         enabled=True,
         attempted=True,
         status=status,
-        inventory=(
-            DsaSourceListResponse.model_validate(inventory)
+        inventory=DsaSourceListResponse.model_validate(
+            inventory
             if inventory is not None
-            else None
+            else {"sources": [_source("source_a")]}
         ),
-        declared_scope=declared_scope,
+        declared_scope=(
+            declared_scope
+            if declared_scope is not None
+            else {
+                "source_ids": ["source_a"],
+                "source_categories": [],
+                "exact_source_refs": [],
+                "inventory_status": "complete_for_declared_scope",
+                "time_scope_ref": None,
+                "version_scope_ref": None,
+                "domain_scope_ref": None,
+                "project_scope_ref": None,
+            }
+        ),
         plan=PlanResult.model_validate(plan_data),
         manifest_id="evidence_manifest_0123456789abcdef0123456789abcdef",
         sufficiency=SufficiencyResult.model_validate(response),
@@ -2684,6 +2698,16 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
     assert "do not invent, trim, or normalize field names" in (
         system_instruction.lower()
     )
+    assert "bounded evidence-acquisition coverage pattern" in system_instruction
+    assert "does not limit what downstream reasoning may do" in system_instruction
+    assert "not inherently cross-source comparison" in system_instruction
+    assert (
+        "required acquisition coverage itself cannot be determined safely"
+        in system_instruction
+    )
+    assert "closed evidence operation" not in system_instruction
+    for domain_term in ("calendar", "vehicle", "schedule", "fraction", "percent"):
+        assert domain_term not in system_instruction.lower()
 
 
 def test_evidence_interpreter_response_format_is_strict_and_closed():
@@ -5349,6 +5373,59 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
     )
 
 
+def _cross_source_targeted_state() -> EvidenceAcquisitionState:
+    shape_data = _hybrid_shape_response()["result"]
+    plan_data = _hybrid_plan_response(strategy="targeted_retrieval")["result"]
+    state = EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        shape=ShapeResult.model_validate(shape_data),
+        inventory=DsaSourceListResponse.model_validate(
+            {
+                "sources": [
+                    _source(
+                        source_id,
+                        capabilities=["profile", "search"],
+                    )
+                    for source_id in ("source_a", "source_b")
+                ]
+            }
+        ),
+        declared_scope={
+            "source_ids": ["source_a", "source_b"],
+            "source_categories": [],
+            "exact_source_refs": [],
+            "inventory_status": "complete_for_declared_scope",
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        plan=PlanResult.model_validate(plan_data),
+    )
+    return state
+
+
+def test_targeted_strategy_admission_is_independent_of_reasoning_shape():
+    state = _cross_source_targeted_state()
+
+    assert state.supported_targeted_path is True
+    assert state.supported_governed_path is True
+    assert _validate_supported_plan(state) is True
+    assert {
+        requirement.requirement_kind
+        for requirement in state.plan.declared_requirements
+    } == {
+        "selected_source_coverage",
+        "cross_source_comparison",
+        "context_delivery",
+    }
+    unauthorized_authority = copy.deepcopy(state)
+    unauthorized_authority.plan.authoritative_source_ids = ["source_other"]
+    assert unauthorized_authority.supported_targeted_path is False
+
+
 @pytest.mark.asyncio
 async def test_scope_selector_and_unanimous_refs_reach_cr_without_raw_metadata():
     plan = _plan_response()
@@ -5687,7 +5764,17 @@ async def test_trusted_inventory_status_maps_exactly(
 
 @pytest.mark.asyncio
 async def test_trusted_authority_and_scope_filters_reach_plan_without_inference():
-    runtime = FakeRuntime()
+    plan = _plan_response()
+    plan["result"].update(
+        {
+            "eligible_source_ids": [
+                "source_authoritative",
+                "source_supplemental",
+            ],
+            "authoritative_source_ids": ["source_authoritative"],
+        }
+    )
+    runtime = FakeRuntime(plan=plan)
     sources = [
         _source(
             "source_supplemental",
@@ -6447,7 +6534,7 @@ def _exhaustive_targeted_context_pack():
 
 
 def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
-    assert _exhaustive_state().supported_bounded_exhaustive_path is True
+    assert _exhaustive_state().supported_complete_scope_path is True
     assert _exhaustive_state().supported_governed_path is True
 
     second_source = _source(
@@ -6483,8 +6570,8 @@ def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
         declared_source_ids=[],
         declared_categories=["records"],
     )
-    assert narrowed_by_id.supported_bounded_exhaustive_path is True
-    assert narrowed_by_category.supported_bounded_exhaustive_path is True
+    assert narrowed_by_id.supported_complete_scope_path is True
+    assert narrowed_by_category.supported_complete_scope_path is True
 
 
 @pytest.mark.parametrize(
@@ -6493,16 +6580,11 @@ def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
         "unsupported-status",
         "ready-with-limitations",
         "limitation-code",
-        "wrong-shape",
         "wrong-strategy",
         "wrong-completeness",
-        "no-contradiction",
         "exact-reference",
         "zero-eligible",
         "two-eligible",
-        "missing-requirement",
-        "extra-requirement",
-        "optional-requirement",
         "non-material-requirement",
         "missing-authoritative",
         "additional-authoritative",
@@ -6575,7 +6657,48 @@ def test_bounded_exhaustive_rejects_plan_contract_variants(case):
         requirements=requirements,
         exact_source_refs=exact_source_refs,
     )
-    assert state.supported_bounded_exhaustive_path is False
+    assert state.supported_complete_scope_path is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "different-shape",
+        "no-contradiction",
+        "missing-cognitive-requirement",
+        "extra-requirement",
+        "optional-truncation-requirement",
+    ],
+)
+def test_complete_scope_execution_is_not_gated_by_reasoning_shape(case):
+    requirements = _exhaustive_requirements()
+    overrides = {}
+    if case == "different-shape":
+        overrides["task_shape"] = "contradiction_review"
+    elif case == "no-contradiction":
+        overrides["contradiction_search_required"] = False
+    elif case == "missing-cognitive-requirement":
+        requirements = [
+            item
+            for item in requirements
+            if item["requirement_kind"] != "contradiction_search"
+        ]
+    elif case == "extra-requirement":
+        requirements.append(
+            {
+                "requirement_id": "targeted-evidence",
+                "requirement_kind": "targeted_evidence",
+                "criticality": "material",
+            }
+        )
+    else:
+        requirements[-1]["criticality"] = "optional"
+
+    state = _exhaustive_state(
+        plan_overrides=overrides,
+        requirements=requirements,
+    )
+    assert state.supported_complete_scope_path is True
 
 
 @pytest.mark.parametrize(
@@ -6614,7 +6737,7 @@ def test_bounded_exhaustive_rejects_untrusted_or_incapable_source(
         tags=["official"],
     )
     assert (
-        _exhaustive_state(sources=[source]).supported_bounded_exhaustive_path
+        _exhaustive_state(sources=[source]).supported_complete_scope_path
         is False
     ), case
 
@@ -6643,7 +6766,7 @@ def test_bounded_exhaustive_rejects_untrusted_inventory_states(
     assert (
         _exhaustive_state(
             inventory_metadata=inventory_metadata
-        ).supported_bounded_exhaustive_path
+        ).supported_complete_scope_path
         is False
     )
 
@@ -6683,13 +6806,13 @@ def test_bounded_exhaustive_rejects_malformed_inventory_and_wider_universe():
                 second_source,
             ],
             declared_source_ids=[],
-        ).supported_bounded_exhaustive_path
+        ).supported_complete_scope_path
         is False
     )
     assert (
         _exhaustive_state(
             declared_source_ids=["source_a", "missing_authoritative_source"]
-        ).supported_bounded_exhaustive_path
+        ).supported_complete_scope_path
         is False
     )
 
@@ -7215,8 +7338,8 @@ def _hybrid_state(
     )
 
 
-def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
-    assert _hybrid_state().supported_hybrid_comparison_path is True
+def test_hybrid_supported_boundary_is_strategy_based():
+    assert _hybrid_state().supported_hybrid_path is True
     limited_requirements = [
         *_hybrid_plan_response()["result"]["declared_requirements"],
         {
@@ -7232,43 +7355,21 @@ def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
                 "declared_requirements": limited_requirements,
                 "limitation_codes": ["optional_source_unavailable"],
             }
-        ).supported_hybrid_comparison_path
+        ).supported_hybrid_path
         is True
     )
 
+    for task_shape in (
+        "contradiction_review",
+        "recommendation_or_decision_support",
+        "bounded_exhaustive_review",
+    ):
+        assert _hybrid_state(
+            plan_overrides={"task_shape": task_shape}
+        ).supported_hybrid_path is True
+
     variants = [
-        _hybrid_state(source_ids=["source_a"]),
         _hybrid_state(source_ids=[f"source_{index}" for index in range(9)]),
-        _hybrid_state(
-            plan_overrides={
-                "declared_requirements": _hybrid_plan_response()["result"][
-                    "declared_requirements"
-                ][1:]
-            }
-        ),
-        _hybrid_state(
-            plan_overrides={
-                "declared_requirements": [
-                    *_hybrid_plan_response()["result"]["declared_requirements"],
-                    {
-                        "requirement_id": "targeted-evidence",
-                        "requirement_kind": "targeted_evidence",
-                        "criticality": "material",
-                    },
-                ]
-            }
-        ),
-        _hybrid_state(
-            plan_overrides={
-                "task_shape": "bounded_exhaustive_review",
-                "completeness_expectation": "complete_for_declared_scope",
-                "contradiction_search_required": True,
-            }
-        ),
-        _hybrid_state(
-            plan_overrides={"completeness_expectation": "targeted_scope"}
-        ),
-        _hybrid_state(plan_overrides={"contradiction_search_required": True}),
         _hybrid_state(
             exact_source_refs=[
                 {
@@ -7292,7 +7393,7 @@ def test_hybrid_supported_boundary_accepts_only_bounded_comparison():
         _hybrid_state(source_status="unavailable"),
     ]
     assert all(
-        state.supported_hybrid_comparison_path is False
+        state.supported_hybrid_path is False
         for state in variants
     )
 
@@ -7409,7 +7510,7 @@ async def test_hybrid_execution_is_stable_bounded_and_deduplicated():
         ],
     )
 
-    combined, trace = await execute_hybrid_comparison(
+    combined, trace = await execute_hybrid_acquisition(
         state=state,
         dsa=dsa,
         targeted_context_pack=targeted,
@@ -7492,7 +7593,7 @@ async def test_hybrid_selects_first_descriptor_bearing_result_and_first_mode():
         ],
     )
 
-    await execute_hybrid_comparison(
+    await execute_hybrid_acquisition(
         state=state,
         dsa=dsa,
         targeted_context_pack=targeted,
@@ -7539,7 +7640,7 @@ async def test_hybrid_execution_records_failures_without_retry(
         ],
     )
 
-    combined, trace = await execute_hybrid_comparison(
+    combined, trace = await execute_hybrid_acquisition(
         state=state,
         dsa=dsa,
         targeted_context_pack=targeted,
@@ -7564,7 +7665,7 @@ async def test_hybrid_missing_descriptor_records_unsupported_and_continues():
         context_responses=[_context_response(source_id="source_b")],
     )
 
-    _, trace = await execute_hybrid_comparison(
+    _, trace = await execute_hybrid_acquisition(
         state=state,
         dsa=dsa,
         targeted_context_pack=targeted,
@@ -7713,6 +7814,131 @@ def test_hybrid_facts_manifest_identity_and_privacy_are_prompt_aware():
         "query-a",
     ):
         assert prohibited not in serialized
+
+
+def test_targeted_facts_follow_actual_cross_source_coverage():
+    state = _cross_source_targeted_state()
+    context_pack = _targeted_hybrid_context_pack()
+    complete_refs = {
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+    }
+
+    complete = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs=complete_refs,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in complete} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+
+    partial = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs={"connector:source_a:seed-a"},
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in partial} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "partial",
+        "selected-source-coverage": "partial",
+    }
+
+
+def test_hybrid_material_facts_follow_actual_coverage_not_reasoning_shape():
+    state = _hybrid_state()
+    requirements = [
+        ("authoritative-inventory", "authoritative_inventory"),
+        ("candidate-coverage", "candidate_evidence_coverage"),
+        ("contradiction-search", "contradiction_search"),
+        ("counterevidence-coverage", "counterevidence_coverage"),
+        ("historical-scope", "historical_scope"),
+        ("historical-sequence", "historical_sequence_coverage"),
+        ("context-delivery", "context_delivery"),
+        ("no-material-truncation", "no_material_truncation"),
+        ("complete-scope", "complete_scope_coverage"),
+    ]
+    plan_data = state.plan.model_dump(mode="json")
+    plan_data.update(
+        {
+            "task_shape": "recommendation_or_decision_support",
+            "completeness_expectation": "bounded_decision_support",
+            "contradiction_search_required": True,
+            "authoritative_source_ids": ["source_a", "source_b"],
+            "declared_requirements": [
+                {
+                    "requirement_id": requirement_id,
+                    "requirement_kind": requirement_kind,
+                    "criticality": "material",
+                }
+                for requirement_id, requirement_kind in requirements
+            ],
+        }
+    )
+    plan = PlanResult.model_validate(plan_data)
+    state.expansion_attempts = [
+        {
+            "source_id": source_id,
+            "seed_source_ref": f"connector:{source_id}:seed",
+            "context_mode": "bounded_context",
+            "outcome": "satisfied",
+            "query_id": f"query-{source_id}",
+            "returned_reference_count": 1,
+        }
+        for source_id in ("source_a", "source_b")
+    ]
+    context_pack = _targeted_hybrid_context_pack()
+    retained = {
+        "connector:source_a:seed-a",
+        "connector:source_b:seed-b",
+    }
+
+    facts = _build_acquisition_facts(
+        plan=plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs=retained,
+        expansion_attempts=state.expansion_attempts,
+        declared_scope={"time_scope_ref": "bounded-window"},
+    )
+    outcomes = {item["requirement_id"]: item["outcome"] for item in facts}
+
+    assert outcomes == {
+        "authoritative-inventory": "satisfied",
+        "candidate-coverage": "satisfied",
+        "complete-scope": "unknown",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "counterevidence-coverage": "satisfied",
+        "historical-scope": "satisfied",
+        "historical-sequence": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+
+    partial = _build_acquisition_facts(
+        plan=plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs={"connector:source_a:seed-a"},
+        expansion_attempts=state.expansion_attempts,
+        declared_scope={"time_scope_ref": "bounded-window"},
+    )
+    partial_outcomes = {
+        item["requirement_id"]: item["outcome"] for item in partial
+    }
+    for requirement_id in (
+        "candidate-coverage",
+        "contradiction-search",
+        "counterevidence-coverage",
+        "historical-sequence",
+        "context-delivery",
+    ):
+        assert partial_outcomes[requirement_id] == "filtered"
+    assert partial_outcomes["complete-scope"] == "unknown"
 
 
 def test_comparison_scope_boundary_is_unconditional_and_idempotent():
@@ -8063,6 +8289,148 @@ def test_fetch_response_contract_rejects_malformed_or_unassociated_results(
             expected_source_id="source_a",
             expected_source_ref="connector:source_a:item-1",
         )
+
+
+def _cross_source_exact_state() -> EvidenceAcquisitionState:
+    source_ids = ["source_a", "source_b"]
+    exact_source_refs = [
+        {
+            "source_id": "source_a",
+            "source_ref": "connector:source_a:item-1",
+        },
+        {
+            "source_id": "source_b",
+            "source_ref": "connector:source_b:item-2",
+        },
+    ]
+    plan_data = _hybrid_plan_response(
+        strategy="exact_fetch",
+        eligible_source_ids=source_ids,
+    )["result"]
+    return EvidenceAcquisitionState(
+        enabled=True,
+        attempted=True,
+        status="acquisition_ready",
+        shape=ShapeResult.model_validate(_hybrid_shape_response()["result"]),
+        inventory=DsaSourceListResponse.model_validate(
+            {
+                "sources": [
+                    _source(source_id, capabilities=["profile", "fetch"])
+                    for source_id in source_ids
+                ]
+            }
+        ),
+        declared_scope={
+            "source_ids": source_ids,
+            "source_categories": [],
+            "exact_source_refs": exact_source_refs,
+            "inventory_status": "complete_for_declared_scope",
+            "time_scope_ref": None,
+            "version_scope_ref": None,
+            "domain_scope_ref": None,
+            "project_scope_ref": None,
+        },
+        plan=PlanResult.model_validate(plan_data),
+        exact_source_refs=exact_source_refs,
+    )
+
+
+def test_exact_strategy_admission_is_independent_of_reasoning_shape():
+    state = _cross_source_exact_state()
+
+    assert state.supported_exact_path is True
+    assert state.supported_governed_path is True
+    assert _validate_supported_plan(state) is True
+    assert "targeted_evidence" not in {
+        requirement.requirement_kind
+        for requirement in state.plan.declared_requirements
+    }
+
+    mismatched = copy.deepcopy(state)
+    mismatched.exact_source_refs = [state.exact_source_refs[0]]
+    assert mismatched.supported_exact_path is False
+
+    missing_capability = copy.deepcopy(state)
+    missing_capability.inventory.sources[1].capabilities = ["profile"]
+    assert missing_capability.supported_exact_path is False
+
+
+@pytest.mark.asyncio
+async def test_cross_source_exact_evidence_preserves_identity_and_coverage():
+    state = _cross_source_exact_state()
+    dsa = FakeDsa(
+        [],
+        fetch_responses=[
+            _fetch_response(),
+            _fetch_response(
+                source_id="source_b",
+                source_ref="connector:source_b:item-2",
+            ),
+        ],
+    )
+
+    context, trace = await execute_exact_fetches(state=state, dsa=dsa)
+
+    assert context is not None
+    assert [call[1]["source_ref"] for call in dsa.calls] == [
+        "connector:source_a:item-1",
+        "connector:source_b:item-2",
+    ]
+    assert [item["source_id"] for item in context["items"]] == [
+        "source_a",
+        "source_b",
+    ]
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context,
+        dsa_trace=trace,
+        retained_source_refs={
+            "connector:source_a:item-1",
+            "connector:source_b:item-2",
+        },
+        exact_source_refs=state.exact_source_refs,
+        exact_attempts=state.exact_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in facts} == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_source_exact_partial_evidence_remains_available():
+    state = _cross_source_exact_state()
+    dsa = FakeDsa(
+        [],
+        fetch_responses=[
+            _fetch_response(),
+            RuntimeError("PRIVATE DEPENDENCY ERROR"),
+        ],
+    )
+
+    context, trace = await execute_exact_fetches(state=state, dsa=dsa)
+
+    assert context is not None
+    assert [call[1]["source_ref"] for call in dsa.calls] == [
+        "connector:source_a:item-1",
+        "connector:source_b:item-2",
+    ]
+    assert context["sources_used"] == ["source_a"]
+    assert context["items"][0]["source_id"] == "source_a"
+    facts = _build_acquisition_facts(
+        plan=state.plan,
+        context_pack=context,
+        dsa_trace=trace,
+        retained_source_refs={"connector:source_a:item-1"},
+        exact_source_refs=state.exact_source_refs,
+        exact_attempts=state.exact_attempts,
+    )
+    assert {item["requirement_id"]: item["outcome"] for item in facts} == {
+        "context-delivery": "unknown",
+        "cross-source-comparison": "partial",
+        "selected-source-coverage": "partial",
+    }
 
 
 @pytest.mark.asyncio
@@ -8736,7 +9104,7 @@ def test_material_selected_source_coverage_keeps_path_specific_outcome():
         for fact in facts
     } == {
         "context-delivery": "satisfied",
-        "material-selected-source-coverage": "unknown",
+        "material-selected-source-coverage": "satisfied",
         "optional-selected-source-coverage": "partial",
         "targeted-evidence": "satisfied",
     }

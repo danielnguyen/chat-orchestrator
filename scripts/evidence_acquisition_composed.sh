@@ -6638,6 +6638,212 @@ run_general_evidence_reasoning_shadow_scenario() {
   fi
 }
 
+run_generalized_acquisition_reasoning_scenarios() {
+  local case_name expected_shape question owner client conversation_id
+  local external response request_id trace manifest provider_calls audit proposal claim
+  local alpha_ref beta_ref alpha_evidence_ref beta_evidence_ref
+  alpha_ref="ics_calendar:calendar_alpha:event:alpha-event"
+  beta_ref="ics_calendar:calendar_beta:event:beta-event"
+  alpha_evidence_ref="$alpha_ref"
+  beta_evidence_ref="$beta_ref"
+  external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
+
+  while IFS='|' read -r case_name expected_shape question claim; do
+    owner="owner-generalized-${case_name}"
+    client="client-generalized-${case_name}"
+    provider_post "/fixture/reset" '{}'
+    reset_source_fixture
+    reset_dsa_audit
+    proposal="$(jq -nc --arg claim "$claim" \
+      --arg alpha "$alpha_evidence_ref" --arg beta "$beta_evidence_ref" '
+      {
+        proposed_claim:$claim,
+        supporting_evidence_ref_ids:[$alpha,$beta],
+        counterevidence_ref_ids:[],
+        material_exclusions:[],
+        derivation_requests:[]
+      }')"
+    queue_provider_answer "$proposal"
+    conversation_id="$(resolve_conversation "$owner" "$client" "generalized-${case_name}")"
+    response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+    request_id="$(jq -er '.request_id' <<<"$response")"
+    trace="$(fetch_trace "$request_id")"
+    manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+    provider_calls="$(fetch_provider_calls "$request_id")"
+    audit="$(fetch_dsa_audit)"
+
+    if ! jq -e --arg claim "$claim" '
+      .status == "ok" and .pending_action == null
+      and (.answer | startswith($claim))
+    ' <<<"$response" >/dev/null 2>&1; then
+      printf 'Generalized %s response: %s\n' \
+        "$case_name" "$(jq -c . <<<"$response")" >&2
+      return 1
+    fi
+    assert_jq "generalized.${case_name}.acquisition" "$manifest" '
+      .shape.task_shape == $shape
+      and .plan.plan_status == "ready"
+      and .plan.selected_strategies == ["hybrid"]
+      and .acquisition.strategy_attempted == "hybrid"
+      and .acquisition.sources_selected == ["calendar_alpha","calendar_beta"]
+      and .acquisition.sources_used == ["calendar_alpha","calendar_beta"]
+      and .acquisition.expansion_attempt_count == 2
+      and .acquisition.expansion_successful_count == 2
+      and .acquisition.prompt_retained_item_count >= 2
+    ' --arg shape "$expected_shape"
+    assert_jq "generalized.${case_name}.authority" "$trace" '
+      .prompt.general_evidence_reasoning.attempted == true
+      and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+      and .prompt.general_evidence_reasoning.validation_status == "accepted"
+      and .prompt.general_evidence_reasoning.cr_call_count == 1
+      and (.prompt.general_evidence_reasoning.cr_conclusion_disposition
+        == "allowed" or
+        .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified")
+      and .prompt.general_evidence_reasoning.presented_to_user == true
+      and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+      and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    '
+    assert_semantic_interpreter_calls "$provider_calls" 0
+    assert_general_evidence_reasoning_calls "$provider_calls" 1
+    assert_diagnostic_advisory_calls "$provider_calls" 0
+    assert_jq "generalized.${case_name}.provider" "$provider_calls" '
+      ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+    '
+    assert_jq "generalized.${case_name}.dsa" "$audit" '
+      ([.[] | select(.operation == "context_pack")] | length) == 1
+      and ([.[] | select(.operation == "context")] | length) == 2
+      and ([.[] | select(.operation == "fetch")] | length) == 0
+    '
+    assert_persisted_answer_matches \
+      "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
+  done <<'CASES'
+contradiction|contradiction_review|Review the selected records for potentially conflicting evidence.|The bounded records support a contradiction-sensitive synthesis.
+decision|recommendation_or_decision_support|Assess the selected records as bounded evidence for a decision.|The bounded records support a qualified decision synthesis.
+CASES
+
+  question="Check whether every mandatory record in the Migration Records is reviewed."
+  claim="The complete migration records support the bounded synthesis."
+  owner="owner-generalized-full-scope"
+  client="client-generalized-full-scope"
+  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":1}'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  local complete_ref complete_evidence_ref
+  complete_ref="google_sheets:records_primary:Records!A2:C3"
+  complete_evidence_ref="external-source:$(printf '%s' "$complete_ref" | sha256sum | cut -d' ' -f1)"
+  queue_provider_answer "$(jq -nc --arg claim "$claim" --arg ref "$complete_evidence_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "generalized-full-scope")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  if ! jq -e --arg claim "$claim" '
+    .status == "ok" and .pending_action == null and (.answer | startswith($claim))
+  ' <<<"$response" >/dev/null 2>&1; then
+    printf 'Generalized full-scope response: %s\n' \
+      "$(jq -c . <<<"$response")" >&2
+    printf 'Generalized full-scope acquisition: %s\n' "$manifest" >&2
+    printf 'Generalized full-scope reasoning: %s\n' \
+      "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" >&2
+    return 1
+  fi
+  assert_jq "generalized.full_scope.acquisition" "$manifest" '
+    .shape.task_shape == "bounded_exhaustive_review"
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["hybrid"]
+    and .acquisition.strategy_attempted == "hybrid"
+    and .acquisition.expansion_attempt_count == 1
+    and .acquisition.expansion_successful_count == 1
+    and .acquisition.prompt_retained_item_count == 1
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "generalized.full_scope.authority" "$trace" '
+    .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_dsa_operation_counts "$audit" 1 1 0
+
+  question="Review the selected records for potentially conflicting evidence."
+  owner="owner-generalized-partial"
+  client="client-generalized-partial"
+  external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  configure_source_fixture "calendar-beta" "unavailable_after_first"
+  reset_dsa_audit
+  queue_provider_answer "$(jq -nc --arg ref "$alpha_evidence_ref" '
+    {
+      proposed_claim:"Only the retained record can be considered.",
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  queue_diagnostic_advisory \
+    "One selected source was unavailable during bounded acquisition." \
+    "Consider trying the bounded review again later."
+  conversation_id="$(resolve_conversation "$owner" "$client" "generalized-partial")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  if ! jq -e '
+    .status == "ok" and .pending_action == null
+    and (.answer | contains("source lookup failed with an upstream HTTP 503"))
+    and (.answer | contains("Only the retained record can be considered.") | not)
+  ' <<<"$response" >/dev/null 2>&1; then
+    printf 'Generalized partial response: %s\n' \
+      "$(jq -c . <<<"$response")" >&2
+    printf 'Generalized partial acquisition: %s\n' "$manifest" >&2
+    printf 'Generalized partial reasoning: %s\n' \
+      "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" >&2
+    return 1
+  fi
+  assert_jq "generalized.partial.acquisition" "$manifest" '
+    .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["hybrid"]
+    and .acquisition.sources_used == ["calendar_alpha","calendar_beta"]
+    and .acquisition.expansion_attempt_count == 2
+    and .acquisition.expansion_successful_count == 1
+    and .acquisition.prompt_retained_item_count >= 1
+    and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
+  '
+  assert_jq "generalized.partial.authority" "$trace" '
+    .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition != "allowed"
+    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_jq "generalized.partial.dsa" "$audit" '
+    ([.[] | select(.operation == "context_pack")] | length) == 1
+    and ([.[] | select(.operation == "context")] | length) == 2
+    and ([.[] | select(.operation == "fetch")] | length) == 0
+  '
+  configure_source_fixture "calendar-beta" "ready"
+  echo "Generalized acquisition reasoning: contradiction=presented decision=presented full_scope=presented partial=withheld actions=0 retries=0 repairs=0 reacquisition=0"
+}
+
 run_authority_comparison_incomplete_scope_case() {
   local owner client conversation_id question external response request_id trace
   local provider_calls audit
@@ -7106,6 +7312,7 @@ run_evidence_acquisition_composed_suite() {
       ;;
     general-reasoning-presentation)
       run_general_evidence_reasoning_shadow_scenario true
+      run_generalized_acquisition_reasoning_scenarios
       run_authority_comparison_equivalent_case
       run_authority_comparison_consequence_case
       run_authority_comparison_failure_case
@@ -7113,7 +7320,7 @@ run_evidence_acquisition_composed_suite() {
       restart_orchestrator_with_generic_presentation false
       run_general_evidence_reasoning_shadow_scenario false
       restart_orchestrator_with_generic_presentation true
-      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-presentation,equivalent,consequence,failure,rollback"
+      echo "Evidence acquisition composed smoke passed: scenarios=general-reasoning-presentation,generalized-acquisition,equivalent,consequence,failure,rollback"
       ;;
     history-hybrid)
       run_evidence_history_hybrid_scenario

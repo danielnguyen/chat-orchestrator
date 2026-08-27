@@ -97,7 +97,7 @@ from services.evidence_acquisition import (
     execute_aggregate_values,
     execute_bounded_exhaustive_review,
     execute_exact_fetches,
-    execute_hybrid_comparison,
+    execute_hybrid_acquisition,
     finalize_aggregate_conclusion,
     governed_evidence_claim_anchor,
     grounded_evidence_response_format,
@@ -9844,7 +9844,7 @@ async def orchestrate_chat(
                             dsa=dsa,
                             dsa_trace=dsa_trace,
                         )
-                    elif evidence_acquisition.supported_bounded_exhaustive_path:
+                    elif evidence_acquisition.supported_complete_scope_path:
                         governed_plan = evidence_acquisition.plan
                         if governed_plan is None:
                             raise RuntimeError(
@@ -9892,7 +9892,7 @@ async def orchestrate_chat(
                                 dsa_trace=dsa_trace,
                             )
                         )
-                    elif evidence_acquisition.supported_hybrid_comparison_path:
+                    elif evidence_acquisition.supported_hybrid_path:
                         governed_plan = evidence_acquisition.plan
                         if governed_plan is None:
                             raise RuntimeError("hybrid_plan_unavailable")
@@ -9922,7 +9922,7 @@ async def orchestrate_chat(
                                             governed_plan.eligible_source_ids
                                         ),
                                         preserve_available_context=True,
-                                        require_all_eligible_sources=True,
+                                        require_all_eligible_sources=False,
                                     )
                                 ),
                                 preserve_available_context=True,
@@ -9933,7 +9933,7 @@ async def orchestrate_chat(
                         )
                         if external_context_pack is not None:
                             external_context_pack, dsa_trace = (
-                                await execute_hybrid_comparison(
+                                await execute_hybrid_acquisition(
                                     state=evidence_acquisition,
                                     dsa=dsa,
                                     targeted_context_pack=external_context_pack,

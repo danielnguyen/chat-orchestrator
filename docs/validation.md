@@ -177,7 +177,9 @@ EVIDENCE_ACQUISITION_ONLY=1 make composed-smoke
 ```
 
 That mode exercises real HTTP planning, inventory and capability discovery,
-targeted retrieval, exact fetch, hybrid comparison, configured-worksheet review,
+targeted retrieval, exact fetch, strategy-based hybrid acquisition across
+comparison, contradiction-sensitive, and decision-support planning shapes,
+configured-worksheet full-scope review, conservative partial-source coverage,
 prompt retention, sufficiency, deterministic next-step selection, one bounded
 changed-premise exact follow-up, provider gating, response qualification, durable
 message/trace/manifest association, eligible claim support, response-first
@@ -185,6 +187,12 @@ acquisition history, privacy suppression, isolation, and compound new verificati
 Positive records are created through the normal CO and BMS lifecycle. SQL reads are
 used only to confirm durability; the two fail-closed history cases corrupt an
 already-valid retained trace after that lifecycle has completed.
+
+The formatted general-reasoning presentation proof additionally verifies that
+newly executable ready plans reach the existing general reasoner and Cognitive
+Runtime claim-support evaluator, without task-specific answer providers, tools,
+retries, repair, or diagnostic reacquisition. Its partial-coverage case retains
+usable evidence while preventing an unqualified complete conclusion.
 
 Run only the server-owned admission and advisory composition proof with:
 

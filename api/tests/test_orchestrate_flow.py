@@ -14388,6 +14388,16 @@ def _governed_context_pack(query: str) -> dict[str, object]:
     }
 
 
+def _neutral_diagnostic_runtime(*, request_id: str, question: str):
+    return FakeRuntime(
+        evidence_plan_response=_targeted_plan_response(
+            request_id=request_id,
+            question=question,
+            eligible_source_ids=["records_primary"],
+        )
+    )
+
+
 def _neutral_reasoning_context_pack(*, query: str, text: str) -> dict[str, object]:
     response = _governed_context_pack(query)
     response["sources_used"] = ["neutral_records"]
@@ -14452,6 +14462,31 @@ def _multi_source_governed_context_pack(query: str) -> dict[str, object]:
     diagnostics["candidate_counts_by_source"] = {
         "vehicle_log_primary": 1,
         "vehicle_log_secondary": 1,
+    }
+    return response
+
+
+def _neutral_multi_source_context_pack(query: str) -> dict[str, object]:
+    response = _multi_source_governed_context_pack(query)
+    source_ids = ("records_primary", "records_secondary")
+    response["sources_used"] = list(source_ids)
+    for index, (item, source_id) in enumerate(
+        zip(response["items"], source_ids, strict=True), start=1
+    ):
+        item.update(
+            {
+                "source_id": source_id,
+                "source_name": f"Records {index}",
+                "source_ref": f"{source_id}:record_{index}",
+                "title": f"Bounded record {index}",
+                "text": f"Bounded neutral evidence item {index}.",
+            }
+        )
+    diagnostics = response["diagnostics"]
+    diagnostics["considered_source_ids"] = list(source_ids)
+    diagnostics["selected_source_ids"] = list(source_ids)
+    diagnostics["candidate_counts_by_source"] = {
+        source_id: 1 for source_id in source_ids
     }
     return response
 
@@ -14820,16 +14855,15 @@ def _hybrid_plan_response(
     request_id: str,
     question: str,
     task_shape: str = "cross_source_comparison",
+    eligible_source_ids: list[str] | None = None,
 ) -> dict[str, object]:
     response = _targeted_plan_response(
         request_id=request_id,
         question=question,
         strategy="hybrid",
         task_shape=task_shape,
-        eligible_source_ids=[
-            "vehicle_log_primary",
-            "vehicle_log_secondary",
-        ],
+        eligible_source_ids=eligible_source_ids
+        or ["vehicle_log_primary", "vehicle_log_secondary"],
     )
     result = response["result"]
     result["completeness_expectation"] = "complete_for_selected_sources"
@@ -14851,6 +14885,43 @@ def _hybrid_plan_response(
             "criticality": "material",
         },
     ]
+    if task_shape == "contradiction_review":
+        result["contradiction_search_required"] = True
+        result["declared_requirements"] = [
+            {
+                "requirement_id": "contradiction-search",
+                "requirement_kind": "contradiction_search",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "counterevidence-coverage",
+                "requirement_kind": "counterevidence_coverage",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "context-delivery",
+                "requirement_kind": "context_delivery",
+                "criticality": "material",
+            },
+        ]
+    elif task_shape == "recommendation_or_decision_support":
+        result["completeness_expectation"] = "bounded_decision_support"
+        result["contradiction_search_required"] = True
+        result["declared_requirements"] = [
+            {
+                "requirement_id": kind.replace("_", "-"),
+                "requirement_kind": kind,
+                "criticality": "material",
+            }
+            for kind in (
+                "candidate_evidence_coverage",
+                "cross_source_comparison",
+                "contradiction_search",
+                "counterevidence_coverage",
+                "context_delivery",
+                "no_material_truncation",
+            )
+        ]
     return response
 
 
@@ -15169,19 +15240,48 @@ async def _run_hybrid_comparison_case(
     privacy_context_enabled: bool = False,
     configured_scope_refs: dict[str, str] | None = None,
     requested_scope_refs: dict[str, str] | None = None,
+    task_shape: str = "cross_source_comparison",
+    general_reasoning_completion: dict[str, object] | None = None,
+    presentation_enabled: bool = False,
+    source_ids: tuple[str, str] = (
+        "vehicle_log_primary",
+        "vehicle_log_secondary",
+    ),
+    question: str = "Compare the maintenance history in these two vehicle logs.",
 ):
     rules, models = _write_default_route_files(tmp_path)
-    question = "Compare the maintenance history in these two vehicle logs."
+    if general_reasoning_completion is not None:
+        models.write_text(
+            models.read_text(encoding="utf-8")
+            + "logical_routes:\n"
+            + "  evidence_reasoning:\n"
+            + "    model: gpt-5-mini\n"
+            + "    provider: cloud\n",
+            encoding="utf-8",
+        )
+    expanded_texts = (
+        (
+            "Primary expanded history includes an oil change.",
+            "Secondary expanded history includes a tire rotation.",
+        )
+        if source_ids == ("vehicle_log_primary", "vehicle_log_secondary")
+        else (
+            "Primary expanded record contains bounded evidence.",
+            "Secondary expanded record contains bounded evidence.",
+        )
+    )
     request_id = "rid-evidence-hybrid-comparison"
     runtime = FakeRuntime(
         evidence_shape_response=_derived_shape_response(
             request_id=request_id,
             question=question,
-            task_shape="cross_source_comparison",
+            task_shape=task_shape,
         ),
         evidence_plan_response=_hybrid_plan_response(
             request_id=request_id,
             question=question,
+            task_shape=task_shape,
+            eligible_source_ids=list(source_ids),
         ),
         privacy_context_response=privacy_context_response,
     )
@@ -15200,10 +15300,7 @@ async def _run_hybrid_comparison_case(
                 "last_checked_at": "2026-07-17T00:00:00Z",
                 "last_error": None,
             }
-            for source_id in (
-                "vehicle_log_primary",
-                "vehicle_log_secondary",
-            )
+            for source_id in source_ids
         ]
     }
     if configured_scope_refs is not None:
@@ -15217,32 +15314,38 @@ async def _run_hybrid_comparison_case(
             if context_responses is not None
             else [
                 _hybrid_context_response(
-                    source_id="vehicle_log_primary",
-                    source_ref="vehicle_log_primary:expanded_1",
-                    text="Primary expanded history includes an oil change.",
+                    source_id=source_ids[0],
+                    source_ref=f"{source_ids[0]}:expanded_1",
+                    text=expanded_texts[0],
                 ),
                 _hybrid_context_response(
-                    source_id="vehicle_log_secondary",
-                    source_ref="vehicle_log_secondary:expanded_2",
-                    text="Secondary expanded history includes a tire rotation.",
+                    source_id=source_ids[1],
+                    source_ref=f"{source_ids[1]}:expanded_2",
+                    text=expanded_texts[1],
                 ),
             ]
         ),
     )
-    litellm = FakeLiteLLM(
-        content=provider_answer
-        or _evidence_candidate(
-            (
-                "vehicle_log_primary:expanded_1",
-                "Primary expanded history includes an oil change.",
-            ),
-            (
-                "vehicle_log_secondary:expanded_2",
-                "Secondary expanded history includes a tire rotation.",
-            ),
-        )
+    legacy_answer = provider_answer or _evidence_candidate(
+        (
+            f"{source_ids[0]}:expanded_1",
+            expanded_texts[0],
+        ),
+        (
+            f"{source_ids[1]}:expanded_2",
+            expanded_texts[1],
+        ),
     )
-    memory_store = memory_store or FakeMemoryStore()
+    litellm = (
+        SequenceLiteLLM([general_reasoning_completion])
+        if general_reasoning_completion is not None
+        else FakeLiteLLM(content=legacy_answer)
+    )
+    memory_store = memory_store or (
+        ClaimCaptureMemoryStore()
+        if general_reasoning_completion is not None
+        else FakeMemoryStore()
+    )
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             question,
@@ -15264,12 +15367,233 @@ async def _run_hybrid_comparison_case(
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
         privacy_context_enabled=privacy_context_enabled,
+        claim_record_capture_enabled=general_reasoning_completion is not None,
+        general_evidence_reasoning_enabled=general_reasoning_completion is not None,
+        general_evidence_reasoning_presentation_enabled=presentation_enabled,
+        general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
         request_id=request_id,
     )
     return out, runtime, dsa, litellm, memory_store
+
+
+async def _run_targeted_cross_source_case(
+    *,
+    tmp_path,
+    partial: bool = False,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_reasoning:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    question = "Compare the bounded records from the selected sources."
+    request_id = "rid-evidence-targeted-cross-source"
+    source_ids = ["records_primary", "records_secondary"]
+    plan = _hybrid_plan_response(
+        request_id=request_id,
+        question=question,
+        eligible_source_ids=source_ids,
+    )
+    plan["result"]["selected_strategies"] = ["targeted_retrieval"]
+    runtime = FakeRuntime(
+        evidence_shape_response=_derived_shape_response(
+            request_id=request_id,
+            question=question,
+            task_shape="cross_source_comparison",
+        ),
+        evidence_plan_response=plan,
+    )
+    context_pack = _neutral_multi_source_context_pack(question)
+    if partial:
+        context_pack["items"] = context_pack["items"][:1]
+        context_pack["sources_used"] = [source_ids[0]]
+        context_pack["budget"]["returned_results"] = 1
+        context_pack["diagnostics"]["selected_source_ids"] = [source_ids[0]]
+        context_pack["diagnostics"]["candidate_counts_by_source"] = {
+            source_ids[0]: 1,
+        }
+    dsa = FakeDSA(
+        response=context_pack,
+        source_response={
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "display_name": f"Record Source {index}",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["records"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+                for index, source_id in enumerate(source_ids, start=1)
+            ]
+        },
+    )
+    evidence_refs = [
+        governed_external_reference_id(item["source_ref"])
+        for item in context_pack["items"]
+    ]
+    litellm = SequenceLiteLLM(
+        [
+            _general_reasoning_completion(
+                proposed_claim=(
+                    "The retained bounded records support a qualified comparison."
+                ),
+                evidence_ref_id=evidence_refs[0],
+                supporting_evidence_ref_ids=evidence_refs,
+            )
+        ]
+    )
+    memory_store = ClaimCaptureMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=True,
+        general_evidence_reasoning_timeout_ms=5000,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+    return out, runtime, dsa, litellm, memory_store
+
+
+@pytest.mark.asyncio
+async def test_targeted_retrieval_runs_cross_source_generic_reasoning(tmp_path):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_targeted_cross_source_case(tmp_path=tmp_path)
+    )
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert out["status"] == "ok"
+    assert "qualified comparison" in out["answer"]
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["source_ids"] == [
+        "records_primary",
+        "records_secondary",
+    ]
+    assert dsa.context_calls == []
+    assert dsa.fetch_calls == []
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    } == {
+        "context-delivery": "satisfied",
+        "cross-source-comparison": "satisfied",
+        "selected-source-coverage": "satisfied",
+    }
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert out.get("pending_action") is None
+    reasoning = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning["reasoning_provider_call_count"] == 1
+    assert reasoning["cr_call_count"] == 1
+    assert reasoning["presented_to_user"] is True
+
+
+@pytest.mark.asyncio
+async def test_targeted_retrieval_partial_cross_source_coverage_is_conservative(
+    tmp_path,
+):
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_targeted_cross_source_case(tmp_path=tmp_path, partial=True)
+    )
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts["selected-source-coverage"] == "partial"
+    assert facts["cross-source-comparison"] == "partial"
+    assert len(dsa.calls) == 1
+    assert dsa.calls[0]["source_ids"] == [
+        "records_primary",
+        "records_secondary",
+    ]
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert trace["prompt"]["general_evidence_reasoning"][
+        "presented_to_user"
+    ] is False
+    assert trace["prompt"]["general_evidence_reasoning"][
+        "cr_conclusion_disposition"
+    ] != "allowed"
+    assert "qualified comparison" not in out["answer"]
+    assert out.get("pending_action") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_shape",
+    ["contradiction_review", "recommendation_or_decision_support"],
+)
+async def test_generic_reasoning_consumes_hybrid_evidence_across_shapes(
+    tmp_path,
+    task_shape,
+):
+    evidence_refs = [
+        governed_external_reference_id(source_ref)
+        for source_ref in (
+            "records_primary:expanded_1",
+            "records_secondary:expanded_2",
+        )
+    ]
+    completion = _general_reasoning_completion(
+        proposed_claim="The bounded records support a qualified synthesis.",
+        evidence_ref_id=evidence_refs[0],
+        supporting_evidence_ref_ids=evidence_refs,
+    )
+
+    out, runtime, dsa, litellm, memory_store = await _run_hybrid_comparison_case(
+        tmp_path=tmp_path,
+        task_shape=task_shape,
+        context_pack=_neutral_multi_source_context_pack(
+            "Synthesize the bounded records for the requested review."
+        ),
+        general_reasoning_completion=completion,
+        presentation_enabled=True,
+        source_ids=("records_primary", "records_secondary"),
+        question="Synthesize the bounded records for the requested review.",
+    )
+
+    trace = memory_store.trace_calls[-1]["payload"]
+    assert out["status"] == "ok"
+    assert "bounded records support a qualified synthesis" in out["answer"]
+    assert len(dsa.calls) == 1
+    assert len(dsa.context_calls) == 2
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert out.get("pending_action") is None
+    reasoning = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning["attempted"] is True
+    assert reasoning["reasoning_provider_call_count"] == 1
+    assert reasoning["cr_call_count"] == 1
+    assert reasoning["presented_to_user"] is True
 
 
 async def _run_bounded_exhaustive_case(
@@ -20070,7 +20394,9 @@ async def test_partial_inventory_remains_limited_through_governed_answer(tmp_pat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("strategy", ["exact_fetch", "bounded_full_context", "hybrid"])
+@pytest.mark.parametrize(
+    "strategy", ["exact_fetch", "bounded_full_context", "structured_query", "hybrid"]
+)
 async def test_evidence_acquisition_non_targeted_strategy_is_provider_and_acquisition_free(
     tmp_path,
     strategy,
@@ -20183,40 +20509,70 @@ async def test_evidence_acquisition_unsupported_shape_is_provider_and_acquisitio
     [
         "bounded_exhaustive_review",
         "contradiction_review",
-        "absence_or_coverage_check",
         "historical_reconstruction",
         "recommendation_or_decision_support",
     ],
 )
-async def test_hybrid_non_comparison_shapes_remain_acquisition_and_provider_free(
+async def test_hybrid_acquisition_executes_across_reasoning_shapes(
     tmp_path,
     task_shape,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Perform the requested bounded evidence review."
-    request_id = f"rid-evidence-hybrid-unsupported-{task_shape}"
+    request_id = f"rid-evidence-hybrid-{task_shape}"
+    plan = _hybrid_plan_response(
+        request_id=request_id,
+        question=question,
+        task_shape=task_shape,
+    )
+    plan["result"]["eligible_source_ids"] = [
+        "records_primary",
+        "records_secondary",
+    ]
     runtime = FakeRuntime(
         evidence_shape_response=_derived_shape_response(
             request_id=request_id,
             question=question,
             task_shape=task_shape,
         ),
-        evidence_plan_response=_hybrid_plan_response(
-            request_id=request_id,
-            question=question,
-            task_shape=task_shape,
-        ),
+        evidence_plan_response=plan,
     )
-    schedule_sources = _neutral_schedule_sources()
-    schedule_sources[0]["content_fields"] = ["PRIVATE-CONTENT-FIELD-SENTINEL"]
+    context_pack = _multi_source_governed_context_pack(question)
+    context_pack["sources_used"] = ["records_primary", "records_secondary"]
+    context_pack["diagnostics"]["considered_source_ids"] = [
+        "records_primary",
+        "records_secondary",
+    ]
+    context_pack["diagnostics"]["selected_source_ids"] = [
+        "records_primary",
+        "records_secondary",
+    ]
+    context_pack["diagnostics"]["candidate_counts_by_source"] = {
+        "records_primary": 1,
+        "records_secondary": 1,
+    }
+    for item, source_id in zip(
+        context_pack["items"],
+        ("records_primary", "records_secondary"),
+        strict=True,
+    ):
+        item["source_id"] = source_id
+        item["source_ref"] = f"neutral_connector:{source_id}:seed"
+        item["available_context"] = [
+            {
+                "context_mode": "surrounding",
+                "description": "Bounded related records.",
+            }
+        ]
     dsa = FakeDSA(
+        response=context_pack,
         source_response={
             "sources": [
                 {
                     "source_id": source_id,
                     "display_name": source_id,
                     "connector": "neutral_connector",
-                    "domain_tags": ["vehicle"],
+                    "domain_tags": ["records"],
                     "sensitivity": "medium",
                     "access_mode": "read_only",
                     "capabilities": ["profile", "search", "context"],
@@ -20226,20 +20582,44 @@ async def test_hybrid_non_comparison_shapes_remain_acquisition_and_provider_free
                     "last_error": None,
                 }
                 for source_id in (
-                    "vehicle_log_primary",
-                    "vehicle_log_secondary",
+                    "records_primary",
+                    "records_secondary",
                 )
             ]
-        }
+        },
+        context_responses=[
+            _hybrid_context_response(
+                source_id="records_primary",
+                source_ref="neutral_connector:records_primary:expanded",
+                text="Primary bounded evidence.",
+            ),
+            _hybrid_context_response(
+                source_id="records_secondary",
+                source_ref="neutral_connector:records_secondary:expanded",
+                text="Secondary bounded evidence.",
+            ),
+        ],
     )
-    litellm = FakeLiteLLM()
+    litellm = FakeLiteLLM(
+        content=_evidence_candidate(
+            (
+                "neutral_connector:records_primary:expanded",
+                "Primary bounded evidence.",
+            ),
+            (
+                "neutral_connector:records_secondary:expanded",
+                "Secondary bounded evidence.",
+            ),
+        )
+    )
+    memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             question,
             external_context_enabled=True,
         ),
-        memory_store=FakeMemoryStore(),
+        memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
         dsa=dsa,
@@ -20252,17 +20632,18 @@ async def test_hybrid_non_comparison_shapes_remain_acquisition_and_provider_free
         request_id=request_id,
     )
 
-    assert out["answer"] == (
-        "I can’t safely complete that evidence request with the currently "
-        "available source capabilities."
-    )
+    assert out["answer"]
     assert len(dsa.list_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
-    assert dsa.calls == []
-    assert dsa.context_calls == []
+    assert len(dsa.calls) == 1
+    assert len(dsa.context_calls) == 2
     assert dsa.fetch_calls == []
-    assert runtime.evidence_sufficiency_calls == []
-    assert litellm.calls == []
+    assert len(runtime.evidence_sufficiency_calls) == 1
+    assert len(litellm.calls) == 1
+    assert (
+        litellm.calls[0]["response_format"]["json_schema"]["name"]
+        == "grounded_evidence_response"
+    )
 
 
 @pytest.mark.asyncio
@@ -20358,7 +20739,10 @@ async def test_step13_dsa_failure_uses_one_bounded_advisory_and_no_answer_provid
 ):
     rules, models = _write_diagnostic_route_files(tmp_path, include_interpreter=True)
     memory_store = FakeMemoryStore()
-    runtime = FakeRuntime()
+    question = "Verify a record in Configured Records."
+    runtime = _neutral_diagnostic_runtime(
+        request_id="rid-step13-dsa-advisory", question=question
+    )
     dsa = FakeDSA(
         error=_trusted_dsa_http_failure(),
         source_response=_neutral_diagnostic_source_response(),
@@ -20373,7 +20757,7 @@ async def test_step13_dsa_failure_uses_one_bounded_advisory_and_no_answer_provid
     )
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
-            "Verify a record in Configured Records.",
+            question,
             external_context_enabled=True,
         ),
         memory_store=memory_store,
@@ -20463,6 +20847,7 @@ async def test_step13_diagnostic_failure_renders_facts_without_retry_or_fallback
 ):
     rules, models = _write_diagnostic_route_files(tmp_path, include_interpreter=True)
     memory_store = FakeMemoryStore()
+    question = "Verify a record in Configured Records."
     dsa = FakeDSA(
         error=_trusted_dsa_http_failure(),
         source_response=_neutral_diagnostic_source_response(),
@@ -20478,11 +20863,13 @@ async def test_step13_diagnostic_failure_renders_facts_without_retry_or_fallback
 
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
-            "Verify a record in Configured Records.", external_context_enabled=True
+            question, external_context_enabled=True
         ),
         memory_store=memory_store,
         litellm=litellm,
-        runtime=FakeRuntime(),
+        runtime=_neutral_diagnostic_runtime(
+            request_id="rid-step13-diagnostic-failure", question=question
+        ),
         dsa=dsa,
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
@@ -20516,6 +20903,7 @@ async def test_step13_diagnostic_cloud_policy_gate_renders_facts_without_call(
 ):
     rules, models = _write_diagnostic_route_files(tmp_path, include_interpreter=True)
     memory_store = FakeMemoryStore()
+    question = "Verify a record in Configured Records."
     litellm = SequenceLiteLLM(
         [
             _evidence_interpreter_completion(
@@ -20524,7 +20912,7 @@ async def test_step13_diagnostic_cloud_policy_gate_renders_facts_without_call(
         ]
     )
     payload = _first_party_chat_payload(
-        "Verify a record in Configured Records.", external_context_enabled=True
+        question, external_context_enabled=True
     )
     payload["surface_context"]["sensitivity_level"] = "restricted"
 
@@ -20532,7 +20920,9 @@ async def test_step13_diagnostic_cloud_policy_gate_renders_facts_without_call(
         payload=payload,
         memory_store=memory_store,
         litellm=litellm,
-        runtime=FakeRuntime(),
+        runtime=_neutral_diagnostic_runtime(
+            request_id="rid-step13-policy-gate", question=question
+        ),
         dsa=FakeDSA(
             error=_trusted_dsa_http_failure(),
             source_response=_neutral_diagnostic_source_response(),

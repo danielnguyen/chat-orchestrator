@@ -285,9 +285,11 @@ evidence shape. A `not_applicable` result returns to ordinary answering without
 listing, searching, fetching, or expanding DSA sources. A derived result then
 reads the governed DSA source inventory, adapts the neutral source capabilities,
 and asks Cognitive Runtime to compile an evidence plan. Governed execution
-proceeds for a derived `targeted_lookup` whose ready plan selects only
-`targeted_retrieval` or `exact_fetch`, and for the bounded hybrid comparison and
-bounded exhaustive-review contracts described below. Bounded trace metadata
+proceeds when that ready plan selects a strategy Chat Orchestrator can execute:
+`targeted_retrieval`, `exact_fetch`, `hybrid`, or the bounded structured-field
+contract described below. Admission follows the selected strategy and exact
+planned source scope rather than treating the reasoning task shape as an
+execution allow-list. Bounded trace metadata
 distinguishes `client_request`, `evidence_policy`, and `not_requested` activation
 without storing the task text.
 
@@ -319,15 +321,19 @@ Context-pack items may also declare bounded `available_context` descriptors for
 connector-owned expansion modes. The targeted path strictly validates and then
 removes those descriptors without executing them.
 
-The first hybrid path is limited to a ready `cross_source_comparison` plan over
-two to eight selected sources, with `complete_for_selected_sources` completeness,
-no exact references, no contradiction search, and material selected-source
-coverage, cross-source comparison, and context-delivery requirements. Every
-selected source must be available and support both targeted retrieval and context
-expansion. Other hybrid task shapes remain unsupported.
+The hybrid path accepts a ready plan over one to eight selected sources with no
+exact references. Every selected source must be available and support both
+targeted retrieval and context expansion. The same bounded executor is used for
+comparison, contradiction-sensitive, historical, decision-support, and other
+planning shapes when Cognitive Runtime selects `hybrid`; no task-specific
+reasoning executor is introduced. Strategies not implemented by the current DSA
+adapter, including native `bounded_full_context` and `structured_query`, remain
+fail-closed at this caller boundary.
 
 Hybrid execution makes one targeted context-pack request over the exact planned
-source IDs, requiring at least one result from each. In stable source order, it
+source IDs. Usable authorized results are retained when another selected source
+is missing or fails; the missing coverage remains explicit for sufficiency and
+claim-support policy. In stable source order, it
 chooses the first result that declares an expansion option and that result's
 first connector-declared mode. It makes at most one sequential context call per
 source, with no retry, replacement search, connector-specific inference, or
@@ -344,6 +350,18 @@ raw connector data, and cache internals do not enter the provider prompt.
 After prompt assembly, Chat Orchestrator reports requirement outcomes based on
 what was actually acquired and what external context survived into provider
 reasoning.
+Selected-source, candidate, contradiction-search, counterevidence, historical,
+delivery, complete-scope, and truncation facts describe mechanical acquisition
+coverage; they do not claim that deterministic code performed the semantic
+reasoning. Ordinary bounded context is not proof of complete scope. General
+reasoning may use partial retained evidence, while Cognitive Runtime remains
+responsible for qualifying or withholding claims whose material coverage was
+not established.
+Process-failure diagnosis follows the acquisition strategy that actually ran.
+It remains bounded recovery for dependency, malformed-response, retrieval-limit,
+and mechanical aggregate failures; an unfamiliar downstream reasoning operation
+does not trigger diagnosis, and a successful governed reasoning result does not
+need the diagnostic provider.
 For exact fetch, every declared reference must return a valid untruncated result,
 and every returned reference must survive in the final provider prompt. Partial,
 missing, malformed, failed, truncated, or prompt-filtered exact coverage cannot
