@@ -6639,31 +6639,21 @@ run_general_evidence_reasoning_shadow_scenario() {
 }
 
 run_generalized_acquisition_reasoning_scenarios() {
-  local case_name operation expected_shape question owner client conversation_id
+  local case_name expected_shape question owner client conversation_id
   local external response request_id trace manifest provider_calls audit proposal claim
   local alpha_ref beta_ref alpha_evidence_ref beta_evidence_ref
   alpha_ref="ics_calendar:calendar_alpha:event:alpha-event"
   beta_ref="ics_calendar:calendar_beta:event:beta-event"
   alpha_evidence_ref="external-source:$(printf '%s' "$alpha_ref" | sha256sum | cut -d' ' -f1)"
   beta_evidence_ref="external-source:$(printf '%s' "$beta_ref" | sha256sum | cut -d' ' -f1)"
-  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":2}'
+  external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
 
-  while IFS='|' read -r case_name operation expected_shape question claim; do
+  while IFS='|' read -r case_name expected_shape question claim; do
     owner="owner-generalized-${case_name}"
     client="client-generalized-${case_name}"
     provider_post "/fixture/reset" '{}'
     reset_source_fixture
     reset_dsa_audit
-    queue_semantic_interpretation "$(jq -nc \
-      --arg request_text "$question" --arg operation "$operation" '
-      {
-        expected_request_text:$request_text,
-        expected_source_id:"calendar_alpha",
-        expected_content_fields:["description","end","location","start","summary"],
-        interpretation_status:"resolved",
-        operation_hint:$operation,
-        candidate_source_ids:["calendar_alpha","calendar_beta"]
-      }')"
     proposal="$(jq -nc --arg claim "$claim" \
       --arg alpha "$alpha_evidence_ref" --arg beta "$beta_evidence_ref" '
       {
@@ -6709,7 +6699,7 @@ run_generalized_acquisition_reasoning_scenarios() {
       and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
       and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
     '
-    assert_semantic_interpreter_calls "$provider_calls" 1
+    assert_semantic_interpreter_calls "$provider_calls" 0
     assert_general_evidence_reasoning_calls "$provider_calls" 1
     assert_diagnostic_advisory_calls "$provider_calls" 0
     assert_jq "generalized.${case_name}.provider" "$provider_calls" '
@@ -6723,27 +6713,18 @@ run_generalized_acquisition_reasoning_scenarios() {
     assert_persisted_answer_matches \
       "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
   done <<'CASES'
-contradiction|contradiction_review|contradiction_review|Review the selected records for potentially conflicting evidence.|The bounded records support a contradiction-sensitive synthesis.
-decision|decision_support|recommendation_or_decision_support|Assess the selected records as bounded evidence for a decision.|The bounded records support a qualified decision synthesis.
+contradiction|contradiction_review|Review the selected records for potentially conflicting evidence.|The bounded records support a contradiction-sensitive synthesis.
+decision|recommendation_or_decision_support|Assess the selected records as bounded evidence for a decision.|The bounded records support a qualified decision synthesis.
 CASES
 
   question="Review the full configured register and summarize the bounded records."
   claim="The complete configured register supports the bounded synthesis."
   owner="owner-generalized-full-scope"
   client="client-generalized-full-scope"
-  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":1}'
+  external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":1}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
-    {
-      expected_request_text:$request_text,
-      expected_source_id:"complete_register",
-      expected_content_fields:["Entry","Required","Status"],
-      interpretation_status:"resolved",
-      operation_hint:"exhaustive_review",
-      candidate_source_ids:["complete_register"]
-    }')"
   local complete_ref complete_evidence_ref
   complete_ref="google_sheets:complete_register:Register!A2:C4"
   complete_evidence_ref="external-source:$(printf '%s' "$complete_ref" | sha256sum | cut -d' ' -f1)"
@@ -6781,7 +6762,7 @@ CASES
     and .prompt.general_evidence_reasoning.presented_to_user == true
     and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
   '
-  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_diagnostic_advisory_calls "$provider_calls" 0
   assert_dsa_operation_counts "$audit" 1 1 0
@@ -6789,20 +6770,11 @@ CASES
   question="Review the selected records for potentially conflicting evidence."
   owner="owner-generalized-partial"
   client="client-generalized-partial"
-  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":2}'
+  external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   configure_source_fixture "calendar-beta" "unavailable_after_first"
   reset_dsa_audit
-  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
-    {
-      expected_request_text:$request_text,
-      expected_source_id:"calendar_alpha",
-      expected_content_fields:["description","end","location","start","summary"],
-      interpretation_status:"resolved",
-      operation_hint:"contradiction_review",
-      candidate_source_ids:["calendar_alpha","calendar_beta"]
-    }')"
   queue_provider_answer "$(jq -nc --arg ref "$alpha_evidence_ref" '
     {
       proposed_claim:"Only the retained record can be considered.",
@@ -6841,7 +6813,7 @@ CASES
     and .prompt.general_evidence_reasoning.presented_to_user == false
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
   '
-  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_jq "generalized.partial.dsa" "$audit" '
     ([.[] | select(.operation == "context_pack")] | length) == 1
