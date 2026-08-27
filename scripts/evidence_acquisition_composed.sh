@@ -6804,10 +6804,17 @@ CASES
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "generalized.partial.response" "$response" '
+  if ! jq -e '
     .status == "degraded" and .pending_action == null
     and (.answer | contains("Only the retained record can be considered.") | not)
-  '
+  ' <<<"$response" >/dev/null 2>&1; then
+    printf 'Generalized partial response: %s\n' \
+      "$(jq -c . <<<"$response")" >&2
+    printf 'Generalized partial acquisition: %s\n' "$manifest" >&2
+    printf 'Generalized partial reasoning: %s\n' \
+      "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" >&2
+    return 1
+  fi
   assert_jq "generalized.partial.acquisition" "$manifest" '
     .plan.plan_status == "ready"
     and .plan.selected_strategies == ["hybrid"]
