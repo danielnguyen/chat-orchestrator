@@ -6672,10 +6672,14 @@ run_generalized_acquisition_reasoning_scenarios() {
     provider_calls="$(fetch_provider_calls "$request_id")"
     audit="$(fetch_dsa_audit)"
 
-    assert_jq "generalized.${case_name}.response" "$response" '
+    if ! jq -e --arg claim "$claim" '
       .status == "ok" and .pending_action == null
       and (.answer | startswith($claim))
-    ' --arg claim "$claim"
+    ' <<<"$response" >/dev/null 2>&1; then
+      printf 'Generalized %s response: %s\n' \
+        "$case_name" "$(jq -c . <<<"$response")" >&2
+      return 1
+    fi
     assert_jq "generalized.${case_name}.acquisition" "$manifest" '
       .shape.task_shape == $shape
       and .plan.plan_status == "ready"
