@@ -6721,16 +6721,16 @@ contradiction|contradiction_review|Review the selected records for potentially c
 decision|recommendation_or_decision_support|Assess the selected records as bounded evidence for a decision.|The bounded records support a qualified decision synthesis.
 CASES
 
-  question="$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION"
-  claim="The complete configured register supports the bounded synthesis."
+  question="Check whether every mandatory record in the Migration Records is reviewed."
+  claim="The complete migration records support the bounded synthesis."
   owner="owner-generalized-full-scope"
   client="client-generalized-full-scope"
-  external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":1}'
+  external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":1}'
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
   local complete_ref complete_evidence_ref
-  complete_ref="google_sheets:complete_register:Register!A2:C4"
+  complete_ref="google_sheets:records_primary:Records!A2:C3"
   complete_evidence_ref="external-source:$(printf '%s' "$complete_ref" | sha256sum | cut -d' ' -f1)"
   queue_provider_answer "$(jq -nc --arg claim "$claim" --arg ref "$complete_evidence_ref" '
     {
