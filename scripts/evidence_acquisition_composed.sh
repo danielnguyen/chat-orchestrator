@@ -6805,7 +6805,8 @@ CASES
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
   if ! jq -e '
-    .status == "degraded" and .pending_action == null
+    .status == "ok" and .pending_action == null
+    and (.answer | contains("source lookup failed with an upstream HTTP 503"))
     and (.answer | contains("Only the retained record can be considered.") | not)
   ' <<<"$response" >/dev/null 2>&1; then
     printf 'Generalized partial response: %s\n' \
@@ -6833,6 +6834,7 @@ CASES
   '
   assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 1
   assert_jq "generalized.partial.dsa" "$audit" '
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "context")] | length) == 2
