@@ -6747,9 +6747,16 @@ CASES
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "generalized.full_scope.response" "$response" '
+  if ! jq -e --arg claim "$claim" '
     .status == "ok" and .pending_action == null and (.answer | startswith($claim))
-  ' --arg claim "$claim"
+  ' <<<"$response" >/dev/null 2>&1; then
+    printf 'Generalized full-scope response: %s\n' \
+      "$(jq -c . <<<"$response")" >&2
+    printf 'Generalized full-scope acquisition: %s\n' "$manifest" >&2
+    printf 'Generalized full-scope reasoning: %s\n' \
+      "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" >&2
+    return 1
+  fi
   assert_jq "generalized.full_scope.acquisition" "$manifest" '
     .shape.task_shape == "bounded_exhaustive_review"
     and .plan.plan_status == "ready"
