@@ -7095,8 +7095,11 @@ CASES
     and .retrieval.prompt_assembly.dsa.final_combined_item_count == 1
     and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.reasoning_context_limited == false
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.decision_comparison.reason_codes
+      == ["unknown_freshness"]
     and .prompt.general_evidence_reasoning.presented_to_user == true
-    and .retrieval.prompt_assembly.evidence_response.repair_call_count == 0
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
   '
   assert_semantic_interpreter_calls "$provider_calls" 0
