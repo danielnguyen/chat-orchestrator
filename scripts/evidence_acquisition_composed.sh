@@ -6771,10 +6771,15 @@ run_generalized_acquisition_reasoning_scenarios() {
   '
   assert_jq "generalized.topical_no_match.boundary" "$manifest" '
     .status == "not_applicable"
-    and .shape.derivation_status == "not_applicable"
-    and .shape.source_match.status == "no_match"
     and .plan.plan_status == "not_compiled"
-    and .acquisition.dsa_outcome == "not_called"
+    and .acquisition.strategy_attempted == null
+  '
+  assert_jq "generalized.topical_no_match.semantic" "$trace" '
+    .prompt.semantic_interpreter.called == true
+    and .prompt.semantic_interpreter.status == "accepted"
+    and .prompt.semantic_interpreter.interpretation_status == "no_match"
+    and .prompt.semantic_interpreter.operation_hint == "unknown"
+    and .prompt.semantic_interpreter.candidate_count == 0
   '
   assert_jq "generalized.topical_no_match.runtime" "$diagnostics" '
     [.events[] | select(
