@@ -1184,7 +1184,9 @@ run_evidence_source_scope_scenarios() {
 
   jq -e '
     .status == "degraded"
-    and .answer == "I need a narrower evidence request before I can determine what should be checked."
+    and .answer == "I found more than one plausible place to check: Alpha Review Calendar and Beta Review Calendar. Which should I use?"
+    and (.answer | contains("calendar_alpha") | not)
+    and (.answer | contains("calendar_beta") | not)
   ' <<<"$response" >/dev/null
   jq -e '
     .status == "source_scope_ambiguous"
@@ -6647,6 +6649,119 @@ run_generalized_acquisition_reasoning_scenarios() {
   alpha_evidence_ref="$alpha_ref"
   beta_evidence_ref="$beta_ref"
   external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
+
+  question="Compare the bounded records from the plausible review calendars."
+  claim="The bounded calendar records support a qualified comparison."
+  owner="owner-generalized-ambiguous-probe"
+  client="client-generalized-ambiguous-probe"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"calendar_alpha",
+      expected_content_fields:["summary","start","end","location","description"],
+      interpretation_status:"ambiguous",
+      operation_hint:"comparison",
+      candidate_source_ids:["calendar_alpha","calendar_beta"]
+    }')"
+  queue_provider_answer "$(jq -nc --arg claim "$claim" \
+    --arg alpha "$alpha_evidence_ref" --arg beta "$beta_evidence_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$alpha,$beta],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "generalized-ambiguous-probe")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" \
+    '{"enabled":true,"allowed_sensitivity":"medium","max_results":2}')"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "generalized.ambiguous_probe.response" "$response" '
+    .status == "ok" and .pending_action == null and (.answer | startswith($claim))
+  ' --arg claim "$claim"
+  assert_jq "generalized.ambiguous_probe.acquisition" "$manifest" '
+    .shape.task_shape == "cross_source_comparison"
+    and .shape.source_match.status == "ambiguous"
+    and .shape.source_match.matched_source_ids == []
+    and .shape.source_match.probe_source_count == 2
+    and ((.shape.source_match | has("probe_source_ids")) | not)
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["hybrid"]
+    and .inventory.declared_source_count == 2
+    and .acquisition.sources_selected == ["calendar_alpha","calendar_beta"]
+    and .acquisition.sources_used == ["calendar_alpha","calendar_beta"]
+    and .acquisition.strategy_attempted == "hybrid"
+  '
+  assert_jq "generalized.ambiguous_probe.authority" "$trace" '
+    .prompt.semantic_interpreter.interpretation_status == "ambiguous"
+    and .prompt.semantic_interpreter.operation_hint == "comparison"
+    and .prompt.semantic_interpreter.candidate_count == 2
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_jq "generalized.ambiguous_probe.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_jq "generalized.ambiguous_probe.dsa" "$audit" '
+    ([.[] | select(.operation == "context_pack" and
+      .source_ids == ["calendar_alpha","calendar_beta"])] | length) == 1
+    and ([.[] | select(.operation == "context")] | length) == 2
+    and ([.[] | select(.operation == "fetch")] | length) == 0
+  '
+
+  question="Review every record in the plausible review calendars."
+  owner="owner-generalized-ambiguity-clarification"
+  client="client-generalized-ambiguity-clarification"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"calendar_alpha",
+      expected_content_fields:["summary","start","end","location","description"],
+      interpretation_status:"ambiguous",
+      operation_hint:"exhaustive_review",
+      candidate_source_ids:["calendar_alpha","calendar_beta"]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "generalized-ambiguity-clarification")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" \
+    '{"enabled":true,"allowed_sensitivity":"medium","max_results":2}')"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "generalized.ambiguity_clarification.response" "$response" '
+    .status == "degraded"
+    and .answer == "I found more than one plausible place to check: Alpha Review Calendar and Beta Review Calendar. Which should I use?"
+    and (.answer | contains("calendar_alpha") | not)
+    and (.answer | contains("calendar_beta") | not)
+    and (.answer | contains("evidence request") | not)
+  '
+  assert_jq "generalized.ambiguity_clarification.boundary" "$manifest" '
+    .shape.source_match.status == "ambiguous"
+    and .shape.source_match.matched_source_ids == []
+    and ((.shape.source_match | has("probe_source_count")) | not)
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.dsa_outcome == "inventory_only"
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_general_evidence_reasoning_calls "$provider_calls" 0
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_dsa_operation_counts "$audit" 0 0 0
 
   while IFS='|' read -r case_name expected_shape question claim; do
     owner="owner-generalized-${case_name}"
