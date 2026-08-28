@@ -231,6 +231,8 @@ _DIAGNOSTIC_ADVISORY_ROUTE = "diagnostic_advisory"
 _EVIDENCE_REASONING_ROUTE = "evidence_reasoning"
 _EVIDENCE_REASONING_MAX_COMPLETION_TOKENS = 2048
 _EVIDENCE_REASONING_REASONING_EFFORT = "medium"
+_MULTI_ITEM_REASONING_TEXT_LIMIT = 4000
+_SINGLE_ITEM_REASONING_TEXT_LIMIT = 12000
 _AUTHORITY_DISPOSITION_LEVEL = {"withheld": 0, "qualified": 1, "allowed": 2}
 _EXISTING_AUTHORITY_DISPOSITIONS = {
     "bounded_conclusion_allowed": "allowed",
@@ -7416,6 +7418,11 @@ def _bounded_reasoning_evidence(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], bool]:
     retained = set(retained_source_refs or [])
     items = context_pack.get("items") if isinstance(context_pack, dict) else None
+    text_limit = (
+        _SINGLE_ITEM_REASONING_TEXT_LIMIT
+        if len(retained) == 1 and not structured_items
+        else _MULTI_ITEM_REASONING_TEXT_LIMIT
+    )
     evidence: list[dict[str, Any]] = []
     metadata: dict[str, dict[str, Any]] = {}
     seen_source_refs: set[str] = set()
@@ -7448,8 +7455,8 @@ def _bounded_reasoning_evidence(
         if len(evidence) >= 8:
             reasoning_context_limited = True
             continue
-        bounded_text = text[:4000]
-        reasoning_context_limited = reasoning_context_limited or len(text) > 4000
+        bounded_text = text[:text_limit]
+        reasoning_context_limited = reasoning_context_limited or len(text) > text_limit
         source_descriptor = source_descriptor_for_inventory_entry(
             inventory.get(source_id)
         )

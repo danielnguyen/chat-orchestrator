@@ -15608,8 +15608,19 @@ async def _run_bounded_exhaustive_case(
     privacy_context_enabled: bool = False,
     evidence_sufficiency_response=None,
     claim_record_capture_enabled: bool = False,
+    general_reasoning_completion: dict[str, object] | None = None,
+    presentation_enabled: bool = False,
 ):
     rules, models = _write_default_route_files(tmp_path)
+    if general_reasoning_completion is not None:
+        models.write_text(
+            models.read_text(encoding="utf-8")
+            + "logical_routes:\n"
+            + "  evidence_reasoning:\n"
+            + "    model: gpt-5-mini\n"
+            + "    provider: cloud\n",
+            encoding="utf-8",
+        )
     question = "Review every maintenance record in the configured worksheet."
     request_id = "rid-evidence-bounded-exhaustive"
     runtime = FakeRuntime(
@@ -15654,16 +15665,24 @@ async def _run_bounded_exhaustive_case(
             else [_configured_worksheet_context_response()]
         ),
     )
-    litellm = FakeLiteLLM(
-        content=provider_answer
-        or _evidence_candidate(
-            (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20",
-                "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
+    litellm = (
+        SequenceLiteLLM([general_reasoning_completion])
+        if general_reasoning_completion is not None
+        else FakeLiteLLM(
+            content=provider_answer
+            or _evidence_candidate(
+                (
+                    "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20",
+                    "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
+                )
             )
         )
     )
-    memory_store = memory_store or FakeMemoryStore()
+    memory_store = memory_store or (
+        ClaimCaptureMemoryStore()
+        if general_reasoning_completion is not None
+        else FakeMemoryStore()
+    )
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             question,
@@ -15680,13 +15699,62 @@ async def _run_bounded_exhaustive_case(
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
         privacy_context_enabled=privacy_context_enabled,
-        claim_record_capture_enabled=claim_record_capture_enabled,
+        claim_record_capture_enabled=(
+            claim_record_capture_enabled or general_reasoning_completion is not None
+        ),
+        general_evidence_reasoning_enabled=general_reasoning_completion is not None,
+        general_evidence_reasoning_presentation_enabled=presentation_enabled,
+        general_evidence_reasoning_timeout_ms=5000,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
         request_id=request_id,
     )
     return out, runtime, dsa, litellm, memory_store
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_single_text_preserves_complete_scope_authority(
+    tmp_path,
+):
+    context_response = _configured_worksheet_context_response()
+    source_ref = context_response["results"][0]["source_ref"]
+    text = "bounded neutral worksheet detail. " * 250
+    context_response["results"][0]["text"] = text
+    evidence_ref_id = governed_external_reference_id(source_ref)
+
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        context_responses=[context_response],
+        general_reasoning_completion=_general_reasoning_completion(
+            proposed_claim="The complete bounded worksheet supports the review.",
+            evidence_ref_id=evidence_ref_id,
+        ),
+        presentation_enabled=True,
+    )
+
+    assert 4000 < len(text) < 12000
+    assert out["answer"] == "The complete bounded worksheet supports the review."
+    assert len(dsa.calls) == 1
+    assert len(dsa.context_calls) == 1
+    assert len(litellm.calls) == 1
+    reasoning_input = json.loads(litellm.calls[0]["messages"][1]["content"])
+    assert len(reasoning_input["authorized_evidence"]) == 1
+    reasoning_evidence = reasoning_input["authorized_evidence"][0]
+    assert reasoning_evidence["evidence_ref_id"] == evidence_ref_id
+    assert reasoning_evidence["text"] == text
+    assert reasoning_evidence["source_descriptor"]["source_id"] == (
+        "vehicle_log_primary"
+    )
+    assert len(runtime.claim_support_calls) == 1
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    assert authority["complete_declared_scope_required"] is True
+    assert authority["complete_declared_scope_established"] is True
+    assert authority["material_acquisition_limited"] is False
+    reasoning_trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert reasoning_trace["reasoning_context_limited"] is False
 
 
 @pytest.mark.asyncio
@@ -17496,6 +17564,72 @@ def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed(
     ]
     assert len(structured_metadata) == 1
     assert structured_limited is False
+
+
+def test_bounded_reasoning_preserves_one_text_item_within_single_item_limit():
+    source_ref = "neutral-source:bounded-item"
+    text = "bounded neutral evidence. " * 320
+
+    evidence, metadata, limited = _bounded_reasoning_evidence(
+        context_pack={
+            "items": [
+                {
+                    "source_ref": source_ref,
+                    "source_id": "neutral-source",
+                    "text": text,
+                }
+            ]
+        },
+        retained_source_refs=[source_ref],
+        structured_items=[],
+    )
+
+    assert evidence == [
+        {
+            "evidence_ref_id": governed_external_reference_id(source_ref),
+            "text": text,
+        }
+    ]
+    assert metadata == {
+        governed_external_reference_id(source_ref): {
+            "source_id": "neutral-source",
+            "source_ref": source_ref,
+            "source_descriptor": None,
+        }
+    }
+    assert len(text) > 4000
+    assert len(text) < 12000
+    assert limited is False
+
+
+def test_bounded_reasoning_truncates_one_text_item_above_single_item_limit():
+    source_ref = "neutral-source:oversized-item"
+    text = "x" * 12001
+
+    evidence, metadata, limited = _bounded_reasoning_evidence(
+        context_pack={
+            "items": [
+                {
+                    "source_ref": source_ref,
+                    "source_id": "neutral-source",
+                    "text": text,
+                }
+            ]
+        },
+        retained_source_refs=[source_ref],
+        structured_items=[],
+    )
+
+    assert evidence == [
+        {
+            "evidence_ref_id": governed_external_reference_id(source_ref),
+            "text": "x" * 12000,
+        }
+    ]
+    assert metadata[governed_external_reference_id(source_ref)]["source_ref"] == (
+        source_ref
+    )
+    assert limited is True
 
 
 @pytest.mark.asyncio
