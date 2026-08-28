@@ -15718,9 +15718,7 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
     assert dsa.calls[0]["budget"]["max_results"] == 1
     assert dsa.context_calls == [
         {
-            "source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
-            ),
+            "source_id": "vehicle_log_primary",
             "context_mode": "configured_worksheet",
             "budget": {
                 "max_rows": 20,
@@ -15777,9 +15775,7 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
     assert acquisition["expansion_attempts"] == [
         {
             "source_id": "vehicle_log_primary",
-            "seed_source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
-            ),
+            "seed_source_ref": None,
             "context_mode": "configured_worksheet",
             "outcome": "satisfied",
             "returned_reference_count": 1,
@@ -15961,7 +15957,7 @@ async def test_bounded_exhaustive_malformed_sufficiency_constraints_fail_closed(
 
 
 @pytest.mark.asyncio
-async def test_bounded_exhaustive_missing_exact_descriptor_never_falls_back(
+async def test_bounded_exhaustive_missing_descriptor_uses_planned_source_directly(
     tmp_path,
 ):
     context_pack = _bounded_exhaustive_context_pack(
@@ -15977,32 +15973,71 @@ async def test_bounded_exhaustive_missing_exact_descriptor_never_falls_back(
         await _run_bounded_exhaustive_case(
             tmp_path=tmp_path,
             context_pack=context_pack,
-            context_responses=[],
         )
     )
 
-    _assert_material_gap_answer(
-        out["answer"],
-        fragments=[
-            "complete declared source scope",
-            "required acquisition was unsupported",
-        ],
-        withholding="I’m withholding a complete-scope conclusion.",
+    assert out["answer"] == _rendered_evidence_answer(
+        "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
+        boundary=EXHAUSTIVE_SCOPE_SUFFIX,
     )
     assert len(dsa.calls) == 1
-    assert dsa.context_calls == []
+    assert context_pack["items"][0]["available_context"] == [
+        {
+            "context_mode": "nearby_rows",
+            "description": "Fetch the complete configured worksheet.",
+        }
+    ]
+    assert dsa.context_calls == [
+        {
+            "source_id": "vehicle_log_primary",
+            "context_mode": "configured_worksheet",
+            "budget": {
+                "max_rows": 20,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
     assert dsa.fetch_calls == []
-    assert litellm.calls == []
+    assert len(litellm.calls) == 1
+    provider_messages = json.dumps(litellm.calls[0]["messages"], sort_keys=True)
+    assert "COMPLETE WORKSHEET RANGE" in provider_messages
+    assert "PRIVATE TARGETED SEED ROW" not in provider_messages
     facts = {
         fact["requirement_id"]: fact["outcome"]
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
-    assert facts["complete-scope-coverage"] == "unsupported"
-    acquisition = memory_store.trace_calls[0]["payload"]["prompt"][
+    assert facts == {
+        "authoritative-inventory": "satisfied",
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+    manifest = memory_store.trace_calls[0]["payload"]["prompt"][
         "evidence_acquisition"
-    ]["acquisition"]
+    ]
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    acquisition = manifest["acquisition"]
+    assert acquisition["sources_considered"] == ["vehicle_log_primary"]
+    assert acquisition["sources_selected"] == ["vehicle_log_primary"]
+    assert acquisition["sources_used"] == ["vehicle_log_primary"]
+    assert acquisition["item_count"] == 1
+    assert acquisition["source_references_retained"] == [
+        "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20"
+    ]
     assert acquisition["expansion_attempt_count"] == 1
-    assert acquisition["expansion_unsupported_count"] == 1
+    assert acquisition["expansion_successful_count"] == 1
+    assert acquisition.get("expansion_unsupported_count", 0) == 0
+    assert acquisition["expansion_attempts"] == [
+        {
+            "source_id": "vehicle_log_primary",
+            "seed_source_ref": None,
+            "context_mode": "configured_worksheet",
+            "outcome": "satisfied",
+            "returned_reference_count": 1,
+        }
+    ]
 
 
 @pytest.mark.asyncio

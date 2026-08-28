@@ -4712,8 +4712,6 @@ def validate_bounded_exhaustive_context_pack_response(
         raise ValueError("context_pack_errors_present")
     if normalized["budget"]["returned_results"] != len(normalized["items"]):
         raise ValueError("context_pack_result_count_mismatch")
-    if not normalized["items"]:
-        raise ValueError("context_pack_seed_missing")
     diagnostics = normalized.get("diagnostics")
     if not isinstance(diagnostics, dict):
         raise ValueError("context_pack_diagnostics_missing")
@@ -5339,29 +5337,9 @@ async def execute_bounded_exhaustive_review(
         if isinstance(targeted_context_pack, dict)
         else []
     )
-    target: dict[str, Any] | None = None
-    for item in targeted_items:
-        descriptors = item.get("available_context")
-        if not isinstance(descriptors, list):
-            continue
-        if any(
-            isinstance(descriptor, dict)
-            and descriptor.get("context_mode")
-            == CONFIGURED_WORKSHEET_CONTEXT_MODE
-            for descriptor in descriptors
-        ):
-            target = item
-            break
-
     attempt: dict[str, Any] = {
         "source_id": source_id,
-        "seed_source_ref": (
-            target.get("source_ref")
-            if isinstance(target, dict)
-            else targeted_items[0].get("source_ref")
-            if targeted_items
-            else None
-        ),
+        "seed_source_ref": None,
         "context_mode": CONFIGURED_WORKSHEET_CONTEXT_MODE,
         "outcome": "unsupported",
         "query_id": None,
@@ -5388,16 +5366,12 @@ async def execute_bounded_exhaustive_review(
             if dsa_trace.get("error_code") == "malformed_response"
             else "failed"
         )
-    elif not isinstance(target, dict) or not isinstance(
-        attempt["seed_source_ref"], str
-    ):
-        attempt["outcome"] = "unsupported"
     else:
         context_call_count = 1
         try:
             response_raw = await dsa.context_source(
                 request_id=state.request_id,
-                source_ref=attempt["seed_source_ref"],
+                source_id=source_id,
                 context_mode=CONFIGURED_WORKSHEET_CONTEXT_MODE,
                 budget=dict(BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET),
             )
