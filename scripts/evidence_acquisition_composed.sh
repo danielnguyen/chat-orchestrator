@@ -1178,7 +1178,7 @@ run_evidence_source_scope_scenarios() {
     {
       expected_request_text:$request_text,
       expected_source_id:"calendar_alpha",
-      expected_content_fields:["description","end","location","start","summary"],
+      expected_content_fields:[],
       interpretation_status:"ambiguous",
       operation_hint:"exhaustive_review",
       candidate_source_ids:["calendar_alpha","calendar_beta"]
@@ -6670,7 +6670,7 @@ run_generalized_acquisition_reasoning_scenarios() {
     {
       expected_request_text:$request_text,
       expected_source_id:"calendar_alpha",
-      expected_content_fields:["description","end","location","start","summary"],
+      expected_content_fields:[],
       interpretation_status:"ambiguous",
       operation_hint:"comparison",
       candidate_source_ids:["calendar_alpha","calendar_beta"]
@@ -6740,7 +6740,7 @@ run_generalized_acquisition_reasoning_scenarios() {
     {
       expected_request_text:$request_text,
       expected_source_id:"calendar_alpha",
-      expected_content_fields:["description","end","location","start","summary"],
+      expected_content_fields:[],
       interpretation_status:"ambiguous",
       operation_hint:"exhaustive_review",
       candidate_source_ids:["calendar_alpha","calendar_beta"]
