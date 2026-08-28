@@ -6651,13 +6651,145 @@ run_general_evidence_reasoning_shadow_scenario() {
 
 run_generalized_acquisition_reasoning_scenarios() {
   local case_name expected_shape question owner client conversation_id
-  local external response request_id trace manifest provider_calls audit proposal claim
+  local external response request_id trace manifest diagnostics provider_calls audit proposal claim
   local alpha_ref beta_ref alpha_evidence_ref beta_evidence_ref
   alpha_ref="ics_calendar:calendar_alpha:event:alpha-event"
   beta_ref="ics_calendar:calendar_beta:event:beta-event"
   alpha_evidence_ref="$alpha_ref"
   beta_evidence_ref="$beta_ref"
   external='{"enabled":true,"source_ids":["calendar_alpha","calendar_beta"],"allowed_sensitivity":"medium","max_results":2}'
+
+  question="Check alpha review records for contradictory evidence."
+  claim="The bounded review records expose relevant counterevidence."
+  owner="owner-matched-source-refinement"
+  client="client-matched-source-refinement"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"calendar_alpha",
+      expected_content_fields:[],
+      interpretation_status:"ambiguous",
+      operation_hint:"contradiction_review",
+      candidate_source_ids:["calendar_alpha","calendar_beta"]
+    }')"
+  queue_provider_answer "$(jq -nc --arg claim "$claim" \
+    --arg alpha "$alpha_evidence_ref" --arg beta "$beta_evidence_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$alpha,$beta],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "matched-source-refinement")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" \
+    '{"enabled":true,"allowed_sensitivity":"medium","max_results":2}')"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "generalized.matched_refinement.response" "$response" '
+    .status == "ok" and .pending_action == null and (.answer | startswith($claim))
+  ' --arg claim "$claim"
+  assert_jq "generalized.matched_refinement.acquisition" "$manifest" '
+    .shape.task_shape == "contradiction_review"
+    and .shape.source_match.status == "ambiguous"
+    and .shape.source_match.matched_source_ids == []
+    and .shape.source_match.probe_source_count == 2
+    and ((.shape.source_match | has("probe_source_ids")) | not)
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["hybrid"]
+    and .inventory.declared_source_count == 2
+    and .acquisition.sources_selected == ["calendar_alpha","calendar_beta"]
+    and .acquisition.sources_used == ["calendar_alpha","calendar_beta"]
+    and .acquisition.strategy_attempted == "hybrid"
+  '
+  assert_jq "generalized.matched_refinement.authority" "$trace" '
+    .prompt.semantic_interpreter.called == true
+    and .prompt.semantic_interpreter.status == "accepted"
+    and .prompt.semantic_interpreter.interpretation_status == "ambiguous"
+    and .prompt.semantic_interpreter.candidate_count == 2
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+  '
+  assert_jq "generalized.matched_refinement.runtime" "$diagnostics" '
+    [.events[] | select(
+        .event_type == "evidence_shape_derived"
+        and .event_payload_json.request_id == $request_id)
+      | .event_payload_json] as $shapes
+    | ($shapes | length) == 2
+    and $shapes[0].source_match_status == "matched"
+    and $shapes[0].task_shape == "contradiction_review"
+    and $shapes[1].source_match_status == "ambiguous"
+    and $shapes[1].probe_source_count == 2
+    and (($shapes[1] | has("probe_source_ids")) | not)
+  ' --arg request_id "$request_id"
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_jq "generalized.matched_refinement.dsa" "$audit" '
+    ([.[] | select(.operation == "context_pack" and
+      .source_ids == ["calendar_alpha","calendar_beta"])] | length) == 1
+    and ([.[] | select(.operation == "context")] | length) == 2
+    and ([.[] | select(.operation == "fetch")] | length) == 0
+  '
+
+  question="Why can alpha review practices improve feedback?"
+  owner="owner-matched-topical-no-match"
+  client="client-matched-topical-no-match"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"calendar_alpha",
+      expected_content_fields:[],
+      interpretation_status:"no_match",
+      operation_hint:"unknown",
+      candidate_source_ids:[]
+    }')"
+  queue_provider_answer "Useful reviews give specific, actionable feedback."
+  conversation_id="$(resolve_conversation "$owner" "$client" "matched-topical-no-match")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" \
+    '{"enabled":true,"allowed_sensitivity":"medium","max_results":2}')"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "generalized.topical_no_match.response" "$response" '
+    .status == "ok"
+    and .answer == "Useful reviews give specific, actionable feedback."
+  '
+  assert_jq "generalized.topical_no_match.boundary" "$manifest" '
+    .status == "not_applicable"
+    and .shape.derivation_status == "not_applicable"
+    and .shape.source_match.status == "no_match"
+    and .plan.plan_status == "not_compiled"
+    and .acquisition.dsa_outcome == "not_called"
+  '
+  assert_jq "generalized.topical_no_match.runtime" "$diagnostics" '
+    [.events[] | select(
+        .event_type == "evidence_shape_derived"
+        and .event_payload_json.request_id == $request_id)
+      | .event_payload_json] as $shapes
+    | ($shapes | length) == 2
+    and $shapes[0].source_match_status == "matched"
+    and $shapes[1].source_match_status == "no_match"
+    and $shapes[1].derivation_status == "not_applicable"
+  ' --arg request_id "$request_id"
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_general_evidence_reasoning_calls "$provider_calls" 0
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_dsa_operation_counts "$audit" 0 0 0
 
   question="Compare the bounded records from the plausible review calendars."
   claim="The bounded calendar records support a qualified comparison."
@@ -6965,7 +7097,7 @@ CASES
     and ([.[] | select(.operation == "fetch")] | length) == 0
   '
   configure_source_fixture "calendar-beta" "ready"
-  echo "Generalized acquisition reasoning: contradiction=presented decision=presented full_scope=presented partial=withheld actions=0 retries=0 repairs=0 reacquisition=0"
+  echo "Generalized acquisition reasoning: matched_refinement=presented topical_no_match=ordinary_chat contradiction=presented decision=presented full_scope=presented partial=withheld actions=0 retries=0 repairs=0 reacquisition=0"
 }
 
 run_authority_comparison_incomplete_scope_case() {
