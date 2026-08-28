@@ -2712,6 +2712,53 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
         assert domain_term not in system_instruction.lower()
 
 
+def test_evidence_interpreter_instruction_requires_set_level_coverage_when_material():
+    inventory = DsaSourceListResponse.model_validate(
+        {
+            "sources": [
+                _source(
+                    "review_schedule",
+                    display_name="Review Schedule",
+                )
+            ]
+        }
+    )
+
+    messages = evidence_interpreter_messages(
+        task_text="Which entry has the longest interval between reviews?",
+        source_list=inventory,
+    )
+
+    system_instruction = messages[0]["content"].lower()
+    assert "not inherently cross-source comparison" in system_instruction
+    assert "an omitted relevant record could change the result" in system_instruction
+    assert "does not need to say all, every, complete, or exhaustive" in system_instruction
+    assert "use lookup when retrieving bounded matching evidence" in system_instruction
+
+
+def test_evidence_interpreter_instruction_preserves_bounded_lookup():
+    inventory = DsaSourceListResponse.model_validate(
+        {
+            "sources": [
+                _source(
+                    "review_schedule",
+                    display_name="Review Schedule",
+                )
+            ]
+        }
+    )
+
+    messages = evidence_interpreter_messages(
+        task_text="Find the entry for review ID alpha-17.",
+        source_list=inventory,
+    )
+
+    system_instruction = messages[0]["content"].lower()
+    assert "use lookup when retrieving bounded matching evidence" in system_instruction
+    assert "without showing that every relevant record was examined" in system_instruction
+    assert "multiple records alone does not require exhaustive_review" in system_instruction
+
+
 def test_evidence_interpreter_response_format_is_strict_and_closed():
     schema = evidence_interpreter_response_format()["json_schema"]
 
