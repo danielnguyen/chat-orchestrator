@@ -1173,7 +1173,16 @@ run_evidence_source_scope_scenarios() {
   owner="owner-source-scope-ambiguous"
   client="client-source-scope-ambiguous"
   conversation_id="$(resolve_conversation "$owner" "$client" "source-scope-ambiguous")"
-  question="Check the comparison source."
+  question="Review every record in the plausible review calendars."
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"calendar_alpha",
+      expected_content_fields:["summary","start","end","location","description"],
+      interpretation_status:"ambiguous",
+      operation_hint:"exhaustive_review",
+      candidate_source_ids:["calendar_alpha","calendar_beta"]
+    }')"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
