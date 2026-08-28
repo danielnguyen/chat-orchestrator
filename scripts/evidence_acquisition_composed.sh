@@ -1808,7 +1808,7 @@ run_evidence_clarification_scenario() {
   configure_source_fixture "complete-sheet" "empty_after_first"
   reset_dsa_audit
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-clarification")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" '{"enabled":true,"allowed_sensitivity":"medium"}')"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" '{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium"}')"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   provider_calls="$(fetch_provider_calls "$request_id")"
