@@ -102,7 +102,6 @@ def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
     content_fields = body.get("expected_content_fields")
     if (
         not isinstance(content_fields, list)
-        or not content_fields
         or len(content_fields) > 24
         or any(
             not isinstance(field, str)
@@ -207,7 +206,7 @@ def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
     ]
     if len(matches) != 1:
         raise HTTPException(status_code=422, detail="semantic fixture source mismatch")
-    if matches[0].get("content_fields") != fixture["expected_content_fields"]:
+    if (matches[0].get("content_fields") or []) != fixture["expected_content_fields"]:
         raise HTTPException(status_code=422, detail="semantic fixture content fields mismatch")
     result = {
         "interpretation_status": fixture["interpretation_status"],

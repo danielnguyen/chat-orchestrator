@@ -9,13 +9,15 @@ import pytest
 from models import ChatRequest
 from pydantic import ValidationError
 from services.evidence_acquisition import (
-    AMBIGUOUS_ANSWER,
     BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
     COMPARISON_SCOPE_SUFFIX,
     CONFIGURED_WORKSHEET_CONTEXT_MODE,
     HELPFUL_GROUNDED_RECOVERY_RESPONSE,
     MALFORMED_EVIDENCE_RESPONSE,
     NEXT_STEP_DEPENDENCY_ANSWER,
+    SEMANTIC_INTERPRETER_FAILURE_ANSWER,
+    SOURCE_AMBIGUITY_ANSWER,
+    SOURCE_NO_MATCH_ANSWER,
     TARGETED_SCOPE_SUFFIX,
     UNSUPPORTED_ANSWER,
     WITHHELD_ANSWER,
@@ -3446,6 +3448,163 @@ async def test_bounded_probe_authorization_compiles_exact_acquisition_scope(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("task_shape", "operation_hint"),
+    [
+        ("cross_source_comparison", "comparison"),
+        ("contradiction_review", "contradiction_review"),
+        ("recommendation_or_decision_support", "decision_support"),
+    ],
+)
+async def test_bounded_probe_consumption_is_strategy_based(
+    task_shape,
+    operation_hint,
+):
+    probe_source_ids = ["source_a", "source_b"]
+    first = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    second = _shape_with_source_match(status="ambiguous")
+    second["result"].update(
+        {
+            "task_shape": task_shape,
+            "candidate_task_shapes": [task_shape],
+        }
+    )
+    second["result"]["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": probe_source_ids,
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    plan = _plan_response()
+    plan["result"].update(
+        {
+            "task_shape": task_shape,
+            "eligible_source_ids": probe_source_ids,
+            "selected_strategies": ["hybrid"],
+            "declared_requirements": [
+                {
+                    "requirement_id": "selected-source-coverage",
+                    "requirement_kind": "selected_source_coverage",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "context-delivery",
+                    "requirement_kind": "context_delivery",
+                    "criticality": "material",
+                },
+            ],
+        }
+    )
+    runtime = SequentialShapeRuntime([first, second], plan=plan)
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": "ambiguous",
+            "operation_hint": operation_hint,
+            "candidate_source_ids": probe_source_ids,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source(
+                    source_id,
+                    capabilities=["profile", "search", "context"],
+                )
+                for source_id in [*probe_source_ids, "source_decoy"]
+            ],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    assert state.forced_answer is None
+    assert state.is_authorized_probe is True
+    assert state.shape.task_shape == task_shape
+    assert state.shape.source_match.matched_source_ids == []
+    assert state.declared_scope["source_ids"] == probe_source_ids
+    assert state.plan.eligible_source_ids == probe_source_ids
+    assert state.plan.selected_strategies == ["hybrid"]
+    assert state.supported_hybrid_path is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe_label", [False, True])
+async def test_nonprobeable_source_ambiguity_uses_safe_inventory_labels(
+    unsafe_label,
+):
+    candidate_ids = ["source_a", "source_b"]
+    first = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    second = _shape_with_source_match(status="ambiguous")
+    second["result"].update(
+        {
+            "task_shape": "bounded_exhaustive_review",
+            "candidate_task_shapes": ["bounded_exhaustive_review"],
+        }
+    )
+    runtime = SequentialShapeRuntime([first, second])
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": "ambiguous",
+            "operation_hint": "exhaustive_review",
+            "candidate_source_ids": candidate_ids,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source("source_a", display_name="Alpha Review Calendar"),
+                _source(
+                    "source_b",
+                    display_name=(
+                        "https://private.invalid/Beta" if unsafe_label
+                        else "Beta Review Calendar"
+                    ),
+                ),
+            ],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "source_scope_ambiguous"
+    assert state.plan is None
+    if unsafe_label:
+        assert state.forced_answer == SOURCE_AMBIGUITY_ANSWER
+        assert "source_a" not in state.forced_answer
+        assert "private.invalid" not in state.forced_answer
+    else:
+        assert state.forced_answer == (
+            "I found more than one plausible place to check: Alpha Review Calendar "
+            "and Beta Review Calendar. Which should I use?"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "planned_source_ids",
     [
         ["source_a"],
@@ -3460,6 +3619,12 @@ async def test_bounded_probe_rejects_plan_source_set_mismatch(planned_source_ids
         derivation_status="not_applicable",
     )
     second = _shape_with_source_match(status="ambiguous")
+    second["result"].update(
+        {
+            "task_shape": "cross_source_comparison",
+            "candidate_task_shapes": ["cross_source_comparison"],
+        }
+    )
     second["result"]["source_match"] = {
         "status": "ambiguous",
         "matched_source_ids": [],
@@ -3467,20 +3632,32 @@ async def test_bounded_probe_rejects_plan_source_set_mismatch(planned_source_ids
         "reason_codes": ["semantic_candidates_ambiguous"],
     }
     plan = _plan_response()
-    plan["result"]["eligible_source_ids"] = planned_source_ids
+    plan["result"].update(
+        {
+            "task_shape": "cross_source_comparison",
+            "eligible_source_ids": planned_source_ids,
+            "selected_strategies": ["hybrid"],
+        }
+    )
     runtime = SequentialShapeRuntime([first, second], plan=plan)
 
     async def interpreter(**kwargs):
         return {
             "interpretation_status": "ambiguous",
-            "operation_hint": "lookup",
+            "operation_hint": "comparison",
             "candidate_source_ids": probe_source_ids,
         }
 
     state = await begin_evidence_acquisition(
         runtime=runtime,
         dsa=FakeDsa(
-            [_source("source_a"), _source("source_b"), _source("source_decoy")],
+            [
+                _source(
+                    source_id,
+                    capabilities=["profile", "search", "context"],
+                )
+                for source_id in ["source_a", "source_b", "source_decoy"]
+            ],
             inventory_metadata={
                 "inventory_scope": "configured_sources",
                 "inventory_status": "complete",
@@ -3802,7 +3979,7 @@ async def test_operation_refinement_rejects_candidate_outside_deterministic_scop
     )
 
     assert state.status == "semantic_interpreter_failed"
-    assert state.forced_answer == AMBIGUOUS_ANSWER
+    assert state.forced_answer == SEMANTIC_INTERPRETER_FAILURE_ANSWER
     assert state.semantic_interpreter["reason"] == "malformed_response"
     assert state.semantic_interpreter["failure_code"] == (
         "proposal_reference_unauthorized"
@@ -3911,7 +4088,7 @@ async def test_operation_refinement_unknown_or_no_match_fails_closed(advisory):
     )
 
     assert state.status == "semantic_interpreter_failed"
-    assert state.forced_answer == AMBIGUOUS_ANSWER
+    assert state.forced_answer == SEMANTIC_INTERPRETER_FAILURE_ANSWER
     assert state.semantic_interpreter["reason"] == "unresolved_operation"
     assert [name for name, _ in runtime.calls] == ["shape"]
     assert state.plan is None
@@ -3958,7 +4135,7 @@ async def test_operation_refinement_provider_failures_are_safe(failure_mode):
     )
 
     assert state.status == "semantic_interpreter_failed"
-    assert state.forced_answer == AMBIGUOUS_ANSWER
+    assert state.forced_answer == SEMANTIC_INTERPRETER_FAILURE_ANSWER
     assert state.semantic_interpreter["reason"] == (
         "dependency_failure"
         if failure_mode in {"timeout", "dependency"}
@@ -4114,7 +4291,7 @@ async def test_semantic_failure_preserves_ordinary_but_clarifies_material_reques
     assert ordinary.follow_existing_path is True
     assert ordinary.semantic_interpreter["reason"] == "dependency_failure"
     assert material.status == "semantic_interpreter_failed"
-    assert material.forced_answer == AMBIGUOUS_ANSWER
+    assert material.forced_answer == SEMANTIC_INTERPRETER_FAILURE_ANSWER
     assert all(call[0] != "plan" for call in material_runtime.calls)
 
 
@@ -4574,8 +4751,8 @@ async def test_explicit_source_selector_has_precedence_over_natural_match():
 @pytest.mark.parametrize(
     ("match_status", "expected_status", "expected_answer"),
     [
-        ("ambiguous", "source_scope_ambiguous", AMBIGUOUS_ANSWER),
-        ("no_match", "source_scope_no_match", AMBIGUOUS_ANSWER),
+        ("ambiguous", "source_scope_ambiguous", SOURCE_AMBIGUITY_ANSWER),
+        ("no_match", "source_scope_no_match", SOURCE_NO_MATCH_ANSWER),
         (
             "inventory_unavailable",
             "inventory_dependency_failed",

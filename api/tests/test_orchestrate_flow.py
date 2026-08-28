@@ -19525,7 +19525,8 @@ async def test_evidence_acquisition_ambiguous_shape_is_provider_and_dsa_free(tmp
     )
 
     assert out["answer"] == (
-        "I need a narrower evidence request before I can determine what should be checked."
+        "I need one detail before I can answer: what exactly do you want me to "
+        "determine?"
     )
     assert out["selected_model"] == "not_called"
     assert dsa.list_calls == [{}]
@@ -19574,7 +19575,8 @@ async def test_source_match_ambiguity_is_inventory_only_and_provider_free(tmp_pa
     )
 
     assert result["answer"] == (
-        "I need a narrower evidence request before I can determine what should be checked."
+        "I found more than one plausible place to check. Which record or data set "
+        "should I use?"
     )
     assert dsa.list_calls == [{}]
     assert dsa.calls == []
@@ -21606,6 +21608,26 @@ def _semantic_test_shape(call, *, second_status="resolved"):
             "probe_source_ids": sorted(advisory["candidate_source_ids"]),
             "reason_codes": ["semantic_candidates_ambiguous"],
         }
+    elif second_status == "comparison_probe":
+        response["result"].update(
+            {
+                "derivation_status": "derived",
+                "task_shape": "cross_source_comparison",
+                "candidate_task_shapes": ["cross_source_comparison"],
+                "evidence_scope_material": True,
+                "clarification_required": False,
+                "reason_codes": [
+                    "semantic_operation_hint",
+                    "comparison_requested",
+                ],
+            }
+        )
+        response["result"]["source_match"] = {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": sorted(advisory["candidate_source_ids"]),
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        }
     elif second_status == "ambiguous":
         response["result"].update(
             {
@@ -22516,6 +22538,134 @@ async def test_authorized_probe_requires_every_planned_source_in_dsa_accounting(
         assert out["status"] == "degraded"
         assert len(litellm.calls) == 1
         assert manifest["acquisition"]["dsa_outcome"] != "success"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_comparison_probe_reaches_governed_reasoning(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_interpreter:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n"
+        + "  evidence_reasoning:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    request_id = "rid-semantic-comparison-probe"
+    question = "Compare the bounded records from the plausible data sets."
+    probe_source_ids = ["records_primary", "records_secondary"]
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(
+            call,
+            second_status="comparison_probe",
+        ),
+        evidence_plan_response=_hybrid_plan_response(
+            request_id=request_id,
+            question=question,
+            eligible_source_ids=probe_source_ids,
+        ),
+        auto_source_match=False,
+    )
+    dsa = FakeDSA(
+        response=_neutral_multi_source_context_pack(question),
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "display_name": f"Record Set {index}",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["records"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+                for index, source_id in enumerate(probe_source_ids, start=1)
+            ],
+        },
+        context_responses=[
+            _hybrid_context_response(
+                source_id=probe_source_ids[0],
+                source_ref=f"{probe_source_ids[0]}:expanded_1",
+                text="The first bounded record contains supporting evidence.",
+            ),
+            _hybrid_context_response(
+                source_id=probe_source_ids[1],
+                source_ref=f"{probe_source_ids[1]}:expanded_2",
+                text="The second bounded record contains supporting evidence.",
+            ),
+        ],
+    )
+    evidence_refs = [
+        governed_external_reference_id(f"{source_id}:expanded_{index}")
+        for index, source_id in enumerate(probe_source_ids, start=1)
+    ]
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "ambiguous",
+                "comparison",
+                probe_source_ids,
+            ),
+            _general_reasoning_completion(
+                proposed_claim="The bounded records support a qualified comparison.",
+                evidence_ref_id=evidence_refs[0],
+                supporting_evidence_ref_ids=evidence_refs,
+            ),
+        ]
+    )
+    memory_store = ClaimCaptureMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question,
+            external_context_enabled=True,
+        ),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=True,
+        general_evidence_reasoning_timeout_ms=5000,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    prompt_trace = memory_store.trace_calls[-1]["payload"]["prompt"]
+    manifest = prompt_trace["evidence_acquisition"]
+    assert out["status"] == "ok"
+    assert "qualified comparison" in out["answer"]
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == (
+        probe_source_ids
+    )
+    assert dsa.calls[0]["source_ids"] == probe_source_ids
+    assert len(dsa.context_calls) == 2
+    assert len(litellm.calls) == 2
+    assert len(runtime.claim_support_calls) == 1
+    assert manifest["shape"]["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+        "probe_source_count": 2,
+    }
+    assert prompt_trace["general_evidence_reasoning"]["attempted"] is True
+    assert prompt_trace["general_evidence_reasoning"]["cr_call_count"] == 1
+    assert out.get("pending_action") is None
 
 
 @pytest.mark.asyncio
@@ -23996,8 +24146,8 @@ async def test_evidence_acquisition_exact_fetch_ineligible_paths_fail_closed(
     )
 
     assert out["answer"] == (
-        "I need a narrower evidence request before I can determine what should "
-        "be checked."
+            "I need one detail before I can answer: what exactly do you want me to "
+            "determine?"
         if case == "ambiguous"
         else "I can’t safely complete that evidence request with the currently "
         "available source capabilities."

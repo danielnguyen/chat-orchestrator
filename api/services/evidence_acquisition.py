@@ -228,8 +228,19 @@ NextStepReasonCode = Literal[
     "unsupported_conclusion_withheld",
 ]
 
-AMBIGUOUS_ANSWER = (
-    "I need a narrower evidence request before I can determine what should be checked."
+QUESTION_CLARIFICATION_ANSWER = (
+    "I need one detail before I can answer: what exactly do you want me to determine?"
+)
+SOURCE_AMBIGUITY_ANSWER = (
+    "I found more than one plausible place to check. Which record or data set "
+    "should I use?"
+)
+SOURCE_NO_MATCH_ANSWER = (
+    "I couldn't tell what information to use for this question. What should I check?"
+)
+SEMANTIC_INTERPRETER_FAILURE_ANSWER = (
+    "I couldn't determine what information this question needs, so I can't answer "
+    "it safely right now."
 )
 UNSUPPORTED_ANSWER = (
     "I can’t safely complete that evidence request with the currently available "
@@ -4098,6 +4109,32 @@ def _validate_supported_plan(state: EvidenceAcquisitionState) -> bool:
     )
 
 
+def _source_ambiguity_answer(
+    inventory: DsaSourceListResponse,
+    candidate_source_ids: list[str],
+) -> str:
+    if not 2 <= len(candidate_source_ids) <= 3:
+        return SOURCE_AMBIGUITY_ANSWER
+    inventory_by_id = {source.source_id: source for source in inventory.sources}
+    display_names: list[str] = []
+    for source_id in candidate_source_ids:
+        source = inventory_by_id.get(source_id)
+        if source is None:
+            return SOURCE_AMBIGUITY_ANSWER
+        display_name = _safe_source_summary_text(source.display_name, maximum=120)
+        if display_name is None:
+            return SOURCE_AMBIGUITY_ANSWER
+        display_names.append(display_name)
+    if len(display_names) == 2:
+        rendered = f"{display_names[0]} and {display_names[1]}"
+    else:
+        rendered = f"{display_names[0]}, {display_names[1]}, and {display_names[2]}"
+    return (
+        f"I found more than one plausible place to check: {rendered}. "
+        "Which should I use?"
+    )
+
+
 async def begin_evidence_acquisition(
     *,
     runtime: Any,
@@ -4214,6 +4251,7 @@ async def begin_evidence_acquisition(
                 raise ValueError("source_match_inventory_mismatch")
         return result
 
+    semantic_candidate_source_ids: list[str] = []
     state.status = "shape_requested"
     try:
         state.shape = await derive_shape(task_context)
@@ -4303,7 +4341,7 @@ async def begin_evidence_acquisition(
                     {"status": "failed", "reason": "unresolved_operation"}
                 )
                 state.status = "semantic_interpreter_failed"
-                state.forced_answer = AMBIGUOUS_ANSWER
+                state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(
                     scope=scope,
                     plan_id=None,
@@ -4315,6 +4353,9 @@ async def begin_evidence_acquisition(
             advisory_payload["candidate_source_ids"] = sorted(
                 advisory.candidate_source_ids
             )
+            semantic_candidate_source_ids = list(
+                advisory_payload["candidate_source_ids"]
+            )
         except SemanticInterpreterFailure as exc:
             failure = {"status": "failed", "reason": exc.reason}
             if exc.failure_code is not None:
@@ -4324,7 +4365,7 @@ async def begin_evidence_acquisition(
             state.semantic_interpreter.update(failure)
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
-                state.forced_answer = AMBIGUOUS_ANSWER
+                state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(
                     scope=scope,
                     plan_id=None,
@@ -4343,7 +4384,7 @@ async def begin_evidence_acquisition(
             state.semantic_interpreter.update(failure)
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
-                state.forced_answer = AMBIGUOUS_ANSWER
+                state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(
                     scope=scope,
                     plan_id=None,
@@ -4361,7 +4402,7 @@ async def begin_evidence_acquisition(
             )
             if first_shape.derivation_status != "not_applicable":
                 state.status = "semantic_interpreter_failed"
-                state.forced_answer = AMBIGUOUS_ANSWER
+                state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(
                     scope=scope,
                     plan_id=None,
@@ -4410,7 +4451,18 @@ async def begin_evidence_acquisition(
         return state
     if state.shape.derivation_status == "ambiguous":
         state.status = "ambiguous"
-        state.forced_answer = AMBIGUOUS_ANSWER
+        if (
+            state.shape.source_match is not None
+            and state.shape.source_match.status == "ambiguous"
+            and state.inventory is not None
+            and semantic_candidate_source_ids
+        ):
+            state.forced_answer = _source_ambiguity_answer(
+                state.inventory,
+                semantic_candidate_source_ids,
+            )
+        else:
+            state.forced_answer = QUESTION_CLARIFICATION_ANSWER
         state.manifest_id = _manifest_id(
             scope=scope,
             plan_id=None,
@@ -4441,10 +4493,13 @@ async def begin_evidence_acquisition(
                 natural_source_ids = list(source_match.probe_source_ids)
             else:
                 state.status = "source_scope_ambiguous"
-                state.forced_answer = AMBIGUOUS_ANSWER
+                state.forced_answer = _source_ambiguity_answer(
+                    state.inventory,
+                    semantic_candidate_source_ids,
+                )
         elif source_match.status == "no_match":
             state.status = "source_scope_no_match"
-            state.forced_answer = AMBIGUOUS_ANSWER
+            state.forced_answer = SOURCE_NO_MATCH_ANSWER
         elif source_match.status == "inventory_unavailable":
             state.status = "inventory_dependency_failed"
             state.forced_answer = UNSUPPORTED_ANSWER
@@ -4542,9 +4597,7 @@ async def begin_evidence_acquisition(
         return state
 
     if state.is_authorized_probe and not (
-        state.plan.task_shape == "targeted_lookup"
-        and state.plan.plan_status in {"ready", "ready_with_limitations"}
-        and state.plan.selected_strategies == ["targeted_retrieval"]
+        state.plan.plan_status in {"ready", "ready_with_limitations"}
         and state.plan.eligible_source_ids == state.authorized_probe_source_ids
         and state.declared_scope.get("exact_source_refs") == []
     ):
