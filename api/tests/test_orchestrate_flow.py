@@ -22169,6 +22169,101 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
 
 
 @pytest.mark.asyncio
+async def test_matched_targeted_no_match_returns_to_existing_provider_path(tmp_path):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    question = "What makes a review useful?"
+
+    def matched_then_not_applicable(call):
+        response = _not_applicable_shape_response(call)
+        advisory = call["task_context"].get("semantic_advisory")
+        if advisory is None:
+            response["result"].update(
+                {
+                    "derivation_status": "derived",
+                    "task_shape": "targeted_lookup",
+                    "candidate_task_shapes": ["targeted_lookup"],
+                    "evidence_scope_material": True,
+                    "reason_codes": ["targeted_lookup_derived"],
+                }
+            )
+            response["result"]["source_match"] = {
+                "status": "matched",
+                "matched_source_ids": ["review_archive"],
+                "reason_codes": ["source_id_match"],
+            }
+        else:
+            response["result"]["source_match"] = {
+                "status": "no_match",
+                "matched_source_ids": [],
+                "reason_codes": ["semantic_no_match"],
+            }
+        return response
+
+    runtime = FakeRuntime(
+        evidence_shape_response=matched_then_not_applicable,
+        auto_source_match=False,
+    )
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion("no_match", "unknown", []),
+            {"choices": [{"message": {"content": "Useful reviews are specific."}}]},
+        ]
+    )
+    dsa = FakeDSA(
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": "review_archive",
+                    "display_name": "Alpha Review Archive",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["alpha", "review"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+            ],
+        }
+    )
+    memory_store = FakeMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id="rid-matched-topical-no-match",
+    )
+
+    assert out["status"] == "ok"
+    assert out["answer"] == "Useful reviews are specific."
+    assert len(runtime.evidence_shape_calls) == 2
+    assert runtime.evidence_plan_calls == []
+    assert dsa.calls == []
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls == []
+    assert len(litellm.calls) == 2
+    assert memory_store.trace_calls[0]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]["status"] == "not_applicable"
+    assert memory_store.trace_calls[0]["payload"]["prompt"][
+        "semantic_interpreter"
+    ]["interpretation_status"] == "no_match"
+
+
+@pytest.mark.asyncio
 async def test_explicit_source_fast_path_skips_interpreter(tmp_path):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
     question = "Verify the maintenance record."
@@ -22663,6 +22758,170 @@ async def test_ambiguous_comparison_probe_reaches_governed_reasoning(tmp_path):
         "reason_codes": ["semantic_candidates_ambiguous"],
         "probe_source_count": 2,
     }
+    assert prompt_trace["general_evidence_reasoning"]["attempted"] is True
+    assert prompt_trace["general_evidence_reasoning"]["cr_call_count"] == 1
+    assert out.get("pending_action") is None
+
+
+@pytest.mark.asyncio
+async def test_matched_non_targeted_refinement_reaches_probe_and_reasoning(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    models.write_text(
+        models.read_text(encoding="utf-8")
+        + "logical_routes:\n"
+        + "  evidence_interpreter:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n"
+        + "  evidence_reasoning:\n"
+        + "    model: gpt-5-mini\n"
+        + "    provider: cloud\n",
+        encoding="utf-8",
+    )
+    request_id = "rid-matched-contradiction-refinement"
+    question = "Review the bounded records for conflicting evidence."
+    probe_source_ids = ["records_primary", "records_secondary"]
+
+    def matched_then_probe(call):
+        response = _not_applicable_shape_response(call)
+        advisory = call["task_context"].get("semantic_advisory")
+        response["result"].update(
+            {
+                "derivation_status": "derived",
+                "task_shape": "contradiction_review",
+                "candidate_task_shapes": ["contradiction_review"],
+                "evidence_scope_material": True,
+                "clarification_required": False,
+                "reason_codes": ["contradiction_requested"],
+            }
+        )
+        if advisory is None:
+            response["result"]["source_match"] = {
+                "status": "matched",
+                "matched_source_ids": [probe_source_ids[0]],
+                "reason_codes": ["source_id_match"],
+            }
+        else:
+            response["result"]["source_match"] = {
+                "status": "ambiguous",
+                "matched_source_ids": [],
+                "probe_source_ids": probe_source_ids,
+                "reason_codes": ["semantic_candidates_ambiguous"],
+            }
+        return response
+
+    runtime = FakeRuntime(
+        evidence_shape_response=matched_then_probe,
+        evidence_plan_response=_hybrid_plan_response(
+            request_id=request_id,
+            question=question,
+            task_shape="contradiction_review",
+            eligible_source_ids=probe_source_ids,
+        ),
+        auto_source_match=False,
+    )
+    dsa = FakeDSA(
+        response=_neutral_multi_source_context_pack(question),
+        source_response={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+            "sources": [
+                {
+                    "source_id": source_id,
+                    "display_name": f"Review Record Set {index}",
+                    "connector": "neutral_connector",
+                    "domain_tags": ["records"],
+                    "sensitivity": "medium",
+                    "access_mode": "read_only",
+                    "capabilities": ["profile", "search", "context"],
+                    "enabled": True,
+                    "status": "ready",
+                    "last_checked_at": "2026-07-17T00:00:00Z",
+                    "last_error": None,
+                }
+                for index, source_id in enumerate(
+                    [*probe_source_ids, "records_decoy"], start=1
+                )
+            ],
+        },
+        context_responses=[
+            _hybrid_context_response(
+                source_id=probe_source_ids[0],
+                source_ref=f"{probe_source_ids[0]}:expanded_1",
+                text="The first bounded record contains supporting evidence.",
+            ),
+            _hybrid_context_response(
+                source_id=probe_source_ids[1],
+                source_ref=f"{probe_source_ids[1]}:expanded_2",
+                text="The second bounded record contains counterevidence.",
+            ),
+        ],
+    )
+    evidence_refs = [
+        governed_external_reference_id(f"{source_id}:expanded_{index}")
+        for index, source_id in enumerate(probe_source_ids, start=1)
+    ]
+    litellm = SequenceLiteLLM(
+        [
+            _evidence_interpreter_completion(
+                "ambiguous",
+                "contradiction_review",
+                probe_source_ids,
+            ),
+            _general_reasoning_completion(
+                proposed_claim="The bounded records expose relevant counterevidence.",
+                evidence_ref_id=evidence_refs[0],
+                supporting_evidence_ref_ids=evidence_refs,
+            ),
+        ]
+    )
+    memory_store = ClaimCaptureMemoryStore()
+
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory_store,
+        litellm=litellm,
+        runtime=runtime,
+        dsa=dsa,
+        dsa_enabled=True,
+        evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True,
+        claim_record_capture_enabled=True,
+        general_evidence_reasoning_enabled=True,
+        general_evidence_reasoning_presentation_enabled=True,
+        general_evidence_reasoning_timeout_ms=5000,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        request_id=request_id,
+    )
+
+    prompt_trace = memory_store.trace_calls[-1]["payload"]["prompt"]
+    manifest = prompt_trace["evidence_acquisition"]
+    assert out["status"] == "ok"
+    assert len(runtime.evidence_shape_calls) == 2
+    assert runtime.evidence_plan_calls[0]["declared_scope"]["source_ids"] == (
+        probe_source_ids
+    )
+    assert dsa.calls[0]["source_ids"] == probe_source_ids
+    assert len(dsa.context_calls) == 2
+    assert {
+        call["source_ref"].split(":", maxsplit=1)[0]
+        for call in dsa.context_calls
+    } == set(probe_source_ids)
+    assert all(
+        not call["source_ref"].startswith("records_decoy:")
+        for call in dsa.context_calls
+    )
+    assert len(litellm.calls) == 2
+    assert "records_decoy" in litellm.calls[0]["messages"][1]["content"]
+    assert len(runtime.claim_support_calls) == 1
+    assert manifest["shape"]["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+        "probe_source_count": 2,
+    }
+    assert prompt_trace["semantic_interpreter"]["reason"] == "validated"
     assert prompt_trace["general_evidence_reasoning"]["attempted"] is True
     assert prompt_trace["general_evidence_reasoning"]["cr_call_count"] == 1
     assert out.get("pending_action") is None

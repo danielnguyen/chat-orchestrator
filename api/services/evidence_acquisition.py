@@ -4277,11 +4277,19 @@ async def begin_evidence_acquisition(
         and first_shape.derivation_status == "derived"
         and first_shape.task_shape == "targeted_lookup"
     )
+    matched_source_refinement = bool(
+        first_shape.source_match is not None
+        and first_shape.source_match.status == "matched"
+        and first_shape.derivation_status == "derived"
+        and not operation_refinement
+    )
     semantic_eligibility_reason = None
     if unresolved_source_scope:
         semantic_eligibility_reason = "unresolved_source_scope"
     elif operation_refinement:
         semantic_eligibility_reason = "operation_refinement"
+    elif matched_source_refinement:
+        semantic_eligibility_reason = "matched_source_refinement"
     semantic_eligible = bool(
         not explicit_selector
         and semantic_interpreter is not None
@@ -4333,9 +4341,13 @@ async def begin_evidence_acquisition(
                 advisory,
                 semantic_source_list,
             )
-            if operation_refinement and (
-                advisory.operation_hint == "unknown"
-                or not advisory.candidate_source_ids
+            if (
+                operation_refinement
+                and advisory.interpretation_status != "no_match"
+                and (
+                    advisory.operation_hint == "unknown"
+                    or not advisory.candidate_source_ids
+                )
             ):
                 state.semantic_interpreter.update(
                     {"status": "failed", "reason": "unresolved_operation"}
@@ -4363,7 +4375,10 @@ async def begin_evidence_acquisition(
             if exc.failure_detail_code is not None:
                 failure["failure_detail_code"] = exc.failure_detail_code
             state.semantic_interpreter.update(failure)
-            if first_shape.derivation_status != "not_applicable":
+            if (
+                not matched_source_refinement
+                and first_shape.derivation_status != "not_applicable"
+            ):
                 state.status = "semantic_interpreter_failed"
                 state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(
@@ -4382,7 +4397,10 @@ async def begin_evidence_acquisition(
             if exc.detail_code is not None:
                 failure["failure_detail_code"] = exc.detail_code
             state.semantic_interpreter.update(failure)
-            if first_shape.derivation_status != "not_applicable":
+            if (
+                not matched_source_refinement
+                and first_shape.derivation_status != "not_applicable"
+            ):
                 state.status = "semantic_interpreter_failed"
                 state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(
@@ -4400,7 +4418,10 @@ async def begin_evidence_acquisition(
                     "failure_code": "proposal_schema_invalid",
                 }
             )
-            if first_shape.derivation_status != "not_applicable":
+            if (
+                not matched_source_refinement
+                and first_shape.derivation_status != "not_applicable"
+            ):
                 state.status = "semantic_interpreter_failed"
                 state.forced_answer = SEMANTIC_INTERPRETER_FAILURE_ANSWER
                 state.manifest_id = _manifest_id(

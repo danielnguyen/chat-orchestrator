@@ -4044,23 +4044,12 @@ async def test_semantic_self_consistency_failure_reaches_bounded_trace():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "advisory",
-    [
-        {
-            "interpretation_status": "resolved",
-            "operation_hint": "unknown",
-            "candidate_source_ids": ["source_a"],
-        },
-        {
-            "interpretation_status": "no_match",
-            "operation_hint": "unknown",
-            "candidate_source_ids": [],
-        },
-    ],
-    ids=["unknown-operation", "no-usable-candidate"],
-)
-async def test_operation_refinement_unknown_or_no_match_fails_closed(advisory):
+async def test_operation_refinement_unknown_operation_fails_closed():
+    advisory = {
+        "interpretation_status": "resolved",
+        "operation_hint": "unknown",
+        "candidate_source_ids": ["source_a"],
+    }
     first = _shape_with_source_match(
         status="matched",
         matched_source_ids=["source_a"],
@@ -4093,6 +4082,258 @@ async def test_operation_refinement_unknown_or_no_match_fails_closed(advisory):
     assert [name for name, _ in runtime.calls] == ["shape"]
     assert state.plan is None
     assert dsa.calls == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_operation_refinement_valid_no_match_returns_to_existing_path():
+    first = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+    )
+    second = _shape_with_source_match(
+        status="no_match",
+        derivation_status="not_applicable",
+    )
+    runtime = SequentialShapeRuntime([first, second])
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": "no_match",
+            "operation_hint": "unknown",
+            "candidate_source_ids": [],
+        }
+
+    dsa = FakeDsa(
+        [_source("source_a")],
+        inventory_metadata={
+            "inventory_scope": "configured_sources",
+            "inventory_status": "complete",
+        },
+    )
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "not_applicable"
+    assert state.follow_existing_path is True
+    assert state.forced_answer is None
+    assert state.plan is None
+    assert state.semantic_interpreter == {
+        "called": True,
+        "status": "accepted",
+        "reason": "validated",
+        "interpretation_status": "no_match",
+        "operation_hint": "unknown",
+        "candidate_count": 0,
+    }
+    assert [name for name, _ in runtime.calls] == ["shape", "shape"]
+    assert runtime.calls[1][1]["task_context"]["semantic_advisory"] == {
+        "interpretation_status": "no_match",
+        "operation_hint": "unknown",
+        "candidate_source_ids": [],
+    }
+    assert dsa.calls == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_operation_refinement_accepts_cr_preserved_exact_match():
+    first = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+    )
+    second = copy.deepcopy(first)
+    runtime = SequentialShapeRuntime([first, second])
+
+    async def interpreter(**kwargs):
+        return {
+            "interpretation_status": "no_match",
+            "operation_hint": "unknown",
+            "candidate_source_ids": [],
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [_source("source_a")],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    assert state.follow_existing_path is False
+    assert state.shape.source_match.matched_source_ids == ["source_a"]
+    assert state.declared_scope["source_ids"] == ["source_a"]
+    assert state.plan.eligible_source_ids == ["source_a"]
+    assert [name for name, _ in runtime.calls] == ["shape", "shape", "plan"]
+
+
+@pytest.mark.asyncio
+async def test_matched_non_targeted_scope_refines_over_full_inventory_to_probe():
+    probe_source_ids = ["source_a", "source_b"]
+    first = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+    )
+    first["result"].update(
+        {
+            "task_shape": "contradiction_review",
+            "candidate_task_shapes": ["contradiction_review"],
+        }
+    )
+    second = copy.deepcopy(first)
+    second["result"]["source_match"] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": probe_source_ids,
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    plan = _plan_response()
+    plan["result"].update(
+        {
+            "task_shape": "contradiction_review",
+            "eligible_source_ids": probe_source_ids,
+            "selected_strategies": ["hybrid"],
+            "declared_requirements": [
+                {
+                    "requirement_id": "contradiction-search",
+                    "requirement_kind": "contradiction_search",
+                    "criticality": "material",
+                },
+                {
+                    "requirement_id": "context-delivery",
+                    "requirement_kind": "context_delivery",
+                    "criticality": "material",
+                },
+            ],
+        }
+    )
+    runtime = SequentialShapeRuntime([first, second], plan=plan)
+    interpreter_calls = []
+
+    async def interpreter(**kwargs):
+        interpreter_calls.append(kwargs)
+        return {
+            "interpretation_status": "ambiguous",
+            "operation_hint": "contradiction_review",
+            "candidate_source_ids": probe_source_ids,
+        }
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [
+                _source(source_id, capabilities=["profile", "search", "context"])
+                for source_id in [*probe_source_ids, "source_decoy"]
+            ],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert len(interpreter_calls) == 1
+    assert [
+        source.source_id for source in interpreter_calls[0]["source_list"].sources
+    ] == ["source_a", "source_b", "source_decoy"]
+    assert state.status == "acquisition_ready"
+    assert state.forced_answer is None
+    assert state.semantic_interpreter["reason"] == "validated"
+    assert state.shape.task_shape == "contradiction_review"
+    assert state.shape.source_match.status == "ambiguous"
+    assert state.shape.source_match.matched_source_ids == []
+    assert state.shape.source_match.probe_source_ids == probe_source_ids
+    assert state.declared_scope["source_ids"] == probe_source_ids
+    assert state.plan.eligible_source_ids == probe_source_ids
+    assert state.plan.selected_strategies == ["hybrid"]
+    assert state.is_authorized_probe is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["dependency", "malformed", "unauthorized_candidate"],
+)
+async def test_optional_matched_source_refinement_failure_preserves_first_shape(
+    failure_mode,
+):
+    first = _shape_with_source_match(
+        status="matched",
+        matched_source_ids=["source_a"],
+    )
+    first["result"].update(
+        {
+            "task_shape": "contradiction_review",
+            "candidate_task_shapes": ["contradiction_review"],
+        }
+    )
+    plan = _plan_response()
+    plan["result"].update(
+        {
+            "task_shape": "contradiction_review",
+            "eligible_source_ids": ["source_a"],
+            "selected_strategies": ["targeted_retrieval"],
+        }
+    )
+    runtime = SequentialShapeRuntime([first], plan=plan)
+    interpreter_calls = []
+
+    async def interpreter(**kwargs):
+        interpreter_calls.append(kwargs)
+        if failure_mode == "dependency":
+            raise SemanticInterpreterFailure("dependency_failure")
+        if failure_mode == "unauthorized_candidate":
+            return {
+                "interpretation_status": "resolved",
+                "operation_hint": "contradiction_review",
+                "candidate_source_ids": ["source_outside_inventory"],
+            }
+        return {"unexpected": "PRIVATE_SEMANTIC_PAYLOAD"}
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa(
+            [_source("source_a")],
+            inventory_metadata={
+                "inventory_scope": "configured_sources",
+                "inventory_status": "complete",
+            },
+        ),
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context=None,
+        semantic_interpreter=interpreter,
+        **SCOPE,
+    )
+
+    assert len(interpreter_calls) == 1
+    assert state.status == "acquisition_ready"
+    assert state.forced_answer is None
+    assert state.shape == ShapeResult.model_validate(first["result"])
+    assert state.shape.source_match.matched_source_ids == ["source_a"]
+    assert state.shape.source_match.probe_source_ids == []
+    assert state.declared_scope["source_ids"] == ["source_a"]
+    assert state.semantic_interpreter["status"] == "failed"
+    assert [name for name, _ in runtime.calls] == ["shape", "plan"]
 
 
 @pytest.mark.asyncio
@@ -4149,7 +4390,7 @@ async def test_operation_refinement_provider_failures_are_safe(failure_mode):
 
 
 @pytest.mark.asyncio
-async def test_explicit_and_specialized_deterministic_matches_bypass_semantic_interpreter():
+async def test_explicit_selector_bypasses_semantic_interpreter():
     async def forbidden_interpreter(**kwargs):
         raise AssertionError(kwargs)
 
@@ -4166,37 +4407,8 @@ async def test_explicit_and_specialized_deterministic_matches_bypass_semantic_in
         semantic_interpreter=forbidden_interpreter,
         **SCOPE,
     )
-    specialized_shape = _exhaustive_shape_response()
-    specialized_shape["result"]["source_match"] = {
-        "status": "matched",
-        "matched_source_ids": ["source_a"],
-        "reason_codes": ["source_id_match"],
-    }
-    specialized_runtime = FakeRuntime(
-        shape=specialized_shape,
-        plan=_exhaustive_plan_response(),
-        auto_source_match=False,
-    )
-    specialized = await begin_evidence_acquisition(
-        runtime=specialized_runtime,
-        dsa=FakeDsa(
-            [_source("source_a", capabilities=["profile", "search", "context"])],
-            inventory_metadata={
-                "inventory_scope": "configured_sources",
-                "inventory_status": "complete",
-            },
-        ),
-        task_text=specialized_shape["result"]["question_anchor"],
-        interaction_kind="question",
-        external_context=None,
-        semantic_interpreter=forbidden_interpreter,
-        **SCOPE,
-    )
-
     assert explicit.declared_scope["source_ids"] == ["source_a"]
-    assert specialized.declared_scope["source_ids"] == ["source_a"]
     assert len([call for call in explicit_runtime.calls if call[0] == "shape"]) == 1
-    assert len([call for call in specialized_runtime.calls if call[0] == "shape"]) == 1
 
 
 @pytest.mark.asyncio
