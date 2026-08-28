@@ -1815,7 +1815,7 @@ def _expansion_attempt_projection(
         observed = None
     else:
         observed = {outcome: 0 for outcome in outcomes}
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str | None]] = set()
         for attempt in attempts:
             if not isinstance(attempt, dict) or set(attempt) != {
                 "source_id",
@@ -1850,19 +1850,19 @@ def _expansion_attempt_projection(
                 or (
                     outcome == "satisfied"
                     and (
-                        not isinstance(source_ref, str)
-                        or not isinstance(mode, str)
-                        or returned == 0
+                        not isinstance(mode, str) or returned == 0
                     )
-                )
-                or (
-                    isinstance(source_ref, str)
-                    and (source_id, source_ref) in seen
                 )
             ):
                 return None
-            if isinstance(source_ref, str):
-                seen.add((source_id, source_ref))
+            attempt_identity = (
+                ("seed", source_id, source_ref)
+                if isinstance(source_ref, str)
+                else ("source", source_id, mode)
+            )
+            if attempt_identity in seen:
+                return None
+            seen.add(attempt_identity)
             observed[outcome] += 1
         attempt_count = len(attempts)
 
