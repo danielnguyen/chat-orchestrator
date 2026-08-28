@@ -6922,6 +6922,23 @@ def _exhaustive_targeted_context_pack():
     )
 
 
+def _empty_exhaustive_targeted_context_pack():
+    response = _exhaustive_targeted_context_pack()
+    response["items"] = []
+    response["budget"].update(
+        {
+            "returned_results": 0,
+            "estimated_bytes": 0,
+        }
+    )
+    response["diagnostics"]["candidate_counts_by_source"] = {"source_a": 0}
+    return validate_bounded_exhaustive_context_pack_response(
+        response,
+        expected_query=response["query"],
+        expected_source_id="source_a",
+    )
+
+
 def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
     assert _exhaustive_state().supported_complete_scope_path is True
     assert _exhaustive_state().supported_governed_path is True
@@ -7206,7 +7223,7 @@ def test_bounded_exhaustive_rejects_malformed_inventory_and_wider_universe():
     )
 
 
-def test_bounded_exhaustive_context_pack_requires_exact_seed_association():
+def test_bounded_exhaustive_context_pack_preserves_exact_planned_source_scope():
     valid = _exhaustive_targeted_context_pack()
     assert valid["items"][0]["available_context"][0]["context_mode"] == (
         "nearby_rows"
@@ -7214,11 +7231,16 @@ def test_bounded_exhaustive_context_pack_requires_exact_seed_association():
     assert valid["items"][0]["available_context"][1]["context_mode"] == (
         "configured_worksheet"
     )
+    empty = _empty_exhaustive_targeted_context_pack()
+    assert empty["sources_used"] == ["source_a"]
+    assert empty["items"] == []
+    assert empty["diagnostics"]["selected_source_ids"] == ["source_a"]
+    assert empty["diagnostics"]["candidate_counts_by_source"] == {"source_a": 0}
 
     mutations = []
     for mutation in (
         "errors",
-        "missing-items",
+        "dropped-source-scope",
         "wrong-count",
         "missing-diagnostics",
         "wrong-considered",
@@ -7241,7 +7263,7 @@ def test_bounded_exhaustive_context_pack_requires_exact_seed_association():
         )
         if mutation == "errors":
             response["errors"] = [{"code": "bounded_error"}]
-        elif mutation == "missing-items":
+        elif mutation == "dropped-source-scope":
             response["items"] = []
             response["sources_used"] = []
             response["budget"]["returned_results"] = 0
@@ -7366,7 +7388,7 @@ def test_configured_worksheet_response_rejects_malformed_contract(mutation):
 
 
 @pytest.mark.asyncio
-async def test_bounded_exhaustive_selects_exact_descriptor_and_only_delivers_range():
+async def test_bounded_exhaustive_uses_exact_planned_source_and_only_delivers_range():
     state = _exhaustive_state()
     targeted = _exhaustive_targeted_context_pack()
     first_without_mode = copy.deepcopy(targeted["items"][0])
@@ -7406,7 +7428,7 @@ async def test_bounded_exhaustive_selects_exact_descriptor_and_only_delivers_ran
         (
             "context_source",
             {
-                "source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+                "source_id": "source_a",
                 "context_mode": "configured_worksheet",
                 "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
             },
@@ -7439,7 +7461,7 @@ async def test_bounded_exhaustive_selects_exact_descriptor_and_only_delivers_ran
     assert state.expansion_attempts == [
         {
             "source_id": "source_a",
-            "seed_source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+            "seed_source_ref": None,
             "context_mode": "configured_worksheet",
             "outcome": "satisfied",
             "query_id": "configured-worksheet-query",
@@ -7449,7 +7471,7 @@ async def test_bounded_exhaustive_selects_exact_descriptor_and_only_delivers_ran
 
 
 @pytest.mark.asyncio
-async def test_bounded_exhaustive_missing_exact_descriptor_is_unsupported_without_call():
+async def test_bounded_exhaustive_missing_descriptor_still_uses_planned_source():
     state = _exhaustive_state()
     targeted = _exhaustive_targeted_context_pack()
     targeted["items"][0]["available_context"] = [
@@ -7458,7 +7480,7 @@ async def test_bounded_exhaustive_missing_exact_descriptor_is_unsupported_withou
             "description": "Fetch every complete worksheet.",
         }
     ]
-    dsa = FakeDsa([], context_responses=[])
+    dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
 
     bundle, trace = await execute_bounded_exhaustive_review(
         state=state,
@@ -7467,13 +7489,138 @@ async def test_bounded_exhaustive_missing_exact_descriptor_is_unsupported_withou
         dsa_trace={"called": True, "status": "success"},
     )
 
-    assert dsa.calls == []
-    assert bundle["items"] == []
-    assert state.expansion_attempts[0]["outcome"] == "unsupported"
+    assert dsa.calls == [
+        (
+            "context_source",
+            {
+                "source_id": "source_a",
+                "context_mode": "configured_worksheet",
+                "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
+            },
+        )
+    ]
+    assert bundle["sources_used"] == ["source_a"]
+    assert len(bundle["items"]) == 1
+    assert state.expansion_attempts[0]["outcome"] == "satisfied"
+    assert state.expansion_attempts[0]["seed_source_ref"] is None
     assert state.expansion_attempts[0]["context_mode"] == (
         CONFIGURED_WORKSHEET_CONTEXT_MODE
     )
-    assert trace["call_count"] == 1
+    assert trace["call_count"] == 2
+    assert trace["context_expansion_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_zero_targeted_results_expands_directly():
+    state = _exhaustive_state()
+    targeted = _empty_exhaustive_targeted_context_pack()
+    dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
+
+    bundle, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=targeted,
+        dsa_trace={"called": True, "status": "success"},
+    )
+
+    assert state.supported_complete_scope_path is True
+    assert dsa.calls == [
+        (
+            "context_source",
+            {
+                "source_id": "source_a",
+                "context_mode": "configured_worksheet",
+                "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
+            },
+        )
+    ]
+    assert bundle["sources_used"] == ["source_a"]
+    assert len(bundle["items"]) == 1
+    assert trace["raw_targeted_item_count"] == 0
+    assert trace["raw_expanded_item_count"] == 1
+    assert trace["final_combined_item_count"] == 1
+    assert trace["context_pack_call_count"] == 1
+    assert trace["context_expansion_call_count"] == 1
+    assert trace["expansion_attempt_counts"]["satisfied"] == 1
+    assert trace["status"] == "included"
+    assert state.expansion_attempts == [
+        {
+            "source_id": "source_a",
+            "seed_source_ref": None,
+            "context_mode": "configured_worksheet",
+            "outcome": "satisfied",
+            "query_id": "configured-worksheet-query",
+            "returned_reference_count": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
+    state = _exhaustive_state()
+    runtime = FakeRuntime()
+    dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
+    bundle, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=_empty_exhaustive_targeted_context_pack(),
+        dsa_trace={"called": True, "status": "success"},
+    )
+    retained_ref = "google_sheets:source_a:Maintenance!A2:E5"
+
+    await evaluate_acquisition_sufficiency(
+        state=state,
+        runtime=runtime,
+        context_pack=bundle,
+        dsa_trace=trace,
+        retained_source_refs={retained_ref},
+        **SCOPE,
+    )
+
+    assert state.status == "sufficient_for_declared_scope"
+    assert state.sufficiency is not None
+    assert state.sufficiency.sufficiency_status == "sufficient_for_declared_scope"
+    assert {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in state.acquisition_facts or []
+    } == {
+        "authoritative-inventory": "satisfied",
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+    assert len([call for call in runtime.calls if call[0] == "sufficiency"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "expected_outcome"),
+    [("dependency_failure", "failed"), ("malformed_response", "filtered")],
+)
+async def test_bounded_exhaustive_targeted_leg_failure_does_not_expand(
+    error_code,
+    expected_outcome,
+):
+    state = _exhaustive_state()
+    dsa = FakeDsa([], context_responses=[])
+
+    bundle, trace = await execute_bounded_exhaustive_review(
+        state=state,
+        dsa=dsa,
+        targeted_context_pack=None,
+        dsa_trace={
+            "called": True,
+            "status": "error",
+            "error_code": error_code,
+        },
+    )
+
+    assert dsa.calls == []
+    assert bundle["items"] == []
+    assert state.expansion_attempts[0]["outcome"] == expected_outcome
+    assert state.expansion_attempts[0]["seed_source_ref"] is None
+    assert trace["context_pack_call_count"] == 1
     assert trace["context_expansion_call_count"] == 0
 
 
@@ -7506,7 +7653,16 @@ async def test_bounded_exhaustive_failures_are_single_attempt_and_provider_safe(
         dsa_trace={"called": True, "status": "success"},
     )
     assert len(dsa.calls) == 1
+    assert dsa.calls[0] == (
+        "context_source",
+        {
+            "source_id": "source_a",
+            "context_mode": "configured_worksheet",
+            "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
+        },
+    )
     assert state.expansion_attempts[0]["outcome"] == expected_outcome
+    assert state.expansion_attempts[0]["seed_source_ref"] is None
     assert bundle["items"] == []
     assert trace["expansion_attempt_counts"][expected_outcome] == 1
     assert "PRIVATE DEPENDENCY FAILURE" not in json.dumps(
@@ -7520,7 +7676,7 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
     state.expansion_attempts = [
         {
             "source_id": "source_a",
-            "seed_source_ref": "google_sheets:source_a:Maintenance!A2:E2",
+            "seed_source_ref": None,
             "context_mode": "configured_worksheet",
             "outcome": "satisfied",
             "query_id": "configured-worksheet-query",
@@ -7649,7 +7805,7 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
             "called": True,
             "status": "included",
             "raw_item_count": 1,
-            "raw_targeted_item_count": 1,
+            "raw_targeted_item_count": 0,
             "raw_expanded_item_count": 1,
         },
         retained_source_refs={complete_ref},

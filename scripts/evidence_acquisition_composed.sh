@@ -7039,6 +7039,93 @@ CASES
   assert_diagnostic_advisory_calls "$provider_calls" 0
   assert_dsa_operation_counts "$audit" 1 1 0
 
+  question="Check whether every mandatory item meets the requested condition."
+  claim="The complete configured register supports the bounded synthesis."
+  owner="owner-generalized-seedless-full-scope"
+  client="client-generalized-seedless-full-scope"
+  external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":1}'
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  reset_dsa_audit
+  complete_ref="google_sheets:complete_register:Register!A2:C4"
+  complete_evidence_ref="external-source:$(printf '%s' "$complete_ref" | sha256sum | cut -d' ' -f1)"
+  queue_provider_answer "$(jq -nc --arg claim "$claim" --arg ref "$complete_evidence_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "generalized-seedless-full-scope")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  audit="$(fetch_dsa_audit)"
+  if ! jq -e --arg claim "$claim" '
+    .status == "ok" and .pending_action == null and (.answer | startswith($claim))
+  ' <<<"$response" >/dev/null 2>&1; then
+    printf 'Generalized seedless full-scope response: %s\n' \
+      "$(jq -c . <<<"$response")" >&2
+    printf 'Generalized seedless full-scope acquisition: %s\n' "$manifest" >&2
+    printf 'Generalized seedless full-scope reasoning: %s\n' \
+      "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" >&2
+    return 1
+  fi
+  assert_jq "generalized.seedless_full_scope.acquisition" "$manifest" '
+    .shape.task_shape == "bounded_exhaustive_review"
+    and .plan.plan_status == "ready"
+    and .plan.selected_strategies == ["hybrid"]
+    and .inventory.declared_source_count == 1
+    and .acquisition.strategy_attempted == "hybrid"
+    and .acquisition.sources_selected == ["complete_register"]
+    and .acquisition.sources_used == ["complete_register"]
+    and .acquisition.expansion_attempt_count == 1
+    and .acquisition.expansion_successful_count == 1
+    and .acquisition.prompt_retained_item_count == 1
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "generalized.seedless_full_scope.execution" "$trace" '
+    .retrieval.prompt_assembly.dsa.context_pack_call_count == 1
+    and .retrieval.prompt_assembly.dsa.context_expansion_call_count == 1
+    and .retrieval.prompt_assembly.dsa.raw_targeted_item_count == 0
+    and .retrieval.prompt_assembly.dsa.raw_expanded_item_count == 1
+    and .retrieval.prompt_assembly.dsa.final_combined_item_count == 1
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.reasoning_context_limited == false
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.decision_comparison.reason_codes
+      == ["unknown_freshness"]
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+  '
+  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_dsa_operation_counts "$audit" 1 1 0
+  assert_jq "generalized.seedless_full_scope.dsa" "$audit" '
+    ([.[] | select(
+      .operation == "context_pack"
+      and .source_ids == ["complete_register"]
+      and .result_count == 0
+    )] | length) == 1
+    and ([.[] | select(
+      .operation == "context"
+      and .source_ids == ["complete_register"]
+      and .source_ref == null
+      and .result_count == 1
+    )] | length) == 1
+    and ([.[] | select(
+      (.operation == "context_pack" or .operation == "context" or .operation == "fetch")
+      and .source_ids != ["complete_register"]
+    )] | length) == 0
+  '
+  assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
+
   question="Review the selected records for potentially conflicting evidence."
   owner="owner-generalized-partial"
   client="client-generalized-partial"

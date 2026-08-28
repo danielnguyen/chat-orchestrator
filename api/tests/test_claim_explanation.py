@@ -367,7 +367,7 @@ def _hybrid_manifest(
     exhaustive = task_shape == "bounded_exhaustive_review"
     source_ids = ["source-a"] if exhaustive else ["source-a", "source-b"]
     returned = ["range-a"] if exhaustive else ["range-a", "range-b"]
-    seeds = ["seed-a"] if exhaustive else ["seed-a", "seed-b"]
+    seeds = [None] if exhaustive else ["seed-a", "seed-b"]
     manifest["shape"]["task_shape"] = task_shape
     manifest["plan"].update(
         {
@@ -401,7 +401,7 @@ def _hybrid_manifest(
             "source_references_returned": returned,
             "source_references_retained": returned,
             "source_references_filtered_or_omitted": [],
-            "source_references_attempted": seeds,
+            "source_references_attempted": [] if exhaustive else seeds,
             "source_references_unsuccessful": [],
             "exact_reference_attempts": [],
             "exact_reference_attempt_count": 0,
@@ -907,6 +907,103 @@ def test_expansion_attempt_accepts_same_opaque_source_reference_contract():
     assert [
         attempt["seed_source_ref"] for attempt in acquisition["expansion_attempts"]
     ] == references
+
+
+def test_bounded_exhaustive_projection_accepts_seedless_direct_expansion():
+    manifest = _hybrid_manifest(task_shape="bounded_exhaustive_review")
+    acquisition = manifest["acquisition"]
+    acquisition["source_references_attempted"] = []
+    acquisition["expansion_attempts"][0]["seed_source_ref"] = None
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is not None
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history.counts["expansion_attempts"] == 1
+    assert diagnosed.history.counts["expansion_successful"] == 1
+    assert acquisition["source_references_attempted"] == []
+
+
+def test_seedless_expansion_requires_structural_seed_key():
+    manifest = _hybrid_manifest(task_shape="bounded_exhaustive_review")
+    del manifest["acquisition"]["expansion_attempts"][0]["seed_source_ref"]
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "expansion_attempt_projection_invalid"
+
+
+@pytest.mark.parametrize("seed_source_ref", [13, "unsafe\tref"])
+def test_seedless_expansion_rejects_invalid_non_null_seed(seed_source_ref):
+    manifest = _hybrid_manifest(task_shape="bounded_exhaustive_review")
+    manifest["acquisition"]["expansion_attempts"][0][
+        "seed_source_ref"
+    ] = seed_source_ref
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "expansion_attempt_projection_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("returned_reference_count", 0), ("context_mode", 13)],
+)
+def test_seedless_satisfied_expansion_preserves_required_structure(field, value):
+    manifest = _hybrid_manifest(task_shape="bounded_exhaustive_review")
+    manifest["acquisition"]["expansion_attempts"][0][field] = value
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "expansion_attempt_projection_invalid"
+
+
+def test_seedless_expansion_rejects_duplicate_source_and_context_attempt():
+    manifest = _hybrid_manifest(task_shape="bounded_exhaustive_review")
+    acquisition = manifest["acquisition"]
+    acquisition["expansion_attempts"].append(
+        copy.deepcopy(acquisition["expansion_attempts"][0])
+    )
+    acquisition["expansion_attempt_count"] = 2
+    acquisition["expansion_successful_count"] = 2
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is None
+    assert diagnosed.reason == "expansion_attempt_projection_invalid"
+
+
+def test_seedless_expansion_preserves_suppressed_history_projection():
+    manifest = _hybrid_manifest(task_shape="bounded_exhaustive_review")
+    acquisition = manifest["acquisition"]
+    for field in (
+        "sources_considered",
+        "sources_selected",
+        "sources_used",
+        "source_references_returned",
+        "source_references_retained",
+        "source_references_filtered_or_omitted",
+        "source_references_attempted",
+        "source_references_unsuccessful",
+        "exact_reference_attempts",
+        "expansion_attempts",
+        "unavailable_source_ids",
+        "failed_source_ids",
+    ):
+        acquisition[f"{field}_count"] = len(acquisition[field])
+        acquisition[field] = []
+    acquisition["source_identifiers_suppressed"] = True
+
+    diagnosed = _diagnose_acquisition_history_projection(manifest)
+
+    assert diagnosed.history is not None
+    assert diagnosed.reason == "accepted"
+    assert diagnosed.history.identifiers_suppressed is True
+    assert diagnosed.history.counts["expansion_attempts"] == 1
+    assert diagnosed.history.counts["expansion_successful"] == 1
 
 
 @pytest.mark.parametrize(
