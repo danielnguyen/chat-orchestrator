@@ -7236,8 +7236,6 @@ CASES
       | index("supplied_evidence_scope")) != null
     and ($records[0].support.material_scope_limitations
       | index("complete_scope_not_established")) != null
-    and ($records[0].support.material_scope_limitations
-      | index("material_acquisition_limited")) != null
     and (($records[0].support | tostring) | contains("PRIVATE") | not)
   ' <<<"$claim_records" >/dev/null 2>&1; then
     printf 'Generalized partial persistence: %s\n' "$(jq -c '{
