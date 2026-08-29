@@ -1508,13 +1508,17 @@ run_evidence_exhaustive_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "exhaustive.positive.response" "$response" '
+  if ! jq -e '
     .status == "ok"
     and (.answer | startswith("The retained evidence supports the requested conclusion."))
     and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This conclusion is complete only for the declared source scope that was checked; sources outside that scope were not examined."))
     and (.answer | contains("universal") | not)
-  '
+  ' <<<"$response" >/dev/null; then
+    printf 'Evidence exhaustive positive response: %s\n' \
+      "$(jq -c '{status,answer,source_count:(.sources | length)}' <<<"$response")" >&2
+    return 1
+  fi
   assert_jq "exhaustive.positive.manifest" "$manifest" '
     .shape.task_shape == "bounded_exhaustive_review"
     and .plan.selected_strategies == ["hybrid"]
