@@ -1508,14 +1508,14 @@ run_evidence_exhaustive_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   audit="$(fetch_dsa_audit)"
-  jq -e '
+  assert_jq "exhaustive.positive.response" "$response" '
     .status == "ok"
     and (.answer | startswith("The retained evidence supports the requested conclusion."))
     and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This conclusion is complete only for the declared source scope that was checked; sources outside that scope were not examined."))
     and (.answer | contains("universal") | not)
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "exhaustive.positive.manifest" "$manifest" '
     .shape.task_shape == "bounded_exhaustive_review"
     and .plan.selected_strategies == ["hybrid"]
     and .acquisition.expansion_attempt_count == 1
@@ -1523,12 +1523,13 @@ run_evidence_exhaustive_scenarios() {
     and .acquisition.item_count == 1
     and .acquisition.prompt_retained_item_count == 1
     and .sufficiency.status == "sufficient_for_declared_scope"
-  ' <<<"$manifest" >/dev/null
-  jq -e '
+  '
+  assert_jq "exhaustive.positive.audit" "$audit" '
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "context")] | length) == 1
-  ' <<<"$audit" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 2' <<<"$provider_calls" >/dev/null
+  '
+  assert_jq "exhaustive.positive.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 2'
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
@@ -1556,18 +1557,19 @@ run_evidence_exhaustive_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
-  jq -e '
+  assert_jq "exhaustive.truncation.response" "$response" '
     .status == "degraded"
     and (.answer | contains("reasoning context"))
     and (.answer | contains("withholding a complete-scope conclusion"))
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "exhaustive.truncation.manifest" "$manifest" '
     .acquisition.expansion_successful_count == 1
     and .acquisition.item_count == 1
     and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "unknown"
-  ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
+  '
+  assert_jq "exhaustive.truncation.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
   assert_semantic_interpreter_calls "$provider_calls" 1
   assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
   restart_orchestrator_with_reserve 2048
