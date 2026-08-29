@@ -1483,7 +1483,7 @@ run_evidence_exhaustive_scenarios() {
   local owner client conversation_id question external response request_id answer
   local trace provider_calls diagnostics manifest audit
   question="$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION"
-  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":1}'
+  external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
 
   owner="owner-evidence-exhaustive"
   client="client-evidence-exhaustive"
