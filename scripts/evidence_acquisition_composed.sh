@@ -795,7 +795,7 @@ assert_history_request_boundaries() {
 }
 
 readonly EVIDENCE_HYBRID_COMPARISON_QUESTION="Compare these two review calendar records and explain the differences between them."
-readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory record in Configured Review Register is reviewed."
+readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Inspect every record in Configured Review Register and summarize the bounded dataset."
 readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
 readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
