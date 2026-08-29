@@ -1517,6 +1517,19 @@ run_evidence_exhaustive_scenarios() {
   ' <<<"$response" >/dev/null; then
     printf 'Evidence exhaustive positive response: %s\n' \
       "$(jq -c '{status,answer,source_count:(.sources | length)}' <<<"$response")" >&2
+    printf 'Evidence exhaustive positive acquisition: %s\n' \
+      "$(jq -c '{
+        shape:.shape.task_shape,
+        strategies:.plan.selected_strategies,
+        item_count:.acquisition.item_count,
+        retained_count:.acquisition.prompt_retained_item_count,
+        search_budget_truncated:.acquisition.search_budget_truncated,
+        expansion_budget_truncated:.acquisition.expansion_budget_truncated,
+        candidate_truncated:.acquisition.candidate_truncated,
+        raw_targeted_item_count:.acquisition.raw_targeted_item_count,
+        raw_expanded_item_count:.acquisition.raw_expanded_item_count,
+        sufficiency:.sufficiency.status
+      }' <<<"$manifest")" >&2
     return 1
   fi
   assert_jq "exhaustive.positive.manifest" "$manifest" '
