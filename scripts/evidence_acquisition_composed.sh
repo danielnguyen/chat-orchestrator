@@ -970,7 +970,7 @@ run_evidence_source_scope_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   audit="$(fetch_dsa_audit)"
 
-  if ! jq -e '
+  jq -e '
     .status == "ok"
     and (.answer | startswith("The retained evidence supports the requested conclusion."))
   ' <<<"$response" >/dev/null
@@ -1191,7 +1191,7 @@ run_evidence_source_scope_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
 
-  jq -e '
+  if ! jq -e '
     .status == "degraded"
     and .answer == "I found more than one plausible place to check: Alpha Review Calendar and Beta Review Calendar. Which should I use?"
     and (.answer | contains("calendar_alpha") | not)
