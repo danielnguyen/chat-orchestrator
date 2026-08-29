@@ -2117,9 +2117,7 @@ class EvidenceAcquisitionState:
             for requirement in plan.declared_requirements
             if requirement.criticality == "material"
         } if plan is not None else set()
-        required_material = {
-            "authoritative_inventory", "complete_scope_coverage"
-        }
+        required_material = {"complete_scope_coverage"}
         if not (
             plan
             and inventory

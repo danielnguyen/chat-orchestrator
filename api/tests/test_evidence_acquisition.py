@@ -1029,7 +1029,6 @@ def _exhaustive_requirements():
             "criticality": "material",
         }
         for requirement_kind in (
-            "authoritative_inventory",
             "complete_scope_coverage",
             "contradiction_search",
             "context_delivery",
@@ -7084,8 +7083,16 @@ def _empty_exhaustive_targeted_context_pack():
 
 
 def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
-    assert _exhaustive_state().supported_complete_scope_path is True
-    assert _exhaustive_state().supported_governed_path is True
+    state = _exhaustive_state()
+    material_kinds = {
+        requirement.requirement_kind
+        for requirement in state.plan.declared_requirements
+        if requirement.criticality == "material"
+    }
+    assert "authoritative_inventory" not in material_kinds
+    assert "complete_scope_coverage" in material_kinds
+    assert state.supported_complete_scope_path is True
+    assert state.supported_governed_path is True
 
     second_source = _source(
         "source_b",
@@ -7728,7 +7735,6 @@ async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
         fact["requirement_id"]: fact["outcome"]
         for fact in state.acquisition_facts or []
     } == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
@@ -7873,7 +7879,6 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
         item["requirement_id"]: item["outcome"]
         for item in satisfied
     } == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
