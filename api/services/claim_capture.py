@@ -804,6 +804,11 @@ def claim_support_record_payload(
                     if authority.get("material_acquisition_limited") is True
                     else []
                 ),
+                *(
+                    ["supplied_evidence_scope"]
+                    if authority.get("claim_scope_basis") == "supplied_evidence"
+                    else []
+                ),
             }
         ),
         "calibration_status": status,

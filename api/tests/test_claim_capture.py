@@ -296,6 +296,69 @@ def test_presented_claim_support_payload_and_response_preserve_same_v2_contract(
     assert payload["calibration_result"]["strongest_authority"] == "unknown"
 
 
+def test_supplied_evidence_scope_is_persisted_in_existing_support_limitations():
+    reasoning_result = _shadow_result()
+    reasoning_result["authority_context"].update(
+        {
+            "claim_scope_basis": "supplied_evidence",
+            "complete_declared_scope_required": True,
+            "complete_declared_scope_established": False,
+        }
+    )
+    reasoning_result["cr_result"].update(
+        {
+            "limitation_codes": ["complete_scope_not_established"],
+            "calibration_status": "limited",
+            "conclusion_disposition": "qualified",
+            "qualification_required": True,
+        }
+    )
+
+    payload = claim_support_record_payload(
+        reasoning_result=reasoning_result,
+        presented_to_user=True,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        assistant_message_id="message-1",
+        surface="desktop_private",
+        runtime_session_id="session-1",
+        runtime_turn_id="turn-1",
+        acquisition_manifest_id="manifest-1",
+    )
+
+    assert payload is not None
+    assert payload["presented_to_user"] is True
+    assert payload["support"]["material_scope_limitations"] == [
+        "complete_scope_not_established",
+        "supplied_evidence_scope",
+    ]
+    assert "claim_scope_basis" not in payload
+
+
+def test_declared_scope_does_not_add_supplied_evidence_limitation():
+    reasoning_result = _shadow_result()
+    reasoning_result["authority_context"]["claim_scope_basis"] = "declared_scope"
+
+    payload = claim_support_record_payload(
+        reasoning_result=reasoning_result,
+        presented_to_user=True,
+        request_id="request-1",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        assistant_message_id="message-1",
+        surface="desktop_private",
+        runtime_session_id="session-1",
+        runtime_turn_id="turn-1",
+        acquisition_manifest_id="manifest-1",
+    )
+
+    assert payload is not None
+    assert "supplied_evidence_scope" not in payload["support"][
+        "material_scope_limitations"
+    ]
+
+
 def test_presented_claim_support_uses_only_system_evidence_source_descriptor():
     reasoning_result = _shadow_result()
     system_descriptor = {

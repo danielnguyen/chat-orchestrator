@@ -6652,6 +6652,7 @@ run_general_evidence_reasoning_shadow_scenario() {
 run_generalized_acquisition_reasoning_scenarios() {
   local case_name expected_shape question owner client conversation_id
   local external response request_id trace manifest diagnostics provider_calls audit proposal claim
+  local bounded_claim claim_records
   local alpha_ref beta_ref alpha_evidence_ref beta_evidence_ref
   alpha_ref="ics_calendar:calendar_alpha:event:alpha-event"
   beta_ref="ics_calendar:calendar_beta:event:beta-event"
@@ -7029,7 +7030,8 @@ CASES
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
   assert_jq "generalized.full_scope.authority" "$trace" '
-    .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    .prompt.general_evidence_reasoning.claim_scope_basis == "declared_scope"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
     and .prompt.general_evidence_reasoning.presented_to_user == true
     and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
@@ -7093,6 +7095,7 @@ CASES
     and .retrieval.prompt_assembly.dsa.raw_targeted_item_count == 0
     and .retrieval.prompt_assembly.dsa.raw_expanded_item_count == 1
     and .retrieval.prompt_assembly.dsa.final_combined_item_count == 1
+    and .prompt.general_evidence_reasoning.claim_scope_basis == "declared_scope"
     and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
     and .prompt.general_evidence_reasoning.reasoning_context_limited == false
@@ -7152,10 +7155,12 @@ CASES
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
-  if ! jq -e '
+  claim_records="$(list_claim_records "$owner" "$conversation_id")"
+  bounded_claim="Based only on the evidence I could examine, this is the conclusion I can support: Only the retained record can be considered."
+  if ! jq -e --arg bounded "$bounded_claim" '
     .status == "ok" and .pending_action == null
-    and (.answer | contains("source lookup failed with an upstream HTTP 503"))
-    and (.answer | contains("Only the retained record can be considered.") | not)
+    and (.answer | startswith($bounded + "\n\n"))
+    and (.answer | contains("the available records may be incomplete"))
   ' <<<"$response" >/dev/null 2>&1; then
     printf 'Generalized partial response: %s\n' \
       "$(jq -c . <<<"$response")" >&2
@@ -7174,22 +7179,49 @@ CASES
     and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
   '
   assert_jq "generalized.partial.authority" "$trace" '
-    .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    .prompt.general_evidence_reasoning.claim_scope_basis == "supplied_evidence"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
-    and .prompt.general_evidence_reasoning.cr_conclusion_disposition != "allowed"
-    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.qualification_required == true
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .prompt.general_evidence_reasoning.decision_comparison.relation
+      == "claim_support_more_permissive"
+    and (.prompt.general_evidence_reasoning.decision_comparison.categories
+      | index("claim_support_more_useful")) != null
+    and (.prompt.general_evidence_reasoning.decision_comparison.categories
+      | index("claim_support_overpermissive")) == null
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
   '
+  assert_jq "generalized.partial.persistence" "$claim_records" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == true
+    and $records[0].claim_anchor == $bounded
+    and $records[0].support.calibration_status == "limited"
+    and $records[0].support.conclusion_disposition == "qualified"
+    and ($records[0].support.material_scope_limitations
+      | index("supplied_evidence_scope")) != null
+    and ($records[0].support.material_scope_limitations
+      | index("complete_scope_not_established")) != null
+    and ($records[0].support.material_scope_limitations
+      | index("material_acquisition_limited")) != null
+    and (($records[0].support | tostring) | contains("PRIVATE") | not)
+  ' --arg bounded "$bounded_claim"
   assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
-  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
   assert_jq "generalized.partial.dsa" "$audit" '
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "context")] | length) == 2
     and ([.[] | select(.operation == "fetch")] | length) == 0
   '
+  assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
   configure_source_fixture "calendar-beta" "ready"
-  echo "Generalized acquisition reasoning: matched_refinement=presented topical_no_match=ordinary_chat contradiction=presented decision=presented full_scope=presented partial=withheld actions=0 retries=0 repairs=0 reacquisition=0"
+  echo "Generalized acquisition reasoning: matched_refinement=presented topical_no_match=ordinary_chat contradiction=presented decision=presented full_scope=presented partial=qualified_supplied_evidence actions=0 retries=0 repairs=0 reacquisition=0"
 }
 
 run_authority_comparison_incomplete_scope_case() {

@@ -53,7 +53,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: 03e67b9e7f9c848576b82a691a5a249de2de72ea
+          ref: f7522679c4e36693dc6ef6d4bb702f343bebbb08
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -75,7 +75,7 @@ jobs:
 
       - name: Establish pinned local main refs
         run: |
-          git -C cognitive-runtime branch --force main 03e67b9e7f9c848576b82a691a5a249de2de72ea
+          git -C cognitive-runtime branch --force main f7522679c4e36693dc6ef6d4bb702f343bebbb08
           git -C data-source-aggregator branch --force main 57389cab54481d1c768d403fb9213cc2748103d3
           git -C basic-memory-store branch --force main 2ea5df0f598742992608198b800cfd1b8633bd6b
           git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD

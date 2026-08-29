@@ -78,6 +78,7 @@ from services.evidence_acquisition import (
     SemanticInterpreterFailure,
     advisory_provider_allowed,
     begin_evidence_acquisition,
+    bind_evidence_reasoning_claim_scope,
     bind_manifest_response,
     bounded_evidence_reasoning_completion_metadata,
     build_manifest_trace,
@@ -115,6 +116,7 @@ from services.evidence_acquisition import (
     render_governed_evidence_answer,
     render_process_failure_response,
     retain_initial_attempt_summary,
+    select_claim_scope_basis,
     select_evidence_next_step,
     source_descriptor_for_inventory_entry,
     suppress_manifest_identifiers,
@@ -7044,7 +7046,7 @@ def _compare_authority_decisions(
         hard_blockers.add("consequence_policy_disallows_claim")
     if authority.get("complete_declared_scope_required") is True and (
         authority.get("complete_declared_scope_established") is not True
-    ):
+    ) and authority.get("claim_scope_basis") != "supplied_evidence":
         hard_blockers.add("complete_scope_not_established")
     if (
         relation == "claim_support_more_permissive"
@@ -7071,7 +7073,11 @@ def _compare_authority_decisions(
                     "existing_policy_correctly_more_conservative",
                 }
             )
-        elif enumeration_blocked:
+        elif enumeration_blocked or (
+            authority.get("claim_scope_basis") == "supplied_evidence"
+            and existing == "withheld"
+            and bool(supporting_refs)
+        ):
             categories.add("claim_support_more_useful")
     if enumeration_blocked and interpretation_dependent:
         categories.add("interpretation_disagreement")
@@ -7381,6 +7387,7 @@ def _general_evidence_reasoning_trace(
         "derivation_request_count": 0,
         "derivation_executed_count": 0,
         "claim_digest": None,
+        "claim_scope_basis": None,
         "cr_call_count": 0,
         "cr_calibration_status": None,
         "cr_conclusion_disposition": None,
@@ -7633,6 +7640,11 @@ async def _run_general_evidence_reasoning(
             }
         )
         return output
+    scope_authority = project_generic_scope_authority(
+        state,
+        reasoning_context_limited=reasoning_context_limited,
+    )
+    claim_scope_basis = select_claim_scope_basis(scope_authority)
     route = _load_logical_route(model_registry_path, _EVIDENCE_REASONING_ROUTE)
     if route is None:
         trace.update(
@@ -7660,6 +7672,7 @@ async def _run_general_evidence_reasoning(
             "runtime_session_id": runtime_session_id,
             "runtime_turn_id": runtime_turn_id,
             "reasoning_context_limited": reasoning_context_limited,
+            "claim_scope_basis": claim_scope_basis,
         }
     )
     authorized_ref_ids = set(evidence_metadata)
@@ -7670,6 +7683,7 @@ async def _run_general_evidence_reasoning(
             messages=evidence_reasoning_messages(
                 request_text=request_text,
                 evidence=evidence,
+                claim_scope_basis=claim_scope_basis,
             ),
             tools=[],
             response_format=evidence_reasoning_response_format(),
@@ -7715,7 +7729,10 @@ async def _run_general_evidence_reasoning(
         )
         return output
     try:
-        presentation_claim_template = proposal.proposed_claim
+        presentation_claim_template = bind_evidence_reasoning_claim_scope(
+            proposal.proposed_claim,
+            claim_scope_basis=claim_scope_basis,
+        )
         executions = execute_derivations(
             proposal.derivation_requests,
             authorized_evidence_ref_ids=authorized_ref_ids,
@@ -7731,6 +7748,14 @@ async def _run_general_evidence_reasoning(
         return output
     try:
         proposal = materialize_evidence_reasoning_claim(proposal, executions)
+        proposal = proposal.model_copy(
+            update={
+                "proposed_claim": bind_evidence_reasoning_claim_scope(
+                    proposal.proposed_claim,
+                    claim_scope_basis=claim_scope_basis,
+                )
+            }
+        )
     except ValueError:
         trace.update(
             {
@@ -7769,10 +7794,6 @@ async def _run_general_evidence_reasoning(
                 "material_role": "neutral",
             }
         )
-    scope_authority = project_generic_scope_authority(
-        state,
-        reasoning_context_limited=reasoning_context_limited,
-    )
     authority_context = {
         "owner_id": owner_id,
         "conversation_id": conversation_id,
@@ -7781,6 +7802,7 @@ async def _run_general_evidence_reasoning(
         "runtime_turn_id": runtime_turn_id,
         "evidence_references": evidence_authority,
         **scope_authority,
+        "claim_scope_basis": claim_scope_basis,
         "privacy_policy_allows_claim": True,
         "consequence_policy_allows_claim": consequence_policy_allows_claim,
         "executed_derivations": [

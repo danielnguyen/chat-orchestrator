@@ -59,6 +59,7 @@ from services.evidence_acquisition import (
     _validate_supported_plan,
     advisory_provider_allowed,
     begin_evidence_acquisition,
+    bind_evidence_reasoning_claim_scope,
     bind_manifest_response,
     bounded_evidence_reasoning_completion_metadata,
     build_current_acquisition_premise,
@@ -89,6 +90,7 @@ from services.evidence_acquisition import (
     render_governed_evidence_answer,
     render_process_failure_response,
     retain_initial_attempt_summary,
+    select_claim_scope_basis,
     select_evidence_next_step,
     source_descriptor_for_inventory_entry,
     suppress_manifest_identifiers,
@@ -311,6 +313,101 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     assert "{{derivation:<derivation_id>}}" in messages[0]["content"]
     assert "Every terminal requested derivation must appear exactly once" in (
         messages[0]["content"]
+    )
+    assert "claim_scope_basis" not in schema["schema"]["properties"]
+
+
+@pytest.mark.parametrize(
+    ("scope_authority", "expected"),
+    [
+        (
+            {
+                "complete_declared_scope_required": False,
+                "complete_declared_scope_established": None,
+                "material_acquisition_limited": False,
+            },
+            "declared_scope",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": True,
+                "material_acquisition_limited": False,
+            },
+            "declared_scope",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": False,
+                "material_acquisition_limited": False,
+            },
+            "supplied_evidence",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": False,
+                "material_acquisition_limited": True,
+            },
+            "supplied_evidence",
+        ),
+    ],
+)
+def test_claim_scope_basis_is_selected_only_from_system_scope_authority(
+    scope_authority,
+    expected,
+):
+    assert select_claim_scope_basis(scope_authority) == expected
+
+
+def test_supplied_evidence_reasoning_contract_is_bounded_without_schema_authority():
+    messages = evidence_reasoning_messages(
+        request_text="Evaluate the available neutral records.",
+        evidence=[{"evidence_ref_id": "evidence-1", "text": "bounded record"}],
+        claim_scope_basis="supplied_evidence",
+    )
+    instruction = messages[0]["content"]
+    schema = evidence_reasoning_response_format()["json_schema"]["schema"]
+
+    assert "broader requested evidence scope is incomplete" in instruction
+    assert "Reason only from the authorized evidence supplied" in instruction
+    assert "unexamined evidence was covered" in instruction
+    assert "system will apply the required visible scope boundary" in instruction
+    assert "claim_scope_basis" not in schema["properties"]
+
+
+@pytest.mark.parametrize(
+    ("basis", "provider_claim", "expected"),
+    [
+        ("declared_scope", "The records support option A.", "The records support option A."),
+        (
+            "supplied_evidence",
+            "Option A appears strongest.",
+            "Based only on the evidence I could examine, this is the conclusion I can "
+            "support: Option A appears strongest.",
+        ),
+        (
+            "supplied_evidence",
+            "No matching condition appears in the supplied records.",
+            "Based only on the evidence I could examine, this is the conclusion I can "
+            "support: No matching condition appears in the supplied records.",
+        ),
+        (
+            "supplied_evidence",
+            "The bounded ratio is {{derivation:ratio-1}}.",
+            "Based only on the evidence I could examine, this is the conclusion I can "
+            "support: The bounded ratio is {{derivation:ratio-1}}.",
+        ),
+    ],
+)
+def test_claim_scope_binding_is_mechanical(basis, provider_claim, expected):
+    assert (
+        bind_evidence_reasoning_claim_scope(
+            provider_claim,
+            claim_scope_basis=basis,
+        )
+        == expected
     )
 
 
