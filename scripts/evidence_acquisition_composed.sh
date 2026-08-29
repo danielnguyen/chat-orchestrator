@@ -1490,6 +1490,15 @@ run_evidence_exhaustive_scenarios() {
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"complete_register",
+      expected_content_fields:["Entry","Required","Status"],
+      interpretation_status:"resolved",
+      operation_hint:"exhaustive_review",
+      candidate_source_ids:["complete_register"]
+    }')"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exhaustive")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1519,8 +1528,9 @@ run_evidence_exhaustive_scenarios() {
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "context")] | length) == 1
   ' <<<"$audit" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 2' <<<"$provider_calls" >/dev/null
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
 
   owner="owner-evidence-exhaustive-truncation"
@@ -1530,6 +1540,15 @@ run_evidence_exhaustive_scenarios() {
   reset_dsa_audit
   configure_source_fixture "complete-sheet" "large"
   restart_orchestrator_with_reserve 180000
+  queue_semantic_interpretation "$(jq -nc --arg request_text "$question" '
+    {
+      expected_request_text:$request_text,
+      expected_source_id:"complete_register",
+      expected_content_fields:["Entry","Required","Status"],
+      interpretation_status:"resolved",
+      operation_hint:"exhaustive_review",
+      candidate_source_ids:["complete_register"]
+    }')"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exhaustive-truncation")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -r '.request_id' <<<"$response")"
@@ -1548,11 +1567,12 @@ run_evidence_exhaustive_scenarios() {
     and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "unknown"
   ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
-  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
+  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 2 1 1 1
   restart_orchestrator_with_reserve 2048
   configure_source_fixture "complete-sheet" "ready"
-  echo "Evidence exhaustive: positive_provider=1 configured_expansion=1 truncation_provider=0 truncation_retained=0"
+  echo "Evidence exhaustive: semantic=1_each positive_provider=1 configured_expansion=1 truncation_provider=0 truncation_retained=0"
 }
 
 run_evidence_limitation_and_failure_scenarios() {
