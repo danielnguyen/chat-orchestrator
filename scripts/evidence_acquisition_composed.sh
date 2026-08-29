@@ -7225,7 +7225,7 @@ CASES
     and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
   '
-  assert_jq "generalized.partial.persistence" "$claim_records" '
+  if ! jq -e --arg bounded "$bounded_claim" '
     [.records[] | select(.schema_version == "claim-record.v2")] as $records
     | ($records | length) == 1
     and $records[0].presented_to_user == true
@@ -7239,7 +7239,20 @@ CASES
     and ($records[0].support.material_scope_limitations
       | index("material_acquisition_limited")) != null
     and (($records[0].support | tostring) | contains("PRIVATE") | not)
-  ' --arg bounded "$bounded_claim"
+  ' <<<"$claim_records" >/dev/null 2>&1; then
+    printf 'Generalized partial persistence: %s\n' "$(jq -c '{
+      record_count:(.records | length),
+      records:[.records[] | {
+        schema_version,
+        presented_to_user,
+        claim_anchor,
+        calibration_status:.support.calibration_status,
+        conclusion_disposition:.support.conclusion_disposition,
+        material_scope_limitations:.support.material_scope_limitations
+      }]
+    }' <<<"$claim_records")" >&2
+    return 1
+  fi
   assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_diagnostic_advisory_calls "$provider_calls" 0
