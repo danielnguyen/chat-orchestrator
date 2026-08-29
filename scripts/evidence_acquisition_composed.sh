@@ -970,7 +970,7 @@ run_evidence_source_scope_scenarios() {
   fixture_calls="$(fetch_source_fixture_calls)"
   audit="$(fetch_dsa_audit)"
 
-  jq -e '
+  if ! jq -e '
     .status == "ok"
     and (.answer | startswith("The retained evidence supports the requested conclusion."))
   ' <<<"$response" >/dev/null
@@ -1196,14 +1196,20 @@ run_evidence_source_scope_scenarios() {
     and .answer == "I found more than one plausible place to check: Alpha Review Calendar and Beta Review Calendar. Which should I use?"
     and (.answer | contains("calendar_alpha") | not)
     and (.answer | contains("calendar_beta") | not)
-  ' <<<"$response" >/dev/null
-  jq -e '
+  ' <<<"$response" >/dev/null; then
+    printf 'Evidence exhaustive response: %s\n' "$(jq -c . <<<"$response")" >&2
+    return 1
+  fi
+  if ! jq -e '
     .status == "source_scope_ambiguous"
     and .shape.source_match.status == "ambiguous"
     and .shape.source_match.matched_source_ids == []
     and .plan.plan_status == "not_compiled"
     and .acquisition.dsa_outcome == "inventory_only"
-  ' <<<"$manifest" >/dev/null
+  ' <<<"$manifest" >/dev/null; then
+    printf 'Evidence exhaustive manifest: %s\n' "$manifest" >&2
+    return 1
+  fi
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_calls" >/dev/null
   assert_semantic_interpreter_calls "$provider_calls" 1
@@ -1364,7 +1370,10 @@ run_evidence_exact_scenario() {
     and .sufficiency.status == "sufficient_for_declared_scope"
   ' <<<"$manifest" >/dev/null
   jq -e '([.[] | select(.operation == "fetch" and .status == "success")] | length) == 1' <<<"$audit" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
+  if ! jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null; then
+    printf 'Evidence exhaustive provider calls: %s\n' "$provider_calls" >&2
+    return 1
+  fi
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
