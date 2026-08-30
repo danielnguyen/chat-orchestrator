@@ -7132,6 +7132,62 @@ def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
 
 
 @pytest.mark.parametrize(
+    ("authority_role", "authoritative_source_ids"),
+    [
+        ("authoritative", ["source_a"]),
+        ("supplemental", []),
+        ("unknown", []),
+    ],
+)
+def test_bounded_exhaustive_accepts_truthful_source_authority_metadata(
+    authority_role,
+    authoritative_source_ids,
+):
+    source = _source(
+        "source_a",
+        capabilities=["profile", "search", "context"],
+        authority_role=authority_role,
+        connector="google_sheets",
+    )
+    state = _exhaustive_state(
+        sources=[source],
+        plan_overrides={
+            "authoritative_source_ids": authoritative_source_ids,
+        },
+    )
+
+    assert state.supported_complete_scope_path is True
+
+
+@pytest.mark.parametrize(
+    ("authority_role", "authoritative_source_ids"),
+    [
+        ("unknown", ["source_a"]),
+        ("supplemental", ["source_a"]),
+        ("authoritative", []),
+    ],
+)
+def test_bounded_exhaustive_rejects_inconsistent_source_authority_metadata(
+    authority_role,
+    authoritative_source_ids,
+):
+    source = _source(
+        "source_a",
+        capabilities=["profile", "search", "context"],
+        authority_role=authority_role,
+        connector="google_sheets",
+    )
+    state = _exhaustive_state(
+        sources=[source],
+        plan_overrides={
+            "authoritative_source_ids": authoritative_source_ids,
+        },
+    )
+
+    assert state.supported_complete_scope_path is False
+
+
+@pytest.mark.parametrize(
     "case",
     [
         "unsupported-status",
@@ -7264,8 +7320,6 @@ def test_complete_scope_execution_is_not_gated_by_reasoning_shape(case):
         ("disabled", {"enabled": False, "status": "disabled"}),
         ("unavailable", {"status": "unavailable"}),
         ("unknown-status", {"status": "unknown"}),
-        ("supplemental", {"authority_role": "supplemental"}),
-        ("unknown-authority", {"authority_role": "unknown"}),
         ("wrong-connector", {"connector": "ics_calendar"}),
         ("missing-search", {"capabilities": ["profile", "context"]}),
         ("missing-context", {"capabilities": ["profile", "search"]}),
@@ -7707,8 +7761,20 @@ async def test_bounded_exhaustive_zero_targeted_results_expands_directly():
 
 
 @pytest.mark.asyncio
-async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
-    state = _exhaustive_state()
+@pytest.mark.parametrize("authority_role", ["supplemental", "unknown"])
+async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope(
+    authority_role,
+):
+    source = _source(
+        "source_a",
+        capabilities=["profile", "search", "context"],
+        authority_role=authority_role,
+        connector="google_sheets",
+    )
+    state = _exhaustive_state(
+        sources=[source],
+        plan_overrides={"authoritative_source_ids": []},
+    )
     runtime = FakeRuntime()
     dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
     bundle, trace = await execute_bounded_exhaustive_review(
@@ -7718,6 +7784,21 @@ async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
         dsa_trace={"called": True, "status": "success"},
     )
     retained_ref = "google_sheets:source_a:Maintenance!A2:E5"
+
+    assert state.supported_complete_scope_path is True
+    assert dsa.calls == [
+        (
+            "context_source",
+            {
+                "source_id": "source_a",
+                "context_mode": "configured_worksheet",
+                "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
+            },
+        )
+    ]
+    assert bundle["sources_used"] == ["source_a"]
+    assert len(bundle["items"]) == 1
+    assert trace.get("error_code") != "unsupported_bounded_exhaustive_plan"
 
     await evaluate_acquisition_sufficiency(
         state=state,
@@ -7739,6 +7820,9 @@ async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
         "no-material-truncation": "satisfied",
+    }
+    assert "authoritative-inventory" not in {
+        fact["requirement_id"] for fact in state.acquisition_facts or []
     }
     assert len([call for call in runtime.calls if call[0] == "sufficiency"]) == 1
 

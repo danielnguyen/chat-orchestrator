@@ -83,7 +83,7 @@ scope_refs:
   project: firefox
 connector: google_sheets
 enabled: true
-authority_role: authoritative
+authority_role: unknown
 sensitivity: medium
 access_mode: read_only
 connector_config:
@@ -1526,6 +1526,8 @@ run_evidence_exhaustive_scenarios() {
   fi
   assert_jq "exhaustive.positive.manifest" "$manifest" '
     .shape.task_shape == "bounded_exhaustive_review"
+    and .plan.plan_status == "ready"
+    and .plan.material_requirement_count == 4
     and .plan.selected_strategies == ["hybrid"]
     and .acquisition.expansion_attempt_count == 1
     and .acquisition.expansion_successful_count == 1
@@ -1539,6 +1541,18 @@ run_evidence_exhaustive_scenarios() {
   '
   assert_jq "exhaustive.positive.provider" "$provider_calls" \
     '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_jq "exhaustive.positive.runtime_plan" "$diagnostics" '
+    [.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_plan_compiled"
+    ) | .event_payload_json] as $plans
+    | ($plans | length) == 1
+    and $plans[0].plan_status == "ready"
+    and $plans[0].task_shape == "bounded_exhaustive_review"
+    and $plans[0].eligible_source_count == 1
+    and $plans[0].authoritative_source_count == 0
+    and $plans[0].material_requirement_count == 4
+  ' --arg request_id "$request_id"
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
 
@@ -7093,6 +7107,7 @@ CASES
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
@@ -7109,6 +7124,7 @@ CASES
   assert_jq "generalized.seedless_full_scope.acquisition" "$manifest" '
     .shape.task_shape == "bounded_exhaustive_review"
     and .plan.plan_status == "ready"
+    and .plan.material_requirement_count == 4
     and .plan.selected_strategies == ["hybrid"]
     and .inventory.declared_source_count == 1
     and .acquisition.strategy_attempted == "hybrid"
@@ -7135,6 +7151,18 @@ CASES
     and .prompt.general_evidence_reasoning.presented_to_user == true
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
   '
+  assert_jq "generalized.seedless_full_scope.runtime_plan" "$diagnostics" '
+    [.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_plan_compiled"
+    ) | .event_payload_json] as $plans
+    | ($plans | length) == 1
+    and $plans[0].plan_status == "ready"
+    and $plans[0].task_shape == "bounded_exhaustive_review"
+    and $plans[0].eligible_source_count == 1
+    and $plans[0].authoritative_source_count == 0
+    and $plans[0].material_requirement_count == 4
+  ' --arg request_id "$request_id"
   assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_diagnostic_advisory_calls "$provider_calls" 0

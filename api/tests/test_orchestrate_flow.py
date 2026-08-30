@@ -7,6 +7,7 @@ import logging
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -14941,6 +14942,8 @@ def _bounded_exhaustive_plan_response(
     request_id: str,
     question: str,
     status: str = "ready",
+    source_id: str = "vehicle_log_primary",
+    authoritative_source_ids: list[str] | None = None,
 ) -> dict[str, object]:
     response = _targeted_plan_response(
         request_id=request_id,
@@ -14952,14 +14955,13 @@ def _bounded_exhaustive_plan_response(
     result["plan_status"] = status
     result["completeness_expectation"] = "complete_for_declared_scope"
     result["contradiction_search_required"] = True
-    result["eligible_source_ids"] = ["vehicle_log_primary"]
-    result["authoritative_source_ids"] = ["vehicle_log_primary"]
+    result["eligible_source_ids"] = [source_id]
+    result["authoritative_source_ids"] = (
+        [source_id]
+        if authoritative_source_ids is None
+        else authoritative_source_ids
+    )
     result["declared_requirements"] = [
-        {
-            "requirement_id": "authoritative-inventory",
-            "requirement_kind": "authoritative_inventory",
-            "criticality": "material",
-        },
         {
             "requirement_id": "complete-scope-coverage",
             "requirement_kind": "complete_scope_coverage",
@@ -14987,18 +14989,24 @@ def _bounded_exhaustive_plan_response(
     return response
 
 
-def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
+def _bounded_exhaustive_context_pack(
+    query: str,
+    *,
+    source_id: str = "vehicle_log_primary",
+    worksheet_name: str = "Maintenance Log",
+) -> dict[str, object]:
     response = _governed_context_pack(query)
     response["query_id"] = "configured-worksheet-seed-query"
-    response["sources_used"] = ["vehicle_log_primary"]
+    response["sources_used"] = [source_id]
     response["items"] = [
         {
             "result_id": "targeted-seed-result",
             "source_type": "google_sheets",
-            "source_id": "vehicle_log_primary",
+            "source_id": source_id,
             "source_name": "PRIVATE WORKSHEET NAME",
             "source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
+                f"google_sheets:{source_id}:"
+                f"{quote(worksheet_name, safe='')}!A2:E2"
             ),
             "retrieved_at": "2026-07-17T00:00:00Z",
             "source_modified_at": None,
@@ -15029,11 +15037,11 @@ def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
     }
     response["diagnostics"] = {
         "selection_mode": "query_relevance",
-        "considered_source_ids": ["vehicle_log_primary"],
-        "selected_source_ids": ["vehicle_log_primary"],
+        "considered_source_ids": [source_id],
+        "selected_source_ids": [source_id],
         "source_diagnostics": [],
         "ranking_mode": "single_source",
-        "candidate_counts_by_source": {"vehicle_log_primary": 4},
+        "candidate_counts_by_source": {source_id: 4},
         "budget_truncated_candidates": True,
     }
     return response
@@ -15044,6 +15052,7 @@ def _configured_worksheet_context_response(
     result: bool = True,
     truncated: bool = False,
     source_id: str = "vehicle_log_primary",
+    worksheet_name: str = "Maintenance Log",
 ) -> dict[str, object]:
     results = (
         [
@@ -15053,7 +15062,8 @@ def _configured_worksheet_context_response(
                 "source_id": source_id,
                 "source_name": "PRIVATE WORKSHEET NAME",
                 "source_ref": (
-                    f"google_sheets:{source_id}:Maintenance%20Log!A2:E20"
+                    f"google_sheets:{source_id}:"
+                    f"{quote(worksheet_name, safe='')}!A2:E20"
                 ),
                 "retrieved_at": "2026-07-17T00:00:00Z",
                 "source_modified_at": None,
@@ -15713,6 +15723,13 @@ async def _run_bounded_exhaustive_case(
     claim_record_capture_enabled: bool = False,
     general_reasoning_completion: dict[str, object] | None = None,
     presentation_enabled: bool = False,
+    question: str = "Review every maintenance record in the configured worksheet.",
+    source_id: str = "vehicle_log_primary",
+    source_display_name: str = "PRIVATE WORKSHEET NAME",
+    source_domain_tags: list[str] | None = None,
+    authority_role: str = "authoritative",
+    authoritative_source_ids: list[str] | None = None,
+    worksheet_name: str = "Maintenance Log",
 ):
     rules, models = _write_default_route_files(tmp_path)
     if general_reasoning_completion is not None:
@@ -15724,7 +15741,6 @@ async def _run_bounded_exhaustive_case(
             + "    provider: cloud\n",
             encoding="utf-8",
         )
-    question = "Review every maintenance record in the configured worksheet."
     request_id = "rid-evidence-bounded-exhaustive"
     runtime = FakeRuntime(
         evidence_shape_response=_derived_shape_response(
@@ -15736,26 +15752,34 @@ async def _run_bounded_exhaustive_case(
             request_id=request_id,
             question=question,
             status=plan_status,
+            source_id=source_id,
+            authoritative_source_ids=authoritative_source_ids,
         ),
         evidence_sufficiency_response=evidence_sufficiency_response,
         privacy_context_response=privacy_context_response,
     )
     dsa = FakeDSA(
-        response=context_pack or _bounded_exhaustive_context_pack(question),
+        response=context_pack
+        or _bounded_exhaustive_context_pack(
+            question,
+            source_id=source_id,
+            worksheet_name=worksheet_name,
+        ),
         source_response={
             "inventory_scope": "configured_sources",
             "inventory_status": "complete",
             "sources": [
                 {
-                    "source_id": "vehicle_log_primary",
-                    "display_name": "PRIVATE WORKSHEET NAME",
+                    "source_id": source_id,
+                    "display_name": source_display_name,
                     "connector": "google_sheets",
-                    "domain_tags": ["vehicle", "maintenance"],
+                    "domain_tags": source_domain_tags
+                    or ["vehicle", "maintenance"],
                     "sensitivity": "medium",
                     "access_mode": "read_only",
                     "capabilities": ["profile", "search", "context"],
                     "enabled": True,
-                    "authority_role": "authoritative",
+                    "authority_role": authority_role,
                     "status": "ready",
                     "last_checked_at": "2026-07-17T00:00:00Z",
                     "last_error": None,
@@ -15765,7 +15789,12 @@ async def _run_bounded_exhaustive_case(
         context_responses=(
             context_responses
             if context_responses is not None
-            else [_configured_worksheet_context_response()]
+            else [
+                _configured_worksheet_context_response(
+                    source_id=source_id,
+                    worksheet_name=worksheet_name,
+                )
+            ]
         ),
     )
     litellm = (
@@ -15775,7 +15804,8 @@ async def _run_bounded_exhaustive_case(
             content=provider_answer
             or _evidence_candidate(
                 (
-                    "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20",
+                    f"google_sheets:{source_id}:"
+                    f"{quote(worksheet_name, safe='')}!A2:E20",
                     "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
                 )
             )
@@ -15791,7 +15821,7 @@ async def _run_bounded_exhaustive_case(
             question,
             external_context={
                 "enabled": True,
-                "source_ids": ["vehicle_log_primary"],
+                "source_ids": [source_id],
             },
         ),
         memory_store=memory_store,
@@ -15861,6 +15891,92 @@ async def test_bounded_exhaustive_single_text_preserves_complete_scope_authority
 
 
 @pytest.mark.asyncio
+async def test_unknown_authority_bounded_exhaustive_plan_reaches_reasoning(
+    tmp_path,
+):
+    source_id = "review_schedule"
+    worksheet_name = "Review Schedule"
+    question = "Which entry has the longest interval between reviews?"
+    context_response = _configured_worksheet_context_response(
+        source_id=source_id,
+        worksheet_name=worksheet_name,
+    )
+    context_response["results"][0].update(
+        {
+            "source_name": "Review Schedule",
+            "title": "Complete review schedule",
+            "text": (
+                "Complete review schedule: alpha 7 days; beta 14 days; "
+                "gamma 10 days."
+            ),
+        }
+    )
+    source_ref = context_response["results"][0]["source_ref"]
+    evidence_ref_id = governed_external_reference_id(source_ref)
+    claim = "Beta has the longest interval in the supplied review schedule."
+
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        question=question,
+        source_id=source_id,
+        source_display_name="Review Schedule",
+        source_domain_tags=["review", "schedule"],
+        authority_role="unknown",
+        authoritative_source_ids=[],
+        worksheet_name=worksheet_name,
+        context_responses=[context_response],
+        general_reasoning_completion=_general_reasoning_completion(
+            proposed_claim=claim,
+            evidence_ref_id=evidence_ref_id,
+        ),
+        presentation_enabled=True,
+    )
+
+    assert out["answer"] == claim
+    assert runtime.evidence_plan_calls[0]["task_shape"] == (
+        "bounded_exhaustive_review"
+    )
+    assert len(dsa.calls) == 1
+    assert dsa.context_calls == [
+        {
+            "source_id": source_id,
+            "context_mode": "configured_worksheet",
+            "budget": {
+                "max_rows": 20,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert runtime.claim_support_calls[0]["authority_context"][
+        "complete_declared_scope_established"
+    ] is True
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+    manifest = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert runtime.evidence_plan_response["result"][
+        "authoritative_source_ids"
+    ] == []
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert manifest["acquisition"]["sources_used"] == [source_id]
+    assert manifest["acquisition"].get("error_code") != (
+        "unsupported_bounded_exhaustive_plan"
+    )
+
+
+@pytest.mark.asyncio
 async def test_bounded_exhaustive_review_delivers_only_complete_configured_worksheet(
     tmp_path,
 ):
@@ -15917,7 +16033,6 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
@@ -16004,7 +16119,6 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "filtered",
         "contradiction-search": "filtered",
@@ -16179,7 +16293,6 @@ async def test_bounded_exhaustive_missing_descriptor_uses_planned_source_directl
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",

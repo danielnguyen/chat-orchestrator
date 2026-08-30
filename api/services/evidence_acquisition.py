@@ -2129,7 +2129,6 @@ class EvidenceAcquisitionState:
             and not self.exact_source_refs
             and not declared_scope.get("exact_source_refs")
             and len(plan.eligible_source_ids) == 1
-            and plan.authoritative_source_ids == plan.eligible_source_ids
             and required_material.issubset(material)
             and inventory.inventory_scope == "configured_sources"
             and inventory.inventory_status == "complete"
@@ -2159,13 +2158,19 @@ class EvidenceAcquisitionState:
 
         source = scoped_sources[0]
         eligible_source_id = plan.eligible_source_ids[0]
+        expected_authoritative_source_ids = (
+            [source.source_id]
+            if source.authority_role == "authoritative"
+            else []
+        )
         if declared_source_ids and declared_source_ids != {source.source_id}:
             return False
         return bool(
             source.source_id == eligible_source_id
+            and plan.authoritative_source_ids
+            == expected_authoritative_source_ids
             and source.enabled
             and source.status == "ready"
-            and source.authority_role == "authoritative"
             and source.connector == "google_sheets"
             and {"search", "context"}.issubset(source.capabilities)
         )
