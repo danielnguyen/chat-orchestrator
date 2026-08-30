@@ -395,6 +395,15 @@ restart_dsa() {
   wait_for_http "http://127.0.0.1:14374/health"
 }
 
+set_configured_source_authority() {
+  local source_file="$1" authority_role="$2"
+  sed -i -E \
+    "s/^authority_role: (authoritative|supplemental|unknown)$/authority_role: $authority_role/" \
+    "$COMPOSED_SMOKE_TMP/config/sources/$source_file"
+  grep -qx "authority_role: $authority_role" \
+    "$COMPOSED_SMOKE_TMP/config/sources/$source_file"
+}
+
 restrict_dsa_config_to() {
   local retained="$1" path base
   for path in "$COMPOSED_SMOKE_TMP"/config/sources/*.yaml; do
@@ -795,7 +804,7 @@ assert_history_request_boundaries() {
 }
 
 readonly EVIDENCE_HYBRID_COMPARISON_QUESTION="Compare these two review calendar records and explain the differences between them."
-readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Check whether every mandatory record in the register is reviewed."
+readonly EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION="Inspect every record in Configured Review Register and summarize the bounded dataset."
 readonly EVIDENCE_HISTORY_NO_RECORD_SENTENCE="I couldn’t resolve a retained acquisition record for the specified response."
 readonly EVIDENCE_HISTORY_AMBIGUOUS_SENTENCE="More than one exact prior response matched, so I did not select an acquisition record."
 readonly EVIDENCE_HISTORY_NEGATIVE_NO_NEW_VERIFICATION_SENTENCE="I did not perform a new verification for this explanation."
@@ -1191,19 +1200,25 @@ run_evidence_source_scope_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
 
-  jq -e '
+  if ! jq -e '
     .status == "degraded"
     and .answer == "I found more than one plausible place to check: Alpha Review Calendar and Beta Review Calendar. Which should I use?"
     and (.answer | contains("calendar_alpha") | not)
     and (.answer | contains("calendar_beta") | not)
-  ' <<<"$response" >/dev/null
-  jq -e '
+  ' <<<"$response" >/dev/null; then
+    printf 'Evidence exhaustive response: %s\n' "$(jq -c . <<<"$response")" >&2
+    return 1
+  fi
+  if ! jq -e '
     .status == "source_scope_ambiguous"
     and .shape.source_match.status == "ambiguous"
     and .shape.source_match.matched_source_ids == []
     and .plan.plan_status == "not_compiled"
     and .acquisition.dsa_outcome == "inventory_only"
-  ' <<<"$manifest" >/dev/null
+  ' <<<"$manifest" >/dev/null; then
+    printf 'Evidence exhaustive manifest: %s\n' "$manifest" >&2
+    return 1
+  fi
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
     <<<"$provider_calls" >/dev/null
   assert_semantic_interpreter_calls "$provider_calls" 1
@@ -1364,7 +1379,10 @@ run_evidence_exact_scenario() {
     and .sufficiency.status == "sufficient_for_declared_scope"
   ' <<<"$manifest" >/dev/null
   jq -e '([.[] | select(.operation == "fetch" and .status == "success")] | length) == 1' <<<"$audit" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
+  if ! jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null; then
+    printf 'Evidence exhaustive provider calls: %s\n' "$provider_calls" >&2
+    return 1
+  fi
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
@@ -1474,11 +1492,13 @@ run_evidence_exhaustive_scenarios() {
   local owner client conversation_id question external response request_id answer
   local trace provider_calls diagnostics manifest audit
   question="$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION"
-  external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":1}'
+  external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":5}'
 
   owner="owner-evidence-exhaustive"
   client="client-evidence-exhaustive"
   provider_post "/fixture/reset" '{}'
+  set_configured_source_authority "complete_register.yaml" "unknown"
+  restrict_dsa_config_to "complete_register.yaml"
   reset_source_fixture
   reset_dsa_audit
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-exhaustive")"
@@ -1490,27 +1510,59 @@ run_evidence_exhaustive_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   audit="$(fetch_dsa_audit)"
-  jq -e '
+  if ! jq -e '
     .status == "ok"
     and (.answer | startswith("The retained evidence supports the requested conclusion."))
     and (.answer | contains("conclusion_disposition") | not)
     and (.answer | endswith("This conclusion is complete only for the declared source scope that was checked; sources outside that scope were not examined."))
     and (.answer | contains("universal") | not)
-  ' <<<"$response" >/dev/null
-  jq -e '
+  ' <<<"$response" >/dev/null; then
+    printf 'Evidence exhaustive positive response: %s\n' \
+      "$(jq -c '{status,answer,source_count:(.sources | length)}' <<<"$response")" >&2
+    printf 'Evidence exhaustive positive acquisition: %s\n' \
+      "$(jq -c '{
+        shape:.shape.task_shape,
+        strategies:.plan.selected_strategies,
+        item_count:.acquisition.item_count,
+        retained_count:.acquisition.prompt_retained_item_count,
+        search_budget_truncated:.acquisition.search_budget_truncated,
+        expansion_budget_truncated:.acquisition.expansion_budget_truncated,
+        candidate_truncated:.acquisition.candidate_truncated,
+        raw_targeted_item_count:.acquisition.raw_targeted_item_count,
+        raw_expanded_item_count:.acquisition.raw_expanded_item_count,
+        sufficiency:.sufficiency.status
+      }' <<<"$manifest")" >&2
+    return 1
+  fi
+  assert_jq "exhaustive.positive.manifest" "$manifest" '
     .shape.task_shape == "bounded_exhaustive_review"
+    and .plan.plan_status == "ready"
+    and .plan.material_requirement_count == 4
     and .plan.selected_strategies == ["hybrid"]
     and .acquisition.expansion_attempt_count == 1
     and .acquisition.expansion_successful_count == 1
     and .acquisition.item_count == 1
     and .acquisition.prompt_retained_item_count == 1
     and .sufficiency.status == "sufficient_for_declared_scope"
-  ' <<<"$manifest" >/dev/null
-  jq -e '
+  '
+  assert_jq "exhaustive.positive.audit" "$audit" '
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "context")] | length) == 1
-  ' <<<"$audit" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1' <<<"$provider_calls" >/dev/null
+  '
+  assert_jq "exhaustive.positive.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 1'
+  assert_jq "exhaustive.positive.runtime_plan" "$diagnostics" '
+    [.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_plan_compiled"
+    ) | .event_payload_json] as $plans
+    | ($plans | length) == 1
+    and $plans[0].plan_status == "ready"
+    and $plans[0].task_shape == "bounded_exhaustive_review"
+    and $plans[0].eligible_source_count == 1
+    and $plans[0].authoritative_source_count == 0
+    and $plans[0].material_requirement_count == 4
+  ' --arg request_id "$request_id"
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
 
@@ -1528,21 +1580,24 @@ run_evidence_exhaustive_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
-  jq -e '
+  assert_jq "exhaustive.truncation.response" "$response" '
     .status == "degraded"
     and (.answer | contains("reasoning context"))
     and (.answer | contains("withholding a complete-scope conclusion"))
-  ' <<<"$response" >/dev/null
-  jq -e '
+  '
+  assert_jq "exhaustive.truncation.manifest" "$manifest" '
     .acquisition.expansion_successful_count == 1
     and .acquisition.item_count == 1
     and .acquisition.prompt_retained_item_count == 0
     and .sufficiency.status == "unknown"
-  ' <<<"$manifest" >/dev/null
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$provider_calls" >/dev/null
+  '
+  assert_jq "exhaustive.truncation.provider" "$provider_calls" \
+    '([.calls[] | select(.kind == "chat")] | length) == 0'
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   restart_orchestrator_with_reserve 2048
   configure_source_fixture "complete-sheet" "ready"
+  set_configured_source_authority "complete_register.yaml" "authoritative"
+  restore_dsa_config
   echo "Evidence exhaustive: positive_provider=1 configured_expansion=1 truncation_provider=0 truncation_retained=0"
 }
 
@@ -6652,6 +6707,7 @@ run_general_evidence_reasoning_shadow_scenario() {
 run_generalized_acquisition_reasoning_scenarios() {
   local case_name expected_shape question owner client conversation_id
   local external response request_id trace manifest diagnostics provider_calls audit proposal claim
+  local bounded_claim claim_records
   local alpha_ref beta_ref alpha_evidence_ref beta_evidence_ref
   alpha_ref="ics_calendar:calendar_alpha:event:alpha-event"
   beta_ref="ics_calendar:calendar_beta:event:beta-event"
@@ -7029,7 +7085,8 @@ CASES
     and .sufficiency.status == "sufficient_for_declared_scope"
   '
   assert_jq "generalized.full_scope.authority" "$trace" '
-    .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    .prompt.general_evidence_reasoning.claim_scope_basis == "declared_scope"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
     and .prompt.general_evidence_reasoning.presented_to_user == true
     and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
@@ -7093,6 +7150,7 @@ CASES
     and .retrieval.prompt_assembly.dsa.raw_targeted_item_count == 0
     and .retrieval.prompt_assembly.dsa.raw_expanded_item_count == 1
     and .retrieval.prompt_assembly.dsa.final_combined_item_count == 1
+    and .prompt.general_evidence_reasoning.claim_scope_basis == "declared_scope"
     and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
     and .prompt.general_evidence_reasoning.reasoning_context_limited == false
@@ -7152,10 +7210,12 @@ CASES
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
   audit="$(fetch_dsa_audit)"
-  if ! jq -e '
+  claim_records="$(list_claim_records "$owner" "$conversation_id")"
+  bounded_claim="Based only on the evidence I could examine, this is the conclusion I can support: Only the retained record can be considered."
+  if ! jq -e --arg bounded "$bounded_claim" '
     .status == "ok" and .pending_action == null
-    and (.answer | contains("source lookup failed with an upstream HTTP 503"))
-    and (.answer | contains("Only the retained record can be considered.") | not)
+    and (.answer | startswith($bounded + "\n\n"))
+    and (.answer | contains("the available records may be incomplete"))
   ' <<<"$response" >/dev/null 2>&1; then
     printf 'Generalized partial response: %s\n' \
       "$(jq -c . <<<"$response")" >&2
@@ -7174,22 +7234,60 @@ CASES
     and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
   '
   assert_jq "generalized.partial.authority" "$trace" '
-    .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    .prompt.general_evidence_reasoning.claim_scope_basis == "supplied_evidence"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
     and .prompt.general_evidence_reasoning.cr_call_count == 1
-    and .prompt.general_evidence_reasoning.cr_conclusion_disposition != "allowed"
-    and .prompt.general_evidence_reasoning.presented_to_user == false
+    and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.qualification_required == true
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .prompt.general_evidence_reasoning.decision_comparison.relation
+      == "claim_support_more_permissive"
+    and (.prompt.general_evidence_reasoning.decision_comparison.categories
+      | index("claim_support_more_useful")) != null
+    and (.prompt.general_evidence_reasoning.decision_comparison.categories
+      | index("claim_support_overpermissive")) == null
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
   '
+  if ! jq -e --arg bounded "$bounded_claim" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == true
+    and $records[0].claim_anchor == $bounded
+    and $records[0].support.calibration_status == "limited"
+    and $records[0].support.conclusion_disposition == "qualified"
+    and ($records[0].support.material_scope_limitations
+      | index("supplied_evidence_scope")) != null
+    and ($records[0].support.material_scope_limitations
+      | index("complete_scope_not_established")) != null
+    and (($records[0].support | tostring) | contains("PRIVATE") | not)
+  ' <<<"$claim_records" >/dev/null 2>&1; then
+    printf 'Generalized partial persistence: %s\n' "$(jq -c '{
+      record_count:(.records | length),
+      records:[.records[] | {
+        schema_version,
+        presented_to_user,
+        claim_anchor,
+        calibration_status:.support.calibration_status,
+        conclusion_disposition:.support.conclusion_disposition,
+        material_scope_limitations:.support.material_scope_limitations
+      }]
+    }' <<<"$claim_records")" >&2
+    return 1
+  fi
   assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
-  assert_diagnostic_advisory_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
   assert_jq "generalized.partial.dsa" "$audit" '
     ([.[] | select(.operation == "context_pack")] | length) == 1
     and ([.[] | select(.operation == "context")] | length) == 2
     and ([.[] | select(.operation == "fetch")] | length) == 0
   '
+  assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
   configure_source_fixture "calendar-beta" "ready"
-  echo "Generalized acquisition reasoning: matched_refinement=presented topical_no_match=ordinary_chat contradiction=presented decision=presented full_scope=presented partial=withheld actions=0 retries=0 repairs=0 reacquisition=0"
+  echo "Generalized acquisition reasoning: matched_refinement=presented topical_no_match=ordinary_chat contradiction=presented decision=presented full_scope=presented partial=qualified_supplied_evidence actions=0 retries=0 repairs=0 reacquisition=0"
 }
 
 run_authority_comparison_incomplete_scope_case() {

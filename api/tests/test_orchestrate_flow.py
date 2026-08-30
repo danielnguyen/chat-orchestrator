@@ -7,6 +7,7 @@ import logging
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -1779,18 +1780,29 @@ class FakeRuntime:
             authority["complete_declared_scope_required"] is True
             and authority["complete_declared_scope_established"] is not True
         )
+        supplied_evidence_scope = (
+            authority.get("claim_scope_basis") == "supplied_evidence"
+        )
         policy_blocked = not authority["privacy_policy_allows_claim"] or not authority[
             "consequence_policy_allows_claim"
         ]
         no_support = not proposal["supporting_evidence_ref_ids"] and not proposal[
             "executed_derivation_ref_ids"
         ]
-        unsupported = incomplete_scope or policy_blocked or no_support
+        unsupported = (
+            (incomplete_scope and not supplied_evidence_scope)
+            or policy_blocked
+            or no_support
+        )
         has_exclusions = bool(proposal["material_exclusions"])
         has_counterevidence = bool(proposal["counterevidence_ref_ids"])
         material_limited = authority["material_acquisition_limited"] is True
         limited = (
-            interpreted or has_exclusions or has_counterevidence or material_limited
+            interpreted
+            or has_exclusions
+            or has_counterevidence
+            or material_limited
+            or (incomplete_scope and supplied_evidence_scope)
         ) and not unsupported
         limitations = []
         if no_support:
@@ -14930,6 +14942,8 @@ def _bounded_exhaustive_plan_response(
     request_id: str,
     question: str,
     status: str = "ready",
+    source_id: str = "vehicle_log_primary",
+    authoritative_source_ids: list[str] | None = None,
 ) -> dict[str, object]:
     response = _targeted_plan_response(
         request_id=request_id,
@@ -14941,14 +14955,13 @@ def _bounded_exhaustive_plan_response(
     result["plan_status"] = status
     result["completeness_expectation"] = "complete_for_declared_scope"
     result["contradiction_search_required"] = True
-    result["eligible_source_ids"] = ["vehicle_log_primary"]
-    result["authoritative_source_ids"] = ["vehicle_log_primary"]
+    result["eligible_source_ids"] = [source_id]
+    result["authoritative_source_ids"] = (
+        [source_id]
+        if authoritative_source_ids is None
+        else authoritative_source_ids
+    )
     result["declared_requirements"] = [
-        {
-            "requirement_id": "authoritative-inventory",
-            "requirement_kind": "authoritative_inventory",
-            "criticality": "material",
-        },
         {
             "requirement_id": "complete-scope-coverage",
             "requirement_kind": "complete_scope_coverage",
@@ -14976,18 +14989,24 @@ def _bounded_exhaustive_plan_response(
     return response
 
 
-def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
+def _bounded_exhaustive_context_pack(
+    query: str,
+    *,
+    source_id: str = "vehicle_log_primary",
+    worksheet_name: str = "Maintenance Log",
+) -> dict[str, object]:
     response = _governed_context_pack(query)
     response["query_id"] = "configured-worksheet-seed-query"
-    response["sources_used"] = ["vehicle_log_primary"]
+    response["sources_used"] = [source_id]
     response["items"] = [
         {
             "result_id": "targeted-seed-result",
             "source_type": "google_sheets",
-            "source_id": "vehicle_log_primary",
+            "source_id": source_id,
             "source_name": "PRIVATE WORKSHEET NAME",
             "source_ref": (
-                "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
+                f"google_sheets:{source_id}:"
+                f"{quote(worksheet_name, safe='')}!A2:E2"
             ),
             "retrieved_at": "2026-07-17T00:00:00Z",
             "source_modified_at": None,
@@ -15018,11 +15037,11 @@ def _bounded_exhaustive_context_pack(query: str) -> dict[str, object]:
     }
     response["diagnostics"] = {
         "selection_mode": "query_relevance",
-        "considered_source_ids": ["vehicle_log_primary"],
-        "selected_source_ids": ["vehicle_log_primary"],
+        "considered_source_ids": [source_id],
+        "selected_source_ids": [source_id],
         "source_diagnostics": [],
         "ranking_mode": "single_source",
-        "candidate_counts_by_source": {"vehicle_log_primary": 4},
+        "candidate_counts_by_source": {source_id: 4},
         "budget_truncated_candidates": True,
     }
     return response
@@ -15033,6 +15052,7 @@ def _configured_worksheet_context_response(
     result: bool = True,
     truncated: bool = False,
     source_id: str = "vehicle_log_primary",
+    worksheet_name: str = "Maintenance Log",
 ) -> dict[str, object]:
     results = (
         [
@@ -15042,7 +15062,8 @@ def _configured_worksheet_context_response(
                 "source_id": source_id,
                 "source_name": "PRIVATE WORKSHEET NAME",
                 "source_ref": (
-                    f"google_sheets:{source_id}:Maintenance%20Log!A2:E20"
+                    f"google_sheets:{source_id}:"
+                    f"{quote(worksheet_name, safe='')}!A2:E20"
                 ),
                 "retrieved_at": "2026-07-17T00:00:00Z",
                 "source_modified_at": None,
@@ -15383,6 +15404,10 @@ async def _run_targeted_cross_source_case(
     *,
     tmp_path,
     partial: bool = False,
+    provider_claim: str = (
+        "The retained bounded records support a qualified comparison."
+    ),
+    supporting: bool = True,
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -15447,11 +15472,9 @@ async def _run_targeted_cross_source_case(
     litellm = SequenceLiteLLM(
         [
             _general_reasoning_completion(
-                proposed_claim=(
-                    "The retained bounded records support a qualified comparison."
-                ),
+                proposed_claim=provider_claim,
                 evidence_ref_id=evidence_refs[0],
-                supporting_evidence_ref_ids=evidence_refs,
+                supporting_evidence_ref_ids=(evidence_refs if supporting else []),
             )
         ]
     )
@@ -15508,6 +15531,12 @@ async def test_targeted_retrieval_runs_cross_source_generic_reasoning(tmp_path):
     }
     assert len(litellm.calls) == 1
     assert len(runtime.claim_support_calls) == 1
+    assert runtime.claim_support_calls[0]["authority_context"][
+        "claim_scope_basis"
+    ] == "declared_scope"
+    assert runtime.claim_support_calls[0]["proposal"]["proposed_claim"] == (
+        "The retained bounded records support a qualified comparison."
+    )
     assert out.get("pending_action") is None
     reasoning = trace["prompt"]["general_evidence_reasoning"]
     assert reasoning["reasoning_provider_call_count"] == 1
@@ -15516,7 +15545,7 @@ async def test_targeted_retrieval_runs_cross_source_generic_reasoning(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_targeted_retrieval_partial_cross_source_coverage_is_conservative(
+async def test_targeted_retrieval_partial_cross_source_coverage_is_scope_bounded(
     tmp_path,
 ):
     out, runtime, dsa, litellm, memory_store = (
@@ -15537,14 +15566,98 @@ async def test_targeted_retrieval_partial_cross_source_coverage_is_conservative(
     ]
     assert len(litellm.calls) == 1
     assert len(runtime.claim_support_calls) == 1
-    assert trace["prompt"]["general_evidence_reasoning"][
-        "presented_to_user"
-    ] is False
-    assert trace["prompt"]["general_evidence_reasoning"][
-        "cr_conclusion_disposition"
-    ] != "allowed"
-    assert "qualified comparison" not in out["answer"]
+    bounded_claim = (
+        "Based only on the evidence I could examine, this is the conclusion I can "
+        "support: The retained bounded records support a qualified comparison."
+    )
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    assert authority["claim_scope_basis"] == "supplied_evidence"
+    assert authority["complete_declared_scope_required"] is True
+    assert authority["complete_declared_scope_established"] is False
+    assert runtime.claim_support_calls[0]["proposal"]["proposed_claim"] == (
+        bounded_claim
+    )
+    reasoning = trace["prompt"]["general_evidence_reasoning"]
+    assert reasoning["claim_scope_basis"] == "supplied_evidence"
+    assert reasoning["presented_to_user"] is True
+    assert reasoning["cr_conclusion_disposition"] == "qualified"
+    assert reasoning["reasoning_provider_call_count"] == 1
+    assert reasoning["cr_call_count"] == 1
+    assert out["answer"].startswith(bounded_claim + "\n\n")
+    assert "the available records may be incomplete" in out["answer"]
+    assert out["answer"].split("\n\n", maxsplit=1)[0] == bounded_claim
+    assert reasoning["decision_comparison"]["relation"] == (
+        "claim_support_more_permissive"
+    )
+    assert "claim_support_more_useful" in reasoning["decision_comparison"][
+        "categories"
+    ]
+    assert "claim_support_overpermissive" not in reasoning[
+        "decision_comparison"
+    ]["categories"]
+    record = next(
+        call["payload"]
+        for call in memory_store.claim_record_calls
+        if call["payload"]["schema_version"] == "claim-record.v2"
+    )
+    assert record["presented_to_user"] is True
+    assert record["support"]["material_scope_limitations"] == [
+        "complete_scope_not_established",
+        "supplied_evidence_scope",
+    ]
     assert out.get("pending_action") is None
+
+
+@pytest.mark.asyncio
+async def test_incomplete_universal_style_proposal_is_only_presented_with_scope_boundary(
+    tmp_path,
+):
+    provider_claim = "No matching condition appears in the supplied records."
+    out, runtime, _, _, memory_store = await _run_targeted_cross_source_case(
+        tmp_path=tmp_path,
+        partial=True,
+        provider_claim=provider_claim,
+    )
+
+    bounded_claim = (
+        "Based only on the evidence I could examine, this is the conclusion I can "
+        f"support: {provider_claim}"
+    )
+    assert runtime.claim_support_calls[0]["authority_context"][
+        "claim_scope_basis"
+    ] == "supplied_evidence"
+    assert runtime.claim_support_calls[0]["proposal"]["proposed_claim"] == (
+        bounded_claim
+    )
+    assert out["answer"].split("\n\n", maxsplit=1)[0] == bounded_claim
+    assert out["answer"] != provider_claim
+    assert "the available records may be incomplete" in out["answer"]
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert trace["cr_conclusion_disposition"] == "qualified"
+
+
+@pytest.mark.asyncio
+async def test_supplied_evidence_scope_does_not_override_missing_support(tmp_path):
+    out, runtime, _, _, memory_store = await _run_targeted_cross_source_case(
+        tmp_path=tmp_path,
+        partial=True,
+        supporting=False,
+    )
+
+    assert runtime.claim_support_calls[0]["authority_context"][
+        "claim_scope_basis"
+    ] == "supplied_evidence"
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "general_evidence_reasoning"
+    ]
+    assert trace["cr_conclusion_disposition"] == "withheld"
+    assert trace["presented_to_user"] is False
+    assert "claim_support_overpermissive" not in trace["decision_comparison"][
+        "categories"
+    ]
+    assert "conclusion I can support" not in out["answer"]
 
 
 @pytest.mark.asyncio
@@ -15610,6 +15723,13 @@ async def _run_bounded_exhaustive_case(
     claim_record_capture_enabled: bool = False,
     general_reasoning_completion: dict[str, object] | None = None,
     presentation_enabled: bool = False,
+    question: str = "Review every maintenance record in the configured worksheet.",
+    source_id: str = "vehicle_log_primary",
+    source_display_name: str = "PRIVATE WORKSHEET NAME",
+    source_domain_tags: list[str] | None = None,
+    authority_role: str = "authoritative",
+    authoritative_source_ids: list[str] | None = None,
+    worksheet_name: str = "Maintenance Log",
 ):
     rules, models = _write_default_route_files(tmp_path)
     if general_reasoning_completion is not None:
@@ -15621,7 +15741,6 @@ async def _run_bounded_exhaustive_case(
             + "    provider: cloud\n",
             encoding="utf-8",
         )
-    question = "Review every maintenance record in the configured worksheet."
     request_id = "rid-evidence-bounded-exhaustive"
     runtime = FakeRuntime(
         evidence_shape_response=_derived_shape_response(
@@ -15633,26 +15752,34 @@ async def _run_bounded_exhaustive_case(
             request_id=request_id,
             question=question,
             status=plan_status,
+            source_id=source_id,
+            authoritative_source_ids=authoritative_source_ids,
         ),
         evidence_sufficiency_response=evidence_sufficiency_response,
         privacy_context_response=privacy_context_response,
     )
     dsa = FakeDSA(
-        response=context_pack or _bounded_exhaustive_context_pack(question),
+        response=context_pack
+        or _bounded_exhaustive_context_pack(
+            question,
+            source_id=source_id,
+            worksheet_name=worksheet_name,
+        ),
         source_response={
             "inventory_scope": "configured_sources",
             "inventory_status": "complete",
             "sources": [
                 {
-                    "source_id": "vehicle_log_primary",
-                    "display_name": "PRIVATE WORKSHEET NAME",
+                    "source_id": source_id,
+                    "display_name": source_display_name,
                     "connector": "google_sheets",
-                    "domain_tags": ["vehicle", "maintenance"],
+                    "domain_tags": source_domain_tags
+                    or ["vehicle", "maintenance"],
                     "sensitivity": "medium",
                     "access_mode": "read_only",
                     "capabilities": ["profile", "search", "context"],
                     "enabled": True,
-                    "authority_role": "authoritative",
+                    "authority_role": authority_role,
                     "status": "ready",
                     "last_checked_at": "2026-07-17T00:00:00Z",
                     "last_error": None,
@@ -15662,7 +15789,12 @@ async def _run_bounded_exhaustive_case(
         context_responses=(
             context_responses
             if context_responses is not None
-            else [_configured_worksheet_context_response()]
+            else [
+                _configured_worksheet_context_response(
+                    source_id=source_id,
+                    worksheet_name=worksheet_name,
+                )
+            ]
         ),
     )
     litellm = (
@@ -15672,7 +15804,8 @@ async def _run_bounded_exhaustive_case(
             content=provider_answer
             or _evidence_candidate(
                 (
-                    "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E20",
+                    f"google_sheets:{source_id}:"
+                    f"{quote(worksheet_name, safe='')}!A2:E20",
                     "COMPLETE WORKSHEET RANGE: oil, brake, tire, and battery records.",
                 )
             )
@@ -15688,7 +15821,7 @@ async def _run_bounded_exhaustive_case(
             question,
             external_context={
                 "enabled": True,
-                "source_ids": ["vehicle_log_primary"],
+                "source_ids": [source_id],
             },
         ),
         memory_store=memory_store,
@@ -15758,6 +15891,92 @@ async def test_bounded_exhaustive_single_text_preserves_complete_scope_authority
 
 
 @pytest.mark.asyncio
+async def test_unknown_authority_bounded_exhaustive_plan_reaches_reasoning(
+    tmp_path,
+):
+    source_id = "review_schedule"
+    worksheet_name = "Review Schedule"
+    question = "Which entry has the longest interval between reviews?"
+    context_response = _configured_worksheet_context_response(
+        source_id=source_id,
+        worksheet_name=worksheet_name,
+    )
+    context_response["results"][0].update(
+        {
+            "source_name": "Review Schedule",
+            "title": "Complete review schedule",
+            "text": (
+                "Complete review schedule: alpha 7 days; beta 14 days; "
+                "gamma 10 days."
+            ),
+        }
+    )
+    source_ref = context_response["results"][0]["source_ref"]
+    evidence_ref_id = governed_external_reference_id(source_ref)
+    claim = "Beta has the longest interval in the supplied review schedule."
+
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        question=question,
+        source_id=source_id,
+        source_display_name="Review Schedule",
+        source_domain_tags=["review", "schedule"],
+        authority_role="unknown",
+        authoritative_source_ids=[],
+        worksheet_name=worksheet_name,
+        context_responses=[context_response],
+        general_reasoning_completion=_general_reasoning_completion(
+            proposed_claim=claim,
+            evidence_ref_id=evidence_ref_id,
+        ),
+        presentation_enabled=True,
+    )
+
+    assert out["answer"] == claim
+    assert runtime.evidence_plan_calls[0]["task_shape"] == (
+        "bounded_exhaustive_review"
+    )
+    assert len(dsa.calls) == 1
+    assert dsa.context_calls == [
+        {
+            "source_id": source_id,
+            "context_mode": "configured_worksheet",
+            "budget": {
+                "max_rows": 20,
+                "max_bytes": 50000,
+                "max_text_chars": 12000,
+            },
+        }
+    ]
+    assert len(litellm.calls) == 1
+    assert len(runtime.claim_support_calls) == 1
+    assert runtime.claim_support_calls[0]["authority_context"][
+        "complete_declared_scope_established"
+    ] is True
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "complete-scope-coverage": "satisfied",
+        "context-delivery": "satisfied",
+        "contradiction-search": "satisfied",
+        "no-material-truncation": "satisfied",
+    }
+    manifest = memory_store.trace_calls[-1]["payload"]["prompt"][
+        "evidence_acquisition"
+    ]
+    assert runtime.evidence_plan_response["result"][
+        "authoritative_source_ids"
+    ] == []
+    assert manifest["status"] == "sufficient_for_declared_scope"
+    assert manifest["acquisition"]["sources_used"] == [source_id]
+    assert manifest["acquisition"].get("error_code") != (
+        "unsupported_bounded_exhaustive_plan"
+    )
+
+
+@pytest.mark.asyncio
 async def test_bounded_exhaustive_review_delivers_only_complete_configured_worksheet(
     tmp_path,
 ):
@@ -15814,7 +16033,6 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
@@ -15901,7 +16119,6 @@ async def test_bounded_exhaustive_prompt_removal_filters_delivery_not_coverage(
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "filtered",
         "contradiction-search": "filtered",
@@ -16076,7 +16293,6 @@ async def test_bounded_exhaustive_missing_descriptor_uses_planned_source_directl
         for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
     }
     assert facts == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
@@ -16461,6 +16677,7 @@ def _authority_comparison_context(**overrides):
         "consequence_policy_allows_claim": True,
         "complete_declared_scope_required": False,
         "complete_declared_scope_established": None,
+        "claim_scope_basis": "declared_scope",
         "executed_derivations": [],
     }
     context.update(overrides)
@@ -16627,6 +16844,52 @@ def test_authority_decision_comparison_detects_missing_support_overpermissivenes
 
     assert "claim_support_overpermissive" in comparison["categories"]
     assert comparison["reason_codes"] == ["supporting_evidence_absent"]
+
+
+def test_authority_decision_comparison_accepts_narrower_supported_claim():
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition="requested_conclusion_withheld",
+        claim_support_result=_authority_comparison_result(
+            "qualified",
+            limitations=["complete_scope_not_established"],
+        ),
+        authority_context=_authority_comparison_context(
+            complete_declared_scope_required=True,
+            complete_declared_scope_established=False,
+            claim_scope_basis="supplied_evidence",
+        ),
+        aggregate_execution=None,
+        shape_reason_codes=[],
+    )
+
+    assert comparison["relation"] == "claim_support_more_permissive"
+    assert "claim_support_more_useful" in comparison["categories"]
+    assert "claim_support_overpermissive" not in comparison["categories"]
+    assert "existing_policy_correctly_more_conservative" not in comparison[
+        "categories"
+    ]
+    assert comparison["reason_codes"] == ["complete_scope_not_established"]
+
+
+def test_authority_decision_comparison_keeps_hard_blocker_for_narrower_claim():
+    comparison = _compare_authority_decisions(
+        existing_conclusion_disposition="requested_conclusion_withheld",
+        claim_support_result=_authority_comparison_result("qualified"),
+        authority_context=_authority_comparison_context(
+            complete_declared_scope_required=True,
+            complete_declared_scope_established=False,
+            claim_scope_basis="supplied_evidence",
+            privacy_policy_allows_claim=False,
+        ),
+        aggregate_execution=None,
+        shape_reason_codes=[],
+    )
+
+    assert comparison["categories"] == [
+        "claim_support_overpermissive",
+        "existing_policy_correctly_more_conservative",
+    ]
+    assert comparison["reason_codes"] == ["privacy_policy_disallows_claim"]
 
 
 def test_authority_decision_comparison_is_deterministic_and_privacy_safe():
@@ -18240,6 +18503,7 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
     assert authority["complete_declared_scope_required"] is False
     assert authority["complete_declared_scope_established"] is None
     assert authority["material_acquisition_limited"] is True
+    assert authority["claim_scope_basis"] == "declared_scope"
     assert limited["cr_result"]["calibration_status"] == "limited"
     assert limited["cr_result"]["conclusion_disposition"] == "qualified"
 
@@ -18289,8 +18553,25 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
         ),
     )
     exhaustive_runtime = FakeRuntime()
+    exhaustive_completion = _general_reasoning_completion(
+        proposed_claim="The bounded ratio is {{derivation:ratio-1}}.",
+        evidence_ref_id=ref_id,
+        derivation_requests=[
+            {
+                "derivation_id": "ratio-1",
+                "operation": "divide",
+                "operands": [
+                    {"value": "1", "derivation_ref": None},
+                    {"value": "2", "derivation_ref": None},
+                ],
+                "supporting_evidence_ref_ids": [ref_id],
+            }
+        ],
+    )
+    exhaustive_provider = SequenceLiteLLM([exhaustive_completion])
     exhaustive = await _run_general_evidence_reasoning(
         enabled=True,
+        presentation_enabled=True,
         request_id="rid-exhaustive",
         request_text=question,
         owner_id="owner",
@@ -18301,7 +18582,7 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
         state=exhaustive_state,
         context_pack=context_pack,
         retained_source_refs=[ref_id],
-        litellm=SequenceLiteLLM([completion]),
+        litellm=exhaustive_provider,
         runtime=exhaustive_runtime,
         model_registry_path=str(models),
         timeout_ms=5000,
@@ -18317,8 +18598,40 @@ async def test_general_evidence_reasoning_passes_claim_sensitive_completeness_to
     ]
     assert exhaustive_authority["complete_declared_scope_required"] is True
     assert exhaustive_authority["complete_declared_scope_established"] is False
-    assert exhaustive["cr_result"]["calibration_status"] == "unsupported"
-    assert exhaustive["cr_result"]["conclusion_disposition"] == "withheld"
+    assert exhaustive_authority["claim_scope_basis"] == "supplied_evidence"
+    bounded_claim = (
+        "Based only on the evidence I could examine, this is the conclusion I can "
+        "support: The bounded ratio is 0.5."
+    )
+    assert exhaustive_runtime.claim_support_calls[0]["proposal"][
+        "proposed_claim"
+    ] == bounded_claim
+    assert exhaustive["proposal"]["proposed_claim"] == bounded_claim
+    assert exhaustive["trace"]["claim_scope_basis"] == "supplied_evidence"
+    assert exhaustive["trace"]["derivation_executed_count"] == 1
+    assert exhaustive["cr_result"]["claim_digest"] == (
+        "sha256:" + hashlib.sha256(bounded_claim.encode()).hexdigest()
+    )
+    assert exhaustive["cr_result"]["calibration_status"] == "limited"
+    assert exhaustive["cr_result"]["conclusion_disposition"] == "qualified"
+    assert "complete_scope_not_established" in exhaustive["cr_result"][
+        "limitation_codes"
+    ]
+    instruction = exhaustive_provider.calls[0]["messages"][0]["content"]
+    assert "broader requested evidence scope is incomplete" in instruction
+    presentation, answer = _select_claim_support_presentation(
+        enabled=True,
+        reasoning_result=exhaustive,
+        privacy_suppressed=False,
+        consequence_policy_allows_claim=True,
+        action_related=False,
+    )
+    assert presentation["status"] == "presented"
+    assert answer == (
+        bounded_claim
+        + "\n\nThis result has some uncertainty because some source values had to be "
+        "interpreted; the available records may be incomplete."
+    )
 
 
 @pytest.mark.asyncio

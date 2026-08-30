@@ -59,6 +59,7 @@ from services.evidence_acquisition import (
     _validate_supported_plan,
     advisory_provider_allowed,
     begin_evidence_acquisition,
+    bind_evidence_reasoning_claim_scope,
     bind_manifest_response,
     bounded_evidence_reasoning_completion_metadata,
     build_current_acquisition_premise,
@@ -89,6 +90,7 @@ from services.evidence_acquisition import (
     render_governed_evidence_answer,
     render_process_failure_response,
     retain_initial_attempt_summary,
+    select_claim_scope_basis,
     select_evidence_next_step,
     source_descriptor_for_inventory_entry,
     suppress_manifest_identifiers,
@@ -311,6 +313,101 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     assert "{{derivation:<derivation_id>}}" in messages[0]["content"]
     assert "Every terminal requested derivation must appear exactly once" in (
         messages[0]["content"]
+    )
+    assert "claim_scope_basis" not in schema["schema"]["properties"]
+
+
+@pytest.mark.parametrize(
+    ("scope_authority", "expected"),
+    [
+        (
+            {
+                "complete_declared_scope_required": False,
+                "complete_declared_scope_established": None,
+                "material_acquisition_limited": False,
+            },
+            "declared_scope",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": True,
+                "material_acquisition_limited": False,
+            },
+            "declared_scope",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": False,
+                "material_acquisition_limited": False,
+            },
+            "supplied_evidence",
+        ),
+        (
+            {
+                "complete_declared_scope_required": True,
+                "complete_declared_scope_established": False,
+                "material_acquisition_limited": True,
+            },
+            "supplied_evidence",
+        ),
+    ],
+)
+def test_claim_scope_basis_is_selected_only_from_system_scope_authority(
+    scope_authority,
+    expected,
+):
+    assert select_claim_scope_basis(scope_authority) == expected
+
+
+def test_supplied_evidence_reasoning_contract_is_bounded_without_schema_authority():
+    messages = evidence_reasoning_messages(
+        request_text="Evaluate the available neutral records.",
+        evidence=[{"evidence_ref_id": "evidence-1", "text": "bounded record"}],
+        claim_scope_basis="supplied_evidence",
+    )
+    instruction = messages[0]["content"]
+    schema = evidence_reasoning_response_format()["json_schema"]["schema"]
+
+    assert "broader requested evidence scope is incomplete" in instruction
+    assert "Reason only from the authorized evidence supplied" in instruction
+    assert "unexamined evidence was covered" in instruction
+    assert "system will apply the required visible scope boundary" in instruction
+    assert "claim_scope_basis" not in schema["properties"]
+
+
+@pytest.mark.parametrize(
+    ("basis", "provider_claim", "expected"),
+    [
+        ("declared_scope", "The records support option A.", "The records support option A."),
+        (
+            "supplied_evidence",
+            "Option A appears strongest.",
+            "Based only on the evidence I could examine, this is the conclusion I can "
+            "support: Option A appears strongest.",
+        ),
+        (
+            "supplied_evidence",
+            "No matching condition appears in the supplied records.",
+            "Based only on the evidence I could examine, this is the conclusion I can "
+            "support: No matching condition appears in the supplied records.",
+        ),
+        (
+            "supplied_evidence",
+            "The bounded ratio is {{derivation:ratio-1}}.",
+            "Based only on the evidence I could examine, this is the conclusion I can "
+            "support: The bounded ratio is {{derivation:ratio-1}}.",
+        ),
+    ],
+)
+def test_claim_scope_binding_is_mechanical(basis, provider_claim, expected):
+    assert (
+        bind_evidence_reasoning_claim_scope(
+            provider_claim,
+            claim_scope_basis=basis,
+        )
+        == expected
     )
 
 
@@ -932,7 +1029,6 @@ def _exhaustive_requirements():
             "criticality": "material",
         }
         for requirement_kind in (
-            "authoritative_inventory",
             "complete_scope_coverage",
             "contradiction_search",
             "context_delivery",
@@ -6987,8 +7083,16 @@ def _empty_exhaustive_targeted_context_pack():
 
 
 def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
-    assert _exhaustive_state().supported_complete_scope_path is True
-    assert _exhaustive_state().supported_governed_path is True
+    state = _exhaustive_state()
+    material_kinds = {
+        requirement.requirement_kind
+        for requirement in state.plan.declared_requirements
+        if requirement.criticality == "material"
+    }
+    assert "authoritative_inventory" not in material_kinds
+    assert "complete_scope_coverage" in material_kinds
+    assert state.supported_complete_scope_path is True
+    assert state.supported_governed_path is True
 
     second_source = _source(
         "source_b",
@@ -7025,6 +7129,62 @@ def test_bounded_exhaustive_supported_boundary_is_exact_and_scope_aware():
     )
     assert narrowed_by_id.supported_complete_scope_path is True
     assert narrowed_by_category.supported_complete_scope_path is True
+
+
+@pytest.mark.parametrize(
+    ("authority_role", "authoritative_source_ids"),
+    [
+        ("authoritative", ["source_a"]),
+        ("supplemental", []),
+        ("unknown", []),
+    ],
+)
+def test_bounded_exhaustive_accepts_truthful_source_authority_metadata(
+    authority_role,
+    authoritative_source_ids,
+):
+    source = _source(
+        "source_a",
+        capabilities=["profile", "search", "context"],
+        authority_role=authority_role,
+        connector="google_sheets",
+    )
+    state = _exhaustive_state(
+        sources=[source],
+        plan_overrides={
+            "authoritative_source_ids": authoritative_source_ids,
+        },
+    )
+
+    assert state.supported_complete_scope_path is True
+
+
+@pytest.mark.parametrize(
+    ("authority_role", "authoritative_source_ids"),
+    [
+        ("unknown", ["source_a"]),
+        ("supplemental", ["source_a"]),
+        ("authoritative", []),
+    ],
+)
+def test_bounded_exhaustive_rejects_inconsistent_source_authority_metadata(
+    authority_role,
+    authoritative_source_ids,
+):
+    source = _source(
+        "source_a",
+        capabilities=["profile", "search", "context"],
+        authority_role=authority_role,
+        connector="google_sheets",
+    )
+    state = _exhaustive_state(
+        sources=[source],
+        plan_overrides={
+            "authoritative_source_ids": authoritative_source_ids,
+        },
+    )
+
+    assert state.supported_complete_scope_path is False
 
 
 @pytest.mark.parametrize(
@@ -7160,8 +7320,6 @@ def test_complete_scope_execution_is_not_gated_by_reasoning_shape(case):
         ("disabled", {"enabled": False, "status": "disabled"}),
         ("unavailable", {"status": "unavailable"}),
         ("unknown-status", {"status": "unknown"}),
-        ("supplemental", {"authority_role": "supplemental"}),
-        ("unknown-authority", {"authority_role": "unknown"}),
         ("wrong-connector", {"connector": "ics_calendar"}),
         ("missing-search", {"capabilities": ["profile", "context"]}),
         ("missing-context", {"capabilities": ["profile", "search"]}),
@@ -7603,8 +7761,20 @@ async def test_bounded_exhaustive_zero_targeted_results_expands_directly():
 
 
 @pytest.mark.asyncio
-async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
-    state = _exhaustive_state()
+@pytest.mark.parametrize("authority_role", ["supplemental", "unknown"])
+async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope(
+    authority_role,
+):
+    source = _source(
+        "source_a",
+        capabilities=["profile", "search", "context"],
+        authority_role=authority_role,
+        connector="google_sheets",
+    )
+    state = _exhaustive_state(
+        sources=[source],
+        plan_overrides={"authoritative_source_ids": []},
+    )
     runtime = FakeRuntime()
     dsa = FakeDsa([], context_responses=[_configured_worksheet_response()])
     bundle, trace = await execute_bounded_exhaustive_review(
@@ -7614,6 +7784,21 @@ async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
         dsa_trace={"called": True, "status": "success"},
     )
     retained_ref = "google_sheets:source_a:Maintenance!A2:E5"
+
+    assert state.supported_complete_scope_path is True
+    assert dsa.calls == [
+        (
+            "context_source",
+            {
+                "source_id": "source_a",
+                "context_mode": "configured_worksheet",
+                "budget": BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET,
+            },
+        )
+    ]
+    assert bundle["sources_used"] == ["source_a"]
+    assert len(bundle["items"]) == 1
+    assert trace.get("error_code") != "unsupported_bounded_exhaustive_plan"
 
     await evaluate_acquisition_sufficiency(
         state=state,
@@ -7631,11 +7816,13 @@ async def test_seedless_bounded_exhaustive_facts_reach_sufficient_scope():
         fact["requirement_id"]: fact["outcome"]
         for fact in state.acquisition_facts or []
     } == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
         "no-material-truncation": "satisfied",
+    }
+    assert "authoritative-inventory" not in {
+        fact["requirement_id"] for fact in state.acquisition_facts or []
     }
     assert len([call for call in runtime.calls if call[0] == "sufficiency"]) == 1
 
@@ -7776,7 +7963,6 @@ def test_bounded_exhaustive_facts_identity_manifest_and_privacy_are_prompt_aware
         item["requirement_id"]: item["outcome"]
         for item in satisfied
     } == {
-        "authoritative-inventory": "satisfied",
         "complete-scope-coverage": "satisfied",
         "context-delivery": "satisfied",
         "contradiction-search": "satisfied",
