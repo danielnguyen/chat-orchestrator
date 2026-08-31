@@ -235,6 +235,7 @@ _EVIDENCE_REASONING_MAX_COMPLETION_TOKENS = 2048
 _EVIDENCE_REASONING_REASONING_EFFORT = "medium"
 _MULTI_ITEM_REASONING_TEXT_LIMIT = 4000
 _SINGLE_ITEM_REASONING_TEXT_LIMIT = 12000
+_MAX_REASONING_EVIDENCE_ITEMS = 8
 _AUTHORITY_DISPOSITION_LEVEL = {"withheld": 0, "qualified": 1, "allowed": 2}
 _EXISTING_AUTHORITY_DISPOSITIONS = {
     "bounded_conclusion_allowed": "allowed",
@@ -7430,9 +7431,11 @@ def _bounded_reasoning_evidence(
         if len(retained) == 1 and not structured_items
         else _MULTI_ITEM_REASONING_TEXT_LIMIT
     )
-    evidence: list[dict[str, Any]] = []
-    metadata: dict[str, dict[str, Any]] = {}
+    candidates: list[
+        tuple[str, dict[str, Any], dict[str, Any]]
+    ] = []
     seen_source_refs: set[str] = set()
+    seen_ref_ids: set[str] = set()
     reasoning_context_limited = False
     inventory = {
         source.source_id: source
@@ -7457,11 +7460,9 @@ def _bounded_reasoning_evidence(
             return [], {}, False
         seen_source_refs.add(source_ref)
         ref_id = governed_external_reference_id(source_ref)
-        if ref_id in metadata:
+        if ref_id in seen_ref_ids:
             return [], {}, False
-        if len(evidence) >= 8:
-            reasoning_context_limited = True
-            continue
+        seen_ref_ids.add(ref_id)
         bounded_text = text[:text_limit]
         reasoning_context_limited = reasoning_context_limited or len(text) > text_limit
         source_descriptor = source_descriptor_for_inventory_entry(
@@ -7470,12 +7471,17 @@ def _bounded_reasoning_evidence(
         evidence_item = {"evidence_ref_id": ref_id, "text": bounded_text}
         if source_descriptor is not None:
             evidence_item["source_descriptor"] = source_descriptor
-        evidence.append(evidence_item)
-        metadata[ref_id] = {
-            "source_id": source_id,
-            "source_ref": source_ref,
-            "source_descriptor": source_descriptor,
-        }
+        candidates.append(
+            (
+                source_id,
+                evidence_item,
+                {
+                    "source_id": source_id,
+                    "source_ref": source_ref,
+                    "source_descriptor": source_descriptor,
+                },
+            )
+        )
     for item in structured_items or []:
         structured = getattr(item, "structured_data", None)
         source_ref = getattr(item, "source_ref", None)
@@ -7488,11 +7494,9 @@ def _bounded_reasoning_evidence(
             return [], {}, False
         seen_source_refs.add(source_ref)
         ref_id = governed_external_reference_id(source_ref)
-        if ref_id in metadata:
+        if ref_id in seen_ref_ids:
             return [], {}, False
-        if len(evidence) >= 8:
-            reasoning_context_limited = True
-            continue
+        seen_ref_ids.add(ref_id)
         structured_payload = structured.model_dump(mode="json")
         serialized = json.dumps(
             structured_payload,
@@ -7542,14 +7546,55 @@ def _bounded_reasoning_evidence(
         }
         if source_descriptor is not None:
             evidence_item["source_descriptor"] = source_descriptor
-        evidence.append(evidence_item)
-        metadata[ref_id] = {
-            "source_id": source_id,
-            "source_ref": source_ref,
-            "source_descriptor": source_descriptor,
-        }
+        candidates.append(
+            (
+                source_id,
+                evidence_item,
+                {
+                    "source_id": source_id,
+                    "source_ref": source_ref,
+                    "source_descriptor": source_descriptor,
+                },
+            )
+        )
     if retained and not retained.issubset(seen_source_refs):
         return [], {}, False
+
+    selected = candidates
+    if len(candidates) > _MAX_REASONING_EVIDENCE_ITEMS:
+        source_order: list[str] = []
+        candidates_by_source: dict[
+            str, list[tuple[str, dict[str, Any], dict[str, Any]]]
+        ] = {}
+        for candidate in candidates:
+            source_id = candidate[0]
+            if source_id not in candidates_by_source:
+                source_order.append(source_id)
+                candidates_by_source[source_id] = []
+            candidates_by_source[source_id].append(candidate)
+
+        selected = []
+        source_offsets = {source_id: 0 for source_id in source_order}
+        while len(selected) < _MAX_REASONING_EVIDENCE_ITEMS:
+            for source_id in source_order:
+                offset = source_offsets[source_id]
+                source_candidates = candidates_by_source[source_id]
+                if offset >= len(source_candidates):
+                    continue
+                selected.append(source_candidates[offset])
+                source_offsets[source_id] = offset + 1
+                if len(selected) >= _MAX_REASONING_EVIDENCE_ITEMS:
+                    break
+
+    reasoning_context_limited = (
+        reasoning_context_limited
+        or len(candidates) > _MAX_REASONING_EVIDENCE_ITEMS
+    )
+    evidence = [candidate[1] for candidate in selected]
+    metadata = {
+        candidate[1]["evidence_ref_id"]: candidate[2]
+        for candidate in selected
+    }
     return evidence, metadata, reasoning_context_limited
 
 

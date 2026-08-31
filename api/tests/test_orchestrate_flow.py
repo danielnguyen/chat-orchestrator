@@ -15408,6 +15408,9 @@ async def _run_targeted_cross_source_case(
         "The retained bounded records support a qualified comparison."
     ),
     supporting: bool = True,
+    source_ids: list[str] | None = None,
+    context_pack: dict[str, object] | None = None,
+    supporting_source_refs: list[str] | None = None,
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -15420,7 +15423,7 @@ async def _run_targeted_cross_source_case(
     )
     question = "Compare the bounded records from the selected sources."
     request_id = "rid-evidence-targeted-cross-source"
-    source_ids = ["records_primary", "records_secondary"]
+    source_ids = source_ids or ["records_primary", "records_secondary"]
     plan = _hybrid_plan_response(
         request_id=request_id,
         question=question,
@@ -15435,7 +15438,7 @@ async def _run_targeted_cross_source_case(
         ),
         evidence_plan_response=plan,
     )
-    context_pack = _neutral_multi_source_context_pack(question)
+    context_pack = context_pack or _neutral_multi_source_context_pack(question)
     if partial:
         context_pack["items"] = context_pack["items"][:1]
         context_pack["sources_used"] = [source_ids[0]]
@@ -15469,12 +15472,22 @@ async def _run_targeted_cross_source_case(
         governed_external_reference_id(item["source_ref"])
         for item in context_pack["items"]
     ]
+    supporting_evidence_refs = (
+        [
+            governed_external_reference_id(source_ref)
+            for source_ref in supporting_source_refs
+        ]
+        if supporting_source_refs is not None
+        else evidence_refs
+    )
     litellm = SequenceLiteLLM(
         [
             _general_reasoning_completion(
                 proposed_claim=provider_claim,
                 evidence_ref_id=evidence_refs[0],
-                supporting_evidence_ref_ids=(evidence_refs if supporting else []),
+                supporting_evidence_ref_ids=(
+                    supporting_evidence_refs if supporting else []
+                ),
             )
         ]
     )
@@ -15605,6 +15618,107 @@ async def test_targeted_retrieval_partial_cross_source_coverage_is_scope_bounded
         "complete_scope_not_established",
         "supplied_evidence_scope",
     ]
+    assert out.get("pending_action") is None
+
+
+@pytest.mark.asyncio
+async def test_multisource_reasoning_projection_is_balanced_without_widening_scope(
+    tmp_path,
+):
+    source_counts = {
+        "records_alpha": 6,
+        "records_beta": 5,
+        "records_gamma": 5,
+    }
+    source_ids = list(source_counts)
+    context_pack = _governed_context_pack(
+        "Compare the bounded records from the selected sources."
+    )
+    context_pack["sources_used"] = source_ids
+    context_pack["items"] = [
+        {
+            "result_id": f"result_{source_id}_{index}",
+            "source_type": "record",
+            "source_id": source_id,
+            "source_name": f"Neutral records {source_id}",
+            "source_ref": f"{source_id}:item-{index}",
+            "retrieved_at": "2026-07-17T00:00:00Z",
+            "source_modified_at": None,
+            "title": f"Neutral item {index}",
+            "content_type": "text",
+            "text": f"Bounded relationship evidence {source_id} item {index}.",
+            "confidence": "high",
+            "available_context": [],
+            "warnings": [],
+        }
+        for source_id, count in source_counts.items()
+        for index in range(1, count + 1)
+    ]
+    context_pack["budget"] = {
+        "max_results": 16,
+        "returned_results": 16,
+        "estimated_bytes": 3200,
+        "truncated": True,
+    }
+    context_pack["diagnostics"] = {
+        "selection_mode": "query_relevance",
+        "considered_source_ids": source_ids,
+        "selected_source_ids": source_ids,
+        "source_diagnostics": [],
+        "ranking_mode": "cross_source",
+        "candidate_counts_by_source": dict(source_counts),
+        "budget_truncated_candidates": True,
+    }
+    selected_source_refs = [
+        "records_alpha:item-1",
+        "records_beta:item-1",
+        "records_gamma:item-1",
+        "records_alpha:item-2",
+        "records_beta:item-2",
+        "records_gamma:item-2",
+        "records_alpha:item-3",
+        "records_beta:item-3",
+    ]
+
+    out, runtime, dsa, litellm, memory_store = (
+        await _run_targeted_cross_source_case(
+            tmp_path=tmp_path,
+            source_ids=source_ids,
+            context_pack=context_pack,
+            supporting_source_refs=selected_source_refs,
+        )
+    )
+
+    assert len(litellm.calls) == 1, (
+        out,
+        memory_store.trace_calls[-1]["payload"]["prompt"],
+    )
+    reasoning_input = json.loads(litellm.calls[0]["messages"][1]["content"])
+    assert [
+        item["evidence_ref_id"]
+        for item in reasoning_input["authorized_evidence"]
+    ] == [
+        governed_external_reference_id(source_ref)
+        for source_ref in selected_source_refs
+    ]
+    assert len(reasoning_input["authorized_evidence"]) == 8
+    assert len(runtime.claim_support_calls) == 1
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    assert authority["claim_scope_basis"] == "supplied_evidence"
+    assert authority["complete_declared_scope_required"] is True
+    assert authority["complete_declared_scope_established"] is False
+    assert authority["material_acquisition_limited"] is True
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]
+    assert trace["general_evidence_reasoning"][
+        "reasoning_context_limited"
+    ] is True
+    assert trace["general_evidence_reasoning"]["claim_scope_basis"] == (
+        "supplied_evidence"
+    )
+    assert len(dsa.calls) == 1
+    assert dsa.context_calls == []
+    assert dsa.fetch_calls == []
+    assert runtime.capability_authority_calls == []
     assert out.get("pending_action") is None
 
 
@@ -17800,6 +17914,9 @@ def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed(
     assert len(evidence) == 8
     assert len(evidence[0]["text"]) == 4000
     assert len(metadata) == 8
+    assert [
+        metadata[item["evidence_ref_id"]]["source_ref"] for item in evidence
+    ] == [f"neutral-source:item-{index}" for index in range(8)]
     assert limited is True
 
     structured_payload = _aggregate_structured_response()["results"][0]
@@ -17827,6 +17944,110 @@ def test_general_reasoning_local_projection_is_bounded_and_materially_disclosed(
     ]
     assert len(structured_metadata) == 1
     assert structured_limited is False
+
+
+def test_bounded_reasoning_balances_multiple_sources_under_item_cap():
+    source_items = {
+        "source-a": 6,
+        "source-b": 5,
+        "source-c": 5,
+    }
+    items = [
+        {
+            "source_ref": f"{source_id}:item-{index}",
+            "source_id": source_id,
+            "text": f"Neutral evidence {source_id} item {index}.",
+        }
+        for source_id, count in source_items.items()
+        for index in range(1, count + 1)
+    ]
+    retained = [item["source_ref"] for item in items]
+    expected_source_refs = [
+        "source-a:item-1",
+        "source-b:item-1",
+        "source-c:item-1",
+        "source-a:item-2",
+        "source-b:item-2",
+        "source-c:item-2",
+        "source-a:item-3",
+        "source-b:item-3",
+    ]
+
+    projections = [
+        _bounded_reasoning_evidence(
+            context_pack={"items": items},
+            retained_source_refs=retained,
+            structured_items=[],
+        )
+        for _ in range(2)
+    ]
+
+    for evidence, metadata, limited in projections:
+        selected_source_refs = [
+            metadata[item["evidence_ref_id"]]["source_ref"]
+            for item in evidence
+        ]
+        assert selected_source_refs == expected_source_refs
+        assert len(evidence) == 8
+        assert {item["source_id"] for item in metadata.values()} == {
+            "source-a",
+            "source-b",
+            "source-c",
+        }
+        assert limited is True
+
+    assert projections[0] == projections[1]
+
+
+def test_bounded_reasoning_balances_structured_and_prose_evidence():
+    text_items = [
+        {
+            "source_ref": f"source-a:item-{index}",
+            "source_id": "source-a",
+            "text": f"Neutral prose item {index}.",
+        }
+        for index in range(1, 8)
+    ]
+    text_items.append(
+        {
+            "source_ref": "source-b:item-1",
+            "source_id": "source-b",
+            "text": "Neutral prose from a second source.",
+        }
+    )
+    structured_payload = _aggregate_structured_response()["results"][0]
+    structured_payload.update(
+        {
+            "source_id": "source-c",
+            "source_ref": "source-c:structured-1",
+        }
+    )
+    structured_item = DsaContextItem.model_validate(structured_payload)
+    retained = [item["source_ref"] for item in text_items]
+    retained.append(structured_item.source_ref)
+
+    evidence, metadata, limited = _bounded_reasoning_evidence(
+        context_pack={"items": text_items},
+        retained_source_refs=retained,
+        structured_items=[structured_item],
+    )
+
+    selected_source_refs = [
+        metadata[item["evidence_ref_id"]]["source_ref"] for item in evidence
+    ]
+    assert selected_source_refs == [
+        "source-a:item-1",
+        "source-b:item-1",
+        "source-c:structured-1",
+        "source-a:item-2",
+        "source-a:item-3",
+        "source-a:item-4",
+        "source-a:item-5",
+        "source-a:item-6",
+    ]
+    assert evidence[2]["content_type"] == "structured_field_values"
+    assert len(evidence) == len(metadata) == len(set(selected_source_refs)) == 8
+    assert limited is True
 
 
 def test_bounded_reasoning_preserves_one_text_item_within_single_item_limit():
