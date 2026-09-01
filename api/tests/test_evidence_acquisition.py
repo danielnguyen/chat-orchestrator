@@ -56,6 +56,7 @@ from services.evidence_acquisition import (
     _resolve_declared_scope,
     _source_discovery_projection,
     _source_summaries,
+    _validate_aggregate_advisory_inventory,
     _validate_supported_plan,
     advisory_provider_allowed,
     begin_evidence_acquisition,
@@ -2856,8 +2857,10 @@ def test_evidence_interpreter_instruction_preserves_bounded_lookup():
 
 
 def test_evidence_interpreter_response_format_is_strict_and_closed():
-    schema = evidence_interpreter_response_format()["json_schema"]
+    response_format = evidence_interpreter_response_format()
+    schema = response_format["json_schema"]
 
+    assert response_format["type"] == "json_schema"
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
     candidate_schema = schema["schema"]["properties"]["candidate_source_ids"]
@@ -2894,11 +2897,11 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 120,
-                "pattern": r"^(?!\s)[^\x00-\x1f\x7f]*\S$",
             },
             {"type": "null"},
         ]
     }
+    assert "pattern" not in field_schema["anyOf"][0]
 
 
 @pytest.mark.parametrize(
@@ -3065,6 +3068,46 @@ def test_evidence_interpreter_output_accepts_closed_aggregate_contract(
 
     assert output.aggregate_function == aggregate_function
     assert output.aggregate_field_name == "Fuel (L)"
+
+
+def test_evidence_interpreter_aggregate_field_inventory_authority_is_preserved():
+    inventory = DsaSourceListResponse.model_validate(
+        {
+            "sources": [
+                {
+                    **_source("source_a"),
+                    "content_fields": ["Latency (ms)"],
+                }
+            ]
+        }
+    )
+    parsed = parse_evidence_interpreter_completion(
+        _semantic_completion(
+            {
+                "interpretation_status": "resolved",
+                "operation_hint": "aggregate",
+                "candidate_source_ids": ["source_a"],
+                "aggregate_function": "mean",
+                "aggregate_field_name": "Latency (ms)",
+            }
+        ),
+        inventory_source_ids={"source_a"},
+    )
+    advisory = EvidenceInterpreterOutput.model_validate(parsed)
+
+    assert advisory.aggregate_field_name == "Latency (ms)"
+    _validate_aggregate_advisory_inventory(advisory, inventory)
+
+    unconfigured = advisory.model_copy(
+        update={"aggregate_field_name": "Unconfigured Field"}
+    )
+    with pytest.raises(ProviderOutputValidationError) as exc_info:
+        _validate_aggregate_advisory_inventory(unconfigured, inventory)
+    assert exc_info.value.failure_code == "proposal_scope_unauthorized"
+    assert (
+        exc_info.value.detail_code
+        == "aggregate_field_not_configured_for_candidate"
+    )
 
 
 def test_evidence_interpreter_output_preserves_legacy_and_nullable_contracts():
