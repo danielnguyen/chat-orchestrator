@@ -2711,7 +2711,6 @@ def evidence_interpreter_response_format() -> dict[str, Any]:
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 120,
-                                "pattern": r"^(?!\s)[^\x00-\x1f\x7f]*\S$",
                             },
                             {"type": "null"},
                         ]
