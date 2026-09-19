@@ -39,7 +39,7 @@ def test_general_evidence_reasoning_uses_bounded_logical_route():
     }
 
 
-def test_simpler_bounded_roles_remain_on_minimal_model_routes():
+def test_evidence_interpreter_uses_sol_while_intent_classifier_remains_on_mini():
     registry = yaml.safe_load(
         (ROOT / "router" / "model_registry.yaml").read_text(encoding="utf-8")
     )
@@ -49,6 +49,6 @@ def test_simpler_bounded_roles_remain_on_minimal_model_routes():
         "provider": "cloud",
     }
     assert registry["logical_routes"]["evidence_interpreter"] == {
-        "model": "gpt-5-mini",
+        "model": "gpt-5.6-sol",
         "provider": "cloud",
     }

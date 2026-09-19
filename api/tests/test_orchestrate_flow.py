@@ -14141,7 +14141,7 @@ def _write_evidence_interpreter_route_files(tmp_path):
         models.read_text(encoding="utf-8")
         + "logical_routes:\n"
         + "  evidence_interpreter:\n"
-        + "    model: gpt-5-mini\n"
+        + "    model: gpt-5.6-sol\n"
         + "    provider: cloud\n",
         encoding="utf-8",
     )
@@ -22572,7 +22572,7 @@ async def test_evidence_interpreter_http_error_logs_bounded_structural_detail(
     assert "provider_error_param=response_format" in logs
     assert "provider_error_code=invalid_schema" in logs
     assert "max_completion_tokens=512" in logs
-    assert "reasoning_effort=minimal" in logs
+    assert "reasoning_effort=medium" in logs
     assert "Invalid schema for response_format" in logs
     assert "uniqueItems" in logs
     assert next(
@@ -22746,11 +22746,11 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "event=semantic_interpreter_completed" in logs
     assert "request_id=rid-evidence-operator-diagnostics" in logs
     assert "logical_route=evidence_interpreter" in logs
-    assert "model=gpt-5-mini" in logs
+    assert "model=gpt-5.6-sol" in logs
     assert "provider=cloud" in logs
     assert "timeout_ms=5000" in logs
     assert "max_completion_tokens=512" in logs
-    assert "reasoning_effort=minimal" in logs
+    assert "reasoning_effort=medium" in logs
     assert "interpretation_status=resolved" in logs
     assert "operation_hint=aggregate" in logs
     assert "candidate_count=1" in logs
@@ -22763,10 +22763,10 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "PRIVATE_" not in logs
     assert "aggregate_function" not in logs
     assert "median" not in logs
-    assert litellm.calls[0]["model"] == "gpt-5-mini"
+    assert litellm.calls[0]["model"] == "gpt-5.6-sol"
     assert litellm.calls[0]["timeout_ms"] == 5000
     assert litellm.calls[0]["max_completion_tokens"] == 512
-    assert litellm.calls[0]["reasoning_effort"] == "minimal"
+    assert litellm.calls[0]["reasoning_effort"] == "medium"
     response_format = litellm.calls[0]["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["name"] == (
@@ -22854,7 +22854,7 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
     assert len(litellm.calls) == 2
     assert litellm.calls[0]["timeout_ms"] == 5000
     assert litellm.calls[0]["max_completion_tokens"] == 512
-    assert litellm.calls[0]["reasoning_effort"] == "minimal"
+    assert litellm.calls[0]["reasoning_effort"] == "medium"
     assert dsa.list_calls == [{}]
     assert dsa.calls == []
     assert runtime.evidence_plan_calls == []
@@ -35712,7 +35712,7 @@ def test_evidence_interpreter_logical_route_is_distinct_and_configurable(tmp_pat
     _, models = _write_evidence_interpreter_route_files(tmp_path)
 
     assert _load_logical_route(str(models), "evidence_interpreter") == {
-        "model": "gpt-5-mini",
+        "model": "gpt-5.6-sol",
         "provider": "cloud",
     }
     assert _load_logical_route(str(models), "intent_classifier") is None
@@ -36032,9 +36032,10 @@ async def test_provider_paths_use_independent_nondefault_timeouts(tmp_path):
         evidence_interpreter_timeout_ms=4321,
     )
 
+    assert evidence_litellm.calls[0]["model"] == "gpt-5.6-sol"
     assert evidence_litellm.calls[0]["timeout_ms"] == 4321
     assert evidence_litellm.calls[0]["max_completion_tokens"] == 512
-    assert evidence_litellm.calls[0]["reasoning_effort"] == "minimal"
+    assert evidence_litellm.calls[0]["reasoning_effort"] == "medium"
     assert history_litellm.calls[0]["timeout_ms"] == 1111
     assert history_litellm.calls[0]["max_completion_tokens"] == 120
     assert "reasoning_effort" not in history_litellm.calls[0]
