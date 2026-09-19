@@ -707,7 +707,8 @@ assert_semantic_interpreter_calls() {
             "aggregate_function", "aggregate_field_name"]
       and .tool_count == 0
       and .max_completion_tokens == 512
-      and .reasoning_effort == "minimal"
+      and .model == "gpt-5.6-sol"
+      and .reasoning_effort == "medium"
       and .status == "ok"
       and ((keys - [
         "kind",
