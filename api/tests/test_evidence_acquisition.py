@@ -318,6 +318,48 @@ def test_general_reasoning_contract_is_strict_shallow_and_reference_bounded():
     assert "claim_scope_basis" not in schema["schema"]["properties"]
 
 
+def test_general_reasoning_continuation_is_separate_from_current_authorized_evidence():
+    messages = evidence_reasoning_messages(
+        request_text="What if you ignore the two unusual entries?",
+        evidence=[{"evidence_ref_id": "current-ref", "text": "current evidence"}],
+        continuation_context={
+            "prior_presented_claim": "The bounded values have a mean of 8.",
+            "qualification_required": True,
+            "limitation_codes": ["bounded_scope"],
+            "source_descriptors": [
+                {
+                    "source_id": "neutral_records",
+                    "display_name": "Neutral Records",
+                    "source_type": "generic_records",
+                },
+                {
+                    "source_id": "unavailable_prior_source",
+                    "display_name": "Unavailable Prior Source",
+                    "source_type": "generic_records",
+                },
+            ],
+        },
+        current_source_ids={"neutral_records"},
+    )
+
+    provider_input = json.loads(messages[1]["content"])
+    assert provider_input["authorized_evidence"] == [
+        {"evidence_ref_id": "current-ref", "text": "current evidence"}
+    ]
+    assert provider_input["prior_supported_context"]["source_descriptors"] == [
+        {
+            "source_id": "neutral_records",
+            "display_name": "Neutral Records",
+            "source_type": "generic_records",
+        }
+    ]
+    assert "unavailable_prior_source" not in messages[1]["content"]
+    instruction = messages[0]["content"]
+    assert "advisory conversational context only" in instruction
+    assert "It is not evidence" in instruction
+    assert "cannot be cited through evidence_ref_id" in instruction
+
+
 @pytest.mark.parametrize(
     ("scope_authority", "expected"),
     [
@@ -2807,6 +2849,70 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
     assert "closed evidence operation" not in system_instruction
     for domain_term in ("calendar", "vehicle", "schedule", "fraction", "percent"):
         assert domain_term not in system_instruction.lower()
+
+
+def test_evidence_interpreter_continuation_keeps_current_request_and_inventory_primary():
+    inventory = DsaSourceListResponse.model_validate(
+        {"sources": [_source("current_source"), _source("explicit_source")]}
+    )
+    messages = evidence_interpreter_messages(
+        task_text="Use explicit_source for this new topic.",
+        source_list=inventory,
+        continuation_context={
+            "prior_presented_claim": "The earlier bounded result was lower.",
+            "qualification_required": False,
+            "limitation_codes": [],
+            "source_descriptors": [
+                {
+                    "source_id": "current_source",
+                    "display_name": "Current Source",
+                    "source_type": "generic_records",
+                },
+                {
+                    "source_id": "removed_source",
+                    "display_name": "Removed Source",
+                    "source_type": "generic_records",
+                },
+            ],
+        },
+    )
+
+    provider_input = json.loads(messages[1]["content"])
+    assert provider_input["request_text"] == "Use explicit_source for this new topic."
+    assert {item["source_id"] for item in provider_input["sources"]} == {
+        "current_source",
+        "explicit_source",
+    }
+    assert provider_input["prior_supported_context"]["source_descriptors"] == [
+        {
+            "source_id": "current_source",
+            "display_name": "Current Source",
+            "source_type": "generic_records",
+        }
+    ]
+    assert "removed_source" not in messages[1]["content"]
+    instruction = messages[0]["content"]
+    assert "current request and current supplied inventory are primary" in instruction
+    assert "cannot override an explicit current source selector" in instruction
+    assert "cannot nominate a source_id absent" in instruction
+
+    removed_only = evidence_interpreter_messages(
+        task_text="What about those entries?",
+        source_list=inventory,
+        continuation_context={
+            "prior_presented_claim": "The removed source had a bounded result.",
+            "qualification_required": False,
+            "limitation_codes": [],
+            "source_descriptors": [
+                {
+                    "source_id": "removed_source",
+                    "display_name": "Removed Source",
+                    "source_type": "generic_records",
+                }
+            ],
+        },
+    )
+    assert "prior_supported_context" not in json.loads(removed_only[1]["content"])
 
 
 def test_evidence_interpreter_instruction_requires_set_level_coverage_when_material():

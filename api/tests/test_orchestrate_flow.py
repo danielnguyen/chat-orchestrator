@@ -80,6 +80,7 @@ from services.orchestrate import (
     _run_general_evidence_reasoning,
     _select_capability_claim_refs,
     _select_claim_support_presentation,
+    _trace_prompt,
     _visible_claim_digest,
     orchestrate_chat,
 )
@@ -14224,6 +14225,8 @@ async def _call_evidence_interpreter(
     local_only=False,
     include_route=True,
     timeout_ms=5000,
+    task_text="PRIVATE_USER_PROMPT_SENTINEL",
+    continuation_context=None,
 ):
     _, models = (
         _write_evidence_interpreter_route_files(tmp_path)
@@ -14232,7 +14235,7 @@ async def _call_evidence_interpreter(
     )
     return await _interpret_evidence_request(
         request_id=request_id,
-        task_text="PRIVATE_USER_PROMPT_SENTINEL",
+        task_text=task_text,
         source_list=_operator_diagnostic_source_list(),
         litellm=litellm,
         model_registry_path=str(models),
@@ -14240,6 +14243,7 @@ async def _call_evidence_interpreter(
         local_only=local_only,
         routing_policy={},
         effective_payload={},
+        continuation_context=continuation_context,
     )
 
 
@@ -18208,11 +18212,22 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
         effective_payload={},
         privacy_suppressed=False,
         consequence_policy_allows_claim=True,
+        continuation_context={
+            "prior_presented_claim": "The prior bounded answer described a rollout.",
+            "qualification_required": True,
+            "limitation_codes": ["bounded_scope"],
+            "source_descriptors": [],
+        },
     )
 
-    supplied = json.loads(provider.calls[0]["messages"][1]["content"])[
-        "authorized_evidence"
-    ]
+    provider_input = json.loads(provider.calls[0]["messages"][1]["content"])
+    supplied = provider_input["authorized_evidence"]
+    assert provider_input["prior_supported_context"] == {
+        "prior_presented_claim": "The prior bounded answer described a rollout.",
+        "qualification_required": True,
+        "limitation_codes": ["bounded_scope"],
+        "source_descriptors": [],
+    }
     assert {item["evidence_ref_id"] for item in supplied} == {
         text_ref,
         structured_ref,
@@ -18224,6 +18239,9 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
     assert runtime.claim_support_calls[0]["proposal"][
         "counterevidence_ref_ids"
     ] == [structured_ref]
+    assert "prior_supported_context" not in json.dumps(
+        runtime.claim_support_calls[0], sort_keys=True
+    )
     assert result["cr_result"]["calibration_status"] == "limited"
     assert result["cr_result"]["conclusion_disposition"] == "qualified"
     assert result["cr_result"]["limitation_codes"] == [
@@ -18231,6 +18249,63 @@ async def test_general_evidence_reasoning_combines_structured_and_prose_with_con
     ]
     assert result["trace"]["reasoning_provider_call_count"] == 1
     assert result["trace"]["cr_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_general_reasoning_privacy_suppression_never_sends_prior_context():
+    provider = SequenceLiteLLM([])
+
+    result = await _run_general_evidence_reasoning(
+        enabled=True,
+        request_id="rid-private-continuation",
+        request_text="What about those entries?",
+        owner_id="owner",
+        conversation_id="conv-1",
+        surface="node_red",
+        runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1",
+        state=None,
+        context_pack=None,
+        retained_source_refs=None,
+        litellm=provider,
+        runtime=FakeRuntime(),
+        model_registry_path="unused",
+        timeout_ms=5000,
+        local_only=False,
+        routing_policy={},
+        effective_payload={},
+        privacy_suppressed=True,
+        consequence_policy_allows_claim=True,
+        continuation_context={
+            "prior_presented_claim": "PRIVATE PRIOR CLAIM",
+            "qualification_required": False,
+            "limitation_codes": [],
+            "source_descriptors": [],
+        },
+    )
+
+    assert provider.calls == []
+    assert result["trace"]["reason_code"] == "privacy_suppressed"
+
+
+def test_prompt_trace_retains_only_structural_reasoning_continuation_status():
+    trace = _trace_prompt(
+        {
+            "reasoning_continuation": {
+                "status": "available",
+                "reason": "direct_presented_v2_support",
+                "source_descriptor_count": 1,
+            },
+            "prior_supported_context": "PRIVATE PRIOR CLAIM",
+        }
+    )
+
+    assert trace["reasoning_continuation"] == {
+        "status": "available",
+        "reason": "direct_presented_v2_support",
+        "source_descriptor_count": 1,
+    }
+    assert "PRIVATE PRIOR CLAIM" not in json.dumps(trace, sort_keys=True)
 
 
 @pytest.mark.asyncio
@@ -22773,6 +22848,50 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
         "evidence_source_interpretation"
     )
     assert response_format["json_schema"]["strict"] is True
+
+
+@pytest.mark.asyncio
+async def test_evidence_interpreter_uses_bounded_context_without_source_stickiness(
+    tmp_path,
+):
+    litellm = SequenceLiteLLM(
+        [_evidence_interpreter_completion("no_match", "unknown", [])]
+    )
+    result = await _call_evidence_interpreter(
+        tmp_path=tmp_path,
+        litellm=litellm,
+        task_text="Discuss an unrelated new topic.",
+        continuation_context={
+            "prior_presented_claim": "The earlier bounded result was lower.",
+            "qualification_required": True,
+            "limitation_codes": ["bounded_scope"],
+            "source_descriptors": [
+                {
+                    "source_id": "PRIVATE_SOURCE_ID_SENTINEL",
+                    "display_name": "Current Inventory Source",
+                    "source_type": "generic_records",
+                },
+                {
+                    "source_id": "removed_source",
+                    "display_name": "Removed Source",
+                    "source_type": "generic_records",
+                },
+            ],
+        },
+    )
+
+    assert result["interpretation_status"] == "no_match"
+    assert result["candidate_source_ids"] == []
+    provider_input = json.loads(litellm.calls[0]["messages"][1]["content"])
+    assert provider_input["request_text"] == "Discuss an unrelated new topic."
+    assert provider_input["prior_supported_context"]["source_descriptors"] == [
+        {
+            "source_id": "PRIVATE_SOURCE_ID_SENTINEL",
+            "display_name": "Current Inventory Source",
+            "source_type": "generic_records",
+        }
+    ]
+    assert "removed_source" not in litellm.calls[0]["messages"][1]["content"]
 
 
 @pytest.mark.asyncio
@@ -35587,7 +35706,22 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         *expected_source_references,
     ):
         assert prohibited not in follow_up["answer"]
-    assert len(memory_store.immediate_history_calls) == 1
+    assert memory_store.immediate_history_calls == [
+        {
+            "request_id": original_request_id,
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "node_red",
+            "explanation_kind": "support",
+        },
+        {
+            "request_id": "request-ordinary-dsa-follow-up",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "node_red",
+            "explanation_kind": "acquisition",
+        },
+    ]
     assert len(candidate_calls) == 1
     assert len(provider.calls) == 2
     assert history_trace["bms_resolution_status"] == "resolved"

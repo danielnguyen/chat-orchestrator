@@ -6324,7 +6324,9 @@ run_step13_diagnostic_scenarios() {
 run_general_evidence_reasoning_shadow_scenario() {
   local owner client conversation_id question external response request_id answer
   local trace manifest provider_calls audit diagnostics claim_records proposal history
-  local followup_response followup_question
+  local followup_response followup_question continuation_response continuation_request_id
+  local continuation_trace continuation_calls continuation_claim_records
+  local continuation_question continuation_proposal continuation_answer
   local presentation_expected="${1:-false}"
   local expected_derivations exact_claim exact_result visible_first visible_digest
   local source_ref="google_sheets:metrics_archive:Measurements!A2:C6"
@@ -6682,10 +6684,131 @@ run_general_evidence_reasoning_shadow_scenario() {
     HISTORY_ORIGINAL_ANSWER="$answer"
     HISTORY_ORIGINAL_REQUEST_ID="$request_id"
     HISTORY_ORIGINAL_MANIFEST="$manifest"
-    followup_question="What was that based on?"
     provider_post "/fixture/reset" '{}'
     reset_dsa_audit
     restart_orchestrator_with_history_followup true
+
+    continuation_question="What if you ignore the two unusual entries?"
+    queue_semantic_interpretation "$(jq -nc \
+      --arg request_text "$continuation_question" '
+      {
+        expected_request_text:$request_text,
+        expected_source_id:"metrics_archive",
+        expected_content_fields:["Entry","Reading"],
+        interpretation_status:"resolved",
+        operation_hint:"aggregate",
+        candidate_source_ids:["metrics_archive"],
+        aggregate_function:"mean",
+        aggregate_field_name:"Entry"
+      }')"
+    continuation_proposal="$(jq -nc --arg ref "$evidence_ref_id" '
+      {
+        proposed_claim:"Ignoring the two unusual entries, the bounded mean is {{derivation:adjusted_mean}}.",
+        supporting_evidence_ref_ids:[$ref],
+        counterevidence_ref_ids:[],
+        material_exclusions:[{
+          evidence_ref_id:$ref,
+          reason:"Two unusual entries were excluded at the user request."
+        }],
+        derivation_requests:[{
+          derivation_id:"adjusted_mean",
+          operation:"mean",
+          operands:["0.625","0.5625","0.375","0.25","0.5","0.5","0.5","0.25","0.625","0.5"]
+            | map({value:.,derivation_ref:null}),
+          supporting_evidence_ref_ids:[$ref]
+        }]
+      }')"
+    queue_provider_answer "$continuation_proposal"
+    continuation_response="$(run_history_current_turn \
+      "$owner" "$client" "$conversation_id" "$continuation_question" \
+      "private" "$external")"
+    continuation_request_id="$(jq -er '.request_id' <<<"$continuation_response")"
+    continuation_answer="$(jq -er '.answer' <<<"$continuation_response")"
+    continuation_trace="$(fetch_trace "$continuation_request_id")"
+    continuation_calls="$(fetch_provider_calls "$continuation_request_id")"
+    continuation_claim_records="$(list_claim_records "$owner" "$conversation_id")"
+    audit="$(fetch_dsa_audit)"
+    diagnostics="$(runtime_diagnostics_from_trace "$continuation_trace")"
+
+    assert_jq "general_reasoning.continuation.response" "$continuation_response" '
+      .status == "ok"
+      and (.answer | startswith("Ignoring the two unusual entries, the bounded mean is 0.4688."))
+      and .pending_action == null
+      and .sources == []
+    '
+    if ! assert_jq "general_reasoning.continuation.trace" "$continuation_trace" '
+      .prompt.reasoning_continuation == {
+        status:"available",
+        reason:"direct_presented_v2_support",
+        source_descriptor_count:1
+      }
+      and .prompt.semantic_interpreter.called == true
+      and .prompt.semantic_interpreter.status == "accepted"
+      and .prompt.semantic_interpreter.interpretation_status == "resolved"
+      and .prompt.semantic_interpreter.candidate_count == 1
+      and .prompt.general_evidence_reasoning.attempted == true
+      and .prompt.general_evidence_reasoning.validation_status == "accepted"
+      and .prompt.general_evidence_reasoning.cr_call_count == 1
+      and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+      and .prompt.general_evidence_reasoning.presented_to_user == true
+      and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+      and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    '; then
+      jq -c '{
+        reasoning_continuation:.prompt.reasoning_continuation,
+        semantic_interpreter:.prompt.semantic_interpreter,
+        general_evidence_reasoning:.prompt.general_evidence_reasoning,
+        capabilities:.retrieval.prompt_assembly.capabilities
+      }' <<<"$continuation_trace" >&2
+      return 1
+    fi
+    assert_semantic_interpreter_calls "$continuation_calls" 1
+    assert_general_evidence_reasoning_calls "$continuation_calls" 1
+    assert_jq "general_reasoning.continuation.provider" "$continuation_calls" '
+      [.calls[] | select(
+        .kind == "chat"
+        and .response_schema_name == "general_evidence_reasoning_proposal"
+      )] as $reasoning
+      | ($reasoning | length) == 1
+      and ($reasoning[0].normalized_messages | any(
+        .role == "user"
+        and (.content | contains("prior_supported_context"))
+        and (.content | contains("The bounded mean is 0.4635416666666666666666666667."))
+        and (.content | contains("Configured Metrics Archive"))
+        and (.content | contains("authorized_evidence"))
+      ))
+      and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+    '
+    assert_dsa_operation_counts "$audit" 0 1 0
+    assert_jq "general_reasoning.continuation.runtime" "$diagnostics" '
+      ([.events[] | select(
+        .event_payload_json.request_id == $request_id
+        and .event_type == "claim_support_evaluated"
+      )] | length) == 1
+    ' --arg request_id "$continuation_request_id"
+    assert_jq "general_reasoning.continuation.claim_records" "$continuation_claim_records" '
+      [.records[] | select(
+        .schema_version == "claim-record.v2"
+        and .presented_to_user == true
+      )] as $records
+      | ($records | length) == 2
+      and ($records | any(
+        .claim_anchor == "Ignoring the two unusual entries, the bounded mean is 0.46875."
+        and .support.executed_derivations[-1].canonical_result == "0.46875"
+        and .validated_evidence_references[0].source_descriptor.source_id
+          == "metrics_archive"
+      ))
+    '
+    assert_persisted_answer_matches \
+      "$conversation_id" "$continuation_request_id" "$continuation_answer"
+
+    HISTORY_ORIGINAL_ANSWER="$continuation_answer"
+    HISTORY_ORIGINAL_REQUEST_ID="$continuation_request_id"
+    HISTORY_ORIGINAL_MANIFEST="$(jq -c '.prompt.evidence_acquisition' \
+      <<<"$continuation_trace")"
+    followup_question="What was that based on?"
+    provider_post "/fixture/reset" '{}'
+    reset_dsa_audit
     followup_response="$(run_history_current_turn \
       "$owner" "$client" "$conversation_id" "$followup_question" "private")"
     assert_jq "general_reasoning.history.source_descriptor" "$followup_response" '
@@ -6699,7 +6822,7 @@ run_general_evidence_reasoning_shadow_scenario() {
       "$owner" "$conversation_id" "$followup_response" "$followup_question" \
       "deterministic" "support_explanation" "support" 0
     restart_orchestrator_with_history_followup false
-    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=1 diagnostic_provider=0 presentation_provider=0 dsa=1 derivations=1 cr=1 presentation_cr=0 bms_v1=0 bms_v2_presented=1 source_descriptor=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
+    echo "General evidence reasoning presentation: structured_failure=1 reasoning_provider=2 diagnostic_provider=0 presentation_provider=0 dsa=2 derivations=2 cr=2 presentation_cr=0 bms_v1=0 bms_v2_presented=2 source_descriptor=2 restart_continuation=1 ordinary_reasoning_followup=1 visible_history_v2=1 co_history_v2=1 history_classifier=0 history_dsa=0 history_provider=0 actions=0 retries=0 repairs=0 reacquisition=0 visible_authority=claim_support_qualified"
   else
     echo "General evidence reasoning shadow: structured_failure=1 reasoning_provider=1 diagnostic_provider=1 dsa=1 derivations=4 cr=1 bms_v2=1 comparison=claim_support_more_permissive categories=claim_support_more_useful,existing_enumeration_blocked,interpretation_disagreement,provenance_support_disagreement overpermissive=0 visible_history_shadow=0 actions=0 retries=0 visible_authority=unchanged"
   fi
