@@ -6736,7 +6736,7 @@ run_general_evidence_reasoning_shadow_scenario() {
       and .pending_action == null
       and .sources == []
     '
-    assert_jq "general_reasoning.continuation.trace" "$continuation_trace" '
+    if ! assert_jq "general_reasoning.continuation.trace" "$continuation_trace" '
       .prompt.reasoning_continuation == {
         status:"available",
         reason:"direct_presented_v2_support",
@@ -6753,7 +6753,15 @@ run_general_evidence_reasoning_shadow_scenario() {
       and .prompt.general_evidence_reasoning.presented_to_user == true
       and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
       and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
-    '
+    '; then
+      jq -c '{
+        reasoning_continuation:.prompt.reasoning_continuation,
+        semantic_interpreter:.prompt.semantic_interpreter,
+        general_evidence_reasoning:.prompt.general_evidence_reasoning,
+        capabilities:.retrieval.prompt_assembly.capabilities
+      }' <<<"$continuation_trace" >&2
+      return 1
+    fi
     assert_semantic_interpreter_calls "$continuation_calls" 1
     assert_general_evidence_reasoning_calls "$continuation_calls" 1
     assert_jq "general_reasoning.continuation.provider" "$continuation_calls" '
