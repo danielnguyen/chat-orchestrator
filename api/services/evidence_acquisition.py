@@ -288,7 +288,6 @@ STRUCTURED_OUTPUT_UNSUPPORTED_RESPONSE = (
 CONFIGURED_WORKSHEET_CONTEXT_MODE = "configured_worksheet"
 CONFIGURED_FIELD_VALUES_CONTEXT_MODE = "configured_field_values"
 BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET = {
-    "max_rows": 20,
     "max_bytes": 50000,
     "max_text_chars": 12000,
 }
@@ -5506,7 +5505,10 @@ async def execute_bounded_exhaustive_review(
         ]
         if isinstance(code, str)
     }
-    safe_items: list[dict[str, Any]] = []
+    safe_items = [
+        _prompt_safe_targeted_item(item)
+        for item in targeted_items
+    ]
     raw_expanded_item_count = 0
     expansion_estimated_bytes = 0
     expansion_truncated = False
@@ -5587,6 +5589,9 @@ async def execute_bounded_exhaustive_review(
         and isinstance(targeted_context_pack.get("budget"), dict)
         else {}
     )
+    using_targeted_fallback = bool(
+        safe_items and attempt["outcome"] != "satisfied"
+    )
     sources_used = [source_id] if safe_items else []
     bundle = {
         "bundle_id": _bounded_exhaustive_bundle_id(
@@ -5605,11 +5610,25 @@ async def execute_bounded_exhaustive_review(
         "budget": {
             "max_results": 1,
             "returned_results": len(safe_items),
-            "estimated_bytes": expansion_estimated_bytes,
-            "truncated": expansion_truncated,
+            "estimated_bytes": (
+                int(targeted_budget.get("estimated_bytes") or 0)
+                if using_targeted_fallback
+                else expansion_estimated_bytes
+            ),
+            "truncated": bool(
+                expansion_truncated
+                or (
+                    using_targeted_fallback
+                    and targeted_budget.get("truncated")
+                )
+            ),
         },
         "diagnostics": diagnostics,
-        "raw_item_count": raw_expanded_item_count,
+        "raw_item_count": (
+            len(targeted_items)
+            if using_targeted_fallback
+            else raw_expanded_item_count
+        ),
     }
     outcome_counts = {
         outcome: int(attempt["outcome"] == outcome)
@@ -5650,7 +5669,11 @@ async def execute_bounded_exhaustive_review(
         "error_codes": sorted(aggregate_error_codes),
         "raw_targeted_item_count": len(targeted_items),
         "raw_expanded_item_count": raw_expanded_item_count,
-        "raw_item_count": raw_expanded_item_count,
+        "raw_item_count": (
+            len(targeted_items)
+            if using_targeted_fallback
+            else raw_expanded_item_count
+        ),
         "final_combined_item_count": len(safe_items),
         "expansion_attempt_counts": outcome_counts,
         "budget_truncated": bool(

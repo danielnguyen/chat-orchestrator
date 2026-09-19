@@ -15965,10 +15965,13 @@ async def _run_bounded_exhaustive_case(
 
 
 @pytest.mark.asyncio
-async def test_bounded_exhaustive_single_text_preserves_complete_scope_authority(
+async def test_bounded_exhaustive_more_than_twenty_rows_preserves_complete_scope_authority(
     tmp_path,
 ):
     context_response = _configured_worksheet_context_response()
+    context_response["results"][0]["source_ref"] = (
+        "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E27"
+    )
     source_ref = context_response["results"][0]["source_ref"]
     text = "bounded neutral worksheet detail. " * 250
     context_response["results"][0]["text"] = text
@@ -15988,6 +15991,11 @@ async def test_bounded_exhaustive_single_text_preserves_complete_scope_authority
     assert out["answer"] == "The complete bounded worksheet supports the review."
     assert len(dsa.calls) == 1
     assert len(dsa.context_calls) == 1
+    assert dsa.context_calls[0]["budget"] == {
+        "max_bytes": 50000,
+        "max_text_chars": 12000,
+    }
+    assert "max_rows" not in dsa.context_calls[0]["budget"]
     assert len(litellm.calls) == 1
     reasoning_input = json.loads(litellm.calls[0]["messages"][1]["content"])
     assert len(reasoning_input["authorized_evidence"]) == 1
@@ -16060,7 +16068,6 @@ async def test_unknown_authority_bounded_exhaustive_plan_reaches_reasoning(
             "source_id": source_id,
             "context_mode": "configured_worksheet",
             "budget": {
-                "max_rows": 20,
                 "max_bytes": 50000,
                 "max_text_chars": 12000,
             },
@@ -16126,7 +16133,6 @@ async def test_bounded_exhaustive_review_delivers_only_complete_configured_works
             "source_id": "vehicle_log_primary",
             "context_mode": "configured_worksheet",
             "budget": {
-                "max_rows": 20,
                 "max_bytes": 50000,
                 "max_text_chars": 12000,
             },
@@ -16395,7 +16401,6 @@ async def test_bounded_exhaustive_missing_descriptor_uses_planned_source_directl
             "source_id": "vehicle_log_primary",
             "context_mode": "configured_worksheet",
             "budget": {
-                "max_rows": 20,
                 "max_bytes": 50000,
                 "max_text_chars": 12000,
             },
@@ -16515,6 +16520,164 @@ async def test_bounded_exhaustive_failure_is_single_attempt_and_provider_free(
     serialized = json.dumps(memory_store.trace_calls[0]["payload"], sort_keys=True)
     assert "PRIVATE CONFIGURED WORKSHEET TIMEOUT" not in serialized
     assert "COMPLETE WORKSHEET RANGE" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expansion_response", "expected_outcome"),
+    [
+        (
+            _http_status_error(
+                413,
+                {"detail": {"code": "result_too_large"}},
+            ),
+            "failed",
+        ),
+        (_configured_worksheet_context_response(truncated=True), "truncated"),
+    ],
+)
+async def test_bounded_exhaustive_incomplete_expansion_uses_qualified_targeted_evidence(
+    tmp_path,
+    expansion_response,
+    expected_outcome,
+):
+    targeted_source_ref = (
+        "google_sheets:vehicle_log_primary:Maintenance%20Log!A2:E2"
+    )
+    evidence_ref_id = governed_external_reference_id(targeted_source_ref)
+    proposed_claim = "The supplied record identifies a recurring maintenance concern."
+
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        context_responses=[expansion_response],
+        general_reasoning_completion=_general_reasoning_completion(
+            proposed_claim=proposed_claim,
+            evidence_ref_id=evidence_ref_id,
+        ),
+        presentation_enabled=True,
+    )
+
+    assert len(dsa.calls) == 1
+    assert len(dsa.context_calls) == 1
+    assert dsa.fetch_calls == []
+    assert dsa.context_calls[0]["budget"] == {
+        "max_bytes": 50000,
+        "max_text_chars": 12000,
+    }
+    assert len(litellm.calls) == 1
+    assert litellm.calls[0]["tools"] == []
+    reasoning_input = json.loads(litellm.calls[0]["messages"][1]["content"])
+    assert reasoning_input["authorized_evidence"] == [
+        {
+            "evidence_ref_id": evidence_ref_id,
+            "source_descriptor": {
+                "source_id": "vehicle_log_primary",
+                "display_name": "PRIVATE WORKSHEET NAME",
+                "source_type": "google_sheets",
+            },
+            "text": "PRIVATE TARGETED SEED ROW",
+        }
+    ]
+    assert len(runtime.claim_support_calls) == 1
+    authority = runtime.claim_support_calls[0]["authority_context"]
+    assert authority["complete_declared_scope_required"] is True
+    assert authority["complete_declared_scope_established"] is False
+    assert authority["claim_scope_basis"] == "supplied_evidence"
+    facts = {
+        fact["requirement_id"]: fact["outcome"]
+        for fact in runtime.evidence_sufficiency_calls[0]["acquisition_facts"]
+    }
+    assert facts == {
+        "complete-scope-coverage": expected_outcome,
+        "context-delivery": expected_outcome,
+        "contradiction-search": expected_outcome,
+        "no-material-truncation": expected_outcome,
+    }
+    bounded_claim = (
+        "Based only on the evidence I could examine, this is the conclusion I can "
+        f"support: {proposed_claim}"
+    )
+    assert runtime.claim_support_calls[0]["proposal"]["proposed_claim"] == (
+        bounded_claim
+    )
+    assert out["answer"].startswith(bounded_claim + "\n\n")
+    assert "the available records may be incomplete" in out["answer"]
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]
+    reasoning_trace = trace["general_evidence_reasoning"]
+    assert reasoning_trace["claim_scope_basis"] == "supplied_evidence"
+    assert reasoning_trace["reasoning_provider_call_count"] == 1
+    assert reasoning_trace["cr_call_count"] == 1
+    assert reasoning_trace["presented_to_user"] is True
+    acquisition = trace["evidence_acquisition"]["acquisition"]
+    assert acquisition["expansion_attempt_count"] == 1
+    assert acquisition[f"expansion_{expected_outcome}_count"] == 1
+    assert acquisition["source_references_retained"] == [targeted_source_ref]
+    records = [
+        call["payload"]
+        for call in memory_store.claim_record_calls
+        if call["payload"]["schema_version"] == "claim-record.v2"
+    ]
+    assert len(records) == 1
+    assert records[0]["presented_to_user"] is True
+    assert records[0]["support"]["supporting_evidence_ref_ids"] == [
+        evidence_ref_id
+    ]
+    assert records[0]["support"]["counterevidence_ref_ids"] == []
+    assert records[0]["support"]["executed_derivations"] == []
+    assert records[0]["calibration_result"][
+        "validated_evidence_references"
+    ] == [
+        {
+            "ref_type": "external_source",
+            "ref_id": evidence_ref_id,
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "support_kind": "contextual",
+            "authority": "unknown",
+            "freshness_state": "unknown_freshness",
+            "source_descriptor": {
+                "source_id": "vehicle_log_primary",
+                "display_name": "PRIVATE WORKSHEET NAME",
+                "source_type": "google_sheets",
+            },
+        }
+    ]
+    assert out.get("pending_action") is None
+
+
+@pytest.mark.asyncio
+async def test_bounded_exhaustive_failed_expansion_without_targeted_evidence_still_withholds(
+    tmp_path,
+):
+    context_pack = _bounded_exhaustive_context_pack(
+        "Review every maintenance record in the configured worksheet."
+    )
+    context_pack["items"] = []
+    context_pack["budget"].update(
+        {"returned_results": 0, "estimated_bytes": 0, "truncated": False}
+    )
+    context_pack["diagnostics"]["candidate_counts_by_source"] = {
+        "vehicle_log_primary": 0
+    }
+
+    out, runtime, dsa, litellm, memory_store = await _run_bounded_exhaustive_case(
+        tmp_path=tmp_path,
+        context_pack=context_pack,
+        context_responses=[
+            _http_status_error(
+                413,
+                {"detail": {"code": "result_too_large"}},
+            )
+        ],
+    )
+
+    assert len(dsa.calls) == 1
+    assert len(dsa.context_calls) == 1
+    assert litellm.calls == []
+    assert runtime.claim_support_calls == []
+    assert memory_store.claim_record_calls == []
+    assert "complete declared source scope" in out["answer"]
+    assert out.get("pending_action") is None
 
 
 @pytest.mark.asyncio

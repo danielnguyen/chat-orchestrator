@@ -88,6 +88,24 @@ _GOOGLE_VALUES: dict[str, list[list[str]]] = {
             "reviewed " + "bounded configured detail. " * 100,
         ],
     ],
+    "complete-row-boundary-sheet": [
+        ["Entry", "Required", "Status"],
+        *[
+            [f"entry-{index:02d}", "yes", "reviewed"]
+            for index in range(1, 27)
+        ],
+    ],
+    "oversized-complete-sheet": [
+        ["Entry", "Required", "Status"],
+        *[
+            [
+                entry,
+                "yes",
+                "reviewed " + "bounded oversized detail. " * 180,
+            ]
+            for entry in ("alpha", "beta", "gamma")
+        ],
+    ],
     "followup-sheet": [
         ["Record", "Status", "Notes"],
         *[

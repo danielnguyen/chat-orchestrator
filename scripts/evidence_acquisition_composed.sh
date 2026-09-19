@@ -265,6 +265,20 @@ configure_google_sheet_worksheet() {
   restart_dsa
 }
 
+configure_google_sheet_fixture() {
+  local source_file="$1" spreadsheet_id="$2" max_context_rows="$3"
+  local config_path="$COMPOSED_SMOKE_TMP/config/sources/$source_file"
+  sed -i -E \
+    "s|^  spreadsheet_id: .*$|  spreadsheet_id: $spreadsheet_id|" \
+    "$config_path"
+  sed -i -E \
+    "s|^  max_context_rows: [0-9]+$|  max_context_rows: $max_context_rows|" \
+    "$config_path"
+  grep -qx "  spreadsheet_id: $spreadsheet_id" "$config_path"
+  grep -qx "  max_context_rows: $max_context_rows" "$config_path"
+  restart_dsa
+}
+
 queue_provider_answer() {
   local answer="$1"
   provider_post "/fixture/next-answer" \
@@ -7414,6 +7428,184 @@ CASES
   echo "Generalized acquisition reasoning: matched_refinement=presented topical_no_match=ordinary_chat contradiction=presented decision=presented full_scope=presented partial=qualified_supplied_evidence actions=0 retries=0 repairs=0 reacquisition=0"
 }
 
+run_exhaustive_source_owned_boundary_scenarios() {
+  local owner client conversation_id question external response request_id trace
+  local manifest provider_calls fixture_calls audit claim_records claim
+  local source_ref evidence_ref bounded_claim
+  question="$EVIDENCE_EXHAUSTIVE_REVIEW_QUESTION"
+  external='{"enabled":true,"source_ids":["complete_register"],"allowed_sensitivity":"medium","max_results":1}'
+
+  owner="owner-source-owned-row-boundary"
+  client="client-source-owned-row-boundary"
+  claim="The complete configured register supports the bounded review."
+  source_ref="google_sheets:complete_register:Register!A2:C27"
+  evidence_ref="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  configure_google_sheet_fixture \
+    "complete_register.yaml" "complete-row-boundary-sheet" 30
+  reset_dsa_audit
+  queue_provider_answer "$(jq -nc --arg claim "$claim" --arg ref "$evidence_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "source-owned-row-boundary")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  claim_records="$(list_claim_records "$owner" "$conversation_id")"
+
+  assert_jq "source_owned_rows.response" "$response" '
+    .status == "ok"
+    and .pending_action == null
+    and (.answer | startswith($claim))
+    and (.answer | contains("Based only on the evidence I could examine") | not)
+  ' --arg claim "$claim"
+  assert_jq "source_owned_rows.acquisition" "$manifest" '
+    .shape.task_shape == "bounded_exhaustive_review"
+    and .plan.selected_strategies == ["hybrid"]
+    and .acquisition.expansion_attempt_count == 1
+    and .acquisition.expansion_successful_count == 1
+    and .acquisition.expansion_failed_count == 0
+    and .acquisition.expansion_truncated_count == 0
+    and .acquisition.prompt_retained_item_count == 1
+    and .sufficiency.status == "sufficient_for_declared_scope"
+  '
+  assert_jq "source_owned_rows.authority" "$trace" '
+    .prompt.general_evidence_reasoning.claim_scope_basis == "declared_scope"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+  '
+  assert_jq "source_owned_rows.fixture" "$fixture_calls" '
+    [.calls[] | select(
+      .source == "complete-row-boundary-sheet"
+      and .operation == "google_values"
+    )] as $calls
+    | ($calls | length) == 2
+    and ($calls | all(.returned_row_count == 27))
+  '
+  assert_jq "source_owned_rows.persistence" "$claim_records" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == true
+    and $records[0].support.supporting_evidence_ref_ids == [$ref]
+    and $records[0].support.material_scope_limitations == []
+  ' --arg ref "$evidence_ref"
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_jq "source_owned_rows.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 1 1 0
+  assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
+
+  owner="owner-exhaustive-supplied-evidence"
+  client="client-exhaustive-supplied-evidence"
+  claim="The supplied record identifies a bounded review concern."
+  source_ref="google_sheets:complete_register:Register!A2:C2"
+  evidence_ref="external-source:$(printf '%s' "$source_ref" | sha256sum | cut -d' ' -f1)"
+  bounded_claim="Based only on the evidence I could examine, this is the conclusion I can support: $claim"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  configure_google_sheet_fixture \
+    "complete_register.yaml" "oversized-complete-sheet" 20
+  reset_dsa_audit
+  queue_provider_answer "$(jq -nc --arg claim "$claim" --arg ref "$evidence_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
+  conversation_id="$(resolve_conversation "$owner" "$client" "exhaustive-supplied-evidence")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  fixture_calls="$(fetch_source_fixture_calls)"
+  audit="$(fetch_dsa_audit)"
+  claim_records="$(list_claim_records "$owner" "$conversation_id")"
+
+  assert_jq "exhaustive_supplied.response" "$response" '
+    .status == "ok"
+    and .pending_action == null
+    and (.answer | startswith($bounded + "\n\n"))
+    and (.answer | contains("the available records may be incomplete"))
+    and (.answer | contains("entire source was reviewed") | not)
+    and (.answer | contains("all concerns") | not)
+  ' --arg bounded "$bounded_claim"
+  assert_jq "exhaustive_supplied.acquisition" "$manifest" '
+    .shape.task_shape == "bounded_exhaustive_review"
+    and .plan.selected_strategies == ["hybrid"]
+    and .acquisition.expansion_attempt_count == 1
+    and .acquisition.expansion_failed_count == 1
+    and .acquisition.expansion_successful_count == 0
+    and .acquisition.prompt_retained_item_count == 1
+    and .acquisition.source_references_retained == [$source_ref]
+    and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
+  ' --arg source_ref "$source_ref"
+  assert_jq "exhaustive_supplied.authority" "$trace" '
+    .prompt.general_evidence_reasoning.claim_scope_basis == "supplied_evidence"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+  '
+  assert_jq "exhaustive_supplied.fixture" "$fixture_calls" '
+    [.calls[] | select(
+      .source == "oversized-complete-sheet"
+      and .operation == "google_values"
+    )] as $calls
+    | ($calls | length) == 2
+    and ($calls | all(.returned_row_count == 4))
+    and ($calls | all(.returned_cell_character_count > 12000))
+  '
+  assert_jq "exhaustive_supplied.persistence" "$claim_records" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == true
+    and $records[0].claim_anchor == $bounded
+    and $records[0].support.supporting_evidence_ref_ids == [$ref]
+    and $records[0].support.counterevidence_ref_ids == []
+    and $records[0].support.executed_derivations == []
+    and ($records[0].support.material_scope_limitations
+      | index("complete_scope_not_established")) != null
+    and ($records[0].support.material_scope_limitations
+      | index("supplied_evidence_scope")) != null
+  ' --arg bounded "$bounded_claim" --arg ref "$evidence_ref"
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_jq "exhaustive_supplied.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 1 1 0
+  assert_persisted_answer_matches \
+    "$conversation_id" "$request_id" "$(jq -r '.answer' <<<"$response")"
+
+  configure_google_sheet_fixture "complete_register.yaml" "complete-sheet" 20
+  echo "Exhaustive source-owned boundary: complete_rows=26 source_limit=30 complete_scope=established partial_expansion=failed supplied_evidence=qualified reasoning=1 cr=1 tools=0 actions=0 retries=0 repairs=0 reacquisition=0"
+}
+
 run_authority_comparison_incomplete_scope_case() {
   local owner client conversation_id question external response request_id trace
   local provider_calls audit
@@ -7883,6 +8075,7 @@ run_evidence_acquisition_composed_suite() {
     general-reasoning-presentation)
       run_general_evidence_reasoning_shadow_scenario true
       run_generalized_acquisition_reasoning_scenarios
+      run_exhaustive_source_owned_boundary_scenarios
       run_authority_comparison_equivalent_case
       run_authority_comparison_consequence_case
       run_authority_comparison_failure_case
