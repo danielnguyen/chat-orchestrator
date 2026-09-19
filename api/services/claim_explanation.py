@@ -739,6 +739,12 @@ class ClaimExplanationOutcome:
     )
 
 
+@dataclass(frozen=True)
+class ReasoningContinuationContextOutcome:
+    context: dict[str, Any] | None
+    trace: dict[str, Any]
+
+
 def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
@@ -1233,6 +1239,128 @@ def _record_matches_scope(
         reference.owner_id == owner_id
         and reference.conversation_id in {None, conversation_id}
         for reference in record.validated_evidence_references
+    )
+
+
+def _reasoning_continuation_projection(record: ClaimRecordV2) -> dict[str, Any]:
+    supporting_ids = set(record.support.supporting_evidence_ref_ids)
+    source_descriptors: list[dict[str, str]] = []
+    seen_source_ids: set[str] = set()
+    for reference in record.validated_evidence_references:
+        descriptor = reference.source_descriptor
+        if (
+            reference.ref_id not in supporting_ids
+            or descriptor is None
+            or descriptor.source_id is None
+            or descriptor.source_id in seen_source_ids
+        ):
+            continue
+        seen_source_ids.add(descriptor.source_id)
+        source_descriptors.append(
+            {
+                "source_id": descriptor.source_id,
+                "display_name": descriptor.display_name,
+                "source_type": descriptor.source_type,
+            }
+        )
+        if len(source_descriptors) == 3:
+            break
+    limitation_codes = list(
+        dict.fromkeys(
+            [
+                *record.support.material_scope_limitations,
+                *record.support.limitation_codes,
+                *record.limitation_codes,
+            ]
+        )
+    )[:10]
+    return {
+        "prior_presented_claim": record.claim_anchor,
+        "qualification_required": record.support.qualification_required,
+        "limitation_codes": limitation_codes,
+        "source_descriptors": source_descriptors,
+    }
+
+
+async def resolve_reasoning_continuation_context(
+    *,
+    memory_store: Any,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+) -> ReasoningContinuationContextOutcome:
+    """Project the exact previous presented v2 support into advisory context."""
+    try:
+        payload = await memory_store.resolve_immediate_history(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            explanation_kind="support",
+        )
+        response = ImmediateHistoryResolveResponse.model_validate(payload)
+        expected_scope = {
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+            "explanation_kind": "support",
+        }
+        if any(getattr(response, key) != value for key, value in expected_scope.items()):
+            raise ValueError("immediate_history_scope_mismatch")
+    except Exception:
+        return ReasoningContinuationContextOutcome(
+            context=None,
+            trace={"status": "rejected", "reason": "invalid_or_unavailable"},
+        )
+
+    if (
+        response.resolution_status != "resolved"
+        or response.resolution_source != "direct_record"
+        or response.lineage_dereference_count != 0
+        or response.record is None
+        or response.record.record_kind != "support"
+        or response.record.support_record is None
+    ):
+        return ReasoningContinuationContextOutcome(
+            context=None,
+            trace={"status": "not_available", "reason": response.reason_code},
+        )
+
+    immediate = response.record
+    record = immediate.support_record
+    if (
+        not isinstance(record, ClaimRecordV2)
+        or not record.presented_to_user
+        or record.request_id != immediate.original_request_id
+        or record.assistant_message_id != immediate.assistant_message_id
+        or record.surface != surface
+        or not _record_matches_scope(
+            record,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        or _record_support_status(
+            record,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        != "supported"
+    ):
+        return ReasoningContinuationContextOutcome(
+            context=None,
+            trace={"status": "rejected", "reason": "support_record_ineligible"},
+        )
+
+    context = _reasoning_continuation_projection(record)
+    return ReasoningContinuationContextOutcome(
+        context=context,
+        trace={
+            "status": "available",
+            "reason": "direct_presented_v2_support",
+            "source_descriptor_count": len(context["source_descriptors"]),
+        },
     )
 
 

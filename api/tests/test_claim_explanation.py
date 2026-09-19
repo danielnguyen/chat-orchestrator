@@ -25,6 +25,7 @@ from services.claim_explanation import (
     parse_history_classifier_completion,
     resolve_claim_explanation,
     resolve_immediate_claim_explanation,
+    resolve_reasoning_continuation_context,
 )
 
 ANCHOR = "The retained file reports that the setting is active."
@@ -3981,6 +3982,129 @@ def _immediate_record(kind="support", *, assistant_message_id=ROOT_MESSAGE_ID):
             ),
         },
     }
+
+
+def _continuation_response(**record_overrides):
+    descriptor = {
+        "source_id": "neutral_records",
+        "display_name": "Neutral Records",
+        "source_type": "generic_records",
+    }
+    support = _record_v2(
+        request_id="original-request",
+        assistant_message_id=ROOT_MESSAGE_ID,
+        surface="vscode",
+        validated_evidence_references=[
+            {
+                "ref_type": "external_source",
+                "ref_id": "external-source:bounded-record",
+                "owner_id": "owner",
+                "conversation_id": "conversation-1",
+                "support_kind": "contextual",
+                "authority": "unknown",
+                "freshness_state": "unknown_freshness",
+                "source_descriptor": descriptor,
+            }
+        ],
+        **record_overrides,
+    )
+    return _immediate_response(
+        record={
+            "record_kind": "support",
+            "assistant_message_id": ROOT_MESSAGE_ID,
+            "original_request_id": "original-request",
+            "support_record": support,
+            "acquisition_record": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_continuation_projects_only_bounded_direct_presented_v2_support():
+    store = _ImmediateMemoryStore(_continuation_response())
+
+    outcome = await resolve_reasoning_continuation_context(
+        memory_store=store,
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.context == {
+        "prior_presented_claim": ANCHOR,
+        "qualification_required": True,
+        "limitation_codes": [
+            "bounded_scope",
+            "interpretation_dependent",
+            "unknown_freshness",
+        ],
+        "source_descriptors": [
+            {
+                "source_id": "neutral_records",
+                "display_name": "Neutral Records",
+                "source_type": "generic_records",
+            }
+        ],
+    }
+    assert outcome.trace == {
+        "status": "available",
+        "reason": "direct_presented_v2_support",
+        "source_descriptor_count": 1,
+    }
+    assert store.calls == [
+        {
+            "request_id": "request-history",
+            "owner_id": "owner",
+            "conversation_id": "conversation-1",
+            "surface": "vscode",
+            "explanation_kind": "support",
+        }
+    ]
+    serialized = json.dumps(outcome.context, sort_keys=True)
+    for forbidden in (
+        "external-source:bounded-record",
+        "PRIVATE-MATERIAL-EXCLUSION-REASON",
+        "canonical_result",
+        "runtime-session-1",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        _immediate_response(record=None, status="no_record"),
+        _continuation_response(presented_to_user=False),
+        _continuation_response(
+            support={
+                **_record_v2()["support"],
+                "conclusion_disposition": "withheld",
+            }
+        ),
+        _continuation_response(owner_id="other-owner"),
+        _continuation_response(conversation_id="other-conversation"),
+        {"schema_version": "malformed"},
+        _immediate_response(
+            record={
+                **_continuation_response()["record"],
+            },
+            source="root_lineage",
+        ),
+    ],
+)
+async def test_reasoning_continuation_fails_closed_for_ineligible_history(response):
+    outcome = await resolve_reasoning_continuation_context(
+        memory_store=_ImmediateMemoryStore(response),
+        request_id="request-history",
+        owner_id="owner",
+        conversation_id="conversation-1",
+        surface="vscode",
+    )
+
+    assert outcome.context is None
+    assert outcome.trace["status"] in {"not_available", "rejected"}
 
 
 @pytest.mark.asyncio

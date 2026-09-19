@@ -66,6 +66,7 @@ from services.claim_explanation import (
     parse_history_classifier_completion,
     resolve_claim_explanation,
     resolve_immediate_claim_explanation,
+    resolve_reasoning_continuation_context,
 )
 from services.companion_presentation import build_companion_presentation
 from services.deterministic_derivation import execute_derivations
@@ -6661,6 +6662,7 @@ async def _interpret_evidence_request(
     local_only: bool,
     routing_policy: dict[str, Any],
     effective_payload: dict[str, Any],
+    continuation_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     route = _load_logical_route(model_registry_path, _EVIDENCE_INTERPRETER_ROUTE)
     if route is None:
@@ -6695,6 +6697,7 @@ async def _interpret_evidence_request(
         messages = evidence_interpreter_messages(
             task_text=task_text,
             source_list=source_list,
+            continuation_context=continuation_context,
         )
         response_format = evidence_interpreter_response_format()
         schema_name = response_format.get("json_schema", {}).get("name", "unknown")
@@ -7621,6 +7624,7 @@ async def _run_general_evidence_reasoning(
     effective_payload: dict[str, Any],
     privacy_suppressed: bool,
     consequence_policy_allows_claim: bool,
+    continuation_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     trace = _general_evidence_reasoning_trace(
         enabled=enabled,
@@ -7729,6 +7733,15 @@ async def _run_general_evidence_reasoning(
                 request_text=request_text,
                 evidence=evidence,
                 claim_scope_basis=claim_scope_basis,
+                continuation_context=continuation_context,
+                current_source_ids={
+                    source.source_id
+                    for source in (
+                        state.inventory.sources
+                        if state.inventory is not None
+                        else []
+                    )
+                },
             ),
             tools=[],
             response_format=evidence_reasoning_response_format(),
@@ -9065,6 +9078,11 @@ async def orchestrate_chat(
         compound_verification_target: str | None = None
         evidence_task_text = last_user_text
         history_followup_trace = _history_trace(enabled=history_followup_enabled)
+        reasoning_continuation_context: dict[str, Any] | None = None
+        reasoning_continuation_trace: dict[str, Any] = {
+            "status": "not_attempted",
+            "reason": "ineligible",
+        }
     except Exception:
         if turn_state_trace.get("runtime_turn_id"):
             await _complete_runtime_turn(
@@ -9634,6 +9652,27 @@ async def orchestrate_chat(
             and interaction_governance_trace.get("included") is True
         )
         evidence_path_deferred = exact_reference_request or governed_evidence_eligible
+        if (
+            governed_evidence_eligible
+            and history_followup_enabled
+            and claim_record_capture_enabled
+            and not claim_explanation.handled
+            and not privacy_context_enabled
+        ):
+            continuation = await resolve_reasoning_continuation_context(
+                memory_store=memory_store,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+            )
+            reasoning_continuation_context = continuation.context
+            reasoning_continuation_trace = continuation.trace
+        elif privacy_context_enabled:
+            reasoning_continuation_trace = {
+                "status": "suppressed",
+                "reason": "privacy_context_boundary",
+            }
         if evidence_path_deferred:
             external_context_pack = None
             dsa_trace = {
@@ -9878,6 +9917,7 @@ async def orchestrate_chat(
                         local_only=local_only,
                         routing_policy=routing_policy,
                         effective_payload=effective_payload,
+                        continuation_context=reasoning_continuation_context,
                     )
 
                 evidence_acquisition = await begin_evidence_acquisition(
@@ -10854,6 +10894,7 @@ async def orchestrate_chat(
                     consequence_policy_allows_claim=(
                         interaction_kind != "high_impact_decision"
                     ),
+                    continuation_context=reasoning_continuation_context,
                 )
                 _, preliminary_presented_answer = (
                     _select_claim_support_presentation(
@@ -12062,6 +12103,7 @@ async def orchestrate_chat(
         }
 
         references = _trace_references(retrieval_bundle)
+        prompt.trace["reasoning_continuation"] = reasoning_continuation_trace
         if general_evidence_reasoning is None:
             general_evidence_reasoning = await _run_general_evidence_reasoning(
                 enabled=bool(general_evidence_reasoning_enabled),
@@ -12093,6 +12135,7 @@ async def orchestrate_chat(
                 consequence_policy_allows_claim=(
                     interaction_kind != "high_impact_decision"
                 ),
+                continuation_context=reasoning_continuation_context,
             )
         prompt.trace["general_evidence_reasoning"] = general_evidence_reasoning[
             "trace"
