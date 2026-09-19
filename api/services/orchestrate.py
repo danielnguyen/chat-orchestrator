@@ -4247,6 +4247,8 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         summary["general_evidence_reasoning"] = trace[
             "general_evidence_reasoning"
         ]
+    if isinstance(trace.get("reasoning_continuation"), dict):
+        summary["reasoning_continuation"] = trace["reasoning_continuation"]
     if isinstance(trace.get("history_followup"), dict):
         summary["history_followup"] = trace["history_followup"]
     return summary

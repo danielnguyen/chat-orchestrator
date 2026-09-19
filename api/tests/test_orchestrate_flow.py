@@ -80,6 +80,7 @@ from services.orchestrate import (
     _run_general_evidence_reasoning,
     _select_capability_claim_refs,
     _select_claim_support_presentation,
+    _trace_prompt,
     _visible_claim_digest,
     orchestrate_chat,
 )
@@ -18285,6 +18286,26 @@ async def test_general_reasoning_privacy_suppression_never_sends_prior_context()
 
     assert provider.calls == []
     assert result["trace"]["reason_code"] == "privacy_suppressed"
+
+
+def test_prompt_trace_retains_only_structural_reasoning_continuation_status():
+    trace = _trace_prompt(
+        {
+            "reasoning_continuation": {
+                "status": "available",
+                "reason": "direct_presented_v2_support",
+                "source_descriptor_count": 1,
+            },
+            "prior_supported_context": "PRIVATE PRIOR CLAIM",
+        }
+    )
+
+    assert trace["reasoning_continuation"] == {
+        "status": "available",
+        "reason": "direct_presented_v2_support",
+        "source_descriptor_count": 1,
+    }
+    assert "PRIVATE PRIOR CLAIM" not in json.dumps(trace, sort_keys=True)
 
 
 @pytest.mark.asyncio
