@@ -362,6 +362,15 @@ restart_orchestrator_with_generic_presentation() {
   wait_for_http "http://127.0.0.1:14361/healthz"
 }
 
+restart_orchestrator_with_generic_reasoning() {
+  COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED="$1"
+  COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED="$1"
+  export COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED
+  export COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+}
+
 run_evidence_chat_with_artifacts() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
   local external_context
@@ -4166,6 +4175,7 @@ run_evidence_scope_reference_scenarios() {
   claim="The retained calendar record places the migration review in the bounded sequence."
   source_ref="ics_calendar:calendar_alpha:event:alpha-event"
   bounded_claim="Based only on the evidence I could examine, this is the conclusion I can support: $claim"
+  restart_orchestrator_with_generic_reasoning true
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
@@ -4269,6 +4279,7 @@ run_evidence_scope_reference_scenarios() {
   assert_claim_calibration_events "$diagnostics" "$request_id" 1
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  restart_orchestrator_with_generic_reasoning false
   echo "Scope reference case passed: missing but bounded"
 
   owner="owner-historical-unsupported"
