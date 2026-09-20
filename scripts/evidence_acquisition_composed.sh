@@ -4189,7 +4189,7 @@ run_evidence_scope_reference_scenarios() {
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   claims="$(list_claim_records "$owner" "$conversation_id")"
-  assert_jq "scope.missing.response" "$response" '
+  if ! jq -e --arg bounded "$bounded_claim" '
     .status == "ok"
     and .pending_action == null
     and (.answer | startswith($bounded + "\n\n"))
@@ -4197,7 +4197,13 @@ run_evidence_scope_reference_scenarios() {
     and ((.answer | ascii_downcase | contains("all history")) | not)
     and ((.answer | ascii_downcase | contains("complete history")) | not)
     and ((.answer | ascii_downcase | contains("every historical")) | not)
-  ' --arg bounded "$bounded_claim"
+  ' <<<"$response" >/dev/null 2>&1; then
+    printf 'Missing historical scope response: %s\n' "$(jq -c . <<<"$response")" >&2
+    printf 'Missing historical scope acquisition: %s\n' "$manifest" >&2
+    printf 'Missing historical scope reasoning: %s\n' \
+      "$(jq -c '.prompt.general_evidence_reasoning' <<<"$trace")" >&2
+    return 1
+  fi
   assert_jq "scope.missing.manifest" "$manifest" '
     .shape.task_shape == "historical_reconstruction"
     and .plan.plan_status == "ready_with_limitations"
