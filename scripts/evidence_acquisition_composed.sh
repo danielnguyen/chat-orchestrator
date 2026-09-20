@@ -4291,7 +4291,16 @@ run_evidence_scope_reference_scenarios() {
     return 1
   fi
   echo "Historical limited checkpoint passed: runtime scope plan"
-  assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  if ! assert_claim_calibration_events "$diagnostics" "$request_id" 1; then
+    printf 'Historical limited calibration events: %s\n' "$(jq -c '
+      [.events[] | select(.event_type == "claim_calibration_evaluated") | {
+        event_type,
+        request_id:.event_payload_json.request_id,
+        claim_id:.event_payload_json.claim_id
+      }]
+    ' <<<"$diagnostics")" >&2
+    return 1
+  fi
   echo "Historical limited checkpoint passed: claim calibration"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 1
