@@ -87,9 +87,15 @@ jobs:
 
       - name: Establish checked-out local main refs
         run: |
-          git -C cognitive-runtime branch --force main "$(git -C cognitive-runtime rev-parse HEAD)"
-          git -C data-source-aggregator branch --force main "$(git -C data-source-aggregator rev-parse HEAD)"
-          git -C basic-memory-store branch --force main "$(git -C basic-memory-store rev-parse HEAD)"
+          cr="$(git -C cognitive-runtime rev-parse HEAD)"
+          dsa="$(git -C data-source-aggregator rev-parse HEAD)"
+          bms="$(git -C basic-memory-store rev-parse HEAD)"
+          git -C cognitive-runtime switch --detach "$cr"
+          git -C data-source-aggregator switch --detach "$dsa"
+          git -C basic-memory-store switch --detach "$bms"
+          git -C cognitive-runtime branch --force main "$cr"
+          git -C data-source-aggregator branch --force main "$dsa"
+          git -C basic-memory-store branch --force main "$bms"
           git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD
 
       - name: Validate Compose configuration
