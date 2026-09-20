@@ -4280,10 +4280,19 @@ run_evidence_scope_reference_scenarios() {
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   echo "Historical limited checkpoint passed: acquisition events"
   missing_scope='{"source_ids":["calendar_alpha"],"source_categories":[],"exact_source_refs":[],"inventory_status":"complete_for_declared_scope","time_scope_ref":null,"version_scope_ref":null,"domain_scope_ref":null,"project_scope_ref":null}'
-  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
-    "$missing_scope" "calendar_alpha" "historical_reconstruction" '["hybrid"]'
+  if ! assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$missing_scope" "calendar_alpha" "historical_reconstruction" '["hybrid"]'; then
+    printf 'Historical limited runtime plan: %s\n' "$(jq -c --arg request_id "$request_id" '
+      [.events[] | select(
+        .event_payload_json.request_id == $request_id
+        and .event_type == "evidence_plan_compiled"
+      ) | .event_payload_json]
+    ' <<<"$diagnostics")" >&2
+    return 1
+  fi
+  echo "Historical limited checkpoint passed: runtime scope plan"
   assert_claim_calibration_events "$diagnostics" "$request_id" 1
-  echo "Historical limited checkpoint passed: runtime authority"
+  echo "Historical limited checkpoint passed: claim calibration"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 1
   echo "Historical limited checkpoint passed: answer persistence"
