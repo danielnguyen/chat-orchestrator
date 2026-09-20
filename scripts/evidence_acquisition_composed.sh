@@ -3983,7 +3983,7 @@ run_evidence_scope_reference_scenarios() {
   local owner client conversation_id response request_id answer trace manifest
   local provider_calls diagnostics audit inventory claims external declared_scope
   local serialized optional_config optional_backup history history_trace
-  local missing_scope partial_scope
+  local missing_scope partial_scope claim source_ref bounded_claim
 
   inventory="$(fetch_dsa_inventory)"
   assert_jq "scope.producer.inventory" "$inventory" '
@@ -4163,9 +4163,20 @@ run_evidence_scope_reference_scenarios() {
 
   owner="owner-scope-missing"
   client="client-scope-missing"
+  claim="The retained calendar record places the migration review in the bounded sequence."
+  source_ref="ics_calendar:calendar_alpha:event:alpha-event"
+  bounded_claim="Based only on the evidence I could examine, this is the conclusion I can support: $claim"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
+  queue_provider_answer "$(jq -nc --arg claim "$claim" --arg ref "$source_ref" '
+    {
+      proposed_claim:$claim,
+      supporting_evidence_ref_ids:[$ref],
+      counterevidence_ref_ids:[],
+      material_exclusions:[],
+      derivation_requests:[]
+    }')"
   conversation_id="$(resolve_conversation "$owner" "$client" "scope-missing")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
     "Reconstruct what happened across the records last week." \
@@ -4177,30 +4188,127 @@ run_evidence_scope_reference_scenarios() {
   provider_calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  assert_jq "scope.missing.response" "$response" \
-    '.status == "degraded" and (.answer | contains("can’t safely complete that evidence request"))'
+  claims="$(list_claim_records "$owner" "$conversation_id")"
+  assert_jq "scope.missing.response" "$response" '
+    .status == "ok"
+    and .pending_action == null
+    and (.answer | startswith($bounded + "\n\n"))
+    and (.answer | contains("the available records may be incomplete"))
+    and ((.answer | ascii_downcase | contains("all history")) | not)
+    and ((.answer | ascii_downcase | contains("complete history")) | not)
+    and ((.answer | ascii_downcase | contains("every historical")) | not)
+  ' --arg bounded "$bounded_claim"
   assert_jq "scope.missing.manifest" "$manifest" '
+    .shape.task_shape == "historical_reconstruction"
+    and .plan.plan_status == "ready_with_limitations"
+    and .plan.selected_strategies == ["hybrid"]
+    and (.plan.limitation_codes | index("historical_time_scope_missing")) != null
+    and .acquisition.strategy_attempted == "hybrid"
+    and .acquisition.sources_selected == ["calendar_alpha"]
+    and .acquisition.sources_used == ["calendar_alpha"]
+    and .acquisition.expansion_attempt_count == 1
+    and .acquisition.expansion_successful_count == 1
+    and .acquisition.prompt_retained_item_count >= 1
+    and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
+  '
+  assert_jq "scope.missing.authority" "$trace" '
+    .prompt.general_evidence_reasoning.claim_scope_basis == "supplied_evidence"
+    and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_call_count == 1
+    and .prompt.general_evidence_reasoning.cr_calibration_status == "limited"
+    and .prompt.general_evidence_reasoning.cr_conclusion_disposition == "qualified"
+    and .prompt.general_evidence_reasoning.qualification_required == true
+    and .prompt.general_evidence_reasoning.presented_to_user == true
+    and .prompt.general_evidence_reasoning.bms_persistence_status == "persisted"
+    and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+  '
+  assert_jq "scope.missing.runtime" "$diagnostics" '
+    [.events[] | select(
+      .event_payload_json.request_id == $request_id
+      and .event_type == "evidence_plan_compiled"
+    ) | .event_payload_json] as $plans
+    | ($plans | length) == 1
+    and $plans[0].task_shape == "historical_reconstruction"
+    and $plans[0].plan_status == "ready_with_limitations"
+    and $plans[0].selected_strategies == ["hybrid"]
+    and $plans[0].material_requirement_count == 4
+    and $plans[0].optional_requirement_count == 0
+  ' --arg request_id "$request_id"
+  assert_jq "scope.missing.persistence" "$claims" '
+    [.records[] | select(.schema_version == "claim-record.v2")] as $records
+    | ($records | length) == 1
+    and $records[0].presented_to_user == true
+    and $records[0].claim_anchor == $bounded
+    and $records[0].support.supporting_evidence_ref_ids == [$ref]
+    and $records[0].support.counterevidence_ref_ids == []
+    and $records[0].support.executed_derivations == []
+    and ($records[0].support.material_scope_limitations
+      | index("complete_scope_not_established")) != null
+    and ($records[0].support.material_scope_limitations
+      | index("supplied_evidence_scope")) != null
+  ' --arg bounded "$bounded_claim" --arg ref "$source_ref"
+  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_general_evidence_reasoning_calls "$provider_calls" 1
+  assert_diagnostic_advisory_calls "$provider_calls" 0
+  assert_jq "scope.missing.provider" "$provider_calls" '
+    ([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
+  '
+  assert_dsa_operation_counts "$audit" 1 1 0
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  missing_scope='{"source_ids":["calendar_alpha"],"source_categories":[],"exact_source_refs":[],"inventory_status":"complete_for_declared_scope","time_scope_ref":null,"version_scope_ref":null,"domain_scope_ref":null,"project_scope_ref":null}'
+  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
+    "$missing_scope" "calendar_alpha" "historical_reconstruction" '["hybrid"]'
+  assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  echo "Scope reference case passed: missing but bounded"
+
+  owner="owner-historical-unsupported"
+  client="client-historical-unsupported"
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  configure_source_fixture "calendar-alpha" "unavailable"
+  restart_dsa
+  reset_dsa_audit
+  conversation_id="$(resolve_conversation "$owner" "$client" "historical-unsupported")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" \
+    "Reconstruct the bounded sequence in the selected records." \
+    '{"enabled":true,"source_ids":["calendar_alpha"],"allowed_sensitivity":"medium"}')"
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  answer="$(jq -r '.answer' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+  provider_calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "historical.unsupported.response" "$response" \
+    '.status == "degraded" and (.answer | contains("can’t safely complete that evidence request"))'
+  assert_jq "historical.unsupported.manifest" "$manifest" '
     .status == "unsupported_plan"
     and .shape.task_shape == "historical_reconstruction"
     and .plan.plan_status == "unsupported"
     and .plan.selected_strategies == []
     and (.plan.limitation_codes | index("historical_time_scope_missing")) != null
+    and (.plan.limitation_codes | index("historical_sequence_not_supported")) != null
     and .acquisition.strategy_attempted == null
     and .acquisition.item_count == 0
     and .sufficiency.status == "not_evaluated"
   '
-  assert_jq "scope.missing.provider" "$provider_calls" \
-    '([.calls[] | select(.kind == "chat")] | length) == 0'
+  assert_semantic_interpreter_calls "$provider_calls" 0
+  assert_general_evidence_reasoning_calls "$provider_calls" 0
+  assert_diagnostic_advisory_calls "$provider_calls" 0
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 0 0
-  missing_scope='{"source_ids":["calendar_alpha"],"source_categories":[],"exact_source_refs":[],"inventory_status":"complete_for_declared_scope","time_scope_ref":null,"version_scope_ref":null,"domain_scope_ref":null,"project_scope_ref":null}'
-  assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
-    "$missing_scope" "calendar_alpha" "historical_reconstruction" '[]'
   assert_provider_free_trace "$trace"
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
-  echo "Scope reference case passed: missing"
+  reset_source_fixture
+  restart_dsa
+  inventory="$(fetch_dsa_inventory)"
+  echo "Historical capability case passed: genuinely unsupported"
 
   optional_config="$COMPOSED_SMOKE_TMP/config/sources/records_optional.yaml"
   optional_backup="$COMPOSED_SMOKE_TMP/config/sources/records_optional.yaml.valid"
