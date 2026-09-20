@@ -1141,10 +1141,6 @@ class PlanResult(StrictModel):
         ]
         if len(set(requirement_shapes)) != len(requirement_shapes):
             raise ValueError("duplicate_evidence_requirement_shape")
-        if self.plan_status == "ready_with_limitations" and not any(
-            item.criticality == "optional" for item in self.declared_requirements
-        ):
-            raise ValueError("limited_plan_requires_optional_requirement")
         if self.task_shape == "aggregate":
             if self.aggregate_spec is None:
                 raise ValueError("aggregate_plan_requires_spec")

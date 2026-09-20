@@ -1046,6 +1046,44 @@ def _hybrid_plan_response(
     }
 
 
+def _historical_limited_plan_response():
+    response = _plan_response(
+        status="ready_with_limitations",
+        requirements=[
+            {
+                "requirement_id": "requirement-context-delivery",
+                "requirement_kind": "context_delivery",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "requirement-historical-scope",
+                "requirement_kind": "historical_scope",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "requirement-historical-sequence-coverage",
+                "requirement_kind": "historical_sequence_coverage",
+                "criticality": "material",
+            },
+            {
+                "requirement_id": "requirement-no-material-truncation",
+                "requirement_kind": "no_material_truncation",
+                "criticality": "material",
+            },
+        ],
+        limitations=["historical_time_scope_missing"],
+    )
+    response["result"].update(
+        {
+            "task_shape": "historical_reconstruction",
+            "completeness_expectation": "complete_for_time_window",
+            "selected_strategies": ["hybrid"],
+            "user_safe_summary": "A bounded historical strategy is available.",
+        }
+    )
+    return response
+
+
 def _exhaustive_shape_response():
     question = "Review every configured worksheet record."
     response = _shape_response(shape="bounded_exhaustive_review")
@@ -1931,6 +1969,76 @@ def test_plan_result_accepts_only_aggregate_plan_spec():
 
     legacy = PlanResult.model_validate(_plan_response()["result"])
     assert "aggregate_spec" not in legacy.model_dump(mode="json")
+
+
+def test_plan_result_accepts_material_only_ready_with_limitations_contract():
+    payload = _historical_limited_plan_response()["result"]
+
+    plan = PlanResult.model_validate(payload)
+
+    assert plan.plan_status == "ready_with_limitations"
+    assert plan.task_shape == "historical_reconstruction"
+    assert plan.selected_strategies == ["hybrid"]
+    assert plan.limitation_codes == ["historical_time_scope_missing"]
+    requirements = [
+        (item.requirement_kind, item.criticality)
+        for item in plan.declared_requirements
+    ]
+    assert requirements == [
+        ("context_delivery", "material"),
+        ("historical_scope", "material"),
+        ("historical_sequence_coverage", "material"),
+        ("no_material_truncation", "material"),
+    ]
+
+
+def test_plan_result_still_accepts_optional_ready_with_limitations_contract():
+    payload = _plan_response(
+        status="ready_with_limitations",
+        requirements=[
+            *_plan_response()["result"]["declared_requirements"],
+            {
+                "requirement_id": "optional-selected-source-coverage",
+                "requirement_kind": "selected_source_coverage",
+                "criticality": "optional",
+            },
+        ],
+        limitations=["optional_source_unavailable"],
+    )["result"]
+
+    plan = PlanResult.model_validate(payload)
+
+    assert plan.plan_status == "ready_with_limitations"
+    assert plan.declared_requirements[-1].criticality == "optional"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "duplicate_requirement_id",
+        "duplicate_requirement_shape",
+        "malformed_requirement",
+        "unsupported_plan_status",
+        "unexpected_field",
+    ],
+)
+def test_material_limited_plan_retains_strict_structural_validation(mutation):
+    payload = _historical_limited_plan_response()["result"]
+    if mutation == "duplicate_requirement_id":
+        payload["declared_requirements"][1]["requirement_id"] = (
+            "requirement-context-delivery"
+        )
+    elif mutation == "duplicate_requirement_shape":
+        payload["declared_requirements"][1]["requirement_kind"] = "context_delivery"
+    elif mutation == "malformed_requirement":
+        payload["declared_requirements"][0]["criticality"] = "supplemental"
+    elif mutation == "unsupported_plan_status":
+        payload["plan_status"] = "limited"
+    else:
+        payload["unexpected_field"] = True
+
+    with pytest.raises(ValidationError):
+        PlanResult.model_validate(payload)
 
 
 @pytest.mark.parametrize("status", ["ready", "ready_with_limitations", "unsupported"])
@@ -6054,6 +6162,47 @@ async def test_begin_calls_shape_inventory_plan_and_maps_only_approved_capabilit
     )
 
 
+@pytest.mark.asyncio
+async def test_material_limited_historical_plan_reaches_governed_hybrid_path():
+    runtime = FakeRuntime(
+        shape=_shape_response(shape="historical_reconstruction"),
+        plan=_historical_limited_plan_response(),
+    )
+    dsa = FakeDsa(
+        [_source("source_a", capabilities=["profile", "search", "context"])]
+    )
+
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=dsa,
+        task_text=QUESTION,
+        interaction_kind="question",
+        external_context={"source_ids": ["source_a"]},
+        **SCOPE,
+    )
+
+    assert state.status == "acquisition_ready"
+    assert state.forced_answer is None
+    assert state.supported_hybrid_path is True
+    assert state.plan.plan_status == "ready_with_limitations"
+    assert state.plan.selected_strategies == ["hybrid"]
+    assert state.plan.limitation_codes == ["historical_time_scope_missing"]
+    assert state.declared_scope["time_scope_ref"] is None
+    assert state.acquisition_facts is None
+    requirements = [
+        (item.requirement_kind, item.criticality)
+        for item in state.plan.declared_requirements
+    ]
+    assert requirements == [
+        ("context_delivery", "material"),
+        ("historical_scope", "material"),
+        ("historical_sequence_coverage", "material"),
+        ("no_material_truncation", "material"),
+    ]
+    assert [name for name, _ in runtime.calls] == ["shape", "plan"]
+    assert dsa.calls == ["list_sources"]
+
+
 def _cross_source_targeted_state() -> EvidenceAcquisitionState:
     shape_data = _hybrid_shape_response()["result"]
     plan_data = _hybrid_plan_response(strategy="targeted_retrieval")["result"]
@@ -8860,6 +9009,20 @@ def test_hybrid_material_facts_follow_actual_coverage_not_reasoning_shape():
         "historical-sequence": "satisfied",
         "no-material-truncation": "satisfied",
     }
+
+    unscoped = _build_acquisition_facts(
+        plan=plan,
+        context_pack=context_pack,
+        dsa_trace={"status": "included"},
+        retained_source_refs=retained,
+        expansion_attempts=state.expansion_attempts,
+        declared_scope={"time_scope_ref": None},
+    )
+    unscoped_outcomes = {
+        item["requirement_id"]: item["outcome"] for item in unscoped
+    }
+    assert unscoped_outcomes["historical-scope"] == "unknown"
+    assert unscoped_outcomes["historical-sequence"] == "satisfied"
 
     partial = _build_acquisition_facts(
         plan=plan,
