@@ -32,6 +32,18 @@ on:
       - api/tools/composed_source_fixture.py
       - docs/validation.md
       - .github/workflows/composed-smoke.yml
+  push:
+    branches:
+      - main
+    paths:
+      - api/**
+      - docker-compose.composed-smoke.yml
+      - scripts/composed_smoke.sh
+      - scripts/evidence_acquisition_composed.sh
+      - api/tools/composed_provider_stub.py
+      - api/tools/composed_source_fixture.py
+      - docs/validation.md
+      - .github/workflows/composed-smoke.yml
 
 permissions:
   contents: read
@@ -53,7 +65,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/cognitive-runtime
-          ref: 4946988e9604bcc6a9a803db2bb53da27bff7b3c
+          ref: main
           path: cognitive-runtime
           fetch-depth: 0
 
@@ -61,7 +73,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/data-source-aggregator
-          ref: 57389cab54481d1c768d403fb9213cc2748103d3
+          ref: main
           path: data-source-aggregator
           fetch-depth: 0
 
@@ -69,15 +81,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: danielnguyen/basic-memory-store
-          ref: 2ea5df0f598742992608198b800cfd1b8633bd6b
+          ref: main
           path: basic-memory-store
           fetch-depth: 0
 
-      - name: Establish pinned local main refs
+      - name: Establish checked-out local main refs
         run: |
-          git -C cognitive-runtime branch --force main 4946988e9604bcc6a9a803db2bb53da27bff7b3c
-          git -C data-source-aggregator branch --force main 57389cab54481d1c768d403fb9213cc2748103d3
-          git -C basic-memory-store branch --force main 2ea5df0f598742992608198b800cfd1b8633bd6b
+          cr="$(git -C cognitive-runtime rev-parse HEAD)"
+          dsa="$(git -C data-source-aggregator rev-parse HEAD)"
+          bms="$(git -C basic-memory-store rev-parse HEAD)"
+          git -C cognitive-runtime switch --detach "$cr"
+          git -C data-source-aggregator switch --detach "$dsa"
+          git -C basic-memory-store switch --detach "$bms"
+          git -C cognitive-runtime branch --force main "$cr"
+          git -C data-source-aggregator branch --force main "$dsa"
+          git -C basic-memory-store branch --force main "$bms"
           git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD
 
       - name: Validate Compose configuration
@@ -178,6 +196,17 @@ jobs:
         env:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
         run: make composed-smoke
+
+      - name: Record successful tested composition
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
+        run: |
+          co="$(git -C chat-orchestrator rev-parse HEAD)"
+          cr="$(git -C cognitive-runtime rev-parse HEAD)"
+          bms="$(git -C basic-memory-store rev-parse HEAD)"
+          dsa="$(git -C data-source-aggregator rev-parse HEAD)"
+          composition="CCP_TESTED_COMPOSITION co=$co cr=$cr bms=$bms dsa=$dsa"
+          printf '%s\n' "$composition"
+          printf '## Tested CCP composition\n\n`%s`\n' "$composition" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload bounded failure diagnostics
         if: failure()
