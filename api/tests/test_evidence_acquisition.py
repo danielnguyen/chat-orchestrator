@@ -7788,6 +7788,11 @@ async def test_bounded_exhaustive_uses_exact_planned_source_and_only_delivers_ra
             },
         )
     ]
+    assert BOUNDED_EXHAUSTIVE_CONTEXT_BUDGET == {
+        "max_bytes": 50000,
+        "max_text_chars": 12000,
+    }
+    assert "max_rows" not in dsa.calls[0][1]["budget"]
     assert bundle["bundle_id"].startswith("evidence_exhaustive_bundle_")
     assert bundle["sources_used"] == ["source_a"]
     assert len(bundle["items"]) == 1
@@ -8023,7 +8028,7 @@ async def test_bounded_exhaustive_targeted_leg_failure_does_not_expand(
         ),
     ],
 )
-async def test_bounded_exhaustive_failures_are_single_attempt_and_provider_safe(
+async def test_bounded_exhaustive_failures_retain_safe_targeted_evidence_once(
     response,
     expected_outcome,
 ):
@@ -8046,7 +8051,17 @@ async def test_bounded_exhaustive_failures_are_single_attempt_and_provider_safe(
     )
     assert state.expansion_attempts[0]["outcome"] == expected_outcome
     assert state.expansion_attempts[0]["seed_source_ref"] is None
-    assert bundle["items"] == []
+    assert len(bundle["items"]) == 1
+    assert bundle["items"][0]["source_ref"] == (
+        "google_sheets:source_a:Maintenance!A2:E2"
+    )
+    assert bundle["items"][0]["text"] == "PRIVATE TARGETED SEED CONTENT"
+    assert "available_context" not in bundle["items"][0]
+    assert bundle["sources_used"] == ["source_a"]
+    assert bundle["raw_item_count"] == 1
+    assert trace["raw_targeted_item_count"] == 1
+    assert trace["raw_expanded_item_count"] in {0, 1}
+    assert trace["final_combined_item_count"] == 1
     assert trace["expansion_attempt_counts"][expected_outcome] == 1
     assert "PRIVATE DEPENDENCY FAILURE" not in json.dumps(
         (bundle, trace),
