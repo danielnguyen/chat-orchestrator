@@ -4227,6 +4227,7 @@ run_evidence_scope_reference_scenarios() {
     and .acquisition.prompt_retained_item_count >= 1
     and (.sufficiency.status == "insufficient" or .sufficiency.status == "unknown")
   '
+  echo "Historical limited checkpoint passed: manifest"
   assert_jq "scope.missing.authority" "$trace" '
     .prompt.general_evidence_reasoning.claim_scope_basis == "supplied_evidence"
     and .prompt.general_evidence_reasoning.reasoning_provider_call_count == 1
@@ -4239,6 +4240,7 @@ run_evidence_scope_reference_scenarios() {
     and .retrieval.prompt_assembly.capabilities.executor_call_count == 0
     and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
   '
+  echo "Historical limited checkpoint passed: authority"
   assert_jq "scope.missing.runtime" "$diagnostics" '
     [.events[] | select(
       .event_payload_json.request_id == $request_id
@@ -4251,6 +4253,7 @@ run_evidence_scope_reference_scenarios() {
     and $plans[0].material_requirement_count == 4
     and $plans[0].optional_requirement_count == 0
   ' --arg request_id "$request_id"
+  echo "Historical limited checkpoint passed: runtime"
   assert_jq "scope.missing.persistence" "$claims" '
     [.records[] | select(.schema_version == "claim-record.v2")] as $records
     | ($records | length) == 1
@@ -4264,6 +4267,7 @@ run_evidence_scope_reference_scenarios() {
     and ($records[0].support.material_scope_limitations
       | index("supplied_evidence_scope")) != null
   ' --arg bounded "$bounded_claim" --arg ref "$source_ref"
+  echo "Historical limited checkpoint passed: persistence"
   assert_semantic_interpreter_calls "$provider_calls" 0
   assert_general_evidence_reasoning_calls "$provider_calls" 1
   assert_diagnostic_advisory_calls "$provider_calls" 0
@@ -4271,14 +4275,18 @@ run_evidence_scope_reference_scenarios() {
     ([.calls[] | select(.kind == "chat")] | length) == 1
     and ([.calls[] | select(.kind == "chat" and .tool_count != 0)] | length) == 0
   '
+  echo "Historical limited checkpoint passed: provider"
   assert_dsa_operation_counts "$audit" 1 1 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  echo "Historical limited checkpoint passed: acquisition events"
   missing_scope='{"source_ids":["calendar_alpha"],"source_categories":[],"exact_source_refs":[],"inventory_status":"complete_for_declared_scope","time_scope_ref":null,"version_scope_ref":null,"domain_scope_ref":null,"project_scope_ref":null}'
   assert_runtime_scope_plan "$diagnostics" "$inventory" "$request_id" \
     "$missing_scope" "calendar_alpha" "historical_reconstruction" '["hybrid"]'
   assert_claim_calibration_events "$diagnostics" "$request_id" 1
+  echo "Historical limited checkpoint passed: runtime authority"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 1
+  echo "Historical limited checkpoint passed: answer persistence"
   restart_orchestrator_with_generic_reasoning false
   echo "Scope reference case passed: missing but bounded"
 
