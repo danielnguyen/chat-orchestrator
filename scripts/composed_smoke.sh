@@ -6,7 +6,7 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="e1d23cb1b1f3608efb4ee214ff5f03e5a55a5553"
+BMS_COMMIT="e3e3c4e07328c9124c75e957d0365c70c061ed74"
 CR_COMMIT="1e4b0d3ac83199520c0165db037a1436eec47370"
 DSA_COMMIT="342b731d8c239dad78ec77bfd6ace41916c20704"
 CO_COMMIT="22c327966c32da733391e5490b8d422ebbee9288"
@@ -2723,6 +2723,41 @@ trace="$(fetch_trace "$request_id")"
 provider_calls="$(fetch_provider_calls "$request_id")"
 assert_common_trace "$trace" "$request_id"
 assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
+# This existing synchronous request must have one reference-only canonical work result.
+jq -e --arg conversation "$conversation_id" '
+  keys == ["answer","conversation_id","profile_name","request_id","selected_model","sources","status"]
+  and .conversation_id == $conversation
+' <<<"$response" >/dev/null
+work_proof="$(psql_exec -At -v owner="$owner" -v request="$request_id" \
+  -v conversation="$conversation_id" -v client="$client" <<'SQL'
+SELECT json_build_object(
+  'work_count', (SELECT count(*) FROM work_items
+    WHERE owner_id=:'owner' AND request_id=:'request'),
+  'completed_match_count', (SELECT count(*) FROM work_items w JOIN messages m
+    ON m.id=w.assistant_message_id
+    WHERE w.owner_id=:'owner' AND w.request_id=:'request'
+      AND w.conversation_id=:'conversation' AND w.client_id=:'client' AND w.surface='chat'
+      AND w.state='completed' AND w.failure_code IS NULL
+      AND w.created_at <= w.started_at AND w.started_at <= w.completed_at
+      AND m.owner_id=w.owner_id AND m.conversation_id=w.conversation_id
+      AND m.role='assistant' AND m.metadata->>'request_id'=w.request_id),
+  'assistant_count', (SELECT count(*) FROM messages
+    WHERE owner_id=:'owner' AND conversation_id=:'conversation'
+      AND role='assistant' AND metadata->>'request_id'=:'request'),
+  'locator_count', (SELECT count(*) FROM current_work
+    WHERE owner_id=:'owner' AND client_id=:'client'),
+  'work_columns', (SELECT json_agg(column_name ORDER BY column_name)
+    FROM information_schema.columns WHERE table_schema='public' AND table_name='work_items')
+);
+SQL
+)"
+jq -e '
+  .work_count == 1 and .completed_match_count == 1 and .assistant_count == 1
+  and .locator_count == 0
+  and .work_columns == ["assistant_message_id","client_id","completed_at","conversation_id",
+    "created_at","failure_code","owner_id","request_id","started_at","state","surface","work_id"]
+' <<<"$work_proof" >/dev/null
+echo "Synchronous durable work proof: exact_completion=true locator_absent=true response_unchanged=true"
 assert_runtime_memory_hygiene_count "$trace" "$request_id" 2
 jq -e '
   .retrieval.prompt_assembly.memory_hygiene.truth_selection.current_canonical_evidence_count >= 1

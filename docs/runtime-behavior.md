@@ -22,6 +22,38 @@ For each chat request, Chat Orchestrator:
 
 Optional integrations are non-authoritative unless their owning policy explicitly supplies a decision. Registration or availability alone does not grant an action permission.
 
+### Durable synchronous work
+
+An actual current user turn gets one BMS work item after conversation resolution
+and mandatory runtime admission. The existing request ID, owner, conversation,
+nullable client ID, and surface are bound immutably. Work starts as `pending`;
+the canonical user message must be acknowledged before it becomes `running`.
+Failure to persist that user message prevents cognition and attempts a bounded
+`dependency_unavailable` work failure while retaining runtime abandonment.
+
+The same synchronous reasoning and action-authority path runs unchanged. After
+the canonical assistant message, ordinary trace, and claim/support handling have
+finished, work becomes `completed` with that exact assistant message ID. The
+early handled claim/history explanation path follows the same completion rule.
+A persisted refusal, qualification, or degraded response may be a completed work
+result: response status and work lifecycle are separate concepts.
+
+Exceptions before completion attempt bounded `execution_failed` (or
+`dependency_unavailable` for distinguishable storage/dependency failures).
+Failure to record failure does not mask the original exception. If completion
+cannot be confirmed, orchestration fails conservatively; it does not return a
+normal success, generate another answer, retry, or overwrite a possibly completed
+work item. Existing non-pending work returned for the same request is not executed
+again. Interruption recovery is not implemented.
+
+Work stores references, not prompts, evidence, or duplicate answer text. The BMS
+client strictly validates exact work projections and explicit current-work
+resolution. Synchronous turns never set that locator. `/v1/chat` returns its
+existing response fields, with no work ID, pending disposition, or polling URL.
+There is no detached task, worker, or new retry/reclaim policy. Conversation
+retirement and message-append rules, privacy, cognition, and action confirmation
+remain unchanged; work identity grants no additional authority.
+
 ## Conversation resolution
 
 When a request supplies `conversation_id`, Chat Orchestrator performs an exact

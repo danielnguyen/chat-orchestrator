@@ -53,6 +53,38 @@ class ReplayMemoryStore:
     def _record(self, name: str, request_id: str | None = None, **details: Any) -> None:
         self.calls.append({"name": name, "request_id": request_id, **details})
 
+    async def create_work(self, **association):
+        work = {
+            **association, "work_id": "00000000-0000-4000-8000-000000000090",
+            "state": "pending", "created_at": "2026-09-21T00:00:00+00:00",
+            "started_at": None, "completed_at": None,
+            "assistant_message_id": None, "failure_code": None,
+        }
+        self.work_calls = getattr(self, "work_calls", [])
+        self.work_calls.append(("create", dict(work)))
+        self.work = work
+        return dict(work)
+
+    async def transition_work(self, *, work, state, assistant_message_id=None, failure_code=None):
+        assert work["work_id"] == self.work["work_id"]
+        assert (self.work["state"], state) in {
+            ("pending", "running"), ("pending", "failed"),
+            ("running", "completed"), ("running", "failed"),
+        }
+        self.work = {
+            **self.work, "state": state,
+            "assistant_message_id": assistant_message_id, "failure_code": failure_code,
+        }
+        if state == "running":
+            self.work["started_at"] = "2026-09-21T00:00:01+00:00"
+        if state in {"completed", "failed"}:
+            self.work["completed_at"] = "2026-09-21T00:00:02+00:00"
+        self.work_calls.append((state, dict(self.work)))
+        return dict(self.work)
+
+    async def set_current_work(self, **kwargs):
+        raise AssertionError("synchronous turns must not set current work")
+
     async def resolve_conversation(self, **kwargs: Any) -> dict[str, Any]:
         self._record("conversation_resolution")
         return {"conversation_id": "00000000-0000-0000-0000-000000000001", "reused": False}
@@ -74,7 +106,9 @@ class ReplayMemoryStore:
             policy_metadata_present=kwargs.get("policy_metadata") is not None,
         )
         return {
-            "message_id": kwargs.get("message_id", f"message-{self.message_ordinal}")
+            "message_id": kwargs.get(
+                "message_id", f"00000000-0000-4000-8000-{self.message_ordinal:012d}"
+            )
         }
 
     async def resolve_profile(self, **kwargs: Any) -> dict[str, Any]:

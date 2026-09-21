@@ -46,6 +46,55 @@ def _full_chat_payload(**overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("completion_failure", [False, True])
+async def test_chat_api_durable_work_keeps_synchronous_contract(
+    monkeypatch, tmp_path, completion_failure,
+):
+    from test_orchestrate_flow import (
+        DurableWorkMemoryStore,
+        FakeLiteLLM,
+        FakeRuntime,
+        _write_router_files,
+    )
+
+    main = _load_main(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory = DurableWorkMemoryStore(fail_at="completed" if completion_failure else None)
+    provider = FakeLiteLLM(content="Canonical synchronous answer.")
+    monkeypatch.setattr(main, "memory_store", memory)
+    monkeypatch.setattr(main, "litellm", provider)
+    monkeypatch.setattr(main, "runtime", FakeRuntime())
+    monkeypatch.setattr(main.settings, "router_rules_path", str(rules))
+    monkeypatch.setattr(main.settings, "model_registry_path", str(models))
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/chat", headers={"X-API-Key": "orch-test"},
+            json=_full_chat_payload(messages=[{"role": "user", "content": "Hello."}]),
+        )
+    result = response.json()
+    assert memory.work["request_id"] == result["request_id"]
+    assert len(provider.calls) == 1
+    assert [m["role"] for m in memory.added_messages] == ["user", "assistant"]
+    assert "work_id" not in result
+    if completion_failure:
+        assert response.status_code == 500
+        assert result["error"]["code"] == "orchestration_error"
+        assert memory.work["state"] == "running"
+        assert "answer" not in result
+    else:
+        assert response.status_code == 200
+        assert result["answer"] == "Canonical synchronous answer."
+        assert set(result) == {
+            "request_id", "conversation_id", "profile_name", "selected_model",
+            "answer", "status", "sources",
+        }
+        assert memory.work["state"] == "completed"
+        assert memory.work["conversation_id"] == result["conversation_id"]
+        assert memory.work["assistant_message_id"] == "00000000-0000-4000-8000-000000000002"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "expected_enabled", "expected_external_context"),
     [
@@ -106,6 +155,10 @@ async def test_chat_endpoint_preserves_request_level_external_context_contract(
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert set(response.json()) == {
+        "request_id", "conversation_id", "profile_name", "selected_model",
+        "answer", "status", "sources",
+    }
     assert len(captured_payloads) == 1
     assert captured_payloads[0]["external_context_enabled"] is expected_enabled
     assert captured_payloads[0]["external_context"] == expected_external_context
