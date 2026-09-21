@@ -25,19 +25,53 @@ class BudgetMemoryStore:
         self.added_messages = []
         self.trace_calls = []
 
+    async def create_work(self, **association):
+        work = {
+            **association, "work_id": "00000000-0000-4000-8000-000000000090",
+            "state": "pending", "created_at": "2026-09-21T00:00:00+00:00",
+            "started_at": None, "completed_at": None,
+            "assistant_message_id": None, "failure_code": None,
+        }
+        self.work_calls = getattr(self, "work_calls", [])
+        self.work_calls.append(("create", dict(work)))
+        self.work = work
+        return dict(work)
+
+    async def transition_work(self, *, work, state, assistant_message_id=None, failure_code=None):
+        assert work["work_id"] == self.work["work_id"]
+        assert (self.work["state"], state) in {
+            ("pending", "running"), ("pending", "failed"),
+            ("running", "completed"), ("running", "failed"),
+        }
+        self.work = {
+            **self.work, "state": state,
+            "assistant_message_id": assistant_message_id, "failure_code": failure_code,
+        }
+        if state == "running":
+            self.work["started_at"] = "2026-09-21T00:00:01+00:00"
+        if state in {"completed", "failed"}:
+            self.work["completed_at"] = "2026-09-21T00:00:02+00:00"
+        self.work_calls.append((state, dict(self.work)))
+        return dict(self.work)
+
+    async def set_current_work(self, **kwargs):
+        raise AssertionError("synchronous turns must not set current work")
+
     async def resolve_conversation(self, **kwargs):
-        return {"conversation_id": "conv-budget", "reused": False}
+        return {"conversation_id": "00000000-0000-4000-8000-000000000001", "reused": False}
 
     async def list_open_conversations(self, **kwargs):
         return {"conversations": [], "next_cursor": None}
 
     async def create_conversation(self, **kwargs):
-        return {"conversation_id": "conv-budget"}
+        return {"conversation_id": "00000000-0000-4000-8000-000000000001"}
 
     async def add_message(self, **kwargs):
         self.added_messages.append(kwargs)
         return {
-            "message_id": kwargs.get("message_id", f"message-{len(self.added_messages)}")
+            "message_id": kwargs.get(
+                "message_id", f"00000000-0000-4000-8000-{len(self.added_messages):012d}"
+            )
         }
 
     async def resolve_profile(self, **kwargs):

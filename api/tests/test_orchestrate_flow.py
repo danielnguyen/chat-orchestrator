@@ -157,6 +157,8 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
     )
 
 
+
+
 class FakeMemoryStore:
     def __init__(self):
         self.resolve_conversation_calls = []
@@ -180,6 +182,38 @@ class FakeMemoryStore:
         self.profile_calls = []
         self.trace_calls = []
         self.claim_record_calls = []
+
+    async def create_work(self, **association):
+        work = {
+            **association, "work_id": "00000000-0000-4000-8000-000000000090",
+            "state": "pending", "created_at": "2026-09-21T00:00:00+00:00",
+            "started_at": None, "completed_at": None,
+            "assistant_message_id": None, "failure_code": None,
+        }
+        self.work_calls = getattr(self, "work_calls", [])
+        self.work_calls.append(("create", dict(work)))
+        self.work = work
+        return dict(work)
+
+    async def transition_work(self, *, work, state, assistant_message_id=None, failure_code=None):
+        assert work["work_id"] == self.work["work_id"]
+        assert (self.work["state"], state) in {
+            ("pending", "running"), ("pending", "failed"),
+            ("running", "completed"), ("running", "failed"),
+        }
+        self.work = {
+            **self.work, "state": state,
+            "assistant_message_id": assistant_message_id, "failure_code": failure_code,
+        }
+        if state == "running":
+            self.work["started_at"] = "2026-09-21T00:00:01+00:00"
+        if state in {"completed", "failed"}:
+            self.work["completed_at"] = "2026-09-21T00:00:02+00:00"
+        self.work_calls.append((state, dict(self.work)))
+        return dict(self.work)
+
+    async def set_current_work(self, **kwargs):
+        raise AssertionError("synchronous turns must not set current work")
 
     async def resolve_conversation(self, **kwargs):
         self.resolve_conversation_calls.append(kwargs)
@@ -24510,6 +24544,8 @@ async def test_winning_generic_presentation_stays_degraded_if_support_not_persis
         "bms_persistence_status"
     ] == "failed"
     assert "PRIVATE-STORAGE-ERROR" not in json.dumps(trace, sort_keys=True)
+    assert memory_store.work["state"] == "completed"
+    assert memory_store.work["assistant_message_id"] == "00000000-0000-4000-8000-000000000002"
 
 
 @pytest.mark.asyncio
@@ -27294,11 +27330,10 @@ async def test_orchestrate_calibration_failure_is_nonfatal_and_skips_claim_stora
 @pytest.mark.asyncio
 async def test_orchestrate_malformed_message_ack_skips_claim_storage(tmp_path):
     memory_store = ClaimCaptureMemoryStore(malformed_assistant_ack=True)
-    result, memory_store, _, _ = await _run_claim_capture_chat(
-        tmp_path,
-        memory_store=memory_store,
-    )
-    assert result["status"] == "ok"
+    with pytest.raises(RuntimeError, match="assistant_message_acknowledgement_invalid"):
+        await _run_claim_capture_chat(tmp_path, memory_store=memory_store)
+    assert memory_store.work["state"] == "failed"
+    assert memory_store.work["failure_code"] == "dependency_unavailable"
     assert memory_store.claim_record_calls == []
     assert len(memory_store.trace_calls) == 1
     assert memory_store.trace_calls[0]["payload"]["prompt"]["claim_capture"][
@@ -36190,6 +36225,9 @@ async def test_lineage_append_rejection_returns_bounded_nondurable_failure(tmp_p
     serialized = json.dumps(result, sort_keys=True)
     assert HISTORY_ROOT_MESSAGE_ID not in serialized
     assert "PRIVATE-LINEAGE-APPEND-ERROR" not in serialized
+    assert memory_store.work["state"] == "failed"
+    assert memory_store.work["failure_code"] == "dependency_unavailable"
+    assert memory_store.work["assistant_message_id"] is None
 
 
 @pytest.mark.asyncio
@@ -37251,3 +37289,289 @@ async def test_provider_fallback_reuses_identical_situated_presence_messages(tmp
     assert len(runtime.situated_presence_calls) == 1
     assert len(provider.calls) == 2
     assert provider.calls[0]["messages"] == provider.calls[1]["messages"]
+
+
+class DurableWorkMemoryStore(ClaimCaptureMemoryStore):
+    def __init__(self, *, fail_at=None, mismatch=None, replay_state=None, **kwargs):
+        super().__init__(**kwargs)
+        self.fail_at = fail_at
+        self.mismatch = mismatch
+        self.replay_state = replay_state
+        self.create_conversation_response = {
+            "conversation_id": "00000000-0000-4000-8000-000000000010"
+        }
+
+    async def create_work(self, **association):
+        self.events.append("work:pending")
+        response = await super().create_work(**association)
+        if self.mismatch:
+            response[self.mismatch] = "other"
+        if self.replay_state:
+            response["state"] = self.replay_state
+        return response
+
+    async def transition_work(self, **kwargs):
+        state = kwargs["state"]
+        self.events.append(f"work:{state}")
+        if self.fail_at == state:
+            raise RuntimeError(f"failed:{state}")
+        if self.fail_at == "committed_completion" and state == "completed":
+            await super().transition_work(**kwargs)
+            raise RuntimeError("completion_ack_lost")
+        return await super().transition_work(**kwargs)
+
+    async def add_message(self, **kwargs):
+        role = kwargs["role"]
+        assert self.work["state"] == ("pending" if role == "user" else "running")
+        if self.fail_at == role:
+            self.events.append(f"rejected:{role}")
+            raise RuntimeError(f"failed:{role}")
+        return await super().add_message(**kwargs)
+
+    async def resolve_profile(self, **kwargs):
+        assert self.work["state"] == "running"
+        if self.fail_at in {"profile", "failed"}:
+            raise RuntimeError("original_execution_failure")
+        return await super().resolve_profile(**kwargs)
+
+    async def create_trace(self, **kwargs):
+        assert self.work["state"] == "running"
+        if self.fail_at == "trace":
+            raise RuntimeError("failed:trace")
+        return await super().create_trace(**kwargs)
+
+
+async def _run_durable_work_chat(tmp_path, memory, *, provider=None, **options):
+    rules, models = _write_router_files(tmp_path)
+    return await orchestrate_chat(
+        payload=options.pop("payload", _base_payload()),
+        memory_store=memory, litellm=provider or FakeLiteLLM(
+            content="The retained file reports that the setting is active."
+        ),
+        runtime=options.pop("runtime", FakeRuntime()),
+        rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, request_id="request-work", **options,
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_work_synchronous_order_and_exact_completion(tmp_path):
+    memory = DurableWorkMemoryStore()
+
+    class OrderedProvider(FakeLiteLLM):
+        async def chat(self, **kwargs):
+            assert memory.work["state"] == "running"
+            memory.events.append("provider")
+            return await super().chat(**kwargs)
+
+    provider = OrderedProvider(content="The retained file reports that the setting is active.")
+    result = await _run_durable_work_chat(
+        tmp_path, memory, provider=provider, claim_record_capture_enabled=True,
+    )
+    assert memory.events == [
+        "work:pending", "message:user", "work:running", "provider",
+        "message:assistant", "trace:1", "claim_record", "trace:2", "work:completed",
+    ]
+    assert [call[0] for call in memory.work_calls] == ["create", "running", "completed"]
+    assert memory.work == {
+        "work_id": "00000000-0000-4000-8000-000000000090",
+        "owner_id": "owner", "conversation_id": result["conversation_id"],
+        "request_id": result["request_id"], "client_id": "vscode", "surface": "vscode",
+        "state": "completed", "created_at": "2026-09-21T00:00:00+00:00",
+        "started_at": "2026-09-21T00:00:01+00:00",
+        "completed_at": "2026-09-21T00:00:02+00:00",
+        "assistant_message_id": "00000000-0000-4000-8000-000000000002",
+        "failure_code": None,
+    }
+    assert len(provider.calls) == 1
+    assert [m["role"] for m in memory.added_messages] == ["user", "assistant"]
+    assert set(result) == {
+        "request_id", "conversation_id", "profile_name", "selected_model",
+        "answer", "status", "sources",
+    }
+
+
+@pytest.mark.asyncio
+async def test_durable_work_pre_admission_failure_creates_nothing(tmp_path):
+    memory = DurableWorkMemoryStore()
+    provider = FakeLiteLLM()
+    result = await _run_durable_work_chat(
+        tmp_path, memory, provider=provider,
+        runtime=FakeRuntime(turn_start_error=RuntimeError("unavailable")),
+    )
+    assert result["status"] == "failed"
+    assert memory.events == []
+    assert memory.added_messages == provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["owner_id", "conversation_id", "request_id", "client_id", "surface"],
+)
+async def test_durable_work_create_mismatch_stops_before_persistence(tmp_path, field):
+    memory = DurableWorkMemoryStore(mismatch=field)
+    provider = FakeLiteLLM()
+    with pytest.raises(RuntimeError, match="work_projection_context_mismatch"):
+        await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert memory.added_messages == provider.calls == []
+    assert [c[0] for c in memory.work_calls] == ["create"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["running", "completed", "failed"])
+async def test_durable_work_nonpending_replay_never_reexecutes_or_overwrites(tmp_path, state):
+    memory = DurableWorkMemoryStore(replay_state=state)
+    provider = FakeLiteLLM()
+    with pytest.raises(RuntimeError, match="work_projection_context_mismatch"):
+        await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert provider.calls == memory.added_messages == []
+    assert [c[0] for c in memory.work_calls] == ["create"]
+
+
+@pytest.mark.asyncio
+async def test_durable_work_user_persistence_failure_prevents_cognition(tmp_path):
+    memory = DurableWorkMemoryStore(fail_at="user")
+    provider = FakeLiteLLM()
+    runtime = FakeRuntime()
+    result = await _run_durable_work_chat(tmp_path, memory, provider=provider, runtime=runtime)
+    assert result["status"] == "failed"
+    assert provider.calls == memory.added_messages == []
+    assert memory.work["state"] == "failed"
+    assert memory.work["failure_code"] == "dependency_unavailable"
+    assert [c[0] for c in memory.work_calls] == ["create", "failed"]
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,code", [
+    ("profile", "execution_failed"), ("assistant", "dependency_unavailable"),
+    ("trace", "dependency_unavailable"), ("running", "execution_failed"),
+])
+async def test_durable_work_exception_attempts_bounded_failure(tmp_path, failure, code):
+    memory = DurableWorkMemoryStore(fail_at=failure)
+    provider = FakeLiteLLM()
+    with pytest.raises(RuntimeError):
+        await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert memory.work["state"] == "failed"
+    assert memory.work["failure_code"] == code
+    assert memory.work["assistant_message_id"] is None
+    assert len(provider.calls) <= 1
+    assert "work:completed" not in memory.events
+
+
+@pytest.mark.asyncio
+async def test_durable_work_failure_storage_does_not_mask_original_error(tmp_path, caplog):
+    memory = DurableWorkMemoryStore(fail_at="failed")
+    with pytest.raises(RuntimeError, match="original_execution_failure"):
+        await _run_durable_work_chat(tmp_path, memory)
+    assert memory.work["state"] == "running"
+    assert "durable_work_failure_unconfirmed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["completed", "committed_completion"])
+async def test_durable_work_unconfirmed_completion_never_overwrites_or_regenerates(
+    tmp_path, failure,
+):
+    memory = DurableWorkMemoryStore(fail_at=failure)
+    provider = FakeLiteLLM()
+    with pytest.raises(RuntimeError):
+        await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert len(provider.calls) == 1
+    assert [m["role"] for m in memory.added_messages] == ["user", "assistant"]
+    assert memory.events[-1] == "work:completed"
+    assert "work:failed" not in memory.events
+    assert memory.work["state"] == ("completed" if failure == "committed_completion" else "running")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["ok", "degraded", "failed"])
+async def test_durable_work_handled_history_canonical_response_completes(
+    tmp_path, monkeypatch, status,
+):
+    async def explanation(**kwargs):
+        return orchestrate_service.ClaimExplanationOutcome(
+            True, "Bounded retained explanation.", status, {},
+        )
+
+    monkeypatch.setattr(orchestrate_service, "resolve_claim_explanation", explanation)
+    memory = DurableWorkMemoryStore()
+    provider = FakeLiteLLM()
+    result = await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert result["status"] == status
+    assert provider.calls == []
+    assert memory.events == [
+        "work:pending", "message:user", "work:running",
+        "message:assistant", "trace:1", "work:completed",
+    ]
+    assert memory.work["assistant_message_id"] == "00000000-0000-4000-8000-000000000002"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["assistant", "trace"])
+async def test_durable_work_handled_history_persistence_failure_cannot_complete(
+    tmp_path, monkeypatch, failure,
+):
+    async def explanation(**kwargs):
+        return orchestrate_service.ClaimExplanationOutcome(True, "Explanation.", "ok", {})
+
+    monkeypatch.setattr(orchestrate_service, "resolve_claim_explanation", explanation)
+    memory = DurableWorkMemoryStore(fail_at=failure)
+    provider = FakeLiteLLM()
+    with pytest.raises(RuntimeError):
+        await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert provider.calls == []
+    assert memory.work["state"] == "failed"
+    assert memory.work["failure_code"] == "dependency_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_durable_work_absent_without_current_user_turn(tmp_path):
+    memory = FakeMemoryStore()
+    result = await _run_durable_work_chat(
+        tmp_path, memory, payload=_base_payload(messages=[{"role": "system", "content": "Hello."}]),
+    )
+    assert "work_id" not in result
+    assert not hasattr(memory, "work_calls")
+
+
+@pytest.mark.asyncio
+async def test_durable_work_claim_persistence_handling_precedes_completion(tmp_path):
+    memory = DurableWorkMemoryStore(claim_record_error=RuntimeError("storage unavailable"))
+    result = await _run_durable_work_chat(tmp_path, memory, claim_record_capture_enabled=True)
+    assert result["status"] == "ok"
+    assert memory.events.index("claim_record") < memory.events.index("trace:2")
+    assert memory.events[-1] == "work:completed"
+    assert memory.work["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_durable_work_nullable_origin_client_is_preserved(tmp_path):
+    memory = DurableWorkMemoryStore()
+    result = await _run_durable_work_chat(tmp_path, memory, payload=_base_payload(client_id=None))
+    assert result["status"] == "ok"
+    assert memory.work["client_id"] is None
+    assert memory.work["state"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_state", ["running", "completed"])
+async def test_durable_work_transition_response_mismatch_is_not_retried(tmp_path, changed_state):
+    class MismatchedTransitionStore(DurableWorkMemoryStore):
+        async def transition_work(self, **kwargs):
+            response = await super().transition_work(**kwargs)
+            if kwargs["state"] == changed_state:
+                response["request_id"] = "wrong-request"
+            return response
+
+    memory = MismatchedTransitionStore()
+    provider = FakeLiteLLM()
+    with pytest.raises(RuntimeError, match="work_projection_context_mismatch"):
+        await _run_durable_work_chat(tmp_path, memory, provider=provider)
+    assert memory.events.count(f"work:{changed_state}") == 1
+    assert len(provider.calls) == (1 if changed_state == "completed" else 0)
+    if changed_state == "completed":
+        assert memory.work["state"] == "completed"
+        assert "work:failed" not in memory.events
+    else:
+        assert memory.work["state"] == "failed"

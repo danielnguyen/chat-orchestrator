@@ -1,10 +1,107 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 import httpx
+
+_WORK_ASSOCIATION_FIELDS = {
+    "work_id", "owner_id", "conversation_id", "request_id", "client_id", "surface",
+}
+_WORK_FIELDS = _WORK_ASSOCIATION_FIELDS | {
+    "state", "created_at", "started_at", "completed_at", "assistant_message_id", "failure_code",
+}
+_WORK_FAILURE_CODES = {
+    "interrupted", "execution_failed", "dependency_unavailable", "authority_unavailable",
+}
+
+
+def _work_uuid(value: Any) -> None:
+    try:
+        if not isinstance(value, str) or str(UUID(value)) != value:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        raise RuntimeError("work_projection_invalid") from None
+
+
+def _work_identifier(value: Any, limit: int = 120) -> None:
+    if (not isinstance(value, str) or not 1 <= len(value) <= limit
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value) is None):
+        raise RuntimeError("work_projection_invalid")
+
+
+def _validate_work_projection(
+    response: Any, *, expected: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the bounded BMS reference-only contract, never answer content."""
+    if not isinstance(response, dict) or set(response) != _WORK_FIELDS:
+        raise RuntimeError("work_projection_invalid")
+    for key in ("work_id", "conversation_id"):
+        _work_uuid(response[key])
+    for key in ("owner_id", "request_id"):
+        _work_identifier(response[key])
+    _work_identifier(response["surface"], 64)
+    if response["client_id"] is not None:
+        _work_identifier(response["client_id"])
+    state = response["state"]
+    if not isinstance(state, str) or state not in {"pending", "running", "completed", "failed"}:
+        raise RuntimeError("work_projection_invalid")
+    assistant = response["assistant_message_id"]
+    failure = response["failure_code"]
+    if (state == "completed") != (assistant is not None):
+        raise RuntimeError("work_projection_invalid")
+    if assistant is not None:
+        _work_uuid(assistant)
+    if (state == "failed") != (failure is not None):
+        raise RuntimeError("work_projection_invalid")
+    if failure is not None and (
+        not isinstance(failure, str) or failure not in _WORK_FAILURE_CODES
+    ):
+        raise RuntimeError("work_projection_invalid")
+    timestamps = {}
+    for key in ("created_at", "started_at", "completed_at"):
+        value = response[key]
+        if value is None and key != "created_at":
+            timestamps[key] = None
+            continue
+        try:
+            if not isinstance(value, str) or len(value) > 64:
+                raise ValueError
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise RuntimeError("work_projection_invalid") from None
+        timestamps[key] = parsed
+    created, started, completed = (timestamps[k] for k in (
+        "created_at", "started_at", "completed_at",
+    ))
+    if (
+        (state in {"running", "completed"} and started is None)
+        or (state == "pending" and started is not None)
+        or ((state in {"completed", "failed"}) != (completed is not None))
+        or (started is not None and started < created)
+        or (completed is not None and completed < (started or created))
+    ):
+        raise RuntimeError("work_projection_invalid")
+    if expected and any(response.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("work_projection_context_mismatch")
+    return response
+
+
+def _validate_current_work(
+    response: Any, *, expected: dict[str, Any], allow_none: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(response, dict) or set(response) != {"status", "work"}:
+        raise RuntimeError("current_work_response_invalid")
+    if response["status"] == "none" and response["work"] is None and allow_none:
+        return response
+    if response["status"] != "resolved":
+        raise RuntimeError("current_work_response_invalid")
+    _validate_work_projection(response["work"], expected=expected)
+    return response
 
 
 class MemoryStoreClient:
@@ -12,6 +109,83 @@ class MemoryStoreClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout_ms / 1000
+
+    async def create_work(
+        self, *, owner_id: str, conversation_id: str, request_id: str,
+        client_id: str | None, surface: str,
+    ) -> dict[str, Any]:
+        association = dict(owner_id=owner_id, conversation_id=conversation_id,
+                           request_id=request_id, client_id=client_id, surface=surface)
+        response = await self._post(
+            "/v1/internal/work-items", request_id=request_id, json=association,
+        )
+        return _validate_work_projection(response, expected=association)
+
+    async def get_work(
+        self, *, work_id: str, owner_id: str, conversation_id: str,
+    ) -> dict[str, Any]:
+        _work_uuid(work_id)
+        response = await self._get(
+            f"/v1/internal/work-items/{work_id}",
+            params={"owner_id": owner_id, "conversation_id": conversation_id},
+        )
+        return _validate_work_projection(response, expected={
+            "work_id": work_id, "owner_id": owner_id, "conversation_id": conversation_id,
+        })
+
+    async def _work_write(
+        self, method: str, path: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.request(
+                method, f"{self.base_url}{path}",
+                headers={"X-API-Key": self.api_key}, json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def transition_work(
+        self, *, work: dict[str, Any], state: str,
+        assistant_message_id: str | None = None, failure_code: str | None = None,
+    ) -> dict[str, Any]:
+        _validate_work_projection(work)
+        payload = {
+            "owner_id": work["owner_id"], "conversation_id": work["conversation_id"],
+            "state": state, "assistant_message_id": assistant_message_id,
+            "failure_code": failure_code,
+        }
+        expected = {key: work[key] for key in _WORK_ASSOCIATION_FIELDS}
+        expected.update(payload)
+        expected["created_at"] = work["created_at"]
+        if work["started_at"] is not None:
+            expected["started_at"] = work["started_at"]
+        if work["completed_at"] is not None:
+            expected["completed_at"] = work["completed_at"]
+        response = await self._work_write(
+            "PATCH", f"/v1/internal/work-items/{work['work_id']}", payload,
+        )
+        return _validate_work_projection(response, expected=expected)
+
+    async def set_current_work(
+        self, *, owner_id: str, client_id: str, work_id: str,
+    ) -> dict[str, Any]:
+        _work_identifier(client_id)
+        _work_uuid(work_id)
+        response = await self._work_write("PUT", "/v1/internal/current-work", {
+            "owner_id": owner_id, "client_id": client_id, "work_id": work_id,
+        })
+        return _validate_current_work(response, expected={
+            "owner_id": owner_id, "client_id": client_id, "work_id": work_id,
+        }, allow_none=False)
+
+    async def get_current_work(self, *, owner_id: str, client_id: str) -> dict[str, Any]:
+        _work_identifier(client_id)
+        response = await self._get("/v1/internal/current-work", params={
+            "owner_id": owner_id, "client_id": client_id,
+        })
+        return _validate_current_work(response, expected={
+            "owner_id": owner_id, "client_id": client_id,
+        })
 
     async def _post(
         self,

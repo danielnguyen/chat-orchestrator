@@ -8436,6 +8436,71 @@ async def _opportunistic_retirement_cleanup(
             return
 
 
+class _SynchronousWork:
+    """Track the existing turn; an uncertain finalization is never overwritten."""
+
+    def __init__(self, memory_store: MemoryStoreClient) -> None:
+        self.memory_store = memory_store
+        self.work: dict[str, Any] | None = None
+        self.finalizing = False
+        self.failure_code = "execution_failed"
+
+    async def admit(self, **association: Any) -> None:
+        response = await self.memory_store.create_work(**association)
+        self._expect(response, {**association, "state": "pending"})
+        try:
+            if str(UUID(response["work_id"])) != response["work_id"]:
+                raise ValueError
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise RuntimeError("work_projection_invalid") from None
+        self.work = response
+
+    @staticmethod
+    def _expect(response: Any, expected: dict[str, Any]) -> None:
+        # Structural validation belongs to MemoryStoreClient. Keep the orchestration
+        # admission/result association explicit even for injected service clients.
+        if not isinstance(response, dict) or any(
+            key not in response or response[key] != value for key, value in expected.items()
+        ):
+            raise RuntimeError("work_projection_context_mismatch")
+
+    async def transition(self, state: str, **result: Any) -> None:
+        if self.work is None:
+            return
+        response = await self.memory_store.transition_work(
+            work=self.work, state=state, **result,
+        )
+        expected = {key: self.work[key] for key in (
+            "work_id", "owner_id", "conversation_id", "request_id", "client_id", "surface",
+        )}
+        expected.update(state=state, assistant_message_id=None, failure_code=None)
+        expected.update(result)
+        self._expect(response, expected)
+        self.work = response
+
+    async def complete(self, acknowledgement: Any) -> None:
+        if self.work is None:
+            return
+        message_id = (
+            acknowledgement.get("message_id") if isinstance(acknowledgement, dict) else None
+        )
+        if not isinstance(message_id, str) or not message_id:
+            self.failure_code = "dependency_unavailable"
+            raise RuntimeError("assistant_message_acknowledgement_invalid")
+        # The server may commit before its response is lost. Never issue a competing
+        # failed transition after this point, and never rerun cognition.
+        self.finalizing = True
+        await self.transition("completed", assistant_message_id=message_id)
+
+    async def fail_if_unfinished(self) -> None:
+        if self.work is None or self.finalizing or self.work["state"] in {"completed", "failed"}:
+            return
+        try:
+            await self.transition("failed", failure_code=self.failure_code)
+        except Exception:
+            logging.getLogger(__name__).warning("durable_work_failure_unconfirmed")
+
+
 async def orchestrate_chat(
     *,
     payload: dict[str, Any],
@@ -8851,160 +8916,168 @@ async def orchestrate_chat(
         }
     turn_state_trace["conversation_resolution"] = conversation_resolution_trace
 
-    runtime_session = (
-        turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
-    )
-    runtime_session_trace = _runtime_session_trace_from_session(
-        runtime_session,
-        attempted=bool(turn_state_trace.get("attempted")),
-        omission_reason=turn_state_trace.get(
-            "omission_reason",
-            "runtime_session_missing_from_turn_response",
-        ),
-        error_type=turn_state_trace.get("error_type"),
-    )
-    (
-        interaction_governance,
-        interaction_governance_trace,
-    ) = await _resolve_interaction_governance(
-        runtime=runtime,
-        enabled=interaction_governance_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        surface_session_id=surface_session_id,
-        active_mode=active_mode,
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    persona_containment, persona_containment_trace = await _resolve_persona_containment(
-        runtime=runtime,
-        enabled=persona_containment_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        persona_scope_hint=(
-            interaction_governance.get("persona_scope_hint")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        interaction_kind=(
-            interaction_governance.get("interaction_kind")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    if persona_containment_enabled:
-        mandatory_policy = await _resolve_mandatory_retrieval_policy(
+    work = _SynchronousWork(memory_store)
+    try:
+        if current_user_message is not None:
+            await work.admit(
+                owner_id=payload["owner_id"], conversation_id=conversation_id,
+                request_id=request_id, client_id=payload.get("client_id"), surface=surface,
+            )
+        runtime_session = (
+            turn_response.get("runtime_session") if isinstance(turn_response, dict) else None
+        )
+        runtime_session_trace = _runtime_session_trace_from_session(
+            runtime_session,
+            attempted=bool(turn_state_trace.get("attempted")),
+            omission_reason=turn_state_trace.get(
+                "omission_reason",
+                "runtime_session_missing_from_turn_response",
+            ),
+            error_type=turn_state_trace.get("error_type"),
+        )
+        (
+            interaction_governance,
+            interaction_governance_trace,
+        ) = await _resolve_interaction_governance(
             runtime=runtime,
+            enabled=interaction_governance_enabled,
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,
             surface=surface,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            persona_containment=persona_containment,
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            surface_session_id=surface_session_id,
+            active_mode=active_mode,
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
         )
-        persona_containment_trace.update(mandatory_policy.validation_trace)
-    restraint, restraint_trace = await _resolve_restraint(
-        runtime=runtime,
-        enabled=restraint_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        interaction_kind=(
-            interaction_governance.get("interaction_kind")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        response_posture=(
-            interaction_governance.get("response_posture")
-            if isinstance(interaction_governance, dict)
-            else None
-        ),
-        active_persona_id=(
-            persona_containment.get("active_persona_id")
-            if isinstance(persona_containment, dict)
-            else None
-        ),
-        capability_domain=(
-            persona_containment.get("capability_domain")
-            if isinstance(persona_containment, dict)
-            else None
-        ),
-        current_user_text=last_user_text,
-        recent_messages=recent_messages,
-        surface_metadata_json=surface_metadata_json,
-    )
-    situated_presence, situated_presence_trace = await resolve_situated_presence(
-        runtime=runtime,
-        interaction_governance_enabled=interaction_governance_enabled,
-        restraint_enabled=restraint_enabled,
-        request_id=request_id,
-        owner_id=payload["owner_id"],
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-        payload=payload,
-        interaction_governance=interaction_governance,
-        restraint=restraint,
-    )
-    if persona_containment_enabled:
-        relationship_projection = (
-            mandatory_policy.containment_policy.get("relationship_scope_projection")
-            if isinstance(mandatory_policy.containment_policy, dict)
-            else None
-        )
-        turn_policy_metadata, turn_policy_omission_reason = _classify_turn_policy_metadata(
-            persona_containment=persona_containment,
-            relationship_projection=relationship_projection,
-            request_sensitivity=payload.get("sensitivity"),
-            interaction_governance=interaction_governance,
-        )
-
-    if current_user_message is not None and current_user_message_id is not None:
-        last_user_message_id = await _append_current_user_message(
-            memory_store=memory_store,
+        persona_containment, persona_containment_trace = await _resolve_persona_containment(
+            runtime=runtime,
+            enabled=persona_containment_enabled,
             request_id=request_id,
-            message_id=current_user_message_id,
-            conversation_id=conversation_id,
             owner_id=payload["owner_id"],
-            client_id=payload.get("client_id"),
-            content=current_user_message.get("content", ""),
+            conversation_id=conversation_id,
             surface=surface,
-            policy_metadata=turn_policy_metadata,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            persona_scope_hint=(
+                interaction_governance.get("persona_scope_hint")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
         )
-        if last_user_message_id is None:
-            await _complete_runtime_turn(
+        if persona_containment_enabled:
+            mandatory_policy = await _resolve_mandatory_retrieval_policy(
                 runtime=runtime,
-                turn_state_trace=turn_state_trace,
                 request_id=request_id,
-                turn_status="abandoned",
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                persona_containment=persona_containment,
             )
-            return {
-                "request_id": request_id,
-                "conversation_id": conversation_id,
-                "profile_name": "unresolved",
-                "selected_model": "not_called",
-                "answer": _MESSAGE_PERSISTENCE_UNAVAILABLE,
-                "status": "failed",
-                "sources": [],
-            }
+            persona_containment_trace.update(mandatory_policy.validation_trace)
+        restraint, restraint_trace = await _resolve_restraint(
+            runtime=runtime,
+            enabled=restraint_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            interaction_kind=(
+                interaction_governance.get("interaction_kind")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            response_posture=(
+                interaction_governance.get("response_posture")
+                if isinstance(interaction_governance, dict)
+                else None
+            ),
+            active_persona_id=(
+                persona_containment.get("active_persona_id")
+                if isinstance(persona_containment, dict)
+                else None
+            ),
+            capability_domain=(
+                persona_containment.get("capability_domain")
+                if isinstance(persona_containment, dict)
+                else None
+            ),
+            current_user_text=last_user_text,
+            recent_messages=recent_messages,
+            surface_metadata_json=surface_metadata_json,
+        )
+        situated_presence, situated_presence_trace = await resolve_situated_presence(
+            runtime=runtime,
+            interaction_governance_enabled=interaction_governance_enabled,
+            restraint_enabled=restraint_enabled,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            payload=payload,
+            interaction_governance=interaction_governance,
+            restraint=restraint,
+        )
+        if persona_containment_enabled:
+            relationship_projection = (
+                mandatory_policy.containment_policy.get("relationship_scope_projection")
+                if isinstance(mandatory_policy.containment_policy, dict)
+                else None
+            )
+            turn_policy_metadata, turn_policy_omission_reason = _classify_turn_policy_metadata(
+                persona_containment=persona_containment,
+                relationship_projection=relationship_projection,
+                request_sensitivity=payload.get("sensitivity"),
+                interaction_governance=interaction_governance,
+            )
 
-    try:
+        if current_user_message is not None and current_user_message_id is not None:
+            last_user_message_id = await _append_current_user_message(
+                memory_store=memory_store,
+                request_id=request_id,
+                message_id=current_user_message_id,
+                conversation_id=conversation_id,
+                owner_id=payload["owner_id"],
+                client_id=payload.get("client_id"),
+                content=current_user_message.get("content", ""),
+                surface=surface,
+                policy_metadata=turn_policy_metadata,
+            )
+            if last_user_message_id is None:
+                work.failure_code = "dependency_unavailable"
+                await _complete_runtime_turn(
+                    runtime=runtime,
+                    turn_state_trace=turn_state_trace,
+                    request_id=request_id,
+                    turn_status="abandoned",
+                )
+                return {
+                    "request_id": request_id,
+                    "conversation_id": conversation_id,
+                    "profile_name": "unresolved",
+                    "selected_model": "not_called",
+                    "answer": _MESSAGE_PERSISTENCE_UNAVAILABLE,
+                    "status": "failed",
+                    "sources": [],
+                }
+
+        await work.transition("running")
         profile = await memory_store.resolve_profile(
             owner_id=payload["owner_id"],
             surface=surface,
@@ -9085,17 +9158,6 @@ async def orchestrate_chat(
             "status": "not_attempted",
             "reason": "ineligible",
         }
-    except Exception:
-        if turn_state_trace.get("runtime_turn_id"):
-            await _complete_runtime_turn(
-                runtime=runtime,
-                turn_state_trace=turn_state_trace,
-                request_id=request_id,
-                turn_status="abandoned",
-            )
-        raise
-
-    try:
         parsed_exact_intent = (
             parse_claim_explanation_intent(last_user_text)
             if history_followup_enabled
@@ -9368,10 +9430,13 @@ async def orchestrate_chat(
                     assistant_append["history_root_lineage"] = (
                         claim_explanation.history_root_lineage
                     )
-                await memory_store.add_message(
+                work.failure_code = "dependency_unavailable"
+                assistant_message_ack = await memory_store.add_message(
                     **assistant_append,
                 )
+                work.failure_code = "execution_failed"
             except Exception:
+                work.failure_code = "dependency_unavailable"
                 if claim_explanation.history_root_lineage is None:
                     raise
                 await _complete_runtime_turn(
@@ -9470,10 +9535,13 @@ async def orchestrate_chat(
                 "error": None,
                 "created_at": datetime.now(UTC).isoformat(),
             }
+            work.failure_code = "dependency_unavailable"
             await memory_store.create_trace(
                 request_id=request_id,
                 payload=trace_payload,
             )
+            work.failure_code = "execution_failed"
+            await work.complete(assistant_message_ack)
             return {
                 "request_id": request_id,
                 "conversation_id": conversation_id,
@@ -12338,6 +12406,7 @@ async def orchestrate_chat(
                 f"{verification_label}:\n{verification_answer}"
             )
 
+        work.failure_code = "dependency_unavailable"
         assistant_message_ack = await memory_store.add_message(
             conversation_id=conversation_id,
             owner_id=payload["owner_id"],
@@ -12347,6 +12416,7 @@ async def orchestrate_chat(
             metadata={"request_id": request_id, "selected_model": selected_model},
             policy_metadata=turn_policy_metadata,
         )
+        work.failure_code = "execution_failed"
         if evidence_manifest is not None:
             bind_manifest_response(
                 evidence_manifest,
@@ -12528,10 +12598,12 @@ async def orchestrate_chat(
             "error": model_error,
             "created_at": datetime.now(UTC).isoformat(),
         }
+        work.failure_code = "dependency_unavailable"
         await memory_store.create_trace(
             request_id=request_id,
             payload=trace_payload,
         )
+        work.failure_code = "execution_failed"
 
         record_payload = claim_record_payload(
             state=claim_capture,
@@ -12658,8 +12730,11 @@ async def orchestrate_chat(
         }
         if pending_action is not None:
             result["pending_action"] = pending_action
+        await work.complete(assistant_message_ack)
         return result
-    except Exception:
+    except Exception as error:
+        if isinstance(error, httpx.HTTPError):
+            work.failure_code = "dependency_unavailable"
         if turn_state_trace.get("runtime_turn_id") and not turn_state_trace.get("completed"):
             await _complete_runtime_turn(
                 runtime=runtime,
@@ -12668,3 +12743,5 @@ async def orchestrate_chat(
                 turn_status="abandoned",
             )
         raise
+    finally:
+        await work.fail_if_unfinished()
