@@ -2840,7 +2840,7 @@ run_delivery_equivalence_scenario() {
     --argjson sync "$sync"
   sync_calls="$(fetch_provider_calls "$sync_request")"
   deferred_calls="$(fetch_provider_calls "$deferred_request")"
-  assert_jq "delivery_equivalence.provider" '{}' '
+  if ! assert_jq "delivery_equivalence.provider" '{}' '
     [$a.calls[] | select(.kind=="chat")] as $a
     | [$b.calls[] | select(.kind=="chat")] as $b
     | ($a|length)==1 and ($b|length)==1
@@ -2852,7 +2852,16 @@ run_delivery_equivalence_scenario() {
       and ($b[0].normalized_messages | tostring | test("allow_deferred|delivery_wait_ms") | not)
       and ([$a[0].normalized_messages[] | select(.content | contains("The migration record confirms the bounded setting."))] | length) == 1
       and ([$a[0].normalized_messages[] | select(.content | contains("A second retained row prevents count-only proof."))] | length) == 1
-  ' --argjson a "$sync_calls" --argjson b "$deferred_calls"
+  ' --argjson a "$sync_calls" --argjson b "$deferred_calls"; then
+    # Existing provider records contain only this neutral, isolated test fixture.
+    # Preserve them on failure so a prompt difference cannot be hidden by normalization.
+    if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+      mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+      printf '%s\n' "$sync_calls" >"$COMPOSED_SMOKE_LOG_DIR/delivery-sync-provider.json"
+      printf '%s\n' "$deferred_calls" >"$COMPOSED_SMOKE_LOG_DIR/delivery-deferred-provider.json"
+    fi
+    return 1
+  fi
   sync_trace="$(fetch_trace "$sync_request")"
   deferred_trace="$(fetch_trace "$deferred_request")"
   assert_jq "delivery_equivalence.authority" '{}' '
