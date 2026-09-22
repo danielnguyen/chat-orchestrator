@@ -260,6 +260,56 @@ class DeferredChatResponse(BaseModel):
     delivery_status: Literal["pending"] = "pending"
 
 
+WorkIdentifier = Annotated[
+    str, Field(strict=True, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
+WorkUUID = Annotated[
+    str, Field(
+        strict=True, pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    ),
+]
+
+
+class WorkResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    assistant_message_id: WorkUUID
+    answer: str
+
+
+class WorkStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    work_id: WorkUUID
+    conversation_id: WorkUUID
+    request_id: WorkIdentifier
+    state: Literal["pending", "running", "completed", "failed"]
+    failure_code: Literal[
+        "interrupted", "execution_failed", "dependency_unavailable", "authority_unavailable",
+    ] | None
+    result: WorkResult | None
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> WorkStatus:
+        if ((self.state == "completed") != (self.result is not None)
+                or (self.state == "failed") != (self.failure_code is not None)):
+            raise ValueError("work_status_invalid")
+        return self
+
+
+class CurrentWorkStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["none", "resolved"]
+    work: WorkStatus | None
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> CurrentWorkStatus:
+        if (self.status == "resolved") != (self.work is not None):
+            raise ValueError("current_work_status_invalid")
+        return self
+
+
 class ChatResponse(BaseModel):
     request_id: str
     conversation_id: Optional[str] = None

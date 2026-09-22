@@ -83,7 +83,7 @@ waiting for the same task, not another computation. A null client needs no
 locator. Completion just after the timeout remains a valid deferred delivery
 event. Timeouts and HTTP waiter cancellation do not cancel the owned task;
 completed tasks are removed and unexpected exceptions are consumed with bounded
-logging. Status/result readback through CO is not implemented here.
+logging.
 
 Startup opens RuntimeClient when configured, reconciles CR interrupted turns
 with one new startup request ID, then reconciles BMS interrupted work using its
@@ -99,6 +99,44 @@ operator must ensure the former sole executor is gone before starting its
 replacement. Overlapping executors/workers are unsupported and would require
 revisiting execution ownership. No queue, broker, worker service, lease,
 heartbeat, retry/reclaim policy, or client-specific adapter behavior is added.
+
+## Exact durable work status and result
+
+The normal service key protects both read-only endpoints:
+
+- `GET /v1/work-items/{work_id}?owner_id=...&conversation_id=...`
+- `GET /v1/current-work?owner_id=...&client_id=...`
+
+Exact lookup requires the owner and original conversation, not possession of a
+work ID alone. It calls only BMS's exact work-result read. Its strict public
+projection contains `work_id`, `conversation_id`, `request_id`, `state`,
+`failure_code`, and `result`. Pending/running/failed work has `result: null`;
+only failed work has a bounded existing failure code. Completed work contains
+`result: {assistant_message_id, answer}`, where `answer` is the exact canonical
+BMS assistant-message content, unchanged. Provisional messages are never
+results. This does not reconstruct the synchronous ChatResponse: no sources,
+profile, selected model, trace, or answer-status metadata is fabricated.
+
+Current lookup returns exactly `{status: "none", work: null}` when no explicit
+owner/client locator exists. Otherwise it reads the exact work named by that
+locator and returns `{status: "resolved", work: <public projection>}`. Work,
+owner, conversation, request, originating client/surface, and creation timestamp
+must match between the two BMS reads; lifecycle may advance. A disappearing or
+inconsistent resolved item fails closed, never becoming `none` or a recency
+search. Polling does not change the locator or originating provenance.
+
+Missing/wrong-owner/wrong-conversation exact work has the same bounded
+`404 {detail: "work_not_found"}` response. Unavailable, malformed, or inconsistent
+dependency state has bounded `503 {detail: "work_unavailable"}`. No dependency
+exception text or private content is returned on error. Owner/client/surface,
+timestamps, internal metadata, and reverse bindings are not public fields.
+
+Already-admitted work remains readable under its original owner/conversation
+after retirement; reads do not reopen the conversation. Another authorized
+surface may read the same exact result without rewriting its provenance.
+Neither endpoint invokes cognition, providers, DSA, CR, routing, semantic/history
+retrieval, or writes messages, traces, claims, work, or current-work associations.
+Repeated polling returns durable state without recomputation or answer duplication.
 
 ## Conversation resolution
 

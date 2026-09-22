@@ -11,7 +11,11 @@ from uuid import uuid4
 import httpx
 from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.litellm import LiteLLMClient
-from clients.memory_store import MemoryStoreClient
+from clients.memory_store import (
+    MemoryStoreClient,
+    _validate_current_work,
+    _validate_work_result,
+)
 from clients.runtime import RuntimeClient
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
@@ -21,7 +25,11 @@ from models import (
     BriefGenerateResponse,
     ChatRequest,
     ChatResponse,
+    CurrentWorkStatus,
     DeferredChatResponse,
+    WorkIdentifier,
+    WorkStatus,
+    WorkUUID,
 )
 from services.briefing import generate_brief
 from services.orchestrate import orchestrate_chat
@@ -128,6 +136,65 @@ dsa = (
 async def require_api_key(api_key: str | None = Security(api_key_header)) -> None:
     if not api_key or api_key != settings.orch_api_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _public_work_result(value: dict[str, Any], **expected: Any) -> WorkStatus:
+    validated = _validate_work_result(value, expected=expected)
+    work, result = validated["work"], validated["result"]
+    return WorkStatus(
+        **{key: work[key] for key in (
+            "work_id", "conversation_id", "request_id", "state", "failure_code",
+        )},
+        result=None if result is None else {
+            "assistant_message_id": result["assistant_message_id"], "answer": result["content"],
+        },
+    )
+
+
+@app.get(
+    "/v1/work-items/{work_id}", response_model=WorkStatus,
+    dependencies=[Depends(require_api_key)],
+)
+async def work_status(
+    work_id: WorkUUID, owner_id: WorkIdentifier, conversation_id: WorkUUID,
+) -> WorkStatus:
+    try:
+        expected = dict(work_id=work_id, owner_id=owner_id, conversation_id=conversation_id)
+        value = await memory_store.get_work_result(**expected)
+        result = None if value is None else _public_work_result(value, **expected)
+    except Exception:
+        raise HTTPException(status_code=503, detail="work_unavailable") from None
+    if result is None:
+        raise HTTPException(status_code=404, detail="work_not_found")
+    return result
+
+
+@app.get(
+    "/v1/current-work", response_model=CurrentWorkStatus,
+    dependencies=[Depends(require_api_key)],
+)
+async def current_work_status(
+    owner_id: WorkIdentifier, client_id: WorkIdentifier,
+) -> CurrentWorkStatus:
+    try:
+        locator = _validate_current_work(
+            await memory_store.get_current_work(owner_id=owner_id, client_id=client_id),
+            expected={"owner_id": owner_id, "client_id": client_id},
+        )
+        if locator["status"] == "none":
+            return CurrentWorkStatus(status="none", work=None)
+        work = locator["work"]
+        value = await memory_store.get_work_result(
+            work_id=work["work_id"], owner_id=owner_id, conversation_id=work["conversation_id"],
+        )
+        # Only lifecycle fields may advance between the explicit locator and exact read.
+        expected = {key: work[key] for key in (
+            "work_id", "owner_id", "conversation_id", "request_id", "client_id", "surface",
+            "created_at",
+        )}
+        return CurrentWorkStatus(status="resolved", work=_public_work_result(value, **expected))
+    except Exception:
+        raise HTTPException(status_code=503, detail="work_unavailable") from None
 
 
 @app.get("/healthz")

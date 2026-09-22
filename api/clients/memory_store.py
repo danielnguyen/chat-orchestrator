@@ -104,6 +104,24 @@ def _validate_current_work(
     return response
 
 
+def _validate_work_result(response: Any, *, expected: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(response, dict) or set(response) != {"work", "result"}:
+        raise RuntimeError("work_result_invalid")
+    work = _validate_work_projection(response["work"], expected=expected)
+    result = response["result"]
+    if work["state"] != "completed":
+        if result is not None:
+            raise RuntimeError("work_result_invalid")
+    else:
+        if not isinstance(result, dict) or set(result) != {"assistant_message_id", "content"}:
+            raise RuntimeError("work_result_invalid")
+        _work_uuid(result["assistant_message_id"])
+        if (result["assistant_message_id"] != work["assistant_message_id"]
+                or not isinstance(result["content"], str)):
+            raise RuntimeError("work_result_invalid")
+    return response
+
+
 class MemoryStoreClient:
     def __init__(self, base_url: str, api_key: str, timeout_ms: int = 30000) -> None:
         self.base_url = base_url.rstrip("/")
@@ -160,6 +178,25 @@ class MemoryStoreClient:
             )
             response.raise_for_status()
             return response.json()
+
+    async def get_work_result(
+        self, *, work_id: str, owner_id: str, conversation_id: str,
+    ) -> dict[str, Any] | None:
+        _work_uuid(work_id)
+        _work_uuid(conversation_id)
+        _work_identifier(owner_id)
+        try:
+            response = await self._get(
+                f"/v1/internal/work-items/{work_id}/result",
+                params={"owner_id": owner_id, "conversation_id": conversation_id},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        return _validate_work_result(response, expected={
+            "work_id": work_id, "owner_id": owner_id, "conversation_id": conversation_id,
+        })
 
     async def transition_work(
         self, *, work: dict[str, Any], state: str,

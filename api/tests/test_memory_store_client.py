@@ -74,7 +74,10 @@ def service(monkeypatch):
 
     def handler(request):
         calls.append(request)
-        return httpx.Response(200, content=json.dumps(responses.pop(0)))
+        response = responses.pop(0)
+        return response if isinstance(response, httpx.Response) else httpx.Response(
+            200, content=json.dumps(response),
+        )
 
     monkeypatch.setattr(
         httpx,
@@ -287,4 +290,103 @@ async def test_exact_work_lookup_is_context_bound_and_does_not_retry(service):
     responses.append(projection(owner_id="other"))
     with pytest.raises(RuntimeError, match="context_mismatch"):
         await client.get_work(work_id=WORK_ID, owner_id="owner", conversation_id=CONVERSATION_ID)
+    assert len(calls) == 1
+
+
+def result_projection(state="completed", **work_overrides):
+    work = projection(state, **work_overrides)
+    return {"work": work, "result": {
+        "assistant_message_id": MESSAGE_ID, "content": "Exact\ncanonical α. ",
+    } if state == "completed" else None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "running", "completed", "failed"])
+async def test_work_result_exact_contract(service, state):
+    client, responses, calls = service
+    value = result_projection(state)
+    responses.append(value)
+    assert await client.get_work_result(
+        work_id=WORK_ID, owner_id="owner", conversation_id=CONVERSATION_ID,
+    ) == value
+    assert len(calls) == 1
+    assert calls[0].method == "GET"
+    assert calls[0].url.path == f"/v1/internal/work-items/{WORK_ID}/result"
+    assert dict(calls[0].url.params) == {
+        "owner_id": "owner", "conversation_id": CONVERSATION_ID,
+    }
+    assert calls[0].headers["X-API-Key"] == "test-key"
+    assert calls[0].content == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 401, 500, 503])
+async def test_work_result_http_failure_no_retry(service, status):
+    client, responses, calls = service
+    responses.append(httpx.Response(status, json={"detail": "private-sentinel"}))
+    kwargs = dict(work_id=WORK_ID, owner_id="owner", conversation_id=CONVERSATION_ID)
+    if status == 404:
+        assert await client.get_work_result(**kwargs) is None
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_work_result(**kwargs)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("work_id", "bad"), ("work_id", WORK_ID.replace("-", "")),
+    ("conversation_id", "bad"), ("owner_id", ""), ("owner_id", "x" * 121),
+    ("owner_id", "private owner"),
+])
+async def test_work_result_validates_input_before_request(service, field, value):
+    client, _, calls = service
+    kwargs = dict(work_id=WORK_ID, owner_id="owner", conversation_id=CONVERSATION_ID)
+    kwargs[field] = value
+    with pytest.raises(RuntimeError):
+        await client.get_work_result(**kwargs)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformation", [
+    "outer_extra", "outer_missing", "work_extra", "work_missing", "work_malformed",
+    "work_id", "owner_id", "conversation_id", "result_extra", "result_missing",
+    "result_null", "result_type", "message_id", "message_uuid", "content_type",
+    "pending_result", "running_result", "failed_result",
+])
+async def test_work_result_rejects_malformed_or_mismatched_response(service, malformation):
+    client, responses, calls = service
+    value = result_projection()
+    if malformation == "outer_extra":
+        value["trace"] = "private-sentinel"
+    elif malformation == "outer_missing":
+        del value["result"]
+    elif malformation == "work_extra":
+        value["work"]["prompt"] = "private-sentinel"
+    elif malformation == "work_missing":
+        del value["work"]["surface"]
+    elif malformation == "work_malformed":
+        value["work"]["state"] = "unknown"
+    elif malformation in {"work_id", "owner_id", "conversation_id"}:
+        value["work"][malformation] = "other" if malformation == "owner_id" else MESSAGE_ID
+    elif malformation == "result_extra":
+        value["result"]["metadata"] = "private-sentinel"
+    elif malformation == "result_missing":
+        del value["result"]["content"]
+    elif malformation in {"result_null", "result_type"}:
+        value["result"] = None if malformation == "result_null" else []
+    elif malformation in {"message_id", "message_uuid"}:
+        value["result"]["assistant_message_id"] = (
+            WORK_ID if malformation == "message_id" else MESSAGE_ID.replace("-", "")
+        )
+    elif malformation == "content_type":
+        value["result"]["content"] = 42
+    else:
+        value["work"] = projection(malformation.split("_")[0])
+    responses.append(value)
+    with pytest.raises(RuntimeError):
+        await client.get_work_result(
+            work_id=WORK_ID, owner_id="owner", conversation_id=CONVERSATION_ID,
+        )
     assert len(calls) == 1
