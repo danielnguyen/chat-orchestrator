@@ -44,15 +44,61 @@ Failure to record failure does not mask the original exception. If completion
 cannot be confirmed, orchestration fails conservatively; it does not return a
 normal success, generate another answer, retry, or overwrite a possibly completed
 work item. Existing non-pending work returned for the same request is not executed
-again. Interruption recovery is not implemented.
+again. Startup interruption reconciliation is described below; computation is never resumed.
 
 Work stores references, not prompts, evidence, or duplicate answer text. The BMS
 client strictly validates exact work projections and explicit current-work
 resolution. Synchronous turns never set that locator. `/v1/chat` returns its
 existing response fields, with no work ID, pending disposition, or polling URL.
-There is no detached task, worker, or new retry/reclaim policy. Conversation
+There is no worker or retry/reclaim policy. Conversation
 retirement and message-append rules, privacy, cognition, and action confirmation
 remain unchanged; work identity grants no additional authority.
+
+### Delivery waiting and process lifetime
+
+`/v1/chat` defaults to synchronous delivery. A caller may supply
+`allow_deferred: true` together with an integer `delivery_wait_ms` from 100 to
+30000. Neither field enters the orchestration payload or cognition. Supplying
+only one control is invalid.
+
+Detachment is eligible only with Cognitive Runtime configured, the capability
+registry disabled, and no capability confirmation. Otherwise the same request
+runs synchronously. In particular, capability/action continuations are not
+backgrounded.
+
+An eligible request starts exactly one invocation of `orchestrate_chat` in a
+module-owned task registry. A defensive, non-authoritative admission observer
+signals only after the exact pending BMS work association is accepted. The
+delivery deadline starts then, not during conversation/runtime admission.
+Observer failure cannot affect canonical execution. An early result/error or a
+result inside the budget retains the ordinary HTTP 200 response/error contract
+and never writes the current-work locator.
+
+When the budget expires, the same task continues. HTTP 202 contains exactly
+`request_id`, `conversation_id`, `work_id`, and `delivery_status: "pending"`.
+There is no answer, pending assistant message, or speculative result. With a
+non-null client ID, the explicit BMS current-work locator must be confirmed for
+that exact owner/client/work before returning 202. Locator failure falls back to
+waiting for the same task, not another computation. A null client needs no
+locator. Completion just after the timeout remains a valid deferred delivery
+event. Timeouts and HTTP waiter cancellation do not cancel the owned task;
+completed tasks are removed and unexpected exceptions are consumed with bounded
+logging. Status/result readback through CO is not implemented here.
+
+Startup opens RuntimeClient when configured, reconciles CR interrupted turns
+with one new startup request ID, then reconciles BMS interrupted work using its
+bodyless endpoint. Only then does the lifespan yield to admit traffic. Without
+CR, BMS reconciliation still runs. Any required failure/malformed response fails
+startup closed and closes the runtime pool. A later start can safely repeat both
+idempotent operations; there is no cross-service rollback. Shutdown cancels and
+gathers owned tasks so existing lifecycle cleanup runs before closing runtime.
+Process crashes are handled by the next startup's reconciliation, not resumption.
+
+This mechanism assumes **one active CO process and one Uvicorn worker**. The
+operator must ensure the former sole executor is gone before starting its
+replacement. Overlapping executors/workers are unsupported and would require
+revisiting execution ownership. No queue, broker, worker service, lease,
+heartbeat, retry/reclaim policy, or client-specific adapter behavior is added.
 
 ## Conversation resolution
 

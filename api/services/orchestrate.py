@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -8439,8 +8440,12 @@ async def _opportunistic_retirement_cleanup(
 class _SynchronousWork:
     """Track the existing turn; an uncertain finalization is never overwritten."""
 
-    def __init__(self, memory_store: MemoryStoreClient) -> None:
+    def __init__(
+        self, memory_store: MemoryStoreClient,
+        on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.memory_store = memory_store
+        self.on_work_admitted = on_work_admitted
         self.work: dict[str, Any] | None = None
         self.finalizing = False
         self.failure_code = "execution_failed"
@@ -8454,6 +8459,11 @@ class _SynchronousWork:
         except (KeyError, ValueError, TypeError, AttributeError):
             raise RuntimeError("work_projection_invalid") from None
         self.work = response
+        if self.on_work_admitted is not None:
+            try:
+                self.on_work_admitted(deepcopy(self.work))
+            except Exception:
+                logging.getLogger(__name__).warning("work_admission_observer_failed")
 
     @staticmethod
     def _expect(response: Any, expected: dict[str, Any]) -> None:
@@ -8510,6 +8520,7 @@ async def orchestrate_chat(
     model_registry_path: str,
     allow_manual_override: bool,
     request_id: str,
+    on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
@@ -8916,7 +8927,7 @@ async def orchestrate_chat(
         }
     turn_state_trace["conversation_resolution"] = conversation_resolution_trace
 
-    work = _SynchronousWork(memory_store)
+    work = _SynchronousWork(memory_store, on_work_admitted)
     try:
         if current_user_message is not None:
             await work.admit(

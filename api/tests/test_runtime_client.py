@@ -1190,9 +1190,17 @@ async def test_fastapi_lifespan_opens_and_closes_same_runtime_client(monkeypatch
         async def close(self) -> None:
             self.close_calls += 1
 
+        async def reconcile_interrupted_turns(self, request_id):
+            return {"interrupted_count": 0}
+
+    class Memory:
+        async def reconcile_interrupted_work(self):
+            return {"interrupted_count": 0}
+
     configured = ManagedRuntime()
     replacement = ManagedRuntime()
     monkeypatch.setattr(main, "runtime", configured)
+    monkeypatch.setattr(main, "memory_store", Memory())
 
     async with main.app.router.lifespan_context(main.app):
         assert configured.open_calls == 1
@@ -1209,6 +1217,9 @@ async def test_runtime_disabled_lifespan_does_not_manage_other_clients(monkeypat
     main = _load_main(monkeypatch)
 
     class UnexpectedLifecycle:
+        async def reconcile_interrupted_work(self):
+            return {"interrupted_count": 0}
+
         async def open(self) -> None:
             raise AssertionError("unexpected open")
 
@@ -1222,6 +1233,33 @@ async def test_runtime_disabled_lifespan_does_not_manage_other_clients(monkeypat
 
     async with main.app.router.lifespan_context(main.app):
         pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    {"interrupted_count": 0}, {"interrupted_count": 4},
+    None, [], {}, {"interrupted_count": True}, {"interrupted_count": -1},
+    {"interrupted_count": 1.0}, {"interrupted_count": "1"},
+    {"interrupted_count": 0, "turns": []},
+])
+async def test_reconcile_turns_uses_open_pool_strict_count_and_no_retry(monkeypatch, response):
+    http = _FakeAsyncClient([response])
+    factory = _ClientFactory([http])
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    client = RuntimeClient("http://runtime", "key")
+    await client.open()
+    try:
+        if response in ({"interrupted_count": 0}, {"interrupted_count": 4}):
+            assert await client.reconcile_interrupted_turns("startup-request") == response
+        else:
+            with pytest.raises(RuntimeError, match="runtime_reconciliation_response_invalid"):
+                await client.reconcile_interrupted_turns("startup-request")
+        assert http.posts == [(
+            "/v1/runtime/turns/reconcile-interrupted", {"request_id": "startup-request"},
+        )]
+        assert len(factory.clients) == 1
+    finally:
+        await client.close()
 
 
 def _history_policy(**overrides):

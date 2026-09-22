@@ -6,8 +6,8 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="e3e3c4e07328c9124c75e957d0365c70c061ed74"
-CR_COMMIT="1e4b0d3ac83199520c0165db037a1436eec47370"
+BMS_COMMIT="cedae24af3ed5177129829a6e3db9b527d0f1b15"
+CR_COMMIT="c97d5994e25caf5028e772797078624d0291ffdd"
 DSA_COMMIT="342b731d8c239dad78ec77bfd6ace41916c20704"
 CO_COMMIT="22c327966c32da733391e5490b8d422ebbee9288"
 
@@ -2630,6 +2630,75 @@ run_situated_presence_scenario() {
   provider_post "/fixture/reset" '{}' >/dev/null
 }
 
+run_deferred_delivery_scenario() {
+  local owner="owner-deferred-delivery" client="client-deferred-delivery"
+  local conversation payload response http_status request_id work_id current work proof calls
+  conversation="$(resolve_conversation "$owner" "$client" "deferred-delivery")"
+  # The composed CO uses the default disabled capability registry: read-only delivery only.
+  provider_post "/fixture/delay-next-primary" '{"delay_ms":4000}'
+  payload="$(jq -nc --arg owner "$owner" --arg client "$client" \
+    --arg conversation "$conversation" '{owner_id:$owner,client_id:$client,
+      conversation_id:$conversation,surface:"chat",sensitivity:"private",
+      messages:[{role:"user",content:"Give a brief neutral greeting."}],
+      allow_deferred:true,delivery_wait_ms:100}')"
+  http_status="$(curl -fsS -X POST "http://127.0.0.1:14361/v1/chat" \
+    -H "X-API-Key: smoke-orchestrator-key" -H "Content-Type: application/json" \
+    -d "$payload" -o "$COMPOSED_SMOKE_TMP/deferred-response.json" -w '%{http_code}')"
+  test "$http_status" = "202"
+  response="$(<"$COMPOSED_SMOKE_TMP/deferred-response.json")"
+  jq -e --arg conversation "$conversation" '
+    keys == ["conversation_id","delivery_status","request_id","work_id"]
+    and .delivery_status == "pending" and .conversation_id == $conversation
+  ' <<<"$response" >/dev/null
+  request_id="$(jq -r '.request_id' <<<"$response")"
+  work_id="$(jq -r '.work_id' <<<"$response")"
+  current="$(curl -fsS -G "http://127.0.0.1:14321/v1/internal/current-work" \
+    -H "X-API-Key: smoke-memory-key" \
+    --data-urlencode "owner_id=$owner" --data-urlencode "client_id=$client")"
+  jq -e --arg work "$work_id" --arg request "$request_id" \
+    '.status == "resolved" and .work.work_id == $work and .work.request_id == $request' \
+    <<<"$current" >/dev/null
+  for _ in $(seq 1 100); do
+    work="$(curl -fsS -G "http://127.0.0.1:14321/v1/internal/work-items/$work_id" \
+      -H "X-API-Key: smoke-memory-key" --data-urlencode "owner_id=$owner" \
+      --data-urlencode "conversation_id=$conversation")"
+    if [ "$(jq -r '.state' <<<"$work")" = "completed" ]; then break; fi
+    sleep 0.1
+  done
+  jq -e --arg work "$work_id" --arg request "$request_id" '
+    .work_id == $work and .request_id == $request and .state == "completed"
+    and .assistant_message_id != null and .failure_code == null
+  ' <<<"$work" >/dev/null
+  proof="$(psql_exec -At -v owner="$owner" -v client="$client" -v work="$work_id" \
+    -v request="$request_id" -v conversation="$conversation" <<'SQL'
+SELECT json_build_object(
+  'work_count', (SELECT count(*) FROM work_items WHERE owner_id=:'owner'),
+  'user_count', (SELECT count(*) FROM messages WHERE owner_id=:'owner' AND role='user'),
+  'assistant_count', (SELECT count(*) FROM messages
+    WHERE owner_id=:'owner' AND role='assistant'),
+  'canonical_match_count', (SELECT count(*) FROM work_items w JOIN messages m
+    ON m.work_id=w.work_id AND m.id=w.assistant_message_id
+    WHERE w.work_id=:'work' AND w.owner_id=:'owner' AND w.request_id=:'request'
+      AND w.conversation_id=:'conversation' AND w.client_id=:'client' AND w.surface='chat'
+      AND w.state='completed' AND m.role='assistant' AND m.owner_id=w.owner_id
+      AND m.conversation_id=w.conversation_id AND m.metadata->>'request_id'=w.request_id),
+  'locator_count', (SELECT count(*) FROM current_work
+    WHERE owner_id=:'owner' AND client_id=:'client' AND work_id=:'work')
+);
+SQL
+)"
+  jq -e '.work_count == 1 and .user_count == 1 and .assistant_count == 1
+    and .canonical_match_count == 1 and .locator_count == 1' <<<"$proof" >/dev/null
+  calls="$(fetch_provider_calls "$request_id")"
+  jq -e '(.calls | map(select(.kind == "chat")) | length) == 1' <<<"$calls" >/dev/null
+  assert_persisted_answer_matches "$conversation" "$request_id" \
+    "$(psql_exec -At -v work="$work_id" <<'SQL'
+SELECT content FROM messages WHERE work_id=:'work';
+SQL
+)"
+  echo "Deferred delivery proof: http=202 work_count=1 provider_chat=1 canonical_assistant=1 exact_locator=true"
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 
@@ -2705,6 +2774,7 @@ if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
 fi
 
 # Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
+run_deferred_delivery_scenario
 owner="owner-smoke-a"
 client="client-smoke-a"
 conversation_id="$(resolve_conversation "$owner" "$client" "smoke-a")"
