@@ -2912,7 +2912,13 @@ run_interrupted_delivery_scenario() {
   test "$(docker inspect --format '{{.State.Running}}' "$container")" = "false"
   # The old sole executor is gone. No other service is restarted or reconciled manually.
   since="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')"
-  docker compose -f "$COMPOSE" start --wait orchestrator
+  docker compose -f "$COMPOSE" start orchestrator
+  for _ in $(seq 1 100); do
+    if curl -fsS --max-time 1 http://127.0.0.1:14361/healthz >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
   curl -fsS http://127.0.0.1:14361/healthz >/dev/null
   events="$(docker compose -f "$COMPOSE" logs --timestamps --no-color --since "$since" runtime bms orchestrator \
     | grep -E 'reconcile-interrupted|GET /healthz ')"
