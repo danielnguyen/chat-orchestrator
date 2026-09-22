@@ -2820,7 +2820,9 @@ run_delivery_equivalence_scenario() {
       domain_tags:[],exact_source_refs:[],allowed_sensitivity:"medium",max_results:5}
   }')"
   sync="$(co_post "$(jq -c --arg conversation "$sync_conversation" '. + {conversation_id:$conversation}' <<<"$payload")")"
-  jq -e '.status == "ok" and (.sources | length) > 0' <<<"$sync" >/dev/null
+  # ChatResponse.sources carries artifact references, not the acquired DSA rows.
+  # Assert non-empty retained evidence below through its trace and provider input.
+  assert_jq "delivery_equivalence.sync_status" "$sync" '.status == "ok"'
   sync_request="$(jq -r '.request_id' <<<"$sync")"
   provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
   status="$(curl -fsS -X POST "http://127.0.0.1:14361/v1/chat" \
@@ -2834,10 +2836,11 @@ run_delivery_equivalence_scenario() {
   work_id="$(jq -r '.work_id' <<<"$pending")"
   result="$(wait_completed_work "$owner" "$deferred_conversation" "$work_id")"
   assert_exact_canonical_result "$result"
-  jq -e --argjson sync "$sync" '.result.answer == $sync.answer' <<<"$result" >/dev/null
+  assert_jq "delivery_equivalence.answer" "$result" '.result.answer == $sync.answer' \
+    --argjson sync "$sync"
   sync_calls="$(fetch_provider_calls "$sync_request")"
   deferred_calls="$(fetch_provider_calls "$deferred_request")"
-  jq -en --argjson a "$sync_calls" --argjson b "$deferred_calls" '
+  assert_jq "delivery_equivalence.provider" '{}' '
     [$a.calls[] | select(.kind=="chat")] as $a
     | [$b.calls[] | select(.kind=="chat")] as $b
     | ($a|length)==1 and ($b|length)==1
@@ -2847,10 +2850,12 @@ run_delivery_equivalence_scenario() {
       and $a[0].response_schema_name == $b[0].response_schema_name
       and $a[0].max_completion_tokens == $b[0].max_completion_tokens
       and ($b[0].normalized_messages | tostring | test("allow_deferred|delivery_wait_ms") | not)
-  ' >/dev/null
+      and ([$a[0].normalized_messages[] | select(.content | contains("The migration record confirms the bounded setting."))] | length) == 1
+      and ([$a[0].normalized_messages[] | select(.content | contains("A second retained row prevents count-only proof."))] | length) == 1
+  ' --argjson a "$sync_calls" --argjson b "$deferred_calls"
   sync_trace="$(fetch_trace "$sync_request")"
   deferred_trace="$(fetch_trace "$deferred_request")"
-  jq -en --argjson a "$sync_trace" --argjson b "$deferred_trace" '
+  assert_jq "delivery_equivalence.authority" '{}' '
     def stable: {
       profile:{name:.profile.name,version:.profile.version},
       route:{model:.router_decision.selected_model,provider:.router_decision.provider,
@@ -2870,7 +2875,7 @@ run_delivery_equivalence_scenario() {
     and $a.prompt.evidence_acquisition.sufficiency.status == "sufficient_for_declared_scope"
     and $a.retrieval.prompt_assembly.evidence_provider_mode.mode == "grounded"
     and $a.profile.name != null and $a.router_decision.provider != null
-  ' >/dev/null
+  ' --argjson a "$sync_trace" --argjson b "$deferred_trace"
   assert_grounded_structured_provider_calls "$sync_calls" 1
   assert_grounded_structured_provider_calls "$deferred_calls" 1
   echo "Delivery cognition equivalence: exact_answer=true exact_provider_messages=true model_equal=true tools=0 retained_evidence=2 source=records_primary CR_scope_and_next_step_equal=true"
