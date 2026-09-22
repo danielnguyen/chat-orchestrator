@@ -1,9 +1,274 @@
 import asyncio
 import importlib
+from copy import deepcopy
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
 import pytest
+
+
+@pytest.fixture
+def work_reads(monkeypatch):
+    from test_memory_store_client import result_projection
+
+    main = _load_main(monkeypatch)
+    value = result_projection()
+
+    async def exact(**identity):
+        if any(value["work"][key] != item for key, item in identity.items()):
+            return None
+        return deepcopy(value)
+
+    async def current(**identity):
+        if any(value["work"][key] != item for key, item in identity.items()):
+            return {"status": "none", "work": None}
+        return {"status": "resolved", "work": deepcopy(value["work"])}
+
+    forbidden = [AsyncMock(side_effect=AssertionError("polling side effect")) for _ in range(5)]
+    memory = SimpleNamespace(get_work_result=AsyncMock(side_effect=exact),
+                             get_current_work=AsyncMock(side_effect=current))
+    for method in ("create_work", "transition_work", "set_current_work", "add_message",
+                   "create_trace", "retrieve"):
+        setattr(memory, method, forbidden[4])
+    monkeypatch.setattr(main, "memory_store", memory)
+    monkeypatch.setattr(main, "orchestrate_chat", forbidden[0])
+    monkeypatch.setattr(main, "litellm", SimpleNamespace(chat=forbidden[1]))
+    monkeypatch.setattr(main, "dsa", SimpleNamespace(context_pack=forbidden[2]))
+    monkeypatch.setattr(main, "runtime", SimpleNamespace(start_turn=forbidden[3]))
+    return main, value, memory, forbidden
+
+
+async def _poll_work(main, work, *, current=False, headers=None, **overrides):
+    params = {"owner_id": work["owner_id"]}
+    params.update({"client_id": work["client_id"]} if current else {
+        "conversation_id": work["conversation_id"],
+    })
+    work_id = overrides.pop("work_id", work["work_id"])
+    params.update(overrides)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://test") as client:
+        return await client.get(
+            "/v1/current-work" if current else f"/v1/work-items/{work_id}", params=params,
+            headers={"X-API-Key": "orch-test"} if headers is None else headers,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "running", "completed", "failed"])
+async def test_work_polling_exact_current_private_and_zero_cognition(work_reads, state):
+    from test_memory_store_client import result_projection
+
+    main, value, memory, forbidden = work_reads
+    value.update(result_projection(state))
+    expected = {key: value["work"][key] for key in (
+        "work_id", "conversation_id", "request_id", "state", "failure_code",
+    )}
+    expected["result"] = None if value["result"] is None else {
+        "assistant_message_id": value["result"]["assistant_message_id"],
+        "answer": value["result"]["content"],
+    }
+    before = deepcopy(value)
+    for _ in range(3):
+        for current in (False, True):
+            response = await _poll_work(main, value["work"], current=current)
+            assert response.status_code == 200
+            assert response.json() == ({"status": "resolved", "work": expected}
+                                       if current else expected)
+    assert value == before
+    assert memory.get_work_result.await_count == 6
+    assert memory.get_current_work.await_count == 3
+    for call in memory.get_work_result.call_args_list:
+        assert call.kwargs == {key: value["work"][key] for key in (
+            "work_id", "owner_id", "conversation_id",
+        )}
+    for counter in forbidden:
+        counter.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["owner_id", "conversation_id", "work_id"])
+async def test_exact_work_wrong_identity_is_indistinguishable(work_reads, field):
+    main, value, memory, _ = work_reads
+    wrong = "other" if field == "owner_id" else "00000000-0000-4000-8000-000000000099"
+    response = await _poll_work(main, value["work"], **{field: wrong})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "work_not_found"}
+    memory.get_current_work.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["owner_id", "client_id", "missing"])
+async def test_current_work_has_no_recency_fallback(work_reads, field):
+    main, value, memory, _ = work_reads
+    overrides = {} if field == "missing" else {field: "other"}
+    if field == "missing":
+        memory.get_current_work.side_effect = None
+        memory.get_current_work.return_value = {"status": "none", "work": None}
+    response = await _poll_work(main, value["work"], current=True, **overrides)
+    assert response.status_code == 200
+    assert response.json() == {"status": "none", "work": None}
+    memory.get_work_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [False, True])
+@pytest.mark.parametrize("failure", ["dependency", "extra", "provisional", "reference"])
+async def test_work_polling_failures_are_bounded(work_reads, current, failure):
+    main, value, memory, _ = work_reads
+    if failure == "dependency":
+        memory.get_work_result.side_effect = RuntimeError("private URL SQL sentinel")
+    elif failure == "extra":
+        value["result"]["metadata"] = "private sentinel"
+    elif failure == "provisional":
+        from test_memory_store_client import projection
+        value["work"] = projection("running")
+    else:
+        value["result"]["assistant_message_id"] = value["work"]["work_id"]
+    response = await _poll_work(main, value["work"], current=current)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "work_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", [
+    "work_id", "owner_id", "conversation_id", "request_id", "client_id", "surface",
+    "created_at", "disappeared", "locator_malformed", "locator_unavailable",
+])
+async def test_current_result_immutable_association_is_revalidated(work_reads, field):
+    main, value, memory, _ = work_reads
+    locator = {"status": "resolved", "work": deepcopy(value["work"])}
+    memory.get_current_work.side_effect = None
+    memory.get_current_work.return_value = locator
+    memory.get_work_result.side_effect = None
+    memory.get_work_result.return_value = value
+    if field == "disappeared":
+        memory.get_work_result.return_value = None
+    elif field == "locator_malformed":
+        locator["private"] = "sentinel"
+    elif field == "locator_unavailable":
+        memory.get_current_work.side_effect = RuntimeError("private sentinel")
+    else:
+        value["work"][field] = (
+            "00000000-0000-4000-8000-000000000099" if field.endswith("_id")
+            else "2026-09-20T00:00:00Z" if field == "created_at" else "other"
+        )
+    response = await _poll_work(main, locator["work"], current=True)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "work_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_current_result_allows_lifecycle_advance(work_reads):
+    from test_memory_store_client import projection
+    main, value, memory, _ = work_reads
+    memory.get_current_work.side_effect = None
+    memory.get_current_work.return_value = {"status": "resolved", "work": projection("running")}
+    response = await _poll_work(main, value["work"], current=True)
+    assert response.status_code == 200
+    assert response.json()["work"]["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_exact_work_can_be_read_from_another_surface_without_rewriting_origin(work_reads):
+    main, value, memory, _ = work_reads
+    before = deepcopy(value)
+    response = await _poll_work(main, value["work"], headers={
+        "X-API-Key": "orch-test", "X-Client-ID": "another-client", "X-Surface": "another-surface",
+    })
+    assert response.status_code == 200
+    assert response.json()["result"]["answer"] == value["result"]["content"]
+    assert value == before
+    memory.get_current_work.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["extra", "completed_null", "pending_result", "failure",
+                                        "bad_uuid", "request_id", "result_extra"])
+def test_public_work_models_enforce_strict_shape_and_lifecycle(change):
+    from models import CurrentWorkStatus, WorkStatus
+    from pydantic import ValidationError
+    from test_memory_store_client import result_projection
+
+    source = result_projection()
+    value = {key: source["work"][key] for key in (
+        "work_id", "conversation_id", "request_id", "state", "failure_code",
+    )}
+    value["result"] = {"assistant_message_id": source["result"]["assistant_message_id"],
+                       "answer": source["result"]["content"]}
+    if change == "extra":
+        value["owner_id"] = "private-owner"
+    elif change == "completed_null":
+        value["result"] = None
+    elif change == "pending_result":
+        value["state"] = "pending"
+    elif change == "failure":
+        value["failure_code"] = "interrupted"
+    elif change == "bad_uuid":
+        value["result"]["assistant_message_id"] = "not-a-uuid"
+    elif change == "request_id":
+        value["request_id"] = "x" * 121
+    else:
+        value["result"]["sources"] = []
+    with pytest.raises(ValidationError):
+        WorkStatus.model_validate(value)
+    for current in ({"status": "resolved", "work": None},
+                    {"status": "none", "work": None, "private": "sentinel"}):
+        with pytest.raises(ValidationError):
+            CurrentWorkStatus.model_validate(current)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [False, True])
+async def test_work_polling_requires_service_auth_and_valid_scope(work_reads, current):
+    main, value, memory, _ = work_reads
+    response = await _poll_work(main, value["work"], current=current, headers={})
+    assert response.status_code == 401
+    for overrides in ({"owner_id": ""}, {"client_id" if current else "conversation_id": ""}):
+        response = await _poll_work(main, value["work"], current=current, **overrides)
+        assert response.status_code == 422
+    memory.get_work_result.assert_not_called()
+    memory.get_current_work.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_same_deferred_task_result_is_retrieved_without_recomputation(
+    delivery_flow, monkeypatch,
+):
+    main, memory, provider, _, release, _, _ = delivery_flow
+    invocation = AsyncMock(wraps=main.orchestrate_chat)
+    monkeypatch.setattr(main, "orchestrate_chat", invocation)
+
+    async def exact(**identity):
+        assert identity == {key: memory.work[key] for key in (
+            "work_id", "owner_id", "conversation_id",
+        )}
+        assistant = next(m for m in memory.added_messages if m["role"] == "assistant")
+        return {"work": dict(memory.work), "result": {
+            "assistant_message_id": memory.work["assistant_message_id"],
+            "content": assistant["content"],
+        }}
+
+    monkeypatch.setattr(memory, "get_work_result", exact, raising=False)
+    response = await _delivery_post(main)
+    try:
+        assert response.status_code == 202
+        task, = main._owned_chat_tasks
+    finally:
+        release.set()
+        completed = await asyncio.gather(*main._owned_chat_tasks)
+    canonical = completed[0]
+    assert task.done() and not main._owned_chat_tasks
+    for _ in range(3):
+        result = await _poll_work(main, memory.work)
+        assert result.status_code == 200
+        result = result.json()
+        for key in ("work_id", "conversation_id", "request_id"):
+            assert result[key] == response.json()[key]
+        assert result["result"]["answer"] == canonical["answer"]
+    assert invocation.await_count == 1 and len(provider.calls) == 1
+    assert [c[0] for c in memory.work_calls] == ["create", "running", "completed"]
+    assert [m["role"] for m in memory.added_messages] == ["user", "assistant"]
 
 
 @pytest.mark.asyncio

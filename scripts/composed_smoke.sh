@@ -6,10 +6,10 @@ BMS="$ROOT/../basic-memory-store"
 CR="$ROOT/../cognitive-runtime"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
-BMS_COMMIT="cedae24af3ed5177129829a6e3db9b527d0f1b15"
+BMS_COMMIT="f7d0f77ba572b13f10f38b563469bef367964a35"
 CR_COMMIT="c97d5994e25caf5028e772797078624d0291ffdd"
 DSA_COMMIT="342b731d8c239dad78ec77bfd6ace41916c20704"
-CO_COMMIT="22c327966c32da733391e5490b8d422ebbee9288"
+CO_COMMIT="636ac64084584aef395e066c86415e230a57630d"
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -495,7 +495,7 @@ for path in pathlib.Path("/data").glob("*.sqlite3"):
         ).fetchone()[0] == 0:
             continue
         thread = connection.execute(
-            "SELECT state, revision, last_activity_at, active_runtime_session_id, active_runtime_turn_id FROM conversation_runtime_threads WHERE owner_id = ? AND conversation_id = ?",
+            "SELECT state, revision, last_activity_at, active_runtime_session_id, active_runtime_turn_id, active_surface, active_request_id FROM conversation_runtime_threads WHERE owner_id = ? AND conversation_id = ?",
             (owner, conversation_id),
         ).fetchone()
         if thread is None:
@@ -514,6 +514,12 @@ for path in pathlib.Path("/data").glob("*.sqlite3"):
             "last_activity_at": thread["last_activity_at"],
             "active_runtime_session_id": thread["active_runtime_session_id"],
             "active_runtime_turn_id": thread["active_runtime_turn_id"],
+            "active_surface": thread["active_surface"],
+            "active_request_id": thread["active_request_id"],
+            "turn_statuses": [row[0] for row in connection.execute(
+                "SELECT t.turn_status FROM conversation_runtime_turns t JOIN conversation_runtime_sessions s ON s.runtime_session_id=t.runtime_session_id WHERE s.owner_id=? AND s.conversation_id=? ORDER BY t.id",
+                (owner, conversation_id),
+            ).fetchall()],
             "surfaces": [row["surface"] for row in sessions],
             "session_count": len(sessions),
             "reservation_count": reservations,
@@ -2630,12 +2636,69 @@ run_situated_presence_scenario() {
   provider_post "/fixture/reset" '{}' >/dev/null
 }
 
+co_work_result() {
+  curl -fsS -G "http://127.0.0.1:14361/v1/work-items/$3" \
+    -H "X-API-Key: smoke-orchestrator-key" \
+    --data-urlencode "owner_id=$1" --data-urlencode "conversation_id=$2"
+}
+
+co_current_work() {
+  curl -fsS -G "http://127.0.0.1:14361/v1/current-work" \
+    -H "X-API-Key: smoke-orchestrator-key" \
+    --data-urlencode "owner_id=$1" --data-urlencode "client_id=$2"
+}
+
+assert_public_work() {
+  local value="$1" work="$2" conversation="$3" request="$4"
+  jq -e --arg work "$work" --arg conversation "$conversation" --arg request "$request" '
+    keys == ["conversation_id","failure_code","request_id","result","state","work_id"]
+    and .work_id == $work and .conversation_id == $conversation and .request_id == $request
+    and (if .state == "completed" then
+      .failure_code == null and (.result | keys) == ["answer","assistant_message_id"]
+    else .result == null end)
+  ' <<<"$value" >/dev/null
+}
+
+wait_completed_work() {
+  local value
+  for _ in $(seq 1 150); do
+    value="$(co_work_result "$1" "$2" "$3")"
+    if [ "$(jq -r '.state' <<<"$value")" = "completed" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    test "$(jq -r '.state' <<<"$value")" != "failed"
+    sleep 0.1
+  done
+  echo "Work did not complete within the bounded fixture wait" >&2
+  return 1
+}
+
+assert_exact_canonical_result() {
+  local value="$1" canonical
+  canonical="$(psql_exec -At -v work="$(jq -r '.work_id' <<<"$value")" <<'SQL'
+SELECT json_build_object('assistant_message_id',m.id,'answer',m.content)
+FROM work_items w JOIN messages m ON m.id=w.assistant_message_id AND m.work_id=w.work_id
+WHERE w.work_id=:'work' AND w.state='completed' AND m.role='assistant'
+  AND m.owner_id=w.owner_id AND m.conversation_id=w.conversation_id;
+SQL
+)"
+  jq -e --argjson canonical "$canonical" '.result == $canonical' <<<"$value" >/dev/null
+}
+
+dsa_request_count() {
+  # Audit events do not cover every inventory request; access logs cover every /v1 read.
+  docker compose -f "$COMPOSE" logs --no-color dsa 2>&1 \
+    | awk '/"(GET|POST|PUT|PATCH|DELETE) \/v1\// {n++} END {print n+0}'
+}
+
 run_deferred_delivery_scenario() {
   local owner="owner-deferred-delivery" client="client-deferred-delivery"
   local conversation payload response http_status request_id work_id current work proof calls
+  local public before_dsa before_calls after_calls before_rows after_rows
   conversation="$(resolve_conversation "$owner" "$client" "deferred-delivery")"
   # The composed CO uses the default disabled capability registry: read-only delivery only.
-  provider_post "/fixture/delay-next-primary" '{"delay_ms":4000}'
+  provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
   payload="$(jq -nc --arg owner "$owner" --arg client "$client" \
     --arg conversation "$conversation" '{owner_id:$owner,client_id:$client,
       conversation_id:$conversation,surface:"chat",sensitivity:"private",
@@ -2652,6 +2715,13 @@ run_deferred_delivery_scenario() {
   ' <<<"$response" >/dev/null
   request_id="$(jq -r '.request_id' <<<"$response")"
   work_id="$(jq -r '.work_id' <<<"$response")"
+  public="$(co_work_result "$owner" "$conversation" "$work_id")"
+  assert_public_work "$public" "$work_id" "$conversation" "$request_id"
+  jq -e '(.state == "pending" or .state == "running") and .result == null' <<<"$public" >/dev/null
+  current="$(co_current_work "$owner" "$client")"
+  jq -e --arg work "$work_id" '.status == "resolved" and .work.work_id == $work
+    and (.work.state == "pending" or .work.state == "running") and .work.result == null' \
+    <<<"$current" >/dev/null
   current="$(curl -fsS -G "http://127.0.0.1:14321/v1/internal/current-work" \
     -H "X-API-Key: smoke-memory-key" \
     --data-urlencode "owner_id=$owner" --data-urlencode "client_id=$client")"
@@ -2696,7 +2766,205 @@ SQL
 SELECT content FROM messages WHERE work_id=:'work';
 SQL
 )"
+  public="$(wait_completed_work "$owner" "$conversation" "$work_id")"
+  assert_public_work "$public" "$work_id" "$conversation" "$request_id"
+  assert_exact_canonical_result "$public"
+  before_calls="$(fetch_provider_calls "$request_id")"
+  before_dsa="$(dsa_request_count)"
+  before_rows="$(psql_exec -At -v owner="$owner" <<'SQL'
+SELECT json_build_array(
+ (SELECT count(*) FROM work_items WHERE owner_id=:'owner'),
+ (SELECT count(*) FROM messages WHERE owner_id=:'owner'),
+ (SELECT count(*) FROM traces WHERE owner_id=:'owner'),
+ (SELECT count(*) FROM claim_records WHERE owner_id=:'owner'));
+SQL
+)"
+  for _ in 1 2 3; do
+    test "$(co_work_result "$owner" "$conversation" "$work_id" | jq -Sc .)" = "$(jq -Sc . <<<"$public")"
+    current="$(co_current_work "$owner" "$client")"
+    jq -e --argjson public "$public" '.status == "resolved" and .work == $public' <<<"$current" >/dev/null
+  done
+  http_status="$(curl -sS -G "http://127.0.0.1:14361/v1/work-items/$work_id" \
+    -H "X-API-Key: smoke-orchestrator-key" --data-urlencode 'owner_id=wrong-owner' \
+    --data-urlencode "conversation_id=$conversation" -o "$COMPOSED_SMOKE_TMP/wrong-owner.json" -w '%{http_code}')"
+  test "$http_status" = "404"
+  jq -e '. == {detail:"work_not_found"}' "$COMPOSED_SMOKE_TMP/wrong-owner.json" >/dev/null
+  after_calls="$(fetch_provider_calls "$request_id")"
+  test "$(jq -Sc . <<<"$before_calls")" = "$(jq -Sc . <<<"$after_calls")"
+  test "$(dsa_request_count)" = "$before_dsa"
+  after_rows="$(psql_exec -At -v owner="$owner" <<'SQL'
+SELECT json_build_array(
+ (SELECT count(*) FROM work_items WHERE owner_id=:'owner'),
+ (SELECT count(*) FROM messages WHERE owner_id=:'owner'),
+ (SELECT count(*) FROM traces WHERE owner_id=:'owner'),
+ (SELECT count(*) FROM claim_records WHERE owner_id=:'owner'));
+SQL
+)"
+  test "$before_rows" = "$after_rows"
+  echo "Deferred result polling: exact=current=canonical provider_chat=1 polling_provider_delta=0 polling_dsa_delta=0 owner_isolation=true durable_counts_unchanged=true"
   echo "Deferred delivery proof: http=202 work_count=1 provider_chat=1 canonical_assistant=1 exact_locator=true"
+}
+
+run_delivery_equivalence_scenario() {
+  local owner="owner-delivery-equivalence" client="client-delivery-equivalence"
+  local sync_conversation deferred_conversation payload sync pending result status
+  local sync_request deferred_request work_id sync_calls deferred_calls sync_trace deferred_trace
+  provider_post "/fixture/reset" '{}'
+  reset_source_fixture
+  sync_conversation="$(create_conversation "$owner" "$client")"
+  deferred_conversation="$(create_conversation "$owner" "$client")"
+  # Existing BMS question-index policy excludes '?' queries, avoiding a newly
+  # indexed self-echo with a different server timestamp in each fresh conversation.
+  # The external evidence remains non-empty and provider messages must match exactly.
+  payload="$(jq -nc --arg owner "$owner" --arg client "$client" '{
+    owner_id:$owner,client_id:$client,surface:"chat",sensitivity:"private",
+    messages:[{role:"user",content:"Verify the migration record?"}],
+    external_context_enabled:true,external_context:{enabled:true,source_ids:["records_primary"],
+      domain_tags:[],exact_source_refs:[],allowed_sensitivity:"medium",max_results:5}
+  }')"
+  sync="$(co_post "$(jq -c --arg conversation "$sync_conversation" '. + {conversation_id:$conversation}' <<<"$payload")")"
+  # ChatResponse.sources carries artifact references, not the acquired DSA rows.
+  # Assert non-empty retained evidence below through its trace and provider input.
+  assert_jq "delivery_equivalence.sync_status" "$sync" '.status == "ok"'
+  sync_request="$(jq -r '.request_id' <<<"$sync")"
+  provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
+  status="$(curl -fsS -X POST "http://127.0.0.1:14361/v1/chat" \
+    -H "X-API-Key: smoke-orchestrator-key" -H 'Content-Type: application/json' \
+    -d "$(jq -c --arg conversation "$deferred_conversation" \
+      '. + {conversation_id:$conversation,allow_deferred:true,delivery_wait_ms:100}' <<<"$payload")" \
+    -o "$COMPOSED_SMOKE_TMP/equivalent-pending.json" -w '%{http_code}')"
+  test "$status" = "202"
+  pending="$(<"$COMPOSED_SMOKE_TMP/equivalent-pending.json")"
+  deferred_request="$(jq -r '.request_id' <<<"$pending")"
+  work_id="$(jq -r '.work_id' <<<"$pending")"
+  result="$(wait_completed_work "$owner" "$deferred_conversation" "$work_id")"
+  assert_exact_canonical_result "$result"
+  assert_jq "delivery_equivalence.answer" "$result" '.result.answer == $sync.answer' \
+    --argjson sync "$sync"
+  sync_calls="$(fetch_provider_calls "$sync_request")"
+  deferred_calls="$(fetch_provider_calls "$deferred_request")"
+  assert_jq "delivery_equivalence.provider" '{}' '
+    [$a.calls[] | select(.kind=="chat")] as $a
+    | [$b.calls[] | select(.kind=="chat")] as $b
+    | ($a|length)==1 and ($b|length)==1
+      and $a[0].model == $b[0].model and $a[0].tool_count == 0 and $b[0].tool_count == 0
+      and $a[0].normalized_messages == $b[0].normalized_messages
+      and $a[0].prompt_fingerprint == $b[0].prompt_fingerprint
+      and $a[0].response_schema_name == $b[0].response_schema_name
+      and $a[0].max_completion_tokens == $b[0].max_completion_tokens
+      and ($b[0].normalized_messages | tostring | test("allow_deferred|delivery_wait_ms") | not)
+      and ([$a[0].normalized_messages[] | select(.content | contains("The migration record confirms the bounded setting."))] | length) == 1
+      and ([$a[0].normalized_messages[] | select(.content | contains("A second retained row prevents count-only proof."))] | length) == 1
+  ' --argjson a "$sync_calls" --argjson b "$deferred_calls"
+  sync_trace="$(fetch_trace "$sync_request")"
+  deferred_trace="$(fetch_trace "$deferred_request")"
+  assert_jq "delivery_equivalence.authority" '{}' '
+    def stable: {
+      profile:{name:.profile.name,version:.profile.version},
+      route:{model:.router_decision.selected_model,provider:.router_decision.provider,
+        rule:.router_decision.rule_id},
+      shape:.prompt.evidence_acquisition.shape.task_shape,
+      plan:.prompt.evidence_acquisition.plan.plan_status,
+      strategies:.prompt.evidence_acquisition.plan.selected_strategies,
+      sources:.prompt.evidence_acquisition.acquisition.sources_used,
+      retained:.prompt.evidence_acquisition.acquisition.prompt_retained_item_count,
+      sufficiency:.prompt.evidence_acquisition.sufficiency.status,
+      next_steps:[.prompt.evidence_acquisition.next_steps.selections[].selected_next_step],
+      provider_mode:.retrieval.prompt_assembly.evidence_provider_mode.mode
+    };
+    ($a|stable) == ($b|stable)
+    and $a.prompt.evidence_acquisition.acquisition.sources_used == ["records_primary"]
+    and $a.prompt.evidence_acquisition.acquisition.prompt_retained_item_count == 2
+    and $a.prompt.evidence_acquisition.sufficiency.status == "sufficient_for_declared_scope"
+    and $a.retrieval.prompt_assembly.evidence_provider_mode.mode == "grounded"
+    and $a.profile.name != null and $a.router_decision.provider != null
+  ' --argjson a "$sync_trace" --argjson b "$deferred_trace"
+  assert_grounded_structured_provider_calls "$sync_calls" 1
+  assert_grounded_structured_provider_calls "$deferred_calls" 1
+  echo "Delivery cognition equivalence: exact_answer=true exact_provider_messages=true model_equal=true tools=0 retained_evidence=2 source=records_primary CR_scope_and_next_step_equal=true"
+}
+
+run_interrupted_delivery_scenario() {
+  local owner="owner-delivery-interrupted" client="client-delivery-interrupted"
+  local conversation payload status pending request work current before after container since events proof
+  provider_post "/fixture/reset" '{}'
+  conversation="$(create_conversation "$owner" "$client")"
+  provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
+  payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" '{
+    owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",sensitivity:"private",
+    messages:[{role:"user",content:"Give a brief neutral greeting."}],
+    allow_deferred:true,delivery_wait_ms:100}')"
+  status="$(curl -fsS -X POST "http://127.0.0.1:14361/v1/chat" \
+    -H 'X-API-Key: smoke-orchestrator-key' -H 'Content-Type: application/json' -d "$payload" \
+    -o "$COMPOSED_SMOKE_TMP/interrupted-pending.json" -w '%{http_code}')"
+  test "$status" = "202"
+  pending="$(<"$COMPOSED_SMOKE_TMP/interrupted-pending.json")"
+  request="$(jq -r '.request_id' <<<"$pending")"
+  work="$(jq -r '.work_id' <<<"$pending")"
+  before="$(co_work_result "$owner" "$conversation" "$work")"
+  jq -e '.state == "running" and .result == null' <<<"$before" >/dev/null
+  current="$(co_current_work "$owner" "$client")"
+  jq -e --arg work "$work" '.status=="resolved" and .work.work_id==$work
+    and .work.state=="running" and .work.result==null' <<<"$current" >/dev/null
+  container="$(docker compose -f "$COMPOSE" ps -q orchestrator)"
+  test -n "$container"
+  docker compose -f "$COMPOSE" kill -s SIGKILL orchestrator
+  test "$(docker inspect --format '{{.State.Running}}' "$container")" = "false"
+  # The old sole executor is gone. No other service is restarted or reconciled manually.
+  since="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')"
+  docker compose -f "$COMPOSE" start orchestrator
+  for _ in $(seq 1 100); do
+    if curl -fsS --max-time 1 http://127.0.0.1:14361/healthz >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+  curl -fsS http://127.0.0.1:14361/healthz >/dev/null
+  events="$(docker compose -f "$COMPOSE" logs --timestamps --no-color --since "$since" runtime bms orchestrator \
+    | grep -E 'reconcile-interrupted|GET /healthz ')"
+  python3 - "$events" <<'PY'
+import re
+import sys
+from datetime import datetime
+
+events = sys.argv[1].splitlines()
+def first(fragment, service=None):
+    matches = [line for line in events if fragment in line and (service is None or service in line)]
+    assert matches, fragment
+    return min(datetime.fromisoformat(re.search(r"\d{4}-\d\d-\d\dT\S+", line)[0].replace("Z", "+00:00"))
+               for line in matches)
+assert first("POST /v1/runtime/turns/reconcile-interrupted") < first("POST /v1/internal/work-items/reconcile-interrupted") < first("GET /healthz ", "orchestrator")
+print("Restart startup order: CR reconciliation -> BMS reconciliation -> CO health")
+PY
+  for attempt in 1 2; do
+    after="$(co_work_result "$owner" "$conversation" "$work")"
+    assert_public_work "$after" "$work" "$conversation" "$request"
+    jq -e '.state=="failed" and .failure_code=="interrupted" and .result==null' <<<"$after" >/dev/null
+    current="$(co_current_work "$owner" "$client")"
+    jq -e --argjson after "$after" '.status=="resolved" and .work==$after' <<<"$current" >/dev/null
+    proof="$(psql_exec -At -v owner="$owner" -v request="$request" -v work="$work" <<'SQL'
+SELECT json_build_object(
+ 'work_count',(SELECT count(*) FROM work_items WHERE owner_id=:'owner'),
+ 'failed_exact',(SELECT count(*) FROM work_items WHERE work_id=:'work' AND owner_id=:'owner'
+   AND request_id=:'request' AND state='failed' AND failure_code='interrupted' AND assistant_message_id IS NULL),
+ 'user_count',(SELECT count(*) FROM messages WHERE owner_id=:'owner' AND role='user'),
+ 'assistant_count',(SELECT count(*) FROM messages WHERE owner_id=:'owner' AND role='assistant'),
+ 'claim_count',(SELECT count(*) FROM claim_records WHERE owner_id=:'owner'));
+SQL
+)"
+    jq -e '.work_count==1 and .failed_exact==1 and .user_count==1
+      and .assistant_count==0 and .claim_count==0' <<<"$proof" >/dev/null
+    jq -e '([.calls[] | select(.kind=="chat")] | length) <= 1' \
+      <<<"$(fetch_provider_calls "$request")" >/dev/null
+    after="$(runtime_thread_snapshot "$owner" "$conversation")"
+    jq -e '.state=="idle" and .active_runtime_session_id==null and .active_runtime_turn_id==null
+      and .active_surface==null and .active_request_id==null and .turn_statuses==["abandoned"]' \
+      <<<"$after" >/dev/null
+    # Exceed the provider fixture maximum delay before proving the old response cannot publish.
+    if [ "$attempt" = "1" ]; then sleep 6; fi
+  done
+  echo "Interrupted delivery proof: hard_kill=orchestrator_only work_count=1 failed=interrupted exact=current assistant_count=0 claim_count=0 CR_abandoned=1 provider_chat_at_most=1 late_publication=false"
+  provider_post "/fixture/reset" '{}'
 }
 
 ensure_qdrant_collection
@@ -2775,6 +3043,8 @@ fi
 
 # Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
 run_deferred_delivery_scenario
+run_delivery_equivalence_scenario
+run_interrupted_delivery_scenario
 owner="owner-smoke-a"
 client="client-smoke-a"
 conversation_id="$(resolve_conversation "$owner" "$client" "smoke-a")"
