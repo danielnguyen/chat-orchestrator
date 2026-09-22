@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -14,23 +16,78 @@ from clients.runtime import RuntimeClient
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from models import BriefGenerateRequest, BriefGenerateResponse, ChatRequest, ChatResponse
+from models import (
+    BriefGenerateRequest,
+    BriefGenerateResponse,
+    ChatRequest,
+    ChatResponse,
+    DeferredChatResponse,
+)
 from services.briefing import generate_brief
 from services.orchestrate import orchestrate_chat
 from settings import get_settings
 
 settings = get_settings()
 _chat_logger = logging.getLogger("uvicorn.error.chat_orchestrator.chat")
+_owned_chat_tasks: set[asyncio.Task] = set()
+
+
+def _chat_task_done(task: asyncio.Task) -> None:
+    _owned_chat_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _chat_logger.warning("owned_chat_execution_failed")
+
+
+async def _await_chat_delivery(
+    cognition: Coroutine[Any, Any, dict[str, Any]],
+    admitted: asyncio.Future,
+    body: ChatRequest,
+) -> dict[str, Any] | DeferredChatResponse:
+    # One process owns this exact invocation, independently of the HTTP waiter.
+    task = asyncio.create_task(cognition)
+    _owned_chat_tasks.add(task)
+    task.add_done_callback(_chat_task_done)
+    # wait() does not propagate waiter cancellation to these independently owned tasks.
+    await asyncio.wait({task, admitted}, return_when=asyncio.FIRST_COMPLETED)
+    if task.done():
+        return task.result()
+    work, admitted_at = admitted.result()
+    remaining = max(
+        0, admitted_at + body.delivery_wait_ms / 1000 - asyncio.get_running_loop().time(),
+    )
+    # asyncio.wait distinguishes delivery expiry from a TimeoutError in cognition.
+    done, _ = await asyncio.wait({task}, timeout=remaining)
+    if done:
+        return task.result()
+    if body.client_id is not None:
+        try:
+            await memory_store.set_current_work(
+                owner_id=work["owner_id"], client_id=body.client_id, work_id=work["work_id"],
+            )
+        except Exception:
+            _chat_logger.warning("deferred_locator_unconfirmed")
+            return await asyncio.shield(task)
+    return DeferredChatResponse(
+        request_id=work["request_id"], conversation_id=work["conversation_id"],
+        work_id=work["work_id"],
+    )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     runtime_client = runtime
-    if runtime_client is not None:
-        await runtime_client.open()
     try:
+        if runtime_client is not None:
+            await runtime_client.open()
+            await runtime_client.reconcile_interrupted_turns(str(uuid4()))
+        await memory_store.reconcile_interrupted_work()
         yield
     finally:
+        tasks = tuple(_owned_chat_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if runtime_client is not None:
             await runtime_client.close()
 
@@ -121,6 +178,7 @@ async def brief_generate(body: BriefGenerateRequest) -> BriefGenerateResponse:
 @app.post(
     "/v1/chat",
     response_model=ChatResponse,
+    responses={202: {"model": DeferredChatResponse}},
     dependencies=[Depends(require_api_key)],
 )
 async def chat(body: ChatRequest) -> ChatResponse:
@@ -130,8 +188,20 @@ async def chat(body: ChatRequest) -> ChatResponse:
         request_id,
     )
     try:
-        result = await orchestrate_chat(
-            payload=body.model_dump(),
+        eligible = (
+            body.allow_deferred and body.delivery_wait_ms is not None
+            and runtime is not None
+            and not settings.cognitive_runtime_capability_registry_enabled
+            and body.capability_confirmation is None
+        )
+        admitted = asyncio.get_running_loop().create_future() if eligible else None
+
+        def on_work_admitted(work: dict[str, Any]) -> None:
+            if admitted is not None and not admitted.done():
+                admitted.set_result((work, asyncio.get_running_loop().time()))
+
+        cognition = orchestrate_chat(
+            payload=body.model_dump(exclude={"allow_deferred", "delivery_wait_ms"}),
             memory_store=memory_store,
             litellm=litellm,
             runtime=runtime,
@@ -164,7 +234,14 @@ async def chat(body: ChatRequest) -> ChatResponse:
             prompt_output_token_reserve=settings.prompt_output_token_reserve,
             prompt_context_safety_margin=settings.prompt_context_safety_margin,
             request_id=request_id,
+            on_work_admitted=on_work_admitted if eligible else None,
         )
+        result = (
+            await _await_chat_delivery(cognition, admitted, body)
+            if eligible else await cognition
+        )
+        if isinstance(result, DeferredChatResponse):
+            return JSONResponse(status_code=202, content=result.model_dump())
         response = ChatResponse(**result)
         _chat_logger.info(
             "chat_request_completed component=chat-orchestrator request_id=%s status=%s",

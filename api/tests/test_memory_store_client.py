@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 
 import httpx
@@ -38,6 +39,33 @@ def projection(state="pending", **overrides):
     return {**value, **overrides}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, 3])
+async def test_reconcile_work_is_bodyless_count_only(service, count):
+    client, responses, calls = service
+    responses.append({"interrupted_count": count})
+    assert await client.reconcile_interrupted_work() == {"interrupted_count": count}
+    assert len(calls) == 1
+    assert calls[0].method == "POST"
+    assert calls[0].url.path == "/v1/internal/work-items/reconcile-interrupted"
+    assert calls[0].content == b""
+    assert calls[0].headers["X-API-Key"] == "test-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    None, [], {}, {"interrupted_count": True}, {"interrupted_count": -1},
+    {"interrupted_count": 1.0}, {"interrupted_count": "1"},
+    {"interrupted_count": 0, "work": []},
+])
+async def test_reconcile_work_rejects_malformed_without_retry(service, response):
+    client, responses, calls = service
+    responses.append(response)
+    with pytest.raises(RuntimeError, match="work_reconciliation_response_invalid"):
+        await client.reconcile_interrupted_work()
+    assert len(calls) == 1
+
+
 @pytest.fixture
 def service(monkeypatch):
     calls = []
@@ -46,7 +74,7 @@ def service(monkeypatch):
 
     def handler(request):
         calls.append(request)
-        return httpx.Response(200, json=responses.pop(0))
+        return httpx.Response(200, content=json.dumps(responses.pop(0)))
 
     monkeypatch.setattr(
         httpx,

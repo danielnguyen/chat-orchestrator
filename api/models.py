@@ -231,6 +231,14 @@ class ChatRequest(BaseModel):
     brief_type: BriefType = "general"
     interrupt_policy_mode: InterruptPolicyMode = "off"
     capability_confirmation: Optional[CapabilityConfirmationInput] = None
+    allow_deferred: bool = False
+    delivery_wait_ms: Optional[int] = Field(default=None, ge=100, le=30000, strict=True)
+
+    @model_validator(mode="after")
+    def validate_delivery_wait(self) -> "ChatRequest":
+        if self.allow_deferred != (self.delivery_wait_ms is not None):
+            raise ValueError("deferred_delivery_requires_wait_budget")
+        return self
 
     @model_validator(mode="after")
     def validate_exact_reference_opt_in(self) -> "ChatRequest":
@@ -241,6 +249,15 @@ class ChatRequest(BaseModel):
             ):
                 raise ValueError("exact_source_reference_requires_external_context")
         return self
+
+
+class DeferredChatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=36, max_length=36)
+    work_id: str = Field(min_length=36, max_length=36)
+    delivery_status: Literal["pending"] = "pending"
 
 
 class ChatResponse(BaseModel):

@@ -879,6 +879,19 @@ class RuntimeClient:
                 pass
             raise
 
+    async def reconcile_interrupted_turns(self, request_id: str) -> dict[str, int]:
+        response = await self._post(
+            "/v1/runtime/turns/reconcile-interrupted", json={"request_id": request_id},
+        )
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"interrupted_count"}
+            or type(response["interrupted_count"]) is not int
+            or response["interrupted_count"] < 0
+        ):
+            raise RuntimeError("runtime_reconciliation_response_invalid")
+        return response
+
     async def overlay(
         self,
         *,

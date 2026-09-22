@@ -110,6 +110,23 @@ class MemoryStoreClient:
         self.api_key = api_key
         self.timeout = timeout_ms / 1000
 
+    async def reconcile_interrupted_work(self) -> dict[str, int]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/v1/internal/work-items/reconcile-interrupted",
+                headers={"X-API-Key": self.api_key},
+            )
+            response.raise_for_status()
+            result = response.json()
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"interrupted_count"}
+            or type(result["interrupted_count"]) is not int
+            or result["interrupted_count"] < 0
+        ):
+            raise RuntimeError("work_reconciliation_response_invalid")
+        return result
+
     async def create_work(
         self, *, owner_id: str, conversation_id: str, request_id: str,
         client_id: str | None, surface: str,

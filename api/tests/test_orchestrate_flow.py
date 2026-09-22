@@ -37355,6 +37355,43 @@ async def _run_durable_work_chat(tmp_path, memory, *, provider=None, **options):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("observer_fails", [False, True])
+async def test_work_admission_observer_is_once_defensive_and_non_authoritative(
+    tmp_path, observer_fails,
+):
+    memory = DurableWorkMemoryStore()
+    observed = []
+
+    def observer(work):
+        assert memory.events == ["work:pending"]
+        assert work == memory.work and work is not memory.work
+        assert work["state"] == "pending"
+        assert set(work) == {
+            "work_id", "owner_id", "conversation_id", "request_id", "client_id", "surface",
+            "state", "created_at", "started_at", "completed_at",
+            "assistant_message_id", "failure_code",
+        }
+        observed.append(dict(work))
+        work["owner_id"] = "cannot-alter-authority"
+        if observer_fails:
+            raise RuntimeError("private observer detail")
+
+    result = await _run_durable_work_chat(tmp_path, memory, on_work_admitted=observer)
+    assert len(observed) == 1
+    assert memory.work["owner_id"] == "owner"
+    assert memory.work["state"] == "completed" and result["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_work_admission_observer_not_called_for_rejected_work(tmp_path):
+    memory = DurableWorkMemoryStore(mismatch="owner_id")
+    observed = []
+    with pytest.raises(RuntimeError, match="work_projection_context_mismatch"):
+        await _run_durable_work_chat(tmp_path, memory, on_work_admitted=observed.append)
+    assert observed == []
+
+
+@pytest.mark.asyncio
 async def test_durable_work_synchronous_order_and_exact_completion(tmp_path):
     memory = DurableWorkMemoryStore()
 
