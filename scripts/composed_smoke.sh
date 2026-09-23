@@ -10,6 +10,9 @@ BMS_COMMIT="f7d0f77ba572b13f10f38b563469bef367964a35"
 CR_COMMIT="c97d5994e25caf5028e772797078624d0291ffdd"
 DSA_COMMIT="342b731d8c239dad78ec77bfd6ace41916c20704"
 CO_COMMIT="636ac64084584aef395e066c86415e230a57630d"
+G2="$ROOT/../g2-gateway"
+G2_CONTAINER=""
+G2_IMAGE=""
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -45,7 +48,13 @@ git -C "$ROOT" merge-base --is-ancestor "$CO_COMMIT" HEAD || {
   exit 2
 }
 
-docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
+if [ "${G2_DEFERRED_ONLY:-}" = "1" ]; then
+  git -C "$G2" merge-base --is-ancestor 56f2e55d240ba539aa938a994c1be64d8fde275f HEAD || {
+    echo "g2-gateway/HEAD must contain the merged deferred-result contract" >&2
+    exit 2
+  }
+  test -z "$(git -C "$G2" status --porcelain)"
+fi
 
 composed_tmp_root="${COMPOSED_SMOKE_TMP_ROOT:-/tmp}"
 mkdir -p "$composed_tmp_root"
@@ -61,6 +70,12 @@ fi
 
 cleanup() {
   local status="$?"
+  if [ -n "$G2_CONTAINER" ]; then
+    docker rm -f "$G2_CONTAINER" >/dev/null || status=1
+  fi
+  if [ -n "$G2_IMAGE" ]; then
+    docker image rm "$G2_IMAGE" >/dev/null || status=1
+  fi
   if [ "$status" -ne 0 ] && [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
     mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
     docker compose -f "$COMPOSE" ps --format json \
@@ -69,11 +84,17 @@ cleanup() {
       | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+' \
       >"$COMPOSED_SMOKE_LOG_DIR/bounded-service.log" || true
   fi
-  docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || status=1
   rm -rf "$COMPOSED_SMOKE_TMP"
+  if [ "${G2_DEFERRED_ONLY:-}" = "1" ]; then
+    echo "G2 deferred cleanup: exit_status=$status"
+  fi
   return "$status"
 }
 trap cleanup EXIT
+
+# Resolve the fixture mounts before removing any previous disposable composition.
+docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null
 
 compose_up_args=(-d --wait)
 if [ "${COMPOSED_SKIP_BUILD:-}" != "1" ]; then
@@ -2967,8 +2988,143 @@ SQL
   provider_post "/fixture/reset" '{}'
 }
 
+g2_work_result() {
+  curl -fsS --max-time 20 -G "http://127.0.0.1:14341/g2/work-items/$1" \
+    -H 'Authorization: Bearer smoke-g2-token' --data-urlencode "conversation_id=$2"
+}
+
+g2_work_rows() {
+  psql_exec -At -v request="$1" <<'SQL'
+SELECT coalesce(json_agg(w ORDER BY work_id)::text, '[]') FROM work_items w
+WHERE owner_id='owner-ac10-g2' AND request_id=:'request';
+SQL
+}
+
+run_g2_deferred_scenario() {
+  local network gateway_sha status pending request conversation work result public
+  local before_calls after_calls before_rows after_rows gateway_gets=0
+  gateway_sha="$(git -C "$G2" rev-parse HEAD)"
+  install_disposable_surface_binding g2
+  network="$(docker inspect "$(docker compose -f "$COMPOSE" ps -q orchestrator)" \
+    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{end}}')"
+  test -n "$network"
+  G2_IMAGE="g2-gateway-smoke:$(basename "$COMPOSED_SMOKE_TMP" | tr '[:upper:]' '[:lower:]')"
+  docker build -f "$G2/Containerfile" -t "$G2_IMAGE" "$G2"
+  # Name it before creation so a failed start (for example a port collision) is cleaned up too.
+  G2_CONTAINER="$(basename "$COMPOSED_SMOKE_TMP")-g2"
+  docker run -d --name "$G2_CONTAINER" --network "$network" -p 127.0.0.1:14341:8000 \
+    -e G2_GATEWAY_TOKEN=smoke-g2-token -e G2_OWNER_ID=owner-ac10-g2 \
+    -e G2_CLIENT_ID=even-realities-g2 \
+    -e CHAT_ORCHESTRATOR_URL=http://orchestrator:8000 \
+    -e CHAT_ORCHESTRATOR_API_KEY=smoke-orchestrator-key "$G2_IMAGE" >/dev/null
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 http://127.0.0.1:14341/health >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
+  curl -fsS --max-time 2 http://127.0.0.1:14341/health >/dev/null
+  echo "G2 composition: gateway=$gateway_sha co=$(git -C "$ROOT" rev-parse HEAD) bms=$(git -C "$BMS" rev-parse HEAD) cr=$(git -C "$CR" rev-parse HEAD) dsa=$(git -C "$DSA" rev-parse HEAD) disposable_g2_binding=true"
+  provider_post /fixture/reset '{}'
+  provider_post /fixture/delay-next-primary '{"delay_ms":18000}'
+  status="$(curl -sS --max-time 20 -o "$COMPOSED_SMOKE_TMP/g2-pending.json" -w '%{http_code}' \
+    http://127.0.0.1:14341/g2/turn -H 'Authorization: Bearer smoke-g2-token' \
+    -H 'Content-Type: application/json' \
+    -d '{"mode":"ask","text":"Explain how a compass indicates direction.","input_mode":"voice_transcribed"}')"
+  test "$status" = 202
+  pending="$(cat "$COMPOSED_SMOKE_TMP/g2-pending.json")"
+  jq -e 'keys == ["conversation_id","delivery_status","request_id","source","title","work_id"]
+    and .delivery_status == "pending" and .source == "chat-orchestrator"
+    and ([.request_id,.conversation_id,.work_id] | all(type == "string" and length > 0))' \
+    <<<"$pending" >/dev/null
+  request="$(jq -r .request_id <<<"$pending")"
+  conversation="$(jq -r .conversation_id <<<"$pending")"
+  work="$(jq -r .work_id <<<"$pending")"
+  python3 - "$conversation" "$work" <<'PY'
+import sys, uuid
+assert all(str(uuid.UUID(value)) == value for value in sys.argv[1:])
+PY
+  # Like the HUD, wait before each serialized exact read. This bound is only a CI deadline.
+  for _ in $(seq 1 60); do
+    sleep 1
+    result="$(g2_work_result "$work" "$conversation")"
+    gateway_gets=$((gateway_gets + 1))
+    jq -e --arg work "$work" --arg conversation "$conversation" --arg request "$request" '
+      .work_id == $work and .conversation_id == $conversation and .request_id == $request
+      and .source == "chat-orchestrator"
+      and (if .state == "completed" then
+        keys == ["conversation_id","pages","raw_length","request_id","source","state","work_id"]
+      else (.state == "pending" or .state == "running")
+        and keys == ["conversation_id","request_id","source","state","work_id"] end)' \
+      <<<"$result" >/dev/null
+    if [ "$(jq -r .state <<<"$result")" = completed ]; then break; fi
+  done
+  test "$(jq -r .state <<<"$result")" = completed
+  public="$(co_work_result owner-ac10-g2 "$conversation" "$work")"
+  assert_public_work "$public" "$work" "$conversation" "$request"
+  jq -e '.state == "completed" and (.result.answer | type == "string" and test("\\S"))' <<<"$public" >/dev/null
+  assert_exact_canonical_result "$public"
+  # Execute the actual merged gateway pagination implementation; never log answer content.
+  jq -nc --argjson public "$public" --argjson g2 "$result" '{public:$public,g2:$g2}' \
+    | docker exec -i "$G2_CONTAINER" node --input-type=module -e '
+      import {paginateText} from "./dist/pagination.js";
+      let input = ""; for await (const chunk of process.stdin) input += chunk;
+      const {public: work, g2} = JSON.parse(input);
+      const answer = work.result.answer;
+      if (g2.raw_length !== answer.length ||
+          JSON.stringify(g2.pages) !== JSON.stringify(paginateText(answer))) process.exit(1);
+    '
+  before_calls="$(fetch_provider_calls "$request")"
+  jq -e '(.calls | map(select(.kind == "chat")) | length) == 1' <<<"$before_calls" >/dev/null
+  before_rows="$(g2_work_rows "$request")"
+  jq -e --arg work "$work" --arg conversation "$conversation" \
+    --arg message "$(jq -r .result.assistant_message_id <<<"$public")" '
+    length == 1 and .[0].work_id == $work and .[0].conversation_id == $conversation
+    and .[0].client_id == "even-realities-g2" and .[0].surface == "g2"
+    and .[0].state == "completed" and .[0].assistant_message_id == $message' <<<"$before_rows" >/dev/null
+  for _ in 1 2 3; do
+    test "$(g2_work_result "$work" "$conversation" | jq -Sc .)" = "$(jq -Sc . <<<"$result")"
+    gateway_gets=$((gateway_gets + 1))
+    test "$(co_work_result owner-ac10-g2 "$conversation" "$work" | jq -Sc .)" = "$(jq -Sc . <<<"$public")"
+  done
+  after_calls="$(fetch_provider_calls "$request")"
+  after_rows="$(g2_work_rows "$request")"
+  test "$(jq -Sc . <<<"$before_calls")" = "$(jq -Sc . <<<"$after_calls")"
+  test "$(jq -Sc . <<<"$before_rows")" = "$(jq -Sc . <<<"$after_rows")"
+  assert_exact_canonical_result "$public"
+  docker logs "$G2_CONTAINER" >"$COMPOSED_SMOKE_TMP/g2-http.log" 2>&1
+  docker compose -f "$COMPOSE" logs --no-color orchestrator >"$COMPOSED_SMOKE_TMP/co-http.log" 2>&1
+  python3 - "$COMPOSED_SMOKE_TMP" "$work" "$conversation" "$gateway_gets" <<'PY'
+import json, pathlib, re, sys
+from urllib.parse import parse_qs, urlsplit
+root, work, conversation, expected = sys.argv[1:]
+requests = []
+for line in pathlib.Path(root, "g2-http.log").read_text().splitlines():
+    entry = json.loads(line)
+    if "req" in entry and entry["req"]["url"] != "/health":
+        requests.append(entry["req"])
+assert requests[0]["method"] == "POST" and requests[0]["url"] == "/g2/turn"
+assert len(requests) == int(expected) + 1
+for entry in requests[1:]:
+    url = urlsplit(entry["url"])
+    assert entry["method"] == "GET" and url.path == f"/g2/work-items/{work}"
+    assert parse_qs(url.query) == {"conversation_id": [conversation]}
+co = re.findall(r'"(GET|POST|PUT|PATCH|DELETE) (/v1/[^ ]+) HTTP/[^ ]+"',
+                pathlib.Path(root, "co-http.log").read_text())
+assert co[0] == ("POST", "/v1/chat")
+assert len(co) == int(expected) + 5  # one submission, gateway reads, four direct reads
+assert all(method == "GET" and urlsplit(url).path == f"/v1/work-items/{work}"
+           for method, url in co[1:])
+print("G2 HTTP proof: turn_post=1 chat_post=1 subsequent_traffic=exact_get_only")
+PY
+  echo "G2 deferred proof: http=202 delay_ms=18000 request=$request conversation=$conversation work=$work assistant=$(jq -r .result.assistant_message_id <<<"$public") work_count=1 provider_chat=1 polling_provider_delta=0 polling_work_delta=0 pagination_equal=true direct_exact_equal=true identity_unchanged=true"
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+
+if [ "${G2_DEFERRED_ONLY:-}" = "1" ]; then
+  run_g2_deferred_scenario
+  exit 0
+fi
 
 if [ "${CLAIM_TRACE_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: claim-trace-only"

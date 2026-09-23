@@ -20,6 +20,7 @@ on:
           - scope-references
           - structured-answer-recovery
           - source-scope
+          - g2-deferred
   pull_request:
     branches:
       - main
@@ -98,6 +99,15 @@ jobs:
           git -C basic-memory-store branch --force main "$bms"
           git -C chat-orchestrator merge-base --is-ancestor 22c327966c32da733391e5490b8d422ebbee9288 HEAD
 
+      - name: Checkout G2 gateway
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all' || inputs.evidence_scenario == 'g2-deferred'
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/g2-gateway
+          ref: main
+          path: g2-gateway
+          fetch-depth: 0
+
       - name: Validate Compose configuration
         working-directory: chat-orchestrator
         env:
@@ -116,6 +126,7 @@ jobs:
           chat-orchestrator:history-root-lineage-v2-test python -m pytest -q
 
       - name: Run focused actual-service evidence proof
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario != 'g2-deferred'
         working-directory: chat-orchestrator
         env:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
@@ -124,6 +135,7 @@ jobs:
         run: make composed-smoke
 
       - name: Run formatted presentation persistence proof
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario != 'g2-deferred'
         working-directory: chat-orchestrator
         env:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
@@ -131,6 +143,14 @@ jobs:
           EVIDENCE_SCENARIO: general-reasoning-presentation
           COMPOSED_GENERAL_EVIDENCE_REASONING_ENABLED: "true"
           COMPOSED_GENERAL_EVIDENCE_REASONING_PRESENTATION_ENABLED: "true"
+        run: make composed-smoke
+
+      - name: Run G2 deferred result proof
+        if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all' || inputs.evidence_scenario == 'g2-deferred'
+        working-directory: chat-orchestrator
+        env:
+          COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
+          G2_DEFERRED_ONLY: "1"
         run: make composed-smoke
 
       - name: Run policy-admitted advisory evidence proof

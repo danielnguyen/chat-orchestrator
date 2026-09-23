@@ -507,7 +507,7 @@ async def fixture_delay_next_primary(body: dict[str, Any]) -> dict[str, Any]:
     delay_ms = body.get("delay_ms")
     if isinstance(delay_ms, bool) or not isinstance(delay_ms, int):
         raise HTTPException(status_code=422, detail="invalid fixture delay")
-    if not 1 <= delay_ms <= 5_000:
+    if not 1 <= delay_ms <= 20_000:
         raise HTTPException(status_code=422, detail="invalid fixture delay")
     _next_primary_delay_ms = delay_ms
     return {"status": "ok", "delay_ms": delay_ms}
