@@ -3008,13 +3008,15 @@ run_g2_deferred_scenario() {
   network="$(docker inspect "$(docker compose -f "$COMPOSE" ps -q orchestrator)" \
     --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{end}}')"
   test -n "$network"
-  G2_IMAGE="g2-gateway-smoke:$gateway_sha"
+  G2_IMAGE="g2-gateway-smoke:$(basename "$COMPOSED_SMOKE_TMP" | tr '[:upper:]' '[:lower:]')"
   docker build -f "$G2/Containerfile" -t "$G2_IMAGE" "$G2"
-  G2_CONTAINER="$(docker run -d --network "$network" -p 127.0.0.1:14341:8000 \
+  # Name it before creation so a failed start (for example a port collision) is cleaned up too.
+  G2_CONTAINER="$(basename "$COMPOSED_SMOKE_TMP")-g2"
+  docker run -d --name "$G2_CONTAINER" --network "$network" -p 127.0.0.1:14341:8000 \
     -e G2_GATEWAY_TOKEN=smoke-g2-token -e G2_OWNER_ID=owner-ac10-g2 \
     -e G2_CLIENT_ID=even-realities-g2 \
     -e CHAT_ORCHESTRATOR_URL=http://orchestrator:8000 \
-    -e CHAT_ORCHESTRATOR_API_KEY=smoke-orchestrator-key "$G2_IMAGE")"
+    -e CHAT_ORCHESTRATOR_API_KEY=smoke-orchestrator-key "$G2_IMAGE" >/dev/null
   for _ in $(seq 1 30); do
     if curl -fsS --max-time 2 http://127.0.0.1:14341/health >/dev/null 2>&1; then break; fi
     sleep 1
