@@ -14,6 +14,73 @@ _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
 _COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
 _COMPANION_ENDPOINT_KEY = "_cognitive_runtime_compile_endpoint"
 
+_PRESENCE_STATES = {
+    "not_present", "available", "active_conversation", "ambient_listening", "idle",
+    "returning_after_gap", "low_attention", "driving_or_active_task", "do_not_intrude",
+}
+_PRESENCE_DECISION_STATES = {
+    "session_not_present": "not_present",
+    "active_task_mode": "driving_or_active_task",
+    "session_active_task_mode": "driving_or_active_task",
+    "session_paused": "low_attention",
+    "attention_paused": "low_attention",
+    "thread_active": "active_conversation",
+    "session_idle": "idle",
+    "session_available": "available",
+}
+
+
+def validate_presence_response(
+    response: Any, *, scope: dict[str, str], active_task_mode: bool,
+    proactive_output_suppressed: bool,
+) -> dict[str, Any]:
+    if not isinstance(response, dict) or set(response) != {*scope, "result"}:
+        raise RuntimeError("presence_response_invalid")
+    if any(type(response[key]) is not str or response[key] != value
+           for key, value in scope.items()):
+        raise RuntimeError("presence_response_context_mismatch")
+    result = response["result"]
+    if not isinstance(result, dict) or set(result) != {
+        "presence_state", "previous_presence_state", "state_changed",
+        "proactive_output_suppressed", "required_help_allowed", "reason_codes", "policy_version",
+    }:
+        raise RuntimeError("presence_response_invalid")
+    state = result["presence_state"]
+    previous = result["previous_presence_state"]
+    if (
+        not isinstance(state, str) or state not in _PRESENCE_STATES
+        or (previous is not None and (
+            not isinstance(previous, str) or previous not in _PRESENCE_STATES
+        ))
+        or any(type(result[key]) is not bool for key in (
+            "state_changed", "proactive_output_suppressed", "required_help_allowed",
+        ))
+        or result["policy_version"] != "runtime-presence.v1"
+    ):
+        raise RuntimeError("presence_response_invalid")
+    if state not in _PRESENCE_DECISION_STATES.values():
+        raise RuntimeError("presence_response_unsupported_state")
+    reasons = result["reason_codes"]
+    if (
+        not isinstance(reasons, list) or not 1 <= len(reasons) <= 2
+        or any(not isinstance(reason, str) for reason in reasons)
+        or len(reasons) != len(set(reasons))
+        or _PRESENCE_DECISION_STATES.get(reasons[0]) != state
+        or (len(reasons) == 2 and reasons[1] != "proactive_suppression_requested")
+    ):
+        raise RuntimeError("presence_response_invalid")
+    suppressed = state in {"not_present", "idle", "low_attention", "driving_or_active_task"}
+    if (
+        result["state_changed"] != (state != previous)
+        or result["required_help_allowed"] != (state != "not_present")
+        or result["proactive_output_suppressed"] != (suppressed or proactive_output_suppressed)
+        or ("proactive_suppression_requested" in reasons) != proactive_output_suppressed
+        or (reasons[0] == "active_task_mode" and not active_task_mode)
+        or (active_task_mode and state != "not_present" and reasons[0] != "active_task_mode")
+    ):
+        raise RuntimeError("presence_response_invalid")
+    return response
+
 _HISTORY_INTENTS = {
     "not_history_followup",
     "support_explanation",
@@ -2272,6 +2339,33 @@ class RuntimeClient:
         if surface_metadata_json is not None:
             payload["surface_metadata_json"] = surface_metadata_json
         return await self._post("/v1/runtime/restraint/evaluate", json=payload)
+
+    async def evaluate_presence(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        runtime_session_id: str, runtime_turn_id: str, active_task_mode: bool = False,
+        proactive_output_suppressed: bool = False,
+    ) -> dict[str, Any]:
+        scope = {
+            "request_id": request_id, "owner_id": owner_id,
+            "conversation_id": conversation_id, "surface": surface,
+            "runtime_session_id": runtime_session_id, "runtime_turn_id": runtime_turn_id,
+        }
+        if (
+            any(not _bounded_runtime_identifier(value) or not value.strip()
+                for value in scope.values())
+            or len(surface) > 64
+            or type(active_task_mode) is not bool
+            or type(proactive_output_suppressed) is not bool
+        ):
+            raise ValueError("presence_request_invalid")
+        response = await self._post("/v1/runtime/presence/evaluate", json={
+            **scope, "active_task_mode": active_task_mode,
+            "proactive_output_suppressed": proactive_output_suppressed,
+        })
+        return validate_presence_response(
+            response, scope=scope, active_task_mode=active_task_mode,
+            proactive_output_suppressed=proactive_output_suppressed,
+        )
 
     async def evaluate_situated_presence(
         self,

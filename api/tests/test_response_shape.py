@@ -1,6 +1,11 @@
+from copy import deepcopy
+
+import pytest
 from models import StyleEnvelope
 from services.response_shape import (
+    ResponseShape,
     build_response_shape_guidance_block,
+    clamp_response_shape_for_runtime_presence,
     resolve_response_shape,
 )
 
@@ -195,3 +200,49 @@ def test_response_shape_trace_keys_do_not_use_banned_identifiers():
     assert keys
     for token in BANNED_TOKENS:
         assert all(token not in key for key in keys)
+
+
+@pytest.mark.parametrize("presence", [None, {}, {"proactive_output_suppressed": False}])
+def test_runtime_presence_without_suppression_preserves_shape(presence):
+    shape, trace = resolve_response_shape({}, StyleEnvelope(), {})
+    assert clamp_response_shape_for_runtime_presence(shape, trace, presence) == (shape, trace)
+
+
+@pytest.mark.parametrize("continuation", ["none", "expandable", "abbreviated", "suppressed"])
+@pytest.mark.parametrize("spoken", [False, True])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_runtime_presence_only_narrows_expansion_and_preserves_required_detail(
+    continuation, spoken, fallback,
+):
+    shape = ResponseShape(
+        spoken_output=spoken, avoid_markdown=spoken, max_sentence_count=7 if spoken else None,
+        allows_expansion=True, expansion_marker_allowed=True, continuation_state=continuation,
+        confirmation_style="explicit",
+    )
+    trace = {"included": False, "guidance_flags": {"spoken_output": spoken}}
+    before = deepcopy((shape, trace))
+    presence = {"proactive_output_suppressed": True}
+    if fallback:
+        presence.update(status="fallback", fallback_status="suppression_only")
+    narrowed, updated = clamp_response_shape_for_runtime_presence(shape, trace, presence)
+    expected = shape.model_dump()
+    expected.update(
+        allows_expansion=False, expansion_marker_allowed=False,
+        continuation_state="abbreviated" if continuation == "expandable" else continuation,
+    )
+    assert narrowed.model_dump() == expected
+    assert (shape, trace) == before
+    change = updated["runtime_presence"]
+    assert change["applied"] is True
+    assert set(change["changed_fields"]) == {
+        key for key in change["before"] if change["before"][key] != change["after"][key]
+    }
+    guidance = build_response_shape_guidance_block(narrowed, updated)
+    assert "Answer the user's request directly" in guidance
+    assert "Omit optional proactive suggestions" in guidance
+    assert "Preserve all information required" in guidance
+    assert "more detail is available" not in guidance
+    if not spoken:
+        assert "two" not in guidance
+    for internal in ["R44", "Phase 6", "presence", "idle", "driving", "reason_codes"]:
+        assert internal not in guidance

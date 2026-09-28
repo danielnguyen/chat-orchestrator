@@ -1,9 +1,17 @@
 import json
+from copy import deepcopy
 
+import httpx
 import pytest
 from clients.memory_store import MemoryStoreClient
 from clients.runtime import RuntimeClient
 from services.orchestration_replay import (
+    REGISTRY_PATH,
+    RULES_PATH,
+    ReplayMemoryStore,
+    ReplayProvider,
+    ReplayRuntime,
+    _payload,
     assert_snapshot_privacy_safe,
     compare_snapshot,
     load_corpus,
@@ -971,3 +979,230 @@ async def test_failure_scenarios_do_not_claim_false_success():
         "conversation_resolution",
         "cr_turn_start",
     ]
+
+
+async def _ordinary_presence(self, **request):
+    state = "driving_or_active_task" if request["active_task_mode"] else "active_conversation"
+    reason = "active_task_mode" if request["active_task_mode"] else "thread_active"
+    return _replay_presence_response(request, state, reason)
+
+
+def _replay_presence_response(request, state, reason):
+    suppressed = request["proactive_output_suppressed"]
+    return {
+        **{key: value for key, value in request.items()
+           if key not in {"active_task_mode", "proactive_output_suppressed"}},
+        "result": {
+            "presence_state": state, "previous_presence_state": None, "state_changed": True,
+            "proactive_output_suppressed": suppressed or state not in {
+                "available", "active_conversation",
+            },
+            "required_help_allowed": state != "not_present",
+            "reason_codes": [reason] + (["proactive_suppression_requested"] if suppressed else []),
+            "policy_version": "runtime-presence.v1",
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def replay_presence_contract(monkeypatch):
+    # Extend the existing boundary fake; historical corpus projections remain unchanged.
+    monkeypatch.setattr(ReplayRuntime, "evaluate_presence", _ordinary_presence, raising=False)
+
+
+async def _run_presence_turn(
+    monkeypatch, *, state=None, reason=None, failure=None, mutation=None,
+    context=None, surface="chat", restraint=False, configured=True, provider_mode="success",
+):
+    from services import orchestrate
+
+    scenario = {"scenario": "presence", "provider": provider_mode}
+    calls = []
+    memory = ReplayMemoryStore(scenario, calls)
+    runtime = ReplayRuntime(scenario, calls)
+    provider = ReplayProvider(scenario, calls)
+    requests, messages = [], []
+    original_restraint = runtime.evaluate_restraint
+    original_chat = provider.chat
+    original_situated = orchestrate.resolve_situated_presence
+
+    async def evaluate_presence(**request):
+        calls.append({"name": "cr_presence"})
+        requests.append(deepcopy(request))
+        if failure is not None:
+            raise failure
+        response = (
+            _replay_presence_response(request, state, reason) if state
+            else await _ordinary_presence(runtime, **request)
+        )
+        if mutation:
+            mutation(response)
+        return response
+
+    async def evaluate_restraint(**request):
+        response = await original_restraint(**request)
+        response["result"]["proactive_output_suppressed"] = restraint
+        return response
+
+    async def situated(**request):
+        calls.append({"name": "situated_presence"})
+        return await original_situated(**request)
+
+    async def chat(**request):
+        messages.append(deepcopy(request["messages"]))
+        return await original_chat(**request)
+
+    monkeypatch.setattr(runtime, "evaluate_presence", evaluate_presence)
+    monkeypatch.setattr(runtime, "evaluate_restraint", evaluate_restraint)
+    monkeypatch.setattr(provider, "chat", chat)
+    monkeypatch.setattr(orchestrate, "resolve_situated_presence", situated)
+    payload = _payload(scenario)
+    payload.update(surface=surface, surface_context=context or {})
+    result = await orchestrate.orchestrate_chat(
+        payload=payload, memory_store=memory, litellm=provider,
+        runtime=runtime if configured else None,
+        rules_path=str(RULES_PATH), model_registry_path=str(REGISTRY_PATH),
+        allow_manual_override=False, enable_runtime_overlays=True,
+        interaction_governance_enabled=True, persona_containment_enabled=True,
+        restraint_enabled=True, request_id="presence-request",
+        message_id_factory=lambda: "00000000-0000-4000-8000-000000000099",
+    )
+    return result, memory, runtime, calls, requests, messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active", [True, False, 1, "true", None])
+@pytest.mark.parametrize("restraint", [True, False, 1, "true"])
+async def test_presence_admitted_order_exact_scope_and_typed_projections(
+    monkeypatch, active, restraint,
+):
+    result, memory, runtime, calls, requests, messages = await _run_presence_turn(
+        monkeypatch, context={"active_task_mode": active}, restraint=restraint,
+    )
+    assert result["status"] == "ok"
+    names = [call["name"] for call in calls]
+    assert names.index("cr_turn_start") < names.index("cr_restraint")
+    assert names.index("cr_restraint") < names.index("cr_presence")
+    assert names.index("cr_presence") < names.index("situated_presence")
+    assert names.index("situated_presence") < names.index("user_message_persistence")
+    assert requests == [{
+        "request_id": "presence-request", "owner_id": "owner-replay",
+        "conversation_id": result["conversation_id"], "surface": "chat",
+        "runtime_session_id": "runtime-session-1", "runtime_turn_id": "runtime-turn-1",
+        "active_task_mode": active is True, "proactive_output_suppressed": restraint is True,
+    }]
+    trace = memory.trace["retrieval"]["prompt_assembly"]
+    presence = trace["runtime_presence"]
+    assert presence["status"] == presence["runtime_call_status"] == "included"
+    assert presence["attempted"] is True
+    assert presence["required_help_allowed"] is True
+    assert presence["fallback_status"] == "not_used"
+    assert "situated_presence" in trace and "surface_presence" in trace
+    assert runtime.terminal_status == "completed"
+    assert messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,reason", [
+    ("available", "session_available"), ("active_conversation", "thread_active"),
+    ("low_attention", "attention_paused"), ("idle", "session_idle"),
+    ("driving_or_active_task", "session_active_task_mode"),
+])
+async def test_presence_required_help_and_guidance_reach_every_provider_attempt(
+    monkeypatch, state, reason,
+):
+    result, memory, _, _, _, messages = await _run_presence_turn(
+        monkeypatch, state=state, reason=reason, provider_mode="fallback_success",
+    )
+    assert result["status"] == "degraded"
+    assert len(messages) == 2
+    suppressed = state not in {"available", "active_conversation"}
+    trace = memory.trace["retrieval"]["prompt_assembly"]
+    assert trace["runtime_presence"]["presence_state"] == state
+    for attempt in messages:
+        text = json.dumps(attempt)
+        assert ("Omit optional proactive suggestions" in text) == suppressed
+        if suppressed:
+            assert "Preserve all information required" in text
+            assert trace["response_shape"]["runtime_presence"]["applied"] is True
+        for private in ["runtime-presence.v1", "reason_codes", "low_attention", "R44"]:
+            assert private not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,mutation,category", [
+    (httpx.ReadTimeout("PRIVATE"), None, "transport_timeout"),
+    (httpx.ConnectError("PRIVATE"), None, "transport_failure"),
+    (httpx.HTTPStatusError("PRIVATE", request=httpx.Request("POST", "http://runtime"),
+                          response=httpx.Response(503)), None, "dependency_http_failure"),
+    (Exception("PRIVATE"), None, "dependency_unavailable"),
+    (None, lambda r: r.update(owner_id="PRIVATE"), "context_mismatch"),
+    (None, lambda r: r["result"].update(private="PRIVATE"), "response_invalid"),
+    (None, lambda r: r["result"].update(presence_state="ambient_listening"), "unsupported_state"),
+    (None, lambda r: r["result"].update(presence_state="returning_after_gap"), "unsupported_state"),
+    (None, lambda r: r["result"].update(presence_state="do_not_intrude"), "unsupported_state"),
+])
+async def test_presence_dependency_failure_preserves_help_without_inferred_state(
+    monkeypatch, failure, mutation, category,
+):
+    result, memory, _, _, _, messages = await _run_presence_turn(
+        monkeypatch, failure=failure, mutation=mutation,
+    )
+    assert result["status"] == "ok"
+    trace = memory.trace["retrieval"]["prompt_assembly"]
+    presence = trace["runtime_presence"]
+    assert presence == {
+        "attempted": True, "status": "fallback", "runtime_call_status": "failed",
+        "presence_state": None, "previous_presence_state": None, "state_changed": None,
+        "proactive_output_suppressed": True, "required_help_allowed": True,
+        "policy_version": None, "reason_codes": [], "fallback_status": "suppression_only",
+        "failure_category": category,
+    }
+    assert "Omit optional proactive suggestions" in json.dumps(messages)
+    assert "PRIVATE" not in json.dumps([trace, messages])
+
+
+@pytest.mark.asyncio
+async def test_presence_disabled_preserves_existing_response_behavior(monkeypatch):
+    result, memory, _, _, requests, messages = await _run_presence_turn(
+        monkeypatch, configured=False,
+    )
+    assert result["status"] == "ok"
+    assert requests == []
+    trace = memory.trace["retrieval"]["prompt_assembly"]
+    assert trace["runtime_presence"]["status"] == "disabled"
+    assert trace["runtime_presence"]["runtime_call_status"] == "not_attempted"
+    assert trace["runtime_presence"]["proactive_output_suppressed"] is False
+    assert "runtime_presence" not in trace["response_shape"]
+    assert "Omit optional proactive suggestions" not in json.dumps(messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["car", "voice", "alexa"])
+async def test_presence_never_infers_active_task_from_surface(monkeypatch, surface):
+    _, _, _, _, requests, _ = await _run_presence_turn(monkeypatch, surface=surface)
+    assert requests[0]["active_task_mode"] is False
+
+
+@pytest.mark.asyncio
+async def test_presence_disallowed_help_abandons_admitted_work_before_content_use(monkeypatch):
+    result, memory, runtime, calls, _, messages = await _run_presence_turn(
+        monkeypatch, state="not_present", reason="session_not_present",
+    )
+    assert result["status"] == "failed"
+    assert result["selected_model"] == "not_called"
+    assert "current interaction" in result["answer"]
+    assert "not_present" not in json.dumps(result)
+    assert "admitted" not in result["answer"]
+    assert runtime.terminal_status == "abandoned"
+    assert memory.work["state"] == "failed"
+    assert messages == []
+    names = [call["name"] for call in calls]
+    assert "cr_turn_start" in names and "cr_presence" in names
+    assert not set(names) & {
+        "user_message_persistence", "assistant_message_persistence", "retrieval",
+        "provider_attempt", "profile_resolution", "capability_execution",
+    }
+    assert memory.trace["retrieval"]["prompt_assembly"]["runtime_presence"][
+        "required_help_allowed"
+    ] is False

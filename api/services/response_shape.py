@@ -193,11 +193,56 @@ def resolve_response_shape(
     return shape, trace
 
 
+def clamp_response_shape_for_runtime_presence(
+    shape: ResponseShape, trace: dict[str, Any], runtime_presence: dict[str, Any] | None,
+) -> tuple[ResponseShape, dict[str, Any]]:
+    if not isinstance(runtime_presence, dict) or (
+        runtime_presence.get("proactive_output_suppressed") is not True
+    ):
+        return shape, trace
+
+    fields = ("allows_expansion", "expansion_marker_allowed", "continuation_state")
+    before = {field: getattr(shape, field) for field in fields}
+    narrowed = shape.model_copy(update={
+        "allows_expansion": False,
+        "expansion_marker_allowed": False,
+        "continuation_state": (
+            "abbreviated" if shape.continuation_state == "expandable" else shape.continuation_state
+        ),
+    })
+    after = {field: getattr(narrowed, field) for field in fields}
+    return narrowed, {
+        **trace,
+        "included": True,
+        "status": "included",
+        "omission_reason": None,
+        "resolved_shape": narrowed.model_dump(),
+        "continuation_state": narrowed.continuation_state,
+        "guidance_flags": {
+            **trace.get("guidance_flags", {}),
+            "allows_expansion": False,
+            "expansion_marker_allowed": False,
+        },
+        "runtime_presence": {
+            "applied": True, "before": before, "after": after,
+            "changed_fields": [field for field in fields if before[field] != after[field]],
+        },
+    }
+
+
 def build_response_shape_guidance_block(shape: ResponseShape, trace: dict[str, Any]) -> str:
     if not trace.get("included"):
         return ""
 
     lines: list[str] = []
+
+    if (trace.get("runtime_presence") or {}).get("applied") is True:
+        lines.extend([
+            "- Answer the user's request directly.",
+            "- Omit optional proactive suggestions, invitations, social asides, unrelated "
+            "detours, and unnecessary follow-up prompts.",
+            "- Preserve all information required to answer the request safely and correctly.",
+        ])
 
     if shape.spoken_output:
         lines.extend(

@@ -148,6 +148,26 @@ class BudgetRuntime:
         self.terminal_status = kwargs["turn_status"]
         return {"runtime_turn": {"turn_status": kwargs["turn_status"]}}
 
+    async def evaluate_presence(self, **kwargs):
+        return {
+            **{
+                field: kwargs[field]
+                for field in (
+                    "request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id",
+                )
+            },
+            "result": {
+                "presence_state": "active_conversation",
+                "previous_presence_state": None,
+                "state_changed": True,
+                "proactive_output_suppressed": False,
+                "required_help_allowed": True,
+                "reason_codes": ["thread_active"],
+                "policy_version": "runtime-presence.v1",
+            },
+        }
+
     async def resolve_identity(self, **kwargs):
         return {
             "runtime_identity": {"content": "Runtime identity required anchor."},

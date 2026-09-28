@@ -549,6 +549,7 @@ class FakeRuntime:
         persona_containment_response=None,
         relationship_response=None,
         restraint_response=None,
+        presence_response=None,
         situated_presence_response=None,
         memory_hygiene_response=None,
         privacy_context_response=None,
@@ -568,6 +569,7 @@ class FakeRuntime:
         interaction_governance_error: Exception | None = None,
         persona_containment_error: Exception | None = None,
         restraint_error: Exception | None = None,
+        presence_error: Exception | None = None,
         situated_presence_error: Exception | None = None,
         memory_hygiene_error: Exception | None = None,
         privacy_context_error: Exception | None = None,
@@ -612,6 +614,7 @@ class FakeRuntime:
         self.interaction_governance_calls = []
         self.persona_containment_calls = []
         self.restraint_calls = []
+        self.presence_calls = []
         self.situated_presence_calls = []
         self.memory_hygiene_calls = []
         self.privacy_context_calls = []
@@ -838,6 +841,7 @@ class FakeRuntime:
                 "clarification_preferred": False,
             },
         }
+        self.presence_response = presence_response
         self.situated_presence_response = situated_presence_response
         self.interrupt_response = {
             "request_id": "rid-interrupt",
@@ -962,6 +966,7 @@ class FakeRuntime:
         self.interaction_governance_error = interaction_governance_error
         self.persona_containment_error = persona_containment_error
         self.restraint_error = restraint_error
+        self.presence_error = presence_error
         self.situated_presence_error = situated_presence_error
         self.memory_hygiene_error = memory_hygiene_error
         self.privacy_context_error = privacy_context_error
@@ -1588,6 +1593,34 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         return self.restraint_response
+
+    async def evaluate_presence(self, **kwargs):
+        self.presence_calls.append(kwargs)
+        self.call_order.append("presence")
+        if self.presence_error is not None:
+            raise self.presence_error
+        if self.fail:
+            raise RuntimeError("runtime unavailable")
+        if self.presence_response is not None:
+            return self.presence_response
+        return {
+            **{
+                field: kwargs[field]
+                for field in (
+                    "request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id",
+                )
+            },
+            "result": {
+                "presence_state": "active_conversation",
+                "previous_presence_state": None,
+                "state_changed": True,
+                "proactive_output_suppressed": False,
+                "required_help_allowed": True,
+                "reason_codes": ["thread_active"],
+                "policy_version": "runtime-presence.v1",
+            },
+        }
 
     async def evaluate_situated_presence(self, **kwargs):
         self.situated_presence_calls.append(kwargs)

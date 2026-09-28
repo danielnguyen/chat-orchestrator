@@ -3279,3 +3279,163 @@ async def test_runtime_retirement_mutations_reject_mismatched_or_invalid_result(
             reservation_id="retirement-reservation",
             reserved_thread_revision=7,
         )
+
+
+_PRESENCE_SCOPE = {
+    "request_id": "presence-request", "owner_id": "owner",
+    "conversation_id": "conversation", "surface": "web",
+    "runtime_session_id": "session", "runtime_turn_id": "turn",
+}
+
+
+def _presence_response(**updates):
+    result = {
+        "presence_state": "active_conversation", "previous_presence_state": None,
+        "state_changed": True, "proactive_output_suppressed": False,
+        "required_help_allowed": True, "reason_codes": ["thread_active"],
+        "policy_version": "runtime-presence.v1",
+    }
+    result.update(updates)
+    return {**_PRESENCE_SCOPE, "result": result}
+
+
+@pytest.mark.asyncio
+async def test_presence_endpoint_payload_and_persistent_transport():
+    response = _presence_response()
+    transport = _FakeAsyncClient([response, response])
+    factory = _ClientFactory([transport])
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    await client.open()
+    for _ in range(2):
+        assert await client.evaluate_presence(**_PRESENCE_SCOPE) == response
+    assert transport.posts == [("/v1/runtime/presence/evaluate", {
+        **_PRESENCE_SCOPE, "active_task_mode": False, "proactive_output_suppressed": False,
+    })] * 2
+    assert len(factory.clients) == 1
+    await client.close()
+    assert transport.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", list(_PRESENCE_SCOPE))
+@pytest.mark.parametrize("value", [None, "", "   ", 1, True, "x" * 121])
+async def test_presence_request_scope_rejected_before_transport(field, value):
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    with pytest.raises(ValueError, match="presence_request_invalid"):
+        await client.evaluate_presence(**{**_PRESENCE_SCOPE, field: value})
+    assert factory.clients == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("surface", "x" * 65), ("active_task_mode", 1), ("active_task_mode", "true"),
+    ("active_task_mode", None), ("proactive_output_suppressed", 0),
+    ("proactive_output_suppressed", "false"), ("proactive_output_suppressed", None),
+])
+async def test_presence_request_controls_rejected_before_transport(field, value):
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    with pytest.raises(ValueError, match="presence_request_invalid"):
+        await client.evaluate_presence(**{**_PRESENCE_SCOPE, field: value})
+    assert factory.clients == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", list(_PRESENCE_SCOPE))
+async def test_presence_response_exact_scope_binding(field):
+    response = _presence_response()
+    response[field] = "other"
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    with pytest.raises(RuntimeError, match="presence_response_context_mismatch"):
+        await client.evaluate_presence(**_PRESENCE_SCOPE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("presence_state", "unknown"), ("presence_state", []),
+    ("previous_presence_state", "unknown"), ("previous_presence_state", {}),
+    ("state_changed", 1), ("state_changed", False),
+    ("previous_presence_state", "active_conversation"),
+    ("proactive_output_suppressed", "false"), ("proactive_output_suppressed", True),
+    ("required_help_allowed", 1), ("required_help_allowed", False),
+    ("reason_codes", []), ("reason_codes", ["unknown"]),
+    ("reason_codes", ["thread_active", "thread_active"]),
+    ("reason_codes", ["thread_active", "proactive_suppression_requested", "session_idle"]),
+    ("reason_codes", ["session_idle"]), ("reason_codes", ["thread_active", {}]),
+    ("reason_codes", ["thread_active", "proactive_suppression_requested"]),
+    ("policy_version", "runtime-presence.v2"),
+])
+async def test_presence_response_rejects_invalid_or_incoherent_result(field, value):
+    transport = _FakeAsyncClient([_presence_response(**{field: value})])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    with pytest.raises(RuntimeError, match="presence_response_invalid"):
+        await client.evaluate_presence(**_PRESENCE_SCOPE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["extra", "missing", "result_extra", "result_missing", "list"])
+async def test_presence_response_exact_key_shape(mutation):
+    response = _presence_response()
+    if mutation == "extra":
+        response["private"] = "not accepted"
+    elif mutation == "missing":
+        response.pop("surface")
+    elif mutation == "result_extra":
+        response["result"]["private"] = "not accepted"
+    elif mutation == "result_missing":
+        response["result"].pop("policy_version")
+    else:
+        response["result"] = []
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    with pytest.raises(RuntimeError, match="presence_response_invalid"):
+        await client.evaluate_presence(**_PRESENCE_SCOPE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["ambient_listening", "returning_after_gap", "do_not_intrude"])
+async def test_presence_response_future_states_are_not_consumed(state):
+    transport = _FakeAsyncClient([_presence_response(presence_state=state)])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    with pytest.raises(RuntimeError, match="presence_response_unsupported_state"):
+        await client.evaluate_presence(**_PRESENCE_SCOPE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,reason,active", [
+    ("not_present", "session_not_present", False),
+    ("available", "session_available", False),
+    ("active_conversation", "thread_active", False),
+    ("idle", "session_idle", False),
+    ("low_attention", "session_paused", False),
+    ("low_attention", "attention_paused", False),
+    ("driving_or_active_task", "session_active_task_mode", False),
+    ("driving_or_active_task", "active_task_mode", True),
+])
+@pytest.mark.parametrize("suppressed", [False, True])
+async def test_presence_accepts_coherent_v1_states_and_transitions(
+    state, reason, active, suppressed,
+):
+    response = _presence_response(
+        presence_state=state, previous_presence_state=state, state_changed=False,
+        proactive_output_suppressed=suppressed or state not in {"available", "active_conversation"},
+        required_help_allowed=state != "not_present",
+        reason_codes=[reason] + (["proactive_suppression_requested"] if suppressed else []),
+    )
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    assert await client.evaluate_presence(
+        **_PRESENCE_SCOPE, active_task_mode=active, proactive_output_suppressed=suppressed,
+    ) == response
