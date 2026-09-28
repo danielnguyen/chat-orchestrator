@@ -20,6 +20,7 @@ _PRESENCE_STATES = {
 }
 _PRESENCE_DECISION_STATES = {
     "session_not_present": "not_present",
+    "explicit_proactive_opt_out": "do_not_intrude",
     "active_task_mode": "driving_or_active_task",
     "session_active_task_mode": "driving_or_active_task",
     "session_paused": "low_attention",
@@ -32,7 +33,7 @@ _PRESENCE_DECISION_STATES = {
 
 def validate_presence_response(
     response: Any, *, scope: dict[str, str], active_task_mode: bool,
-    proactive_output_suppressed: bool,
+    proactive_output_suppressed: bool, explicit_proactive_opt_out: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(response, dict) or set(response) != {*scope, "result"}:
         raise RuntimeError("presence_response_invalid")
@@ -69,14 +70,20 @@ def validate_presence_response(
         or (len(reasons) == 2 and reasons[1] != "proactive_suppression_requested")
     ):
         raise RuntimeError("presence_response_invalid")
-    suppressed = state in {"not_present", "idle", "low_attention", "driving_or_active_task"}
+    suppressed = state in {
+        "not_present", "do_not_intrude", "idle", "low_attention", "driving_or_active_task",
+    }
     if (
         result["state_changed"] != (state != previous)
         or result["required_help_allowed"] != (state != "not_present")
         or result["proactive_output_suppressed"] != (suppressed or proactive_output_suppressed)
         or ("proactive_suppression_requested" in reasons) != proactive_output_suppressed
         or (reasons[0] == "active_task_mode" and not active_task_mode)
-        or (active_task_mode and state != "not_present" and reasons[0] != "active_task_mode")
+        or (reasons[0] == "explicit_proactive_opt_out" and not explicit_proactive_opt_out)
+        or (explicit_proactive_opt_out and state != "not_present"
+            and reasons[0] != "explicit_proactive_opt_out")
+        or (active_task_mode and not explicit_proactive_opt_out and state != "not_present"
+            and reasons[0] != "active_task_mode")
     ):
         raise RuntimeError("presence_response_invalid")
     return response
@@ -2343,7 +2350,7 @@ class RuntimeClient:
     async def evaluate_presence(
         self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
         runtime_session_id: str, runtime_turn_id: str, active_task_mode: bool = False,
-        proactive_output_suppressed: bool = False,
+        proactive_output_suppressed: bool = False, explicit_proactive_opt_out: bool = False,
     ) -> dict[str, Any]:
         scope = {
             "request_id": request_id, "owner_id": owner_id,
@@ -2356,15 +2363,18 @@ class RuntimeClient:
             or len(surface) > 64
             or type(active_task_mode) is not bool
             or type(proactive_output_suppressed) is not bool
+            or type(explicit_proactive_opt_out) is not bool
         ):
             raise ValueError("presence_request_invalid")
         response = await self._post("/v1/runtime/presence/evaluate", json={
             **scope, "active_task_mode": active_task_mode,
             "proactive_output_suppressed": proactive_output_suppressed,
+            "explicit_proactive_opt_out": explicit_proactive_opt_out,
         })
         return validate_presence_response(
             response, scope=scope, active_task_mode=active_task_mode,
             proactive_output_suppressed=proactive_output_suppressed,
+            explicit_proactive_opt_out=explicit_proactive_opt_out,
         )
 
     async def evaluate_situated_presence(

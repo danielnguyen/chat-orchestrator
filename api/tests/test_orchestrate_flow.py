@@ -160,6 +160,13 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
 
 
 class FakeMemoryStore:
+    async def get_proactive_preferences(self, *, owner_id):
+        return {
+            "owner_id": owner_id, "enabled": False,
+            "allowed_surfaces_json": [], "rule_prefs_json": {},
+            "created_at": None, "updated_at": None,
+        }
+
     def __init__(self):
         self.resolve_conversation_calls = []
         self.exact_conversation_calls = []

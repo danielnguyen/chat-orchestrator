@@ -390,3 +390,70 @@ async def test_work_result_rejects_malformed_or_mismatched_response(service, mal
             work_id=WORK_ID, owner_id="owner", conversation_id=CONVERSATION_ID,
         )
     assert len(calls) == 1
+
+
+def _proactive_preference(*, persisted=False, enabled=False):
+    return {
+        "owner_id": "owner", "enabled": enabled,
+        "allowed_surfaces_json": ["telegram"] if persisted else [],
+        "rule_prefs_json": {"private": "sentinel"} if persisted else {},
+        "created_at": "2026-09-28T00:00:00Z" if persisted else None,
+        "updated_at": "2026-09-28 01:00:00+00:00" if persisted else None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted,enabled", [(False, False), (True, False), (True, True)])
+async def test_proactive_preferences_exact_get_and_persistence_forms(service, persisted, enabled):
+    client, responses, calls = service
+    value = _proactive_preference(persisted=persisted, enabled=enabled)
+    responses.append(value)
+    assert await client.get_proactive_preferences(owner_id="owner") == value
+    assert len(calls) == 1
+    assert calls[0].method == "GET"
+    assert calls[0].url.path == "/v1/proactive/preferences"
+    assert dict(calls[0].url.params) == {"owner_id": "owner"}
+    assert calls[0].headers["X-API-Key"] == "test-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"owner_id": "other"}, {"owner_id": 1}, {"extra": "private"},
+    {"enabled": 0}, {"enabled": "false"}, {"enabled": None},
+    {"allowed_surfaces_json": "telegram"}, {"allowed_surfaces_json": [1]},
+    {"rule_prefs_json": []}, {"rule_prefs_json": None},
+    {"created_at": None}, {"updated_at": None},
+    {"created_at": "invalid"}, {"updated_at": "2026-09-28T01:00:00"},
+    {"created_at": "2026-09-28"}, {"updated_at": 1},
+])
+async def test_proactive_preferences_rejects_malformed_or_mismatched_record(service, changes):
+    client, responses, calls = service
+    responses.append({**_proactive_preference(persisted=True), **changes})
+    with pytest.raises(RuntimeError, match="proactive_preferences_"):
+        await client.get_proactive_preferences(owner_id="owner")
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", list(_proactive_preference()))
+async def test_proactive_preferences_rejects_missing_fields(service, field):
+    client, responses, _ = service
+    value = _proactive_preference()
+    del value[field]
+    responses.append(value)
+    with pytest.raises(RuntimeError, match="proactive_preferences_response_invalid"):
+        await client.get_proactive_preferences(owner_id="owner")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [
+    None, [], {},
+    {**_proactive_preference(), "enabled": True},
+    {**_proactive_preference(), "allowed_surfaces_json": ["telegram"]},
+    {**_proactive_preference(), "rule_prefs_json": {"private": True}},
+])
+async def test_proactive_preferences_rejects_inconsistent_synthetic_form(service, value):
+    client, responses, _ = service
+    responses.append(value)
+    with pytest.raises(RuntimeError, match="proactive_preferences_response_invalid"):
+        await client.get_proactive_preferences(owner_id="owner")

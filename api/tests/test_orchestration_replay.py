@@ -984,6 +984,8 @@ async def test_failure_scenarios_do_not_claim_false_success():
 async def _ordinary_presence(self, **request):
     state = "driving_or_active_task" if request["active_task_mode"] else "active_conversation"
     reason = "active_task_mode" if request["active_task_mode"] else "thread_active"
+    if request["explicit_proactive_opt_out"]:
+        state, reason = "do_not_intrude", "explicit_proactive_opt_out"
     return _replay_presence_response(request, state, reason)
 
 
@@ -991,7 +993,9 @@ def _replay_presence_response(request, state, reason):
     suppressed = request["proactive_output_suppressed"]
     return {
         **{key: value for key, value in request.items()
-           if key not in {"active_task_mode", "proactive_output_suppressed"}},
+           if key not in {
+               "active_task_mode", "proactive_output_suppressed", "explicit_proactive_opt_out",
+           }},
         "result": {
             "presence_state": state, "previous_presence_state": None, "state_changed": True,
             "proactive_output_suppressed": suppressed or state not in {
@@ -1004,19 +1008,32 @@ def _replay_presence_response(request, state, reason):
     }
 
 
+async def _absent_proactive_preference(self, *, owner_id):
+    return {
+        "owner_id": owner_id, "enabled": False,
+        "allowed_surfaces_json": [], "rule_prefs_json": {},
+        "created_at": None, "updated_at": None,
+    }
+
+
 @pytest.fixture(autouse=True)
 def replay_presence_contract(monkeypatch):
     # Extend the existing boundary fake; historical corpus projections remain unchanged.
     monkeypatch.setattr(ReplayRuntime, "evaluate_presence", _ordinary_presence, raising=False)
+    monkeypatch.setattr(ReplayMemoryStore, "get_proactive_preferences",
+                        _absent_proactive_preference, raising=False)
 
 
 async def _run_presence_turn(
     monkeypatch, *, state=None, reason=None, failure=None, mutation=None,
     context=None, surface="chat", restraint=False, configured=True, provider_mode="success",
+    preference=None, preference_error=None, admission_failure=False, owner_id="owner-replay",
 ):
     from services import orchestrate
 
     scenario = {"scenario": "presence", "provider": provider_mode}
+    if admission_failure:
+        scenario["runtime"] = "unavailable"
     calls = []
     memory = ReplayMemoryStore(scenario, calls)
     runtime = ReplayRuntime(scenario, calls)
@@ -1025,6 +1042,14 @@ async def _run_presence_turn(
     original_restraint = runtime.evaluate_restraint
     original_chat = provider.chat
     original_situated = orchestrate.resolve_situated_presence
+
+    async def get_proactive_preferences(*, owner_id):
+        calls.append({"name": "proactive_preference", "owner_id": owner_id})
+        if preference_error is not None:
+            raise preference_error
+        if preference is not None:
+            return deepcopy(preference)
+        return await _absent_proactive_preference(memory, owner_id=owner_id)
 
     async def evaluate_presence(**request):
         calls.append({"name": "cr_presence"})
@@ -1052,12 +1077,13 @@ async def _run_presence_turn(
         messages.append(deepcopy(request["messages"]))
         return await original_chat(**request)
 
+    monkeypatch.setattr(memory, "get_proactive_preferences", get_proactive_preferences)
     monkeypatch.setattr(runtime, "evaluate_presence", evaluate_presence)
     monkeypatch.setattr(runtime, "evaluate_restraint", evaluate_restraint)
     monkeypatch.setattr(provider, "chat", chat)
     monkeypatch.setattr(orchestrate, "resolve_situated_presence", situated)
     payload = _payload(scenario)
-    payload.update(surface=surface, surface_context=context or {})
+    payload.update(surface=surface, surface_context=context or {}, owner_id=owner_id)
     result = await orchestrate.orchestrate_chat(
         payload=payload, memory_store=memory, litellm=provider,
         runtime=runtime if configured else None,
@@ -1090,6 +1116,7 @@ async def test_presence_admitted_order_exact_scope_and_typed_projections(
         "conversation_id": result["conversation_id"], "surface": "chat",
         "runtime_session_id": "runtime-session-1", "runtime_turn_id": "runtime-turn-1",
         "active_task_mode": active is True, "proactive_output_suppressed": restraint is True,
+        "explicit_proactive_opt_out": False,
     }]
     trace = memory.trace["retrieval"]["prompt_assembly"]
     presence = trace["runtime_presence"]
@@ -1140,7 +1167,7 @@ async def test_presence_required_help_and_guidance_reach_every_provider_attempt(
     (None, lambda r: r["result"].update(private="PRIVATE"), "response_invalid"),
     (None, lambda r: r["result"].update(presence_state="ambient_listening"), "unsupported_state"),
     (None, lambda r: r["result"].update(presence_state="returning_after_gap"), "unsupported_state"),
-    (None, lambda r: r["result"].update(presence_state="do_not_intrude"), "unsupported_state"),
+    (None, lambda r: r["result"].update(presence_state="do_not_intrude"), "response_invalid"),
 ])
 async def test_presence_dependency_failure_preserves_help_without_inferred_state(
     monkeypatch, failure, mutation, category,
@@ -1206,3 +1233,109 @@ async def test_presence_disallowed_help_abandons_admitted_work_before_content_us
     assert memory.trace["retrieval"]["prompt_assembly"]["runtime_presence"][
         "required_help_allowed"
     ] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["web", "telegram", "car"])
+@pytest.mark.parametrize("owner", ["owner-replay", "owner-other"])
+@pytest.mark.parametrize("kind", ["absent", "enabled", "disabled"])
+async def test_presence_projects_only_persisted_opt_out(monkeypatch, surface, owner, kind):
+    preference = {
+        "owner_id": owner, "enabled": kind == "enabled",
+        "allowed_surfaces_json": ["PRIVATE-SURFACE"],
+        "rule_prefs_json": {"PRIVATE-RULE": "PRIVATE-VALUE"},
+        "created_at": "2001-02-03T04:05:06+00:00",
+        "updated_at": "2002-03-04T05:06:07+00:00",
+    }
+    if kind == "absent":
+        preference = await _absent_proactive_preference(None, owner_id=owner)
+    result, memory, _, calls, requests, messages = await _run_presence_turn(
+        monkeypatch, preference=preference, surface=surface, owner_id=owner,
+        context={"allows_expansion": True},
+    )
+    assert result["status"] == "ok"
+    assert messages
+    opt_out = kind == "disabled"
+    assert requests == [{
+        "request_id": "presence-request", "owner_id": owner,
+        "conversation_id": result["conversation_id"], "surface": surface,
+        "runtime_session_id": "runtime-session-1", "runtime_turn_id": "runtime-turn-1",
+        "active_task_mode": False, "proactive_output_suppressed": False,
+        "explicit_proactive_opt_out": opt_out,
+    }]
+    names = [call["name"] for call in calls]
+    assert names.index("cr_turn_start") < names.index("cr_restraint")
+    assert names.index("cr_restraint") < names.index("proactive_preference")
+    assert names.index("proactive_preference") < names.index("cr_presence")
+    assert names.index("cr_presence") < names.index("situated_presence")
+    assert [call for call in calls if call["name"] == "proactive_preference"] == [
+        {"name": "proactive_preference", "owner_id": owner},
+    ]
+    trace = memory.trace["retrieval"]["prompt_assembly"]
+    presence = trace["runtime_presence"]
+    assert presence["status"] == "included"
+    assert presence["presence_state"] == ("do_not_intrude" if opt_out else "active_conversation")
+    assert presence["required_help_allowed"] is True
+    assert presence["proactive_output_suppressed"] is opt_out
+    assert ("Omit optional proactive suggestions" in json.dumps(messages)) is opt_out
+    if opt_out:
+        shape = trace["response_shape"]["resolved_shape"]
+        assert shape["allows_expansion"] is False
+        assert shape["expansion_marker_allowed"] is False
+        assert "Preserve all information required" in json.dumps(messages)
+    for private in [
+        "allowed_surfaces_json", "rule_prefs_json", "PRIVATE-SURFACE", "PRIVATE-RULE",
+        "PRIVATE-VALUE", "2001-02-03", "2002-03-04", "proactive_consent", "surface_permission",
+    ]:
+        assert private not in json.dumps([requests, messages, memory.trace, result])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    "timeout", "transport", "http", "exception", "malformed", "owner",
+])
+async def test_preference_failure_suppresses_without_fabricating_opt_out(monkeypatch, failure):
+    preference = None
+    error = None
+    if failure == "timeout":
+        error = httpx.ReadTimeout("PRIVATE-FAILURE")
+    elif failure == "transport":
+        error = httpx.ConnectError("PRIVATE-FAILURE")
+    elif failure == "http":
+        error = httpx.HTTPStatusError(
+            "PRIVATE-FAILURE", request=httpx.Request("GET", "http://memory"),
+            response=httpx.Response(503),
+        )
+    elif failure == "exception":
+        error = Exception("PRIVATE-FAILURE")
+    elif failure == "malformed":
+        preference = {"PRIVATE-FAILURE": True}
+    else:
+        preference = await _absent_proactive_preference(None, owner_id="PRIVATE-FAILURE")
+    result, memory, _, calls, requests, messages = await _run_presence_turn(
+        monkeypatch, preference=preference, preference_error=error,
+    )
+    assert result["status"] == "ok"
+    assert requests[0]["explicit_proactive_opt_out"] is False
+    assert requests[0]["proactive_output_suppressed"] is True
+    presence = memory.trace["retrieval"]["prompt_assembly"]["runtime_presence"]
+    assert presence["status"] == "included"
+    assert presence["presence_state"] == "active_conversation"
+    assert presence["required_help_allowed"] is True
+    assert presence["reason_codes"] == ["thread_active", "proactive_suppression_requested"]
+    assert "Omit optional proactive suggestions" in json.dumps(messages)
+    assert "Preserve all information required" in json.dumps(messages)
+    assert "PRIVATE-FAILURE" not in json.dumps([calls, requests, messages, memory.trace, result])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured,admission_failure", [(False, False), (True, True)])
+async def test_preference_read_requires_configured_and_admitted_runtime(
+    monkeypatch, configured, admission_failure,
+):
+    result, _, _, calls, requests, _ = await _run_presence_turn(
+        monkeypatch, configured=configured, admission_failure=admission_failure,
+    )
+    assert requests == []
+    assert "proactive_preference" not in [call["name"] for call in calls]
+    assert result["status"] == ("failed" if admission_failure else "ok")

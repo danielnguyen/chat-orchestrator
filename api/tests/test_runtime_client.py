@@ -3310,6 +3310,7 @@ async def test_presence_endpoint_payload_and_persistent_transport():
         assert await client.evaluate_presence(**_PRESENCE_SCOPE) == response
     assert transport.posts == [("/v1/runtime/presence/evaluate", {
         **_PRESENCE_SCOPE, "active_task_mode": False, "proactive_output_suppressed": False,
+        "explicit_proactive_opt_out": False,
     })] * 2
     assert len(factory.clients) == 1
     await client.close()
@@ -3401,7 +3402,7 @@ async def test_presence_response_exact_key_shape(mutation):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["ambient_listening", "returning_after_gap", "do_not_intrude"])
+@pytest.mark.parametrize("state", ["ambient_listening", "returning_after_gap"])
 async def test_presence_response_future_states_are_not_consumed(state):
     transport = _FakeAsyncClient([_presence_response(presence_state=state)])
     client = RuntimeClient("http://runtime.local", None,
@@ -3439,3 +3440,68 @@ async def test_presence_accepts_coherent_v1_states_and_transitions(
     assert await client.evaluate_presence(
         **_PRESENCE_SCOPE, active_task_mode=active, proactive_output_suppressed=suppressed,
     ) == response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, 1, 0, "true", "false", {}, []])
+async def test_presence_opt_out_request_is_strict_before_transport(value):
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    with pytest.raises(ValueError, match="presence_request_invalid"):
+        await client.evaluate_presence(**_PRESENCE_SCOPE, explicit_proactive_opt_out=value)
+    assert factory.clients == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("suppressed", [False, True])
+@pytest.mark.parametrize("state,reason", [
+    ("do_not_intrude", "explicit_proactive_opt_out"),
+    ("not_present", "session_not_present"),
+])
+async def test_presence_opt_out_precedence_and_exact_payload(active, suppressed, state, reason):
+    response = _presence_response(
+        presence_state=state, proactive_output_suppressed=True,
+        required_help_allowed=state != "not_present",
+        reason_codes=[reason] + (["proactive_suppression_requested"] if suppressed else []),
+    )
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    assert await client.evaluate_presence(
+        **_PRESENCE_SCOPE, active_task_mode=active,
+        proactive_output_suppressed=suppressed, explicit_proactive_opt_out=True,
+    ) == response
+    assert transport.posts == [("/v1/runtime/presence/evaluate", {
+        **_PRESENCE_SCOPE, "active_task_mode": active,
+        "proactive_output_suppressed": suppressed, "explicit_proactive_opt_out": True,
+    })]
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opt_out,changes", [
+    (False, {}), (True, {"proactive_output_suppressed": False}),
+    (True, {"required_help_allowed": False}),
+    (True, {"reason_codes": ["thread_active"]}),
+    (True, {"reason_codes": ["explicit_proactive_opt_out", "proactive_suppression_requested"]}),
+    (True, {"presence_state": "active_conversation", "reason_codes": ["thread_active"],
+            "proactive_output_suppressed": False}),
+    (True, {"presence_state": "driving_or_active_task", "reason_codes": ["active_task_mode"]}),
+])
+async def test_presence_opt_out_rejects_false_authority_and_incoherence(opt_out, changes):
+    response = _presence_response(
+        presence_state="do_not_intrude", proactive_output_suppressed=True,
+        reason_codes=["explicit_proactive_opt_out"],
+    )
+    response["result"].update(changes)
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    with pytest.raises(RuntimeError, match="presence_response_invalid"):
+        await client.evaluate_presence(
+            **_PRESENCE_SCOPE, explicit_proactive_opt_out=opt_out, active_task_mode=True,
+        )
+    await client.close()

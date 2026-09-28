@@ -7,6 +7,43 @@ from uuid import UUID
 
 import httpx
 
+
+def validate_proactive_preferences_response(
+    response: Any, *, owner_id: str,
+) -> dict[str, Any]:
+    """Validate the existing durable/synthetic distinction without granting permission."""
+    if not isinstance(response, dict) or set(response) != {
+        "owner_id", "enabled", "allowed_surfaces_json", "rule_prefs_json",
+        "created_at", "updated_at",
+    }:
+        raise RuntimeError("proactive_preferences_response_invalid")
+    if type(response["owner_id"]) is not str or response["owner_id"] != owner_id:
+        raise RuntimeError("proactive_preferences_context_mismatch")
+    if (
+        type(response["enabled"]) is not bool
+        or not isinstance(response["allowed_surfaces_json"], list)
+        or any(type(value) is not str for value in response["allowed_surfaces_json"])
+        or not isinstance(response["rule_prefs_json"], dict)
+    ):
+        raise RuntimeError("proactive_preferences_response_invalid")
+    created, updated = response["created_at"], response["updated_at"]
+    if created is None and updated is None:
+        if (response["enabled"] is not False or response["allowed_surfaces_json"] != []
+                or response["rule_prefs_json"] != {}):
+            raise RuntimeError("proactive_preferences_response_invalid")
+    else:
+        for value in (created, updated):
+            try:
+                if not isinstance(value, str) or not 1 <= len(value) <= 64:
+                    raise ValueError
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise RuntimeError("proactive_preferences_response_invalid") from None
+    return response
+
+
 _WORK_ASSOCIATION_FIELDS = {
     "work_id", "owner_id", "conversation_id", "request_id", "client_id", "surface",
 }
@@ -271,6 +308,12 @@ class MemoryStoreClient:
             )
             resp.raise_for_status()
             return resp.json()
+
+    async def get_proactive_preferences(self, *, owner_id: str) -> dict[str, Any]:
+        if not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 120:
+            raise ValueError("proactive_preferences_request_invalid")
+        response = await self._get("/v1/proactive/preferences", params={"owner_id": owner_id})
+        return validate_proactive_preferences_response(response, owner_id=owner_id)
 
     async def resolve_conversation(
         self,

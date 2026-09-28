@@ -21,7 +21,7 @@ from clients.data_source_aggregator import (
     DataSourceAggregatorFailure,
 )
 from clients.litellm import LiteLLMClient
-from clients.memory_store import MemoryStoreClient
+from clients.memory_store import MemoryStoreClient, validate_proactive_preferences_response
 from clients.runtime import validate_history_followup_policy_response, validate_presence_response
 from pydantic import ValidationError
 from router.engine import evaluate_route
@@ -6114,7 +6114,8 @@ async def _resolve_persona_containment(
 
 
 async def _resolve_runtime_presence(
-    *, runtime: Any | None, request_id: str, owner_id: str, conversation_id: str,
+    *, runtime: Any | None, memory_store: MemoryStoreClient,
+    request_id: str, owner_id: str, conversation_id: str,
     surface: str, runtime_session_id: str | None, runtime_turn_id: str | None,
     surface_context: Any, restraint: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -6138,13 +6139,24 @@ async def _resolve_runtime_presence(
     suppressed = (
         isinstance(restraint, dict) and restraint.get("proactive_output_suppressed") is True
     )
+    explicit_opt_out = False
+    try:
+        preference = validate_proactive_preferences_response(
+            await memory_store.get_proactive_preferences(owner_id=owner_id), owner_id=owner_id,
+        )
+        # Absence and enabled records project no opt-out, never proactive consent.
+        explicit_opt_out = preference["created_at"] is not None and preference["enabled"] is False
+    except Exception:
+        # An unavailable preference is not user intent; request suppression only.
+        suppressed = True
     try:
         response = await runtime.evaluate_presence(
             **scope, active_task_mode=active_task, proactive_output_suppressed=suppressed,
+            explicit_proactive_opt_out=explicit_opt_out,
         )
         response = validate_presence_response(
             response, scope=scope, active_task_mode=active_task,
-            proactive_output_suppressed=suppressed,
+            proactive_output_suppressed=suppressed, explicit_proactive_opt_out=explicit_opt_out,
         )
     except Exception as error:
         if isinstance(error, (httpx.TimeoutException, TimeoutError)):
@@ -9098,7 +9110,8 @@ async def orchestrate_chat(
             surface_metadata_json=surface_metadata_json,
         )
         runtime_presence_trace = await _resolve_runtime_presence(
-            runtime=runtime, request_id=request_id, owner_id=payload["owner_id"],
+            memory_store=memory_store, runtime=runtime, request_id=request_id,
+            owner_id=payload["owner_id"],
             conversation_id=conversation_id, surface=surface,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
