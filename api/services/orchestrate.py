@@ -22,7 +22,7 @@ from clients.data_source_aggregator import (
 )
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient
-from clients.runtime import validate_history_followup_policy_response
+from clients.runtime import validate_history_followup_policy_response, validate_presence_response
 from pydantic import ValidationError
 from router.engine import evaluate_route
 from services.action_connectors import ActionConnectorRegistry
@@ -153,6 +153,7 @@ from services.response_action import ResponseActionInput, apply_response_action
 from services.response_review import ResponseReviewInput, review_response
 from services.response_shape import (
     build_response_shape_guidance_block,
+    clamp_response_shape_for_runtime_presence,
     resolve_response_shape,
 )
 from services.routing_contract import routing_trace_metadata
@@ -183,6 +184,9 @@ _HISTORY_PERSISTENCE_UNAVAILABLE = (
 _RUNTIME_ADMISSION_UNAVAILABLE = (
     "I couldn’t safely start that turn, so I did not save or process the message. "
     "Please try again."
+)
+_CURRENT_INTERACTION_UNAVAILABLE = (
+    "This interaction is no longer available. Please start or retry through a current interaction."
 )
 _MESSAGE_PERSISTENCE_UNAVAILABLE = (
     "I couldn’t durably save that message, so I stopped before generating a response. "
@@ -6109,6 +6113,68 @@ async def _resolve_persona_containment(
     }
 
 
+async def _resolve_runtime_presence(
+    *, runtime: Any | None, request_id: str, owner_id: str, conversation_id: str,
+    surface: str, runtime_session_id: str | None, runtime_turn_id: str | None,
+    surface_context: Any, restraint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    trace = {
+        "attempted": False, "status": "disabled", "runtime_call_status": "not_attempted",
+        "presence_state": None, "previous_presence_state": None, "state_changed": None,
+        "proactive_output_suppressed": False, "required_help_allowed": True,
+        "policy_version": None, "reason_codes": [], "fallback_status": "not_used",
+        "failure_category": None,
+    }
+    if runtime is None:
+        return trace
+    scope = {
+        "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+        "surface": surface, "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+    }
+    active_task = (
+        isinstance(surface_context, dict) and surface_context.get("active_task_mode") is True
+    )
+    suppressed = (
+        isinstance(restraint, dict) and restraint.get("proactive_output_suppressed") is True
+    )
+    try:
+        response = await runtime.evaluate_presence(
+            **scope, active_task_mode=active_task, proactive_output_suppressed=suppressed,
+        )
+        response = validate_presence_response(
+            response, scope=scope, active_task_mode=active_task,
+            proactive_output_suppressed=suppressed,
+        )
+    except Exception as error:
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+            category = "transport_timeout"
+        elif isinstance(error, httpx.TransportError):
+            category = "transport_failure"
+        elif isinstance(error, httpx.HTTPStatusError):
+            category = "dependency_http_failure"
+        elif isinstance(error, RuntimeError) and str(error) in {
+            "presence_response_context_mismatch", "presence_response_unsupported_state",
+        }:
+            category = {
+                "presence_response_context_mismatch": "context_mismatch",
+                "presence_response_unsupported_state": "unsupported_state",
+            }[str(error)]
+        elif isinstance(error, (ValueError, RuntimeError)):
+            category = "response_invalid"
+        else:
+            category = "dependency_unavailable"
+        return {
+            **trace, "attempted": True, "status": "fallback", "runtime_call_status": "failed",
+            "proactive_output_suppressed": True, "fallback_status": "suppression_only",
+            "failure_category": category,
+        }
+    return {
+        **trace, **response["result"], "attempted": True, "status": "included",
+        "runtime_call_status": "included",
+    }
+
+
 async def _resolve_restraint(
     *,
     runtime: Any | None,
@@ -9031,6 +9097,35 @@ async def orchestrate_chat(
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
         )
+        runtime_presence_trace = await _resolve_runtime_presence(
+            runtime=runtime, request_id=request_id, owner_id=payload["owner_id"],
+            conversation_id=conversation_id, surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            surface_context=surface_context, restraint=restraint,
+        )
+        if runtime_presence_trace["required_help_allowed"] is False:
+            await _complete_runtime_turn(
+                runtime=runtime, turn_state_trace=turn_state_trace,
+                request_id=request_id, turn_status="abandoned",
+            )
+            await work.fail_if_unfinished()
+            try:
+                await memory_store.create_trace(request_id=request_id, payload={
+                    "owner_id": payload["owner_id"], "conversation_id": conversation_id,
+                    "status": "failed",
+                    "retrieval": {"prompt_assembly": {
+                        "runtime_presence": runtime_presence_trace,
+                        "turn_state": turn_state_trace,
+                    }},
+                })
+            except Exception:
+                pass
+            return {
+                "request_id": request_id, "conversation_id": conversation_id,
+                "profile_name": "unresolved", "selected_model": "not_called",
+                "answer": _CURRENT_INTERACTION_UNAVAILABLE, "status": "failed", "sources": [],
+            }
         situated_presence, situated_presence_trace = await resolve_situated_presence(
             runtime=runtime,
             interaction_governance_enabled=interaction_governance_enabled,
@@ -9108,6 +9203,9 @@ async def orchestrate_chat(
             effective_payload,
             style_envelope,
             style_trace,
+        )
+        response_shape, response_shape_trace = clamp_response_shape_for_runtime_presence(
+            response_shape, response_shape_trace, runtime_presence_trace,
         )
         response_shape_guidance = build_response_shape_guidance_block(
             response_shape, response_shape_trace
@@ -10308,6 +10406,7 @@ async def orchestrate_chat(
                         "persona_containment": persona_containment_trace,
                         "restraint": restraint_trace,
                         "situated_presence": situated_presence_trace,
+                        "runtime_presence": runtime_presence_trace,
                         "retrieval_dispatch": retrieval_dispatch_trace,
                         "memory_hygiene": (
                             memory_hygiene_result.trace
@@ -10496,6 +10595,7 @@ async def orchestrate_chat(
                     ),
                 ),
             )
+            prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
             _preserve_interaction_governance_trace_inputs(
                 prompt.trace,
                 interaction_governance_trace,
@@ -10523,6 +10623,7 @@ async def orchestrate_chat(
                 "result_boundary": result_boundary_trace,
                 "restraint": restraint_trace,
                 "situated_presence": situated_presence_trace,
+                "runtime_presence": runtime_presence_trace,
                 "retrieval_dispatch": retrieval_dispatch_trace,
                 "memory_hygiene": (
                     memory_hygiene_result.trace
@@ -10543,6 +10644,7 @@ async def orchestrate_chat(
                 and evidence_acquisition.supported_governed_path
             ):
                 prompt = PromptAssembly(messages=[], trace=budget_prompt_trace)
+                prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
             else:
                 await _create_error_trace(
                     memory_store=memory_store,
@@ -10814,6 +10916,7 @@ async def orchestrate_chat(
                                 ),
                             ),
                         )
+                        prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
                         _preserve_interaction_governance_trace_inputs(
                             prompt.trace,
                             interaction_governance_trace,
@@ -10839,6 +10942,7 @@ async def orchestrate_chat(
                                 "message_count": 0,
                             },
                         )
+                        prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
                     messages = prompt.messages
                     prompt.trace["capability_registry"] = (
                         capability_registry_trace
@@ -11092,6 +11196,7 @@ async def orchestrate_chat(
                             ),
                         ),
                     )
+                    prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
                     _preserve_interaction_governance_trace_inputs(
                         prompt.trace,
                         interaction_governance_trace,
@@ -11132,6 +11237,7 @@ async def orchestrate_chat(
                             },
                         },
                     )
+                    prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
                 messages = prompt.messages
                 prompt.trace["capability_registry"] = capability_registry_trace
                 prompt.trace["retrieval_dispatch"] = retrieval_dispatch_trace
@@ -11676,6 +11782,7 @@ async def orchestrate_chat(
                             ),
                         ),
                     )
+                    repair_prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
                 except PromptBudgetError:
                     repair_outcome = "prompt_budget_failed"
                     repair_prompt_status = "prompt_budget_failed"
