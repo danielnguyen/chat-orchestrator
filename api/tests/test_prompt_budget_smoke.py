@@ -5,6 +5,13 @@ from services.orchestrate import orchestrate_chat
 
 
 class BudgetMemoryStore:
+    async def get_proactive_preferences(self, *, owner_id):
+        return {
+            "owner_id": owner_id, "enabled": False,
+            "allowed_surfaces_json": [], "rule_prefs_json": {},
+            "created_at": None, "updated_at": None,
+        }
+
     def __init__(
         self,
         *,
