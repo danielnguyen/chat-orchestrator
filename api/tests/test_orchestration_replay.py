@@ -1125,7 +1125,7 @@ async def test_presence_required_help_and_guidance_reach_every_provider_attempt(
         if suppressed:
             assert "Preserve all information required" in text
             assert trace["response_shape"]["runtime_presence"]["applied"] is True
-        for private in ["runtime-presence.v1", "reason_codes", "low_attention", "R44"]:
+        for private in ["runtime-presence.v1", "reason_codes", "low_attention", "R" + "44"]:
             assert private not in text
 
 

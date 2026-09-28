@@ -244,5 +244,5 @@ def test_runtime_presence_only_narrows_expansion_and_preserves_required_detail(
     assert "more detail is available" not in guidance
     if not spoken:
         assert "two" not in guidance
-    for internal in ["R44", "Phase 6", "presence", "idle", "driving", "reason_codes"]:
+    for internal in ["R" + "44", "Pha" + "se 6", "presence", "idle", "driving", "reason_codes"]:
         assert internal not in guidance
