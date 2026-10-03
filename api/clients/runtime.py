@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from services.privacy_context import validate_privacy_policy_result
 
 _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
@@ -87,6 +87,183 @@ def validate_presence_response(
     ):
         raise RuntimeError("presence_response_invalid")
     return response
+
+RuntimeTimingPolicy = Literal[
+    "answer_now", "acknowledge_then_answer", "ask_clarifying_question", "pause_or_wait",
+    "defer_expansion", "yield_to_user", "resume_previous_thread", "close_turn",
+]
+RuntimeTimingRequestedDetail = Literal["unspecified", "brief", "normal", "expanded"]
+RuntimeTimingDependencyState = Literal["ready", "degraded", "blocking"]
+RuntimeTimingDegradationMode = Literal["none", "bounded", "fail_closed"]
+RuntimeTimingContinuationState = Literal[
+    "none", "clarification_required", "waiting", "deferred_expansion", "yielded_to_user",
+    "resuming_previous_thread", "closed",
+]
+RuntimeTimingBudgetClass = Literal[
+    "ordinary_text", "evidence_governed", "history_followup", "safe_action_preview",
+    "provider_fallback", "voice_acknowledgment", "voice_provider_dispatch",
+]
+RuntimeTimingReason = Literal[
+    "dependency_blocking", "continuation_close_turn", "continuation_pause_or_wait",
+    "continuation_clarification", "continuation_resume", "intent_interruption",
+    "restraint_clarification", "unclear_intent_clarification", "spoken_action_acknowledgment",
+    "restraint_defer_expansion", "presence_low_attention", "presence_active_task",
+    "continuation_answer_now", "ordinary_ready", "dependency_degraded",
+]
+
+# Local regression metadata only; these values never grant authority or set deadlines.
+RUNTIME_TIMING_BUDGET_MS = {
+    "ordinary_text": 300, "evidence_governed": 350, "history_followup": 160,
+    "safe_action_preview": 300, "provider_fallback": 350, "voice_acknowledgment": 250,
+    "voice_provider_dispatch": 300,
+}
+RUNTIME_TIMING_PROJECTIONS = {
+    "answer_now": ("none", True, ""),
+    "acknowledge_then_answer": (
+        "none", True,
+        "Acknowledge receipt briefly before the full response. "
+        "This does not authorize, confirm, or execute any action.",
+    ),
+    "ask_clarifying_question": (
+        "clarification_required", False, "Ask one concise clarifying question before proceeding.",
+    ),
+    "pause_or_wait": ("waiting", False, "Do not proceed with the full response while waiting."),
+    "defer_expansion": (
+        "deferred_expansion", False, "Preserve required core content; defer optional expansion.",
+    ),
+    "yield_to_user": (
+        "yielded_to_user", False, "Yield the conversational floor; suppress optional continuation.",
+    ),
+    "resume_previous_thread": (
+        "resuming_previous_thread", True,
+        "Continue the already-admitted prior thread without inventing missing state.",
+    ),
+    "close_turn": ("closed", False, "Do not proceed with provider output under this decision."),
+}
+RUNTIME_TIMING_REASON_POLICIES = {
+    "dependency_blocking": "close_turn",
+    "continuation_close_turn": "close_turn",
+    "continuation_pause_or_wait": "pause_or_wait",
+    "continuation_clarification": "ask_clarifying_question",
+    "continuation_resume": "resume_previous_thread",
+    "intent_interruption": "yield_to_user",
+    "restraint_clarification": "ask_clarifying_question",
+    "unclear_intent_clarification": "ask_clarifying_question",
+    "spoken_action_acknowledgment": "acknowledge_then_answer",
+    "restraint_defer_expansion": "defer_expansion",
+    "presence_low_attention": "defer_expansion",
+    "presence_active_task": "defer_expansion",
+    "continuation_answer_now": "answer_now",
+    "ordinary_ready": "answer_now",
+}
+
+
+class _RuntimeTimingScope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str = Field(min_length=1, max_length=120)
+
+    @field_validator(
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id",
+    )
+    @classmethod
+    def reject_blank_scope(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("timing_scope_blank")
+        return value
+
+
+class RuntimeTimingEvaluateRequest(_RuntimeTimingScope):
+    spoken_output: bool
+    active_task_mode: bool
+    requested_detail: RuntimeTimingRequestedDetail
+    latency_budget_class: RuntimeTimingBudgetClass
+    dependency_state: RuntimeTimingDependencyState
+    continuation_timing_policy: Literal["answer_now", "ask_clarifying_question", "pause_or_wait",
+                                      "resume_previous_thread", "close_turn"] | None = None
+
+
+class RuntimeTimingResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    timing_policy: RuntimeTimingPolicy
+    reason_codes: list[RuntimeTimingReason] = Field(min_length=1, max_length=2)
+    latency_budget_class: RuntimeTimingBudgetClass
+    latency_budget_ms: int = Field(ge=1, le=350)
+    expansion_allowed: bool
+    continuation_state: RuntimeTimingContinuationState
+    degradation_mode: RuntimeTimingDegradationMode
+    policy_version: Literal["runtime-timing.v1"]
+    prompt_overlay: str = Field(max_length=240)
+    trace_ref: Annotated[str, Field(min_length=1, max_length=120)]
+
+    @model_validator(mode="after")
+    def validate_coherence(self) -> "RuntimeTimingResult":
+        state, expansion, overlay = RUNTIME_TIMING_PROJECTIONS[self.timing_policy]
+        if (self.continuation_state, self.expansion_allowed, self.prompt_overlay) != (
+            state, expansion, overlay,
+        ):
+            raise ValueError("timing_projection_inconsistent")
+        if self.latency_budget_ms != RUNTIME_TIMING_BUDGET_MS[self.latency_budget_class]:
+            raise ValueError("timing_budget_inconsistent")
+        primary = self.reason_codes[0]
+        if RUNTIME_TIMING_REASON_POLICIES.get(primary) != self.timing_policy:
+            raise ValueError("timing_reason_inconsistent")
+        if self.degradation_mode == "fail_closed":
+            expected_reasons = ["dependency_blocking"]
+        elif primary == "dependency_blocking":
+            raise ValueError("timing_degradation_inconsistent")
+        else:
+            expected_reasons = [primary]
+            if self.degradation_mode == "bounded":
+                expected_reasons.append("dependency_degraded")
+        if self.reason_codes != expected_reasons:
+            raise ValueError("timing_degradation_inconsistent")
+        return self
+
+
+class RuntimeTimingEvaluateResponse(_RuntimeTimingScope):
+    result: RuntimeTimingResult
+
+
+def validate_timing_request(request: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return RuntimeTimingEvaluateRequest.model_validate(request).model_dump()
+    except ValueError:
+        raise ValueError("timing_request_invalid") from None
+
+
+def validate_timing_response(
+    response: Any, *, request: dict[str, Any],
+) -> dict[str, Any]:
+    request = validate_timing_request(request)
+    try:
+        validated = RuntimeTimingEvaluateResponse.model_validate(response).model_dump()
+    except ValueError:
+        raise RuntimeError("timing_response_invalid") from None
+    if any(validated[field] != request[field] for field in (
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id",
+    )):
+        raise RuntimeError("timing_response_context_mismatch")
+    result = validated["result"]
+    if (
+        result["latency_budget_class"] != request["latency_budget_class"]
+        or result["degradation_mode"] != {
+            "ready": "none", "degraded": "bounded", "blocking": "fail_closed",
+        }[request["dependency_state"]]
+        or (result["reason_codes"][0] == "spoken_action_acknowledgment"
+            and not request["spoken_output"])
+    ):
+        raise RuntimeError("timing_response_invalid")
+    return validated
+
 
 _HISTORY_INTENTS = {
     "not_history_followup",
@@ -2349,6 +2526,11 @@ class RuntimeClient:
         if surface_metadata_json is not None:
             payload["surface_metadata_json"] = surface_metadata_json
         return await self._post("/v1/runtime/restraint/evaluate", json=payload)
+
+    async def evaluate_timing(self, **request: Any) -> dict[str, Any]:
+        request = validate_timing_request(request)
+        response = await self._post("/v1/runtime/timing/evaluate", json=request)
+        return validate_timing_response(response, request=request)
 
     async def evaluate_presence(
         self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
