@@ -38245,21 +38245,28 @@ async def test_timing_presence_fallback_is_degraded_and_explicit_facts_are_proje
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["assistant", "trace"])
-async def test_timing_stop_persistence_failure_never_reopens_provider_or_action(tmp_path, boundary):
+@pytest.mark.parametrize("boundary,policy", [
+    ("assistant", "ask_clarifying_question"), ("trace", "ask_clarifying_question"),
+    ("trace", "close_turn"),
+])
+async def test_timing_stop_persistence_failure_never_reopens_provider_or_action(
+    tmp_path, boundary, policy,
+):
     class FailingStopMemory(FakeMemoryStore):
         async def add_message(self, **kwargs):
+            self.append_attempts = getattr(self, "append_attempts", []) + [kwargs["role"]]
             if boundary == "assistant" and kwargs["role"] == "assistant":
                 raise RuntimeError("PRIVATE-PERSISTENCE")
             return await super().add_message(**kwargs)
 
         async def create_trace(self, **kwargs):
+            self.trace_attempts = getattr(self, "trace_attempts", 0) + 1
             if boundary == "trace":
                 raise RuntimeError("PRIVATE-PERSISTENCE")
             return await super().create_trace(**kwargs)
 
-    out, runtime, provider, _ = await _run_timing_turn(
-        tmp_path, policy="ask_clarifying_question", memory=FailingStopMemory(),
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy=policy, memory=FailingStopMemory(),
         runtime=FakeRuntime(capability_match_response=_capability_match_response()),
         capability_registry_enabled=True,
     )
@@ -38268,5 +38275,137 @@ async def test_timing_stop_persistence_failure_never_reopens_provider_or_action(
     assert runtime.capability_authority_calls == []
     assert runtime.capability_flow_calls == []
     assert len(runtime.timing_calls) == 1
-    assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == (
+        "abandoned" if boundary == "assistant" or policy == "close_turn" else "completed"
+    )
+    assert memory.append_attempts.count("assistant") == int(policy != "close_turn")
+    assert memory.trace_attempts == 1
+    assert memory.work["state"] == "failed"
+    assert memory.work["failure_code"] == "dependency_unavailable"
     assert "PRIVATE-PERSISTENCE" not in str(out)
+
+
+def _assert_bms_trace_create_shape(trace):
+    # Required fields/types in BMS api/models.py TraceCreateRequest at synchronized
+    # f7d0f77ba572b13f10f38b563469bef367964a35. Check the actual boundary envelope,
+    # rather than letting the permissive memory fake accept missing required keys.
+    for key in ("request_id", "conversation_id", "owner_id", "surface"):
+        assert isinstance(trace[key], str) and trace[key]
+    for key in ("profile", "retrieval", "router_decision", "model_call"):
+        assert isinstance(trace[key], dict)
+    assert trace["status"] in {"ok", "degraded", "failed"}
+    assert isinstance(trace["model_calls"], list)
+    assert isinstance(trace["fallback"], dict)
+    assert type(trace["latency_ms"]) is int and trace["latency_ms"] >= 0
+    assert trace["error"] is None or isinstance(trace["error"], str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [
+    "ask_clarifying_question", "pause_or_wait", "yield_to_user", "close_turn",
+])
+async def test_timing_stop_persists_actual_bms_envelope_with_no_provider_work(tmp_path, policy):
+    class StrictTraceMemory(FakeMemoryStore):
+        async def create_trace(self, **kwargs):
+            _assert_bms_trace_create_shape(kwargs["payload"])
+            return await super().create_trace(**kwargs)
+
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy=policy, memory=StrictTraceMemory(),
+        runtime=FakeRuntime(capability_match_response=_capability_match_response()),
+        capability_registry_enabled=True,
+        payload=_base_payload(conversation_id="conv-1", messages=[{
+            "role": "user", "content": "PRIVATE-TIMING-TRACE-CONTENT",
+        }]),
+    )
+    assert provider.calls == runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
+    assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1
+    assert len(memory.trace_calls) == 1
+    trace = memory.trace_calls[0]["payload"]
+    assert trace["request_id"] == "rid-timing-flow"
+    assert trace["conversation_id"] == "conv-1"
+    assert trace["owner_id"] == "owner"
+    assert trace["client_id"] == trace["surface"] == "vscode"
+    assert set(trace["profile"]) == {"name", "version", "effective_profile_ref"}
+    assert trace["router_decision"]["selected_model"] == "not_called"
+    assert trace["router_decision"]["provider"] == "none"
+    assert trace["model_call"] == {
+        "model": "not_called", "provider": "none", "status": "not_called", "latency_ms": 0,
+    }
+    assert trace["model_calls"] == trace["references"] == []
+    assert trace["fallback"] == {"triggered": False, "reason": None}
+    assert trace["artifacts"]["artifact_count"] == 0
+    prompt = trace["retrieval"]["prompt_assembly"]
+    for key in ("runtime_timing", "runtime_session", "turn_state", "runtime_presence",
+                "restraint", "interaction_governance", "situated_presence"):
+        assert key in prompt
+    assert prompt["runtime_timing"]["result"]["timing_policy"] == policy
+    assert trace["prompt"]["runtime_timing"] == prompt["runtime_timing"]
+    assert "PRIVATE-TIMING-TRACE-CONTENT" not in json.dumps(trace)
+    assert "PRIVATE-TIMING-TRACE-CONTENT" not in out["answer"]
+    assert runtime.turn_complete_calls[0]["turn_status"] == (
+        "abandoned" if policy == "close_turn" else "completed"
+    )
+    assert memory.work["state"] == ("failed" if policy == "close_turn" else "completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["no_local", "budget"])
+@pytest.mark.parametrize("timing_enabled", [True, False])
+async def test_post_timing_error_trace_retains_only_evaluated_timing(
+    tmp_path, failure, timing_enabled,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    if failure == "budget":
+        models.write_text("models:\n  gpt-4o-mini:\n    provider: cloud\n")
+    runtime, provider, memory = FakeRuntime(), FakeLiteLLM(), FakeMemoryStore()
+    expected = ("local_only policy active but no local model available" if failure == "no_local"
+                else "model_context_limit_unavailable")
+    with pytest.raises(RuntimeError, match=expected):
+        await orchestrate_chat(
+            payload=_base_payload(conversation_id="conv-1", sensitivity=(
+                "local_only" if failure == "no_local" else "private"
+            )), memory_store=memory, litellm=provider, runtime=runtime,
+            rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+            request_id="rid-timing-error-trace", interaction_governance_enabled=timing_enabled,
+            restraint_enabled=timing_enabled,
+        )
+    assert provider.calls == []
+    assert len(runtime.turn_complete_calls) == 1
+    trace = memory.trace_calls[0]["payload"]
+    _assert_bms_trace_create_shape(trace)
+    prompt = trace["retrieval"]["prompt_assembly"]
+    assert ("runtime_timing" in prompt) is timing_enabled
+    assert ("runtime_timing" in trace["prompt"]) is timing_enabled
+    if timing_enabled:
+        assert len(runtime.timing_calls) == 1
+        assert prompt["runtime_timing"]["result"]["timing_policy"] == "answer_now"
+        assert trace["prompt"]["runtime_timing"] == prompt["runtime_timing"]
+
+
+@pytest.mark.asyncio
+async def test_timing_barrier_does_not_mark_governance_forwarded_to_authority(tmp_path):
+    captured = []
+
+    async def stop():
+        return True
+
+    governance = {"included": True, "status": "included", "interaction_kind": "command",
+                  "tension_level": "low"}
+    runtime = FakeRuntime(capability_match_response=_capability_match_response())
+    _, trace = await orchestrate_service._resolve_capability_registry_context(
+        runtime=runtime, enabled=True, request_id="rid-stop-provenance", owner_id="owner",
+        conversation_id="conv-1", surface="vscode", runtime_session_id="rtsession_1",
+        runtime_turn_id="rtturn_1", active_persona_id="technical_architect",
+        current_user_text="Turn on office lights.", interaction_governance_trace=governance,
+        timing_barrier=stop,
+    )
+    captured.append(trace)
+    assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
+    provenance = captured[0]["decision_provenance"]
+    assert provenance["governance_available"] is True
+    assert provenance["forwarded_to_authority"] is False
+    assert provenance["forwarded_to_action_flow"] is False

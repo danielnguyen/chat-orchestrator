@@ -3097,9 +3097,9 @@ async def _resolve_capability_continuation_policy(
         interaction_governance_trace,
     )
     try:
-        _mark_governance_forwarded(trace["decision_provenance"], authority=True)
         if timing_barrier is not None and await timing_barrier():
             return [], trace
+        _mark_governance_forwarded(trace["decision_provenance"], authority=True)
         authority_response = await runtime.action_authority(
             request_id=f"{request_id}:capability-authority",
             owner_id=owner_id,
@@ -3291,12 +3291,12 @@ async def _resolve_capability_registry_context(
                 )
                 authority_inputs = _authority_context_inputs(interaction_governance_trace)
                 runtime_operation = "authority"
+                if timing_barrier is not None and await timing_barrier():
+                    return [], trace
                 _mark_governance_forwarded(
                     trace["decision_provenance"],
                     authority=True,
                 )
-                if timing_barrier is not None and await timing_barrier():
-                    return [], trace
                 authority_response = await runtime.action_authority(
                     request_id=f"{request_id}:capability-authority",
                     owner_id=owner_id,
@@ -4269,6 +4269,9 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         summary["reasoning_continuation"] = trace["reasoning_continuation"]
     if isinstance(trace.get("history_followup"), dict):
         summary["history_followup"] = trace["history_followup"]
+    timing = trace.get("runtime_timing")
+    if isinstance(timing, dict) and timing.get("attempted"):
+        summary["runtime_timing"] = deepcopy(timing)
     return summary
 
 
@@ -8156,6 +8159,43 @@ def _policy_pick_model(
     return candidates[0][0]
 
 
+
+def _timing_stop_trace_payload(
+    *, request_id: str, conversation_id: str, payload: dict[str, Any],
+    profile: dict[str, Any] | None, prompt_trace: dict[str, Any],
+    status: str, started: float, error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id, "conversation_id": conversation_id,
+        "owner_id": payload["owner_id"], "client_id": payload.get("client_id"),
+        "surface": payload.get("surface", "unknown"),
+        "profile": ({
+            "name": profile["profile_name"], "version": profile["profile_version"],
+            "effective_profile_ref": profile["effective_profile_ref"],
+        } if profile is not None else {}),
+        "retrieval": {
+            "query_present": any(
+                item.get("role") == "user" for item in payload.get("messages", [])
+            ),
+            "bundle": {"status": "not_requested", "recent_count": 0,
+                       "semantic_count": 0, "artifact_ref_count": 0},
+            "prompt_assembly": prompt_trace,
+        },
+        "prompt": _trace_prompt(prompt_trace),
+        "router_decision": {
+            "rule_id": None, "selected_model": "not_called", "provider": "none",
+            "rationale": "runtime_timing", "fallbacks": [],
+        },
+        "manual_override": {"requested_model": None, "applied": False, "rejection_reason": None},
+        "model_call": {"provider": "none", "model": "not_called", "status": "not_called",
+                       "latency_ms": 0},
+        "model_calls": [], "fallback": {"triggered": False, "reason": None},
+        "artifacts": {"status": "not_requested", "artifact_count": 0,
+                      "included_ids": [], "source_reference_count": 0},
+        "references": [], "cost": {}, "latency_ms": int((perf_counter() - started) * 1000),
+        "status": status, "error": error,
+    }
+
 async def _create_error_trace(
     *,
     memory_store: MemoryStoreClient,
@@ -9235,15 +9275,17 @@ async def orchestrate_chat(
             )
             await work.fail_if_unfinished()
             try:
-                await memory_store.create_trace(request_id=request_id, payload={
-                    "owner_id": payload["owner_id"], "conversation_id": conversation_id,
-                    "status": "failed",
-                    "retrieval": {"prompt_assembly": {
-                        "runtime_presence": runtime_presence_trace,
-                        "runtime_timing": timing_trace,
-                        "turn_state": turn_state_trace,
-                    }},
-                })
+                await memory_store.create_trace(
+                    request_id=request_id, payload=_timing_stop_trace_payload(
+                    request_id=request_id, conversation_id=conversation_id, payload=payload,
+                    profile=None, status="failed", started=started,
+                    error="mandatory_input_unavailable", prompt_trace={
+                        "status": "not_requested", "runtime_presence": runtime_presence_trace,
+                        "runtime_timing": timing_trace, "runtime_session": runtime_session_trace,
+                        "turn_state": turn_state_trace, "restraint": restraint_trace,
+                        "interaction_governance": interaction_governance_trace,
+                    },
+                ))
             except Exception:
                 pass
             return {
@@ -9301,12 +9343,16 @@ async def orchestrate_chat(
                 )
                 if timing_applicable:
                     try:
-                        await memory_store.create_trace(request_id=request_id, payload={
-                            "owner_id": payload["owner_id"], "conversation_id": conversation_id,
-                            "status": "failed", "retrieval": {"prompt_assembly": {
-                                "runtime_timing": timing_trace, "turn_state": turn_state_trace,
-                            }},
-                        })
+                        await memory_store.create_trace(
+                            request_id=request_id, payload=_timing_stop_trace_payload(
+                                request_id=request_id, conversation_id=conversation_id,
+                                payload=payload, profile=None, status="failed", started=started,
+                                error="message_persistence_unavailable", prompt_trace={
+                                    "status": "not_requested", "runtime_timing": timing_trace,
+                                    "turn_state": turn_state_trace,
+                                },
+                            ),
+                        )
                     except Exception:
                         pass
                 return {
@@ -9349,7 +9395,15 @@ async def orchestrate_chat(
         timing_consumed = False
 
         async def finish_timing_stop(answer: str, *, failed: bool) -> dict[str, Any]:
-            work.failure_code = "dependency_unavailable" if failed else "execution_failed"
+            failure_answer = "I couldn’t continue this turn safely. Please try again."
+            # A terminal request may commit before its response is lost. Never replay it.
+            if turn_state_trace.get("terminal_transition_attempted"):
+                return {
+                    "request_id": request_id, "conversation_id": conversation_id,
+                    "profile_name": profile["profile_name"], "selected_model": "not_called",
+                    "answer": failure_answer, "status": "failed", "sources": [],
+                }
+            work.failure_code = "dependency_unavailable"
             if not failed:
                 await _advance_runtime_turn(
                     runtime=runtime, turn_state_trace=turn_state_trace,
@@ -9363,28 +9417,38 @@ async def orchestrate_chat(
                         policy_metadata=turn_policy_metadata,
                     )
                 except Exception:
-                    return await timing_failure("outcome_persistence_failed")
+                    failed, answer = True, failure_answer
+                    timing_trace.update(failure_category="outcome_persistence_failed")
+            turn_state_trace["terminal_transition_attempted"] = True
             await _complete_runtime_turn(
                 runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
                 turn_status="abandoned" if failed else "completed",
             )
+            stop_prompt_trace = {
+                "status": "not_requested", "layers": [], "message_count": 0,
+                "runtime_session": runtime_session_trace, "turn_state": turn_state_trace,
+                "runtime_timing": deepcopy(timing_trace),
+                "runtime_presence": runtime_presence_trace,
+                "interaction_governance": interaction_governance_trace,
+                "restraint": restraint_trace, "situated_presence": situated_presence_trace,
+                "response_shape": response_shape_trace, "surface_presence": surface_presence_trace,
+                "history_followup": history_followup_trace,
+                "semantic_interpreter": (evidence_acquisition.semantic_interpreter
+                                         if evidence_acquisition else {}),
+            }
             try:
-                await memory_store.create_trace(request_id=request_id, payload={
-                    "owner_id": payload["owner_id"], "conversation_id": conversation_id,
-                    "status": "failed" if failed else "degraded",
-                    "model_calls": [], "retrieval": {"prompt_assembly": {
-                        "runtime_timing": deepcopy(timing_trace),
-                        "runtime_presence": runtime_presence_trace,
-                        "interaction_governance": interaction_governance_trace,
-                        "restraint": restraint_trace, "turn_state": turn_state_trace,
-                        "history_followup": history_followup_trace,
-                        "semantic_interpreter": (evidence_acquisition.semantic_interpreter
-                                                 if evidence_acquisition else {}),
-                    }},
-                })
+                await memory_store.create_trace(
+                    request_id=request_id, payload=_timing_stop_trace_payload(
+                        request_id=request_id, conversation_id=conversation_id, payload=payload,
+                        profile=profile, prompt_trace=stop_prompt_trace,
+                        status="failed" if failed else "degraded", started=started,
+                        error=timing_trace.get("failure_category") if failed else None,
+                    ),
+                )
             except Exception:
-                if not failed:
-                    return await timing_failure("outcome_persistence_failed")
+                # Required trace persistence failed. Keep the existing terminal outcome,
+                # leave work unfinished for fail_if_unfinished, and do not replay writes.
+                failed, answer = True, failure_answer
             if not failed:
                 await work.complete(acknowledgement)
             return {
@@ -9836,6 +9900,8 @@ async def orchestrate_chat(
                 },
                 "prompt": {
                     "status": "not_requested",
+                    **({"runtime_timing": deepcopy(timing_trace)}
+                       if timing_trace.get("attempted") else {}),
                     "claim_explanation": claim_explanation.trace,
                     **(
                         {"history_followup": history_followup_trace}
@@ -10686,6 +10752,8 @@ async def orchestrate_chat(
                         "restraint": restraint_trace,
                         "situated_presence": situated_presence_trace,
                         "runtime_presence": runtime_presence_trace,
+                        **({"runtime_timing": deepcopy(timing_trace)}
+                           if timing_trace.get("attempted") else {}),
                         "retrieval_dispatch": retrieval_dispatch_trace,
                         "memory_hygiene": (
                             memory_hygiene_result.trace
@@ -10904,6 +10972,8 @@ async def orchestrate_chat(
                 "restraint": restraint_trace,
                 "situated_presence": situated_presence_trace,
                 "runtime_presence": runtime_presence_trace,
+                **({"runtime_timing": deepcopy(timing_trace)}
+                   if timing_trace.get("attempted") else {}),
                 "retrieval_dispatch": retrieval_dispatch_trace,
                 "memory_hygiene": (
                     memory_hygiene_result.trace
@@ -13139,7 +13209,8 @@ async def orchestrate_chat(
     except Exception as error:
         if isinstance(error, httpx.HTTPError):
             work.failure_code = "dependency_unavailable"
-        if turn_state_trace.get("runtime_turn_id") and not turn_state_trace.get("completed"):
+        if (turn_state_trace.get("runtime_turn_id") and not turn_state_trace.get("completed")
+                and not turn_state_trace.get("terminal_transition_attempted")):
             await _complete_runtime_turn(
                 runtime=runtime,
                 turn_state_trace=turn_state_trace,
