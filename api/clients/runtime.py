@@ -946,6 +946,9 @@ class RuntimeClient:
             resp = await client.post(path, json=json)
             resp.raise_for_status()
             return resp.json()
+        except httpx.PoolTimeout:
+            # Waiting for capacity does not make the shared transport unhealthy.
+            raise
         except httpx.TransportError:
             try:
                 await self._invalidate_client(client)

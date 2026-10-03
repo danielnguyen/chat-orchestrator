@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
@@ -9,6 +11,57 @@ from typing import Any
 import httpx
 import pytest
 from clients.runtime import RuntimeClient
+
+
+@asynccontextmanager
+async def _held_http_connection(*, release: asyncio.Event | None = None):
+    """Hold the first HTTP response so the real httpx pool stays occupied."""
+    received = []
+    connections = []
+    entered = asyncio.Event()
+    disconnected = asyncio.Event()
+    handlers = set()
+
+    async def handle(reader, writer):
+        task = asyncio.current_task()
+        handlers.add(task)
+        connections.append(writer.get_extra_info("peername"))
+        try:
+            headers = (await reader.readuntil(b"\r\n\r\n")).decode("ascii")
+            length = next(int(line.split(":", 1)[1]) for line in headers.splitlines()
+                          if line.lower().startswith("content-length:"))
+            payload = json.loads(await reader.readexactly(length))
+            received.append((headers.splitlines()[0], payload))
+            if len(received) == 1:
+                entered.set()
+                if release is None:
+                    # Explicit shutdown must close this occupied socket.
+                    assert await reader.read() == b""
+                    disconnected.set()
+                    return
+                await release.wait()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n"
+                b"Content-Type: application/json\r\nConnection: close\r\n\r\n"
+                b'{"ok":true}'
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            handlers.remove(task)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}", received, connections, entered, disconnected
+    finally:
+        server.close()
+        await server.wait_closed()
+        pending = tuple(handlers)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 class _FakeResponse:
@@ -518,6 +571,146 @@ async def test_transport_failure_is_not_replayed_and_later_call_replaces_client(
     assert len(factory.clients) == 2
     assert len(replacement_client.posts) == 1
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pool_exhaustion_bounds_connections_and_does_not_replay_start_turn():
+    release = asyncio.Event()
+    async with _held_http_connection(release=release) as (
+        url, received, connections, entered, disconnected,
+    ):
+        transports = []
+        attempts = []
+
+        async def record_attempt(request):
+            attempts.append((request.url.path, json.loads(request.content)))
+
+        def factory(**kwargs):
+            # Keep the normal httpx/httpcore transport and its real pool semantics.
+            transport = httpx.AsyncClient(
+                **kwargs, trust_env=False, event_hooks={"request": [record_attempt]},
+            )
+            transports.append(transport)
+            return transport
+
+        client = RuntimeClient(url, None, timeout_ms=10000, max_connections=1,
+                               max_keepalive_connections=1, client_factory=factory)
+        await client.open()
+        held = asyncio.create_task(client.overlay(
+            request_id="held-call", owner_id="owner", conversation_id="conversation",
+            surface="web",
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            # The occupied request retains its long read timeout. Only the queued
+            # request gets a short pool timeout, without changing production defaults.
+            transports[0].timeout = httpx.Timeout(10.0, pool=0.05)
+            transition = dict(request_id="exhausted-start", owner_id="owner",
+                              conversation_id="conversation", surface="web")
+            with pytest.raises(httpx.PoolTimeout) as exc:
+                await asyncio.wait_for(client.start_turn(**transition), timeout=2)
+            assert exc.value.request.url.path == "/v1/runtime/turns/start"
+            assert attempts == [
+                ("/v1/runtime/overlay", dict(request_id="held-call", owner_id="owner",
+                                             conversation_id="conversation", surface="web")),
+                ("/v1/runtime/turns/start", transition),
+            ]
+            # The exhausted transition never obtained a second socket or reached CR.
+            assert len(connections) == 1
+            assert len(received) == 1
+            assert not transports[0].is_closed
+            assert client._client is transports[0]
+            assert len(transports) == 1
+            assert not held.done()
+            assert not disconnected.is_set()
+            # Pool saturation belongs to the waiting request, not the occupied pool.
+            release.set()
+            assert await asyncio.wait_for(held, timeout=2) == {"ok": True}
+            assert await client.overlay(
+                request_id="independent-call", owner_id="owner",
+                conversation_id="conversation", surface="web",
+            ) == {"ok": True}
+            assert len(transports) == 1
+            assert client._client is transports[0]
+            assert not transports[0].is_closed
+            assert len(connections) == 2
+            assert [payload["request_id"] for _, payload in received] == [
+                "held-call", "independent-call",
+            ]
+            assert [path for path, _ in attempts].count("/v1/runtime/turns/start") == 1
+        finally:
+            release.set()
+            await client.close()
+            if not held.done():
+                held.cancel()
+            await asyncio.gather(held, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [httpx.ReadTimeout, httpx.RemoteProtocolError])
+async def test_start_turn_transport_failure_is_never_replayed(failure_type):
+    path = "/v1/runtime/turns/start"
+    failure = failure_type("response lost", request=httpx.Request("POST", f"http://runtime{path}"))
+    failed = _FakeAsyncClient([failure])
+    replacement = _FakeAsyncClient([{"ok": True}])
+    factory = _ClientFactory([failed, replacement])
+    client = RuntimeClient("http://runtime", None, client_factory=factory)
+    transition = dict(request_id="failed-transition", owner_id="owner",
+                      conversation_id="conversation", surface="web", expected_thread_revision=7)
+    await client.open()
+    try:
+        with pytest.raises(failure_type) as exc:
+            await client.start_turn(**transition)
+        assert exc.value is failure
+        assert failed.posts == [(path, transition)]
+        assert failed.close_calls == 1
+        assert client._client is None
+        assert len(factory.clients) == 1
+        assert await client.overlay(
+            request_id="independent-call", owner_id="owner",
+            conversation_id="conversation", surface="web",
+        ) == {"ok": True}
+        assert len(factory.clients) == 2
+        assert [posted_path for posted_path, _ in replacement.posts] == ["/v1/runtime/overlay"]
+        assert failed.posts == [(path, transition)]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_inflight_http_request_without_replacement_or_replay():
+    async with _held_http_connection() as (url, received, connections, entered, disconnected):
+        transports = []
+
+        def factory(**kwargs):
+            transport = httpx.AsyncClient(**kwargs, trust_env=False)
+            transports.append(transport)
+            return transport
+
+        client = RuntimeClient(url, None, timeout_ms=10000, client_factory=factory)
+        await client.open()
+        held = asyncio.create_task(client.overlay(
+            request_id="shutdown-call", owner_id="owner", conversation_id="conversation",
+            surface="web",
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await asyncio.wait_for(client.close(), timeout=2)
+            with pytest.raises(httpx.TransportError):
+                await asyncio.wait_for(held, timeout=2)
+            await asyncio.wait_for(disconnected.wait(), timeout=2)
+            assert transports[0].is_closed
+            assert client._client is None
+            assert len(transports) == len(connections) == len(received) == 1
+            with pytest.raises(RuntimeError, match="^runtime_client_closed$"):
+                await client.overlay(request_id="after-shutdown", owner_id="owner",
+                                     conversation_id="conversation", surface="web")
+            assert len(transports) == 1
+        finally:
+            await client.close()
+            if not held.done():
+                held.cancel()
+            await asyncio.gather(held, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -3347,12 +3540,27 @@ async def test_presence_request_controls_rejected_before_transport(field, value)
 async def test_presence_response_exact_scope_binding(field):
     response = _presence_response()
     response[field] = "other"
-    transport = _FakeAsyncClient([response])
+    later_scope = {
+        **_PRESENCE_SCOPE, "request_id": "later-request", "runtime_turn_id": "later-turn",
+    }
+    later_response = {**_presence_response(), **later_scope}
+    transport = _FakeAsyncClient([response, later_response])
+    factory = _ClientFactory([transport])
     client = RuntimeClient("http://runtime.local", None,
-                           client_factory=_ClientFactory([transport]))
+                           client_factory=factory)
     await client.open()
-    with pytest.raises(RuntimeError, match="presence_response_context_mismatch"):
-        await client.evaluate_presence(**_PRESENCE_SCOPE)
+    try:
+        with pytest.raises(RuntimeError, match="presence_response_context_mismatch"):
+            await client.evaluate_presence(**_PRESENCE_SCOPE)
+        assert len(transport.posts) == 1
+        assert transport.close_calls == 0
+        assert await client.evaluate_presence(**later_scope) == later_response
+        assert len(factory.clients) == 1
+        assert len(transport.posts) == 2
+        assert transport.posts[1][1]["runtime_turn_id"] == "later-turn"
+        assert transport.close_calls == 0
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
