@@ -1601,6 +1601,49 @@ class FakeRuntime:
             raise RuntimeError("runtime unavailable")
         return self.restraint_response
 
+    async def evaluate_timing(self, **kwargs):
+        self.timing_calls = getattr(self, "timing_calls", [])
+        self.timing_calls.append(kwargs)
+        self.call_order.append("timing")
+        if getattr(self, "timing_error", None) is not None:
+            raise self.timing_error
+        from clients.runtime import RUNTIME_TIMING_BUDGET_MS, RUNTIME_TIMING_PROJECTIONS
+
+        policy = getattr(self, "timing_policy", "answer_now")
+        if kwargs["dependency_state"] == "blocking":
+            policy = "close_turn"
+        state, expansion, overlay = RUNTIME_TIMING_PROJECTIONS[policy]
+        reasons = {
+            "answer_now": "ordinary_ready",
+            "acknowledge_then_answer": "spoken_action_acknowledgment",
+            "ask_clarifying_question": "restraint_clarification",
+            "pause_or_wait": "continuation_pause_or_wait",
+            "defer_expansion": "restraint_defer_expansion",
+            "yield_to_user": "intent_interruption", "resume_previous_thread": "continuation_resume",
+            "close_turn": "continuation_close_turn",
+        }
+        reason = ("dependency_blocking" if kwargs["dependency_state"] == "blocking"
+                  else reasons[policy])
+        return {
+            **{key: kwargs[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id",
+            )},
+            "result": {
+                "timing_policy": policy, "reason_codes": [reason] + (
+                    ["dependency_degraded"] if kwargs["dependency_state"] == "degraded" else []
+                ),
+                "latency_budget_class": kwargs["latency_budget_class"],
+                "latency_budget_ms": RUNTIME_TIMING_BUDGET_MS[kwargs["latency_budget_class"]],
+                "expansion_allowed": expansion, "continuation_state": state,
+                "degradation_mode": {
+                    "ready": "none", "degraded": "bounded", "blocking": "fail_closed",
+                }[kwargs["dependency_state"]],
+                "policy_version": "runtime-timing.v1", "prompt_overlay": overlay,
+                "trace_ref": "rtrace-timing-fixture",
+            },
+        }
+
     async def evaluate_presence(self, **kwargs):
         self.presence_calls.append(kwargs)
         self.call_order.append("presence")
@@ -10607,7 +10650,7 @@ async def test_orchestrate_persona_containment_failure_is_non_fatal_and_traceabl
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_restraint_failure_is_non_fatal_and_traceable(tmp_path):
+async def test_orchestrate_restraint_failure_blocks_timing_and_provider(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -10631,10 +10674,14 @@ async def test_orchestrate_restraint_failure_is_non_fatal_and_traceable(tmp_path
         request_id="rid-restraint-failed",
     )
 
-    assert out["status"] == "ok"
-    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["restraint"]
+    assert out["status"] == "failed"
+    assert out["selected_model"] == "not_called"
+    trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+        "runtime_timing"
+    ]
     assert trace["status"] == "failed"
-    assert trace["omission_reason"] == "restraint_unavailable"
+    assert trace["failure_category"] == "mandatory_input_unavailable"
+    assert trace["attempted"] is False
     assert "runtime offline" not in str(trace)
 
 
@@ -20901,6 +20948,9 @@ async def test_grounded_invalid_candidate_repairs_once_with_same_route_and_no_fe
         ]
     )
     memory_store = ClaimCaptureMemoryStore()
+    runtime = FakeRuntime()
+    runtime.timing_policy = "defer_expansion"
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Verify the maintenance record.",
@@ -20908,11 +20958,12 @@ async def test_grounded_invalid_candidate_repairs_once_with_same_route_and_no_fe
         ),
         memory_store=memory_store,
         litellm=litellm,
-        runtime=FakeRuntime(),
+        runtime=runtime,
         dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
+        restraint_enabled=True,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -20942,6 +20993,15 @@ async def test_grounded_invalid_candidate_repairs_once_with_same_route_and_no_fe
     assert response_trace["repair_outcome"] == "valid"
     assert response_trace["validation_status"] == "valid"
     assert len(trace["model_calls"]) == 2
+
+    assert len(runtime.timing_calls) == 1
+    assert runtime.timing_calls[0]["latency_budget_class"] == "evidence_governed"
+    for call in litellm.calls:
+        assert "Timing guidance" in str(call["messages"])
+        assert "Preserve required core content" in str(call["messages"])
+    assert trace["retrieval"]["prompt_assembly"]["runtime_timing"]["result"][
+        "timing_policy"
+    ] == "defer_expansion"
 
 
 @pytest.mark.asyncio
@@ -37652,3 +37712,561 @@ async def test_durable_work_transition_response_mismatch_is_not_retried(tmp_path
         assert "work:failed" not in memory.events
     else:
         assert memory.work["state"] == "failed"
+
+
+async def _run_timing_turn(tmp_path, *, policy="answer_now", error=None, payload=None,
+                           runtime=None, provider=None, memory=None, **options):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = runtime or FakeRuntime()
+    runtime.timing_policy = policy
+    runtime.timing_error = error
+    provider = provider or FakeLiteLLM()
+    memory = memory or FakeMemoryStore()
+    original_chat = provider.chat
+    original_append = memory.add_message
+
+    async def chat(**kwargs):
+        runtime.call_order.append("answer_generation")
+        return await original_chat(**kwargs)
+
+    async def append(**kwargs):
+        if kwargs["role"] == "assistant":
+            runtime.call_order.append("assistant_persistence")
+        return await original_append(**kwargs)
+
+    provider.chat = chat
+    memory.add_message = append
+    out = await orchestrate_chat(
+        payload=payload or _base_payload(conversation_id="conv-1"),
+        memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-timing-flow", **options,
+    )
+    return out, runtime, provider, memory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy,answer,failed", [
+    ("ask_clarifying_question", "Could you clarify what you want me to do?", False),
+    ("pause_or_wait", "I’ll wait before continuing.", False),
+    ("yield_to_user", "Go ahead.", False),
+    ("close_turn", "I can’t continue this turn safely.", True),
+])
+async def test_timing_server_owned_outcomes_stop_provider_and_action(
+    tmp_path, policy, answer, failed,
+):
+    runtime = FakeRuntime(capability_match_response=_capability_match_response())
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy=policy, runtime=runtime, capability_registry_enabled=True,
+        payload=_base_payload(conversation_id="conv-1", messages=[{
+            "role": "user", "content": "Turn on office lights.",
+        }]),
+    )
+    assert out["answer"] == answer
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
+    assert len(runtime.timing_calls) == 1
+    assert runtime.call_order.index("presence") < runtime.call_order.index("timing")
+    assistant = [message for message in memory.added_messages if message["role"] == "assistant"]
+    if failed:
+        assert assistant == []
+        assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+    else:
+        assert assistant[0]["content"] == answer
+        assert (runtime.call_order.index("timing")
+                < runtime.call_order.index("assistant_persistence"))
+        assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["answer_now", "defer_expansion", "resume_previous_thread"])
+async def test_timing_provider_policies_are_consumed_after_upstream_authority(tmp_path, policy):
+    out, runtime, provider, memory = await _run_timing_turn(tmp_path, policy=policy)
+    assert out["answer"] == "hello"
+    assert len(runtime.timing_calls) == len(provider.calls) == 1
+    order = runtime.call_order
+    for upstream in ("interaction_governance", "restraint", "presence"):
+        assert order.index(upstream) < order.index("timing")
+    assert order.index("timing") < order.index("answer_generation")
+    assert order.index("answer_generation") < order.index("assistant_persistence")
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_timing"]["result"]["timing_policy"] == policy
+    assert trace["runtime_timing"]["scope"]["runtime_turn_id"] == "rtturn_1"
+    assert trace["runtime_timing"]["inputs"]["continuation_timing_policy"] is None
+    if policy == "defer_expansion":
+        shape = trace["response_shape"]["resolved_shape"]
+        assert shape["allows_expansion"] is False
+        assert shape["expansion_marker_allowed"] is False
+        assert "Preserve required core content" in str(provider.calls[0]["messages"])
+        assert trace["runtime_timing"]["result"]["continuation_state"] == "deferred_expansion"
+        assert shape["continuation_state"] != "deferred_expansion"
+    if policy == "resume_previous_thread":
+        assert "already-admitted prior thread" in str(provider.calls[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_timing_acknowledgment_does_not_grant_action_authority(tmp_path):
+    runtime = FakeRuntime(capability_match_response=_capability_match_response(),
+                          capability_authority_response={"result": {
+                              "capability_id": "office_lights_on", "risk_level": "low_reversible",
+                              "authority_level": "proposal_only", "requires_confirmation": False,
+                              "allowed": False, "reason_summary": ["not_authorized"],
+                              "action_taken": False,
+                          }})
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy="acknowledge_then_answer", runtime=runtime,
+        capability_registry_enabled=True,
+        payload=_base_payload(conversation_id="conv-1", surface_context={"spoken_output": True}),
+    )
+    assert out["answer"].startswith("Received. ")
+    assert len(runtime.timing_calls) == 1
+    assert runtime.capability_authority_calls
+    assert runtime.call_order.index("timing") < runtime.call_order.index("capability_authority")
+    assert runtime.capability_flow_calls == []
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_timing"]["acknowledgment_delivery"] == "final_response_only"
+    assert "does not authorize, confirm, or execute" in str(provider.calls[0]["messages"])
+    assert trace["capabilities"]["executor_call_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    httpx.ReadTimeout("PRIVATE-ERROR"), httpx.ConnectError("PRIVATE-ERROR"),
+    httpx.HTTPStatusError("PRIVATE-ERROR", request=httpx.Request("POST", "http://runtime"),
+                          response=httpx.Response(503)),
+    ValueError("PRIVATE-ERROR"), RuntimeError("timing_response_context_mismatch"),
+    RuntimeError("timing_response_invalid"),
+])
+async def test_timing_failure_cannot_fall_back_to_provider_or_action(tmp_path, error):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, error=error,
+        runtime=FakeRuntime(capability_match_response=_capability_match_response()),
+        capability_registry_enabled=True,
+    )
+    assert out["status"] == "failed"
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
+    assert len(runtime.timing_calls) == 1
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+    assert not [m for m in memory.added_messages if m["role"] == "assistant"]
+    assert "PRIVATE-ERROR" not in json.dumps(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["alexa", "car", "voice"])
+async def test_timing_request_surface_alone_is_not_spoken_in_real_flow(tmp_path, surface):
+    _, runtime, _, _ = await _run_timing_turn(
+        tmp_path, payload=_base_payload(conversation_id="conv-1", surface=surface),
+    )
+    assert runtime.timing_calls[0]["spoken_output"] is False
+    assert runtime.timing_calls[0]["latency_budget_class"] == "ordinary_text"
+
+
+@pytest.mark.asyncio
+async def test_timing_projection_conflict_stops_before_post_and_provider(tmp_path):
+    out, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, payload=_base_payload(conversation_id="conv-1", surface_context={
+            "spoken_output": False, "output_format": "speech",
+        }),
+    )
+    assert out["status"] == "failed"
+    assert getattr(runtime, "timing_calls", []) == []
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_timing_fallback_reuses_same_decision_and_prompt(tmp_path):
+    rules, models = _write_router_files(tmp_path)
+    rules.write_text(rules.read_text().replace("fallbacks: []",
+                     "fallbacks: [{selected_model: gpt-4o-mini, provider: cloud}]"))
+    runtime, provider, memory = FakeRuntime(), FakeLiteLLM(fail_first=True), FakeMemoryStore()
+    runtime.timing_policy = "defer_expansion"
+    await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"), memory_store=memory, litellm=provider,
+        runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-timing-fallback",
+    )
+    assert len(provider.calls) == 2
+    assert len(runtime.timing_calls) == 1
+    assert runtime.timing_calls[0]["latency_budget_class"] == "ordinary_text"
+    assert provider.calls[0]["messages"] == provider.calls[1]["messages"]
+    assert "Timing guidance" in str(provider.calls[1]["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("governance,restraint", [(False, True), (True, False), (False, False)])
+async def test_timing_unavailable_authority_preserves_disabled_configuration(
+    tmp_path, governance, restraint,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime, provider, memory = FakeRuntime(), FakeLiteLLM(), FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"), memory_store=memory, litellm=provider,
+        runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, interaction_governance_enabled=governance,
+        restraint_enabled=restraint, request_id="rid-timing-disabled",
+    )
+    assert out["answer"] == "hello"
+    assert getattr(runtime, "timing_calls", []) == []
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["runtime_timing"]
+    assert trace["status"] == "disabled"
+    assert trace["result"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classify,failure", [(False, False), (True, False), (True, True)])
+async def test_timing_history_preparation_updates_authority_before_single_evaluation(
+    tmp_path, classify, failure,
+):
+    rules, models = _write_history_route_files(tmp_path)
+    runtime = HistoryPolicyRuntime()
+    runtime.persisted_intent = "question"
+    original_governance = runtime.evaluate_interaction_governance
+    original_timing = runtime.evaluate_timing
+
+    async def governance(**kwargs):
+        result = await original_governance(**kwargs)
+        candidate = kwargs.get("history_followup_candidate")
+        runtime.call_order.append("history_policy" if candidate else "interaction_governance")
+        if candidate:
+            runtime.persisted_intent = candidate["intent"]
+        return result
+
+    async def timing(**kwargs):
+        assert runtime.persisted_intent == ("question" if failure else "support_explanation")
+        return await original_timing(**kwargs)
+
+    runtime.evaluate_interaction_governance = governance
+    runtime.evaluate_timing = timing
+    provider = SequenceLiteLLM([
+        RuntimeError("PRIVATE-CLASSIFIER") if failure
+        else _classifier_completion("support_explanation")
+    ])
+    original_chat = provider.chat
+
+    async def classifier(**kwargs):
+        runtime.call_order.append("history_classifier")
+        return await original_chat(**kwargs)
+
+    provider.chat = classifier
+    memory = ImmediateHistoryMemoryStore()
+    original_append = memory.add_message
+
+    async def append(**kwargs):
+        if kwargs["role"] == "assistant":
+            runtime.call_order.append("assistant_persistence")
+            assert len(runtime.timing_calls) == 1
+        return await original_append(**kwargs)
+
+    memory.add_message = append
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            "Where did that conclusion come from?" if classify else "What evidence supports that?",
+            conversation_id="conv-1",
+        ), memory_store=memory, runtime=runtime, litellm=provider,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True, history_followup_enabled=True,
+        claim_record_capture_enabled=True, request_id="rid-timing-history",
+    )
+    assert out["selected_model"] == "not_called"
+    assert len(runtime.timing_calls) == 1
+    order = runtime.call_order
+    if classify:
+        assert order.index("history_classifier") < order.index("timing")
+        assert len(provider.calls) == 1
+    else:
+        assert provider.calls == []
+    if not failure:
+        assert order.index("history_policy") < order.index("timing")
+        assert runtime.timing_calls[0]["latency_budget_class"] == "history_followup"
+    else:
+        assert runtime.timing_calls[0]["dependency_state"] == "degraded"
+    assert order.index("timing") < order.index("assistant_persistence")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_timing_evidence_semantic_preparation_precedes_response_boundary(tmp_path, failure):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+
+    def material_no_match(call):
+        response = _derived_shape_response(request_id=call["request_id"],
+                                           question=" ".join(call["task_text"].split()),
+                                           task_shape="targeted_lookup")
+        response["result"]["source_match"] = {
+            "status": "no_match", "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        }
+        if call["task_context"].get("semantic_advisory"):
+            response["result"]["source_match"] = {
+                "status": "matched", "matched_source_ids": ["personal_schedule"],
+                "reason_codes": ["source_id_match"],
+            }
+        return response
+
+    runtime = FakeRuntime(evidence_shape_response=material_no_match, auto_source_match=False)
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    original_plan = runtime.compile_evidence_plan
+
+    async def plan(**kwargs):
+        response = await original_plan(**kwargs)
+        response["result"]["eligible_source_ids"] = ["personal_schedule"]
+        return response
+
+    runtime.compile_evidence_plan = plan
+    runtime.timing_policy = "ask_clarifying_question" if not failure else "answer_now"
+    provider = SequenceLiteLLM([
+        RuntimeError("PRIVATE-CLASSIFIER") if failure else _evidence_interpreter_completion(
+            "resolved", "lookup", ["personal_schedule"],
+        ),
+    ])
+    original_chat = provider.chat
+
+    async def chat(**kwargs):
+        runtime.call_order.append("evidence_classifier")
+        assert getattr(runtime, "timing_calls", []) == []
+        return await original_chat(**kwargs)
+
+    provider.chat = chat
+    memory = FakeMemoryStore()
+    original_append = memory.add_message
+
+    async def append(**kwargs):
+        if kwargs["role"] == "assistant":
+            runtime.call_order.append("assistant_persistence")
+            assert len(runtime.timing_calls) == 1
+        return await original_append(**kwargs)
+
+    memory.add_message = append
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Check the schedule.", external_context_enabled=True),
+        memory_store=memory, runtime=runtime, litellm=provider,
+        dsa=FakeDSA(source_response={"inventory_scope": "configured_sources",
+                                   "inventory_status": "complete",
+                                   "sources": _neutral_schedule_sources()}),
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-timing-semantic",
+    )
+    assert len(provider.calls) == len(runtime.timing_calls) == 1
+    assert runtime.call_order.index("evidence_classifier") < runtime.call_order.index("timing")
+    assert (runtime.call_order.index("timing")
+                < runtime.call_order.index("assistant_persistence"))
+    if failure:
+        assert runtime.timing_calls[0]["dependency_state"] == "degraded"
+        assert out["status"] == "degraded"
+    else:
+        assert out["answer"] == "Could you clarify what you want me to do?"
+        assert runtime.timing_calls[0]["latency_budget_class"] == "evidence_governed"
+        assert runtime.evidence_shape_calls[-1]["task_context"].get("semantic_advisory")
+
+
+@pytest.mark.asyncio
+async def test_timing_governed_evidence_answer_generation_follows_single_evaluation(tmp_path):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    runtime, memory = FakeRuntime(), FakeMemoryStore()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    provider = FakeLiteLLM(content=_evidence_candidate(
+        ("vehicle_log_primary:record_1", "The maintenance record lists 2025-07-12."),
+    ))
+    original_chat = provider.chat
+
+    async def chat(**kwargs):
+        assert len(runtime.timing_calls) == 1
+        assert runtime.timing_calls[0]["latency_budget_class"] == "evidence_governed"
+        runtime.call_order.append("evidence_answer_generation")
+        return await original_chat(**kwargs)
+
+    provider.chat = chat
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Verify the maintenance record.",
+                                         external_context_enabled=True,
+                                         external_context={"source_ids": ["vehicle_log_primary"]}),
+        memory_store=memory, runtime=runtime, litellm=provider,
+        dsa=FakeDSA(response=_governed_context_pack("Verify the maintenance record.")),
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-timing-evidence",
+    )
+    assert out["status"] == "ok"
+    assert len(runtime.timing_calls) == 1
+    assert (runtime.call_order.index("timing")
+            < runtime.call_order.index("evidence_answer_generation"))
+
+
+@pytest.mark.asyncio
+async def test_timing_action_preview_branch_and_authority_order(tmp_path):
+    runtime = FakeRuntime(capability_match_response=_capability_match_response(),
+                          capability_flow_response=_action_flow_response(
+                              dry_run_required=True, dry_run_effects=[_dry_run_effect()],
+                              execution_allowed=False, verification_supported=False,
+                              reason_summary=["preview_requested", "dry_run_required"],
+                          ))
+    out, runtime, _, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, capability_registry_enabled=True,
+        payload=_base_payload(conversation_id="conv-1", messages=[{
+            "role": "user", "content": "What would happen if you turn on office lights?",
+        }]),
+    )
+    assert "No action was taken" in out["answer"]
+    assert runtime.timing_calls[0]["latency_budget_class"] == "safe_action_preview"
+    order = runtime.call_order
+    assert order.index("capability_match") < order.index("timing")
+    assert order.index("timing") < order.index("capability_authority")
+    assert order.index("timing") < order.index("capability_flow")
+    assert len(runtime.timing_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_timing_specialized_overlap_does_not_invent_budget_priority(tmp_path):
+    runtime = FakeRuntime(capability_match_response=_capability_match_response())
+    runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, capability_registry_enabled=True,
+        runtime=runtime,
+        payload=_base_payload(conversation_id="conv-1", surface_context={"spoken_output": True},
+                              messages=[{"role": "user", "content":
+                                         "What would happen if you turn on office lights?"}]),
+    )
+    assert out["status"] == "failed"
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == []
+    assert getattr(runtime, "timing_calls", []) == []
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["runtime_timing"]
+    assert trace["failure_category"] == "latency_class_overlap"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["create_new", "resume"])
+async def test_timing_continuation_projection_preserves_selected_conversation(tmp_path, outcome):
+    memory = FakeMemoryStore()
+    selected = _open_candidate()
+    if outcome == "resume":
+        memory.list_conversation_response = {"conversations": [selected], "next_cursor": None}
+    runtime = FakeRuntime(continuation_selection_response=_selection_response(
+        outcome, request_id="rid-timing-flow",
+        selected_conversation_id=selected["conversation_id"] if outcome == "resume" else None,
+        selected_thread_revision=7 if outcome == "resume" else None,
+        candidate_count=int(outcome == "resume"), eligible_candidate_count=int(outcome == "resume"),
+    ))
+    out, runtime, _, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_base_payload(),
+        policy="resume_previous_thread" if outcome == "resume" else "answer_now",
+    )
+    request = runtime.timing_calls[0]
+    assert request["continuation_timing_policy"] == (
+        "resume_previous_thread" if outcome == "resume" else "answer_now"
+    )
+    assert request["conversation_id"] == out["conversation_id"]
+    assert len(runtime.continuation_selection_calls) == len(runtime.timing_calls) == 1
+    if outcome == "resume":
+        assert out["conversation_id"] == selected["conversation_id"]
+        assert memory.create_conversation_calls == []
+        assert runtime.turn_start_calls[0]["expected_thread_revision"] == 7
+
+
+@pytest.mark.asyncio
+async def test_timing_contradictory_continuation_projection_fails_before_admission(tmp_path):
+    selection = _selection_response("create_new", request_id="rid-timing-flow")
+    selection["result"]["timing_policy"] = "resume_previous_thread"
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, payload=_base_payload(),
+        runtime=FakeRuntime(continuation_selection_response=selection),
+    )
+    assert out["status"] == "failed"
+    assert runtime.turn_start_calls == []
+    assert getattr(runtime, "timing_calls", []) == []
+    assert provider.calls == memory.added_messages == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["answer_now", "acknowledge_then_answer"])
+async def test_timing_precedes_capability_authorization_and_actual_executor(tmp_path, policy):
+    runtime = CapabilityRuntime()
+    runtime.interaction_governance_response["result"].update(
+        interaction_kind="command", action_allowed=True,
+    )
+    original_world_state = runtime.world_state_resolve
+
+    async def world_state(**kwargs):
+        if kwargs["request_id"].endswith(":execute"):
+            assert len(runtime.timing_calls) == 1
+            runtime.call_order.append("actual_executor")
+        return await original_world_state(**kwargs)
+
+    runtime.world_state_resolve = world_state
+    out, runtime, _, memory = await _run_timing_turn(
+        tmp_path, policy=policy, runtime=runtime,
+        provider=FakeLiteLLM(completion=_tool_completion(
+            "runtime_world_state_read",
+            {"requested_domains": ["active_repository"], "output_mode": "structured"},
+        )),
+        payload=_first_party_chat_payload("Read current repository state.",
+                                         conversation_id="conv-1",
+                                         surface_context={"spoken_output": True}),
+    )
+    order = runtime.call_order
+    timing_index = order.index("timing")
+    for boundary in (
+        "authorize:exposure", "authorize:selection", "authorize:dispatch", "actual_executor",
+    ):
+        assert timing_index < order.index(boundary)
+    assert order.index("actual_executor") < order.index("assistant_persistence")
+    assert len(runtime.timing_calls) == 1
+    assert runtime.timing_calls[0]["latency_budget_class"] == "voice_acknowledgment"
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
+    assert trace["execution"]["executor_call_count"] == 1
+    assert out["answer"].startswith("Received. ") == (policy == "acknowledge_then_answer")
+
+
+@pytest.mark.asyncio
+async def test_timing_presence_fallback_is_degraded_and_explicit_facts_are_projected(tmp_path):
+    _, runtime, _, memory = await _run_timing_turn(
+        tmp_path, runtime=FakeRuntime(presence_error=httpx.ReadTimeout("PRIVATE-PRESENCE")),
+        payload=_base_payload(conversation_id="conv-1", surface_context={
+            "spoken_output": True, "active_task_mode": True, "verbosity_target": "short",
+        }),
+    )
+    request = runtime.timing_calls[0]
+    assert request["dependency_state"] == "degraded"
+    assert request["spoken_output"] is request["active_task_mode"] is True
+    assert request["requested_detail"] == "brief"
+    assert request["latency_budget_class"] == "voice_provider_dispatch"
+    timing = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["runtime_timing"]
+    assert timing["result"]["degradation_mode"] == "bounded"
+    assert timing["result"]["reason_codes"][-1] == "dependency_degraded"
+    assert "PRIVATE-PRESENCE" not in json.dumps(timing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["assistant", "trace"])
+async def test_timing_stop_persistence_failure_never_reopens_provider_or_action(tmp_path, boundary):
+    class FailingStopMemory(FakeMemoryStore):
+        async def add_message(self, **kwargs):
+            if boundary == "assistant" and kwargs["role"] == "assistant":
+                raise RuntimeError("PRIVATE-PERSISTENCE")
+            return await super().add_message(**kwargs)
+
+        async def create_trace(self, **kwargs):
+            if boundary == "trace":
+                raise RuntimeError("PRIVATE-PERSISTENCE")
+            return await super().create_trace(**kwargs)
+
+    out, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, policy="ask_clarifying_question", memory=FailingStopMemory(),
+        runtime=FakeRuntime(capability_match_response=_capability_match_response()),
+        capability_registry_enabled=True,
+    )
+    assert out["status"] == "failed"
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
+    assert len(runtime.timing_calls) == 1
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+    assert "PRIVATE-PERSISTENCE" not in str(out)

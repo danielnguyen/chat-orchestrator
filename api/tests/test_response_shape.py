@@ -246,3 +246,70 @@ def test_runtime_presence_only_narrows_expansion_and_preserves_required_detail(
         assert "two" not in guidance
     for internal in ["R" + "44", "Pha" + "se 6", "presence", "idle", "driving", "reason_codes"]:
         assert internal not in guidance
+
+
+@pytest.mark.parametrize("surface", ["alexa", "car", "voice"])
+def test_timing_projection_does_not_infer_speech_from_surface(surface):
+    from services.response_shape import project_timing_facts
+
+    assert project_timing_facts({"surface": surface}) == {
+        "spoken_output": False, "active_task_mode": False, "requested_detail": "unspecified",
+    }
+    assert project_timing_facts({"surface_context": {"surface_type": "voice"}})[
+        "spoken_output"
+    ] is False
+
+
+@pytest.mark.parametrize("context,expected", [
+    ({"spoken_output": True}, True), ({"spoken_output": False}, False),
+    ({"interaction_mode": "voice_mediated", "output_format": "speech"}, True),
+    ({"interaction_mode": "text", "output_format": "plain_text"}, False),
+])
+def test_timing_projection_uses_only_consistent_typed_speech(context, expected):
+    from services.response_shape import project_timing_facts
+
+    assert project_timing_facts({"surface_context": context})["spoken_output"] is expected
+
+
+@pytest.mark.parametrize("context", [
+    {"spoken_output": "true"}, {"active_task_mode": 1},
+    {"spoken_output": False, "output_format": "speech"},
+    {"spoken_output": True, "interaction_mode": "text"},
+    {"interaction_mode": "voice_mediated", "output_format": "markdown"},
+])
+def test_timing_projection_rejects_malformed_or_conflicting_typed_facts(context):
+    from services.response_shape import project_timing_facts
+
+    with pytest.raises(ValueError):
+        project_timing_facts({"surface_context": context})
+
+
+@pytest.mark.parametrize("verbosity,detail", [
+    ("short", "brief"), ("normal", "normal"), ("detailed", "expanded"),
+])
+def test_timing_detail_and_active_task_are_explicit(verbosity, detail):
+    from services.response_shape import project_timing_facts
+
+    assert project_timing_facts({"surface_context": {
+        "verbosity_target": verbosity, "active_task_mode": True,
+    }}) == {"spoken_output": False, "active_task_mode": True, "requested_detail": detail}
+    assert project_timing_facts({"response_mode": "brief"})["requested_detail"] == "brief"
+    with pytest.raises(ValueError, match="timing_projection_conflict"):
+        project_timing_facts({"response_mode": "brief", "surface_context": {
+            "verbosity_target": "detailed",
+        }})
+
+
+def test_timing_defer_clamp_keeps_timing_and_presentation_continuation_distinct():
+    from services.response_shape import clamp_response_shape_for_timing
+
+    shape = ResponseShape(allows_expansion=True, expansion_marker_allowed=True,
+                          continuation_state="expandable")
+    narrowed, trace = clamp_response_shape_for_timing(shape, {}, {
+        "timing_policy": "defer_expansion", "continuation_state": "deferred_expansion",
+        "expansion_allowed": False,
+    })
+    assert narrowed.allows_expansion is False
+    assert narrowed.expansion_marker_allowed is False
+    assert narrowed.continuation_state == "abbreviated"
+    assert trace["runtime_timing"]["expansion_allowed"] is False
