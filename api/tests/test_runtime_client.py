@@ -14,7 +14,7 @@ from clients.runtime import RuntimeClient
 
 
 @asynccontextmanager
-async def _held_http_connection():
+async def _held_http_connection(*, release: asyncio.Event | None = None):
     """Hold the first HTTP response so the real httpx pool stays occupied."""
     received = []
     connections = []
@@ -34,16 +34,18 @@ async def _held_http_connection():
             received.append((headers.splitlines()[0], payload))
             if len(received) == 1:
                 entered.set()
-                # Client shutdown/invalidation must close this occupied socket.
-                assert await reader.read() == b""
-                disconnected.set()
-            else:
-                writer.write(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n"
-                    b"Content-Type: application/json\r\nConnection: close\r\n\r\n"
-                    b'{"ok":true}'
-                )
-                await writer.drain()
+                if release is None:
+                    # Explicit shutdown must close this occupied socket.
+                    assert await reader.read() == b""
+                    disconnected.set()
+                    return
+                await release.wait()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n"
+                b"Content-Type: application/json\r\nConnection: close\r\n\r\n"
+                b'{"ok":true}'
+            )
+            await writer.drain()
         finally:
             writer.close()
             await writer.wait_closed()
@@ -573,7 +575,10 @@ async def test_transport_failure_is_not_replayed_and_later_call_replaces_client(
 
 @pytest.mark.asyncio
 async def test_pool_exhaustion_bounds_connections_and_does_not_replay_start_turn():
-    async with _held_http_connection() as (url, received, connections, entered, disconnected):
+    release = asyncio.Event()
+    async with _held_http_connection(release=release) as (
+        url, received, connections, entered, disconnected,
+    ):
         transports = []
         attempts = []
 
@@ -613,24 +618,28 @@ async def test_pool_exhaustion_bounds_connections_and_does_not_replay_start_turn
             # The exhausted transition never obtained a second socket or reached CR.
             assert len(connections) == 1
             assert len(received) == 1
-            assert transports[0].is_closed
-            assert client._client is None
+            assert not transports[0].is_closed
+            assert client._client is transports[0]
             assert len(transports) == 1
-            # Invalidation closes the whole failed pool, including its held request.
-            with pytest.raises(httpx.TransportError):
-                await asyncio.wait_for(held, timeout=2)
-            await asyncio.wait_for(disconnected.wait(), timeout=2)
+            assert not held.done()
+            assert not disconnected.is_set()
+            # Pool saturation belongs to the waiting request, not the occupied pool.
+            release.set()
+            assert await asyncio.wait_for(held, timeout=2) == {"ok": True}
             assert await client.overlay(
                 request_id="independent-call", owner_id="owner",
                 conversation_id="conversation", surface="web",
             ) == {"ok": True}
-            assert len(transports) == 2
+            assert len(transports) == 1
+            assert client._client is transports[0]
+            assert not transports[0].is_closed
             assert len(connections) == 2
             assert [payload["request_id"] for _, payload in received] == [
                 "held-call", "independent-call",
             ]
             assert [path for path, _ in attempts].count("/v1/runtime/turns/start") == 1
         finally:
+            release.set()
             await client.close()
             if not held.done():
                 held.cancel()
