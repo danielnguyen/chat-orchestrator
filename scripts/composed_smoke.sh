@@ -3389,7 +3389,7 @@ run_delivery_equivalence_scenario() {
 
 run_interrupted_delivery_scenario() {
   local tag="${1:-delivery}" owner="owner-delivery-interrupted" client="client-delivery-interrupted" surface=chat
-  local loser loser_before fresh fresh_request diagnostics thread
+  local loser loser_before fresh fresh_request diagnostics thread retrieval_trace_hash
   if [ "$tag" = contention ]; then
     owner=owner-restart-contention
     client=telegram:restart-winner
@@ -3496,6 +3496,20 @@ PY_DIAGNOSTICS
     [ "$loser_before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
     thread="$(runtime_thread_snapshot "$owner" "$conversation")"
     jq -e '.state == "active" and .surfaces == ["telegram"] and .session_count == 1' <<<"$thread" >/dev/null
+    # BMS persists a retrieval diagnostic before CO response generation. Wait
+    # for that preparatory boundary, then prove it is never rewritten as an answer.
+    diagnostics=""
+    for _ in $(seq 1 20); do
+      if diagnostics="$(curl -fsS --max-time 1 "http://127.0.0.1:14351/v1/traces/$request" -H 'X-API-Key: smoke-memory-key' 2>/dev/null)"; then break; fi
+      sleep 0.1
+    done
+    jq -e --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" '
+      .request_id == $request and .owner_id == $owner and .conversation_id == $conversation
+      and .surface == "bms-retrieval" and .model_call == {} and .model_calls == []
+      and .prompt == {} and .router_decision == {}
+    ' <<<"$diagnostics" >/dev/null
+    retrieval_trace_hash="$(psql_exec -At -c "SELECT md5(row_to_json(t)::text) FROM traces t WHERE owner_id='$owner' AND request_id='$request';")"
+    test -n "$retrieval_trace_hash"
     jq -e '.state == "running" and .result == null' <<<"$(co_work_result "$owner" "$conversation" "$work")" >/dev/null
   fi
   container="$(docker compose -f "$COMPOSE" ps -q orchestrator)"
@@ -3580,8 +3594,9 @@ SQL
       'canonical_facts',(SELECT count(*) FROM memory_items WHERE owner_id='$owner'));")"
     echo "Continuation C1-06 restart loser diagnostics: $(runtime_continuation_effect_counts "$owner" "$(jq -r '.request_id' <<<"$loser")")"
     assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
-    [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '1|0|0' ]
-    echo "Continuation C1-06 restart_contention: winner_abandoned=true loser_side_effects=0 late_publication=false fresh_retry_once=true work_failed=1 work_completed=1 messages=2,1 traces=1 claims=0 canonical_facts=0 action_events=0 confirmations=0 winner_provider_calls=$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length') fresh_provider_calls=1 idle_revision=4"
+    [ "$retrieval_trace_hash" = "$(psql_exec -At -c "SELECT md5(row_to_json(t)::text) FROM traces t WHERE owner_id='$owner' AND request_id='$request';")" ]
+    [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM traces WHERE owner_id='$owner' AND request_id='$fresh_request' AND surface='alexa'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '2|1|0|0' ]
+    echo "Continuation C1-06 restart_contention: winner_abandoned=true loser_side_effects=0 late_publication=false fresh_retry_once=true work_failed=1 work_completed=1 messages=2,1 traces=2 unchanged_retrieval_diagnostic=1 fresh_response_trace=1 claims=0 canonical_facts=0 action_events=0 confirmations=0 winner_provider_calls=$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length') fresh_provider_calls=1 idle_revision=4"
   fi
   [ "$tag" = contention ] || echo "Interrupted delivery proof: hard_kill=orchestrator_only work_count=1 failed=interrupted exact=current assistant_count=0 claim_count=0 CR_abandoned=1 provider_chat_at_most=1 late_publication=false"
   provider_post "/fixture/reset" '{}'
