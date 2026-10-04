@@ -2609,8 +2609,10 @@ run_situated_presence_case() {
       and .retrieval.prompt_assembly.runtime_timing.result.continuation_state == "clarification_required"
       and .retrieval.prompt_assembly.runtime_timing.result.expansion_allowed == false
       and .model_call.status == "not_called" and .model_calls == []
-      and .retrieval.prompt_assembly.interaction_governance.forwarded_to_authority == false
-      and .retrieval.prompt_assembly.interaction_governance.forwarded_to_flow == false
+      and ([.retrieval.prompt_assembly | .. | objects
+        | select(has("forwarded_to_authority") or has("forwarded_to_action_flow"))
+        | (.forwarded_to_authority // false) == false
+          and (.forwarded_to_action_flow // false) == false] | all(. == true))
       and .retrieval.prompt_assembly.status == "not_requested"
     ' <<<"$trace" >/dev/null
     jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
