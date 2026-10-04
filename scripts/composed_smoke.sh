@@ -3570,6 +3570,15 @@ SQL
       diagnostics="$(fetch_runtime_diagnostics "$surface")"
       jq -e '([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
     done
+    echo "Continuation C1-06 restart final diagnostics: $(psql_exec -At -c "SELECT json_build_object(
+      'traces',(SELECT count(*) FROM traces WHERE owner_id='$owner'),
+      'claims',(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),
+      'old_winner_claims',(SELECT count(*) FROM claim_records WHERE owner_id='$owner' AND request_id='$request'),
+      'loser_claims',(SELECT count(*) FROM claim_records WHERE owner_id='$owner' AND request_id='$(jq -r '.request_id' <<<"$loser")'),
+      'fresh_claims',(SELECT count(*) FROM claim_records WHERE owner_id='$owner' AND request_id='$fresh_request'),
+      'fresh_claim_association',(SELECT count(*) FROM claim_records c JOIN messages m ON m.id=c.assistant_message_id AND m.owner_id=c.owner_id AND m.conversation_id=c.conversation_id WHERE c.owner_id='$owner' AND c.request_id='$fresh_request' AND m.metadata->>'request_id'='$fresh_request' AND m.role='assistant'),
+      'canonical_facts',(SELECT count(*) FROM memory_items WHERE owner_id='$owner'));")"
+    echo "Continuation C1-06 restart loser diagnostics: $(runtime_continuation_effect_counts "$owner" "$(jq -r '.request_id' <<<"$loser")")"
     assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
     [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '1|0|0' ]
     echo "Continuation C1-06 restart_contention: winner_abandoned=true loser_side_effects=0 late_publication=false fresh_retry_once=true work_failed=1 work_completed=1 messages=2,1 traces=1 claims=0 canonical_facts=0 action_events=0 confirmations=0 winner_provider_calls=$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length') fresh_provider_calls=1 idle_revision=4"
