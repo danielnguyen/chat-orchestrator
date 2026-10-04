@@ -2715,13 +2715,13 @@ run_situated_presence_scenario() {
 }
 
 co_work_result() {
-  curl -fsS -G "http://127.0.0.1:14361/v1/work-items/$3" \
+  curl -fsS --max-time "${4:-0}" -G "http://127.0.0.1:14361/v1/work-items/$3" \
     -H "X-API-Key: smoke-orchestrator-key" \
     --data-urlencode "owner_id=$1" --data-urlencode "conversation_id=$2"
 }
 
 co_current_work() {
-  curl -fsS -G "http://127.0.0.1:14361/v1/current-work" \
+  curl -fsS --max-time "${3:-0}" -G "http://127.0.0.1:14361/v1/current-work" \
     -H "X-API-Key: smoke-orchestrator-key" \
     --data-urlencode "owner_id=$1" --data-urlencode "client_id=$2"
 }
@@ -2965,6 +2965,7 @@ run_delivery_equivalence_scenario() {
 run_interrupted_delivery_scenario() {
   local owner="owner-delivery-interrupted" client="client-delivery-interrupted"
   local conversation payload status pending request work current before after container since events proof
+  local running_deadline remaining running_ready=false running_failure=timeout
   provider_post "/fixture/reset" '{}'
   conversation="$(create_conversation "$owner" "$client")"
   provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
@@ -2977,13 +2978,86 @@ run_interrupted_delivery_scenario() {
     -o "$COMPOSED_SMOKE_TMP/interrupted-pending.json" -w '%{http_code}')"
   test "$status" = "202"
   pending="$(<"$COMPOSED_SMOKE_TMP/interrupted-pending.json")"
+  jq -e --arg conversation "$conversation" '
+    keys == ["conversation_id","delivery_status","request_id","work_id"]
+    and .delivery_status == "pending" and .conversation_id == $conversation
+    and (.request_id | type == "string" and length > 0)
+    and (.work_id | type == "string" and length > 0)
+  ' <<<"$pending" >/dev/null
   request="$(jq -r '.request_id' <<<"$pending")"
   work="$(jq -r '.work_id' <<<"$pending")"
-  before="$(co_work_result "$owner" "$conversation" "$work")"
-  jq -e '.state == "running" and .result == null' <<<"$before" >/dev/null
-  current="$(co_current_work "$owner" "$client")"
-  jq -e --arg work "$work" '.status=="resolved" and .work.work_id==$work
-    and .work.state=="running" and .work.result==null' <<<"$current" >/dev/null
+  # Admission may return while pending. Synchronize on running before killing cognition.
+  running_deadline="$(python3 -c 'import time; print(time.monotonic() + 3.0)')"
+  before=null
+  current=null
+  while remaining="$(python3 -c 'import sys,time; remaining=float(sys.argv[1])-time.monotonic(); sys.exit(1) if remaining<=0 else print(remaining)' "$running_deadline")"; do
+    if ! before="$(co_work_result "$owner" "$conversation" "$work" "$remaining" 2>/dev/null)"; then
+      running_failure=work_lookup_failed
+      break
+    fi
+    if ! jq -e --arg work "$work" --arg request "$request" --arg conversation "$conversation" '
+      keys == ["conversation_id","failure_code","request_id","result","state","work_id"]
+      and .work_id == $work and .request_id == $request and .conversation_id == $conversation
+      and (.state == "pending" or .state == "running")
+      and .result == null and .failure_code == null
+    ' <<<"$before" >/dev/null 2>&1; then
+      running_failure=work_precondition_invalid
+      break
+    fi
+    remaining="$(python3 -c 'import sys,time; remaining=float(sys.argv[1])-time.monotonic(); sys.exit(1) if remaining<=0 else print(remaining)' "$running_deadline")" || break
+    if ! current="$(co_current_work "$owner" "$client" "$remaining" 2>/dev/null)"; then
+      running_failure=locator_lookup_failed
+      break
+    fi
+    if ! jq -e --arg work "$work" --arg request "$request" --arg conversation "$conversation" '
+      keys == ["status","work"] and .status == "resolved"
+      and (.work | keys) == ["conversation_id","failure_code","request_id","result","state","work_id"]
+      and .work.work_id == $work and .work.request_id == $request
+      and .work.conversation_id == $conversation
+      and (.work.state == "pending" or .work.state == "running")
+      and .work.result == null and .work.failure_code == null
+    ' <<<"$current" >/dev/null 2>&1; then
+      running_failure=locator_precondition_invalid
+      break
+    fi
+    if [ "$(jq -r '.state' <<<"$before")" = "running" ] \
+      && [ "$(jq -r '.work.state' <<<"$current")" = "running" ]; then
+      running_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$running_ready" != true ]; then
+    python3 - "$running_failure" "$before" "$current" "$work" "$request" "$conversation" <<'PY_DIAGNOSTICS' >&2
+import json
+import sys
+
+def structural(raw):
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+def state(value):
+    actual = value.get("state")
+    return actual if actual in ("pending", "running", "completed", "failed") else "invalid"
+
+def identity(value):
+    return (value.get("work_id"), value.get("request_id"), value.get("conversation_id")) == tuple(sys.argv[4:7])
+
+exact, locator = structural(sys.argv[2]), structural(sys.argv[3])
+located = locator.get("work")
+located = located if isinstance(located, dict) else {}
+print(json.dumps({
+    "precondition_failure": sys.argv[1], "exact_state": state(exact),
+    "locator_status": locator.get("status") if locator.get("status") in ("none", "resolved") else "invalid",
+    "locator_state": state(located), "exact_identity_matches": identity(exact),
+    "locator_identity_matches": identity(located),
+}))
+PY_DIAGNOSTICS
+    return 1
+  fi
   container="$(docker compose -f "$COMPOSE" ps -q orchestrator)"
   test -n "$container"
   docker compose -f "$COMPOSE" kill -s SIGKILL orchestrator
