@@ -2654,6 +2654,34 @@ run_situated_presence_case() {
         and has("policy_version") and has("reason_summary")]
       | all(. == true))
   ' <<<"$diagnostics" >/dev/null
+  if [ "$fail_primary" = "true" ]; then
+    local active_profile turn_id
+    active_profile="$(curl -fsS "http://127.0.0.1:14371/v1/companion/profile/active")"
+    turn_id="$(jq -r '.retrieval.prompt_assembly.runtime_timing.scope.runtime_turn_id' <<<"$trace")"
+    jq -e '
+      .retrieval.prompt_assembly.runtime_timing as $timing
+      | .retrieval.prompt_assembly.provider_fallback_context as $fallback
+      | $timing.attempted == true and $timing.status == "included"
+        and $timing.inputs.latency_budget_class == "ordinary_text"
+        and $timing.result.latency_budget_class == "ordinary_text"
+        and $fallback.regression_budget_class == "provider_fallback"
+        and $fallback.regression_budget_ms == 350
+        and $fallback.timing_reevaluated == false
+        and $fallback.admitted_timing_class == "ordinary_text"
+    ' <<<"$trace" >/dev/null
+    jq -e --arg request "$request_id" --arg session "$session_id" --arg turn "$turn_id" \
+      --arg profile "$(jq -er '.profile_id' <<<"$active_profile")" \
+      --argjson version "$(jq -er '.profile_version' <<<"$active_profile")" '
+      [.events[] | select(.event_type == "timing_evaluated"
+        and .runtime_session_id == $session and .runtime_turn_id == $turn)] as $timings
+      | ($timings | length) == 1
+        and $timings[0].event_payload_json.request_id == $request
+        and $timings[0].event_payload_json.latency_budget_class == "ordinary_text"
+        and $timings[0].event_payload_json.identity_provenance == {
+          source: "companion_profile_registry", profile_id: $profile, profile_version: $version}
+    ' <<<"$diagnostics" >/dev/null
+    echo "Situated presence fallback timing: timing_events=1 admitted_class=ordinary_text fallback_class=provider_fallback timing_reevaluated=false canonical_identity_match=true"
+  fi
   if [ "$response_mode" = "timing_clarification" ]; then
     jq -e --arg request "$request_id" \
       --arg session "$session_id" \

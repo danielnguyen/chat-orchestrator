@@ -1430,3 +1430,35 @@ async def test_timing_replay_fixtures_control_generation_and_keep_trace_private(
     assert "neutral request" not in json.dumps(timing)
     assert "neutral response" not in json.dumps(timing)
     assert_snapshot_privacy_safe(timing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["provider_fallback", "provider_exhaustion"])
+async def test_timing_replay_fallback_preserves_admitted_class_without_private_metadata(
+    monkeypatch, category,
+):
+    scenario = deepcopy(next(item for item in load_corpus() if item["category"] == category))
+    scenario.update(interaction_governance_enabled=True, restraint_enabled=True, timing_record=True)
+    traces = []
+    original_trace = ReplayMemoryStore.create_trace
+
+    async def create_trace(self, **kwargs):
+        traces.append(deepcopy(kwargs["payload"]))
+        return await original_trace(self, **kwargs)
+
+    monkeypatch.setattr(ReplayMemoryStore, "create_trace", create_trace)
+    snapshot = await run_scenario(scenario)
+    assert snapshot["call_order"].count("cr_timing") == 1
+    prompt = traces[-1]["retrieval"]["prompt_assembly"]
+    assert prompt["runtime_timing"]["inputs"]["latency_budget_class"] == "ordinary_text"
+    assert prompt["runtime_timing"]["result"]["latency_budget_class"] == "ordinary_text"
+    fallback = prompt["provider_fallback_context"]
+    assert fallback["regression_budget_class"] == "provider_fallback"
+    assert fallback["regression_budget_ms"] == 350
+    assert fallback["timing_reevaluated"] is False
+    assert fallback["admitted_timing_class"] == "ordinary_text"
+    assert len(traces[-1]["model_calls"]) == 2
+    assert_snapshot_privacy_safe(fallback)
+    assert "neutral request" not in json.dumps(fallback)
+    assert "neutral response" not in json.dumps(fallback)
+    assert "error" not in fallback

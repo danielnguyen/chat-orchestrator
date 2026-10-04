@@ -23,6 +23,7 @@ from clients.data_source_aggregator import (
 from clients.litellm import LiteLLMClient
 from clients.memory_store import MemoryStoreClient, validate_proactive_preferences_response
 from clients.runtime import (
+    RUNTIME_TIMING_BUDGET_MS,
     validate_history_followup_policy_response,
     validate_presence_response,
     validate_timing_request,
@@ -8160,6 +8161,30 @@ def _policy_pick_model(
 
 
 
+def _select_timing_latency_class(
+    specialized_classes: list[str], *, spoken_output: bool,
+    interaction_kind: str, provider_dispatch: bool,
+) -> str:
+    """Project established branch ownership, without granting policy authority."""
+    classes = set(specialized_classes)
+    if not classes <= {"history_followup", "evidence_governed", "safe_action_preview"}:
+        raise ValueError("request_projection_invalid")
+    if "safe_action_preview" in classes and len(classes) > 1:
+        raise ValueError("latency_class_overlap")
+    # Conflicting action/evidence ownership must fail before a spoken command wins.
+    if spoken_output and interaction_kind == "command":
+        return "voice_acknowledgment"
+    if "evidence_governed" in classes:
+        return "evidence_governed"
+    if "history_followup" in classes:
+        return "history_followup"
+    if "safe_action_preview" in classes:
+        return "safe_action_preview"
+    if spoken_output and provider_dispatch:
+        return "voice_provider_dispatch"
+    return "ordinary_text"
+
+
 def _timing_stop_trace_payload(
     *, request_id: str, conversation_id: str, payload: dict[str, Any],
     profile: dict[str, Any] | None, prompt_trace: dict[str, Any],
@@ -9208,14 +9233,14 @@ async def orchestrate_chat(
             }
             try:
                 facts = project_timing_facts(payload)
-                classes = set(specialized_classes)
-                if facts["spoken_output"]:
-                    if interaction_governance.get("interaction_kind") == "command":
-                        classes.add("voice_acknowledgment")
-                    elif provider_dispatch:
-                        classes.add("voice_provider_dispatch")
-                if len(classes) > 1:
-                    timing_trace.update(status="failed", failure_category="latency_class_overlap")
+                try:
+                    latency_class = _select_timing_latency_class(
+                        specialized_classes, spoken_output=facts["spoken_output"],
+                        interaction_kind=interaction_governance.get("interaction_kind"),
+                        provider_dispatch=provider_dispatch,
+                    )
+                except ValueError as error:
+                    timing_trace.update(status="failed", failure_category=str(error))
                     return False
                 continuation_policy = (
                     conversation_resolution_trace.get("timing_policy")
@@ -9225,7 +9250,7 @@ async def orchestrate_chat(
                 )
                 timing_request = validate_timing_request({
                     **scope, **facts,
-                    "latency_budget_class": next(iter(classes), "ordinary_text"),
+                    "latency_budget_class": latency_class,
                     "dependency_state": (
                         "blocking" if blocking else "degraded"
                         if degraded or runtime_presence_trace["status"] == "fallback" else "ready"
@@ -11869,6 +11894,11 @@ async def orchestrate_chat(
                     "same_sanitized_messages_reused": True,
                     "prompt_fingerprint": prompt_fingerprint["fingerprint"],
                     "message_count": prompt_fingerprint["message_count"],
+                    "regression_budget_class": "provider_fallback",
+                    "regression_budget_ms": RUNTIME_TIMING_BUDGET_MS["provider_fallback"],
+                    "timing_reevaluated": False,
+                    **({"admitted_timing_class": timing_result["latency_budget_class"]}
+                       if timing_result is not None else {}),
                 }
                 fallback_fingerprint = provider_descriptor_fingerprint
                 prompt.trace["capabilities"]["fallback"].update(

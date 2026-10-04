@@ -20756,6 +20756,7 @@ async def test_governed_evidence_transport_fallback_reuses_structured_contract(t
         encoding="utf-8",
     )
     runtime = FakeRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
     dsa = FakeDSA(response=_governed_context_pack("Verify the maintenance record."))
     litellm = FakeLiteLLM(
         fail_first=True,
@@ -20767,24 +20768,27 @@ async def test_governed_evidence_transport_fallback_reuses_structured_contract(t
         ),
     )
 
+    memory = FakeMemoryStore()
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Verify the maintenance record.",
             external_context_enabled=True,
         ),
-        memory_store=FakeMemoryStore(),
+        memory_store=memory,
         litellm=litellm,
         runtime=runtime,
         dsa=dsa,
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
+        restraint_enabled=True,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
         request_id="rid-evidence-transport-fallback",
     )
 
+    _assert_fallback_timing_metadata(runtime, memory, "evidence_governed")
     assert out["status"] == "degraded"
     assert out["answer"] == _rendered_evidence_answer(
         "The maintenance record lists 2025-07-12.",
@@ -36772,10 +36776,19 @@ async def test_feature_disabled_preserves_existing_history_behavior(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_support_reverification_enters_existing_governed_path_once(tmp_path):
+async def test_support_reverification_enters_existing_governed_path_once(tmp_path, monkeypatch):
+    selector = orchestrate_service._select_timing_latency_class
+    selected_branches = []
+
+    def project(classes, **facts):
+        selected_branches.append(classes)
+        return selector(classes, **facts)
+
+    monkeypatch.setattr(orchestrate_service, "_select_timing_latency_class", project)
     rules, models = _write_history_route_files(tmp_path)
     memory_store = ImmediateHistoryMemoryStore()
     runtime = HistoryPolicyRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
     target = _history_support_record()["claim_anchor"]
     task_text = f'Verify this prior statement with a new evidence check: "{target}"'
     dsa = FakeDSA(response=_governed_context_pack(task_text))
@@ -36817,6 +36830,7 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
+        restraint_enabled=True,
         claim_record_capture_enabled=True,
         history_followup_enabled=True,
         rules_path=str(rules),
@@ -36825,6 +36839,9 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
         request_id="request-support-reverification",
     )
 
+    assert selected_branches == [["evidence_governed", "history_followup"]]
+    assert len(runtime.timing_calls) == 1
+    assert runtime.timing_calls[0]["latency_budget_class"] == "evidence_governed"
     assert result["answer"].startswith("Original support:\n")
     assert "\n\nNew verification:\n" in result["answer"]
     assert len(provider.calls) == 2
@@ -37878,23 +37895,41 @@ async def test_timing_projection_conflict_stops_before_post_and_provider(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_timing_fallback_reuses_same_decision_and_prompt(tmp_path):
+@pytest.mark.parametrize("exhausted,timing_enabled", [(False, True), (True, True), (False, False)])
+async def test_timing_fallback_reuses_same_decision_and_prompt(tmp_path, exhausted, timing_enabled):
     rules, models = _write_router_files(tmp_path)
     rules.write_text(rules.read_text().replace("fallbacks: []",
                      "fallbacks: [{selected_model: gpt-4o-mini, provider: cloud}]"))
     runtime, provider, memory = FakeRuntime(), FakeLiteLLM(fail_first=True), FakeMemoryStore()
     runtime.timing_policy = "defer_expansion"
-    await orchestrate_chat(
-        payload=_base_payload(conversation_id="conv-1"), memory_store=memory, litellm=provider,
-        runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
-        allow_manual_override=True, interaction_governance_enabled=True, restraint_enabled=True,
-        request_id="rid-timing-fallback",
-    )
+    if exhausted:
+        provider = SequenceLiteLLM([RuntimeError("PRIVATE-PRIMARY"),
+                                   RuntimeError("PRIVATE-FALLBACK")])
+    async def run():
+        return await orchestrate_chat(
+            payload=_base_payload(conversation_id="conv-1"), memory_store=memory, litellm=provider,
+            runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+            allow_manual_override=True, interaction_governance_enabled=timing_enabled,
+            restraint_enabled=timing_enabled,
+            request_id="rid-timing-fallback",
+        )
+    if exhausted:
+        with pytest.raises(RuntimeError, match="PRIVATE-FALLBACK"):
+            await run()
+    else:
+        await run()
+    if timing_enabled:
+        _assert_fallback_timing_metadata(runtime, memory, "ordinary_text")
+    else:
+        assert getattr(runtime, "timing_calls", []) == []
+        fallback = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
+            "provider_fallback_context"]
+        assert "admitted_timing_class" not in fallback
+        assert fallback["regression_budget_class"] == "provider_fallback"
     assert len(provider.calls) == 2
-    assert len(runtime.timing_calls) == 1
-    assert runtime.timing_calls[0]["latency_budget_class"] == "ordinary_text"
     assert provider.calls[0]["messages"] == provider.calls[1]["messages"]
-    assert "Timing guidance" in str(provider.calls[1]["messages"])
+    if timing_enabled:
+        assert "Timing guidance" in str(provider.calls[1]["messages"])
 
 
 @pytest.mark.asyncio
@@ -37918,9 +37953,10 @@ async def test_timing_unavailable_authority_preserves_disabled_configuration(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spoken", [False, True])
 @pytest.mark.parametrize("classify,failure", [(False, False), (True, False), (True, True)])
 async def test_timing_history_preparation_updates_authority_before_single_evaluation(
-    tmp_path, classify, failure,
+    tmp_path, classify, failure, spoken,
 ):
     rules, models = _write_history_route_files(tmp_path)
     runtime = HistoryPolicyRuntime()
@@ -37966,7 +38002,7 @@ async def test_timing_history_preparation_updates_authority_before_single_evalua
     out = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Where did that conclusion come from?" if classify else "What evidence supports that?",
-            conversation_id="conv-1",
+            conversation_id="conv-1", surface_context={"spoken_output": spoken},
         ), memory_store=memory, runtime=runtime, litellm=provider,
         rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
         interaction_governance_enabled=True, restraint_enabled=True, history_followup_enabled=True,
@@ -38067,7 +38103,10 @@ async def test_timing_evidence_semantic_preparation_precedes_response_boundary(t
 
 
 @pytest.mark.asyncio
-async def test_timing_governed_evidence_answer_generation_follows_single_evaluation(tmp_path):
+@pytest.mark.parametrize("spoken", [False, True])
+async def test_timing_governed_evidence_answer_generation_follows_single_evaluation(
+    tmp_path, spoken,
+):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
     runtime, memory = FakeRuntime(), FakeMemoryStore()
     runtime.restraint_response["result"]["retrieval_suppressed"] = False
@@ -38085,6 +38124,7 @@ async def test_timing_governed_evidence_answer_generation_follows_single_evaluat
     provider.chat = chat
     out = await orchestrate_chat(
         payload=_first_party_chat_payload("Verify the maintenance record.",
+                                         surface_context={"spoken_output": spoken},
                                          external_context_enabled=True,
                                          external_context={"source_ids": ["vehicle_log_primary"]}),
         memory_store=memory, runtime=runtime, litellm=provider,
@@ -38101,21 +38141,30 @@ async def test_timing_governed_evidence_answer_generation_follows_single_evaluat
 
 
 @pytest.mark.asyncio
-async def test_timing_action_preview_branch_and_authority_order(tmp_path):
+@pytest.mark.parametrize("spoken,command,expected", [
+    (False, False, "safe_action_preview"), (True, False, "safe_action_preview"),
+    (True, True, "voice_acknowledgment"),
+])
+async def test_timing_action_preview_branch_and_authority_order(
+    tmp_path, spoken, command, expected,
+):
     runtime = FakeRuntime(capability_match_response=_capability_match_response(),
                           capability_flow_response=_action_flow_response(
                               dry_run_required=True, dry_run_effects=[_dry_run_effect()],
                               execution_allowed=False, verification_supported=False,
                               reason_summary=["preview_requested", "dry_run_required"],
                           ))
+    if command:
+        runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
     out, runtime, _, _ = await _run_timing_turn(
         tmp_path, runtime=runtime, capability_registry_enabled=True,
-        payload=_base_payload(conversation_id="conv-1", messages=[{
+        payload=_base_payload(conversation_id="conv-1",
+                              surface_context={"spoken_output": spoken}, messages=[{
             "role": "user", "content": "What would happen if you turn on office lights?",
         }]),
     )
     assert "No action was taken" in out["answer"]
-    assert runtime.timing_calls[0]["latency_budget_class"] == "safe_action_preview"
+    assert runtime.timing_calls[0]["latency_budget_class"] == expected
     order = runtime.call_order
     assert order.index("capability_match") < order.index("timing")
     assert order.index("timing") < order.index("capability_authority")
@@ -38124,22 +38173,45 @@ async def test_timing_action_preview_branch_and_authority_order(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_timing_specialized_overlap_does_not_invent_budget_priority(tmp_path):
+@pytest.mark.parametrize("classes,category", [
+    (["evidence_governed", "safe_action_preview"], "latency_class_overlap"),
+    (["history_followup", "safe_action_preview"], "latency_class_overlap"),
+    (["unknown_branch"], "request_projection_invalid"),
+])
+@pytest.mark.parametrize("spoken_command", [False, True])
+async def test_timing_unresolved_branch_projection_blocks_all_later_work(
+    tmp_path, monkeypatch, classes, category, spoken_command,
+):
+    # Inject branch facts at the projection seam; exercise its real fail-closed lifecycle.
+    selector = orchestrate_service._select_timing_latency_class
+
+    def project(actual_classes, **facts):
+        return selector(classes, **facts)
+
+    monkeypatch.setattr(orchestrate_service, "_select_timing_latency_class", project)
     runtime = FakeRuntime(capability_match_response=_capability_match_response())
-    runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
+    if spoken_command:
+        runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
     out, runtime, provider, memory = await _run_timing_turn(
-        tmp_path, capability_registry_enabled=True,
-        runtime=runtime,
-        payload=_base_payload(conversation_id="conv-1", surface_context={"spoken_output": True},
-                              messages=[{"role": "user", "content":
-                                         "What would happen if you turn on office lights?"}]),
+        tmp_path, capability_registry_enabled=True, runtime=runtime,
+        payload=_base_payload(conversation_id="conv-1",
+                              surface_context={"spoken_output": spoken_command}),
     )
     assert out["status"] == "failed"
     assert provider.calls == []
-    assert runtime.capability_authority_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
     assert getattr(runtime, "timing_calls", []) == []
     trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["runtime_timing"]
-    assert trace["failure_category"] == "latency_class_overlap"
+    assert trace["failure_category"] == category
+    assert memory.work["state"] == "failed"
+
+
+def test_timing_specialized_duplicate_and_unknown_inputs():
+    selector = orchestrate_service._select_timing_latency_class
+    facts = {"spoken_output": False, "interaction_kind": "question", "provider_dispatch": True}
+    assert selector(["history_followup"] * 2, **facts) == "history_followup"
+    with pytest.raises(ValueError, match="request_projection_invalid"):
+        selector(["provider_fallback"], **facts)
 
 
 @pytest.mark.asyncio
@@ -38409,3 +38481,34 @@ async def test_timing_barrier_does_not_mark_governance_forwarded_to_authority(tm
     assert provenance["governance_available"] is True
     assert provenance["forwarded_to_authority"] is False
     assert provenance["forwarded_to_action_flow"] is False
+
+
+def _assert_fallback_timing_metadata(runtime, memory, admitted_class):
+    assert len(runtime.timing_calls) == 1
+    assert runtime.timing_calls[0]["latency_budget_class"] == admitted_class
+    prompt = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt["runtime_timing"]["result"]["latency_budget_class"] == admitted_class
+    fallback = prompt["provider_fallback_context"]
+    assert fallback["regression_budget_class"] == "provider_fallback"
+    assert fallback["regression_budget_ms"] == 350
+    assert fallback["timing_reevaluated"] is False
+    assert fallback["admitted_timing_class"] == admitted_class
+    assert "PRIVATE-PRIMARY" not in json.dumps(fallback)
+    assert "PRIVATE-FALLBACK" not in json.dumps(fallback)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spoken,command,expected", [
+    (False, False, "ordinary_text"), (True, False, "voice_provider_dispatch"),
+    (True, True, "voice_acknowledgment"),
+])
+async def test_timing_ordinary_dispatch_branch_class(tmp_path, spoken, command, expected):
+    runtime = FakeRuntime()
+    if command:
+        runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
+    _, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime,
+        payload=_base_payload(conversation_id="conv-1", surface_context={"spoken_output": spoken}),
+    )
+    assert len(runtime.timing_calls) == len(provider.calls) == 1
+    assert runtime.timing_calls[0]["latency_budget_class"] == expected
