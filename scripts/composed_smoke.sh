@@ -3500,7 +3500,7 @@ PY_DIAGNOSTICS
     # for that preparatory boundary, then prove it is never rewritten as an answer.
     diagnostics=""
     for _ in $(seq 1 20); do
-      if diagnostics="$(curl -fsS --max-time 1 "http://127.0.0.1:14351/v1/traces/$request" -H 'X-API-Key: smoke-memory-key' 2>/dev/null)"; then break; fi
+      if diagnostics="$(curl -fsS --max-time 1 "http://127.0.0.1:14321/v1/traces/$request" -H 'X-API-Key: smoke-memory-key' 2>/dev/null)"; then break; fi
       sleep 0.1
     done
     jq -e --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" '
