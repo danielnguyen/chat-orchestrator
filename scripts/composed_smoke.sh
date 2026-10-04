@@ -2969,7 +2969,7 @@ run_situated_presence_case() {
     --arg category "$category" \
     --argjson active_task "$active_task" \
     --argjson allows_expansion "$allows_expansion" \
-    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private",style:{style_envelope:{playfulness_budget:"medium",analogy_density:"medium"}},surface_context:{surface_category:$category,active_task_mode:$active_task,allows_expansion:$allows_expansion}}')")"
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private",surface_context:{surface_category:$category,active_task_mode:$active_task,allows_expansion:$allows_expansion,style_envelope:{playfulness_budget:"medium",analogy_density:"medium"}}}')")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   jq -e --arg answer "$expected_answer" --arg expected_status "$expected_status" \
     --arg mode "$response_mode" '
@@ -3042,7 +3042,8 @@ run_situated_presence_case() {
     jq -e --arg raw "$raw_answer" --arg answer "$expected_answer" \
       --arg reasons "$expected_reasons" '
       .retrieval.prompt_assembly.situated_presence_enforcement as $e
-      | $e.evaluated == true
+      | (.retrieval.prompt_assembly.style.recognized_request_fields | index("playfulness_budget")) != null
+        and $e.evaluated == true
         and $e.action_taken == (if $raw == $answer then "none" else "filtered" end)
         and ($e.reason_codes | sort) == ($reasons | split(",") | map(select(length > 0)) | sort)
         and ($e | keys | sort) == (["evaluated","status","enforcement_required","action_taken",
