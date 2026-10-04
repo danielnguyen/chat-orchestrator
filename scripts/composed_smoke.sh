@@ -2366,6 +2366,178 @@ assert_continuation_supplied_rejection() {
   jq -c '{status,profile_name,selected_model,answer,sources}' <<<"$response"
 }
 
+runtime_continuation_effect_counts() {
+  local owner="$1" request="$2"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" "$request" <<'PY'
+import json
+import pathlib
+import sqlite3
+import sys
+
+owner, request = sys.argv[1:]
+counts = {"request_events": 0, "action_events": 0, "confirmations": 0}
+for path in pathlib.Path("/data").glob("*.sqlite3"):
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "conversation_runtime_events" in tables:
+            rows = conn.execute("""SELECT e.event_type,e.event_payload_json
+                FROM conversation_runtime_events e JOIN conversation_runtime_sessions s
+                ON s.runtime_session_id=e.runtime_session_id WHERE s.owner_id=?""", (owner,))
+            for kind, payload in rows:
+                counts["request_events"] += json.loads(payload).get("request_id") == request
+                counts["action_events"] += kind in ("action_authority_evaluated", "action_flow_evaluated")
+        if "capability_confirmation_challenges" in tables:
+            counts["confirmations"] += conn.execute(
+                "SELECT count(*) FROM capability_confirmation_challenges WHERE owner_id=?", (owner,)
+            ).fetchone()[0]
+print(json.dumps(counts, separators=(",", ":")))
+PY
+}
+
+# Inspect the rejected request, not merely aggregate successful-turn counts.
+assert_continuation_contention_loser() {
+  local owner="$1" conversation="$2" client="$3" response="$4" request
+  jq -e --arg conversation "$conversation" '
+    .status == "failed" and .conversation_id == $conversation
+    and .selected_model == "not_called" and .sources == [] and .pending_action == null
+    and .answer == "I couldn’t safely start that turn, so I did not save or process the message. Please try again."
+  ' <<<"$response" >/dev/null
+  request="$(jq -r '.request_id' <<<"$response")"
+  [ "$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length')" = 0 ]
+  [ "$(psql_exec -At -F '|' -c "SELECT
+    (SELECT count(*) FROM messages WHERE owner_id='$owner' AND client_id='$client'),
+    (SELECT count(*) FROM claim_records WHERE owner_id='$owner' AND request_id='$request'),
+    (SELECT count(*) FROM work_items WHERE owner_id='$owner' AND request_id='$request'),
+    (SELECT count(*) FROM traces WHERE owner_id='$owner' AND request_id='$request');")" = '0|0|0|0' ]
+  jq -e '.request_events == 0 and .action_events == 0 and .confirmations == 0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+  [ "$(psql_exec -At -c "SELECT count(*) FROM memory_items WHERE owner_id='$owner';")" = 0 ]
+}
+
+run_continuation_replacement_scenario() {
+  local surface owner conversation client response request trace history thread variant
+  # These are normalized client processes, not live external transport executions.
+  for surface in telegram alexa web wearable; do
+    owner="owner-replacement-$surface"
+    provider_post /fixture/reset '{}'
+    conversation="$(create_conversation "$owner" "$surface:original")"
+    history=""
+    for variant in original exact omitted; do
+      client="$surface:$variant"
+      if [ "$variant" = omitted ]; then
+        response="$(run_omitted_chat "$owner" "$client" "$surface" "What does this function do?")"
+      else
+        response="$(run_distinct_client_chat "$owner" "$client" "$surface" "$conversation" "What does this function do?")"
+      fi
+      jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation and .selected_model != "not_called"' <<<"$response" >/dev/null
+      request="$(jq -r '.request_id' <<<"$response")"
+      trace="$(fetch_trace "$request")"
+      jq -e --arg client "$client" --arg surface "$surface" '.client_id == $client and .surface == $surface
+        and .retrieval.prompt_assembly.runtime_session.surface == $surface' <<<"$trace" >/dev/null
+      if [ "$variant" = omitted ]; then
+        jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+          | .outcome == "resume" and .candidate_count == 1 and .candidate_set_complete == true' <<<"$trace" >/dev/null
+      fi
+      [ "$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
+      if [ "$variant" = original ]; then
+        history="$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text,'' ORDER BY created_at,id)) FROM messages m WHERE owner_id='$owner';")"
+      else
+        [ "$history" = "$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text,'' ORDER BY created_at,id)) FROM (SELECT * FROM messages WHERE owner_id='$owner' ORDER BY created_at,id LIMIT 2) m;")" ]
+      fi
+      [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE m.role='user'),count(*) FILTER (WHERE m.role='assistant'),count(*) FILTER (WHERE coalesce(m.metadata->>'surface',t.surface)='$surface') FROM messages m LEFT JOIN traces t ON t.request_id=m.metadata->>'request_id' AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id WHERE m.owner_id='$owner' AND m.client_id='$client';")" = '1|1|2' ]
+      jq -e '([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$(fetch_runtime_diagnostics "$(jq -r '.retrieval.prompt_assembly.runtime_session.runtime_session_id' <<<"$trace")")" >/dev/null
+    done
+    [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$owner'),(SELECT count(*) FROM messages WHERE owner_id='$owner'),(SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='completed');")" = '1|6|3|0|3' ]
+    thread="$(runtime_thread_snapshot "$owner" "$conversation")"
+    jq -e --arg surface "$surface" '.state == "idle" and .revision == 6 and .session_count == 1
+      and .surfaces == [$surface] and .turn_statuses == ["completed","completed","completed"]' <<<"$thread" >/dev/null
+    echo "Continuation C1-05 replacement $surface: exact=true omitted=server_owned_resume adapter_cache_authority=false historical_rows_unchanged=true clients=3 conversations=1 messages=3,3 traces=3 claims=0 work_completed=3 provider_calls=1,1,1 idle_revision=6"
+  done
+}
+
+run_continuation_admission_boundary_scenario() {
+  local owner=owner-revision-retry conversation thread revision payload first second session turn before durable status diag
+  provider_post /fixture/reset '{}'
+  conversation="$(create_conversation "$owner" telegram:revision)"
+  thread="$(cr_post /v1/runtime/threads/resolve "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{request_id:"revision-resolve",owner_id:$owner,conversation_id:$conversation}')")"
+  revision="$(jq -er '.revision' <<<"$thread")"
+  payload="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --argjson revision "$revision" '{request_id:"retry-admission",owner_id:$owner,conversation_id:$conversation,surface:"telegram",expected_thread_revision:$revision}')"
+  first="$(cr_post /v1/runtime/turns/start "$payload")"
+  before="$(runtime_owner_counts "$owner")"
+  thread="$(runtime_thread_snapshot "$owner" "$conversation")"
+  second="$(cr_post /v1/runtime/turns/start "$payload")"
+  jq -e --argjson first "$first" '.runtime_session == $first.runtime_session and .runtime_turn == $first.runtime_turn' <<<"$second" >/dev/null
+  [ "$before" = "$(runtime_owner_counts "$owner")" ]
+  [ "$thread" = "$(runtime_thread_snapshot "$owner" "$conversation")" ]
+  session="$(jq -r '.runtime_session.runtime_session_id' <<<"$first")"
+  turn="$(jq -r '.runtime_turn.runtime_turn_id' <<<"$first")"
+  cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$session" --arg turn "$turn" '{request_id:"retry-complete",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"completed"}')" >/dev/null
+  diag="$(fetch_runtime_diagnostics "$session")"
+  jq -e --arg turn "$turn" '([.events[] | select(.runtime_turn_id == $turn and .event_type == "turn_started")] | length) == 1
+    and ([.events[] | select(.runtime_turn_id == $turn and .event_type == "turn_completed")] | length) == 1
+    and .latest_turn.turn_status == "completed"' <<<"$diag" >/dev/null
+  echo "Continuation C1-06 retry (actual CR admission boundary): same_session=true same_turn=true turn_started_events=1 terminal_events=1 no_CO_transport_replay_authorized=true"
+  before="$(runtime_owner_counts "$owner")"
+  durable="$(continuation_durable_snapshot "$owner")"
+  thread="$(runtime_thread_snapshot "$owner" "$conversation")"
+  jq -e --argjson revision "$revision" '.state == "idle" and .revision == ($revision + 2) and .active_runtime_turn_id == null' <<<"$thread" >/dev/null
+  payload="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --argjson revision "$revision" '{request_id:"stale-admission",owner_id:$owner,conversation_id:$conversation,surface:"alexa",expected_thread_revision:$revision}')"
+  status="$(curl -sS --max-time 5 -X POST http://127.0.0.1:14371/v1/runtime/turns/start -H 'Content-Type: application/json' -d "$payload" -o "$COMPOSED_SMOKE_TMP/stale-revision.json" -w '%{http_code}')"
+  [ "$status" = 409 ]
+  jq -e '.detail == "runtime_thread_revision_conflict"' "$COMPOSED_SMOKE_TMP/stale-revision.json" >/dev/null
+  [ "$before" = "$(runtime_owner_counts "$owner")" ]
+  [ "$thread" = "$(runtime_thread_snapshot "$owner" "$conversation")" ]
+  [ "$durable" = "$(continuation_durable_snapshot "$owner")" ]
+  [ "$(fetch_provider_calls stale-admission | jq '.calls | length')" = 0 ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner';")" = 0 ]
+  echo "Continuation C1-06 stale_revision (actual CR admission boundary): conflict=true sessions_delta=0 turns_delta=0 events_delta=0 active_ownership_unchanged=true BMS_delta=0 provider_action_calls=0"
+}
+
+run_continuation_failure_contention_scenario() {
+  local owner=owner-failure-contention conversation payload winner_pid response request thread session loser before fresh diagnostics
+  provider_post /fixture/reset '{}'
+  conversation="$(create_conversation "$owner" telegram:failure-winner)"
+  provider_post /fixture/delay-next-primary '{"delay_ms":2500}'
+  provider_post /fixture/fail-next-primary '{}'
+  # Existing local-only policy forbids cloud fallback; no routing behavior is changed.
+  payload="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{owner_id:$owner,client_id:"telegram:failure-winner",conversation_id:$conversation,surface:"telegram",sensitivity:"local_only",messages:[{role:"user",content:"Give a brief neutral greeting."}]}')"
+  curl -sS --max-time 20 -X POST http://127.0.0.1:14361/v1/chat -H 'X-API-Key: smoke-orchestrator-key' -H 'Content-Type: application/json' -d "$payload" -o "$COMPOSED_SMOKE_TMP/contention-failure.json" -w '%{http_code}' >"$COMPOSED_SMOKE_TMP/contention-failure-status" &
+  winner_pid=$!
+  for _ in $(seq 1 30); do
+    thread="$(cr_post /v1/runtime/threads/resolve "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{request_id:"failure-observe",owner_id:$owner,conversation_id:$conversation}')")"
+    [ "$(jq -r '.state' <<<"$thread")" = active ] && break
+    sleep 0.1
+  done
+  jq -e '.state == "active" and .active_surface == "telegram"' <<<"$thread" >/dev/null
+  session="$(jq -r '.active_runtime_session_id' <<<"$thread")"
+  before="$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)"
+  loser="$(run_distinct_client_chat "$owner" alexa:failure-loser alexa "$conversation" "neutral competing input")"
+  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
+  [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
+  wait "$winner_pid"
+  [ "$(cat "$COMPOSED_SMOKE_TMP/contention-failure-status")" = 500 ]
+  response="$(cat "$COMPOSED_SMOKE_TMP/contention-failure.json")"
+  jq -e 'keys == ["error","request_id","status"] and .status == "failed"
+    and .error == {code:"orchestration_error",message:"The chat request could not be completed."}' <<<"$response" >/dev/null
+  request="$(jq -r '.request_id' <<<"$response")"
+  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1
+    and ([.calls[] | select(.kind == "chat")][0].status == "failed")' <<<"$(fetch_provider_calls "$request")" >/dev/null
+  diagnostics="$(fetch_runtime_diagnostics "$session")"
+  jq -e '.latest_turn.turn_status == "abandoned"
+    and ([.events[] | select(.event_type == "turn_completed")] | length) == 1
+    and ([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
+  jq -e '.state == "idle" and .revision == 2 and .session_count == 1 and .surfaces == ["telegram"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='user'),(SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='assistant'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='failed');")" = '1|0|0|1' ]
+  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
+  fresh="$(run_distinct_client_chat "$owner" alexa:failure-fresh alexa "$conversation" "What does this function do?")"
+  jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$fresh" >/dev/null
+  [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$fresh")" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
+  [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '2|1' ]
+  [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE state='failed'),count(*) FILTER (WHERE state='completed'),count(*) FROM work_items WHERE owner_id='$owner';")" = '1|1|2' ]
+  jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and (.turn_statuses | sort) == ["abandoned","completed"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_calls=failed_one,fresh_one assistant_publications=1 work_failed=1 work_completed=1 fresh_admission_once=true"
+  provider_post /fixture/reset '{}'
+}
+
 run_continuation_conformance_scenario() {
   local tag owner conversation first second request trace sessions thread before history rows
   local telegram_client alexa_client first_request first_session second_session first_diag
@@ -2429,6 +2601,18 @@ run_continuation_conformance_scenario() {
       and .surfaces == ["alexa", "telegram"] and .turn_statuses == ["completed", "completed"]' <<<"$thread" >/dev/null
     [ "$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE owner_id='$owner';")" = "0" ]
     echo "Continuation C1-01/C1-07 $tag: exact_cross_surface=true one_conversation=true message_order=telegram_user,telegram_assistant,alexa_user,alexa_assistant telegram_history_preserved=true alexa_current_provenance=true sessions=2 provider_calls=1,1 idle_revision=4 claims=0 action_calls=0"
+    if [ "$tag" = restart ]; then
+      response="$(run_omitted_chat "$owner" web:restart-cache-loss web "What does this function do?")"
+      jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$response" >/dev/null
+      trace="$(fetch_trace "$(jq -r '.request_id' <<<"$response")")"
+      jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+        | .outcome == "resume" and .candidate_count == 1 and .candidate_set_complete == true' <<<"$trace" >/dev/null
+      [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$response")" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
+      [ "$history" = "$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text, '' ORDER BY m.created_at, m.id)) FROM (SELECT * FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' ORDER BY created_at, id LIMIT 2) m;")" ]
+      jq -e '.state == "idle" and .revision == 6 and .session_count == 3 and .surfaces == ["alexa", "telegram", "web"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+      [ "$(psql_exec -At -F '|' -c "SELECT count(DISTINCT conversation_id),count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '1|3|3' ]
+      echo "Continuation C1-05 CO_restart: supplied=exact omitted=server_owned_resume historical_rows_unchanged=true conversations=1 messages=3,3 idle_revision=6"
+    fi
   done
 
   local isolated="owner-continuation-isolated" missing wrong malformed foreign_before foreign_runtime
@@ -2503,7 +2687,7 @@ run_continuation_conformance_scenario() {
   [ "$durable" = "$(continuation_durable_snapshot "$owner")" ]
   [ "$runtime_before" = "$(runtime_owner_counts "$owner")" ]
   echo "Continuation C1-05: idle_CO_restart=preserved telegram_to_alexa=true historical_rows_unchanged=true runtime_outage_supplied=reject runtime_outage_omitted=reject no_cache_authority=true"
-  echo "C1-03 residual: insufficient-confidence state not representable by current continuation contract"
+  echo "Continuation C1-03 confidence: deterministic_unique_eligible_proof=true multiple_incomplete_conflicting_unavailable=no_selection"
   echo "C1-04 residual: separate supplied-thread surface-ineligibility authority not defined"
   provider_post "/fixture/reset" '{}' >/dev/null
 }
@@ -3194,14 +3378,20 @@ run_delivery_equivalence_scenario() {
 }
 
 run_interrupted_delivery_scenario() {
-  local owner="owner-delivery-interrupted" client="client-delivery-interrupted"
+  local tag="${1:-delivery}" owner="owner-delivery-interrupted" client="client-delivery-interrupted" surface=chat
+  local loser loser_before fresh fresh_request diagnostics thread
+  if [ "$tag" = contention ]; then
+    owner=owner-restart-contention
+    client=telegram:restart-winner
+    surface=telegram
+  fi
   local conversation payload status pending request work current before after container since events proof
   local running_deadline remaining running_ready=false running_failure=timeout
   provider_post "/fixture/reset" '{}'
   conversation="$(create_conversation "$owner" "$client")"
   provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
-  payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" '{
-    owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",sensitivity:"private",
+  payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" --arg surface "$surface" '{
+    owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,sensitivity:"private",
     messages:[{role:"user",content:"Give a brief neutral greeting."}],
     allow_deferred:true,delivery_wait_ms:100}')"
   status="$(curl -fsS -X POST "http://127.0.0.1:14361/v1/chat" \
@@ -3289,6 +3479,15 @@ print(json.dumps({
 PY_DIAGNOSTICS
     return 1
   fi
+  if [ "$tag" = contention ]; then
+    loser_before="$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)"
+    loser="$(run_distinct_client_chat "$owner" alexa:restart-loser alexa "$conversation" "neutral competing input")"
+    assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
+    [ "$loser_before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
+    thread="$(runtime_thread_snapshot "$owner" "$conversation")"
+    jq -e '.state == "active" and .surfaces == ["telegram"] and .session_count == 1' <<<"$thread" >/dev/null
+    jq -e '.state == "running" and .result == null' <<<"$(co_work_result "$owner" "$conversation" "$work")" >/dev/null
+  fi
   container="$(docker compose -f "$COMPOSE" ps -q orchestrator)"
   test -n "$container"
   docker compose -f "$COMPOSE" kill -s SIGKILL orchestrator
@@ -3346,7 +3545,24 @@ SQL
     # Exceed the provider fixture maximum delay before proving the old response cannot publish.
     if [ "$attempt" = "1" ]; then sleep 6; fi
   done
-  echo "Interrupted delivery proof: hard_kill=orchestrator_only work_count=1 failed=interrupted exact=current assistant_count=0 claim_count=0 CR_abandoned=1 provider_chat_at_most=1 late_publication=false"
+  if [ "$tag" = contention ]; then
+    assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
+    [ "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='failed' AND failure_code='interrupted';")" = 1 ]
+    fresh="$(run_distinct_client_chat "$owner" alexa:restart-fresh alexa "$conversation" "What does this function do?")"
+    jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$fresh" >/dev/null
+    fresh_request="$(jq -r '.request_id' <<<"$fresh")"
+    [ "$(fetch_provider_calls "$fresh_request" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
+    jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and .surfaces == ["alexa", "telegram"]
+      and (.turn_statuses | sort) == ["abandoned", "completed"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+    [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '2|1' ]
+    [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE state='failed'),count(*) FILTER (WHERE state='completed'),count(*) FROM work_items WHERE owner_id='$owner';")" = '1|1|2' ]
+    for surface in "$(jq -r '.active_runtime_session_id' <<<"$thread")" "$(fetch_trace "$fresh_request" | jq -r '.retrieval.prompt_assembly.runtime_session.runtime_session_id')"; do
+      diagnostics="$(fetch_runtime_diagnostics "$surface")"
+      jq -e '([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
+    done
+    echo "Continuation C1-06 restart_contention: winner_abandoned=true loser_side_effects=0 late_publication=false fresh_retry_once=true work_failed=1 work_completed=1 messages=2,1 idle_revision=4"
+  fi
+  [ "$tag" = contention ] || echo "Interrupted delivery proof: hard_kill=orchestrator_only work_count=1 failed=interrupted exact=current assistant_count=0 claim_count=0 CR_abandoned=1 provider_chat_at_most=1 late_publication=false"
   provider_post "/fixture/reset" '{}'
 }
 
@@ -3563,13 +3779,17 @@ run_runtime_admission_composition_scenario telegram-alexa telegram:admission ale
 run_omitted_continuation_scenario
 run_conversation_retirement_scenario
 run_continuation_conformance_scenario
-echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=not_representable"
+run_continuation_replacement_scenario
+run_continuation_admission_boundary_scenario
+run_continuation_failure_contention_scenario
+echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
 echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
 # Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
 run_deferred_delivery_scenario
 run_delivery_equivalence_scenario
 run_interrupted_delivery_scenario
+run_interrupted_delivery_scenario contention
 owner="owner-smoke-a"
 client="client-smoke-a"
 conversation_id="$(resolve_conversation "$owner" "$client" "smoke-a")"
