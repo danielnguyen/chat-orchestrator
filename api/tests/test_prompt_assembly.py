@@ -2069,3 +2069,32 @@ def test_disabled_situated_presence_does_not_change_prompt_layers():
     )
     assert "situated_presence" not in [layer["name"] for layer in out.trace["layers"]]
     assert out.messages == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.parametrize("budgeted", [False, True])
+def test_timing_is_distinct_required_prompt_layer_and_survives_budget_and_repair(budgeted):
+    from clients.runtime import RUNTIME_TIMING_PROJECTIONS
+    from services.prompt_budget import PromptBudgetContract, ProviderAttempt
+
+    timing = {"status": "included", "result": {
+        "timing_policy": "defer_expansion",
+        "prompt_overlay": RUNTIME_TIMING_PROJECTIONS["defer_expansion"][2],
+        "trace_ref": "rtrace-timing",
+    }}
+    budget = PromptBudgetContract(
+        attempts=[ProviderAttempt("fixture", "local", 4096, "primary")],
+        output_token_reserve=128, context_safety_margin=64,
+    ) if budgeted else None
+    for repair in (None, "reference_not_retained"):
+        out = assemble_prompt(
+            profile={}, retrieval_bundle={"bundle": {}},
+            current_messages=[{"role": "user", "content": "question"}],
+            runtime_timing_trace=timing, prompt_budget_contract=budget,
+            evidence_response_contract=repair is not None, evidence_repair_failure_reason=repair,
+        )
+        assert out.trace["runtime_timing"] == timing
+        layer = next(layer for layer in out.trace["layers"] if layer["name"] == "runtime_timing")
+        assert layer["message_count"] == 1
+        assert sum("Timing guidance:" in message["content"] for message in out.messages) == 1
+        assert "Preserve required core content" in str(out.messages)
+        assert "question" not in str(out.trace["runtime_timing"])

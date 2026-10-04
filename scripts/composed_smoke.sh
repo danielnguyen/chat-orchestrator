@@ -2544,11 +2544,21 @@ run_situated_presence_case() {
   local active_task="$5" allows_expansion="$6" expected_kind="$7"
   local expected_commentary="$8" expected_humor="$9" expected_attunement="${10}"
   local expected_challenge="${11}" expected_posture="${12}" fail_primary="${13:-false}"
+  local response_mode="${14:-provider}" expected_status expected_calls
   local owner="owner-situated-$tag" client="client-situated-$tag" surface="surface-situated-$tag"
   local conversation response request_id trace provider_calls session_id diagnostics thread counts
 
   conversation="$(create_conversation "$owner" "$client")"
-  queue_provider_answer "$expected_answer" >/dev/null
+  if [ "$response_mode" = "timing_clarification" ]; then
+    test "$fail_primary" = "false"
+    expected_status="degraded"
+    expected_calls=0
+  else
+    test "$response_mode" = "provider"
+    expected_status="$([ "$fail_primary" = true ] && echo degraded || echo ok)"
+    expected_calls="$([ "$fail_primary" = true ] && echo 2 || echo 1)"
+    queue_provider_answer "$expected_answer" >/dev/null
+  fi
   if [ "$fail_primary" = "true" ]; then
     provider_post "/fixture/fail-next-primary" '{}' >/dev/null
   fi
@@ -2563,8 +2573,11 @@ run_situated_presence_case() {
     --argjson allows_expansion "$allows_expansion" \
     '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private",surface_context:{surface_category:$category,active_task_mode:$active_task,allows_expansion:$allows_expansion}}')")"
   request_id="$(jq -r '.request_id' <<<"$response")"
-  jq -e --arg answer "$expected_answer" --arg expected_status "$([ "$fail_primary" = true ] && echo degraded || echo ok)" '
-    .answer == $answer and .status == $expected_status and .selected_model != "not_called"
+  jq -e --arg answer "$expected_answer" --arg expected_status "$expected_status" \
+    --arg mode "$response_mode" '
+    .answer == $answer and .status == $expected_status
+    and (if $mode == "timing_clarification" then .selected_model == "not_called"
+      else .selected_model != "not_called" end)
   ' <<<"$response" >/dev/null
   trace="$(fetch_trace "$request_id")"
   provider_calls="$(fetch_provider_calls "$request_id")"
@@ -2584,20 +2597,43 @@ run_situated_presence_case() {
       and .retrieval.prompt_assembly.situated_presence.challenge_allowed == $challenge
       and .retrieval.prompt_assembly.situated_presence.response_posture == $posture
       and .retrieval.prompt_assembly.situated_presence.action_implication_allowed == false
-      and (.retrieval.prompt_assembly.layers | map(.name) | index("situated_presence"))
+    ' <<<"$trace" >/dev/null
+  if [ "$response_mode" = "timing_clarification" ]; then
+    jq -e --arg request "$request_id" --arg conversation "$conversation" '
+      .request_id == $request and .conversation_id == $conversation
+      and .retrieval.prompt_assembly.runtime_timing.status == "included"
+      and .retrieval.prompt_assembly.runtime_timing.attempted == true
+      and .retrieval.prompt_assembly.runtime_timing.scope.request_id == $request
+      and .retrieval.prompt_assembly.runtime_timing.scope.conversation_id == $conversation
+      and .retrieval.prompt_assembly.runtime_timing.result.timing_policy == "ask_clarifying_question"
+      and .retrieval.prompt_assembly.runtime_timing.result.continuation_state == "clarification_required"
+      and .retrieval.prompt_assembly.runtime_timing.result.expansion_allowed == false
+      and .model_call.status == "not_called" and .model_calls == []
+      and ([.retrieval.prompt_assembly | .. | objects
+        | select(has("forwarded_to_authority") or has("forwarded_to_action_flow"))
+        | (.forwarded_to_authority // false) == false
+          and (.forwarded_to_action_flow // false) == false] | all(. == true))
+      and .retrieval.prompt_assembly.status == "not_requested"
+    ' <<<"$trace" >/dev/null
+    jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
+      <<<"$provider_calls" >/dev/null
+  else
+    jq -e '
+      (.retrieval.prompt_assembly.layers | map(.name) | index("situated_presence"))
         > (.retrieval.prompt_assembly.layers | map(.name) | index("restraint"))
       and (.retrieval.prompt_assembly.layers | map(.name) | index("situated_presence"))
         < (.retrieval.prompt_assembly.layers | map(.name) | index("privacy_context") // 999)
     ' <<<"$trace" >/dev/null
-  jq -e \
-    --argjson expected_calls "$([ "$fail_primary" = true ] && echo 2 || echo 1)" '
-      ([.calls[] | select(.kind == "chat")] | length) == $expected_calls
-      and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
-        | select(.role == "system" and (.content | startswith("Situated presence guidance:")))] | length)
-        == $expected_calls
-      and ([.calls[] | select(.kind == "chat") | .normalized_messages[] | .content]
-        | all(contains("light_commentary_allowed") | not))
-    ' <<<"$provider_calls" >/dev/null
+    jq -e \
+      --argjson expected_calls "$expected_calls" '
+        ([.calls[] | select(.kind == "chat")] | length) == $expected_calls
+        and ([.calls[] | select(.kind == "chat") | .normalized_messages[]
+          | select(.role == "system" and (.content | startswith("Situated presence guidance:")))] | length)
+          == $expected_calls
+        and ([.calls[] | select(.kind == "chat") | .normalized_messages[] | .content]
+          | all(contains("light_commentary_allowed") | not))
+      ' <<<"$provider_calls" >/dev/null
+  fi
   if [ "$fail_primary" = "true" ]; then
     jq -e '
       [.calls[] | select(.kind == "chat") | .prompt_fingerprint] as $fingerprints
@@ -2618,6 +2654,27 @@ run_situated_presence_case() {
         and has("policy_version") and has("reason_summary")]
       | all(. == true))
   ' <<<"$diagnostics" >/dev/null
+  if [ "$response_mode" = "timing_clarification" ]; then
+    jq -e --arg request "$request_id" \
+      --arg session "$session_id" \
+      --arg turn "$(jq -r '.retrieval.prompt_assembly.runtime_timing.scope.runtime_turn_id' <<<"$trace")" '
+      .latest_turn.runtime_turn_id == $turn
+      and .latest_turn.timing_policy == "ask_clarifying_question"
+      and ([.events[] | select(.event_type == "timing_evaluated")] | length) == 1
+      and ([.events[] | select(.event_type == "timing_evaluated")
+        | .runtime_session_id == $session and .runtime_turn_id == $turn
+          and .event_payload_json.request_id == $request
+          and .event_payload_json.timing_policy == "ask_clarifying_question"
+          and .event_payload_json.continuation_state == "clarification_required"
+          and .event_payload_json.expansion_allowed == false] | all(. == true))
+      and ([.events[] | select(.event_type == "turn_completed")] | length) == 1
+      and ([.events[] | select(.event_type == "turn_completed")
+        | .runtime_turn_id == $turn and .event_payload_json.turn_status == "completed"]
+        | all(. == true))
+      and ([.events[] | select(.event_type == "action_authority_evaluated"
+        or .event_type == "action_flow_evaluated")] | length) == 0
+    ' <<<"$diagnostics" >/dev/null
+  fi
   case "$(jq -c '.retrieval.prompt_assembly.situated_presence' <<<"$trace")" in
     *"$text"*)
       echo "situated presence trace exposed current turn text" >&2
@@ -2628,7 +2685,7 @@ run_situated_presence_case() {
     -H "Content-Type: application/json" \
     -d "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{request_id:"situated-smoke-final",owner_id:$owner,conversation_id:$conversation}')")"
   jq -e '.state == "idle" and .revision == 2 and .active_runtime_turn_id == null' <<<"$thread" >/dev/null
-  echo "Situated presence $tag: status=$(jq -r '.status' <<<"$response") request_id=$request_id conversation_id=$conversation governance=$expected_kind commentary=$expected_commentary humor=$expected_humor attunement=$expected_attunement challenge=$expected_challenge posture=$expected_posture provider_calls=$([ "$fail_primary" = true ] && echo 2 || echo 1) situated_events=1 durable_user_messages=1 durable_assistant_messages=1 thread_state=idle thread_revision=2 unintended_actions=0"
+  echo "Situated presence $tag: status=$(jq -r '.status' <<<"$response") request_id=$request_id conversation_id=$conversation governance=$expected_kind commentary=$expected_commentary humor=$expected_humor attunement=$expected_attunement challenge=$expected_challenge posture=$expected_posture provider_calls=$expected_calls response_mode=$response_mode situated_events=1 durable_user_messages=1 durable_assistant_messages=1 thread_state=idle thread_revision=2 unintended_actions=0"
 }
 
 run_situated_presence_scenario() {
@@ -2640,8 +2697,8 @@ run_situated_presence_scenario() {
     "It validates the input and returns the normalized result." \
     desktop_private false true question false false none none direct false
   run_situated_presence_case tense "I think I broke the server and prod is failing" \
-    "Check the latest deploy, inspect error rates, and roll back if the failure started there." \
-    desktop_private false true tense_debugging false false none medium tactical false
+    "Could you clarify what you want me to do?" \
+    desktop_private false true tense_debugging false false none medium tactical false timing_clarification
   run_situated_presence_case emotional "Ugh, this sucks and I'm upset." \
     "That is rough. Let’s keep the next step small and concrete." \
     mobile_private false true vent_or_expression false false brief none brief false
@@ -2658,13 +2715,13 @@ run_situated_presence_scenario() {
 }
 
 co_work_result() {
-  curl -fsS -G "http://127.0.0.1:14361/v1/work-items/$3" \
+  curl -fsS --max-time "${4:-0}" -G "http://127.0.0.1:14361/v1/work-items/$3" \
     -H "X-API-Key: smoke-orchestrator-key" \
     --data-urlencode "owner_id=$1" --data-urlencode "conversation_id=$2"
 }
 
 co_current_work() {
-  curl -fsS -G "http://127.0.0.1:14361/v1/current-work" \
+  curl -fsS --max-time "${3:-0}" -G "http://127.0.0.1:14361/v1/current-work" \
     -H "X-API-Key: smoke-orchestrator-key" \
     --data-urlencode "owner_id=$1" --data-urlencode "client_id=$2"
 }
@@ -2908,6 +2965,7 @@ run_delivery_equivalence_scenario() {
 run_interrupted_delivery_scenario() {
   local owner="owner-delivery-interrupted" client="client-delivery-interrupted"
   local conversation payload status pending request work current before after container since events proof
+  local running_deadline remaining running_ready=false running_failure=timeout
   provider_post "/fixture/reset" '{}'
   conversation="$(create_conversation "$owner" "$client")"
   provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
@@ -2920,13 +2978,86 @@ run_interrupted_delivery_scenario() {
     -o "$COMPOSED_SMOKE_TMP/interrupted-pending.json" -w '%{http_code}')"
   test "$status" = "202"
   pending="$(<"$COMPOSED_SMOKE_TMP/interrupted-pending.json")"
+  jq -e --arg conversation "$conversation" '
+    keys == ["conversation_id","delivery_status","request_id","work_id"]
+    and .delivery_status == "pending" and .conversation_id == $conversation
+    and (.request_id | type == "string" and length > 0)
+    and (.work_id | type == "string" and length > 0)
+  ' <<<"$pending" >/dev/null
   request="$(jq -r '.request_id' <<<"$pending")"
   work="$(jq -r '.work_id' <<<"$pending")"
-  before="$(co_work_result "$owner" "$conversation" "$work")"
-  jq -e '.state == "running" and .result == null' <<<"$before" >/dev/null
-  current="$(co_current_work "$owner" "$client")"
-  jq -e --arg work "$work" '.status=="resolved" and .work.work_id==$work
-    and .work.state=="running" and .work.result==null' <<<"$current" >/dev/null
+  # Admission may return while pending. Synchronize on running before killing cognition.
+  running_deadline="$(python3 -c 'import time; print(time.monotonic() + 3.0)')"
+  before=null
+  current=null
+  while remaining="$(python3 -c 'import sys,time; remaining=float(sys.argv[1])-time.monotonic(); sys.exit(1) if remaining<=0 else print(remaining)' "$running_deadline")"; do
+    if ! before="$(co_work_result "$owner" "$conversation" "$work" "$remaining" 2>/dev/null)"; then
+      running_failure=work_lookup_failed
+      break
+    fi
+    if ! jq -e --arg work "$work" --arg request "$request" --arg conversation "$conversation" '
+      keys == ["conversation_id","failure_code","request_id","result","state","work_id"]
+      and .work_id == $work and .request_id == $request and .conversation_id == $conversation
+      and (.state == "pending" or .state == "running")
+      and .result == null and .failure_code == null
+    ' <<<"$before" >/dev/null 2>&1; then
+      running_failure=work_precondition_invalid
+      break
+    fi
+    remaining="$(python3 -c 'import sys,time; remaining=float(sys.argv[1])-time.monotonic(); sys.exit(1) if remaining<=0 else print(remaining)' "$running_deadline")" || break
+    if ! current="$(co_current_work "$owner" "$client" "$remaining" 2>/dev/null)"; then
+      running_failure=locator_lookup_failed
+      break
+    fi
+    if ! jq -e --arg work "$work" --arg request "$request" --arg conversation "$conversation" '
+      keys == ["status","work"] and .status == "resolved"
+      and (.work | keys) == ["conversation_id","failure_code","request_id","result","state","work_id"]
+      and .work.work_id == $work and .work.request_id == $request
+      and .work.conversation_id == $conversation
+      and (.work.state == "pending" or .work.state == "running")
+      and .work.result == null and .work.failure_code == null
+    ' <<<"$current" >/dev/null 2>&1; then
+      running_failure=locator_precondition_invalid
+      break
+    fi
+    if [ "$(jq -r '.state' <<<"$before")" = "running" ] \
+      && [ "$(jq -r '.work.state' <<<"$current")" = "running" ]; then
+      running_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$running_ready" != true ]; then
+    python3 - "$running_failure" "$before" "$current" "$work" "$request" "$conversation" <<'PY_DIAGNOSTICS' >&2
+import json
+import sys
+
+def structural(raw):
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+def state(value):
+    actual = value.get("state")
+    return actual if actual in ("pending", "running", "completed", "failed") else "invalid"
+
+def identity(value):
+    return (value.get("work_id"), value.get("request_id"), value.get("conversation_id")) == tuple(sys.argv[4:7])
+
+exact, locator = structural(sys.argv[2]), structural(sys.argv[3])
+located = locator.get("work")
+located = located if isinstance(located, dict) else {}
+print(json.dumps({
+    "precondition_failure": sys.argv[1], "exact_state": state(exact),
+    "locator_status": locator.get("status") if locator.get("status") in ("none", "resolved") else "invalid",
+    "locator_state": state(located), "exact_identity_matches": identity(exact),
+    "locator_identity_matches": identity(located),
+}))
+PY_DIAGNOSTICS
+    return 1
+  fi
   container="$(docker compose -f "$COMPOSE" ps -q orchestrator)"
   test -n "$container"
   docker compose -f "$COMPOSE" kill -s SIGKILL orchestrator

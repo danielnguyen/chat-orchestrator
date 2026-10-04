@@ -1020,6 +1020,7 @@ async def _absent_proactive_preference(self, *, owner_id):
 def replay_presence_contract(monkeypatch):
     # Extend the existing boundary fake; historical corpus projections remain unchanged.
     monkeypatch.setattr(ReplayRuntime, "evaluate_presence", _ordinary_presence, raising=False)
+    monkeypatch.setattr(ReplayRuntime, "evaluate_timing", _replay_timing, raising=False)
     monkeypatch.setattr(ReplayMemoryStore, "get_proactive_preferences",
                         _absent_proactive_preference, raising=False)
 
@@ -1105,6 +1106,14 @@ async def test_presence_admitted_order_exact_scope_and_typed_projections(
     result, memory, runtime, calls, requests, messages = await _run_presence_turn(
         monkeypatch, context={"active_task_mode": active}, restraint=restraint,
     )
+    if active is not None and type(active) is not bool:
+        assert result["status"] == "failed"
+        assert messages == []
+        assert runtime.terminal_status == "abandoned"
+        assert memory.trace["retrieval"]["prompt_assembly"]["runtime_timing"][
+            "failure_category"
+        ] == "request_projection_invalid"
+        return
     assert result["status"] == "ok"
     names = [call["name"] for call in calls]
     assert names.index("cr_turn_start") < names.index("cr_restraint")
@@ -1339,3 +1348,85 @@ async def test_preference_read_requires_configured_and_admitted_runtime(
     assert requests == []
     assert "proactive_preference" not in [call["name"] for call in calls]
     assert result["status"] == ("failed" if admission_failure else "ok")
+
+
+async def _replay_timing(self, **request):
+    from clients.runtime import (
+        RUNTIME_TIMING_BUDGET_MS,
+        RUNTIME_TIMING_PROJECTIONS,
+        RUNTIME_TIMING_REASON_POLICIES,
+    )
+
+    self.timing_calls = getattr(self, "timing_calls", [])
+    self.timing_calls.append(deepcopy(request))
+    if self.scenario.get("timing_record"):
+        self._record("cr_timing", request["request_id"])
+    if self.scenario.get("timing_failure"):
+        raise httpx.ReadTimeout("private timing dependency failure")
+    policy = self.scenario.get("timing_policy", "answer_now")
+    reason = next(reason for reason, value in RUNTIME_TIMING_REASON_POLICIES.items()
+                  if value == policy and reason != "dependency_blocking")
+    if request["dependency_state"] == "blocking":
+        policy, reason = "close_turn", "dependency_blocking"
+    state, expansion, overlay = RUNTIME_TIMING_PROJECTIONS[policy]
+    return {
+        **{key: request[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )},
+        "result": {
+            "timing_policy": policy, "reason_codes": [reason] + (
+                ["dependency_degraded"] if request["dependency_state"] == "degraded" else []
+            ),
+            "latency_budget_class": request["latency_budget_class"],
+            "latency_budget_ms": RUNTIME_TIMING_BUDGET_MS[request["latency_budget_class"]],
+            "expansion_allowed": expansion, "continuation_state": state,
+            "degradation_mode": {"ready": "none", "degraded": "bounded", "blocking": "fail_closed"}[
+                request["dependency_state"]
+            ],
+            "policy_version": "runtime-timing.v1", "prompt_overlay": overlay,
+            "trace_ref": "rtrace-replay-timing",
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [
+    "answer_now", "defer_expansion", "ask_clarifying_question", "pause_or_wait",
+    "yield_to_user", "close_turn", "resume_previous_thread",
+])
+async def test_timing_replay_fixtures_control_generation_and_keep_trace_private(
+    monkeypatch, policy,
+):
+    scenario = {"scenario": "timing-fixture", "category": "timing", "provider": "success",
+                "interaction_governance_enabled": True, "restraint_enabled": True,
+                "timing_policy": policy, "timing_record": True}
+    traces = []
+    original_trace = ReplayMemoryStore.create_trace
+
+    async def create_trace(self, **kwargs):
+        traces.append(deepcopy(kwargs["payload"]))
+        return await original_trace(self, **kwargs)
+
+    monkeypatch.setattr(ReplayMemoryStore, "create_trace", create_trace)
+    snapshot = await run_scenario(scenario)
+    names = snapshot["call_order"]
+    assert names.count("cr_timing") == 1
+    timing_index = names.index("cr_timing")
+    assert names.index("cr_interaction_governance") < timing_index
+    assert names.index("cr_restraint") < timing_index
+    if policy in {"ask_clarifying_question", "pause_or_wait", "yield_to_user", "close_turn"}:
+        assert not any(name.startswith("provider_") for name in names)
+    else:
+        assert timing_index < next(
+            i for i, name in enumerate(names) if name.startswith("provider_")
+        )
+    timing = traces[0]["retrieval"]["prompt_assembly"]["runtime_timing"]
+    assert timing["result"]["timing_policy"] == policy
+    assert set(timing["scope"]) == {
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id",
+    }
+    assert "neutral request" not in json.dumps(timing)
+    assert "neutral response" not in json.dumps(timing)
+    assert_snapshot_privacy_safe(timing)

@@ -405,6 +405,7 @@ def _apply_prompt_budget(
     profile_messages: list[dict[str, str]],
     style_messages: list[dict[str, str]],
     response_shape_messages: list[dict[str, str]],
+    timing_messages: list[dict[str, str]],
     companion_messages: list[dict[str, str]],
     interaction_governance_messages: list[dict[str, str]],
     persona_containment_messages: list[dict[str, str]],
@@ -453,6 +454,8 @@ def _apply_prompt_budget(
             ("persona_containment", persona_containment_messages, {}),
             ("restraint", restraint_messages, {}),
         ]
+        if timing_messages:
+            ordered.append(("runtime_timing", timing_messages, {}))
         if situated_presence_messages:
             ordered.append(
                 ("situated_presence", situated_presence_messages, {})
@@ -1182,6 +1185,7 @@ def assemble_prompt(
     style_trace: dict[str, Any] | None = None,
     response_shape_guidance: str | None = None,
     response_shape_trace: dict[str, Any] | None = None,
+    runtime_timing_trace: dict[str, Any] | None = None,
     surface_presence_trace: dict[str, Any] | None = None,
     companion_overlays: list[dict[str, Any]] | None = None,
     companion_trace: dict[str, Any] | None = None,
@@ -1262,6 +1266,14 @@ def assemble_prompt(
                 "omission_reason": response_shape_trace_out.get("omission_reason"),
             },
         )
+    )
+
+    timing_trace_out = deepcopy(runtime_timing_trace or {})
+    timing_result = timing_trace_out.get("result") or {}
+    timing_overlay = _sanitize_prompt_overlay(timing_result.get("prompt_overlay"))
+    timing_messages = (
+        [{"role": "system", "content": "Timing guidance:\n" + timing_overlay}]
+        if timing_overlay else []
     )
 
     presentation_input = presentation.prompt_input if presentation is not None else None
@@ -1532,6 +1544,10 @@ def assemble_prompt(
             },
         )
     )
+
+    if timing_trace_out:
+        messages.extend(timing_messages)
+        layers.append(_layer_trace("runtime_timing", timing_messages, metadata=timing_trace_out))
 
     situated_presence_trace_out = dict(situated_presence_trace_data or {})
     situated_presence_guidance = build_situated_presence_guidance(
@@ -1875,6 +1891,7 @@ def assemble_prompt(
                 profile_messages=profile_messages,
                 style_messages=style_messages,
                 response_shape_messages=response_shape_messages,
+                timing_messages=timing_messages,
                 companion_messages=companion_messages,
                 interaction_governance_messages=interaction_governance_messages,
                 persona_containment_messages=persona_containment_messages,
@@ -1934,6 +1951,7 @@ def assemble_prompt(
         "handoff": handoff.trace_summary() if handoff is not None else None,
         "presentation": presentation.trace_summary() if presentation is not None else None,
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
+        "runtime_timing": timing_trace_out,
         "response_shape": response_shape_trace_out
         or {"attempted": False, "status": "not_requested"},
         "surface_presence": surface_presence_trace

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from models import StyleEnvelope
+from models import StyleEnvelope, SurfaceContext
 from pydantic import BaseModel
 
 VOICE_SURFACES = {"voice", "car", "alexa"}
@@ -274,3 +274,49 @@ def build_response_shape_guidance_block(shape: ResponseShape, trace: dict[str, A
     if not lines:
         return ""
     return "Response shape guidance:\n" + "\n".join(dict.fromkeys(lines))
+
+
+def project_timing_facts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project explicit request facts independently of legacy presentation inference."""
+    context = SurfaceContext.model_validate(payload.get("surface_context") or {}, strict=True)
+    spoken_signals = [value for value in (
+        context.spoken_output,
+        None if context.interaction_mode is None else context.interaction_mode == "voice_mediated",
+        None if context.output_format is None else context.output_format == "speech",
+    ) if value is not None]
+    if spoken_signals and len(set(spoken_signals)) != 1:
+        raise ValueError("timing_projection_conflict")
+    detail = {"short": "brief", "normal": "normal", "detailed": "expanded"}.get(
+        context.verbosity_target, "unspecified",
+    )
+    if payload.get("response_mode") == "brief":
+        if detail not in {"unspecified", "brief"}:
+            raise ValueError("timing_projection_conflict")
+        detail = "brief"
+    return {
+        "spoken_output": spoken_signals[0] if spoken_signals else False,
+        "active_task_mode": context.active_task_mode is True,
+        "requested_detail": detail,
+    }
+
+
+def clamp_response_shape_for_timing(
+    shape: ResponseShape, trace: dict[str, Any], timing: dict[str, Any] | None,
+) -> tuple[ResponseShape, dict[str, Any]]:
+    if not timing or timing["expansion_allowed"] is not False:
+        return shape, trace
+    narrowed = shape.model_copy(update={
+        "allows_expansion": False, "expansion_marker_allowed": False,
+        "continuation_state": (
+            "abbreviated" if shape.continuation_state == "expandable" else shape.continuation_state
+        ),
+    })
+    return narrowed, {
+        **trace, "included": True, "status": "included", "omission_reason": None,
+        "resolved_shape": narrowed.model_dump(), "continuation_state": narrowed.continuation_state,
+        "guidance_flags": {
+            **trace.get("guidance_flags", {}),
+            "allows_expansion": False, "expansion_marker_allowed": False,
+        },
+        "runtime_timing": {"applied": True, "expansion_allowed": False},
+    }
