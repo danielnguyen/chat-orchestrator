@@ -2524,7 +2524,7 @@ run_continuation_failure_contention_scenario() {
   # The stub's in-memory counters disappear on kill. Use the durable CO attempt
   # records for the interrupted primary and failed fallback, not reset counters.
   diagnostics="$(fetch_trace "$request")"
-  jq -e '.status == "error" and .fallback.triggered == true and (.model_calls | length) == 2
+  jq -e '.status == "failed" and .fallback.triggered == true and (.model_calls | length) == 2
     and all(.model_calls[]; .status == "failed")' <<<"$diagnostics" >/dev/null
   docker compose -f "$COMPOSE" start provider >/dev/null
   docker compose -f "$COMPOSE" up -d --wait provider >/dev/null
