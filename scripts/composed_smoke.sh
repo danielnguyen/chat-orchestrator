@@ -3389,7 +3389,7 @@ run_delivery_equivalence_scenario() {
 
 run_interrupted_delivery_scenario() {
   local tag="${1:-delivery}" owner="owner-delivery-interrupted" client="client-delivery-interrupted" surface=chat
-  local loser loser_before fresh fresh_request diagnostics thread retrieval_trace_hash
+  local loser loser_before fresh fresh_request diagnostics thread retrieval_trace_hash retrieval_deadline
   if [ "$tag" = contention ]; then
     owner=owner-restart-contention
     client=telegram:restart-winner
@@ -3499,8 +3499,9 @@ PY_DIAGNOSTICS
     # BMS persists a retrieval diagnostic before CO response generation. Wait
     # for that preparatory boundary, then prove it is never rewritten as an answer.
     diagnostics=""
-    for _ in $(seq 1 20); do
-      if diagnostics="$(curl -fsS --max-time 1 "http://127.0.0.1:14321/v1/traces/$request" -H 'X-API-Key: smoke-memory-key' 2>/dev/null)"; then break; fi
+    retrieval_deadline="$(python3 -c 'import time; print(time.monotonic() + 2.0)')"
+    while remaining="$(python3 -c 'import sys,time; remaining=float(sys.argv[1])-time.monotonic(); sys.exit(1) if remaining<=0 else print(remaining)' "$retrieval_deadline")"; do
+      if diagnostics="$(curl -fsS --max-time "$remaining" "http://127.0.0.1:14321/v1/traces/$request" -H 'X-API-Key: smoke-memory-key' 2>/dev/null)"; then break; fi
       sleep 0.1
     done
     jq -e --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" '
