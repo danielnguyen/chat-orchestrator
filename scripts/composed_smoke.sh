@@ -2497,8 +2497,8 @@ run_continuation_failure_contention_scenario() {
   provider_post /fixture/reset '{}'
   conversation="$(create_conversation "$owner" telegram:failure-winner)"
   provider_post /fixture/delay-next-primary '{"delay_ms":2500}'
-  provider_post /fixture/fail-next-primary '{}'
-  # Existing local-only policy forbids cloud fallback; no routing behavior is changed.
+  # Interrupt the response dependency after admission and loser rejection.
+  # Local-only still permits a local fallback; neither routing nor eligibility changes.
   payload="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{owner_id:$owner,client_id:"telegram:failure-winner",conversation_id:$conversation,surface:"telegram",sensitivity:"local_only",messages:[{role:"user",content:"Give a brief neutral greeting."}]}')"
   curl -sS --max-time 20 -X POST http://127.0.0.1:14361/v1/chat -H 'X-API-Key: smoke-orchestrator-key' -H 'Content-Type: application/json' -d "$payload" -o "$COMPOSED_SMOKE_TMP/contention-failure.json" -w '%{http_code}' >"$COMPOSED_SMOKE_TMP/contention-failure-status" &
   winner_pid=$!
@@ -2513,14 +2513,21 @@ run_continuation_failure_contention_scenario() {
   loser="$(run_distinct_client_chat "$owner" alexa:failure-loser alexa "$conversation" "neutral competing input")"
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
   [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
+  jq -e '.state == "active" and .active_surface == "telegram"' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  docker compose -f "$COMPOSE" kill -s SIGKILL provider >/dev/null
   wait "$winner_pid"
   [ "$(cat "$COMPOSED_SMOKE_TMP/contention-failure-status")" = 500 ]
   response="$(cat "$COMPOSED_SMOKE_TMP/contention-failure.json")"
   jq -e 'keys == ["error","request_id","status"] and .status == "failed"
     and .error == {code:"orchestration_error",message:"The chat request could not be completed."}' <<<"$response" >/dev/null
   request="$(jq -r '.request_id' <<<"$response")"
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 1
-    and ([.calls[] | select(.kind == "chat")][0].status == "failed")' <<<"$(fetch_provider_calls "$request")" >/dev/null
+  # The stub's in-memory counters disappear on kill. Use the durable CO attempt
+  # records for the interrupted primary and failed fallback, not reset counters.
+  diagnostics="$(fetch_trace "$request")"
+  jq -e '.status == "error" and .fallback.triggered == true and (.model_calls | length) == 2
+    and all(.model_calls[]; .status == "failed")' <<<"$diagnostics" >/dev/null
+  docker compose -f "$COMPOSE" start provider >/dev/null
+  docker compose -f "$COMPOSE" up -d --wait provider >/dev/null
   diagnostics="$(fetch_runtime_diagnostics "$session")"
   jq -e '.latest_turn.turn_status == "abandoned"
     and ([.events[] | select(.event_type == "turn_completed")] | length) == 1
@@ -2534,7 +2541,7 @@ run_continuation_failure_contention_scenario() {
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '2|1' ]
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE state='failed'),count(*) FILTER (WHERE state='completed'),count(*) FROM work_items WHERE owner_id='$owner';")" = '1|1|2' ]
   jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and (.turn_statuses | sort) == ["abandoned","completed"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
-  echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_calls=failed_one,fresh_one assistant_publications=1 work_failed=1 work_completed=1 fresh_admission_once=true"
+  echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_attempts=failed_primary,failed_fallback,fresh_one primary_fallback_successes=0 assistant_publications=1 work_failed=1 work_completed=1 fresh_admission_once=true"
   provider_post /fixture/reset '{}'
 }
 
