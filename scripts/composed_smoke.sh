@@ -2011,11 +2011,13 @@ run_claim_traceability_scenario() {
 }
 
 run_runtime_admission_composition_scenario() {
+  local tag="${1:-generic}"
   local owner="owner-admission-composition"
-  local winner_client="client-admission-winner"
-  local loser_client="client-admission-loser"
-  local winner_surface="web"
-  local loser_surface="voice"
+  [ "$tag" = generic ] || owner="owner-admission-composition-$tag"
+  local winner_client="${2:-client-admission-winner}"
+  local loser_client="${3:-client-admission-loser}"
+  local winner_surface="${4:-web}"
+  local loser_surface="${5:-voice}"
   local winner_text="neutral winning input"
   local loser_text="neutral competing input"
   local conversation_id winner_payload loser_payload winner_file winner_pid
@@ -2113,6 +2115,19 @@ run_runtime_admission_composition_scenario() {
     <<<"$final_thread" >/dev/null
 
   echo "Runtime admission composition: winner_status=ok loser_status=failed winner_request_id=$winner_request_id loser_request_id=$loser_request_id winner_provider_calls=1 loser_provider_calls=0 conversations=$conversation_count durable_user_messages=1 durable_assistant_messages=1 admitted_input_message_id=$admitted_input_message_id durable_user_message_id=$durable_user_message_id current_client=$winner_client current_surface=$winner_surface thread_state=idle thread_revision=2 loser_side_effects=0"
+  jq -e '.turn_statuses == ["completed"] and .session_count == 1' \
+    <<<"$(runtime_thread_snapshot "$owner" "$conversation_id")" >/dev/null
+  jq -e '[.events[] | select(.event_type == "action_authority_evaluated"
+    or .event_type == "action_flow_evaluated")] | length == 0' \
+    <<<"$runtime_diagnostics" >/dev/null
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation_id' AND client_id != '$winner_client';")" = "0" ]
+  jq -e --arg client "$winner_client" --arg surface "$winner_surface" '
+    .client_id == $client and .surface == $surface
+    and .retrieval.prompt_assembly.runtime_session.surface == $surface
+  ' <<<"$(fetch_trace "$winner_request_id")" >/dev/null
+  if [ "$tag" = "telegram-alexa" ]; then
+    echo "Continuation C1-06: winner=telegram loser=alexa provider_calls=1,0 messages=1,1 losing_sessions=0 losing_claims=0 action_calls=0 idle_revision=2 duplicate_side_effects=0"
+  fi
   provider_post "/fixture/reset" '{}'
 }
 
@@ -2129,6 +2144,7 @@ run_omitted_continuation_scenario() {
   local stale_mix_provenance stale_mix_provider stale_mix_thread
   local multiple_owner="owner-omitted-multiple" multiple_a multiple_b multiple_response multiple_request
   local multiple_before multiple_after multiple_runtime_before multiple_runtime_after multiple_provider
+  local multiple_retrieval_before
   local active_owner="owner-omitted-active" active_conversation initial_response winner_payload winner_file winner_pid
   local observed_thread wait_response wait_request winner_response active_provider active_rows active_thread
   local incomplete_owner="owner-omitted-incomplete" incomplete_response incomplete_request
@@ -2222,11 +2238,12 @@ run_omitted_continuation_scenario() {
   run_distinct_client_chat "$multiple_owner" "client-multiple-a" "surface-multiple-a" "$multiple_a" "neutral candidate a" >/dev/null
   run_distinct_client_chat "$multiple_owner" "client-multiple-b" "surface-multiple-b" "$multiple_b" "neutral candidate b" >/dev/null
   provider_post "/fixture/reset" '{}'
+  multiple_retrieval_before="$(bms_retrieval_access_count "$multiple_a")|$(bms_retrieval_access_count "$multiple_b")"
   multiple_before="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM messages WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM traces WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$multiple_owner');")"
   multiple_runtime_before="$(runtime_owner_counts "$multiple_owner")"
   multiple_response="$(run_omitted_chat "$multiple_owner" "client-multiple-c" "surface-multiple-c" "neutral ambiguous continuation")"
   multiple_request="$(jq -r '.request_id' <<<"$multiple_response")"
-  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .sources == []' <<<"$multiple_response" >/dev/null
+  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .sources == [] and .answer == "I couldn’t safely determine which conversation to continue. Please provide the conversation you want to resume."' <<<"$multiple_response" >/dev/null
   multiple_after="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM messages WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM traces WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$multiple_owner');")"
   multiple_runtime_after="$(runtime_owner_counts "$multiple_owner")"
   [ "$multiple_before" = "$multiple_after" ]
@@ -2278,7 +2295,7 @@ run_omitted_continuation_scenario() {
   incomplete_runtime_before="$(runtime_owner_counts "$incomplete_owner")"
   incomplete_response="$(run_omitted_chat "$incomplete_owner" "client-incomplete-request" "surface-incomplete" "neutral incomplete continuation")"
   incomplete_request="$(jq -r '.request_id' <<<"$incomplete_response")"
-  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and (.answer | contains("provide the conversation"))' <<<"$incomplete_response" >/dev/null
+  jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .answer == "I couldn’t safely determine which conversation to continue. Please provide the conversation you want to resume."' <<<"$incomplete_response" >/dev/null
   incomplete_after="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM messages WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM traces WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$incomplete_owner');")"
   incomplete_runtime_after="$(runtime_owner_counts "$incomplete_owner")"
   [ "$incomplete_before" = "9|0|0|0" ]
@@ -2294,6 +2311,14 @@ run_omitted_continuation_scenario() {
       ;;
   esac
 
+  jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+    | .outcome == "create_new" and .candidate_count == 0 and .candidate_set_complete == true' \
+    <<<"$(fetch_trace "$zero_request")" >/dev/null
+  jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+    | .outcome == "resume" and .candidate_count == 1 and .selected_thread_revision == 2' \
+    <<<"$(fetch_trace "$second_request")" >/dev/null
+  [ "$multiple_retrieval_before" = "$(bms_retrieval_access_count "$multiple_a")|$(bms_retrieval_access_count "$multiple_b")" ]
+  echo "Continuation C1-02: zero=create_new one=resume fresh_among_stale=resume multiple=clarify active=wait incomplete=clarify owner_scoped=true rejected_paths_provider_calls=0 rejected_paths_durable_runtime_unchanged=true semantic_selector=false"
   echo "Omitted continuation zero: status=ok request_id=$zero_request conversation_id=$zero_conversation owner_conversations=1 user_messages=1 assistant_messages=1 provider_calls=1 thread_state=idle thread_revision=2 isolated_conversation_rejected=true"
   echo "Omitted continuation stale-only: status=ok request_id=$stale_only_request conversation_id=$stale_only_conversation stale_open_before=12 stale_open_after=12 owner_conversations=13 provider_calls=1 stale_rows_resumed=false"
   echo "Omitted continuation resume: first_request_id=$first_request second_request_id=$second_request conversation_id=$resume_conversation user_messages=2 assistant_messages=2 provider_calls=1 session_surfaces=surface-resume-a,surface-resume-b thread_state=idle thread_revision=4 provenance_preserved=true"
@@ -2303,6 +2328,184 @@ run_omitted_continuation_scenario() {
   echo "Omitted continuation incomplete: status=degraded conversation_id=null candidates=9 provider_calls=0 durable_counts=9,0,0,0 runtime_counts_unchanged=true side_effects=0"
   echo "Omitted continuation isolation: other_owner_selected=false candidate_details_disclosed=false semantic_selector=false adapter_selector=false"
   provider_post "/fixture/reset" '{}'
+}
+
+continuation_durable_snapshot() {
+  local owner="$1"
+  # Hash whole durable rows to detect rewriting without printing retained content.
+  psql_exec -At -F '|' -c "SELECT
+    (SELECT count(*) || ':' || coalesce(md5(string_agg(row_to_json(c)::text, '' ORDER BY c.id)), '') FROM conversations c WHERE owner_id='$owner'),
+    (SELECT count(*) || ':' || coalesce(md5(string_agg(row_to_json(m)::text, '' ORDER BY m.id)), '') FROM messages m WHERE owner_id='$owner'),
+    (SELECT count(*) FROM traces WHERE owner_id='$owner'),
+    (SELECT count(*) FROM claim_records WHERE owner_id='$owner');"
+}
+
+assert_continuation_supplied_rejection() {
+  local owner="$1" client="$2" target="$3" disposition="${4:-absent}"
+  local runtime_available="${5:-true}" before after runtime_before response request calls
+  before="$(continuation_durable_snapshot "$owner")"
+  if [ "$runtime_available" = "true" ]; then
+    runtime_before="$(runtime_owner_counts "$owner")"
+  fi
+  response="$(run_distinct_client_chat "$owner" "$client" "alexa" "$target" "PRIVATE-CONTINUATION-REJECTED")"
+  request="$(jq -r '.request_id' <<<"$response")"
+  jq -e --arg target "$target" --arg disposition "$disposition" '
+    .status == "failed" and .conversation_id == $target and .selected_model == "not_called"
+    and .sources == [] and (.pending_action == null)
+    and (if $disposition == "non_current" then .conversation_disposition == "non_current"
+      else (has("conversation_disposition") | not) end)
+    and (.answer | contains("PRIVATE-CONTINUATION") | not)
+  ' <<<"$response" >/dev/null
+  after="$(continuation_durable_snapshot "$owner")"
+  [ "$before" = "$after" ]
+  if [ "$runtime_available" = "true" ]; then
+    [ "$runtime_before" = "$(runtime_owner_counts "$owner")" ]
+  fi
+  calls="$(fetch_provider_calls "$request")"
+  [ "$(jq '[.calls[] | select(.kind == "chat")] | length' <<<"$calls")" = "0" ]
+  jq -c '{status,profile_name,selected_model,answer,sources}' <<<"$response"
+}
+
+run_continuation_conformance_scenario() {
+  local tag owner conversation first second request trace sessions thread before history rows
+  local telegram_client alexa_client first_request first_session second_session first_diag
+  for tag in direct restart; do
+    owner="owner-continuation-$tag"
+    telegram_client="telegram:conformance-$tag"
+    alexa_client="alexa:conformance-$tag"
+    provider_post "/fixture/reset" '{}' >/dev/null
+    conversation="$(create_conversation "$owner" "$telegram_client")"
+    queue_provider_answer "It validates the input." >/dev/null
+    first="$(run_distinct_client_chat "$owner" "$telegram_client" telegram "$conversation" "What does this function do?")"
+    first_request="$(jq -r '.request_id' <<<"$first")"
+    jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation and .answer == "It validates the input."' <<<"$first" >/dev/null
+    [ "$(fetch_provider_calls "$first_request" | jq '[.calls[] | select(.kind == "chat")] | length')" = "1" ]
+    history="$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text, '' ORDER BY m.created_at, m.id)) FROM messages m WHERE owner_id='$owner' AND conversation_id='$conversation';")"
+    first_session="$(fetch_trace "$first_request" | jq -er '.retrieval.prompt_assembly.runtime_session.runtime_session_id')"
+    before="$(runtime_thread_snapshot "$owner" "$conversation")"
+    jq -e '.state == "idle" and .revision == 2 and .surfaces == ["telegram"] and .turn_statuses == ["completed"]' <<<"$before" >/dev/null
+    if [ "$tag" = "restart" ]; then
+      docker compose -f "$COMPOSE" stop orchestrator >/dev/null
+      docker compose -f "$COMPOSE" start orchestrator >/dev/null
+      for _ in $(seq 1 100); do
+        if curl -fsS --max-time 1 http://127.0.0.1:14361/healthz >/dev/null 2>&1; then break; fi
+        sleep 0.1
+      done
+      curl -fsS http://127.0.0.1:14361/healthz >/dev/null
+      [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")" ]
+      [ "$history" = "$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text, '' ORDER BY m.created_at, m.id)) FROM messages m WHERE owner_id='$owner' AND conversation_id='$conversation';")" ]
+    fi
+    queue_provider_answer "It returns a normalized result." >/dev/null
+    second="$(run_distinct_client_chat "$owner" "$alexa_client" alexa "$conversation" "What does this function do?")"
+    request="$(jq -r '.request_id' <<<"$second")"
+    jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation and .answer == "It returns a normalized result."' <<<"$second" >/dev/null
+    [ "$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length')" = "1" ]
+    [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner';")" = "1" ]
+    [ "$history" = "$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text, '' ORDER BY m.created_at, m.id)) FROM (SELECT * FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' ORDER BY created_at, id LIMIT 2) m;")" ]
+    # User surface is on its message. Assistant surface is durably bound by its
+    # request_id to the existing BMS trace; do not invent a message surface field.
+    rows="$(psql_exec -At -F '|' -c "SELECT m.role, m.client_id, coalesce(m.metadata->>'surface', t.surface) FROM messages m LEFT JOIN traces t ON t.request_id=m.metadata->>'request_id' AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id WHERE m.owner_id='$owner' AND m.conversation_id='$conversation' ORDER BY m.created_at, m.id;")"
+    [ "$rows" = "$(printf 'user|%s|telegram\nassistant|%s|telegram\nuser|%s|alexa\nassistant|%s|alexa' "$telegram_client" "$telegram_client" "$alexa_client" "$alexa_client")" ]
+    trace="$(fetch_trace "$request")"
+    jq -e --arg owner "$owner" --arg conversation "$conversation" --arg client "$alexa_client" '
+      .owner_id == $owner and .conversation_id == $conversation
+      and .client_id == $client and .surface == "alexa"
+      and .retrieval.prompt_assembly.runtime_session.surface == "alexa"
+      and .retrieval.prompt_assembly.turn_state.conversation_resolution.mode == "supplied"
+    ' <<<"$trace" >/dev/null
+    second_session="$(jq -er '.retrieval.prompt_assembly.runtime_session.runtime_session_id' <<<"$trace")"
+    [ "$first_session" != "$second_session" ]
+    for sessions in "$first_session" "$second_session"; do
+      first_diag="$(fetch_runtime_diagnostics "$sessions")"
+      jq -e --arg owner "$owner" --arg conversation "$conversation" '
+        .runtime_session.owner_id == $owner and .runtime_session.conversation_id == $conversation
+        and .latest_turn.turn_status == "completed"
+        and ([.events[] | select(.event_type == "action_authority_evaluated"
+          or .event_type == "action_flow_evaluated")] | length) == 0
+      ' <<<"$first_diag" >/dev/null
+    done
+    thread="$(runtime_thread_snapshot "$owner" "$conversation")"
+    jq -e '.state == "idle" and .revision == 4 and .session_count == 2
+      and .surfaces == ["alexa", "telegram"] and .turn_statuses == ["completed", "completed"]' <<<"$thread" >/dev/null
+    [ "$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE owner_id='$owner';")" = "0" ]
+    echo "Continuation C1-01/C1-07 $tag: exact_cross_surface=true one_conversation=true message_order=telegram_user,telegram_assistant,alexa_user,alexa_assistant telegram_history_preserved=true alexa_current_provenance=true sessions=2 provider_calls=1,1 idle_revision=4 claims=0 action_calls=0"
+  done
+
+  local isolated="owner-continuation-isolated" missing wrong malformed foreign_before foreign_runtime
+  local lifecycle target replacement durable runtime_before state response
+  provider_post "/fixture/reset" '{}' >/dev/null
+  foreign_before="$(continuation_durable_snapshot "$owner")"
+  foreign_runtime="$(runtime_owner_counts "$owner")"
+  wrong="$(assert_continuation_supplied_rejection "$isolated" "$telegram_client" "$conversation")"
+  missing="$(assert_continuation_supplied_rejection "$isolated" "$telegram_client" "00000000-0000-4000-8000-000000000099")"
+  malformed="$(assert_continuation_supplied_rejection "$isolated" "$telegram_client" "not-a-conversation-id")"
+  [ "$wrong" = "$missing" ]
+  [ "$malformed" = "$missing" ]
+  # Guessed client/surface identifiers are provenance, never thread selectors.
+  response="$(run_omitted_chat "$isolated" "$telegram_client" telegram "What does this function do?")"
+  jq -e --arg foreign "$conversation" '.status == "ok" and .conversation_id != $foreign' <<<"$response" >/dev/null
+  trace="$(fetch_trace "$(jq -r '.request_id' <<<"$response")")"
+  jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+    | .outcome == "create_new" and .candidate_count == 0' <<<"$trace" >/dev/null
+  jq -e --arg owner "$isolated" --arg conversation "$(jq -r '.conversation_id' <<<"$response")" '
+    .runtime_session.owner_id == $owner and .runtime_session.conversation_id == $conversation
+  ' <<<"$(fetch_runtime_diagnostics "$(jq -er '.retrieval.prompt_assembly.runtime_session.runtime_session_id' <<<"$trace")")" >/dev/null
+  case "$(runtime_owner_counts "$isolated")" in
+    1\|1\|1\|*) ;;
+    *) echo "continuation owner isolation created unexpected runtime associations" >&2; exit 1 ;;
+  esac
+  [ "$foreign_before" = "$(continuation_durable_snapshot "$owner")" ]
+  [ "$foreign_runtime" = "$(runtime_owner_counts "$owner")" ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$isolated' AND conversation_id='$conversation';")" = "0" ]
+  echo "Continuation C1-08: foreign_supplied=reject foreign_omitted_candidate_count=0 guessed_client_surface_not_selectors=true foreign_durable_runtime_unchanged=true missing_wrong_owner_indistinguishable=true retained_content_disclosed=false"
+
+  for lifecycle in closed superseded; do
+    target="$(create_conversation "$owner" "client-continuation-$lifecycle")"
+    add_message "$target" "$owner" "client-continuation-$lifecycle" user "PRIVATE-CONTINUATION-TARGET-HISTORY" >/dev/null
+    if [ "$lifecycle" = "superseded" ]; then
+      replacement="$(create_conversation "$owner" "client-continuation-replacement")"
+      psql_exec -c "UPDATE conversations SET lifecycle_state='superseded', superseded_by_conversation_id='$replacement' WHERE owner_id='$owner' AND id='$target';" >/dev/null
+    else
+      psql_exec -c "UPDATE conversations SET lifecycle_state='closed' WHERE owner_id='$owner' AND id='$target';" >/dev/null
+    fi
+    assert_continuation_supplied_rejection "$owner" "alexa:negative" "$target" non_current >/dev/null
+  done
+  echo "Continuation C1-04: missing=reject guessed=reject wrong_owner=reject malformed=bounded_lookup_rejection closed=non_current superseded=non_current no_substitution=true durable_runtime_unchanged=true provider_calls=0 surface_ineligibility=not_defined"
+
+  # Existing disposable projection injection exposes real CR conservative branches.
+  for state in contended unavailable inconsistent; do
+    local state_owner="owner-continuation-$state"
+    target="$(create_conversation "$state_owner" "telegram:state-$state")"
+    run_distinct_client_chat "$state_owner" "telegram:state-$state" telegram "$target" "What does this function do?" >/dev/null
+    runtime_set_thread_projection "$state_owner" "$target" "$([ "$state" = inconsistent ] && echo idle || echo "$state")" "$([ "$state" = inconsistent ] && echo true || echo false)"
+    durable="$(continuation_durable_snapshot "$state_owner")"
+    runtime_before="$(runtime_owner_counts "$state_owner")"
+    response="$(run_omitted_chat "$state_owner" "alexa:state-$state" alexa "PRIVATE-UNSELECTED-CONTENT")"
+    jq -e '.status == "failed" and .conversation_id == null and .selected_model == "not_called"
+      and .sources == [] and .answer == "I couldn’t safely continue a prior conversation. No retained conversation content was used."' <<<"$response" >/dev/null
+    [ "$durable" = "$(continuation_durable_snapshot "$state_owner")" ]
+    [ "$runtime_before" = "$(runtime_owner_counts "$state_owner")" ]
+    [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$response")" | jq '[.calls[] | select(.kind == "chat")] | length')" = "0" ]
+    echo "Continuation C1-03 $state: outcome=decline selected_conversation=null durable_runtime_unchanged=true provider_calls=0 retained_content_disclosed=false"
+  done
+
+  # All prior fixture turns are idle before the disposable dependency outage.
+  durable="$(continuation_durable_snapshot "$owner")"
+  runtime_before="$(runtime_owner_counts "$owner")"
+  docker compose -f "$COMPOSE" stop runtime >/dev/null
+  assert_continuation_supplied_rejection "$owner" "alexa:runtime-unavailable" "$conversation" absent false >/dev/null
+  response="$(run_omitted_chat "$owner" "alexa:runtime-unavailable" alexa "PRIVATE-UNAVAILABLE-CONTENT")"
+  jq -e '.status == "failed" and .conversation_id == null and .selected_model == "not_called"
+    and .sources == [] and .answer == "I couldn’t safely determine which conversation to continue. No retained conversation content was used. Please try again."' <<<"$response" >/dev/null
+  [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$response")" | jq '[.calls[] | select(.kind == "chat")] | length')" = "0" ]
+  docker compose -f "$COMPOSE" start runtime >/dev/null
+  docker compose -f "$COMPOSE" up -d --wait runtime >/dev/null
+  [ "$durable" = "$(continuation_durable_snapshot "$owner")" ]
+  [ "$runtime_before" = "$(runtime_owner_counts "$owner")" ]
+  echo "Continuation C1-05: idle_CO_restart=preserved telegram_to_alexa=true historical_rows_unchanged=true runtime_outage_supplied=reject runtime_outage_omitted=reject no_cache_authority=true"
+  echo "C1-03 residual: insufficient-confidence state not representable by current continuation contract"
+  echo "C1-04 residual: separate supplied-thread surface-ineligibility authority not defined"
+  provider_post "/fixture/reset" '{}' >/dev/null
 }
 
 run_conversation_retirement_scenario() {
@@ -3355,6 +3558,13 @@ if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
   echo "Situated presence composition scenario complete: assertions=true"
   exit 0
 fi
+
+run_runtime_admission_composition_scenario telegram-alexa telegram:admission alexa:admission telegram alexa
+run_omitted_continuation_scenario
+run_conversation_retirement_scenario
+run_continuation_conformance_scenario
+echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=not_representable"
+echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
 # Scenario A: active canonical Alpha remains current while retrievable parked Beta stays historical.
 run_deferred_delivery_scenario
