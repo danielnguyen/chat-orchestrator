@@ -2337,7 +2337,8 @@ continuation_durable_snapshot() {
     (SELECT count(*) || ':' || coalesce(md5(string_agg(row_to_json(c)::text, '' ORDER BY c.id)), '') FROM conversations c WHERE owner_id='$owner'),
     (SELECT count(*) || ':' || coalesce(md5(string_agg(row_to_json(m)::text, '' ORDER BY m.id)), '') FROM messages m WHERE owner_id='$owner'),
     (SELECT count(*) FROM traces WHERE owner_id='$owner'),
-    (SELECT count(*) FROM claim_records WHERE owner_id='$owner');"
+    (SELECT count(*) FROM claim_records WHERE owner_id='$owner'),
+    (SELECT count(*) FROM work_items WHERE owner_id='$owner');"
 }
 
 assert_continuation_supplied_rejection() {
@@ -2541,7 +2542,9 @@ run_continuation_failure_contention_scenario() {
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '2|1' ]
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE state='failed'),count(*) FILTER (WHERE state='completed'),count(*) FROM work_items WHERE owner_id='$owner';")" = '1|1|2' ]
   jq -e '.state == "idle" and .revision == 4 and .session_count == 2 and (.turn_statuses | sort) == ["abandoned","completed"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
-  echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_attempts=failed_primary,failed_fallback,fresh_one primary_fallback_successes=0 assistant_publications=1 work_failed=1 work_completed=1 fresh_admission_once=true"
+  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
+  [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '2|0|0' ]
+  echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_attempts=failed_primary,failed_fallback,fresh_one primary_fallback_successes=0 assistant_publications=1 work_failed=1 work_completed=1 traces=2 claims=0 canonical_facts=0 action_events=0 confirmations=0 fresh_admission_once=true"
   provider_post /fixture/reset '{}'
 }
 
@@ -3567,7 +3570,9 @@ SQL
       diagnostics="$(fetch_runtime_diagnostics "$surface")"
       jq -e '([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
     done
-    echo "Continuation C1-06 restart_contention: winner_abandoned=true loser_side_effects=0 late_publication=false fresh_retry_once=true work_failed=1 work_completed=1 messages=2,1 idle_revision=4"
+    assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
+    [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '1|0|0' ]
+    echo "Continuation C1-06 restart_contention: winner_abandoned=true loser_side_effects=0 late_publication=false fresh_retry_once=true work_failed=1 work_completed=1 messages=2,1 traces=1 claims=0 canonical_facts=0 action_events=0 confirmations=0 winner_provider_calls=$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length') fresh_provider_calls=1 idle_revision=4"
   fi
   [ "$tag" = contention ] || echo "Interrupted delivery proof: hard_kill=orchestrator_only work_count=1 failed=interrupted exact=current assistant_count=0 claim_count=0 CR_abandoned=1 provider_chat_at_most=1 late_publication=false"
   provider_post "/fixture/reset" '{}'
