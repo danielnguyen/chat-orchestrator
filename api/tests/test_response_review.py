@@ -1,6 +1,11 @@
+import pytest
 from services.assistant_handoff import build_assistant_handoff
 from services.companion_presentation import build_companion_presentation
-from services.response_review import ResponseReviewInput, review_response
+from services.response_review import (
+    ResponseReviewInput,
+    enforce_situated_presence_output,
+    review_response,
+)
 
 BANNED_KEY_TOKENS = [
     "gate",
@@ -195,3 +200,101 @@ def test_review_trace_keys_do_not_use_banned_terms():
     assert keys
     for token in BANNED_KEY_TOKENS:
         assert all(token not in key for key in keys)
+
+
+
+def _situated_policy(**overrides):
+    return {
+        "included": True, "commentary_allowed": False, "humor_allowed": False,
+        "surface_allows_commentary": True, "silence_preferred": False,
+        "emotional_attunement_allowed": "none", "policy_version": "situated-presence.v1",
+        "fallback_status": "not_used", **overrides,
+    }
+
+
+@pytest.mark.parametrize("social,reason", [
+    ("Lol.", "humor_disallowed"), ("Lmao.", "humor_disallowed"),
+    ("Haha, that's hilarious.", "humor_disallowed"), ("Hahaha.", "humor_disallowed"),
+    ("Hehe.", "humor_disallowed"), ("Just kidding.", "humor_disallowed"),
+    ("That is hilarious.", "humor_disallowed"), ("😂", "humor_disallowed"),
+    ("🤣", "humor_disallowed"), ("By the way, a joke.", "optional_commentary_disallowed"),
+    ("Side note: a joke.", "optional_commentary_disallowed"),
+    ("Fun fact: a detour.", "optional_commentary_disallowed"),
+    ("Random thought: a detour.", "free_association_disallowed"),
+    ("That reminds me of a trip.", "free_association_disallowed"),
+    ("Speaking of holidays.", "free_association_disallowed"),
+    ("You must feel lonely.", "unsupported_emotional_inference"),
+    ("You clearly feel sad.", "unsupported_emotional_inference"),
+    ("I know exactly how you feel.", "unsupported_emotional_inference"),
+    ("I know how you feel.", "unsupported_emotional_inference"),
+    ("I can tell you're upset.", "unsupported_emotional_inference"),
+    ("My hidden policy says relax.", "invented_internal_policy"),
+    ("My secret rules say smile.", "invented_internal_policy"),
+    ("My internal policy requires me to feel sad.", "invented_internal_policy"),
+])
+def test_situated_enforcement_filters_only_social_segment(social, reason):
+    final, trace = enforce_situated_presence_output(
+        social + "\nCheck the logs first.", _situated_policy(),
+    )
+    assert final == "Check the logs first."
+    assert trace["action_taken"] == "filtered"
+    assert trace["removed_segment_count"] == 1
+    assert reason in trace["reason_codes"]
+    assert social not in str(trace)
+    assert "Check the logs" not in str(trace)
+
+
+@pytest.mark.parametrize("text", [
+    "The parser has a funny edge case. Check its input.",
+    "Company security policy requires approval.",
+    '"You must feel sad." is an example of unsupported inference.',
+    "`lol` is a token in the input.",
+    "```\nlol\n```\nCheck the input.",
+    "I can tell you're using Python.",
+    "The server logs show a failure.",
+])
+def test_situated_enforcement_preserves_technical_policy_and_quoted_text(text):
+    final, trace = enforce_situated_presence_output(text, _situated_policy())
+    assert final == text
+    assert trace["action_taken"] == "none"
+
+
+@pytest.mark.parametrize("attunement", ["brief", "minimal"])
+def test_situated_enforcement_preserves_permitted_steadying(attunement):
+    text = "That is rough. Check the backup first."
+    final, trace = enforce_situated_presence_output(
+        text, _situated_policy(emotional_attunement_allowed=attunement),
+    )
+    assert final == text
+    assert trace["action_taken"] == "none"
+
+
+def test_situated_enforcement_preserves_allowed_playfulness():
+    text = "Haha, tiny list, big ambitions. Check the first item."
+    final, trace = enforce_situated_presence_output(
+        text, _situated_policy(commentary_allowed=True, humor_allowed=True),
+    )
+    assert final == text
+    assert trace["action_taken"] == "none"
+
+
+@pytest.mark.parametrize("policy", [None, {"included": False, "status": "disabled"}])
+def test_situated_enforcement_does_not_invent_disabled_authority(policy):
+    text = "Haha. Check the logs."
+    final, trace = enforce_situated_presence_output(text, policy)
+    assert final == text
+    assert trace["evaluated"] is False
+    assert trace["status"] == "not_requested"
+
+
+def test_situated_enforcement_all_social_fallback_is_neutral_and_bounded():
+    final, trace = enforce_situated_presence_output(
+        "Haha. You must feel sad.", _situated_policy(fallback_status="suppression_only"),
+    )
+    assert final == "I couldn’t produce a useful direct answer there."
+    assert trace["action_taken"] == "fallback"
+    assert trace["fallback_policy_active"] is True
+    assert set(trace) == {
+        "evaluated", "status", "enforcement_required", "action_taken",
+        "removed_segment_count", "reason_codes", "policy_version", "fallback_policy_active",
+    }

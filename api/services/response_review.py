@@ -304,3 +304,92 @@ def review_response(review_input: ResponseReviewInput) -> ResponseReview:
         findings=findings,
         checked_categories=list(CHECKED_CATEGORIES),
     )
+
+
+def enforce_situated_presence_output(
+    candidate_text: str, policy: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Remove explicit optional social segments under the resolved presentation policy.
+
+    This is a lexical fail-safe, not a classifier. Quoted/code material and
+    ambiguous semantic phrasing remain governed by the existing prompt policy.
+    """
+    active = isinstance(policy, dict) and policy.get("included") is True
+    trace: dict[str, Any] = {
+        "evaluated": active,
+        "status": "evaluated" if active else "not_requested",
+        "enforcement_required": False,
+        "action_taken": "none",
+        "removed_segment_count": 0,
+        "reason_codes": [],
+        "policy_version": policy.get("policy_version") if active else None,
+        "fallback_policy_active": active and policy.get("fallback_status") == "suppression_only",
+    }
+    if not active:
+        return candidate_text, trace
+    suppress_commentary = (
+        policy.get("commentary_allowed") is not True
+        or policy.get("surface_allows_commentary") is not True
+        or policy.get("silence_preferred") is True
+    )
+    # Keep original spacing and formatting unless a segment is actually removed.
+    parts = re.split(r"((?<=[.!?;])\s+|\n+)", candidate_text)
+    retained: list[str] = []
+    reasons: list[str] = []
+    removed = 0
+    in_code = False
+    for index in range(0, len(parts), 2):
+        segment = parts[index]
+        separator = parts[index + 1] if index + 1 < len(parts) else ""
+        stripped = segment.strip()
+        quoted = stripped.startswith(('"', '“', "'", "‘", ">", "`"))
+        protected = in_code or quoted or "```" in segment
+        if segment.count("```") % 2:
+            in_code = not in_code
+        segment_reasons: list[str] = []
+        if not protected:
+            lowered = stripped.lower().replace("’", "'")
+            if policy.get("humor_allowed") is not True and re.match(
+                r"^(?:(?:lol|lmao|ha(?:ha)+|hehe)\b|just kidding\b|"
+                r"that(?:'s| is) hilarious\b|[😂🤣])", lowered,
+            ):
+                segment_reasons.append("humor_disallowed")
+            if suppress_commentary and re.match(
+                r"^(?:by the way|side note|random thought|fun fact)\b", lowered,
+            ):
+                segment_reasons.append("optional_commentary_disallowed")
+            if (suppress_commentary or trace["fallback_policy_active"]) and re.match(
+                r"^(?:that reminds me of|speaking of|random thought)\b", lowered,
+            ):
+                segment_reasons.append("free_association_disallowed")
+            if re.match(
+                r"^(?:you must feel\b|you clearly feel\b|i know (?:exactly )?how you feel\b|"
+                r"i can tell you're (?:sad|angry|upset|anxious|afraid|lonely|overwhelmed)\b)",
+                lowered,
+            ):
+                segment_reasons.append("unsupported_emotional_inference")
+            if re.match(
+                r"^(?:my hidden policy says|my secret rules say|"
+                r"my internal policy requires me to feel)\b", lowered,
+            ):
+                segment_reasons.append("invented_internal_policy")
+            if (
+                policy.get("emotional_attunement_allowed") not in {"brief", "minimal"}
+                and re.fullmatch(r"that (?:is|'s) rough[.!]?", lowered)
+            ):
+                segment_reasons.append("optional_commentary_disallowed")
+        if segment_reasons:
+            removed += 1
+            reasons.extend(reason for reason in segment_reasons if reason not in reasons)
+        else:
+            retained.append(segment + separator)
+    if not removed:
+        return candidate_text, trace
+    final = "".join(retained).strip()
+    trace.update(
+        enforcement_required=True,
+        action_taken="filtered" if final else "fallback",
+        removed_segment_count=removed,
+        reason_codes=reasons,
+    )
+    return final or "I couldn’t produce a useful direct answer there.", trace

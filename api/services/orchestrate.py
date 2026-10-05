@@ -156,7 +156,11 @@ from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import PromptAssembly, assemble_prompt
 from services.prompt_budget import PromptBudgetContract, PromptBudgetError
 from services.response_action import ResponseActionInput, apply_response_action
-from services.response_review import ResponseReviewInput, review_response
+from services.response_review import (
+    ResponseReviewInput,
+    enforce_situated_presence_output,
+    review_response,
+)
 from services.response_shape import (
     build_response_shape_guidance_block,
     clamp_response_shape_for_runtime_presence,
@@ -4248,6 +4252,7 @@ def _trace_prompt(prompt_trace: dict[str, Any] | None) -> dict[str, Any]:
         "provider_prompt": trace.get("provider_prompt", {}),
         "provider_fallback_context": trace.get("provider_fallback_context", {}),
         "result_boundary": trace.get("result_boundary", {}),
+        "situated_presence_enforcement": trace.get("situated_presence_enforcement", {}),
         "token_accounting": {
             "status": ("estimated" if prompt_budget else "estimate_unavailable"),
             "budget_enforcement": ("enforced" if prompt_budget else "not_enforced"),
@@ -9837,6 +9842,9 @@ async def orchestrate_chat(
             answer = claim_explanation.answer or ""
             if timing_result and timing_result["timing_policy"] == "acknowledge_then_answer":
                 answer = "Received. " + answer
+            answer, situated_enforcement_trace = enforce_situated_presence_output(
+                answer, situated_presence_trace,
+            )
             status = claim_explanation.status or "degraded"
             await _advance_runtime_turn(
                 runtime=runtime,
@@ -9915,6 +9923,8 @@ async def orchestrate_chat(
                     "prompt_assembly": {
                         "status": "not_requested",
                         "claim_explanation": claim_explanation.trace,
+                        "situated_presence": situated_presence_trace,
+                        "situated_presence_enforcement": situated_enforcement_trace,
                         "runtime_timing": timing_trace,
                         **(
                             {"history_followup": history_followup_trace}
@@ -12784,67 +12794,6 @@ async def orchestrate_chat(
                 or compound_verification_requested
             )
         )
-        claim_capture = prepare_claim_capture(
-            enabled=claim_capture_trace_enabled,
-            compound_verification_requested=compound_verification_requested,
-            trusted_governed_claim=trusted_governed_claim,
-            runtime_available=runtime is not None,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            answer=claim_candidate_answer,
-            is_brief=brief_metadata.get("enabled") is True,
-            pending_action_present=pending_action is not None,
-            capability_requested=(
-                not evidence_provider_call
-                and (
-                    capability_request is not None
-                    or isinstance(
-                        prompt.trace.get("capabilities", {}).get("execution"),
-                        dict,
-                    )
-                )
-            ),
-            capability_executed=(
-                prompt.trace.get("capabilities", {}).get("execution", {}).get(
-                    "executor_called"
-                )
-                is True
-            ),
-            callback_applied=(
-                prompt.trace.get("memory_episode_recall_composition", {}).get(
-                    "final_callback_applied"
-                )
-                is True
-            ),
-            privacy_suppressed=privacy_boundary.enforced,
-            retained_artifacts=artifact_refs_for_sources,
-            public_sources=answer_sources,
-            trace_references=references,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-        )
-        if claim_capture.candidate is not None and (
-            claim_capture.candidate.evidence_reference.get("ref_type")
-            == "external_source"
-        ):
-            reference_identity = {
-                "ref_type": "external_source",
-                "ref_id": governed_external_reference_id(
-                    validated_governed_excerpts[0].source_ref
-                ),
-            }
-            if reference_identity not in references:
-                references.append(reference_identity)
-        claim_capture = await calibrate_claim_capture(
-            runtime=runtime,
-            state=claim_capture,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
-        )
         if generic_terminal_authority_required:
             if generic_presented_answer is not None:
                 answer = generic_presented_answer
@@ -12909,6 +12858,72 @@ async def orchestrate_chat(
 
         if timing_result and timing_result["timing_policy"] == "acknowledge_then_answer":
             answer = "Received. " + answer
+
+        answer, prompt.trace["situated_presence_enforcement"] = (
+            enforce_situated_presence_output(answer, situated_presence_trace)
+        )
+
+        claim_capture = prepare_claim_capture(
+            enabled=claim_capture_trace_enabled,
+            compound_verification_requested=compound_verification_requested,
+            trusted_governed_claim=trusted_governed_claim,
+            runtime_available=runtime is not None,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+            answer=answer,
+            is_brief=brief_metadata.get("enabled") is True,
+            pending_action_present=pending_action is not None,
+            capability_requested=(
+                not evidence_provider_call
+                and (
+                    capability_request is not None
+                    or isinstance(
+                        prompt.trace.get("capabilities", {}).get("execution"),
+                        dict,
+                    )
+                )
+            ),
+            capability_executed=(
+                prompt.trace.get("capabilities", {}).get("execution", {}).get(
+                    "executor_called"
+                )
+                is True
+            ),
+            callback_applied=(
+                prompt.trace.get("memory_episode_recall_composition", {}).get(
+                    "final_callback_applied"
+                )
+                is True
+            ),
+            privacy_suppressed=privacy_boundary.enforced,
+            retained_artifacts=artifact_refs_for_sources,
+            public_sources=answer_sources,
+            trace_references=references,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+        )
+        if claim_capture.candidate is not None and (
+            claim_capture.candidate.evidence_reference.get("ref_type")
+            == "external_source"
+        ):
+            reference_identity = {
+                "ref_type": "external_source",
+                "ref_id": governed_external_reference_id(
+                    validated_governed_excerpts[0].source_ref
+                ),
+            }
+            if reference_identity not in references:
+                references.append(reference_identity)
+        claim_capture = await calibrate_claim_capture(
+            runtime=runtime,
+            state=claim_capture,
+            request_id=request_id,
+            owner_id=payload["owner_id"],
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_trace.get("runtime_session_id") or "",
+            runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
+        )
 
         work.failure_code = "dependency_unavailable"
         assistant_message_ack = await memory_store.add_message(

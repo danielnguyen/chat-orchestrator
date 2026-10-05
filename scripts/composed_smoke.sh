@@ -2942,6 +2942,7 @@ run_situated_presence_case() {
   local expected_commentary="$8" expected_humor="$9" expected_attunement="${10}"
   local expected_challenge="${11}" expected_posture="${12}" fail_primary="${13:-false}"
   local response_mode="${14:-provider}" expected_status expected_calls
+  local raw_answer="${15:-$expected_answer}" expected_reasons="${16:-}"
   local owner="owner-situated-$tag" client="client-situated-$tag" surface="surface-situated-$tag"
   local conversation response request_id trace provider_calls session_id diagnostics thread counts
 
@@ -2954,7 +2955,7 @@ run_situated_presence_case() {
     test "$response_mode" = "provider"
     expected_status="$([ "$fail_primary" = true ] && echo degraded || echo ok)"
     expected_calls="$([ "$fail_primary" = true ] && echo 2 || echo 1)"
-    queue_provider_answer "$expected_answer" >/dev/null
+    queue_provider_answer "$raw_answer" >/dev/null
   fi
   if [ "$fail_primary" = "true" ]; then
     provider_post "/fixture/fail-next-primary" '{}' >/dev/null
@@ -2968,7 +2969,7 @@ run_situated_presence_case() {
     --arg category "$category" \
     --argjson active_task "$active_task" \
     --argjson allows_expansion "$allows_expansion" \
-    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private",surface_context:{surface_category:$category,active_task_mode:$active_task,allows_expansion:$allows_expansion}}')")"
+    '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private",surface_context:{surface_category:$category,active_task_mode:$active_task,allows_expansion:$allows_expansion,style_envelope:{playfulness_budget:"medium",analogy_density:"medium"}}}')")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   jq -e --arg answer "$expected_answer" --arg expected_status "$expected_status" \
     --arg mode "$response_mode" '
@@ -3037,6 +3038,25 @@ run_situated_presence_case() {
       | ($fingerprints | length) == 2 and $fingerprints[0] == $fingerprints[1]
     ' <<<"$provider_calls" >/dev/null
   fi
+  if [ "$response_mode" = provider ]; then
+    jq -e --arg raw "$raw_answer" --arg answer "$expected_answer" \
+      --arg reasons "$expected_reasons" '
+      .retrieval.prompt_assembly.situated_presence_enforcement as $e
+      | (.retrieval.prompt_assembly.style.recognized_request_fields | index("playfulness_budget")) != null
+        and $e.evaluated == true
+        and $e.action_taken == (if $raw == $answer then "none" else "filtered" end)
+        and ($e.reason_codes | sort) == ($reasons | split(",") | map(select(length > 0)) | sort)
+        and ($e | keys | sort) == (["evaluated","status","enforcement_required","action_taken",
+          "removed_segment_count","reason_codes","policy_version","fallback_policy_active"] | sort)
+    ' <<<"$trace" >/dev/null
+    # JSON encoding safely compares the exact durable answer without interpolating prose into SQL.
+    local durable_answer
+    durable_answer="$(psql_exec -At -c "SELECT to_json(content) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND role='assistant';")"
+    jq -e --arg answer "$expected_answer" '. == $answer' <<<"$durable_answer" >/dev/null
+    if [ "$expected_humor" = false ]; then
+      jq -e '.retrieval.prompt_assembly.style.resolved_envelope.playfulness_budget == "none"' <<<"$trace" >/dev/null
+    fi
+  fi
   counts="$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'), count(*) FILTER (WHERE role='assistant'), count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")"
   [ "$counts" = "1|1|2" ]
   session_id="$(jq -r '.retrieval.prompt_assembly.runtime_session.runtime_session_id // empty' <<<"$trace")"
@@ -3051,6 +3071,7 @@ run_situated_presence_case() {
         and has("policy_version") and has("reason_summary")]
       | all(. == true))
   ' <<<"$diagnostics" >/dev/null
+  jq -e '([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
   if [ "$fail_primary" = "true" ]; then
     local active_profile turn_id
     active_profile="$(curl -fsS "http://127.0.0.1:14371/v1/companion/profile/active")"
@@ -3129,13 +3150,42 @@ run_situated_presence_scenario() {
     mobile_private false true vent_or_expression false false brief none brief false
   run_situated_presence_case public "lol roast my tiny todo list" \
     "Your todo list has three items." \
-    glasses_public_or_semi_public false true joke_or_playful false false none none silent_or_minimal false
+    glasses_public_or_semi_public false true joke_or_playful false false none none silent_or_minimal false provider \
+    "By the way, a detour. Your todo list has three items." optional_commentary_disallowed
   run_situated_presence_case constrained "lol roast my tiny todo list" \
     "Your todo list has three items." \
-    notification_preview true false joke_or_playful false false none none silent_or_minimal false
+    notification_preview true false joke_or_playful false false none none silent_or_minimal false provider \
+    "By the way, a detour. Your todo list has three items." optional_commentary_disallowed
   run_situated_presence_case fallback "What does this function do?" \
     "It validates the input and returns the normalized result." \
-    desktop_private false true question false false none none direct true
+    desktop_private false true question false false none none direct true provider \
+    "Haha. By the way, a detour. It validates the input and returns the normalized result." \
+    humor_disallowed,optional_commentary_disallowed
+  run_situated_presence_case tense_direct "Can you clarify why the server broke and prod is failing?" \
+    "Stop there. Check the logs first." desktop_private false true tense_debugging false false none medium tactical false provider \
+    "Haha, that's hilarious. Stop there. Check the logs first." humor_disallowed
+  run_situated_presence_case tense_fallback "Can you clarify why the server broke and prod is failing?" \
+    "Stop there. Check the logs first." desktop_private false true tense_debugging false false none medium tactical true provider \
+    "Haha, that's hilarious. Stop there. Check the logs first." humor_disallowed
+  run_situated_presence_case high_impact "Can you clarify the security policy? lol" \
+    "Require approval before changing access." desktop_private false true high_impact_decision false false none low direct false provider \
+    "Haha. By the way, a detour. Require approval before changing access." humor_disallowed,optional_commentary_disallowed
+  run_situated_presence_case high_impact_fallback "Can you clarify the security policy? lol" \
+    "Require approval before changing access." desktop_private false true high_impact_decision false false none low direct true provider \
+    "Haha. By the way, a detour. Require approval before changing access." humor_disallowed,optional_commentary_disallowed
+  run_situated_presence_case shared "lol roast my tiny todo list" \
+    "Your todo list has three items." car_voice_possible_passenger false true joke_or_playful false false none none silent_or_minimal false provider \
+    "By the way, a detour. Your todo list has three items." optional_commentary_disallowed
+  run_situated_presence_case active_task "lol roast my tiny todo list" \
+    "Your todo list has three items." desktop_private true true joke_or_playful false false none none silent_or_minimal false provider \
+    "By the way, a detour. Your todo list has three items." optional_commentary_disallowed
+  run_situated_presence_case no_expansion "lol roast my tiny todo list" \
+    "Your todo list has three items." desktop_private false false joke_or_playful false false none none silent_or_minimal false provider \
+    "By the way, a detour. Your todo list has three items." optional_commentary_disallowed
+  run_situated_presence_case unknown "lol roast my tiny todo list" \
+    "Your todo list has three items." unknown_surface false true joke_or_playful false false none none silent_or_minimal false provider \
+    "By the way, a detour. Your todo list has three items." optional_commentary_disallowed
+  echo "Situated final output: allowed_commentary_preserved=true steadying_preserved=true tactical_help_preserved=true high_impact_clamped=true surface_matrix=true fallback_filtered=true persisted_equals_returned=true"
   provider_post "/fixture/reset" '{}' >/dev/null
 }
 

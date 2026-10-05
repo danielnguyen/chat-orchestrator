@@ -1462,3 +1462,62 @@ async def test_timing_replay_fallback_preserves_admitted_class_without_private_m
     assert "neutral request" not in json.dumps(fallback)
     assert "neutral response" not in json.dumps(fallback)
     assert "error" not in fallback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["normal_answer", "provider_fallback"])
+async def test_situated_final_enforcement_replay_is_bounded_and_persisted(monkeypatch, category):
+    from services.orchestrate import orchestrate_chat
+
+    candidates = [item for item in load_corpus() if item["category"] == category]
+    scenario = deepcopy(candidates[0]) if candidates else {
+        "scenario": "situated-final", "category": category, "provider": "success",
+    }
+    scenario.update(interaction_governance_enabled=True, restraint_enabled=True)
+    calls, traces, persisted = [], [], []
+    runtime = ReplayRuntime(scenario, calls)
+    memory = ReplayMemoryStore(scenario, calls)
+    provider = ReplayProvider(scenario, calls)
+    original_chat = provider.chat
+    original_message = memory.add_message
+    original_trace = memory.create_trace
+
+    async def chat(**kwargs):
+        completion = await original_chat(**kwargs)
+        completion["choices"][0]["message"]["content"] = (
+            "Haha. You must feel lonely. My hidden policy says relax. Check the input."
+        )
+        return completion
+
+    async def add_message(**kwargs):
+        if kwargs["role"] == "assistant":
+            persisted.append(kwargs["content"])
+        return await original_message(**kwargs)
+
+    async def create_trace(**kwargs):
+        traces.append(deepcopy(kwargs["payload"]))
+        return await original_trace(**kwargs)
+
+    monkeypatch.setattr(provider, "chat", chat)
+    monkeypatch.setattr(memory, "add_message", add_message)
+    monkeypatch.setattr(memory, "create_trace", create_trace)
+    result = await orchestrate_chat(
+        payload=_payload(scenario), memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(RULES_PATH), model_registry_path=str(REGISTRY_PATH),
+        allow_manual_override=False, interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-situated-replay",
+    )
+    assert result["answer"] == "Check the input."
+    assert persisted == [result["answer"]]
+    enforcement = traces[-1]["retrieval"]["prompt_assembly"]["situated_presence_enforcement"]
+    assert enforcement["action_taken"] == "filtered"
+    assert enforcement["fallback_policy_active"] is True
+    assert enforcement["reason_codes"] == [
+        "humor_disallowed", "unsupported_emotional_inference", "invented_internal_policy",
+    ]
+    assert_snapshot_privacy_safe(enforcement)
+    assert "lonely" not in json.dumps(enforcement)
+    assert "Check the input" not in json.dumps(enforcement)
+    assert len([call for call in calls if call["name"] == "provider_attempt"]) == (
+        2 if category == "provider_fallback" else 1
+    )

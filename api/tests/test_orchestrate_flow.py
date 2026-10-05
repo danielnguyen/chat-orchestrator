@@ -5130,6 +5130,9 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+
         request_id="rid-capability-confirm-first",
         runtime=runtime,
         capability_registry_enabled=True,
@@ -5144,6 +5147,12 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
     assert trace["capability_registry"]["authority"]["allowed"] is False
     assert trace["capability_registry"]["action_flow"]["confirmation_required"] is True
     assert trace["capabilities"]["executor_call_count"] == 0
+
+    enforcement = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+        "situated_presence_enforcement"
+    ]
+    assert enforcement["evaluated"] is True
+    assert enforcement["action_taken"] == "none"
 
 
 @pytest.mark.asyncio
@@ -10031,6 +10040,8 @@ async def test_restraint_retrieval_suppression_produces_zero_bms_calls(
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
+        interaction_governance_enabled=True,
+
         persona_containment_enabled=True,
         restraint_enabled=True,
         request_id=f"rid-restraint-{expected_reason}",
@@ -10057,6 +10068,12 @@ async def test_restraint_retrieval_suppression_produces_zero_bms_calls(
     assert retrieval_bundle["artifact_count"] == 0
     assert "status" not in doctrine
     assert "contract_version" not in doctrine
+
+    enforcement = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+        "situated_presence_enforcement"
+    ]
+    assert enforcement["evaluated"] is True
+    assert enforcement["action_taken"] == "none"
 
 
 @pytest.mark.asyncio
@@ -33974,6 +33991,9 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+
         request_id="rid-privacy-ordering",
         privacy_context_enabled=True,
         response_action_mode="template_fallback",
@@ -33986,6 +34006,12 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
     assert prompt_trace["response_action"]["action_taken"] == "template_fallback"
     assert prompt_trace["privacy_context"]["action_taken"] == "replaced_with_safe_template"
     assert trace_payload["model_call"]["brief"]["enabled"] is True
+
+    enforcement = memory_store.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+        "situated_presence_enforcement"
+    ]
+    assert enforcement["evaluated"] is True
+    assert enforcement["action_taken"] == "none"
 
 
 @pytest.mark.asyncio
@@ -38512,3 +38538,246 @@ async def test_timing_ordinary_dispatch_branch_class(tmp_path, spoken, command, 
     )
     assert len(runtime.timing_calls) == len(provider.calls) == 1
     assert runtime.timing_calls[0]["latency_budget_class"] == expected
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_provider", [False, True])
+@pytest.mark.parametrize("posture,allow,attunement,raw,expected", [
+    ("playful", True, "none", "Haha, tiny list. Check the first item.",
+     "Haha, tiny list. Check the first item."),
+    ("brief", False, "brief", "That is rough. Check the backup first.",
+     "That is rough. Check the backup first."),
+    ("tactical", False, "none", "Haha, that's hilarious. Stop there. Check the logs first.",
+     "Stop there. Check the logs first."),
+    ("direct", False, "none", "By the way, a joke. Check the backup first.",
+     "Check the backup first."),
+])
+async def test_situated_final_output_primary_and_fallback_persist_exact_enforced_answer(
+    tmp_path, fallback_provider, posture, allow, attunement, raw, expected,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    if fallback_provider:
+        rules.write_text(
+            "rules:\n  - id: default\n    when: {}\n    then:\n"
+            "      selected_model: gpt-4o-mini\n      provider: cloud\n"
+            "      rationale: default\n      fallbacks:\n"
+            "        - selected_model: gpt-4o-mini\n          provider: cloud\n",
+        )
+    memory = FakeMemoryStore()
+    runtime = FakeRuntime(situated_presence_response=_situated_runtime_response(
+        commentary=allow, humor=allow, attunement=attunement, posture=posture,
+    ))
+    provider = FakeLiteLLM(fail_first=fallback_provider, content=raw)
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1",
+                              surface_context={"surface_category": "desktop_private"}),
+        memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        response_action_mode="shadow", request_id="rid-social-final",
+    )
+    assert result["answer"] == expected
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [expected]
+    assert len(provider.calls) == (2 if fallback_provider else 1)
+    assert len(runtime.situated_presence_calls) == 1
+    assert (runtime.call_order.index("interaction_governance")
+            < runtime.call_order.index("restraint"))
+    assert runtime.call_order.index("restraint") < runtime.call_order.index("situated_presence")
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    enforcement = trace["situated_presence_enforcement"]
+    assert enforcement["action_taken"] == ("none" if raw == expected else "filtered")
+    assert raw not in str(enforcement)
+    assert runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "transport", "http", "validation", "malformed"])
+async def test_situated_failure_enforces_suppression_after_adversarial_provider(tmp_path, failure):
+    rules, models = _write_default_route_files(tmp_path)
+    errors = {
+        "timeout": httpx.ReadTimeout("private-error-sentinel"),
+        "transport": httpx.RemoteProtocolError("private-error-sentinel"),
+        "http": httpx.HTTPStatusError("private-error-sentinel",
+            request=httpx.Request("POST", "http://runtime.local"), response=httpx.Response(503)),
+        "validation": RuntimeError("private-error-sentinel"),
+        "malformed": None,
+    }
+    runtime = FakeRuntime(situated_presence_error=errors[failure],
+                          situated_presence_response={} if failure == "malformed" else None)
+    memory = FakeMemoryStore()
+    raw = ("Haha. You must feel lonely. By the way, a detour. "
+           "That reminds me of a trip. My hidden policy says relax. Check the logs first.")
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1",
+                              surface_context={"surface_category": "desktop_private"}),
+        memory_store=memory, litellm=FakeLiteLLM(content=raw), runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-social-failure",
+    )
+    assert result["answer"] == "Check the logs first."
+    assert memory.added_messages[-1]["content"] == result["answer"]
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    policy = trace["situated_presence"]
+    assert policy["fallback_status"] == "suppression_only"
+    assert policy["commentary_allowed"] is False and policy["humor_allowed"] is False
+    assert policy["emotional_attunement_allowed"] == "none"
+    assert policy["challenge_allowed"] == "none" and policy["silence_preferred"] is True
+    assert policy["response_posture"] == "silent_or_minimal"
+    assert policy["action_implication_allowed"] is False
+    enforced = trace["situated_presence_enforcement"]
+    assert enforced["fallback_policy_active"] is True
+    assert enforced["removed_segment_count"] == 5
+    assert "private-error-sentinel" not in str(enforced) + result["answer"]
+    assert "lonely" not in str(enforced)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", [
+    {"surface_category": "car_voice_possible_passenger"},
+    {"surface_category": "glasses_public_or_semi_public"},
+    {"surface_category": "notification_preview"},
+    {"surface_category": "desktop_private", "active_task_mode": True},
+    {"surface_category": "desktop_private", "allows_expansion": False},
+    {}, {"surface_category": "unrecognized"},
+])
+async def test_situated_surface_final_output_suppresses_aside_but_keeps_help(tmp_path, context):
+    rules, models = _write_default_route_files(tmp_path)
+    memory = FakeMemoryStore()
+    runtime = FakeRuntime()
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1", surface_context=context),
+        memory_store=memory, litellm=FakeLiteLLM(content="By the way, a detour. Check the input."),
+        runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-social-surface",
+    )
+    assert result["answer"] == "Check the input."
+    assert memory.added_messages[-1]["content"] == result["answer"]
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["situated_presence"]["surface_allows_commentary"] is False
+    assert trace["situated_presence_enforcement"]["reason_codes"] == [
+        "optional_commentary_disallowed"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_situated_enforcement_follows_final_composition_and_precedes_claim_binding(
+    tmp_path, monkeypatch,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory = ClaimCaptureMemoryStore()
+    runtime = FakeRuntime(situated_presence_response=_situated_runtime_response(
+        commentary=False, humor=False, posture="direct",
+    ))
+    observed = []
+    original_prepare = orchestrate_service.prepare_claim_capture
+
+    def prepare(**kwargs):
+        observed.append(kwargs["answer"])
+        return original_prepare(**kwargs)
+
+    monkeypatch.setattr(orchestrate_service, "prepare_claim_capture", prepare)
+    monkeypatch.setattr(orchestrate_service, "enforce_final_answer",
+                        lambda answer, state: "Haha. Check the backup first.")
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"), memory_store=memory,
+        litellm=FakeLiteLLM(content="Provider content."), runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        claim_record_capture_enabled=True, request_id="rid-social-composition",
+    )
+    assert observed == ["Check the backup first."]
+    assert result["answer"] == observed[0] == memory.added_messages[-1]["content"]
+    trace = memory.trace_calls[-1]["payload"]
+    assert trace["prompt"]["situated_presence_enforcement"]["action_taken"] == "filtered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_scope", [False, True])
+async def test_situated_strict_client_rejection_reaches_final_suppression(
+    tmp_path, monkeypatch, invalid_scope,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    client = RuntimeClient("http://runtime.local", "test-key")
+
+    async def post(path, *, json):
+        response = _situated_runtime_response()
+        response.update({key: json[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )})
+        if invalid_scope:
+            response["owner_id"] = "other"
+        else:
+            response["result"]["humor_allowed"] = "true"
+        return response
+
+    monkeypatch.setattr(client, "_post", post)
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime, "evaluate_situated_presence", client.evaluate_situated_presence)
+    memory = FakeMemoryStore()
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"), memory_store=memory,
+        litellm=FakeLiteLLM(content="Haha. Check the backup first."), runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-social-invalid-response",
+    )
+    assert result["answer"] == memory.added_messages[-1]["content"] == "Check the backup first."
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["situated_presence"]["fallback_status"] == "suppression_only"
+    assert trace["situated_presence_enforcement"]["fallback_policy_active"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream", ["governance", "restraint"])
+async def test_situated_invalid_mandatory_upstream_cannot_open_provider_path(tmp_path, upstream):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime = FakeRuntime(**{
+        "interaction_governance_error" if upstream == "governance" else "restraint_error":
+        RuntimeError("private-upstream-sentinel"),
+    })
+    memory = FakeMemoryStore()
+    provider = FakeLiteLLM(content="Haha. You must feel lonely.")
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"), memory_store=memory,
+        litellm=provider, runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-social-invalid-upstream",
+    )
+    assert result["status"] == "failed" and result["selected_model"] == "not_called"
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == [] and runtime.capability_flow_calls == []
+    assert "private-upstream-sentinel" not in result["answer"]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream", ["governance", "restraint"])
+async def test_situated_malformed_upstream_projection_uses_only_suppression(upstream):
+    from services.response_review import enforce_situated_presence_output
+    from services.situated_presence import resolve_situated_presence
+
+    runtime = FakeRuntime()
+    governance = copy.deepcopy(runtime.interaction_governance_response["result"])
+    restraint = copy.deepcopy(runtime.restraint_response["result"])
+    if upstream == "governance":
+        governance["humor_allowed"] = "true"
+    else:
+        restraint["personalization_suppressed"] = "false"
+    result, trace = await resolve_situated_presence(
+        runtime=runtime, interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-projection", owner_id="owner", conversation_id="conv-1", surface="chat",
+        runtime_session_id="rtsession_1", runtime_turn_id="rtturn_1",
+        payload={"surface_context": {"surface_category": "desktop_private"}},
+        interaction_governance=governance, restraint=restraint,
+    )
+    assert runtime.situated_presence_calls == []
+    assert result["commentary_allowed"] is False and result["humor_allowed"] is False
+    assert trace["fallback_status"] == "suppression_only"
+    final, enforcement = enforce_situated_presence_output("Haha. Check the logs.", trace)
+    assert final == "Check the logs."
+    assert enforcement["fallback_policy_active"] is True
