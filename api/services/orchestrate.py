@@ -21,7 +21,11 @@ from clients.data_source_aggregator import (
     DataSourceAggregatorFailure,
 )
 from clients.litellm import LiteLLMClient
-from clients.memory_store import MemoryStoreClient, validate_proactive_preferences_response
+from clients.memory_store import (
+    MemoryStoreClient,
+    validate_presence_surface_permission,
+    validate_proactive_preferences_response,
+)
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
     validate_history_followup_policy_response,
@@ -158,6 +162,7 @@ from services.prompt_budget import PromptBudgetContract, PromptBudgetError
 from services.response_action import ResponseActionInput, apply_response_action
 from services.response_review import (
     ResponseReviewInput,
+    enforce_runtime_presence_output,
     enforce_situated_presence_output,
     review_response,
 )
@@ -6140,6 +6145,7 @@ async def _resolve_runtime_presence(
     request_id: str, owner_id: str, conversation_id: str,
     surface: str, runtime_session_id: str | None, runtime_turn_id: str | None,
     surface_context: Any, restraint: dict[str, Any] | None,
+    surface_permission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     trace = {
         "attempted": False, "status": "disabled", "runtime_call_status": "not_attempted",
@@ -6161,6 +6167,10 @@ async def _resolve_runtime_presence(
     suppressed = (
         isinstance(restraint, dict) and restraint.get("proactive_output_suppressed") is True
     )
+    permission = surface_permission or {
+        "surface_permission_status": "unavailable",
+        "proactive_presence_allowed": False, "ambient_listening_allowed": False,
+    }
     explicit_opt_out = False
     try:
         preference = validate_proactive_preferences_response(
@@ -6175,10 +6185,16 @@ async def _resolve_runtime_presence(
         response = await runtime.evaluate_presence(
             **scope, active_task_mode=active_task, proactive_output_suppressed=suppressed,
             explicit_proactive_opt_out=explicit_opt_out,
+            surface_permission_status=permission["surface_permission_status"],
+            proactive_presence_allowed=permission["proactive_presence_allowed"],
+            ambient_listening_allowed=permission["ambient_listening_allowed"],
         )
         response = validate_presence_response(
             response, scope=scope, active_task_mode=active_task,
             proactive_output_suppressed=suppressed, explicit_proactive_opt_out=explicit_opt_out,
+            surface_permission_status=permission["surface_permission_status"],
+            proactive_presence_allowed=permission["proactive_presence_allowed"],
+            ambient_listening_allowed=permission["ambient_listening_allowed"],
         )
     except Exception as error:
         if isinstance(error, (httpx.TimeoutException, TimeoutError)):
@@ -8772,10 +8788,35 @@ async def orchestrate_chat(
             "sources": [],
         }
 
+    surface_permission = {
+        "surface_permission_status": "unavailable", "conversation_context_allowed": False,
+        "proactive_presence_allowed": False, "ambient_listening_allowed": False,
+    }
+    try:
+        permission_record = validate_presence_surface_permission(
+            await memory_store.get_presence_surface_permission(
+                owner_id=payload["owner_id"], surface=surface,
+            ), owner_id=payload["owner_id"], surface=surface,
+        )
+        surface_permission = {
+            "surface_permission_status": (
+                "configured" if permission_record["configured"] else "unconfigured"
+            ),
+            **{key: permission_record[key] for key in (
+                "conversation_context_allowed", "proactive_presence_allowed",
+                "ambient_listening_allowed",
+            )},
+        }
+    except Exception:
+        pass  # Dependency failure is distinct from owner denial.
     supplied_conversation_id = payload.get("conversation_id")
     expected_thread_revision: int | None = None
     conversation_resolution_trace: dict[str, Any]
     if supplied_conversation_id is not None:
+        if runtime is None:
+            return _supplied_conversation_failure(
+                request_id=request_id, conversation_id=supplied_conversation_id,
+            )
         try:
             conversation = await memory_store.get_conversation(
                 conversation_id=supplied_conversation_id,
@@ -8842,6 +8883,16 @@ async def orchestrate_chat(
                     owner_id=payload["owner_id"],
                     conversation_id=supplied_conversation_id,
                 )
+                permission_status = surface_permission["surface_permission_status"]
+                if not (
+                    (permission_status == "configured"
+                     and surface_permission["conversation_context_allowed"])
+                    or (permission_status == "unconfigured"
+                        and surface in thread["participating_surfaces"])
+                ):
+                    return _supplied_conversation_failure(
+                        request_id=request_id, conversation_id=supplied_conversation_id,
+                    )
                 revision = thread["revision"]
                 if (
                     isinstance(revision, bool)
@@ -8903,12 +8954,22 @@ async def orchestrate_chat(
         conversation_id = supplied_conversation_id
         conversation_resolution_trace = {"mode": "supplied"}
     elif runtime is None:
-        resolved = await memory_store.resolve_conversation(
-            owner_id=payload["owner_id"],
-            client_id=payload.get("client_id"),
-        )
-        conversation_id = resolved["conversation_id"]
-        conversation_resolution_trace = {"mode": "compatibility"}
+        try:
+            created = await memory_store.create_conversation(
+                owner_id=payload["owner_id"], client_id=payload.get("client_id"),
+            )
+            conversation_id = created["conversation_id"]
+        except Exception:
+            return {
+                "request_id": request_id, "conversation_id": None,
+                "profile_name": "unresolved", "selected_model": "not_called",
+                "answer": _CONTINUATION_DEPENDENCY_UNAVAILABLE,
+                "status": "failed", "sources": [],
+            }
+        conversation_resolution_trace = {
+            "mode": "compatibility_create_new", "runtime_status": "unavailable",
+            "retained_context_allowed": False,
+        }
     else:
         try:
             updated_since = evaluated_at - timedelta(
@@ -8933,6 +8994,8 @@ async def orchestrate_chat(
                 request_id=request_id,
                 owner_id=payload["owner_id"],
                 surface=surface,
+                surface_permission_status=surface_permission["surface_permission_status"],
+                conversation_context_allowed=surface_permission["conversation_context_allowed"],
                 candidate_set_complete=candidate_set_complete,
                 stale_after_seconds=_CONTINUATION_STALE_AFTER_SECONDS,
                 candidates=candidates,
@@ -9205,6 +9268,7 @@ async def orchestrate_chat(
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
             surface_context=surface_context, restraint=restraint,
+            surface_permission=surface_permission,
         )
         timing_result = None
         timing_trace: dict[str, Any] = {
@@ -9403,6 +9467,20 @@ async def orchestrate_chat(
             client_id=payload.get("client_id"),
         )
         effective_payload = apply_profile_to_request(profile, payload)
+        if conversation_resolution_trace.get("mode") == "compatibility_create_new" or (
+            conversation_resolution_trace.get("outcome") == "create_new" and any(
+                reason in conversation_resolution_trace.get("reason_codes", [])
+                for reason in (
+                    "surface_context_denied", "surface_permission_absent",
+                    "surface_permission_unavailable",
+                )
+            )
+        ):
+            # New requested help must not re-import the ineligible retained thread
+            # through an owner/client-scoped retrieval request.
+            effective_payload["retrieval"] = {
+                **(effective_payload.get("retrieval") or {}), "scope": "conversation",
+            }
         style_envelope, style_trace = resolve_style_envelope(effective_payload, profile)
         style_envelope, style_trace = clamp_style_envelope(
             style_envelope,
@@ -9845,6 +9923,9 @@ async def orchestrate_chat(
             answer, situated_enforcement_trace = enforce_situated_presence_output(
                 answer, situated_presence_trace,
             )
+            answer, runtime_presence_enforcement = enforce_runtime_presence_output(
+                answer, runtime_presence_trace, response_shape_trace,
+            )
             status = claim_explanation.status or "degraded"
             await _advance_runtime_turn(
                 runtime=runtime,
@@ -9925,6 +10006,8 @@ async def orchestrate_chat(
                         "claim_explanation": claim_explanation.trace,
                         "situated_presence": situated_presence_trace,
                         "situated_presence_enforcement": situated_enforcement_trace,
+                        "runtime_presence_enforcement": runtime_presence_enforcement,
+                        "runtime_presence": runtime_presence_trace,
                         "runtime_timing": timing_trace,
                         **(
                             {"history_followup": history_followup_trace}
@@ -12861,6 +12944,10 @@ async def orchestrate_chat(
 
         answer, prompt.trace["situated_presence_enforcement"] = (
             enforce_situated_presence_output(answer, situated_presence_trace)
+        )
+
+        answer, prompt.trace["runtime_presence_enforcement"] = enforce_runtime_presence_output(
+            answer, runtime_presence_trace, response_shape_trace,
         )
 
         claim_capture = prepare_claim_capture(

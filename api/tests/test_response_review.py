@@ -298,3 +298,69 @@ def test_situated_enforcement_all_social_fallback_is_neutral_and_bounded():
         "evaluated", "status", "enforcement_required", "action_taken",
         "removed_segment_count", "reason_codes", "policy_version", "fallback_policy_active",
     }
+
+@pytest.mark.parametrize("state", [
+    "idle", "low_attention", "driving_or_active_task", "do_not_intrude",
+])
+def test_runtime_presence_enforcement_retains_direct_help_and_clamps(state):
+    from services.response_review import enforce_runtime_presence_output
+
+    text = "Check the logs first. If you'd like, I can also help. Save the backup. Extra detail."
+    final, trace = enforce_runtime_presence_output(text, {
+        "status": "included", "presence_state": state, "proactive_output_suppressed": True,
+    }, {"max_sentence_count": 2})
+    assert final == "Check the logs first. Save the backup."
+    assert trace["removed_segment_count"] == 1
+    assert trace["length_clamped"] is True
+    assert trace["reason_codes"] == ["proactive_offer_suppressed", "resolved_length_limit"]
+    assert "Check the logs" not in str(trace) and "Extra detail" not in str(trace)
+
+
+@pytest.mark.parametrize("claim", [
+    "I'm always listening.", "I'm always watching.", "I've been watching you.",
+    "I was listening in the background.", "I get lonely when you're gone.",
+    "I need you here.", "Don't leave me.", "I missed you so much.",
+])
+def test_runtime_presence_never_claims_capture_or_attachment(claim):
+    from services.response_review import enforce_runtime_presence_output
+
+    final, trace = enforce_runtime_presence_output(claim + " Check the logs first.", {
+        "status": "included", "presence_state": "active_conversation",
+        "proactive_output_suppressed": False,
+    }, {})
+    assert final == "Check the logs first."
+    assert trace["reason_codes"] == ["prohibited_presence_claim"]
+    assert claim not in str(trace)
+
+
+@pytest.mark.parametrize("offer", [
+    "If you'd like, I can help.", "If you want, I can help.", "I can also help.",
+    "Want me to help?", "Would you like me to help?",
+])
+def test_runtime_presence_suppression_fallback_removes_explicit_optional_offer(offer):
+    from services.response_review import enforce_runtime_presence_output
+
+    final, trace = enforce_runtime_presence_output("Check the logs. " + offer, {
+        "status": "fallback", "presence_state": None, "proactive_output_suppressed": True,
+    }, {"max_sentence_count": 2})
+    assert final == "Check the logs."
+    assert trace["evaluated"] is True
+    assert trace["reason_codes"] == ["proactive_offer_suppressed"]
+
+
+@pytest.mark.parametrize("text", [
+    """The documentation says "I'm always listening." about the demo.""",
+    '"I need you here." is an example of prohibited language.',
+    "The monitoring system listens on port 443.",
+    "Check the logs first.",
+    "That is rough. Check the backup first.",
+])
+def test_runtime_presence_enforcement_preserves_technical_quotes_and_direct_help(text):
+    from services.response_review import enforce_runtime_presence_output
+
+    final, trace = enforce_runtime_presence_output(text, {
+        "status": "included", "presence_state": "low_attention",
+        "proactive_output_suppressed": True,
+    }, {"max_sentence_count": 2})
+    assert final == text
+    assert trace["action_taken"] == "none"

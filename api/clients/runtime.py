@@ -19,6 +19,7 @@ _PRESENCE_STATES = {
     "returning_after_gap", "low_attention", "driving_or_active_task", "do_not_intrude",
 }
 _PRESENCE_DECISION_STATES = {
+    "ambient_mode_permitted": "ambient_listening",
     "session_not_present": "not_present",
     "explicit_proactive_opt_out": "do_not_intrude",
     "active_task_mode": "driving_or_active_task",
@@ -34,6 +35,8 @@ _PRESENCE_DECISION_STATES = {
 def validate_presence_response(
     response: Any, *, scope: dict[str, str], active_task_mode: bool,
     proactive_output_suppressed: bool, explicit_proactive_opt_out: bool = False,
+    surface_permission_status: str = "configured", proactive_presence_allowed: bool = True,
+    ambient_listening_allowed: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(response, dict) or set(response) != {*scope, "result"}:
         raise RuntimeError("presence_response_invalid")
@@ -63,20 +66,37 @@ def validate_presence_response(
         raise RuntimeError("presence_response_unsupported_state")
     reasons = result["reason_codes"]
     if (
-        not isinstance(reasons, list) or not 1 <= len(reasons) <= 2
+        not isinstance(reasons, list) or not 1 <= len(reasons) <= 3
         or any(not isinstance(reason, str) for reason in reasons)
         or len(reasons) != len(set(reasons))
         or _PRESENCE_DECISION_STATES.get(reasons[0]) != state
-        or (len(reasons) == 2 and reasons[1] != "proactive_suppression_requested")
+        or any(reason not in {
+            "proactive_suppression_requested", "surface_permission_unconfigured",
+            "surface_permission_unavailable", "surface_proactive_denied",
+        } for reason in reasons[1:])
     ):
         raise RuntimeError("presence_response_invalid")
     suppressed = state in {
         "not_present", "do_not_intrude", "idle", "low_attention", "driving_or_active_task",
     }
+    permission_reason = ({
+        "unconfigured": "surface_permission_unconfigured",
+        "unavailable": "surface_permission_unavailable",
+    }.get(surface_permission_status)
+        or ("surface_proactive_denied" if not proactive_presence_allowed else None))
     if (
-        result["state_changed"] != (state != previous)
+        (set(reasons[1:]) & {
+            "surface_permission_unconfigured", "surface_permission_unavailable",
+            "surface_proactive_denied",
+        }) != ({permission_reason} if permission_reason else set())
+        or (state == "ambient_listening" and (
+            surface_permission_status != "configured" or not ambient_listening_allowed
+        ))
+        or result["state_changed"] != (state != previous)
         or result["required_help_allowed"] != (state != "not_present")
-        or result["proactive_output_suppressed"] != (suppressed or proactive_output_suppressed)
+        or result["proactive_output_suppressed"] != (
+            suppressed or proactive_output_suppressed or bool(permission_reason)
+        )
         or ("proactive_suppression_requested" in reasons) != proactive_output_suppressed
         or (reasons[0] == "active_task_mode" and not active_task_mode)
         or (reasons[0] == "explicit_proactive_opt_out" and not explicit_proactive_opt_out)
@@ -313,12 +333,18 @@ _CONTINUATION_REASONS = {
     "candidate_stale",
     "candidate_not_open",
     "no_eligible_candidates",
+    "surface_context_denied",
+    "surface_permission_absent",
+    "surface_permission_unavailable",
 }
 _CONTINUATION_CREATE_NEW_REASONS = (
     "candidate_not_open",
     "runtime_state_missing",
     "runtime_session_missing",
     "candidate_stale",
+    "surface_context_denied",
+    "surface_permission_absent",
+    "surface_permission_unavailable",
 )
 _CONTINUATION_DECLINE_REASONS = (
     "contended_thread_present",
@@ -1793,7 +1819,15 @@ class RuntimeClient:
         candidate_set_complete: bool,
         stale_after_seconds: int,
         candidates: list[dict[str, Any]],
+        surface_permission_status: str = "unconfigured",
+        conversation_context_allowed: bool = False,
     ) -> dict[str, Any]:
+        if (
+            surface_permission_status not in {"configured", "unconfigured", "unavailable"}
+            or type(conversation_context_allowed) is not bool
+            or (surface_permission_status != "configured" and conversation_context_allowed)
+        ):
+            raise ValueError("continuation_selection_request_invalid")
         if type(candidate_set_complete) is not bool:
             raise ValueError("continuation_selection_request_invalid")
         if (
@@ -1840,6 +1874,8 @@ class RuntimeClient:
                 "request_id": request_id,
                 "owner_id": owner_id,
                 "surface": surface,
+                "surface_permission_status": surface_permission_status,
+                "conversation_context_allowed": conversation_context_allowed,
                 "candidate_set_complete": candidate_set_complete,
                 "stale_after_seconds": stale_after_seconds,
                 "candidates": candidate_payloads,
@@ -2536,6 +2572,8 @@ class RuntimeClient:
         self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
         runtime_session_id: str, runtime_turn_id: str, active_task_mode: bool = False,
         proactive_output_suppressed: bool = False, explicit_proactive_opt_out: bool = False,
+        surface_permission_status: str = "unconfigured", proactive_presence_allowed: bool = False,
+        ambient_listening_allowed: bool = False,
     ) -> dict[str, Any]:
         scope = {
             "request_id": request_id, "owner_id": owner_id,
@@ -2546,6 +2584,12 @@ class RuntimeClient:
             any(not _bounded_runtime_identifier(value) or not value.strip()
                 for value in scope.values())
             or len(surface) > 64
+            or surface_permission_status not in {"configured", "unconfigured", "unavailable"}
+            or type(proactive_presence_allowed) is not bool
+            or type(ambient_listening_allowed) is not bool
+            or (surface_permission_status != "configured" and (
+                proactive_presence_allowed or ambient_listening_allowed
+            ))
             or type(active_task_mode) is not bool
             or type(proactive_output_suppressed) is not bool
             or type(explicit_proactive_opt_out) is not bool
@@ -2555,11 +2599,17 @@ class RuntimeClient:
             **scope, "active_task_mode": active_task_mode,
             "proactive_output_suppressed": proactive_output_suppressed,
             "explicit_proactive_opt_out": explicit_proactive_opt_out,
+            "surface_permission_status": surface_permission_status,
+            "proactive_presence_allowed": proactive_presence_allowed,
+            "ambient_listening_allowed": ambient_listening_allowed,
         })
         return validate_presence_response(
             response, scope=scope, active_task_mode=active_task_mode,
             proactive_output_suppressed=proactive_output_suppressed,
             explicit_proactive_opt_out=explicit_proactive_opt_out,
+            surface_permission_status=surface_permission_status,
+            proactive_presence_allowed=proactive_presence_allowed,
+            ambient_listening_allowed=ambient_listening_allowed,
         )
 
     async def evaluate_situated_presence(

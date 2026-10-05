@@ -5,6 +5,15 @@ from services.orchestrate import orchestrate_chat
 
 
 class BudgetMemoryStore:
+    async def get_presence_surface_permission(self, *, owner_id, surface):
+        return {
+            "owner_id": owner_id, "surface": surface, "configured": True,
+            "conversation_context_allowed": True, "proactive_presence_allowed": True,
+            "ambient_listening_allowed": False,
+            "created_at": "2026-10-05T00:00:00+00:00",
+            "updated_at": "2026-10-05T00:00:00+00:00",
+        }
+
     async def get_proactive_preferences(self, *, owner_id):
         return {
             "owner_id": owner_id, "enabled": False,

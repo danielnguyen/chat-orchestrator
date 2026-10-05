@@ -165,6 +165,8 @@ async def test_memory_store_client_creates_conversation_with_exact_payload():
 @pytest.mark.parametrize(
     "response",
     [
+        None, [], {"conversation_id": True},
+        {"conversation_id": "00000000-0000-4000-8000-00000000000A"},
         {},
         {"conversation_id": "not-a-uuid"},
         {
@@ -995,6 +997,8 @@ def _replay_presence_response(request, state, reason):
         **{key: value for key, value in request.items()
            if key not in {
                "active_task_mode", "proactive_output_suppressed", "explicit_proactive_opt_out",
+               "surface_permission_status", "proactive_presence_allowed",
+               "ambient_listening_allowed",
            }},
         "result": {
             "presence_state": state, "previous_presence_state": None, "state_changed": True,
@@ -1016,9 +1020,20 @@ async def _absent_proactive_preference(self, *, owner_id):
     }
 
 
+async def _configured_surface_permission(self, *, owner_id, surface):
+    return {
+        "owner_id": owner_id, "surface": surface, "configured": True,
+        "conversation_context_allowed": True, "proactive_presence_allowed": True,
+        "ambient_listening_allowed": False, "created_at": "2026-10-05T00:00:00+00:00",
+        "updated_at": "2026-10-05T00:00:00+00:00",
+    }
+
+
 @pytest.fixture(autouse=True)
 def replay_presence_contract(monkeypatch):
     # Extend the existing boundary fake; historical corpus projections remain unchanged.
+    monkeypatch.setattr(ReplayMemoryStore, "get_presence_surface_permission",
+                        _configured_surface_permission, raising=False)
     monkeypatch.setattr(ReplayRuntime, "evaluate_presence", _ordinary_presence, raising=False)
     monkeypatch.setattr(ReplayRuntime, "evaluate_timing", _replay_timing, raising=False)
     monkeypatch.setattr(ReplayMemoryStore, "get_proactive_preferences",
@@ -1126,6 +1141,8 @@ async def test_presence_admitted_order_exact_scope_and_typed_projections(
         "runtime_session_id": "runtime-session-1", "runtime_turn_id": "runtime-turn-1",
         "active_task_mode": active is True, "proactive_output_suppressed": restraint is True,
         "explicit_proactive_opt_out": False,
+        "surface_permission_status": "configured", "proactive_presence_allowed": True,
+        "ambient_listening_allowed": False,
     }]
     trace = memory.trace["retrieval"]["prompt_assembly"]
     presence = trace["runtime_presence"]
@@ -1174,7 +1191,7 @@ async def test_presence_required_help_and_guidance_reach_every_provider_attempt(
     (Exception("PRIVATE"), None, "dependency_unavailable"),
     (None, lambda r: r.update(owner_id="PRIVATE"), "context_mismatch"),
     (None, lambda r: r["result"].update(private="PRIVATE"), "response_invalid"),
-    (None, lambda r: r["result"].update(presence_state="ambient_listening"), "unsupported_state"),
+    (None, lambda r: r["result"].update(presence_state="ambient_listening"), "response_invalid"),
     (None, lambda r: r["result"].update(presence_state="returning_after_gap"), "unsupported_state"),
     (None, lambda r: r["result"].update(presence_state="do_not_intrude"), "response_invalid"),
 ])
@@ -1200,7 +1217,7 @@ async def test_presence_dependency_failure_preserves_help_without_inferred_state
 
 @pytest.mark.asyncio
 async def test_presence_disabled_preserves_existing_response_behavior(monkeypatch):
-    result, memory, _, _, requests, messages = await _run_presence_turn(
+    result, memory, _, calls, requests, messages = await _run_presence_turn(
         monkeypatch, configured=False,
     )
     assert result["status"] == "ok"
@@ -1211,6 +1228,15 @@ async def test_presence_disabled_preserves_existing_response_behavior(monkeypatc
     assert trace["runtime_presence"]["proactive_output_suppressed"] is False
     assert "runtime_presence" not in trace["response_shape"]
     assert "Omit optional proactive suggestions" not in json.dumps(messages)
+
+    assert trace["turn_state"]["conversation_resolution"] == {
+        "mode": "compatibility_create_new", "runtime_status": "unavailable",
+        "retained_context_allowed": False,
+    }
+    assert "cr_continuation_selection" not in [call["name"] for call in calls]
+    for private in ("allowed_surfaces_json", "rule_prefs_json", "ambient_listening_allowed",
+                    "conversation_context_allowed", "2026-10-05T00:00:00+00:00"):
+        assert private not in json.dumps([trace, messages, result])
 
 
 @pytest.mark.asyncio
@@ -1271,6 +1297,8 @@ async def test_presence_projects_only_persisted_opt_out(monkeypatch, surface, ow
         "runtime_session_id": "runtime-session-1", "runtime_turn_id": "runtime-turn-1",
         "active_task_mode": False, "proactive_output_suppressed": False,
         "explicit_proactive_opt_out": opt_out,
+        "surface_permission_status": "configured", "proactive_presence_allowed": True,
+        "ambient_listening_allowed": False,
     }]
     names = [call["name"] for call in calls]
     assert names.index("cr_turn_start") < names.index("cr_restraint")
@@ -1294,7 +1322,7 @@ async def test_presence_projects_only_persisted_opt_out(monkeypatch, surface, ow
         assert "Preserve all information required" in json.dumps(messages)
     for private in [
         "allowed_surfaces_json", "rule_prefs_json", "PRIVATE-SURFACE", "PRIVATE-RULE",
-        "PRIVATE-VALUE", "2001-02-03", "2002-03-04", "proactive_consent", "surface_permission",
+        "PRIVATE-VALUE", "2001-02-03", "2002-03-04", "proactive_consent",
     ]:
         assert private not in json.dumps([requests, messages, memory.trace, result])
 

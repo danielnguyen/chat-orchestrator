@@ -8,6 +8,39 @@ from uuid import UUID
 import httpx
 
 
+def validate_presence_surface_permission(
+    response: Any, *, owner_id: str, surface: str,
+) -> dict[str, Any]:
+    fields = {
+        "owner_id", "surface", "configured", "conversation_context_allowed",
+        "proactive_presence_allowed", "ambient_listening_allowed", "created_at", "updated_at",
+    }
+    if not isinstance(response, dict) or set(response) != fields:
+        raise RuntimeError("surface_permission_invalid")
+    if response["owner_id"] != owner_id or response["surface"] != surface:
+        raise RuntimeError("surface_permission_context_mismatch")
+    flags = ("configured", "conversation_context_allowed",
+             "proactive_presence_allowed", "ambient_listening_allowed")
+    if any(type(response[key]) is not bool for key in flags):
+        raise RuntimeError("surface_permission_invalid")
+    if not response["configured"]:
+        if any(response[key] for key in flags[1:]) or any(
+            response[key] is not None for key in ("created_at", "updated_at")
+        ):
+            raise RuntimeError("surface_permission_invalid")
+    else:
+        for key in ("created_at", "updated_at"):
+            value = response[key]
+            try:
+                if not isinstance(value, str) or not 1 <= len(value) <= 64:
+                    raise ValueError
+                if datetime.fromisoformat(value).utcoffset() is None:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise RuntimeError("surface_permission_invalid") from None
+    return response
+
+
 def validate_proactive_preferences_response(
     response: Any, *, owner_id: str,
 ) -> dict[str, Any]:
@@ -308,6 +341,19 @@ class MemoryStoreClient:
             )
             resp.raise_for_status()
             return resp.json()
+
+    async def get_presence_surface_permission(self, *, owner_id: str, surface: str):
+        if (
+            not isinstance(owner_id, str) or not 1 <= len(owner_id) <= 120
+            or owner_id != owner_id.strip()
+            or not isinstance(surface, str) or not 1 <= len(surface) <= 64
+            or re.fullmatch(r"[a-z][a-z0-9_-]*", surface) is None
+        ):
+            raise ValueError("surface_permission_request_invalid")
+        response = await self._get(
+            "/v1/presence/surface-permissions", params={"owner_id": owner_id, "surface": surface},
+        )
+        return validate_presence_surface_permission(response, owner_id=owner_id, surface=surface)
 
     async def get_proactive_preferences(self, *, owner_id: str) -> dict[str, Any]:
         if not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 120:
