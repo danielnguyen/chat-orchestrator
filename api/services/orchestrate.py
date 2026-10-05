@@ -8813,6 +8813,10 @@ async def orchestrate_chat(
     expected_thread_revision: int | None = None
     conversation_resolution_trace: dict[str, Any]
     if supplied_conversation_id is not None:
+        if runtime is None:
+            return _supplied_conversation_failure(
+                request_id=request_id, conversation_id=supplied_conversation_id,
+            )
         try:
             conversation = await memory_store.get_conversation(
                 conversation_id=supplied_conversation_id,
@@ -8947,22 +8951,25 @@ async def orchestrate_chat(
                     conversation_id=supplied_conversation_id,
                 )
             expected_thread_revision = revision
-        if runtime is None and not (
-            surface_permission["surface_permission_status"] == "configured"
-            and surface_permission["conversation_context_allowed"]
-        ):
-            return _supplied_conversation_failure(
-                request_id=request_id, conversation_id=supplied_conversation_id,
-            )
         conversation_id = supplied_conversation_id
         conversation_resolution_trace = {"mode": "supplied"}
     elif runtime is None:
-        resolved = await memory_store.resolve_conversation(
-            owner_id=payload["owner_id"],
-            client_id=payload.get("client_id"),
-        )
-        conversation_id = resolved["conversation_id"]
-        conversation_resolution_trace = {"mode": "compatibility"}
+        try:
+            created = await memory_store.create_conversation(
+                owner_id=payload["owner_id"], client_id=payload.get("client_id"),
+            )
+            conversation_id = created["conversation_id"]
+        except Exception:
+            return {
+                "request_id": request_id, "conversation_id": None,
+                "profile_name": "unresolved", "selected_model": "not_called",
+                "answer": _CONTINUATION_DEPENDENCY_UNAVAILABLE,
+                "status": "failed", "sources": [],
+            }
+        conversation_resolution_trace = {
+            "mode": "compatibility_create_new", "runtime_status": "unavailable",
+            "retained_context_allowed": False,
+        }
     else:
         try:
             updated_since = evaluated_at - timedelta(
@@ -9460,17 +9467,19 @@ async def orchestrate_chat(
             client_id=payload.get("client_id"),
         )
         effective_payload = apply_profile_to_request(profile, payload)
-        if conversation_resolution_trace.get("outcome") == "create_new" and any(
-            reason in conversation_resolution_trace.get("reason_codes", [])
-            for reason in (
-                "surface_context_denied", "surface_permission_absent",
-                "surface_permission_unavailable",
+        if conversation_resolution_trace.get("mode") == "compatibility_create_new" or (
+            conversation_resolution_trace.get("outcome") == "create_new" and any(
+                reason in conversation_resolution_trace.get("reason_codes", [])
+                for reason in (
+                    "surface_context_denied", "surface_permission_absent",
+                    "surface_permission_unavailable",
+                )
             )
         ):
             # New requested help must not re-import the ineligible retained thread
             # through an owner/client-scoped retrieval request.
             effective_payload["retrieval"] = {
-                **effective_payload.get("retrieval", {}), "scope": "conversation",
+                **(effective_payload.get("retrieval") or {}), "scope": "conversation",
             }
         style_envelope, style_trace = resolve_style_envelope(effective_payload, profile)
         style_envelope, style_trace = clamp_style_envelope(

@@ -165,6 +165,8 @@ async def test_memory_store_client_creates_conversation_with_exact_payload():
 @pytest.mark.parametrize(
     "response",
     [
+        None, [], {"conversation_id": True},
+        {"conversation_id": "00000000-0000-4000-8000-00000000000A"},
         {},
         {"conversation_id": "not-a-uuid"},
         {
@@ -1215,7 +1217,7 @@ async def test_presence_dependency_failure_preserves_help_without_inferred_state
 
 @pytest.mark.asyncio
 async def test_presence_disabled_preserves_existing_response_behavior(monkeypatch):
-    result, memory, _, _, requests, messages = await _run_presence_turn(
+    result, memory, _, calls, requests, messages = await _run_presence_turn(
         monkeypatch, configured=False,
     )
     assert result["status"] == "ok"
@@ -1226,6 +1228,15 @@ async def test_presence_disabled_preserves_existing_response_behavior(monkeypatc
     assert trace["runtime_presence"]["proactive_output_suppressed"] is False
     assert "runtime_presence" not in trace["response_shape"]
     assert "Omit optional proactive suggestions" not in json.dumps(messages)
+
+    assert trace["turn_state"]["conversation_resolution"] == {
+        "mode": "compatibility_create_new", "runtime_status": "unavailable",
+        "retained_context_allowed": False,
+    }
+    assert "cr_continuation_selection" not in [call["name"] for call in calls]
+    for private in ("allowed_surfaces_json", "rule_prefs_json", "ambient_listening_allowed",
+                    "conversation_context_allowed", "2026-10-05T00:00:00+00:00"):
+        assert private not in json.dumps([trace, messages, result])
 
 
 @pytest.mark.asyncio

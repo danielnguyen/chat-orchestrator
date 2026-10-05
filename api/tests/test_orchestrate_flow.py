@@ -3387,7 +3387,7 @@ async def test_omitted_dependency_failures_stop_without_conversation_or_side_eff
 
 
 @pytest.mark.asyncio
-async def test_runtime_disabled_omitted_conversation_keeps_rolling_compatibility(tmp_path):
+async def test_runtime_disabled_omitted_conversation_creates_isolated_current_help(tmp_path):
     rules, models = _write_router_files(tmp_path)
     memory_store = FakeMemoryStore()
 
@@ -3404,14 +3404,15 @@ async def test_runtime_disabled_omitted_conversation_keeps_rolling_compatibility
 
     assert result["status"] == "ok"
     assert result["conversation_id"] == "conv-1"
-    assert memory_store.resolve_conversation_calls == [
+    assert memory_store.resolve_conversation_calls == []
+    assert memory_store.list_conversation_calls == []
+    assert memory_store.create_conversation_calls == [
         {"owner_id": "owner", "client_id": "vscode"}
     ]
-    assert memory_store.list_conversation_calls == []
-    assert memory_store.create_conversation_calls == []
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["turn_state"]["conversation_resolution"] == {
-        "mode": "compatibility"
+        "mode": "compatibility_create_new", "runtime_status": "unavailable",
+        "retained_context_allowed": False
     }
 
 
@@ -6837,7 +6838,7 @@ async def test_orchestrate_applies_spec_shaped_retrieval_policy(tmp_path):
     assert memory_store.retrieve_calls[0]["retrieval"] == {
         "k": 6,
         "min_score": 0.3,
-        "scope": "owner",
+        "scope": "conversation",
         "time_window": "30d",
         "retrieval_mode": "historical",
     }
@@ -39004,3 +39005,145 @@ async def test_permission_dependency_failure_preserves_help_without_dnd(tmp_path
     assert trace["runtime_presence"]["presence_state"] == "active_conversation"
     assert trace["runtime_presence"]["proactive_output_suppressed"] is True
     assert "PRIVATE-PERMISSION" not in str(trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission", ["allow", "deny", "absent", "unavailable"])
+async def test_runtime_none_supplied_thread_never_uses_permission_as_authority(
+    tmp_path, permission,
+):
+    memory, provider = FakeMemoryStore(), FakeLiteLLM()
+    if permission == "unavailable":
+        memory.permission_error = httpx.ReadTimeout("PRIVATE-PERMISSION")
+    else:
+        memory.permission_response = {
+            "owner_id": "owner", "surface": "web", "configured": permission != "absent",
+            "conversation_context_allowed": permission == "allow",
+            "proactive_presence_allowed": False, "ambient_listening_allowed": False,
+            "created_at": None if permission == "absent" else "2026-10-05T00:00:00+00:00",
+            "updated_at": None if permission == "absent" else "2026-10-05T00:00:00+00:00",
+        }
+    retained = [{"role": "assistant", "content": "PRIVATE-RETAINED"}]
+    before = copy.deepcopy(retained)
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="retained-thread", surface="web"),
+        memory_store=memory, runtime=None, litellm=provider,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="runtime-none-supplied",
+    )
+    assert result == {
+        "request_id": "runtime-none-supplied", "conversation_id": "retained-thread",
+        "profile_name": "unresolved", "selected_model": "not_called",
+        "answer": ("I could not continue that conversation safely. "
+                   "No retained conversation content was used."),
+        "status": "failed", "sources": [],
+    }
+    assert provider.calls == memory.added_messages == memory.retrieve_calls == []
+    assert memory.claim_record_calls == memory.trace_calls == memory.profile_calls == []
+    assert getattr(memory, "work_calls", []) == []
+    assert memory.resolve_conversation_calls == memory.create_conversation_calls == []
+    assert memory.exact_conversation_calls == memory.list_conversation_calls == []
+    assert retained == before
+    assert "PRIVATE" not in str(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_exists", [False, True])
+async def test_runtime_none_omitted_creates_exact_new_context_not_recent_client_thread(
+    tmp_path, old_exists,
+):
+    memory, provider = FakeMemoryStore(), FakeLiteLLM(content="Check the logs.")
+    old_id = "00000000-0000-4000-8000-000000000001"
+    new_id = "00000000-0000-4000-8000-000000000002"
+    rows = {old_id: [{"role": "assistant", "content": "PRIVATE-RETAINED-SENTINEL"}]} if (
+        old_exists
+    ) else {}
+    before = copy.deepcopy(rows)
+    actual_create = MemoryStoreClient("http://memory.local", "key")
+    endpoint_calls = []
+
+    async def post(path, *, request_id=None, json):
+        endpoint_calls.append((path, copy.deepcopy(json)))
+        rows[new_id] = []
+        return {"conversation_id": new_id}
+
+    actual_create._post = post
+    memory.create_conversation = actual_create.create_conversation
+    append = memory.add_message
+    retrieve = memory.retrieve_bundle
+
+    async def store(**kwargs):
+        rows[kwargs["conversation_id"]].append({
+            "role": kwargs["role"], "content": kwargs["content"],
+        })
+        return await append(**kwargs)
+
+    async def scoped_retrieve(**kwargs):
+        assert kwargs["conversation_id"] == new_id
+        assert kwargs["retrieval"]["scope"] == "conversation"
+        result = await retrieve(**kwargs)
+        result["bundle"]["recent"] = []
+        result["bundle"]["semantic"] = []
+        return result
+
+    memory.add_message, memory.retrieve_bundle = store, scoped_retrieve
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_base_payload(surface="web", client_id="web:same-client",
+                              retrieval={"scope": "owner", "k": 8}),
+        memory_store=memory, runtime=None, litellm=provider,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="runtime-none-created",
+    )
+    assert result["status"] == "ok" and result["conversation_id"] == new_id
+    assert endpoint_calls == [("/v1/conversations", {
+        "owner_id": "owner", "client_id": "web:same-client",
+    })]
+    assert memory.resolve_conversation_calls == memory.list_conversation_calls == []
+    assert memory.exact_conversation_calls == []
+    assert [message["role"] for message in rows[new_id]] == ["user", "assistant"]
+    assert rows[new_id][-1]["content"] == result["answer"]
+    assert {key: value for key, value in rows.items() if key != new_id} == before
+    assert len(provider.calls) == len(memory.retrieve_calls) == 1
+    assert "PRIVATE-RETAINED-SENTINEL" not in str(provider.calls)
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["turn_state"]["conversation_resolution"] == {
+        "mode": "compatibility_create_new", "runtime_status": "unavailable",
+        "retained_context_allowed": False,
+    }
+    assert "PRIVATE-RETAINED-SENTINEL" not in str(trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    None, {}, {"conversation_id": True}, {"conversation_id": "not-canonical"},
+    {"conversation_id": "00000000-0000-4000-8000-000000000001", "private": "PRIVATE-CREATE"},
+    httpx.ReadTimeout("PRIVATE-CREATE"),
+])
+async def test_runtime_none_create_failure_never_substitutes_retained_context(tmp_path, response):
+    memory, provider = FakeMemoryStore(), FakeLiteLLM()
+    client = MemoryStoreClient("http://memory.local", "key")
+    attempts = []
+
+    async def post(path, *, request_id=None, json):
+        attempts.append(path)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    client._post = post
+    memory.create_conversation = client.create_conversation
+    rules, models = _write_default_route_files(tmp_path)
+    result = await orchestrate_chat(
+        payload=_base_payload(), memory_store=memory, litellm=provider, runtime=None,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="runtime-none-create-failure",
+    )
+    assert result["status"] == "failed" and result["conversation_id"] is None
+    assert result["selected_model"] == "not_called" and result["sources"] == []
+    assert attempts == ["/v1/conversations"]
+    assert memory.resolve_conversation_calls == memory.list_conversation_calls == []
+    assert provider.calls == memory.added_messages == memory.retrieve_calls == []
+    assert memory.claim_record_calls == getattr(memory, "work_calls", []) == []
+    assert "PRIVATE" not in str(result)
