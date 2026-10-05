@@ -3601,6 +3601,8 @@ run_delivery_equivalence_scenario() {
   reset_source_fixture
   sync_conversation="$(create_conversation "$owner" "$client")"
   deferred_conversation="$(create_conversation "$owner" "$client")"
+  # Both supplied BMS-created threads have no prior CR surface participant.
+  configure_surface_permission "$owner" chat true true false
   # Existing BMS question-index policy excludes '?' queries, avoiding a newly
   # indexed self-echo with a different server timestamp in each fresh conversation.
   # The external evidence remains non-empty and provider messages must match exactly.
