@@ -39056,9 +39056,16 @@ async def test_runtime_none_omitted_creates_exact_new_context_not_recent_client_
     memory, provider = FakeMemoryStore(), FakeLiteLLM(content="Check the logs.")
     old_id = "00000000-0000-4000-8000-000000000001"
     new_id = "00000000-0000-4000-8000-000000000002"
-    rows = {old_id: [{"role": "assistant", "content": "PRIVATE-RETAINED-SENTINEL"}]} if (
-        old_exists
-    ) else {}
+    rows = {old_id: [{
+        "role": "assistant", "content": "PRIVATE-RETAINED-SENTINEL",
+        "client_id": "web:same-client", "created_at": "2026-10-05T00:00:00+00:00",
+    }]} if old_exists else {}
+
+    async def rolling_resolve(**kwargs):
+        memory.resolve_conversation_calls.append(kwargs)
+        return {"conversation_id": old_id, "reused": old_exists}
+
+    memory.resolve_conversation = rolling_resolve
     before = copy.deepcopy(rows)
     actual_create = MemoryStoreClient("http://memory.local", "key")
     endpoint_calls = []
