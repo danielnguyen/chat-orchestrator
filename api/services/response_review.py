@@ -393,3 +393,70 @@ def enforce_situated_presence_output(
         reason_codes=reasons,
     )
     return final or "I couldn’t produce a useful direct answer there.", trace
+
+
+def enforce_runtime_presence_output(
+    candidate_text: str, presence: dict[str, Any] | None,
+    response_shape: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Apply only resolved suppression and explicit first-person prohibited claims."""
+    active = isinstance(presence, dict) and presence.get("status") in {"included", "fallback"}
+    suppressed = active and presence.get("proactive_output_suppressed") is True
+    trace = {
+        "evaluated": active, "status": "evaluated" if active else "not_requested",
+        "action_taken": "none", "removed_segment_count": 0, "length_clamped": False,
+        "reason_codes": [], "presence_state": presence.get("presence_state") if active else None,
+        "proactive_output_suppressed": suppressed,
+    }
+    if not active:
+        return candidate_text, trace
+    parts = re.split(r"((?<=[.!?;])\s+|\n+)", candidate_text)
+    retained = []
+    in_code = False
+    protected_retained = False
+    for index in range(0, len(parts), 2):
+        segment = parts[index]
+        separator = parts[index + 1] if index + 1 < len(parts) else ""
+        stripped = segment.strip()
+        protected = (
+            in_code or stripped.startswith(('"', "“", "'", "‘", ">", "`")) or "```" in segment
+        )
+        if segment.count("```") % 2:
+            in_code = not in_code
+        reason = None
+        if not protected:
+            lowered = stripped.lower().replace("’", "'")
+            if re.fullmatch(
+                r"(?:i'm always (?:listening|watching)|i've been watching you|"
+                r"i was listening in the background|i get lonely when you're gone|"
+                r"i need you here|don't leave me|i missed you so much)[.!]?", lowered,
+            ):
+                reason = "prohibited_presence_claim"
+            elif suppressed and re.match(
+                r"^(?:if you(?:'d like| want),? i can\b|i can also\b|"
+                r"want me to\b|would you like me to\b)", lowered,
+            ):
+                reason = "proactive_offer_suppressed"
+        if reason:
+            trace["removed_segment_count"] += 1
+            if reason not in trace["reason_codes"]:
+                trace["reason_codes"].append(reason)
+        else:
+            retained.append(segment + separator)
+            protected_retained = protected_retained or protected
+    filtered = "".join(retained).strip() if trace["removed_segment_count"] else candidate_text
+    shape = response_shape.get("resolved_shape", response_shape) if isinstance(
+        response_shape, dict,
+    ) else {}
+    limit = shape.get("max_sentence_count")
+    # Never truncate quoted/code blocks; optional prose remains prompt governed there.
+    if suppressed and type(limit) is int and limit > 0 and not protected_retained:
+        sentences = _split_sentences(filtered)
+        if len(sentences) > limit:
+            filtered = " ".join(sentences[:limit])
+            trace["length_clamped"] = True
+            trace["reason_codes"].append("resolved_length_limit")
+    if trace["removed_segment_count"] or trace["length_clamped"]:
+        trace["action_taken"] = "filtered" if filtered else "fallback"
+        return filtered or "I couldn’t produce a useful direct answer there.", trace
+    return candidate_text, trace

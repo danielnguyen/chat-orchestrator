@@ -160,6 +160,19 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
 
 
 class FakeMemoryStore:
+    async def get_presence_surface_permission(self, *, owner_id, surface):
+        self.permission_calls = getattr(self, "permission_calls", [])
+        self.permission_calls.append({"owner_id": owner_id, "surface": surface})
+        if getattr(self, "permission_error", None):
+            raise self.permission_error
+        return getattr(self, "permission_response", None) or {
+            "owner_id": owner_id, "surface": surface, "configured": True,
+            "conversation_context_allowed": True, "proactive_presence_allowed": True,
+            "ambient_listening_allowed": False,
+            "created_at": "2026-10-05T00:00:00+00:00",
+            "updated_at": "2026-10-05T00:00:00+00:00",
+        }
+
     async def get_proactive_preferences(self, *, owner_id):
         return {
             "owner_id": owner_id, "enabled": False,
@@ -3130,6 +3143,7 @@ async def test_omitted_resume_binds_selected_revision_without_resolution_or_crea
     assert memory_store.exact_conversation_calls == []
     assert memory_store.create_conversation_calls == []
     assert runtime.continuation_selection_calls[0] == {
+        "surface_permission_status": "configured", "conversation_context_allowed": True,
         "request_id": "request-resume",
         "owner_id": "owner",
         "surface": "voice",
@@ -38781,3 +38795,212 @@ async def test_situated_malformed_upstream_projection_uses_only_suppression(upst
     final, enforcement = enforce_situated_presence_output("Haha. Check the logs.", trace)
     assert final == "Check the logs."
     assert enforcement["fallback_policy_active"] is True
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,participants,allowed", [
+    ("allow", [], True), ("absent", ["telegram"], True), ("absent", [], False),
+    ("deny", ["telegram"], False), ("deny", [], False), ("unavailable", ["telegram"], False),
+    ("malformed", ["telegram"], False), ("owner", ["telegram"], False),
+    ("surface", ["telegram"], False),
+])
+async def test_supplied_presence_permission_precedes_all_retained_work(
+    tmp_path, kind, participants, allowed,
+):
+    memory, runtime, provider = FakeMemoryStore(), FakeRuntime(), FakeLiteLLM()
+    record = await memory.get_presence_surface_permission(owner_id="owner", surface="telegram")
+    memory.permission_calls = []
+    if kind == "absent":
+        record.update(configured=False, conversation_context_allowed=False,
+                      proactive_presence_allowed=False, created_at=None, updated_at=None)
+    elif kind == "deny":
+        record["conversation_context_allowed"] = False
+    elif kind == "unavailable":
+        memory.permission_error = httpx.ReadTimeout("PRIVATE-PERMISSION")
+    elif kind == "malformed":
+        record["ambient_listening_allowed"] = "true"
+    elif kind in {"owner", "surface"}:
+        record["owner_id" if kind == "owner" else "surface"] = "PRIVATE-MISMATCH"
+    memory.permission_response = record
+    thread = await runtime.resolve_thread(owner_id="owner", conversation_id="conv-1")
+    thread["participating_surfaces"] = participants
+    thread["participating_session_count"] = len(participants)
+    runtime.thread_response = thread
+    runtime.thread_resolve_calls = []
+    result, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, memory=memory, runtime=runtime, provider=provider,
+        payload=_base_payload(conversation_id="conv-1", surface="telegram"),
+    )
+    assert len(memory.permission_calls) == 1
+    assert "PRIVATE-" not in str(result)
+    if allowed:
+        assert result["status"] == "ok"
+        assert len(runtime.presence_calls) == len(runtime.timing_calls) == 1
+    else:
+        assert result["status"] == "failed"
+        assert result["selected_model"] == "not_called"
+        assert memory.added_messages == provider.calls == runtime.turn_start_calls == []
+        assert memory.retrieve_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["absent", "deny", "allow", "unavailable"])
+async def test_omitted_permission_is_projected_once_to_cr_not_locally_selected(tmp_path, kind):
+    memory, runtime = FakeMemoryStore(), FakeRuntime()
+    record = await memory.get_presence_surface_permission(owner_id="owner", surface="alexa")
+    memory.permission_calls = []
+    if kind == "absent":
+        record.update(configured=False, conversation_context_allowed=False,
+                      proactive_presence_allowed=False, created_at=None, updated_at=None)
+    elif kind == "deny":
+        record["conversation_context_allowed"] = False
+    elif kind == "unavailable":
+        memory.permission_error = httpx.ConnectError("PRIVATE-PERMISSION")
+    memory.permission_response = record
+    result, _, provider, memory = await _run_timing_turn(
+        tmp_path, memory=memory, runtime=runtime, payload=_base_payload(surface="alexa"),
+    )
+    call = runtime.continuation_selection_calls[0]
+    assert call["surface_permission_status"] == {
+        "absent": "unconfigured", "unavailable": "unavailable",
+    }.get(kind, "configured")
+    assert call["conversation_context_allowed"] is (kind == "allow")
+    assert len(memory.permission_calls) == len(runtime.timing_calls) == 1
+    assert result["status"] == "ok"
+    assert "PRIVATE-PERMISSION" not in str(provider.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,reason", [
+    ("idle", "session_idle"), ("low_attention", "attention_paused"),
+    ("driving_or_active_task", "session_active_task_mode"),
+    ("do_not_intrude", "explicit_proactive_opt_out"),
+])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_runtime_presence_common_seam_persists_exact_enforced_help(
+    tmp_path, state, reason, fallback,
+):
+    memory, runtime = FakeMemoryStore(), FakeRuntime()
+    if state == "do_not_intrude":
+        async def opt_out(**kwargs):
+            return {
+                "owner_id": kwargs["owner_id"], "enabled": False,
+                "allowed_surfaces_json": [], "rule_prefs_json": {},
+                "created_at": "2026-10-05T00:00:00+00:00",
+                "updated_at": "2026-10-05T00:00:00+00:00",
+            }
+        memory.get_proactive_preferences = opt_out
+    async def presence(**kwargs):
+        runtime.presence_calls.append(kwargs)
+        runtime.call_order.append("presence")
+        return {
+            **{key: kwargs[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id",
+            )},
+            "result": {
+                "presence_state": state, "previous_presence_state": None, "state_changed": True,
+                "proactive_output_suppressed": True, "required_help_allowed": True,
+                "reason_codes": [reason] + (
+                    ["proactive_suppression_requested"]
+                    if kwargs["proactive_output_suppressed"] else []
+                ), "policy_version": "runtime-presence.v1",
+            },
+        }
+    runtime.evaluate_presence = presence
+    raw = "Check the logs first. I'm always listening. If you'd like, I can help. Save the backup."
+    rules, models = _write_router_files(tmp_path)
+    rules.write_text(rules.read_text().replace(
+        "fallbacks: []", "fallbacks: [{selected_model: gpt-4o-mini, provider: cloud}]",
+    ))
+    provider = FakeLiteLLM(fail_first=fallback, content=raw)
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"), memory_store=memory,
+        litellm=provider, runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="presence-enforcement",
+    )
+    assert result["answer"] == memory.added_messages[-1]["content"] == (
+        "Check the logs first. Save the backup."
+    )
+    assert len(provider.calls) == (2 if fallback else 1)
+    assert len(runtime.timing_calls) == len(memory.permission_calls) == 1
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_presence"]["status"] == "included"
+    assert trace["runtime_presence"]["presence_state"] == state
+    enforcement = trace["runtime_presence_enforcement"]
+    assert enforcement["removed_segment_count"] == 2
+    assert set(enforcement["reason_codes"]) == {
+        "prohibited_presence_claim", "proactive_offer_suppressed",
+    }
+    assert raw not in str(enforcement)
+
+@pytest.mark.asyncio
+async def test_permission_create_new_cannot_reimport_retained_owner_context(tmp_path):
+    memory, runtime = FakeMemoryStore(), FakeRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    memory.permission_response = {
+        "owner_id": "owner", "surface": "alexa", "configured": False,
+        "conversation_context_allowed": False, "proactive_presence_allowed": False,
+        "ambient_listening_allowed": False, "created_at": None, "updated_at": None,
+    }
+    runtime.continuation_selection_response = {
+        "schema_version": "runtime-continuation-selection.v1",
+        "request_id": "rid-timing-flow", "owner_id": "owner", "surface": "alexa",
+        "result": {
+            "outcome": "create_new", "timing_policy": "answer_now",
+            "selected_conversation_id": None, "selected_thread_revision": None,
+            "candidate_count": 1, "eligible_candidate_count": 0,
+            "reason_codes": ["no_eligible_candidates", "surface_permission_absent"],
+            "policy_version": "continuation-selection.v1",
+        },
+    }
+    raw_retrieve = memory.retrieve_bundle
+
+    async def scoped_retrieve(**kwargs):
+        assert kwargs["retrieval"]["scope"] == "conversation"
+        return await raw_retrieve(**kwargs)
+
+    memory.retrieve_bundle = scoped_retrieve
+    result, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, memory=memory, runtime=runtime,
+        payload=_base_payload(
+            surface="alexa", retrieval={"scope": "owner", "k": 8},
+            messages=[{"role": "user", "content": "Explain connection pooling."}],
+        ),
+    )
+    assert result["status"] == "ok"
+    assert len(memory.permission_calls) == len(runtime.continuation_selection_calls) == 1
+    assert memory.retrieve_calls[0]["retrieval"]["scope"] == "conversation"
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    httpx.ReadTimeout("PRIVATE-PERMISSION"), httpx.ConnectError("PRIVATE-PERMISSION"),
+    httpx.HTTPStatusError("PRIVATE-PERMISSION", request=httpx.Request("GET", "http://memory"),
+                          response=httpx.Response(503)),
+])
+async def test_permission_dependency_failure_preserves_help_without_dnd(tmp_path, error):
+    memory, runtime = FakeMemoryStore(), FakeRuntime()
+    memory.permission_error = error
+    original_presence = runtime.evaluate_presence
+
+    async def presence(**kwargs):
+        response = await original_presence(**kwargs)
+        response["result"]["proactive_output_suppressed"] = True
+        if kwargs["proactive_output_suppressed"]:
+            response["result"]["reason_codes"].append("proactive_suppression_requested")
+        response["result"]["reason_codes"].append("surface_permission_unavailable")
+        return response
+
+    runtime.evaluate_presence = presence
+    result, _, provider, memory = await _run_timing_turn(
+        tmp_path, memory=memory, runtime=runtime, payload=_base_payload(surface="web"),
+        provider=FakeLiteLLM(content="Check the logs. I can also help."),
+    )
+    assert result["answer"] == memory.added_messages[-1]["content"] == "Check the logs."
+    assert len(memory.permission_calls) == len(provider.calls) == 1
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_presence"]["presence_state"] == "active_conversation"
+    assert trace["runtime_presence"]["proactive_output_suppressed"] is True
+    assert "PRIVATE-PERMISSION" not in str(trace)

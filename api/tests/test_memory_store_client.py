@@ -457,3 +457,41 @@ async def test_proactive_preferences_rejects_inconsistent_synthetic_form(service
     responses.append(value)
     with pytest.raises(RuntimeError, match="proactive_preferences_response_invalid"):
         await client.get_proactive_preferences(owner_id="owner")
+
+def _permission_record(**changes):
+    return {
+        "owner_id": "owner", "surface": "alexa", "configured": True,
+        "conversation_context_allowed": True, "proactive_presence_allowed": False,
+        "ambient_listening_allowed": False, "created_at": "2026-10-05T00:00:00+00:00",
+        "updated_at": "2026-10-05T00:00:00+00:00", **changes,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [False, True])
+async def test_presence_permission_exact_lookup_and_shape(service, configured):
+    client, responses, calls = service
+    row = _permission_record() if configured else _permission_record(
+        configured=False, conversation_context_allowed=False, created_at=None, updated_at=None,
+    )
+    responses.append(row)
+    assert await client.get_presence_surface_permission(owner_id="owner", surface="alexa") == row
+    assert len(calls) == 1
+    assert calls[0].url.path == "/v1/presence/surface-permissions"
+    assert dict(calls[0].url.params) == {"owner_id": "owner", "surface": "alexa"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"owner_id": "other"}, {"surface": "telegram"}, {"configured": 1},
+    {"conversation_context_allowed": "true"}, {"proactive_presence_allowed": None},
+    {"ambient_listening_allowed": 0}, {"unexpected": True},
+    {"configured": False}, {"created_at": None}, {"updated_at": "invalid"},
+    {"created_at": "2026-10-05"}, {"updated_at": "x" * 65},
+])
+async def test_presence_permission_malformed_fails_without_retry(service, changes):
+    client, responses, calls = service
+    responses.append(_permission_record(**changes))
+    with pytest.raises(RuntimeError, match="surface_permission_"):
+        await client.get_presence_surface_permission(owner_id="owner", surface="alexa")
+    assert len(calls) == 1

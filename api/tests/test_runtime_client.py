@@ -962,6 +962,8 @@ async def test_runtime_client_accepts_coherent_continuation_outcomes(outcome):
                 "request_id": "selection-request",
                 "owner_id": "owner",
                 "surface": "voice",
+                "surface_permission_status": "unconfigured",
+                "conversation_context_allowed": False,
                 "candidate_set_complete": True,
                 "stale_after_seconds": 1800,
                 "candidates": candidates,
@@ -3500,10 +3502,13 @@ async def test_presence_endpoint_payload_and_persistent_transport():
     client = RuntimeClient("http://runtime.local", None, client_factory=factory)
     await client.open()
     for _ in range(2):
-        assert await client.evaluate_presence(**_PRESENCE_SCOPE) == response
+        assert await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **_PRESENCE_SCOPE) == response
     assert transport.posts == [("/v1/runtime/presence/evaluate", {
         **_PRESENCE_SCOPE, "active_task_mode": False, "proactive_output_suppressed": False,
         "explicit_proactive_opt_out": False,
+        "surface_permission_status": "configured", "proactive_presence_allowed": True,
+        "ambient_listening_allowed": False,
     })] * 2
     assert len(factory.clients) == 1
     await client.close()
@@ -3551,10 +3556,12 @@ async def test_presence_response_exact_scope_binding(field):
     await client.open()
     try:
         with pytest.raises(RuntimeError, match="presence_response_context_mismatch"):
-            await client.evaluate_presence(**_PRESENCE_SCOPE)
+            await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **_PRESENCE_SCOPE)
         assert len(transport.posts) == 1
         assert transport.close_calls == 0
-        assert await client.evaluate_presence(**later_scope) == later_response
+        assert await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **later_scope) == later_response
         assert len(factory.clients) == 1
         assert len(transport.posts) == 2
         assert transport.posts[1][1]["runtime_turn_id"] == "later-turn"
@@ -3584,7 +3591,8 @@ async def test_presence_response_rejects_invalid_or_incoherent_result(field, val
                            client_factory=_ClientFactory([transport]))
     await client.open()
     with pytest.raises(RuntimeError, match="presence_response_invalid"):
-        await client.evaluate_presence(**_PRESENCE_SCOPE)
+        await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **_PRESENCE_SCOPE)
 
 
 @pytest.mark.asyncio
@@ -3606,18 +3614,20 @@ async def test_presence_response_exact_key_shape(mutation):
                            client_factory=_ClientFactory([transport]))
     await client.open()
     with pytest.raises(RuntimeError, match="presence_response_invalid"):
-        await client.evaluate_presence(**_PRESENCE_SCOPE)
+        await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **_PRESENCE_SCOPE)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["ambient_listening", "returning_after_gap"])
+@pytest.mark.parametrize("state", ["returning_after_gap"])
 async def test_presence_response_future_states_are_not_consumed(state):
     transport = _FakeAsyncClient([_presence_response(presence_state=state)])
     client = RuntimeClient("http://runtime.local", None,
                            client_factory=_ClientFactory([transport]))
     await client.open()
     with pytest.raises(RuntimeError, match="presence_response_unsupported_state"):
-        await client.evaluate_presence(**_PRESENCE_SCOPE)
+        await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **_PRESENCE_SCOPE)
 
 
 @pytest.mark.asyncio
@@ -3646,6 +3656,7 @@ async def test_presence_accepts_coherent_v1_states_and_transitions(
                            client_factory=_ClientFactory([transport]))
     await client.open()
     assert await client.evaluate_presence(
+        surface_permission_status="configured", proactive_presence_allowed=True,
         **_PRESENCE_SCOPE, active_task_mode=active, proactive_output_suppressed=suppressed,
     ) == response
 
@@ -3656,7 +3667,8 @@ async def test_presence_opt_out_request_is_strict_before_transport(value):
     factory = _ClientFactory()
     client = RuntimeClient("http://runtime.local", None, client_factory=factory)
     with pytest.raises(ValueError, match="presence_request_invalid"):
-        await client.evaluate_presence(**_PRESENCE_SCOPE, explicit_proactive_opt_out=value)
+        await client.evaluate_presence(surface_permission_status="configured",
+            proactive_presence_allowed=True, **_PRESENCE_SCOPE, explicit_proactive_opt_out=value)
     assert factory.clients == []
 
 
@@ -3678,12 +3690,15 @@ async def test_presence_opt_out_precedence_and_exact_payload(active, suppressed,
                            client_factory=_ClientFactory([transport]))
     await client.open()
     assert await client.evaluate_presence(
+        surface_permission_status="configured", proactive_presence_allowed=True,
         **_PRESENCE_SCOPE, active_task_mode=active,
         proactive_output_suppressed=suppressed, explicit_proactive_opt_out=True,
     ) == response
     assert transport.posts == [("/v1/runtime/presence/evaluate", {
         **_PRESENCE_SCOPE, "active_task_mode": active,
         "proactive_output_suppressed": suppressed, "explicit_proactive_opt_out": True,
+        "surface_permission_status": "configured", "proactive_presence_allowed": True,
+        "ambient_listening_allowed": False,
     })]
     await client.close()
 
@@ -3924,3 +3939,62 @@ async def test_timing_response_scope_keys_types_and_dependency_projection_are_st
         assert transport.close_calls == 0
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,allowed,reason", [
+    ("configured", False, "surface_proactive_denied"),
+    ("unconfigured", False, "surface_permission_unconfigured"),
+    ("unavailable", False, "surface_permission_unavailable"),
+])
+async def test_presence_permission_projection_suppresses_without_inventing_opt_out(
+    status, allowed, reason,
+):
+    response = _presence_response(
+        proactive_output_suppressed=True, reason_codes=["thread_active", reason],
+    )
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    assert await client.evaluate_presence(
+        **_PRESENCE_SCOPE, surface_permission_status=status, proactive_presence_allowed=allowed,
+    ) == response
+    assert transport.posts[0][1]["explicit_proactive_opt_out"] is False
+    assert response["result"]["presence_state"] == "active_conversation"
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"surface_permission_status": "unknown"},
+    {"proactive_presence_allowed": 1},
+    {"ambient_listening_allowed": "true"},
+    {"surface_permission_status": "unavailable", "ambient_listening_allowed": True},
+    {"surface_permission_status": "unconfigured", "proactive_presence_allowed": True},
+])
+async def test_presence_permission_invalid_projection_never_posts(changes):
+    transport = _FakeAsyncClient([])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    with pytest.raises(ValueError, match="presence_request_invalid"):
+        await client.evaluate_presence(**_PRESENCE_SCOPE, **changes)
+    assert transport.posts == []
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_presence_consumer_accepts_permitted_ambient_result():
+    response = _presence_response(
+        presence_state="ambient_listening", reason_codes=["ambient_mode_permitted"],
+    )
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None,
+                           client_factory=_ClientFactory([transport]))
+    await client.open()
+    assert await client.evaluate_presence(
+        **_PRESENCE_SCOPE, surface_permission_status="configured",
+        proactive_presence_allowed=True, ambient_listening_allowed=True,
+    ) == response
+    await client.close()

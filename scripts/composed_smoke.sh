@@ -121,6 +121,16 @@ bms_post() {
     -d "$2"
 }
 
+configure_surface_permission() {
+  local owner="$1" surface="$2" context="$3" proactive="${4:-false}" ambient="${5:-false}"
+  curl -fsS -X PUT "http://127.0.0.1:14321/v1/presence/surface-permissions" \
+    -H "X-API-Key: smoke-memory-key" -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg owner "$owner" --arg surface "$surface" \
+      --argjson context "$context" --argjson proactive "$proactive" --argjson ambient "$ambient" \
+      '{owner_id:$owner,surface:$surface,conversation_context_allowed:$context,
+        proactive_presence_allowed:$proactive,ambient_listening_allowed:$ambient}')" >/dev/null
+}
+
 cr_post() {
   curl -fsS -X POST "http://127.0.0.1:14371$1" \
     -H "Content-Type: application/json" \
@@ -249,6 +259,8 @@ SQL
 
 resolve_conversation() {
   local owner="$1" client="$2" title="$3"
+  # These existing chat fixtures explicitly continue BMS-created threads.
+  configure_surface_permission "$owner" chat true true false
   bms_post "/v1/conversations/resolve" \
     "$(jq -nc --arg owner "$owner" --arg client "$client" --arg title "$title" '{owner_id:$owner, client_id:$client, title:$title, idle_ttl_s:60}')" \
     | jq -r '.conversation_id'
@@ -694,6 +706,10 @@ run_distinct_client_owner_memory_scenario() {
 
   install_disposable_surface_binding "$surface_c" || distinct_client_memory_fail "surface-binding"
 
+  configure_surface_permission "$owner" "$surface_a" true true false
+  configure_surface_permission "$owner" "$surface_b" true true false
+  configure_surface_permission "$owner" "$surface_c" true true false
+  configure_surface_permission "$other_owner" "$surface_other" true true false
   conversation_a="$(resolve_conversation "$owner" "$client_a" "client A project memory")"
   conversation_b="$(resolve_conversation "$owner" "$client_b" "client B project retrieval")"
   conversation_c="$(resolve_conversation "$owner" "$client_c" "client C contained retrieval")"
@@ -730,6 +746,7 @@ run_distinct_client_owner_memory_scenario() {
     --arg private "$private_decoy" \
     '{sentinels:{canonical:$canonical,blocked_decoy:$blocked,private_decoy:$private}}')"
 
+  configure_surface_permission "$owner" "$surface_a" true true false
   response_a="$(run_distinct_client_chat "$owner" "$client_a" "$surface_a" "$conversation_a" "$canonical_question")"
   request_a="$(jq -r '.request_id // empty' <<<"$response_a")"
   [ -n "$request_a" ] || distinct_client_memory_fail "client-A-request-id"
@@ -795,10 +812,13 @@ run_distinct_client_owner_memory_scenario() {
       | length == 1
     ' <<<"$qdrant_payload" >/dev/null || distinct_client_memory_fail "canonical-qdrant-point"
 
+  configure_surface_permission "$owner" "$surface_a" true true false
   run_distinct_client_chat "$owner" "$client_a" "$surface_a" "$conversation_a" "$blocked_question" >/dev/null
+  configure_surface_permission "$owner" "$surface_a" true true false
   run_distinct_client_chat "$owner" "$client_a" "$surface_a" "$conversation_a" "$private_question" >/dev/null
 
   retrieval_before="$(bms_retrieval_access_count "$conversation_b")"
+  configure_surface_permission "$owner" "$surface_b" true true false
   response_b="$(run_distinct_client_chat "$owner" "$client_b" "$surface_b" "$conversation_b" "$client_b_question")"
   request_b="$(jq -r '.request_id // empty' <<<"$response_b")"
   [ -n "$request_b" ] || distinct_client_memory_fail "client-B-request-id"
@@ -853,6 +873,7 @@ run_distinct_client_owner_memory_scenario() {
   [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE id='$canonical_message_id' AND client_id='$client_a' AND conversation_id='$conversation_a' AND metadata->>'surface'='$surface_a';")" = "1" ] \
     || distinct_client_memory_fail "source-provenance-remains-client-A"
 
+  configure_surface_permission "$owner" "$surface_c" true true false
   response_c="$(run_distinct_client_chat "$owner" "$client_c" "$surface_c" "$conversation_c" "$client_c_question")"
   request_c="$(jq -r '.request_id // empty' <<<"$response_c")"
   [ -n "$request_c" ] || distinct_client_memory_fail "client-C-request-id"
@@ -896,6 +917,7 @@ run_distinct_client_owner_memory_scenario() {
   [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation_c' AND position('$canonical' in content) > 0;")" = "0" ] \
     || distinct_client_memory_fail "client-C-no-authorized-result-copy"
 
+  configure_surface_permission "$other_owner" "$surface_other" true true false
   response_other="$(run_distinct_client_chat "$other_owner" "$other_client" "$surface_other" "$conversation_other" "$other_question")"
   request_other="$(jq -r '.request_id // empty' <<<"$response_other")"
   [ -n "$request_other" ] || distinct_client_memory_fail "isolated-owner-request-id"
@@ -2028,6 +2050,8 @@ run_runtime_admission_composition_scenario() {
 
   conversation_id="$(resolve_conversation "$owner" "$winner_client" "admission-composition")"
   provider_post "/fixture/delay-next-primary" '{"delay_ms":2500}'
+  configure_surface_permission "$owner" "$winner_surface" true true false
+  configure_surface_permission "$owner" "$loser_surface" true true false
   winner_payload="$(jq -nc \
     --arg owner "$owner" \
     --arg client "$winner_client" \
@@ -2153,7 +2177,9 @@ run_omitted_continuation_scenario() {
   provider_post "/fixture/reset" '{}'
 
   other_conversation="$(create_conversation "$other_owner" "$other_client")"
+  configure_surface_permission "$other_owner" "surface-isolated" true true false
   run_distinct_client_chat "$other_owner" "$other_client" "surface-isolated" "$other_conversation" "neutral isolated seed" >/dev/null
+  configure_surface_permission "$zero_owner" "$zero_surface" true true false
   zero_response="$(run_omitted_chat "$zero_owner" "$zero_client" "$zero_surface" "neutral new conversation")"
   zero_conversation="$(jq -r '.conversation_id' <<<"$zero_response")"
   zero_request="$(jq -r '.request_id' <<<"$zero_response")"
@@ -2174,6 +2200,7 @@ run_omitted_continuation_scenario() {
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '2 hours' WHERE owner_id='$stale_only_owner';" >/dev/null
   stale_only_before="$(psql_exec -At -F '|' -c "SELECT count(*), count(*) FILTER (WHERE lifecycle_state='open'), count(*) FILTER (WHERE lifecycle_state='open' AND updated_at < now() - interval '1 hour') FROM conversations WHERE owner_id='$stale_only_owner';")"
   [ "$stale_only_before" = "12|12|12" ]
+  configure_surface_permission "$stale_only_owner" "surface-stale-only" true true false
   stale_only_response="$(run_omitted_chat "$stale_only_owner" "client-stale-only-request" "surface-stale-only" "neutral after stale accumulation")"
   stale_only_conversation="$(jq -r '.conversation_id' <<<"$stale_only_response")"
   stale_only_request="$(jq -r '.request_id' <<<"$stale_only_response")"
@@ -2189,10 +2216,12 @@ run_omitted_continuation_scenario() {
 
   provider_post "/fixture/reset" '{}'
   resume_conversation="$(create_conversation "$resume_owner" "client-resume-a")"
+  configure_surface_permission "$resume_owner" "surface-resume-a" true true false
   first_response="$(run_distinct_client_chat "$resume_owner" "client-resume-a" "surface-resume-a" "$resume_conversation" "neutral first turn")"
   first_request="$(jq -r '.request_id' <<<"$first_response")"
   jq -e --arg conversation "$resume_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$first_response" >/dev/null
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$resume_owner" "surface-resume-b" true true false
   second_response="$(run_omitted_chat "$resume_owner" "client-resume-b" "surface-resume-b" "neutral resumed turn")"
   second_request="$(jq -r '.request_id' <<<"$second_response")"
   jq -e --arg conversation "$resume_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$second_response" >/dev/null
@@ -2212,11 +2241,13 @@ run_omitted_continuation_scenario() {
   done
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '2 hours' WHERE owner_id='$stale_mix_owner';" >/dev/null
   stale_mix_conversation="$(create_conversation "$stale_mix_owner" "client-stale-mix-fresh")"
+  configure_surface_permission "$stale_mix_owner" "surface-stale-mix-a" true true false
   stale_mix_seed="$(run_distinct_client_chat "$stale_mix_owner" "client-stale-mix-fresh" "surface-stale-mix-a" "$stale_mix_conversation" "neutral fresh candidate")"
   jq -e --arg conversation "$stale_mix_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$stale_mix_seed" >/dev/null
   stale_mix_before="$(psql_exec -At -F '|' -c "SELECT count(*), count(*) FILTER (WHERE lifecycle_state='open'), count(*) FILTER (WHERE client_id LIKE 'client-stale-mix-%' AND client_id != 'client-stale-mix-fresh' AND lifecycle_state='open' AND updated_at < now() - interval '1 hour') FROM conversations WHERE owner_id='$stale_mix_owner';")"
   [ "$stale_mix_before" = "13|13|12" ]
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$stale_mix_owner" "surface-stale-mix-b" true true false
   stale_mix_response="$(run_omitted_chat "$stale_mix_owner" "client-stale-mix-current" "surface-stale-mix-b" "neutral resume among stale accumulation")"
   stale_mix_request="$(jq -r '.request_id' <<<"$stale_mix_response")"
   jq -e --arg conversation "$stale_mix_conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$stale_mix_response" >/dev/null
@@ -2235,12 +2266,15 @@ run_omitted_continuation_scenario() {
   provider_post "/fixture/reset" '{}'
   multiple_a="$(create_conversation "$multiple_owner" "client-multiple-a")"
   multiple_b="$(create_conversation "$multiple_owner" "client-multiple-b")"
+  configure_surface_permission "$multiple_owner" "surface-multiple-a" true true false
   run_distinct_client_chat "$multiple_owner" "client-multiple-a" "surface-multiple-a" "$multiple_a" "neutral candidate a" >/dev/null
+  configure_surface_permission "$multiple_owner" "surface-multiple-b" true true false
   run_distinct_client_chat "$multiple_owner" "client-multiple-b" "surface-multiple-b" "$multiple_b" "neutral candidate b" >/dev/null
   provider_post "/fixture/reset" '{}'
   multiple_retrieval_before="$(bms_retrieval_access_count "$multiple_a")|$(bms_retrieval_access_count "$multiple_b")"
   multiple_before="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM messages WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM traces WHERE owner_id='$multiple_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$multiple_owner');")"
   multiple_runtime_before="$(runtime_owner_counts "$multiple_owner")"
+  configure_surface_permission "$multiple_owner" "surface-multiple-c" true true false
   multiple_response="$(run_omitted_chat "$multiple_owner" "client-multiple-c" "surface-multiple-c" "neutral ambiguous continuation")"
   multiple_request="$(jq -r '.request_id' <<<"$multiple_response")"
   jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .sources == [] and .answer == "I couldn’t safely determine which conversation to continue. Please provide the conversation you want to resume."' <<<"$multiple_response" >/dev/null
@@ -2253,10 +2287,12 @@ run_omitted_continuation_scenario() {
 
   provider_post "/fixture/reset" '{}'
   active_conversation="$(create_conversation "$active_owner" "client-active-a")"
+  configure_surface_permission "$active_owner" "surface-active-a" true true false
   initial_response="$(run_distinct_client_chat "$active_owner" "client-active-a" "surface-active-a" "$active_conversation" "neutral active seed")"
   jq -e '.status == "ok"' <<<"$initial_response" >/dev/null
   provider_post "/fixture/reset" '{}'
   provider_post "/fixture/delay-next-primary" '{"delay_ms":2500}'
+  configure_surface_permission "$active_owner" surface-active-b true true false
   winner_payload="$(jq -nc --arg owner "$active_owner" --arg client "client-active-b" --arg surface "surface-active-b" --arg conversation "$active_conversation" '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:"neutral active winner"}],sensitivity:"private"}')"
   winner_file="$COMPOSED_SMOKE_TMP/omitted-active-winner.json"
   co_post "$winner_payload" >"$winner_file" &
@@ -2274,6 +2310,7 @@ run_omitted_continuation_scenario() {
     echo "omitted continuation did not observe active candidate" >&2
     exit 1
   }
+  configure_surface_permission "$active_owner" "surface-active-c" true true false
   wait_response="$(run_omitted_chat "$active_owner" "client-active-c" "surface-active-c" "neutral waiting loser")"
   wait_request="$(jq -r '.request_id' <<<"$wait_response")"
   jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .answer == "Another turn is still in progress. Please try again shortly."' <<<"$wait_response" >/dev/null
@@ -2293,6 +2330,7 @@ run_omitted_continuation_scenario() {
   done
   incomplete_before="$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM conversations WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM messages WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM traces WHERE owner_id='$incomplete_owner'), (SELECT count(*) FROM claim_records WHERE owner_id='$incomplete_owner');")"
   incomplete_runtime_before="$(runtime_owner_counts "$incomplete_owner")"
+  configure_surface_permission "$incomplete_owner" "surface-incomplete" true true false
   incomplete_response="$(run_omitted_chat "$incomplete_owner" "client-incomplete-request" "surface-incomplete" "neutral incomplete continuation")"
   incomplete_request="$(jq -r '.request_id' <<<"$incomplete_response")"
   jq -e '.status == "degraded" and .conversation_id == null and .selected_model == "not_called" and .answer == "I couldn’t safely determine which conversation to continue. Please provide the conversation you want to resume."' <<<"$incomplete_response" >/dev/null
@@ -2348,6 +2386,7 @@ assert_continuation_supplied_rejection() {
   if [ "$runtime_available" = "true" ]; then
     runtime_before="$(runtime_owner_counts "$owner")"
   fi
+  configure_surface_permission "$owner" "alexa" true true false
   response="$(run_distinct_client_chat "$owner" "$client" "alexa" "$target" "PRIVATE-CONTINUATION-REJECTED")"
   request="$(jq -r '.request_id' <<<"$response")"
   jq -e --arg target "$target" --arg disposition "$disposition" '
@@ -2425,8 +2464,10 @@ run_continuation_replacement_scenario() {
     for variant in original exact omitted; do
       client="$surface:$variant"
       if [ "$variant" = omitted ]; then
+        configure_surface_permission "$owner" "$surface" true true false
         response="$(run_omitted_chat "$owner" "$client" "$surface" "What does this function do?")"
       else
+        configure_surface_permission "$owner" "$surface" true true false
         response="$(run_distinct_client_chat "$owner" "$client" "$surface" "$conversation" "What does this function do?")"
       fi
       jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation and .selected_model != "not_called"' <<<"$response" >/dev/null
@@ -2500,6 +2541,7 @@ run_continuation_failure_contention_scenario() {
   provider_post /fixture/delay-next-primary '{"delay_ms":2500}'
   # Interrupt the response dependency after admission and loser rejection.
   # Local-only still permits a local fallback; neither routing nor eligibility changes.
+  configure_surface_permission "$owner" telegram true true false
   payload="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{owner_id:$owner,client_id:"telegram:failure-winner",conversation_id:$conversation,surface:"telegram",sensitivity:"local_only",messages:[{role:"user",content:"Give a brief neutral greeting."}]}')"
   curl -sS --max-time 20 -X POST http://127.0.0.1:14361/v1/chat -H 'X-API-Key: smoke-orchestrator-key' -H 'Content-Type: application/json' -d "$payload" -o "$COMPOSED_SMOKE_TMP/contention-failure.json" -w '%{http_code}' >"$COMPOSED_SMOKE_TMP/contention-failure-status" &
   winner_pid=$!
@@ -2511,6 +2553,7 @@ run_continuation_failure_contention_scenario() {
   jq -e '.state == "active" and .active_surface == "telegram"' <<<"$thread" >/dev/null
   session="$(jq -r '.active_runtime_session_id' <<<"$thread")"
   before="$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)"
+  configure_surface_permission "$owner" alexa true true false
   loser="$(run_distinct_client_chat "$owner" alexa:failure-loser alexa "$conversation" "neutral competing input")"
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
   [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
@@ -2536,6 +2579,7 @@ run_continuation_failure_contention_scenario() {
   jq -e '.state == "idle" and .revision == 2 and .session_count == 1 and .surfaces == ["telegram"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
   [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='user'),(SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='assistant'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='failed');")" = '1|0|0|1' ]
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
+  configure_surface_permission "$owner" alexa true true false
   fresh="$(run_distinct_client_chat "$owner" alexa:failure-fresh alexa "$conversation" "What does this function do?")"
   jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$fresh" >/dev/null
   [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$fresh")" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
@@ -2558,6 +2602,7 @@ run_continuation_conformance_scenario() {
     provider_post "/fixture/reset" '{}' >/dev/null
     conversation="$(create_conversation "$owner" "$telegram_client")"
     queue_provider_answer "It validates the input." >/dev/null
+    configure_surface_permission "$owner" telegram true true false
     first="$(run_distinct_client_chat "$owner" "$telegram_client" telegram "$conversation" "What does this function do?")"
     first_request="$(jq -r '.request_id' <<<"$first")"
     jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation and .answer == "It validates the input."' <<<"$first" >/dev/null
@@ -2578,6 +2623,7 @@ run_continuation_conformance_scenario() {
       [ "$history" = "$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text, '' ORDER BY m.created_at, m.id)) FROM messages m WHERE owner_id='$owner' AND conversation_id='$conversation';")" ]
     fi
     queue_provider_answer "It returns a normalized result." >/dev/null
+    configure_surface_permission "$owner" alexa true true false
     second="$(run_distinct_client_chat "$owner" "$alexa_client" alexa "$conversation" "What does this function do?")"
     request="$(jq -r '.request_id' <<<"$second")"
     jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation and .answer == "It returns a normalized result."' <<<"$second" >/dev/null
@@ -2612,6 +2658,7 @@ run_continuation_conformance_scenario() {
     [ "$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE owner_id='$owner';")" = "0" ]
     echo "Continuation C1-01/C1-07 $tag: exact_cross_surface=true one_conversation=true message_order=telegram_user,telegram_assistant,alexa_user,alexa_assistant telegram_history_preserved=true alexa_current_provenance=true sessions=2 provider_calls=1,1 idle_revision=4 claims=0 action_calls=0"
     if [ "$tag" = restart ]; then
+      configure_surface_permission "$owner" web true true false
       response="$(run_omitted_chat "$owner" web:restart-cache-loss web "What does this function do?")"
       jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$response" >/dev/null
       trace="$(fetch_trace "$(jq -r '.request_id' <<<"$response")")"
@@ -2636,6 +2683,7 @@ run_continuation_conformance_scenario() {
   [ "$wrong" = "$missing" ]
   [ "$malformed" = "$missing" ]
   # Guessed client/surface identifiers are provenance, never thread selectors.
+  configure_surface_permission "$isolated" telegram true true false
   response="$(run_omitted_chat "$isolated" "$telegram_client" telegram "What does this function do?")"
   jq -e --arg foreign "$conversation" '.status == "ok" and .conversation_id != $foreign' <<<"$response" >/dev/null
   trace="$(fetch_trace "$(jq -r '.request_id' <<<"$response")")"
@@ -2670,10 +2718,12 @@ run_continuation_conformance_scenario() {
   for state in contended unavailable inconsistent; do
     local state_owner="owner-continuation-$state"
     target="$(create_conversation "$state_owner" "telegram:state-$state")"
+    configure_surface_permission "$state_owner" telegram true true false
     run_distinct_client_chat "$state_owner" "telegram:state-$state" telegram "$target" "What does this function do?" >/dev/null
     runtime_set_thread_projection "$state_owner" "$target" "$([ "$state" = inconsistent ] && echo idle || echo "$state")" "$([ "$state" = inconsistent ] && echo true || echo false)"
     durable="$(continuation_durable_snapshot "$state_owner")"
     runtime_before="$(runtime_owner_counts "$state_owner")"
+    configure_surface_permission "$state_owner" alexa true true false
     response="$(run_omitted_chat "$state_owner" "alexa:state-$state" alexa "PRIVATE-UNSELECTED-CONTENT")"
     jq -e '.status == "failed" and .conversation_id == null and .selected_model == "not_called"
       and .sources == [] and .answer == "I couldn’t safely continue a prior conversation. No retained conversation content was used."' <<<"$response" >/dev/null
@@ -2688,6 +2738,7 @@ run_continuation_conformance_scenario() {
   runtime_before="$(runtime_owner_counts "$owner")"
   docker compose -f "$COMPOSE" stop runtime >/dev/null
   assert_continuation_supplied_rejection "$owner" "alexa:runtime-unavailable" "$conversation" absent false >/dev/null
+  configure_surface_permission "$owner" alexa true true false
   response="$(run_omitted_chat "$owner" "alexa:runtime-unavailable" alexa "PRIVATE-UNAVAILABLE-CONTENT")"
   jq -e '.status == "failed" and .conversation_id == null and .selected_model == "not_called"
     and .sources == [] and .answer == "I couldn’t safely determine which conversation to continue. No retained conversation content was used. Please try again."' <<<"$response" >/dev/null
@@ -2712,6 +2763,7 @@ run_conversation_retirement_scenario() {
   local before_a after_a counts_a provider_a thread_a_before thread_a_after
   provider_post "/fixture/reset" '{}'
   conversation_a="$(create_conversation "$owner_a" "$client_a")"
+  configure_surface_permission "$owner_a" "$surface_a" true true false
   seed_a="$(run_distinct_client_chat "$owner_a" "$client_a" "$surface_a" "$conversation_a" "neutral grace seed")"
   jq -e --arg conversation "$conversation_a" '.status == "ok" and .conversation_id == $conversation' <<<"$seed_a" >/dev/null
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '2 days' WHERE owner_id='$owner_a' AND id='$conversation_a';" >/dev/null
@@ -2719,6 +2771,7 @@ run_conversation_retirement_scenario() {
   before_a="$(psql_exec -At -F '|' -c "SELECT lifecycle_state, count(*) FROM conversations c JOIN messages m ON m.conversation_id=c.id AND m.owner_id=c.owner_id WHERE c.owner_id='$owner_a' AND c.id='$conversation_a' GROUP BY lifecycle_state;")"
   thread_a_before="$(runtime_thread_snapshot "$owner_a" "$conversation_a")"
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$owner_a" "surface-retirement-grace-current" true true false
   response_a="$(run_distinct_client_chat "$owner_a" "client-retirement-grace-current" "surface-retirement-grace-current" "$conversation_a" "neutral grace continuation")"
   request_a="$(jq -r '.request_id' <<<"$response_a")"
   jq -e --arg conversation "$conversation_a" '.status == "ok" and .conversation_id == $conversation and (has("conversation_disposition") | not)' <<<"$response_a" >/dev/null
@@ -2737,12 +2790,14 @@ run_conversation_retirement_scenario() {
   local before_b_revision after_b_thread provider_b history_b lifecycle_b conversation_count_b
   provider_post "/fixture/reset" '{}'
   conversation_b="$(create_conversation "$owner_b" "$client_b")"
+  configure_surface_permission "$owner_b" "$surface_b" true true false
   seed_b="$(run_distinct_client_chat "$owner_b" "$client_b" "$surface_b" "$conversation_b" "neutral safe retirement seed")"
   jq -e '.status == "ok"' <<<"$seed_b" >/dev/null
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_b' AND id='$conversation_b';" >/dev/null
   runtime_backdate_thread "$owner_b" "$conversation_b" "$old_eight_days"
   before_b_revision="$(runtime_thread_snapshot "$owner_b" "$conversation_b" | jq -r '.revision')"
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$owner_b" "surface-retirement-safe-current" true true false
   response_b="$(run_distinct_client_chat "$owner_b" "client-retirement-safe-current" "surface-retirement-safe-current" "$conversation_b" "PRIVATE-RETIREMENT-LOSING-MESSAGE")"
   request_b="$(jq -r '.request_id' <<<"$response_b")"
   jq -e --arg conversation "$conversation_b" '.status == "failed" and .conversation_id == $conversation and .conversation_disposition == "non_current" and .selected_model == "not_called"' <<<"$response_b" >/dev/null
@@ -2762,6 +2817,7 @@ run_conversation_retirement_scenario() {
   local response_c request_c provider_c counts_c state_c
   provider_post "/fixture/reset" '{}'
   conversation_c="$(create_conversation "$owner_c" "$client_c")"
+  configure_surface_permission "$owner_c" "$surface_c" true true false
   seed_c="$(run_distinct_client_chat "$owner_c" "$client_c" "$surface_c" "$conversation_c" "neutral active retirement seed")"
   jq -e '.status == "ok"' <<<"$seed_c" >/dev/null
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_c' AND id='$conversation_c';" >/dev/null
@@ -2770,6 +2826,7 @@ run_conversation_retirement_scenario() {
   session_c="$(jq -r '.runtime_session.runtime_session_id' <<<"$active_c")"
   turn_c="$(jq -r '.runtime_turn.runtime_turn_id' <<<"$active_c")"
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$owner_c" "surface-retirement-active-loser" true true false
   response_c="$(run_distinct_client_chat "$owner_c" "client-retirement-active-loser" "surface-retirement-active-loser" "$conversation_c" "PRIVATE-ACTIVE-LOSER")"
   request_c="$(jq -r '.request_id' <<<"$response_c")"
   jq -e '.status == "degraded" and (has("conversation_disposition") | not) and .selected_model == "not_called"' <<<"$response_c" >/dev/null
@@ -2789,6 +2846,7 @@ run_conversation_retirement_scenario() {
     surface_state="surface-retirement-$state_tag"
     conversation_state="$(create_conversation "$owner_state" "$client_state")"
     provider_post "/fixture/reset" '{}'
+    configure_surface_permission "$owner_state" "$surface_state" true true false
     seed_state="$(run_distinct_client_chat "$owner_state" "$client_state" "$surface_state" "$conversation_state" "neutral $state_tag retirement seed")"
     jq -e '.status == "ok"' <<<"$seed_state" >/dev/null
     psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_state' AND id='$conversation_state';" >/dev/null
@@ -2797,6 +2855,7 @@ run_conversation_retirement_scenario() {
     [ "$state_tag" = "inconsistent" ] && inconsistent=true
     runtime_set_thread_projection "$owner_state" "$conversation_state" "$([ "$state_tag" = "inconsistent" ] && echo idle || echo "$state_tag")" "$inconsistent"
     provider_post "/fixture/reset" '{}'
+    configure_surface_permission "$owner_state" "surface-retirement-$state_tag-loser" true true false
     response_state="$(run_distinct_client_chat "$owner_state" "client-retirement-$state_tag-loser" "surface-retirement-$state_tag-loser" "$conversation_state" "PRIVATE-$state_tag-LOSER")"
     request_state="$(jq -r '.request_id' <<<"$response_state")"
     jq -e '.status == "failed" and (has("conversation_disposition") | not) and .selected_model == "not_called"' <<<"$response_state" >/dev/null
@@ -2818,6 +2877,7 @@ run_conversation_retirement_scenario() {
   local race_message_g close_body_g close_file_g close_status_g after_g cancel_g
   provider_post "/fixture/reset" '{}'
   conversation_g="$(create_conversation "$owner_g" "$client_g")"
+  configure_surface_permission "$owner_g" "surface-retirement-cas" true true false
   seed_g="$(run_distinct_client_chat "$owner_g" "$client_g" "surface-retirement-cas" "$conversation_g" "neutral cas retirement seed")"
   jq -e '.status == "ok"' <<<"$seed_g" >/dev/null
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_g' AND id='$conversation_g';" >/dev/null
@@ -2844,6 +2904,7 @@ run_conversation_retirement_scenario() {
   local conversation_h seed_h durable_h thread_h reserve_h response_h request_h provider_h
   provider_post "/fixture/reset" '{}'
   conversation_h="$(create_conversation "$owner_h" "$client_h")"
+  configure_surface_permission "$owner_h" "surface-retirement-restart" true true false
   seed_h="$(run_distinct_client_chat "$owner_h" "$client_h" "surface-retirement-restart" "$conversation_h" "neutral restart retirement seed")"
   jq -e '.status == "ok"' <<<"$seed_h" >/dev/null
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_h' AND id='$conversation_h';" >/dev/null
@@ -2856,6 +2917,7 @@ run_conversation_retirement_scenario() {
   docker compose -f "$COMPOSE" up -d --wait runtime >/dev/null
   [ "$(runtime_thread_snapshot "$owner_h" "$conversation_h" | jq -r '.reservation_count')" = "1" ]
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$owner_h" "surface-retirement-restart-current" true true false
   response_h="$(run_distinct_client_chat "$owner_h" "client-retirement-restart-current" "surface-retirement-restart-current" "$conversation_h" "PRIVATE-RESTART-LOSER")"
   request_h="$(jq -r '.request_id' <<<"$response_h")"
   jq -e '.conversation_disposition == "non_current" and .selected_model == "not_called"' <<<"$response_h" >/dev/null
@@ -2867,11 +2929,13 @@ run_conversation_retirement_scenario() {
   local owner_i="owner-retirement-isolated-a" conversation_i seed_i response_i request_i provider_i
   provider_post "/fixture/reset" '{}'
   conversation_i="$(create_conversation "$owner_i" "client-retirement-isolated-a")"
+  configure_surface_permission "$owner_i" "surface-retirement-isolated-a" true true false
   seed_i="$(run_distinct_client_chat "$owner_i" "client-retirement-isolated-a" "surface-retirement-isolated-a" "$conversation_i" "neutral isolation retirement seed")"
   jq -e '.status == "ok"' <<<"$seed_i" >/dev/null
   psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days' WHERE owner_id='$owner_i' AND id='$conversation_i';" >/dev/null
   runtime_backdate_thread "$owner_i" "$conversation_i" "$old_eight_days"
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "owner-retirement-isolated-b" "surface-retirement-isolated-b" true true false
   response_i="$(run_distinct_client_chat "owner-retirement-isolated-b" "client-retirement-isolated-b" "surface-retirement-isolated-b" "$conversation_i" "PRIVATE-ISOLATION-LOSER")"
   request_i="$(jq -r '.request_id' <<<"$response_i")"
   jq -e '.status == "failed" and (has("conversation_disposition") | not) and .selected_model == "not_called"' <<<"$response_i" >/dev/null
@@ -2894,6 +2958,7 @@ run_conversation_retirement_scenario() {
   for ordinal in $(seq 1 5); do
     conversation_j="$(create_conversation "$owner_j" "client-retirement-cleanup-$ordinal")"
     old_conversations_j+=("$conversation_j")
+    configure_surface_permission "$owner_j" "surface-retirement-cleanup-$ordinal" true true false
     run_distinct_client_chat "$owner_j" "client-retirement-cleanup-$ordinal" "surface-retirement-cleanup-$ordinal" "$conversation_j" "neutral cleanup seed $ordinal" >/dev/null
     psql_exec -c "UPDATE conversations SET updated_at=now() - interval '8 days $ordinal minutes' WHERE owner_id='$owner_j' AND id='$conversation_j';" >/dev/null
     runtime_backdate_thread "$owner_j" "$conversation_j" "$old_eight_days"
@@ -2901,6 +2966,7 @@ run_conversation_retirement_scenario() {
   first_j="${old_conversations_j[0]}"
   runtime_set_thread_projection "$owner_j" "$first_j" "unavailable"
   provider_post "/fixture/reset" '{}'
+  configure_surface_permission "$owner_j" "surface-retirement-cleanup-current" true true false
   response_j="$(run_omitted_chat "$owner_j" "client-retirement-cleanup-current" "surface-retirement-cleanup-current" "neutral create after cleanup")"
   request_j="$(jq -r '.request_id' <<<"$response_j")"
   current_j="$(jq -r '.conversation_id' <<<"$response_j")"
@@ -2936,6 +3002,174 @@ run_conversation_retirement_scenario() {
   provider_post "/fixture/reset" '{}'
 }
 
+run_surface_permission_scenario() {
+  local tag owner conversation seed response request before after trace session diagnostics new
+  local raw="Check the logs first. I'm always listening. If you'd like, I can help. Save the backup. Extra optional detail."
+  for tag in absent deny allow revoke; do
+    owner="owner-surface-permission-$tag"
+    provider_post /fixture/reset '{}' >/dev/null
+    queue_provider_answer "Check the logs first." >/dev/null
+    seed="$(run_omitted_chat "$owner" "telegram:permission-$tag" telegram "What does this function do?")"
+    conversation="$(jq -er .conversation_id <<<"$seed")"
+    jq -e '.status == "ok"' <<<"$seed" >/dev/null
+    # First requested help had no retained candidate and no permission record.
+    # Later ordinary same-surface continuity uses actual CR participation.
+    queue_provider_answer "Check the logs first." >/dev/null
+    response="$(run_distinct_client_chat "$owner" "telegram:fresh-$tag" telegram "$conversation" "What does this function do?")"
+    jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$response" >/dev/null
+    if [ "$tag" = allow ] || [ "$tag" = revoke ]; then
+      configure_surface_permission "$owner" alexa true false false
+    elif [ "$tag" = deny ]; then
+      configure_surface_permission "$owner" alexa false false false
+    fi
+    before="$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")"
+    provider_post /fixture/reset '{}' >/dev/null
+    queue_provider_answer "Check the logs first." >/dev/null
+    response="$(run_distinct_client_chat "$owner" "alexa:permission-$tag" alexa "$conversation" "What does this function do?")"
+    request="$(jq -er .request_id <<<"$response")"
+    if [ "$tag" = allow ] || [ "$tag" = revoke ]; then
+      jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$response" >/dev/null
+      [ "$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
+      if [ "$tag" = revoke ]; then
+        configure_surface_permission "$owner" alexa false false false
+        before="$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")"
+        response="$(run_distinct_client_chat "$owner" alexa:revoked alexa "$conversation" "What does this function do?")"
+        request="$(jq -er .request_id <<<"$response")"
+      else
+        continue
+      fi
+    fi
+    jq -e '.status == "failed" and .selected_model == "not_called" and .sources == []' <<<"$response" >/dev/null
+    [ "$before" = "$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")" ]
+    [ "$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length')" = 0 ]
+  done
+
+  for tag in absent allow; do
+    owner="owner-surface-omitted-$tag"
+    provider_post /fixture/reset '{}' >/dev/null
+    queue_provider_answer "Permission private retained sentinel." >/dev/null
+    seed="$(run_omitted_chat "$owner" "telegram:omitted-$tag" telegram "What does this function do?")"
+    conversation="$(jq -er .conversation_id <<<"$seed")"
+    if [ "$tag" = allow ]; then
+      configure_surface_permission "$owner" alexa true false false
+    fi
+    queue_provider_answer "Check the logs first." >/dev/null
+    response="$(run_omitted_chat "$owner" "alexa:omitted-$tag" alexa "What does this function do?")"
+    request="$(jq -er .request_id <<<"$response")"
+    new="$(jq -er .conversation_id <<<"$response")"
+    jq -e '.status == "ok"' <<<"$response" >/dev/null
+    trace="$(fetch_trace "$request")"
+    if [ "$tag" = allow ]; then
+      [ "$new" = "$conversation" ]
+      jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution.outcome == "resume"' <<<"$trace" >/dev/null
+    else
+      [ "$new" != "$conversation" ]
+      jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+        | .outcome == "create_new" and (.reason_codes | index("surface_permission_absent") != null)' <<<"$trace" >/dev/null
+      ! fetch_provider_calls "$request" | grep -Fq "Permission private retained sentinel."
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$new';")" = 2 ]
+    fi
+  done
+
+  for tag in driving opt_out; do
+    owner="owner-presence-output-$tag"
+    configure_surface_permission "$owner" web true false false
+    if [ "$tag" = opt_out ]; then
+      curl -fsS -X PUT http://127.0.0.1:14321/v1/proactive/preferences \
+        -H 'X-API-Key: smoke-memory-key' -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg owner "$owner" '{owner_id:$owner,enabled:false,allowed_surfaces_json:[],rule_prefs_json:{}}')" >/dev/null
+    fi
+    provider_post /fixture/reset '{}' >/dev/null
+    queue_provider_answer "$raw" >/dev/null
+    provider_post /fixture/fail-next-primary '{}' >/dev/null
+    response="$(co_post "$(jq -nc --arg owner "$owner" \
+      '{owner_id:$owner,client_id:"web:presence",surface:"web",sensitivity:"private",
+        messages:[{role:"user",content:"What does this function do?"}],
+        surface_context:{active_task_mode:true,verbosity_target:"short"}}')")"
+    request="$(jq -er .request_id <<<"$response")"
+    conversation="$(jq -er .conversation_id <<<"$response")"
+    jq -e '.status == "degraded" and .answer == "Check the logs first. Save the backup."' <<<"$response" >/dev/null
+    assert_persisted_answer_matches "$conversation" "$request" "$(jq -r .answer <<<"$response")"
+    trace="$(fetch_trace "$request")"
+    jq -e --arg state "$([ "$tag" = opt_out ] && echo do_not_intrude || echo driving_or_active_task)" '
+      .retrieval.prompt_assembly.runtime_presence.presence_state == $state
+      and .retrieval.prompt_assembly.runtime_presence.required_help_allowed == true
+      and .retrieval.prompt_assembly.runtime_presence.proactive_output_suppressed == true
+      and .retrieval.prompt_assembly.runtime_presence_enforcement.action_taken == "filtered"
+      and .retrieval.prompt_assembly.runtime_presence_enforcement.length_clamped == true
+      and .retrieval.prompt_assembly.runtime_presence_enforcement.removed_segment_count == 2
+      and (.retrieval.prompt_assembly.runtime_presence_enforcement.reason_codes
+        | (index("prohibited_presence_claim") != null) and (index("proactive_offer_suppressed") != null))
+    ' <<<"$trace" >/dev/null
+    [ "$(fetch_provider_calls "$request" | jq '[.calls[] | select(.kind == "chat")] | length')" = 2 ]
+    session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    jq -e '[.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length == 0' <<<"$diagnostics" >/dev/null
+  done
+  echo "Surface permission: supplied_allow=true supplied_absent_rejected=true supplied_denied_rejected=true revocation=true same_surface_unconfigured=true omitted_absent=create_new omitted_allowed=resume retained_copy=false"
+  echo "Runtime presence output: driving=true explicit_opt_out=true fallback_calls=2 required_help=true persisted_returned_equal=true prohibited_claims_removed=true"
+}
+
+run_ambient_presence_scenario() {
+  local tag owner conversation session response permission ambient mode diagnostics
+  for tag in allowed absent denied unavailable no_mode active active_task opt_out low_attention; do
+    owner="owner-ambient-$tag"
+    conversation="$(create_conversation "$owner" "web:ambient-$tag")"
+    mode=ambient_listening
+    [ "$tag" != no_mode ] || mode=ordinary
+    session="$(cr_post /v1/runtime/sessions/resolve "$(jq -nc \
+      --arg owner "$owner" --arg conversation "$conversation" --arg mode "$mode" \
+      '{request_id:"ambient-session",owner_id:$owner,conversation_id:$conversation,surface:"web",active_mode:$mode}')" | jq -er .runtime_session.runtime_session_id)"
+    permission=configured
+    ambient=true
+    case "$tag" in
+      absent) permission=unconfigured; ambient=false ;;
+      denied) ambient=false ;;
+      unavailable) permission=unavailable; ambient=false ;;
+    esac
+    if [ "$tag" = low_attention ]; then
+      cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+        '{request_id:"ambient-pause",owner_id:$owner,conversation_id:$conversation,surface:"web",
+          updates:{attention_focus:{status:"paused"}}}')" >/dev/null
+    fi
+    if [ "$permission" = configured ]; then
+      configure_surface_permission "$owner" web true false "$ambient"
+      local record
+      record="$(curl -fsS -G -H "X-API-Key: smoke-memory-key" \
+        --data-urlencode "owner_id=$owner" --data-urlencode 'surface=web' \
+        "http://127.0.0.1:14321/v1/presence/surface-permissions")"
+      jq -e --arg owner "$owner" --argjson ambient "$ambient" \
+        '.owner_id == $owner and .surface == "web" and .configured == true and .ambient_listening_allowed == $ambient' <<<"$record" >/dev/null
+    fi
+    if [ "$tag" = active ]; then
+      cr_post /v1/runtime/turns/start "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+        '{request_id:"ambient-current-turn",owner_id:$owner,conversation_id:$conversation,surface:"web"}')" >/dev/null
+    fi
+    response="$(cr_post /v1/runtime/presence/evaluate "$(jq -nc \
+      --arg owner "$owner" --arg conversation "$conversation" --arg session "$session" \
+      --arg permission "$permission" --argjson ambient "$ambient" --arg tag "$tag" \
+      '{request_id:"ambient-evaluate",owner_id:$owner,conversation_id:$conversation,surface:"web",
+        runtime_session_id:$session,runtime_turn_id:null,surface_permission_status:$permission,
+        proactive_presence_allowed:false,ambient_listening_allowed:$ambient,
+        active_task_mode:($tag=="active_task"),explicit_proactive_opt_out:($tag=="opt_out")}')")"
+    if [ "$tag" = allowed ]; then
+      jq -e '.result.presence_state == "ambient_listening" and .result.required_help_allowed == true' <<<"$response" >/dev/null
+    else
+      jq -e '.result.presence_state != "ambient_listening" and .result.required_help_allowed == true' <<<"$response" >/dev/null
+    fi
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    jq -e --argjson result "$(jq -c .result <<<"$response")" '
+      [.events[] | select(.event_type == "presence_evaluated")] | length == 1 and .[0].event_payload_json == $result' <<<"$diagnostics" >/dev/null
+    if [ "$tag" = active ]; then
+      local turn
+      turn="$(jq -er .active_turn.runtime_turn_id <<<"$diagnostics")"
+      cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$session" --arg turn "$turn" \
+        '{request_id:"ambient-complete",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"completed"}')" >/dev/null
+    fi
+  done
+  echo "Ambient presence: configured_permission_and_mode=true absence_denial_unavailable_no_mode_active_task_opt_out_low_attention_rejected=true no_capture_claim=true"
+}
+
 run_situated_presence_case() {
   local tag="$1" text="$2" expected_answer="$3" category="$4"
   local active_task="$5" allows_expansion="$6" expected_kind="$7"
@@ -2947,6 +3181,7 @@ run_situated_presence_case() {
   local conversation response request_id trace provider_calls session_id diagnostics thread counts
 
   conversation="$(create_conversation "$owner" "$client")"
+  configure_surface_permission "$owner" "$surface" true true false
   if [ "$response_mode" = "timing_clarification" ]; then
     test "$fail_primary" = "false"
     expected_status="degraded"
@@ -3449,6 +3684,7 @@ run_interrupted_delivery_scenario() {
   local running_deadline remaining running_ready=false running_failure=timeout
   provider_post "/fixture/reset" '{}'
   conversation="$(create_conversation "$owner" "$client")"
+  configure_surface_permission "$owner" "$surface" true true false
   provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
   payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" --arg surface "$surface" '{
     owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,sensitivity:"private",
@@ -3541,6 +3777,7 @@ PY_DIAGNOSTICS
   fi
   if [ "$tag" = contention ]; then
     loser_before="$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)"
+    configure_surface_permission "$owner" alexa true true false
     loser="$(run_distinct_client_chat "$owner" alexa:restart-loser alexa "$conversation" "neutral competing input")"
     assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
     [ "$loser_before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
@@ -3623,6 +3860,7 @@ SQL
   if [ "$tag" = contention ]; then
     assert_continuation_contention_loser "$owner" "$conversation" alexa:restart-loser "$loser"
     [ "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='failed' AND failure_code='interrupted';")" = 1 ]
+    configure_surface_permission "$owner" alexa true true false
     fresh="$(run_distinct_client_chat "$owner" alexa:restart-fresh alexa "$conversation" "What does this function do?")"
     jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$fresh" >/dev/null
     fresh_request="$(jq -r '.request_id' <<<"$fresh")"
@@ -3869,6 +4107,8 @@ run_continuation_conformance_scenario
 run_continuation_replacement_scenario
 run_continuation_admission_boundary_scenario
 run_continuation_failure_contention_scenario
+run_surface_permission_scenario
+run_ambient_presence_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
 echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
