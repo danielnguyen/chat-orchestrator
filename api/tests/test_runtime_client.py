@@ -3620,12 +3620,12 @@ async def test_presence_response_exact_key_shape(mutation):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["returning_after_gap"])
-async def test_presence_response_future_states_are_not_consumed(state):
+async def test_return_presence_without_matching_reason_is_not_consumed(state):
     transport = _FakeAsyncClient([_presence_response(presence_state=state)])
     client = RuntimeClient("http://runtime.local", None,
                            client_factory=_ClientFactory([transport]))
     await client.open()
-    with pytest.raises(RuntimeError, match="presence_response_unsupported_state"):
+    with pytest.raises(RuntimeError, match="presence_response_invalid"):
         await client.evaluate_presence(surface_permission_status="configured",
             proactive_presence_allowed=True, **_PRESENCE_SCOPE)
 
@@ -3636,6 +3636,8 @@ async def test_presence_response_future_states_are_not_consumed(state):
     ("available", "session_available", False),
     ("active_conversation", "thread_active", False),
     ("idle", "session_idle", False),
+    ("idle", "attention_idle", False),
+    ("returning_after_gap", "return_gap_elapsed", False),
     ("low_attention", "session_paused", False),
     ("low_attention", "attention_paused", False),
     ("driving_or_active_task", "session_active_task_mode", False),
@@ -3647,7 +3649,9 @@ async def test_presence_accepts_coherent_v1_states_and_transitions(
 ):
     response = _presence_response(
         presence_state=state, previous_presence_state=state, state_changed=False,
-        proactive_output_suppressed=suppressed or state not in {"available", "active_conversation"},
+        proactive_output_suppressed=(
+            suppressed or state not in {"available", "active_conversation", "returning_after_gap"}
+        ),
         required_help_allowed=state != "not_present",
         reason_codes=[reason] + (["proactive_suppression_requested"] if suppressed else []),
     )
@@ -3998,3 +4002,108 @@ async def test_presence_consumer_accepts_permitted_ambient_result():
         proactive_presence_allowed=True, ambient_listening_allowed=True,
     ) == response
     await client.close()
+
+
+def _return_snapshot(**updates):
+    return {
+        "schema_version": "runtime-return-after-gap.v1",
+        "status": "eligible",
+        "threshold_seconds": 300,
+        "threshold_met": True,
+        "prior_thread_state": "idle",
+        "prior_thread_revision": 2,
+        "prior_last_activity_at": "2026-01-01T00:00:00+00:00",
+        "elapsed_seconds": 301,
+        "prior_terminal_turn_id": "rtturn_0123456789abcdef",
+        "prior_continuation_state": "deferred_expansion",
+        "reason_code": "return_gap_elapsed",
+        **updates,
+    }
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"schema_version": "wrong"},
+        {"status": "unknown"},
+        {"threshold_met": "true"},
+        {"threshold_seconds": 301},
+        {"elapsed_seconds": -1},
+        {"elapsed_seconds": True},
+        {"prior_terminal_turn_id": "bad"},
+        {"prior_thread_state": "active"},
+        {"prior_last_activity_at": "2026-01-01T00:00:00"},
+        {"prior_continuation_state": "unknown"},
+        {"threshold_met": False},
+        {"status": "below_threshold"},
+        {"extra": "PRIVATE"},
+        {"prior_thread_revision": True},
+    ],
+)
+def test_return_snapshot_is_strict_and_co_does_not_recalculate(updates):
+    from clients.runtime import validate_return_snapshot
+
+    with pytest.raises(RuntimeError, match="^runtime_return_snapshot_invalid$"):
+        validate_return_snapshot(_return_snapshot(**updates))
+
+
+def test_return_snapshot_preserves_cr_fact_without_local_elapsed_calculation():
+    from clients.runtime import validate_return_snapshot
+
+    assert validate_return_snapshot(_return_snapshot()) == _return_snapshot()
+    assert (
+        validate_return_snapshot(
+            _return_snapshot(
+                status="below_threshold",
+                threshold_met=False,
+                elapsed_seconds=299,
+                reason_code="return_gap_below_threshold",
+            )
+        )["status"]
+        == "below_threshold"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [True, False])
+async def test_start_turn_validates_exact_return_snapshot_once(valid):
+    client = RuntimeClient("http://runtime", None)
+    calls = []
+
+    async def post(path, *, json):
+        calls.append(path)
+        return {
+            "runtime_session": {
+                "runtime_session_id": "rtsession_1",
+                "owner_id": "owner",
+                "conversation_id": "thread",
+                "surface": "web",
+            },
+            "runtime_turn": {
+                "runtime_turn_id": "rtturn_1",
+                "runtime_session_id": "rtsession_1",
+                "input_message_id": None,
+                "turn_status": "received",
+            },
+            "event": {
+                "runtime_session_id": "rtsession_1",
+                "runtime_turn_id": "rtturn_1",
+                "event_type": "turn_started",
+                "event_payload_json": {
+                    "return_after_gap": _return_snapshot(threshold_met=True if valid else "true")
+                },
+            },
+        }
+
+    client._post = post
+    if valid:
+        response = await client.start_turn(
+            request_id="current", owner_id="owner", conversation_id="thread", surface="web"
+        )
+        assert response["event"]["event_payload_json"]["return_after_gap"] == _return_snapshot()
+    else:
+        with pytest.raises(RuntimeError, match="runtime_return_snapshot_invalid"):
+            await client.start_turn(
+                request_id="current", owner_id="owner", conversation_id="thread", surface="web"
+            )
+    assert calls == ["/v1/runtime/turns/start"]

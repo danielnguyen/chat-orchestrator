@@ -37853,6 +37853,9 @@ async def test_timing_provider_policies_are_consumed_after_upstream_authority(tm
     assert trace["runtime_timing"]["result"]["timing_policy"] == policy
     assert trace["runtime_timing"]["scope"]["runtime_turn_id"] == "rtturn_1"
     assert trace["runtime_timing"]["inputs"]["continuation_timing_policy"] is None
+    assert runtime.turn_complete_calls[-1]["continuation_state"] == (
+        trace["runtime_timing"]["result"]["continuation_state"]
+    )
     if policy == "defer_expansion":
         shape = trace["response_shape"]["resolved_shape"]
         assert shape["allows_expansion"] is False
@@ -39154,3 +39157,197 @@ async def test_runtime_none_create_failure_never_substitutes_retained_context(tm
     assert provider.calls == memory.added_messages == memory.retrieve_calls == []
     assert memory.claim_record_calls == getattr(memory, "work_calls", []) == []
     assert "PRIVATE" not in str(result)
+
+
+def _return_admission_snapshot(**updates):
+    return {
+        "schema_version": "runtime-return-after-gap.v1",
+        "status": "eligible",
+        "threshold_seconds": 300,
+        "threshold_met": True,
+        "prior_thread_state": "idle",
+        "prior_thread_revision": 2,
+        "prior_last_activity_at": "2026-01-01T00:00:00+00:00",
+        "elapsed_seconds": 301,
+        "prior_terminal_turn_id": "rtturn_0123456789abcdef",
+        "prior_continuation_state": "deferred_expansion",
+        "reason_code": "return_gap_elapsed",
+        **updates,
+    }
+
+
+class ReturnRuntime(FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.restraint_response["result"]["retrieval_suppressed"] = False
+
+    async def start_turn(self, **kwargs):
+        response = await super().start_turn(**kwargs)
+        response["event"] = {
+            "runtime_session_id": response["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": response["runtime_turn"]["runtime_turn_id"],
+            "event_type": "turn_started",
+            "event_payload_json": {
+                "request_id": kwargs["request_id"],
+                "return_after_gap": _return_admission_snapshot(),
+            },
+        }
+        return response
+
+    async def evaluate_presence(self, **kwargs):
+        response = await super().evaluate_presence(**kwargs)
+        reasons = ["return_gap_elapsed"]
+        if kwargs.get("proactive_output_suppressed"):
+            reasons.append("proactive_suppression_requested")
+        permission = kwargs.get("surface_permission_status", "configured")
+        if permission != "configured" or not kwargs.get("proactive_presence_allowed", True):
+            reasons.append(
+                {
+                    "unconfigured": "surface_permission_unconfigured",
+                    "unavailable": "surface_permission_unavailable",
+                    "configured": "surface_proactive_denied",
+                }[permission]
+            )
+        response["result"].update(
+            presence_state="returning_after_gap",
+            reason_codes=reasons,
+            proactive_output_suppressed=len(reasons) > 1,
+        )
+        return response
+
+
+class ReturnMemoryStore(FakeMemoryStore):
+    def __init__(self, *, invalid=None):
+        super().__init__()
+        self.invalid = invalid
+
+    async def retrieve_bundle(self, **kwargs):
+        result = await super().retrieve_bundle(**kwargs)
+        item = {
+            "owner_id": "owner",
+            "message_id": "12345678-1234-1234-1234-123456789abc",
+            "conversation_id": kwargs["conversation_id"],
+            "role": "assistant",
+            "evidence_role": "canonical",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "content": "The prior bounded response explained the backup procedure.",
+            "source_ref": {"ref_type": "message", "ref_id": "12345678-1234-1234-1234-123456789abc"},
+        }
+        if self.invalid == "missing":
+            result["bundle"]["recent"] = []
+        else:
+            if self.invalid:
+                item.update(self.invalid)
+            result["bundle"]["recent"] = [item]
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        {"role": "user"},
+        {"evidence_role": "unverified"},
+        {"conversation_id": "foreign"},
+        {"source_ref": {"ref_type": "artifact", "ref_id": "bad"}},
+        {"created_at": "bad"},
+        {"message_id": "bad"},
+    ],
+)
+async def test_deferred_return_missing_canonical_context_stops_without_provider_action(
+    tmp_path, invalid
+):
+    memory = ReturnMemoryStore(invalid=invalid)
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        policy="resume_previous_thread",
+        runtime=ReturnRuntime(),
+        memory=memory,
+    )
+    assert out["selected_model"] == "not_called"
+    assert "enough retained context" in out["answer"]
+    assert not provider.calls
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert not memory.claim_record_calls
+    assert len(runtime.timing_calls) == 1
+    assert len(runtime.turn_complete_calls) == 1
+    assert memory.retrieve_calls[0]["retrieval"]["scope"] == "conversation"
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["return_resume_context"]["status"] == "unavailable"
+    assert "backup procedure" not in json.dumps(trace["return_resume_context"])
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,text",
+    [
+        ("resume_previous_thread", "tell me more?"),
+        ("answer_now", "What is 2+2?"),
+        ("answer_now", "What were we discussing?"),
+    ],
+)
+async def test_return_uses_canonical_prior_context_and_never_instructs_automatic_recap(
+    tmp_path, policy, text
+):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        policy=policy,
+        runtime=ReturnRuntime(),
+        memory=ReturnMemoryStore(),
+        payload=_base_payload(
+            conversation_id="conv-1", messages=[{"role": "user", "content": text}]
+        ),
+    )
+    assert len(provider.calls) == len(runtime.timing_calls) == 1
+    assert out["answer"] == "hello"
+    messages = provider.calls[0]["messages"]
+    assert any("Do not automatically recap" in m["content"] for m in messages)
+    assert any("backup procedure" in m["content"] for m in messages if m["role"] == "assistant")
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    context = trace["turn_state"]["return_thread_context"]
+    assert context["source_message_ids"] == ["12345678-1234-1234-1234-123456789abc"]
+    assert "backup procedure" not in json.dumps(context)
+    if policy == "resume_previous_thread":
+        assert trace["return_resume_context"]["status"] == "ready"
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "malformed"])
+async def test_deferred_return_retrieval_failure_is_bounded_and_never_replayed(tmp_path, failure):
+    class BrokenReturnMemory(ReturnMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            self.retrieve_calls.append(kwargs)
+            if failure == "timeout":
+                raise httpx.ReadTimeout("PRIVATE-RETRIEVAL-ERROR")
+            return None
+
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy="resume_previous_thread", runtime=ReturnRuntime(),
+        memory=BrokenReturnMemory(),
+    )
+    assert "enough retained context" in out["answer"]
+    assert out["selected_model"] == "not_called"
+    assert not provider.calls and not memory.claim_record_calls
+    assert len(memory.retrieve_calls) == len(runtime.timing_calls) == 1
+    assert "PRIVATE-RETRIEVAL-ERROR" not in json.dumps(memory.trace_calls)
+    assert runtime.timing_calls[0]["dependency_state"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_continuation_context_refinement_narrows_scope_without_return_authority(tmp_path):
+    runtime = FakeRuntime()
+    runtime.restraint_response["result"].update(
+        retrieval_suppressed=False, reason_summary=["continuation_context_requested"],
+    )
+    _, runtime, provider, memory = await _run_timing_turn(tmp_path, runtime=runtime)
+    assert memory.retrieve_calls[0]["retrieval"]["scope"] == "conversation"
+    assert len(provider.calls) == len(runtime.timing_calls) == 1
+    assert memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+        "runtime_timing"]["result"]["timing_policy"] == "answer_now"

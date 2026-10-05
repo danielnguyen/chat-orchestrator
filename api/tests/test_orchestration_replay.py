@@ -1192,7 +1192,7 @@ async def test_presence_required_help_and_guidance_reach_every_provider_attempt(
     (None, lambda r: r.update(owner_id="PRIVATE"), "context_mismatch"),
     (None, lambda r: r["result"].update(private="PRIVATE"), "response_invalid"),
     (None, lambda r: r["result"].update(presence_state="ambient_listening"), "response_invalid"),
-    (None, lambda r: r["result"].update(presence_state="returning_after_gap"), "unsupported_state"),
+    (None, lambda r: r["result"].update(presence_state="returning_after_gap"), "response_invalid"),
     (None, lambda r: r["result"].update(presence_state="do_not_intrude"), "response_invalid"),
 ])
 async def test_presence_dependency_failure_preserves_help_without_inferred_state(
@@ -1549,3 +1549,29 @@ async def test_situated_final_enforcement_replay_is_bounded_and_persisted(monkey
     assert len([call for call in calls if call["name"] == "provider_attempt"]) == (
         2 if category == "provider_fallback" else 1
     )
+
+
+@pytest.mark.asyncio
+async def test_return_resume_provenance_is_structural_and_persistence_is_exact(tmp_path):
+    from test_orchestrate_flow import ReturnMemoryStore, ReturnRuntime, _run_timing_turn
+
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        policy="resume_previous_thread",
+        runtime=ReturnRuntime(),
+        memory=ReturnMemoryStore(),
+    )
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    provenance = {
+        "snapshot": trace["turn_state"]["return_after_gap"],
+        "context": trace["return_resume_context"],
+    }
+    encoded = json.dumps(provenance)
+    assert "backup procedure" not in encoded
+    assert "current_user_text" not in encoded and "content" not in provenance["context"]
+    assert provenance["context"]["source_count"] == 1
+    assert provenance["snapshot"]["threshold_seconds"] == 300
+    assert len(runtime.timing_calls) == len(provider.calls) == 1
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]

@@ -30,6 +30,7 @@ from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
     validate_history_followup_policy_response,
     validate_presence_response,
+    validate_return_snapshot,
     validate_timing_request,
     validate_timing_response,
 )
@@ -5146,6 +5147,75 @@ def _message_ids_equivalent(actual: Any, expected: str) -> bool:
         return False
 
 
+def _return_resume_context(
+    snapshot: Any,
+    timing: Any,
+    bundle: Any,
+    conversation_id: str,
+) -> dict[str, Any]:
+    if not (
+        isinstance(snapshot, dict)
+        and snapshot.get("status") == "eligible"
+        and snapshot.get("prior_continuation_state") == "deferred_expansion"
+        and isinstance(timing, dict)
+        and timing.get("timing_policy") == "resume_previous_thread"
+    ):
+        return {"status": "not_requested"}
+    result = {
+        "status": "unavailable",
+        "prior_runtime_turn_id": snapshot["prior_terminal_turn_id"],
+        "prior_continuation_state": "deferred_expansion",
+        "source_message_ids": [],
+        "source_count": 0,
+        "conversation_id": conversation_id,
+        "reason_code": "retained_context_unavailable",
+    }
+    message_id = _canonical_prior_assistant_id(bundle, conversation_id)
+    if message_id:
+        result.update(
+            status="ready",
+            source_message_ids=[message_id],
+            source_count=1,
+            reason_code="canonical_prior_assistant",
+        )
+    return result
+
+
+def _canonical_prior_assistant_id(bundle: Any, conversation_id: str) -> str | None:
+    if not isinstance(bundle, dict) or bundle.get("conversation_id") != conversation_id:
+        return None
+    material = bundle.get("bundle")
+    if not isinstance(material, dict):
+        return None
+    recent = material.get("recent")
+    if not isinstance(recent, list):
+        return None
+    valid = []
+    for item in recent:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("source_ref")
+        try:
+            message_id = item.get("message_id")
+            if str(UUID(message_id)) != message_id:
+                continue
+            created = datetime.fromisoformat(item.get("created_at"))
+            if created.tzinfo is None or created.utcoffset() is None:
+                continue
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if (
+            item.get("conversation_id") == conversation_id
+            and item.get("role") == "assistant"
+            and item.get("evidence_role") == "canonical"
+            and isinstance(ref, dict)
+            and ref.get("ref_type") == "message"
+            and ref.get("ref_id") == message_id
+            and isinstance(item.get("content"), str)
+            and item["content"].strip()
+        ):
+            valid.append((created, message_id))
+    return max(valid)[1] if valid else None
 def _validate_started_runtime_turn(
     response: Any,
     *,
@@ -5192,6 +5262,12 @@ def _validate_started_runtime_turn(
             or event.get("event_type") != "turn_started"
         ):
             raise RuntimeError("runtime_turn_response_context_mismatch")
+    if isinstance(event, dict):
+        event_payload = event.get("event_payload_json")
+        if "event_payload_json" in event and not isinstance(event_payload, dict):
+            raise RuntimeError("runtime_turn_response_invalid")
+        if isinstance(event_payload, dict) and "return_after_gap" in event_payload:
+            validate_return_snapshot(event_payload["return_after_gap"])
     return response
 
 
@@ -5259,6 +5335,9 @@ async def _start_runtime_turn(
         "input_message_id": turn.get("input_message_id"),
         "turn_status": turn.get("turn_status"),
     }
+    event_payload = (response.get("event") or {}).get("event_payload_json") or {}
+    if "return_after_gap" in event_payload:
+        trace["return_after_gap"] = validate_return_snapshot(event_payload["return_after_gap"])
     if expected_thread_revision is not None:
         trace["expected_thread_revision"] = expected_thread_revision
     return response, trace
@@ -5349,6 +5428,8 @@ async def _complete_runtime_turn(
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
             turn_status=turn_status,
+            **({"continuation_state": turn_state_trace["continuation_state"]}
+               if isinstance(turn_state_trace.get("continuation_state"), str) else {}),
         )
         if isinstance(response, dict):
             turn = response.get("runtime_turn", {}) or {}
@@ -9355,6 +9436,7 @@ async def orchestrate_chat(
                 timing_trace.update(status="failed", failure_category=category)
                 return False
             timing_result = response["result"]
+            turn_state_trace["continuation_state"] = timing_result["continuation_state"]
             timing_trace.update(status="included", result=timing_result, omission_reason=None)
             return True
 
@@ -9501,6 +9583,8 @@ async def orchestrate_chat(
             response_shape, response_shape_trace
         )
         timing_consumed = False
+        return_retrieval_bundle = None
+        return_context_dependency_unavailable = False
 
         async def finish_timing_stop(answer: str, *, failed: bool) -> dict[str, Any]:
             failure_answer = "I couldn’t continue this turn safely. Please try again."
@@ -9541,6 +9625,8 @@ async def orchestrate_chat(
                 "restraint": restraint_trace, "situated_presence": situated_presence_trace,
                 "response_shape": response_shape_trace, "surface_presence": surface_presence_trace,
                 "history_followup": history_followup_trace,
+                "return_resume_context": turn_state_trace.get("return_resume_context",
+                                                              {"status": "not_requested"}),
                 "semantic_interpreter": (evidence_acquisition.semantic_interpreter
                                          if evidence_acquisition else {}),
             }
@@ -9578,7 +9664,8 @@ async def orchestrate_chat(
         ) -> dict[str, Any] | None:
             nonlocal timing_consumed, response_shape, response_shape_trace, response_shape_guidance
             if not await evaluate_timing_once(
-                specialized_classes, provider_dispatch=provider_dispatch, degraded=degraded,
+                specialized_classes, provider_dispatch=provider_dispatch,
+                degraded=degraded or return_context_dependency_unavailable,
             ):
                 return await timing_failure(timing_trace["failure_category"])
             if timing_result is None:
@@ -9595,6 +9682,16 @@ async def orchestrate_chat(
                     return await timing_failure("outcome_persistence_failed")
                 return None
             timing_consumed = True
+            resume_context = _return_resume_context(
+                turn_state_trace.get("return_after_gap"), timing_result,
+                return_retrieval_bundle, conversation_id,
+            )
+            turn_state_trace["return_resume_context"] = resume_context
+            if resume_context["status"] == "unavailable":
+                return await finish_timing_stop(
+                    "I don't have enough retained context to continue that safely. "
+                    "Tell me what you'd like me to continue from.", failed=False,
+                )
             if policy in stop_answers:
                 return await finish_timing_stop(stop_answers[policy], failed=policy == "close_turn")
             response_shape, response_shape_trace = clamp_response_shape_for_timing(
@@ -9614,6 +9711,10 @@ async def orchestrate_chat(
         local_only = sensitivity_local_only or profile_local_only
         cost_mode = routing_policy.get("cost_mode")
         latency_mode = routing_policy.get("latency_mode")
+        if ((turn_state_trace.get("return_after_gap") or {}).get("status") == "eligible"
+                or "continuation_context_requested" in (restraint or {}).get("reason_summary", [])):
+            effective_payload["retrieval"] = {**(effective_payload.get("retrieval") or {}),
+                                              "scope": "conversation"}
         retrieval_boundary = _apply_persona_containment_retrieval_boundary(
             retrieval=(
                 effective_payload.get("retrieval")
@@ -10169,15 +10270,32 @@ async def orchestrate_chat(
                         retrieval_boundary.blocked_memory_domains
                     )
 
-            retrieval_bundle = await memory_store.retrieve_bundle(
-                **retrieve_bundle_kwargs,
-            )
+            try:
+                retrieval_bundle = await memory_store.retrieve_bundle(**retrieve_bundle_kwargs)
+            except Exception:
+                snapshot = turn_state_trace.get("return_after_gap") or {}
+                if (snapshot.get("status") != "eligible"
+                        or snapshot.get("prior_continuation_state") != "deferred_expansion"):
+                    raise
+                return_context_dependency_unavailable = True
+                retrieval_bundle = _empty_retrieval_bundle(
+                    request_id=request_id, conversation_id=conversation_id,
+                    reason="retained_context_unavailable",
+                )
             retrieval_dispatch_trace["bms_retrieval_call_issued"] = True
             if (
                 not isinstance(retrieval_bundle, dict)
                 and mandatory_policy.containment_policy is None
             ):
-                raise RuntimeError("malformed_retrieval_response")
+                snapshot = turn_state_trace.get("return_after_gap") or {}
+                if (snapshot.get("status") != "eligible"
+                        or snapshot.get("prior_continuation_state") != "deferred_expansion"):
+                    raise RuntimeError("malformed_retrieval_response")
+                return_context_dependency_unavailable = True
+                retrieval_bundle = _empty_retrieval_bundle(
+                    request_id=request_id, conversation_id=conversation_id,
+                    reason="retained_context_unavailable",
+                )
             retrieval_bundle, result_boundary_trace = _apply_persona_containment_result_boundary(
                 retrieval_bundle=retrieval_bundle,
                 request_id=request_id,
@@ -10368,6 +10486,7 @@ async def orchestrate_chat(
             episode_response=episode_response,
         )
         retrieval_bundle = memory_recall_composition.retrieval_bundle
+        return_retrieval_bundle = retrieval_bundle
         memory_recall_trace = {
             **memory_recall_composition.trace,
             "dependency": memory_recall_dependency_trace,
@@ -10796,6 +10915,45 @@ async def orchestrate_chat(
             if privacy_prompt_suppressed
             else retrieval_bundle
         )
+        resume_context = _return_resume_context(
+            turn_state_trace.get("return_after_gap"),
+            timing_result,
+            provider_retrieval_bundle,
+            conversation_id,
+        )
+        turn_state_trace["return_resume_context"] = resume_context
+        if resume_context["status"] == "unavailable":
+            return await finish_timing_stop(
+                "I don't have enough retained context to continue that safely. "
+                "Tell me what you'd like me to continue from.",
+                failed=False,
+            )
+        if (turn_state_trace.get("return_after_gap") or {}).get("status") == "eligible":
+            prior_message_id = _canonical_prior_assistant_id(
+                provider_retrieval_bundle, conversation_id,
+            )
+            turn_state_trace["return_thread_context"] = {
+                "source_message_ids": [prior_message_id] if prior_message_id else [],
+                "source_count": 1 if prior_message_id else 0,
+                "conversation_id": conversation_id,
+            }
+        presence_result = runtime_presence_trace
+        if presence_result.get("presence_state") == "returning_after_gap":
+            guidance = (
+                "Answer the current request normally. Do not automatically recap because time "
+                "elapsed. Do not imply watching or listening while the user was away. Use prior "
+                "thread content only from the supplied authorized conversation context."
+            )
+            if resume_context["status"] == "ready":
+                guidance += (
+                    " Continue the deferred response only from that supplied retained context."
+                )
+            turn_state_trace["return_guidance_included"] = True
+            runtime_overlay = {
+                **(runtime_overlay or {}),
+                "role": "system",
+                "content": ((runtime_overlay or {}).get("content", "") + "\n" + guidance),
+            }
         provider_memory_recall_messages = (
             [] if privacy_prompt_suppressed else memory_recall_composition.prompt_messages
         )
@@ -11062,6 +11220,22 @@ async def orchestrate_chat(
                 ),
             )
             prompt.trace["runtime_presence"] = deepcopy(runtime_presence_trace)
+            prompt.trace["return_resume_context"] = deepcopy(resume_context)
+            if resume_context["status"] == "ready":
+                source_ids = set(resume_context["source_message_ids"])
+                source_text = [item["content"] for item in
+                               provider_retrieval_bundle["bundle"]["recent"]
+                               if item.get("message_id") in source_ids]
+                if not all(any(message["role"] == "assistant" and text in message["content"]
+                               for message in prompt.messages) for text in source_text):
+                    turn_state_trace["return_resume_context"].update(
+                        status="unavailable", source_message_ids=[], source_count=0,
+                        reason_code="retained_context_unavailable",
+                    )
+                    return await finish_timing_stop(
+                        "I don't have enough retained context to continue that safely. "
+                        "Tell me what you'd like me to continue from.", failed=False,
+                    )
             _preserve_interaction_governance_trace_inputs(
                 prompt.trace,
                 interaction_governance_trace,
