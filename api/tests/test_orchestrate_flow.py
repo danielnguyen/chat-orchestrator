@@ -1147,6 +1147,17 @@ class FakeRuntime:
                 "input_message_id": kwargs.get("input_message_id"),
             }
         )
+        response.setdefault("event", {
+            "runtime_session_id": session["runtime_session_id"],
+            "runtime_turn_id": turn["runtime_turn_id"], "event_type": "turn_started",
+            "event_payload_json": {"request_id": kwargs["request_id"], "turn_status": "received",
+                "input_message_id": kwargs.get("input_message_id"),
+                "return_after_gap": _return_admission_snapshot(
+                    status="not_applicable", threshold_met=False, elapsed_seconds=0,
+                    prior_thread_revision=0, prior_terminal_turn_id=None,
+                    prior_continuation_state=None, reason_code="no_completed_turn",
+                )},
+        })
         return response
 
     async def update_turn(self, **kwargs):
@@ -31200,6 +31211,14 @@ class ComposedJellyfinRuntime(CapabilityRuntime):
                 "input_message_id": kwargs.get("input_message_id"),
                 "turn_status": "received",
             },
+            "event": {"runtime_session_id": "rtsession_1", "runtime_turn_id": turn_id,
+                "event_type": "turn_started", "event_payload_json": {
+                    "request_id": kwargs["request_id"], "turn_status": "received",
+                    "input_message_id": kwargs.get("input_message_id"),
+                    "return_after_gap": _return_admission_snapshot(status="not_applicable",
+                        threshold_met=False, prior_thread_revision=0, elapsed_seconds=0,
+                        prior_terminal_turn_id=None, prior_continuation_state=None,
+                        reason_code="no_completed_turn")}},
         }
 
     async def action_authority(self, **kwargs):
@@ -39216,6 +39235,13 @@ class ReturnRuntime(FakeRuntime):
         return response
 
 
+    async def evaluate_timing(self, **kwargs):
+        response = await super().evaluate_timing(**kwargs)
+        if response["result"]["timing_policy"] == "resume_previous_thread":
+            response["result"]["reason_codes"][0] = "return_deferred_continuation"
+        return response
+
+
 class ReturnMemoryStore(FakeMemoryStore):
     def __init__(self, *, invalid=None):
         super().__init__()
@@ -39351,3 +39377,189 @@ async def test_continuation_context_refinement_narrows_scope_without_return_auth
     assert len(provider.calls) == len(runtime.timing_calls) == 1
     assert memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
         "runtime_timing"]["result"]["timing_policy"] == "answer_now"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["below_threshold", "not_applicable"])
+async def test_selector_resume_preserves_omitted_id_normal_continuation(tmp_path, status):
+    class SelectorRuntime(FakeRuntime):
+        async def start_turn(self, **kwargs):
+            response = await super().start_turn(**kwargs)
+            snapshot = response["event"]["event_payload_json"]["return_after_gap"]
+            if status == "below_threshold":
+                snapshot.update(
+                    status=status,
+                    elapsed_seconds=60,
+                    prior_terminal_turn_id="rtturn_0123456789abcdef",
+                    prior_continuation_state="none",
+                    reason_code="return_gap_below_threshold",
+                )
+            return response
+
+    runtime, memory = SelectorRuntime(), ReturnMemoryStore()
+    runtime.continuation_selection_response = {
+        "schema_version": "runtime-continuation-selection.v1",
+        "request_id": "rid-timing-flow",
+        "owner_id": "owner",
+        "surface": "dev",
+        "result": {
+            "outcome": "resume",
+            "timing_policy": "resume_previous_thread",
+            "selected_conversation_id": "conv-1",
+            "selected_thread_revision": 2,
+            "candidate_count": 1,
+            "eligible_candidate_count": 1,
+            "reason_codes": ["one_eligible_candidate"],
+            "policy_version": "continuation-selection.v1",
+        },
+    }
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    memory.list_conversation_response = {
+        "conversations": [
+            {
+                "conversation_id": "conv-1",
+                "owner_id": "owner",
+                "client_id": "old-client",
+                "title": None,
+                "lifecycle_state": "open",
+                "superseded_by_conversation_id": None,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-10-06T00:00:00+00:00",
+            }
+        ],
+        "next_cursor": None,
+    }
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        policy="resume_previous_thread",
+        runtime=runtime,
+        memory=memory,
+        payload=_base_payload(conversation_id=None),
+    )
+    assert out["conversation_id"] == "conv-1" and out["answer"] == "hello"
+    assert len(provider.calls) == len(runtime.timing_calls) == 1
+    assert runtime.timing_calls[0]["continuation_timing_policy"] == "resume_previous_thread"
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_timing"]["result"]["reason_codes"][0] == "continuation_resume"
+    assert trace["return_resume_context"] == {"status": "not_requested"}
+    assert trace["turn_state"]["return_after_gap"]["status"] == status
+    assert not memory.create_conversation_calls
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["below_threshold", "not_applicable", "other_state", "bad_prior_id"]
+)
+async def test_deferred_origin_requires_eligible_deferred_snapshot_before_provider(tmp_path, case):
+    class MismatchRuntime(ReturnRuntime):
+        async def start_turn(self, **kwargs):
+            response = await super().start_turn(**kwargs)
+            snapshot = response["event"]["event_payload_json"]["return_after_gap"]
+            if case == "below_threshold":
+                snapshot.update(
+                    status=case,
+                    threshold_met=False,
+                    elapsed_seconds=299,
+                    reason_code="return_gap_below_threshold",
+                )
+            elif case == "not_applicable":
+                snapshot.update(
+                    status=case,
+                    threshold_met=False,
+                    elapsed_seconds=0,
+                    prior_terminal_turn_id=None,
+                    prior_continuation_state=None,
+                    reason_code="no_completed_turn",
+                )
+            elif case == "other_state":
+                snapshot["prior_continuation_state"] = "none"
+            else:
+                snapshot["prior_terminal_turn_id"] = "invalid"
+            return response
+
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        policy="resume_previous_thread",
+        runtime=MismatchRuntime(),
+        memory=ReturnMemoryStore(),
+    )
+    assert not provider.calls and not memory.claim_record_calls
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert len(runtime.turn_complete_calls) <= 1
+    if case == "bad_prior_id":
+        assert out["status"] == "failed" and not getattr(runtime, "timing_calls", [])
+    else:
+        assert "enough retained context" in out["answer"]
+        assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "reasons", [None, [], ["ordinary_ready"], ["unknown"], "continuation_resume"]
+)
+def test_resume_context_defense_rejects_malformed_or_unknown_primary_reason(reasons):
+    from services.orchestrate import _return_resume_context
+
+    result = _return_resume_context(
+        _return_admission_snapshot(),
+        {"timing_policy": "resume_previous_thread", "reason_codes": reasons},
+        None,
+        "conv-1",
+    )
+    assert result["status"] == "unavailable"
+    assert result["reason_code"] == "retained_context_unavailable"
+
+
+def test_deferred_origin_missing_snapshot_is_unavailable_and_selector_uses_first_reason():
+    from services.orchestrate import _return_resume_context
+
+    assert (
+        _return_resume_context(
+            None,
+            {
+                "timing_policy": "resume_previous_thread",
+                "reason_codes": ["return_deferred_continuation", "dependency_degraded"],
+            },
+            None,
+            "conv-1",
+        )["status"]
+        == "unavailable"
+    )
+    assert (
+        _return_resume_context(
+            _return_admission_snapshot(
+                status="not_applicable",
+                threshold_met=False,
+                elapsed_seconds=0,
+                prior_terminal_turn_id=None,
+                prior_continuation_state=None,
+                reason_code="no_completed_turn",
+            ),
+            {
+                "timing_policy": "resume_previous_thread",
+                "reason_codes": ["continuation_resume", "dependency_degraded"],
+            },
+            None,
+            "conv-1",
+        )["status"]
+        == "not_requested"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reasons", [None, [], ["unknown"]])
+async def test_resume_unknown_or_missing_primary_reason_stops_generation(tmp_path, reasons):
+    class BadReasonRuntime(FakeRuntime):
+        async def evaluate_timing(self, **kwargs):
+            response = await super().evaluate_timing(**kwargs)
+            response["result"]["reason_codes"] = reasons
+            return response
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy="resume_previous_thread", runtime=BadReasonRuntime(),
+    )
+    assert out["selected_model"] == "not_called" and out["status"] == "failed"
+    assert not provider.calls and not memory.claim_record_calls
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1

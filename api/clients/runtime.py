@@ -1593,12 +1593,10 @@ class RuntimeClient:
                 or event.get("event_type") != "turn_started"
             ):
                 raise RuntimeError("runtime_turn_response_context_mismatch")
-        if isinstance(event, dict):
-            event_payload = event.get("event_payload_json")
-            if "event_payload_json" in event and not isinstance(event_payload, dict):
-                raise RuntimeError("runtime_turn_response_invalid")
-            if isinstance(event_payload, dict) and "return_after_gap" in event_payload:
-                validate_return_snapshot(event_payload["return_after_gap"])
+        event_payload = event.get("event_payload_json") if isinstance(event, dict) else None
+        if not isinstance(event_payload, dict) or "return_after_gap" not in event_payload:
+            raise RuntimeError("runtime_return_snapshot_invalid")
+        validate_return_snapshot(event_payload["return_after_gap"])
         return response
 
     async def resolve_thread(

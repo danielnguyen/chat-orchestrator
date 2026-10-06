@@ -5153,23 +5153,28 @@ def _return_resume_context(
     bundle: Any,
     conversation_id: str,
 ) -> dict[str, Any]:
-    if not (
-        isinstance(snapshot, dict)
-        and snapshot.get("status") == "eligible"
-        and snapshot.get("prior_continuation_state") == "deferred_expansion"
-        and isinstance(timing, dict)
-        and timing.get("timing_policy") == "resume_previous_thread"
-    ):
+    if not (isinstance(timing, dict) and timing.get("timing_policy") == "resume_previous_thread"):
         return {"status": "not_requested"}
     result = {
-        "status": "unavailable",
-        "prior_runtime_turn_id": snapshot["prior_terminal_turn_id"],
-        "prior_continuation_state": "deferred_expansion",
-        "source_message_ids": [],
-        "source_count": 0,
-        "conversation_id": conversation_id,
-        "reason_code": "retained_context_unavailable",
+        "status": "unavailable", "source_message_ids": [], "source_count": 0,
+        "conversation_id": conversation_id, "reason_code": "retained_context_unavailable",
     }
+    reasons = timing.get("reason_codes")
+    origin = reasons[0] if isinstance(reasons, list) and reasons else None
+    if origin == "continuation_resume":
+        return {"status": "not_requested"}
+    if origin != "return_deferred_continuation":
+        return result
+    try:
+        snapshot = validate_return_snapshot(snapshot)
+    except RuntimeError:
+        return result
+    if (snapshot["status"] != "eligible"
+            or snapshot["prior_continuation_state"] != "deferred_expansion"
+            or snapshot["prior_terminal_turn_id"] is None):
+        return result
+    result.update(prior_runtime_turn_id=snapshot["prior_terminal_turn_id"],
+                  prior_continuation_state="deferred_expansion")
     message_id = _canonical_prior_assistant_id(bundle, conversation_id)
     if message_id:
         result.update(
@@ -5262,12 +5267,10 @@ def _validate_started_runtime_turn(
             or event.get("event_type") != "turn_started"
         ):
             raise RuntimeError("runtime_turn_response_context_mismatch")
-    if isinstance(event, dict):
-        event_payload = event.get("event_payload_json")
-        if "event_payload_json" in event and not isinstance(event_payload, dict):
-            raise RuntimeError("runtime_turn_response_invalid")
-        if isinstance(event_payload, dict) and "return_after_gap" in event_payload:
-            validate_return_snapshot(event_payload["return_after_gap"])
+    event_payload = event.get("event_payload_json") if isinstance(event, dict) else None
+    if not isinstance(event_payload, dict) or "return_after_gap" not in event_payload:
+        raise RuntimeError("runtime_return_snapshot_invalid")
+    validate_return_snapshot(event_payload["return_after_gap"])
     return response
 
 

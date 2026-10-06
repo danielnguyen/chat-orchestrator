@@ -155,8 +155,30 @@ class BudgetRuntime:
                 "input_message_id": kwargs.get("input_message_id"),
                 "turn_status": "received",
             },
+            "event": {
+                "runtime_session_id": "session-budget",
+                "runtime_turn_id": "turn-budget",
+                "event_type": "turn_started",
+                "event_payload_json": {
+                    "request_id": kwargs["request_id"],
+                    "turn_status": "received",
+                    "input_message_id": kwargs.get("input_message_id"),
+                    "return_after_gap": {
+                        "schema_version": "runtime-return-after-gap.v1",
+                        "status": "not_applicable",
+                        "threshold_seconds": 300,
+                        "threshold_met": False,
+                        "prior_thread_state": "idle",
+                        "prior_thread_revision": 0,
+                        "prior_last_activity_at": "2026-01-01T00:00:00+00:00",
+                        "elapsed_seconds": 0,
+                        "prior_terminal_turn_id": None,
+                        "prior_continuation_state": None,
+                        "reason_code": "no_completed_turn",
+                    },
+                },
+            },
         }
-
     async def update_turn(self, **kwargs):
         return {"runtime_turn": {"turn_status": kwargs["turn_status"]}}
 

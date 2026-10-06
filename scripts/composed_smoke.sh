@@ -3111,10 +3111,14 @@ run_surface_permission_scenario() {
 }
 
 run_return_after_gap_scenario() {
+  local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  # This joined proof needs persisted restraint; other smoke families keep their settings.
+  COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
   local tag owner client surface conversation prior response request trace session turn diagnostics
   local state expected gap answer prior_answer source_id calls snapshot provider_count
   prior_answer="Save the backup first. Then check the logs."
-  for tag in same below restart cross denied absent paused active_task opt_out abandoned ordinary summary deferred idle; do
+  for tag in same below selector restart cross denied absent paused active_task opt_out abandoned ordinary summary deferred idle; do
     owner="owner-return-$tag"; client="telegram:return-$tag"; surface=telegram
     if [ "$tag" = abandoned ]; then
       conversation="$(create_conversation "$owner" "$client")"
@@ -3162,7 +3166,7 @@ run_return_after_gap_scenario() {
         -H 'X-API-Key: smoke-memory-key' -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg owner "$owner" '{owner_id:$owner,enabled:false,allowed_surfaces_json:[],rule_prefs_json:{}}')" >/dev/null
     fi
-    gap=360; [ "$tag" != below ] || gap=60
+    gap=360; if [ "$tag" = below ] || [ "$tag" = selector ]; then gap=60; fi
     runtime_backdate_thread "$owner" "$conversation" "$(python3 -c "from datetime import UTC,datetime,timedelta; print((datetime.now(UTC)-timedelta(seconds=$gap)).isoformat())")"
     if [ "$tag" = restart ]; then
       docker compose -f "$COMPOSE" restart runtime >/dev/null
@@ -3175,7 +3179,7 @@ run_return_after_gap_scenario() {
     fi
     expected=returning_after_gap
     case "$tag" in
-      below|abandoned) expected=active_conversation ;;
+      below|selector|abandoned) expected=active_conversation ;;
       paused) expected=low_attention ;;
       active_task) expected=driving_or_active_task ;;
       opt_out) expected=do_not_intrude ;;
@@ -3195,7 +3199,8 @@ run_return_after_gap_scenario() {
       {owner_id:$owner,client_id:$client,surface:$surface,conversation_id:$conversation,sensitivity:"private",
        messages:[{role:"user",content:(if $tag=="deferred" then "continue" elif $tag=="summary" then
          "What were we discussing before?" else "What is 2+2?" end)}],
-       surface_context:{active_task_mode:($tag=="active_task"),verbosity_target:"short"}}')")"
+       surface_context:{active_task_mode:($tag=="active_task"),verbosity_target:"short"}}
+       | if $tag=="selector" then del(.conversation_id) else . end')")"
     request="$(jq -er .request_id <<<"$response")"
     if [ "$tag" = denied ] || [ "$tag" = absent ]; then
       jq -e '.status=="failed" and .selected_model=="not_called"' <<<"$response" >/dev/null
@@ -3225,7 +3230,7 @@ run_return_after_gap_scenario() {
     jq -e --arg tag "$tag" '.schema_version=="runtime-return-after-gap.v1" and .threshold_seconds==300
       and .prior_thread_state=="idle" and
       (if $tag=="abandoned" then .status=="not_applicable" and .prior_terminal_turn_id==null
-       elif $tag=="below" then .status=="below_threshold" and .threshold_met==false
+       elif ($tag=="below" or $tag=="selector") then .status=="below_threshold" and .threshold_met==false
        else .status=="eligible" and .threshold_met==true end)' <<<"$snapshot" >/dev/null
     jq -e --arg state "$expected" '.retrieval.prompt_assembly.runtime_presence.presence_state==$state
       and .retrieval.prompt_assembly.runtime_presence.required_help_allowed==true' <<<"$trace" >/dev/null
@@ -3247,6 +3252,15 @@ run_return_after_gap_scenario() {
       jq -e --arg source "$source_id" '.retrieval.prompt_assembly.turn_state.return_thread_context.source_message_ids==[$source]' <<<"$trace" >/dev/null
       jq -e --arg content "$prior_answer" '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.role=="assistant" and (.content|contains($content))))' <<<"$calls" >/dev/null
     fi
+    if [ "$tag" = selector ]; then
+      jq -e '.retrieval.prompt_assembly.runtime_timing.result.timing_policy=="resume_previous_thread"
+        and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="continuation_resume"
+        and .retrieval.prompt_assembly.turn_state.return_after_gap.prior_continuation_state=="none"
+        and .retrieval.prompt_assembly.return_resume_context.status=="not_requested"' <<<"$trace" >/dev/null
+      [ "$(jq -er .conversation_id <<<"$response")" = "$conversation" ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner';")" = 1 ]
+      echo "Selector resume: below_threshold=true primary_reason=continuation_resume deferred_gate=not_requested provider_calls=1 exact_conversation=true"
+    fi
     if [ "$tag" = deferred ]; then
       jq -e --arg source "$source_id" '.retrieval.prompt_assembly.runtime_timing.result.timing_policy=="resume_previous_thread"
         and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="return_deferred_continuation"
@@ -3265,6 +3279,8 @@ run_return_after_gap_scenario() {
     echo "Return gap $tag: snapshot_exact=true presence=$expected required_help=true provider_calls=$provider_count persisted_returned_equal=true actions=0"
   done
   echo "Return composition: idle_current_help=true paused_fallback=true no_auto_recap=true canonical_summary=true deferred_resume=true CR_restart_durable=true"
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
 }
 
 run_ambient_presence_scenario() {

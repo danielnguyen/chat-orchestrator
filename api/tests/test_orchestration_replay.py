@@ -508,6 +508,13 @@ def _runtime_turn_response(**overrides):
             "runtime_session_id": "session-1",
             "runtime_turn_id": "turn-1",
             "event_type": "turn_started",
+            "event_payload_json": {"return_after_gap": {
+                "schema_version": "runtime-return-after-gap.v1", "status": "not_applicable",
+                "threshold_seconds": 300, "threshold_met": False, "prior_thread_state": "idle",
+                "prior_thread_revision": 0, "prior_last_activity_at": "2026-01-01T00:00:00+00:00",
+                "elapsed_seconds": 0, "prior_terminal_turn_id": None,
+                "prior_continuation_state": None,
+                "reason_code": "no_completed_turn"}},
         },
     }
     for key, value in overrides.items():

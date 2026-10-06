@@ -1338,7 +1338,7 @@ async def test_runtime_client_sends_expected_revision_only_when_supplied():
 
     async def fake_post(path, *, json):
         calls.append(json)
-        return {
+        return _with_fresh_return_event({
             "runtime_session": {
                 "runtime_session_id": "session",
                 "owner_id": json["owner_id"],
@@ -1351,7 +1351,7 @@ async def test_runtime_client_sends_expected_revision_only_when_supplied():
                 "input_message_id": json.get("input_message_id"),
                 "turn_status": "received",
             },
-        }
+        }, json["request_id"])
 
     client._post = fake_post  # type: ignore[method-assign]
     common = {
@@ -2161,7 +2161,7 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
     async def fake_post(path: str, *, json: dict[str, object]):
         calls.append((path, json))
         if path == "/v1/runtime/turns/start":
-            return {
+            return _with_fresh_return_event({
                 "runtime_session": {
                     "runtime_session_id": "rtsession_1",
                     "owner_id": json["owner_id"],
@@ -2179,7 +2179,7 @@ async def test_runtime_identity_and_turn_methods_use_expected_endpoints():
                     "runtime_turn_id": "rtturn_1",
                     "event_type": "turn_started",
                 },
-            }
+            }, json["request_id"])
         if path == "/v1/runtime/privacy-context/evaluate":
             return {
                 "result": {
@@ -4107,3 +4107,130 @@ async def test_start_turn_validates_exact_return_snapshot_once(valid):
                 request_id="current", owner_id="owner", conversation_id="thread", surface="web"
             )
     assert calls == ["/v1/runtime/turns/start"]
+
+
+def _mandatory_start_response(snapshot):
+    return {
+        "runtime_session": {
+            "runtime_session_id": "rtsession_1",
+            "owner_id": "owner",
+            "conversation_id": "thread",
+            "surface": "web",
+        },
+        "runtime_turn": {
+            "runtime_turn_id": "rtturn_1",
+            "runtime_session_id": "rtsession_1",
+            "input_message_id": None,
+            "turn_status": "received",
+        },
+        "event": {
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "event_type": "turn_started",
+            "event_payload_json": {"return_after_gap": snapshot},
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["event", "payload", "null", "string", "list", "snapshot", "malformed"]
+)
+async def test_both_start_validators_reject_missing_mandatory_snapshot(fault):
+    from services.orchestrate import _validate_started_runtime_turn
+
+    response = _mandatory_start_response(_return_snapshot())
+    if fault == "event":
+        response.pop("event")
+    elif fault == "payload":
+        response["event"].pop("event_payload_json")
+    elif fault in {"null", "string", "list"}:
+        response["event"]["event_payload_json"] = {"null": None, "string": "PRIVATE", "list": []}[
+            fault
+        ]
+    elif fault == "snapshot":
+        response["event"]["event_payload_json"].pop("return_after_gap")
+    else:
+        response["event"]["event_payload_json"]["return_after_gap"]["threshold_seconds"] = 301
+    with pytest.raises(RuntimeError, match="runtime_return_snapshot_invalid"):
+        _validate_started_runtime_turn(
+            response,
+            owner_id="owner",
+            conversation_id="thread",
+            surface="web",
+            input_message_id=None,
+        )
+    client = RuntimeClient("http://runtime", None)
+    calls = []
+
+    async def post(path, *, json):
+        calls.append(path)
+        return response
+
+    client._post = post
+    with pytest.raises(RuntimeError, match="runtime_return_snapshot_invalid"):
+        await client.start_turn(
+            request_id="current", owner_id="owner", conversation_id="thread", surface="web"
+        )
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["eligible", "below_threshold", "not_applicable"])
+async def test_both_start_validators_accept_all_valid_mandatory_snapshot_states(status):
+    from services.orchestrate import _validate_started_runtime_turn
+
+    snapshot = _return_snapshot()
+    if status == "below_threshold":
+        snapshot.update(
+            status=status,
+            threshold_met=False,
+            elapsed_seconds=299,
+            reason_code="return_gap_below_threshold",
+        )
+    if status == "not_applicable":
+        snapshot.update(
+            status=status,
+            threshold_met=False,
+            elapsed_seconds=0,
+            prior_terminal_turn_id=None,
+            prior_continuation_state=None,
+            reason_code="no_completed_turn",
+        )
+    response = _mandatory_start_response(snapshot)
+    assert (
+        _validate_started_runtime_turn(
+            response,
+            owner_id="owner",
+            conversation_id="thread",
+            surface="web",
+            input_message_id=None,
+        )
+        == response
+    )
+    client = RuntimeClient("http://runtime", None)
+
+    async def post(path, *, json):
+        return response
+
+    client._post = post
+    assert (
+        await client.start_turn(
+            request_id="current", owner_id="owner", conversation_id="thread", surface="web"
+        )
+        == response
+    )
+
+
+def _with_fresh_return_event(response, request_id):
+    response["event"] = {
+        "runtime_session_id": response["runtime_session"]["runtime_session_id"],
+        "runtime_turn_id": response["runtime_turn"]["runtime_turn_id"],
+        "event_type": "turn_started",
+        "event_payload_json": {"request_id": request_id, "turn_status": "received",
+            "input_message_id": response["runtime_turn"].get("input_message_id"),
+            "return_after_gap": _return_snapshot(status="not_applicable", threshold_met=False,
+                prior_thread_revision=0, elapsed_seconds=0, prior_terminal_turn_id=None,
+                prior_continuation_state=None, reason_code="no_completed_turn")},
+    }
+    return response
