@@ -3328,7 +3328,8 @@ run_timing_matrix_scenario() {
         text="I think I broke the server and prod is failing"
         [ "$tag" != stale_interruption ] || text="hold on"
         answer="Could you clarify what you want me to do?"; policy=ask_clarifying_question
-        reason=restraint_clarification; calls=0 ;;
+        reason=restraint_clarification; calls=0
+        [ "$tag" != clarification ] || reason=unclear_intent_clarification ;;
       yield)
         text="hold on"; answer="Go ahead."; policy=yield_to_user; reason=intent_interruption; calls=0 ;;
     esac
@@ -3351,6 +3352,9 @@ run_timing_matrix_scenario() {
         and $t.result.reason_codes[0]==$reason' <<<"$trace" >/dev/null
     if [ "$tag" = clarification ]; then
       jq -e '.retrieval.prompt_assembly.interaction_governance.interaction_kind=="tense_debugging"
+        and .retrieval.prompt_assembly.restraint.restraint_policy=="short_answer"
+        and .retrieval.prompt_assembly.restraint.reason=="tense_debugging_tactical_restraint"
+        and .retrieval.prompt_assembly.restraint.clarification_preferred==false
         and .retrieval.prompt_assembly.runtime_timing.result.continuation_state=="clarification_required"
         and .retrieval.prompt_assembly.runtime_timing.result.expansion_allowed==false' <<<"$trace" >/dev/null
     fi
@@ -3366,6 +3370,11 @@ run_timing_matrix_scenario() {
         and .latest_turn.runtime_turn_id==$turn and .latest_turn.turn_status=="completed"
         and ([$events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length)==0
     ' <<<"$diagnostics" >/dev/null
+    if [ "$tag" = clarification ]; then
+      jq -e --arg turn "$turn" '.latest_turn.intent_class=="low_confidence_unclear"
+        and ([.events[]|select(.runtime_turn_id==$turn and .event_type=="interaction_governance_evaluated")]
+          | length==1 and .[0].event_payload_json.clarifying_question_allowed==true)' <<<"$diagnostics" >/dev/null
+    fi
     [ "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = "$calls" ]
     jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
     if [ "$calls" = 0 ]; then
