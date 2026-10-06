@@ -3273,6 +3273,13 @@ run_return_after_gap_scenario() {
       jq -e '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.content|contains("Do not automatically recap")))' <<<"$calls" >/dev/null
     fi
     if [ "$tag" = paused ]; then
+      assert_jq "return.paused.timing_shape" "$trace" '
+        .retrieval.prompt_assembly.runtime_timing.result.timing_policy=="defer_expansion"
+        and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="presence_low_attention"
+        and .retrieval.prompt_assembly.response_shape.resolved_shape.max_sentence_count==2
+        and .retrieval.prompt_assembly.response_shape.resolved_shape.concise_first_answer==true
+        and (.retrieval.prompt_assembly.runtime_presence_enforcement.reason_codes
+          | index("proactive_offer_suppressed") != null and index("resolved_length_limit") != null)'
       jq -e '.retrieval.prompt_assembly.runtime_presence_enforcement.length_clamped==true
         and .retrieval.prompt_assembly.runtime_presence_enforcement.action_taken=="filtered"' <<<"$trace" >/dev/null
     fi

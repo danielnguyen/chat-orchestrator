@@ -301,22 +301,53 @@ def project_timing_facts(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def clamp_response_shape_for_timing(
-    shape: ResponseShape, trace: dict[str, Any], timing: dict[str, Any] | None,
+    shape: ResponseShape,
+    trace: dict[str, Any],
+    timing: dict[str, Any] | None,
 ) -> tuple[ResponseShape, dict[str, Any]]:
     if not timing or timing["expansion_allowed"] is not False:
         return shape, trace
-    narrowed = shape.model_copy(update={
-        "allows_expansion": False, "expansion_marker_allowed": False,
+    updates = {
+        "allows_expansion": False,
+        "expansion_marker_allowed": False,
         "continuation_state": (
             "abbreviated" if shape.continuation_state == "expandable" else shape.continuation_state
         ),
-    })
+    }
+    reasons = timing.get("reason_codes")
+    primary_reason = reasons[0] if isinstance(reasons, list) and reasons else None
+    if (
+        timing.get("timing_policy") == "defer_expansion"
+        and primary_reason == "presence_low_attention"
+    ):
+        existing_limit = shape.max_sentence_count
+        updates.update(
+            concise_first_answer=True,
+            max_sentence_count=min(
+                existing_limit if existing_limit and existing_limit > 0 else 2, 2
+            ),
+        )
+    narrowed = shape.model_copy(update=updates)
+    changed_fields = [
+        field for field in updates if getattr(shape, field) != getattr(narrowed, field)
+    ]
     return narrowed, {
-        **trace, "included": True, "status": "included", "omission_reason": None,
-        "resolved_shape": narrowed.model_dump(), "continuation_state": narrowed.continuation_state,
+        **trace,
+        "included": True,
+        "status": "included",
+        "omission_reason": None,
+        "resolved_shape": narrowed.model_dump(),
+        "continuation_state": narrowed.continuation_state,
         "guidance_flags": {
             **trace.get("guidance_flags", {}),
-            "allows_expansion": False, "expansion_marker_allowed": False,
+            "allows_expansion": False,
+            "expansion_marker_allowed": False,
+            "concise_first_answer": narrowed.concise_first_answer,
         },
-        "runtime_timing": {"applied": True, "expansion_allowed": False},
+        "runtime_timing": {
+            "applied": True,
+            "expansion_allowed": False,
+            "primary_reason": primary_reason,
+            "changed_fields": changed_fields,
+        },
     }

@@ -39563,3 +39563,66 @@ async def test_resume_unknown_or_missing_primary_reason_stops_generation(tmp_pat
     assert not provider.calls and not memory.claim_record_calls
     assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
     assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_low_attention_timing_caps_fallback_at_common_persistence_seam(tmp_path):
+    class LowAttentionRuntime(FakeRuntime):
+        async def evaluate_presence(self, **kwargs):
+            response = await super().evaluate_presence(**kwargs)
+            reasons = ["attention_paused"]
+            if kwargs.get("proactive_output_suppressed"):
+                reasons.append("proactive_suppression_requested")
+            response["result"].update(
+                presence_state="low_attention",
+                proactive_output_suppressed=True,
+                reason_codes=reasons,
+            )
+            return response
+
+        async def evaluate_timing(self, **kwargs):
+            response = await super().evaluate_timing(**kwargs)
+            response["result"]["reason_codes"][0] = "presence_low_attention"
+            return response
+
+    rules, models = _write_router_files(tmp_path)
+    rules.write_text(
+        rules.read_text().replace(
+            "fallbacks: []", "fallbacks: [{selected_model: gpt-4o-mini, provider: cloud}]"
+        )
+    )
+    runtime, memory = LowAttentionRuntime(), FakeMemoryStore()
+    runtime.timing_policy = "defer_expansion"
+    provider = FakeLiteLLM(
+        fail_first=True,
+        content=(
+            "Check the logs first. Save the backup. I can also explore other topics. "
+            "Extra optional detail. More optional detail."
+        ),
+    )
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"),
+        memory_store=memory,
+        litellm=provider,
+        runtime=runtime,
+        rules_path=str(rules),
+        model_registry_path=str(models),
+        allow_manual_override=True,
+        interaction_governance_enabled=True,
+        restraint_enabled=True,
+        request_id="low-attention-fallback",
+    )
+    assert result["answer"] == "Check the logs first. Save the backup."
+    assert len(provider.calls) == 2 and len(runtime.timing_calls) == 1
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        result["answer"]
+    ]
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_presence"]["presence_state"] == "low_attention"
+    assert trace["response_shape"]["resolved_shape"]["max_sentence_count"] == 2
+    assert trace["response_shape"]["runtime_timing"]["primary_reason"] == "presence_low_attention"
+    enforcement = trace["runtime_presence_enforcement"]
+    assert enforcement["length_clamped"] and enforcement["action_taken"] == "filtered"
+    assert "resolved_length_limit" in enforcement["reason_codes"]
+    assert "proactive_offer_suppressed" in enforcement["reason_codes"]
