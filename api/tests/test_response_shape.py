@@ -313,3 +313,109 @@ def test_timing_defer_clamp_keeps_timing_and_presentation_continuation_distinct(
     assert narrowed.expansion_marker_allowed is False
     assert narrowed.continuation_state == "abbreviated"
     assert trace["runtime_timing"]["expansion_allowed"] is False
+
+
+@pytest.mark.parametrize("limit,expected", [(None, 2), (4, 2), (2, 2), (1, 1)])
+def test_low_attention_timing_narrows_only_resolved_presentation(limit, expected):
+    from services.response_shape import clamp_response_shape_for_timing
+
+    shape = ResponseShape(
+        max_sentence_count=limit,
+        concise_first_answer=False,
+        allows_expansion=True,
+        expansion_marker_allowed=True,
+    )
+    narrowed, trace = clamp_response_shape_for_timing(
+        shape,
+        {},
+        {
+            "timing_policy": "defer_expansion",
+            "expansion_allowed": False,
+            "reason_codes": ["presence_low_attention", "dependency_degraded"],
+        },
+    )
+    assert narrowed.max_sentence_count == expected
+    assert narrowed.concise_first_answer is True
+    assert not narrowed.allows_expansion and not narrowed.expansion_marker_allowed
+    assert trace["resolved_shape"] == narrowed.model_dump()
+    assert trace["runtime_timing"]["primary_reason"] == "presence_low_attention"
+    assert "concise_first_answer" in trace["runtime_timing"]["changed_fields"]
+    assert ("max_sentence_count" in trace["runtime_timing"]["changed_fields"]) == (
+        limit != expected
+    )
+    assert "Lead with the answer" in build_response_shape_guidance_block(narrowed, trace)
+
+
+@pytest.mark.parametrize("reason", ["presence_active_task", "restraint_defer_expansion"])
+def test_other_defer_reasons_do_not_invent_sentence_boundaries(reason):
+    from services.response_shape import clamp_response_shape_for_timing
+
+    shape = ResponseShape(
+        active_task_mode=reason == "presence_active_task",
+        max_sentence_count=2 if reason == "presence_active_task" else None,
+    )
+    narrowed, trace = clamp_response_shape_for_timing(
+        shape,
+        {},
+        {
+            "timing_policy": "defer_expansion",
+            "expansion_allowed": False,
+            "reason_codes": [reason],
+        },
+    )
+    assert narrowed.max_sentence_count == shape.max_sentence_count
+    assert narrowed.concise_first_answer == shape.concise_first_answer
+    assert not narrowed.allows_expansion
+    assert "max_sentence_count" not in trace["runtime_timing"]["changed_fields"]
+
+
+@pytest.mark.parametrize("state", ["active_conversation", "do_not_intrude"])
+def test_proactive_suppression_with_normal_timing_does_not_cap_sentences(state):
+    from services.response_shape import clamp_response_shape_for_timing
+
+    shape, trace = clamp_response_shape_for_runtime_presence(
+        ResponseShape(),
+        {},
+        {
+            "presence_state": state,
+            "proactive_output_suppressed": True,
+        },
+    )
+    narrowed, _ = clamp_response_shape_for_timing(
+        shape,
+        trace,
+        {
+            "timing_policy": "answer_now",
+            "expansion_allowed": True,
+            "reason_codes": ["ordinary_ready"],
+        },
+    )
+    assert narrowed.max_sentence_count is None
+    assert not narrowed.concise_first_answer
+
+
+def test_explicit_expanded_detail_timing_does_not_apply_low_attention_cap():
+    from services.response_shape import clamp_response_shape_for_timing, project_timing_facts
+
+    facts = project_timing_facts({"surface_context": {"verbosity_target": "detailed"}})
+    assert facts["requested_detail"] == "expanded"
+    # CR's existing expanded-detail precedence yields ordinary_ready, not presence_low_attention.
+    shape, trace = clamp_response_shape_for_runtime_presence(
+        ResponseShape(),
+        {},
+        {
+            "presence_state": "low_attention",
+            "proactive_output_suppressed": True,
+        },
+    )
+    narrowed, _ = clamp_response_shape_for_timing(
+        shape,
+        trace,
+        {
+            "timing_policy": "answer_now",
+            "expansion_allowed": True,
+            "reason_codes": ["ordinary_ready"],
+        },
+    )
+    assert narrowed.max_sentence_count is None
+    assert not narrowed.concise_first_answer

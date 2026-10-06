@@ -14,11 +14,77 @@ _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
 _COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
 _COMPANION_ENDPOINT_KEY = "_cognitive_runtime_compile_endpoint"
 
+
+class _ReturnAfterGap(BaseModel):
+    """Immutable admission provenance, never conversation selection or content authority."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: Literal["runtime-return-after-gap.v1"] = "runtime-return-after-gap.v1"
+    status: Literal["eligible", "below_threshold", "not_applicable"]
+    threshold_seconds: Literal[300] = 300
+    threshold_met: bool
+    prior_thread_state: Literal["idle"]
+    prior_thread_revision: int = Field(ge=0)
+    prior_last_activity_at: str = Field(max_length=64)
+    elapsed_seconds: int = Field(ge=0)
+    prior_terminal_turn_id: str | None = Field(default=None, pattern=r"^rtturn_[0-9a-f]{16}$")
+    prior_continuation_state: (
+        Literal[
+            "none",
+            "clarification_required",
+            "waiting",
+            "deferred_expansion",
+            "yielded_to_user",
+            "resuming_previous_thread",
+            "closed",
+        ]
+        | None
+    ) = None
+    reason_code: Literal["return_gap_elapsed", "return_gap_below_threshold", "no_completed_turn"]
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> "_ReturnAfterGap":
+        value = datetime.fromisoformat(self.prior_last_activity_at)
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("return_timestamp_invalid")
+        expected = (
+            "not_applicable"
+            if self.prior_terminal_turn_id is None
+            else "eligible"
+            if self.elapsed_seconds >= 300
+            else "below_threshold"
+        )
+        reasons = {
+            "eligible": "return_gap_elapsed",
+            "below_threshold": "return_gap_below_threshold",
+            "not_applicable": "no_completed_turn",
+        }
+        if (
+            self.status != expected
+            or self.threshold_met != (expected == "eligible")
+            or self.reason_code != reasons[expected]
+            or (self.prior_terminal_turn_id is None and self.prior_continuation_state is not None)
+        ):
+            raise ValueError("return_snapshot_inconsistent")
+        return self
+
+
+def validate_return_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(_ReturnAfterGap.model_fields):
+        raise RuntimeError("runtime_return_snapshot_invalid")
+    try:
+        return _ReturnAfterGap.model_validate(value).model_dump(mode="json")
+    except ValueError:
+        raise RuntimeError("runtime_return_snapshot_invalid") from None
+
+
 _PRESENCE_STATES = {
     "not_present", "available", "active_conversation", "ambient_listening", "idle",
     "returning_after_gap", "low_attention", "driving_or_active_task", "do_not_intrude",
 }
 _PRESENCE_DECISION_STATES = {
+    "return_gap_elapsed": "returning_after_gap",
+    "attention_idle": "idle",
     "ambient_mode_permitted": "ambient_listening",
     "session_not_present": "not_present",
     "explicit_proactive_opt_out": "do_not_intrude",
@@ -129,6 +195,7 @@ RuntimeTimingReason = Literal[
     "restraint_clarification", "unclear_intent_clarification", "spoken_action_acknowledgment",
     "restraint_defer_expansion", "presence_low_attention", "presence_active_task",
     "continuation_answer_now", "ordinary_ready", "dependency_degraded",
+    "return_deferred_continuation",
 ]
 
 # Local regression metadata only; these values never grant authority or set deadlines.
@@ -175,6 +242,7 @@ RUNTIME_TIMING_REASON_POLICIES = {
     "presence_active_task": "defer_expansion",
     "continuation_answer_now": "answer_now",
     "ordinary_ready": "answer_now",
+    "return_deferred_continuation": "resume_previous_thread",
 }
 
 
@@ -1525,6 +1593,10 @@ class RuntimeClient:
                 or event.get("event_type") != "turn_started"
             ):
                 raise RuntimeError("runtime_turn_response_context_mismatch")
+        event_payload = event.get("event_payload_json") if isinstance(event, dict) else None
+        if not isinstance(event_payload, dict) or "return_after_gap" not in event_payload:
+            raise RuntimeError("runtime_return_snapshot_invalid")
+        validate_return_snapshot(event_payload["return_after_gap"])
         return response
 
     async def resolve_thread(

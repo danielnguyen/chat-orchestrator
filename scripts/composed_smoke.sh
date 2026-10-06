@@ -3110,6 +3110,186 @@ run_surface_permission_scenario() {
   echo "Runtime presence output: driving=true explicit_opt_out=true fallback_calls=2 required_help=true persisted_returned_equal=true prohibited_claims_removed=true"
 }
 
+run_return_after_gap_scenario() {
+  local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  # This joined proof needs persisted restraint; other smoke families keep their settings.
+  COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  local tag owner client surface conversation prior response request trace session turn diagnostics
+  local state expected gap answer prior_answer source_id calls snapshot provider_count
+  prior_answer="Save the backup first. Then check the logs."
+  for tag in same below selector restart cross denied absent paused active_task opt_out abandoned ordinary summary deferred idle; do
+    owner="owner-return-$tag"; client="telegram:return-$tag"; surface=telegram
+    if [ "$tag" = abandoned ]; then
+      conversation="$(create_conversation "$owner" "$client")"
+      response="$(cr_post /v1/runtime/turns/start "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '
+        {request_id:"return-abandoned",owner_id:$owner,conversation_id:$conversation,surface:"telegram"}')")"
+      session="$(jq -er .runtime_session.runtime_session_id <<<"$response")"
+      turn="$(jq -er .runtime_turn.runtime_turn_id <<<"$response")"
+      cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$session" --arg turn "$turn" '
+        {request_id:"return-abandoned",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"abandoned"}')" >/dev/null
+      source_id=""
+    else
+    provider_post /fixture/reset '{}' >/dev/null
+    queue_provider_answer "$prior_answer" >/dev/null
+    prior="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg tag "$tag" '
+      {owner_id:$owner,client_id:$client,surface:"telegram",sensitivity:"private",
+       messages:[{role:"user",content:"What is the backup procedure?"}],
+       surface_context:{active_task_mode:($tag=="deferred")}}')")"
+    jq -e '.status == "ok"' <<<"$prior" >/dev/null
+    conversation="$(jq -er .conversation_id <<<"$prior")"
+    trace="$(fetch_trace "$(jq -er .request_id <<<"$prior")")"
+    session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+    source_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND role='assistant' ORDER BY created_at DESC,id DESC LIMIT 1;")"
+    fi
+    if [ "$tag" = deferred ]; then
+      jq -e '.retrieval.prompt_assembly.runtime_timing.result.continuation_state == "deferred_expansion"' <<<"$trace" >/dev/null
+    fi
+    if [ "$tag" = paused ] || [ "$tag" = idle ]; then
+      state="$([ "$tag" = paused ] && echo paused || echo idle)"
+      cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --arg state "$state" '
+        {request_id:"return-attention",owner_id:$owner,conversation_id:$conversation,surface:"telegram",
+         updates:{attention_focus:{status:$state}}}')" >/dev/null
+    fi
+    if [ "$tag" = idle ]; then
+      response="$(cr_post /v1/runtime/presence/evaluate "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --arg session "$session" '
+        {request_id:"return-idle",owner_id:$owner,conversation_id:$conversation,surface:"telegram",
+         runtime_session_id:$session,runtime_turn_id:null}')")"
+      jq -e '.result.presence_state == "idle" and .result.reason_codes[0] == "attention_idle"
+        and .result.proactive_output_suppressed and .result.required_help_allowed' <<<"$response" >/dev/null
+      [ "$(fetch_provider_calls return-idle | jq '[.calls[]|select(.kind=="chat")]|length')" = 0 ]
+      diagnostics="$(fetch_runtime_diagnostics "$session")"
+      jq -e '[.events[] | select(.event_type=="presence_evaluated" and .event_payload_json.reason_codes[0]=="attention_idle")] | length==1' <<<"$diagnostics" >/dev/null
+    fi
+    if [ "$tag" = opt_out ]; then
+      curl -fsS -X PUT http://127.0.0.1:14321/v1/proactive/preferences \
+        -H 'X-API-Key: smoke-memory-key' -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg owner "$owner" '{owner_id:$owner,enabled:false,allowed_surfaces_json:[],rule_prefs_json:{}}')" >/dev/null
+    fi
+    gap=360; if [ "$tag" = below ] || [ "$tag" = selector ]; then gap=60; fi
+    runtime_backdate_thread "$owner" "$conversation" "$(python3 -c "from datetime import UTC,datetime,timedelta; print((datetime.now(UTC)-timedelta(seconds=$gap)).isoformat())")"
+    if [ "$tag" = restart ]; then
+      docker compose -f "$COMPOSE" restart runtime >/dev/null
+      docker compose -f "$COMPOSE" up -d --wait runtime >/dev/null
+    fi
+    if [ "$tag" = cross ] || [ "$tag" = denied ] || [ "$tag" = absent ]; then
+      surface=alexa; client="alexa:return-$tag"
+      if [ "$tag" = cross ]; then configure_surface_permission "$owner" alexa true false false; fi
+      if [ "$tag" = denied ]; then configure_surface_permission "$owner" alexa false false false; fi
+    fi
+    expected=returning_after_gap
+    case "$tag" in
+      below|selector|abandoned) expected=active_conversation ;;
+      paused) expected=low_attention ;;
+      active_task) expected=driving_or_active_task ;;
+      opt_out) expected=do_not_intrude ;;
+    esac
+    answer="4."
+    [ "$tag" != summary ] || answer="We discussed saving the backup before checking the logs."
+    [ "$tag" != deferred ] || answer="Check the logs after saving the backup."
+    [ "$tag" != paused ] || answer="Check the logs first. Save the backup."
+    provider_post /fixture/reset '{}' >/dev/null
+    if [ "$tag" = paused ]; then
+      queue_provider_answer "Check the logs first. Save the backup. I can also explore other topics. Extra optional detail. More optional detail." >/dev/null
+      provider_post /fixture/fail-next-primary '{}' >/dev/null
+    else
+      queue_provider_answer "$answer" >/dev/null
+    fi
+    response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" --arg conversation "$conversation" --arg tag "$tag" '
+      {owner_id:$owner,client_id:$client,surface:$surface,conversation_id:$conversation,sensitivity:"private",
+       messages:[{role:"user",content:(if $tag=="deferred" then "continue" elif $tag=="summary" then
+         "What were we discussing before?" else "What is 2+2?" end)}],
+       surface_context:{active_task_mode:($tag=="active_task"),verbosity_target:"short"}}
+       | if $tag=="selector" then del(.conversation_id) else . end')")"
+    request="$(jq -er .request_id <<<"$response")"
+    if [ "$tag" = denied ] || [ "$tag" = absent ]; then
+      jq -e '.status=="failed" and .selected_model=="not_called"' <<<"$response" >/dev/null
+      [ "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = 0 ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")" = 2 ]
+      queue_provider_answer "$answer" >/dev/null
+      response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" '
+        {owner_id:$owner,client_id:$client,surface:"alexa",sensitivity:"private",
+         messages:[{role:"user",content:"What is 2+2?"}]}')")"
+      request="$(jq -er .request_id <<<"$response")"
+      [ "$(jq -er .conversation_id <<<"$response")" != "$conversation" ]
+      trace="$(fetch_trace "$request")"
+      jq -e '.retrieval.prompt_assembly.turn_state.return_after_gap.status=="not_applicable"
+        and .retrieval.prompt_assembly.runtime_presence.presence_state!="returning_after_gap"' <<<"$trace" >/dev/null
+      ! fetch_provider_calls "$request" | grep -Fq "$prior_answer"
+      echo "Return gap $tag: retained_rejected=true omitted_new=true snapshot_leak=false provider_rejected=0"
+      continue
+    fi
+    jq -e --arg answer "$answer" '.answer==$answer and (.status=="ok" or .status=="degraded")' <<<"$response" >/dev/null
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    trace="$(fetch_trace "$request")"
+    session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+    turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    snapshot="$(jq -ec --arg turn "$turn" '[.events[]|select(.runtime_turn_id==$turn and .event_type=="turn_started")]
+      | select(length==1) | .[0].event_payload_json.return_after_gap' <<<"$diagnostics")"
+    jq -e --arg tag "$tag" '.schema_version=="runtime-return-after-gap.v1" and .threshold_seconds==300
+      and .prior_thread_state=="idle" and
+      (if $tag=="abandoned" then .status=="not_applicable" and .prior_terminal_turn_id==null
+       elif ($tag=="below" or $tag=="selector") then .status=="below_threshold" and .threshold_met==false
+       else .status=="eligible" and .threshold_met==true end)' <<<"$snapshot" >/dev/null
+    jq -e --arg state "$expected" '.retrieval.prompt_assembly.runtime_presence.presence_state==$state
+      and .retrieval.prompt_assembly.runtime_presence.required_help_allowed==true' <<<"$trace" >/dev/null
+    calls="$(fetch_provider_calls "$request")"
+    provider_count=1; [ "$tag" != paused ] || provider_count=2
+    [ "$(jq '[.calls[]|select(.kind=="chat")]|length' <<<"$calls")" = "$provider_count" ]
+    jq -e --arg turn "$turn" '[.events[]|select(.runtime_turn_id==$turn and .event_type=="timing_evaluated")]|length==1' <<<"$diagnostics" >/dev/null
+    jq -e --arg turn "$turn" '.latest_turn.runtime_turn_id==$turn and .latest_turn.turn_status=="completed"
+      and ([.events[]|select(.runtime_turn_id==$turn and .event_type=="turn_completed")]|length==1)' <<<"$diagnostics" >/dev/null
+    local expected_messages=4
+    [ "$tag" != abandoned ] || expected_messages=2
+    [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")" = "$expected_messages" ]
+    if [ "$tag" != abandoned ]; then
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE id='$source_id' AND client_id='telegram:return-$tag';")" = 1 ]
+    fi
+    jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+    jq -e '[.events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length==0' <<<"$diagnostics" >/dev/null
+    if [ "$tag" = deferred ] || [ "$tag" = summary ]; then
+      jq -e --arg source "$source_id" '.retrieval.prompt_assembly.turn_state.return_thread_context.source_message_ids==[$source]' <<<"$trace" >/dev/null
+      jq -e --arg content "$prior_answer" '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.role=="assistant" and (.content|contains($content))))' <<<"$calls" >/dev/null
+    fi
+    if [ "$tag" = selector ]; then
+      jq -e '.retrieval.prompt_assembly.runtime_timing.result.timing_policy=="resume_previous_thread"
+        and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="continuation_resume"
+        and .retrieval.prompt_assembly.turn_state.return_after_gap.prior_continuation_state=="none"
+        and .retrieval.prompt_assembly.return_resume_context.status=="not_requested"' <<<"$trace" >/dev/null
+      [ "$(jq -er .conversation_id <<<"$response")" = "$conversation" ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner';")" = 1 ]
+      echo "Selector resume: below_threshold=true primary_reason=continuation_resume deferred_gate=not_requested provider_calls=1 exact_conversation=true"
+    fi
+    if [ "$tag" = deferred ]; then
+      jq -e --arg source "$source_id" '.retrieval.prompt_assembly.runtime_timing.result.timing_policy=="resume_previous_thread"
+        and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="return_deferred_continuation"
+        and .retrieval.prompt_assembly.return_resume_context.source_message_ids==[$source]
+        and .retrieval.prompt_assembly.return_resume_context.status=="ready"
+        and .retrieval.prompt_assembly.restraint.retrieval_suppressed==false' <<<"$trace" >/dev/null
+      jq -e --arg turn "$turn" '.latest_turn|select(.runtime_turn_id==$turn)|.intent_class=="continuation"' <<<"$diagnostics" >/dev/null
+    fi
+    if [ "$expected" = returning_after_gap ]; then
+      jq -e '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.content|contains("Do not automatically recap")))' <<<"$calls" >/dev/null
+    fi
+    if [ "$tag" = paused ]; then
+      assert_jq "return.paused.timing_shape" "$trace" '
+        .retrieval.prompt_assembly.runtime_timing.result.timing_policy=="defer_expansion"
+        and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="presence_low_attention"
+        and .retrieval.prompt_assembly.response_shape.resolved_shape.max_sentence_count==2
+        and .retrieval.prompt_assembly.response_shape.resolved_shape.concise_first_answer==true
+        and (.retrieval.prompt_assembly.runtime_presence_enforcement.reason_codes
+          | index("proactive_offer_suppressed") != null and index("resolved_length_limit") != null)'
+      jq -e '.retrieval.prompt_assembly.runtime_presence_enforcement.length_clamped==true
+        and .retrieval.prompt_assembly.runtime_presence_enforcement.action_taken=="filtered"' <<<"$trace" >/dev/null
+    fi
+    echo "Return gap $tag: snapshot_exact=true presence=$expected required_help=true provider_calls=$provider_count persisted_returned_equal=true actions=0"
+  done
+  echo "Return composition: idle_current_help=true paused_fallback=true no_auto_recap=true canonical_summary=true deferred_resume=true CR_restart_durable=true"
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+}
+
 run_ambient_presence_scenario() {
   local tag owner conversation session response permission ambient mode diagnostics
   for tag in allowed absent denied unavailable no_mode active active_task opt_out low_attention; do
@@ -4111,6 +4291,7 @@ run_continuation_admission_boundary_scenario
 run_continuation_failure_contention_scenario
 run_surface_permission_scenario
 run_ambient_presence_scenario
+run_return_after_gap_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
 echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
