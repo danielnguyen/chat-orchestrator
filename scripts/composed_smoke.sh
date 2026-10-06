@@ -3259,7 +3259,7 @@ run_return_after_gap_scenario() {
         and .retrieval.prompt_assembly.return_resume_context.status=="not_requested"' <<<"$trace" >/dev/null
       [ "$(jq -er .conversation_id <<<"$response")" = "$conversation" ]
       [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner';")" = 1 ]
-      R42_MATRIX_SELECTOR_RESUME=true
+      TURN_TIMING_MATRIX_SELECTOR_RESUME=true
       echo "Selector resume: below_threshold=true primary_reason=continuation_resume deferred_gate=not_requested provider_calls=1 exact_conversation=true"
     fi
     if [ "$tag" = deferred ]; then
@@ -3270,7 +3270,7 @@ run_return_after_gap_scenario() {
         and .retrieval.prompt_assembly.restraint.retrieval_suppressed==false' <<<"$trace" >/dev/null
       jq -e --arg turn "$turn" '.latest_turn|select(.runtime_turn_id==$turn)|.intent_class=="continuation"' <<<"$diagnostics" >/dev/null
     fi
-    if [ "$tag" = deferred ]; then R42_MATRIX_DEFERRED_RESUME=true; fi
+    if [ "$tag" = deferred ]; then TURN_TIMING_MATRIX_DEFERRED_RESUME=true; fi
     if [ "$expected" = returning_after_gap ]; then
       jq -e '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.content|contains("Do not automatically recap")))' <<<"$calls" >/dev/null
     fi
@@ -3285,7 +3285,7 @@ run_return_after_gap_scenario() {
       jq -e '.retrieval.prompt_assembly.runtime_presence_enforcement.length_clamped==true
         and .retrieval.prompt_assembly.runtime_presence_enforcement.action_taken=="filtered"' <<<"$trace" >/dev/null
     fi
-    if [ "$tag" = paused ]; then R42_MATRIX_DEFER_EXPANSION=true; fi
+    if [ "$tag" = paused ]; then TURN_TIMING_MATRIX_DEFER_EXPANSION=true; fi
     echo "Return gap $tag: snapshot_exact=true presence=$expected required_help=true provider_calls=$provider_count persisted_returned_equal=true actions=0"
   done
   echo "Return composition: idle_current_help=true paused_fallback=true no_auto_recap=true canonical_summary=true deferred_resume=true CR_restart_durable=true"
@@ -3295,9 +3295,9 @@ run_return_after_gap_scenario() {
 
 run_timing_matrix_scenario() {
   # The full return family already proves defer and both resume origins.
-  test "${R42_MATRIX_DEFER_EXPANSION:-false}" = true
-  test "${R42_MATRIX_SELECTOR_RESUME:-false}" = true
-  test "${R42_MATRIX_DEFERRED_RESUME:-false}" = true
+  test "${TURN_TIMING_MATRIX_DEFER_EXPANSION:-false}" = true
+  test "${TURN_TIMING_MATRIX_SELECTOR_RESUME:-false}" = true
+  test "${TURN_TIMING_MATRIX_DEFERRED_RESUME:-false}" = true
   local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
   COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
@@ -3325,7 +3325,8 @@ run_timing_matrix_scenario() {
         text="Write a greeting."; answer="Received. Hello."; policy=acknowledge_then_answer
         reason=spoken_action_acknowledgment ;;
       clarification|stale_interruption)
-        text="fix this"; [ "$tag" != stale_interruption ] || text="hold on"
+        text="I think I broke the server and prod is failing"
+        [ "$tag" != stale_interruption ] || text="hold on"
         answer="Could you clarify what you want me to do?"; policy=ask_clarifying_question
         reason=restraint_clarification; calls=0 ;;
       yield)
@@ -3348,6 +3349,11 @@ run_timing_matrix_scenario() {
       .retrieval.prompt_assembly.runtime_timing as $t
       | $t.attempted and $t.status=="included" and $t.result.timing_policy==$policy
         and $t.result.reason_codes[0]==$reason' <<<"$trace" >/dev/null
+    if [ "$tag" = clarification ]; then
+      jq -e '.retrieval.prompt_assembly.interaction_governance.interaction_kind=="tense_debugging"
+        and .retrieval.prompt_assembly.runtime_timing.result.continuation_state=="clarification_required"
+        and .retrieval.prompt_assembly.runtime_timing.result.expansion_allowed==false' <<<"$trace" >/dev/null
+    fi
     session="$(jq -er .retrieval.prompt_assembly.runtime_timing.scope.runtime_session_id <<<"$trace")"
     turn="$(jq -er .retrieval.prompt_assembly.runtime_timing.scope.runtime_turn_id <<<"$trace")"
     diagnostics="$(fetch_runtime_diagnostics "$session")"
@@ -3387,7 +3393,7 @@ run_timing_matrix_scenario() {
         jq -e '.latest_turn.intent_class!="interruption"' <<<"$diagnostics" >/dev/null
       fi
     fi
-    echo "R42 matrix $tag: policy=$policy stage=admitted_timing primary_reason=$reason providers=$calls actions=0 timing_events=1 terminal_events=1 persisted_returned_equal=true thread_idle=true"
+    echo "Timing matrix $tag: policy=$policy stage=admitted_timing primary_reason=$reason providers=$calls actions=0 timing_events=1 terminal_events=1 persisted_returned_equal=true thread_idle=true"
   done
 
   # These two policies legitimately terminate at the pre-admission selector.
@@ -3432,15 +3438,15 @@ run_timing_matrix_scenario() {
     [ "$runtime_before" = "$(runtime_owner_counts "$owner")" ]
     [ "$thread_before" = "$(runtime_thread_snapshot "$owner" "$conversation")" ]
     # Equal event counts prove no timing, action, admission, or terminal event was fabricated.
-    echo "R42 matrix $tag: policy=$policy stage=selector primary_reason=$reason providers=0 actions=0 durable_runtime_unchanged=true admitted_timing_events=0"
+    echo "Timing matrix $tag: policy=$policy stage=selector primary_reason=$reason providers=0 actions=0 durable_runtime_unchanged=true admitted_timing_events=0"
     if [ "$tag" = wait ]; then
       cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$session" --arg turn "$turn" '
         {request_id:"matrix-active",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"abandoned"}')" >/dev/null
     fi
   done
-  echo "R42 matrix defer: policy=defer_expansion stage=admitted_timing primary_reason=presence_low_attention providers=2 actions=0 bounded_required_help=true persisted_returned_equal=true"
-  echo "R42 matrix resume: policy=resume_previous_thread stage=admitted_timing primary_reasons=continuation_resume,return_deferred_continuation providers=1_each actions=0 canonical_deferred_source=true persisted_returned_equal=true"
-  echo "R42 timing matrix: all_eight=true selector_outcomes=2 admitted_policies=6 stale_interruption_not_yield=true acknowledgment_delivery=final_response_only"
+  echo "Timing matrix defer: policy=defer_expansion stage=admitted_timing primary_reason=presence_low_attention providers=2 actions=0 bounded_required_help=true persisted_returned_equal=true"
+  echo "Timing matrix resume: policy=resume_previous_thread stage=admitted_timing primary_reasons=continuation_resume,return_deferred_continuation providers=1_each actions=0 canonical_deferred_source=true persisted_returned_equal=true"
+  echo "Turn timing matrix: all_eight=true selector_outcomes=2 admitted_policies=6 stale_interruption_not_yield=true acknowledgment_delivery=final_response_only"
   COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
 }
