@@ -3520,6 +3520,58 @@ run_ambient_presence_scenario() {
   echo "Ambient presence: configured_permission_and_mode=true absence_denial_unavailable_no_mode_active_task_opt_out_low_attention_rejected=true no_capture_claim=true"
 }
 
+runtime_interaction_contract_fixture() {
+  # This helper touches only the disposable runtime volume, never a live database.
+  local mode="$1" original="${2:-}"
+  if [ -z "$original" ]; then original='{}'; fi
+  docker compose -f "$COMPOSE" exec -T runtime python - "$mode" "$original" <<'PYCODE'
+import hashlib
+import json
+import sqlite3
+import sys
+
+mode, original_json = sys.argv[1:]
+original = json.loads(original_json)
+with sqlite3.connect("file:/data/companion_contracts.sqlite3?mode=rw", uri=True) as conn:
+    conn.row_factory = sqlite3.Row
+    profile = conn.execute(
+        "SELECT profile_id, version FROM companion_profiles "
+        "WHERE owner_id='' AND active=1 AND status='active' ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    assert profile is not None, "fixture active profile missing"
+    row = conn.execute(
+        "SELECT * FROM interaction_contracts WHERE owner_id='' AND profile_id=? "
+        "AND profile_version=? AND active=1 AND status='active' "
+        "ORDER BY contract_version DESC LIMIT 1", tuple(profile)
+    ).fetchone()
+    assert row is not None, "fixture active contract missing"
+    if mode != "capture":
+        assert row["id"] == original["row_id"], "fixture active contract replaced"
+    if mode in {"corrupt", "restore"}:
+        current = original["trust_rules_json"] if mode == "corrupt" else "[]"
+        replacement = "[]" if mode == "corrupt" else original["trust_rules_json"]
+        assert conn.execute(
+            "UPDATE interaction_contracts SET trust_rules_json=? WHERE id=? AND trust_rules_json=?",
+            (replacement, row["id"], current)
+        ).rowcount == 1, "fixture field changed unexpectedly"
+        row = conn.execute("SELECT * FROM interaction_contracts WHERE id=?", (row["id"],)).fetchone()
+    else:
+        assert mode in {"capture", "snapshot"}, "fixture mode invalid"
+    # Include row count so an added/replacement contract cannot escape the proof.
+    projection = {"row": dict(row), "row_count": conn.execute(
+        "SELECT count(*) FROM interaction_contracts"
+    ).fetchone()[0]}
+    fingerprint = hashlib.sha256(json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()).hexdigest()
+    if mode == "capture":
+        print(json.dumps({"row_id": row["id"], "trust_rules_json": row["trust_rules_json"],
+                          "fingerprint": fingerprint}, separators=(",", ":")))
+    else:
+        print(fingerprint)
+PYCODE
+}
+
 run_interrupt_enforcement_scenario() {
   local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
   COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
@@ -3527,7 +3579,8 @@ run_interrupt_enforcement_scenario() {
   local branching="Should I rewrite this or add an abstraction or split the module or rework the interface or simplify the module or compare every option? Please nudge me back to the next concrete step."
   local tag owner client surface scene spoken mode text conversation response request trace
   local decision answer expected calls policy session turn diagnostics interrupt
-  for tag in planning coding overload car unknown evaluate_only defer timing; do
+  local original_contract malformed_fingerprint compiled
+  for tag in planning coding overload car unknown evaluate_only defer timing malformed_contract; do
     surface=web; scene=planning; spoken=false; mode=enforce; text="$branching"; calls=0
     case "$tag" in
       coding) surface=telegram; scene=coding_build ;;
@@ -3547,11 +3600,17 @@ run_interrupt_enforcement_scenario() {
     configure_surface_permission "$owner" "$surface" true true false
     provider_post /fixture/reset '{}' >/dev/null
     expected="The next step is to test one small change."
-    if [ "$tag" = planning ] || [ "$tag" = evaluate_only ]; then
+    if [ "$tag" = planning ] || [ "$tag" = evaluate_only ] || [ "$tag" = malformed_contract ]; then
       queue_provider_answer "$expected" >/dev/null
       provider_post /fixture/fail-next-primary '{}' >/dev/null
     elif [ "$tag" = defer ]; then
       queue_provider_answer "$expected" >/dev/null
+    fi
+    if [ "$tag" = malformed_contract ]; then
+      original_contract="$(runtime_interaction_contract_fixture capture)"
+      malformed_fingerprint="$(runtime_interaction_contract_fixture corrupt "$original_contract")"
+      test "$malformed_fingerprint" != "$(jq -er .fingerprint <<<"$original_contract")"
+      test "$(runtime_interaction_contract_fixture snapshot "$original_contract")" = "$malformed_fingerprint"
     fi
     response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" \
       --arg scene "$scene" --arg conversation "$conversation" --arg text "$text" --arg mode "$mode" \
@@ -3621,6 +3680,34 @@ run_interrupt_enforcement_scenario() {
           jq -e --argjson count "$(jq '.warnings|length' <<<"$decision")" '.warning_count==$count' <<<"$interrupt" >/dev/null
         fi ;;
     esac
+    if [ "$tag" = malformed_contract ]; then
+      compiled="$(cr_post /v1/companion/policy/compile "$(jq -nc --arg request "$request" \
+        --arg owner "$owner" --arg conversation "$conversation" --arg surface "$surface" --arg scene "$scene" '
+        {request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface,requested_scene:$scene}')")"
+      jq -e --arg scene "$scene" '
+        .scene_id==$scene and .scene_source=="requested_scene"
+        and .interaction_contract.source=="default_compiled"
+        and .interaction_contract.scope=="global_default"
+        and (.interaction_contract.trust_rules|length)>0
+        and .contract_trace.source=="default_compiled"
+        and .warnings==["default_contract_applied","malformed_interaction_contract_defaulted"]
+        and .contract_trace.warnings==.warnings' <<<"$compiled" >/dev/null
+      jq -e --argjson compiled "$compiled" '
+        .interaction_contract==$compiled.interaction_contract
+        and .contract_trace.source=="default_compiled"
+        and .contract_trace.scope=="global_default"
+        and ([.warnings[]|select(.=="malformed_interaction_contract_defaulted")]|length)==1
+        and ([.contract_trace.warnings[]|select(.=="malformed_interaction_contract_defaulted")]|length)==1
+        and (.warnings|index("default_contract_applied"))!=null
+        and (.warnings|index("default_contract_source"))!=null' <<<"$decision" >/dev/null
+      jq -e --argjson count "$(jq '.warnings|length' <<<"$decision")" '
+        .warning_count==$count and (keys|index("trust_rules_json"))==null
+        and (keys|index("interaction_contract"))==null' <<<"$interrupt" >/dev/null
+      jq -e '(tojson|contains("invalid_interaction_contract_record")|not)' <<<"$trace" >/dev/null
+      # CO, the independent real interrupt read, and direct compilation all ran
+      # while the same malformed persisted row remained in place.
+      test "$(runtime_interaction_contract_fixture snapshot "$original_contract")" = "$malformed_fingerprint"
+    fi
     answer="$(jq -er .answer <<<"$response")"
     test "$answer" = "$expected"
     assert_persisted_answer_matches "$conversation" "$request" "$expected"
@@ -3644,11 +3731,15 @@ run_interrupt_enforcement_scenario() {
       and .active_runtime_session_id==null and .turn_statuses==["completed"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
     # In particular, discard the unused primary-failure switch after preemption.
     provider_post /fixture/reset '{}' >/dev/null
+    if [ "$tag" = malformed_contract ]; then
+      test "$(runtime_interaction_contract_fixture restore "$original_contract")" = "$(jq -er .fingerprint <<<"$original_contract")"
+      echo "Interrupt enforcement malformed_contract: canonical_default=true persisted_unchanged=true original_restored=true companion_compile=true provider_calls=0 actions=0 persisted_equal=true"
+    fi
     echo "Interrupt enforcement $tag: mode=$mode policy=$policy providers=$calls actions=0 messages=2 traces=1 claims=0 timing_events=1 terminal_events=1 persisted_equal=true"
   done
   COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
-  echo "Interrupt enforcement matrix: enforced_surfaces=5 provider_calls=0 persisted_equal=true timing_precedence=true evaluate_only_fallback=true conservative_defer=true actions=0"
+  echo "Interrupt enforcement matrix: enforced_surfaces=5 provider_calls=0 persisted_equal=true timing_precedence=true evaluate_only_fallback=true conservative_defer=true malformed_contract=true actions=0"
 }
 
 run_situated_presence_case() {
