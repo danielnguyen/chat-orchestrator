@@ -85,6 +85,7 @@ from services.orchestrate import (
     orchestrate_chat,
 )
 from services.prompt_budget import estimate_messages_tokens
+from test_runtime_client import _interrupt_lifecycle
 
 BANNED_TRACE_TOKENS = [
     "R26",
@@ -631,6 +632,7 @@ class FakeRuntime:
         self.world_state_calls = []
         self.relationship_calls = []
         self.interrupt_calls = []
+        self.execution_receipt_calls = []
         self.interaction_governance_calls = []
         self.persona_containment_calls = []
         self.restraint_calls = []
@@ -876,6 +878,8 @@ class FakeRuntime:
             "should_defer": False,
             "reason_json": {"defer_reasons": [], "trigger_class": "repetitive_branching"},
             "contract_constraints_applied": {"matched_contract_style": "soft_redirect"},
+            "lifecycle": _interrupt_lifecycle(),
+            "intervention_text": "Pick the next move and test it.",
             "warnings": [],
             "debug": {"detector_signals": {"branch_count": 4}, "user_visible_suppressed": True},
         }
@@ -1219,7 +1223,19 @@ class FakeRuntime:
         self.call_order.append("interrupt")
         if self.fail:
             raise RuntimeError("runtime unavailable")
-        return self.interrupt_response
+        return {**self.interrupt_response, **{key: kwargs.get(key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "requested_scene",
+        )}}
+
+    async def execute_interrupt(self, **kwargs):
+        self.execution_receipt_calls.append(kwargs)
+        self.call_order.append("interrupt_execution_receipt")
+        return {**{key: kwargs[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+        )}, "execution_recorded": True, "idempotent_replay": False,
+            "lifecycle": _interrupt_lifecycle("awaiting_feedback",
+                prior_executed_request_id=kwargs["request_id"],
+                prior_trigger=kwargs["trigger_class"])}
 
     async def evaluate_interaction_governance(self, **kwargs):
         self.interaction_governance_calls.append(kwargs)
@@ -39648,11 +39664,14 @@ async def test_timing_receipt_is_server_owned_and_persisted_without_provider_rec
 
 class EnforceInterruptRuntime(FakeRuntime):
     def __init__(self, *, text="Pick the next move and test it.", interrupt_error=None,
-                 interrupt_overrides=None, **kwargs):
+                 interrupt_overrides=None, receipt_error=None, receipt_overrides=None, **kwargs):
         super().__init__(**kwargs)
         self.intervention_text = text
         self.interrupt_error = interrupt_error
         self.interrupt_overrides = interrupt_overrides or {}
+        self.receipt_error = receipt_error
+        self.receipt_overrides = receipt_overrides or {}
+        self.execution_receipt_calls = []
 
     async def evaluate_interrupt(self, **kwargs):
         self.interrupt_calls.append(kwargs)
@@ -39668,9 +39687,24 @@ class EnforceInterruptRuntime(FakeRuntime):
             "intervention_text": self.intervention_text,
             "reason_json": {"defer_reasons": [], "trigger_class": "repetitive_branching"},
             "contract_constraints_applied": {"matched_contract_style": "soft_redirect"},
+            "lifecycle": _interrupt_lifecycle(),
             "warnings": [], "debug": {"advisory_text": "PRIVATE-CR-DIAGNOSTIC"},
             **self.interrupt_overrides,
         }
+
+
+    async def execute_interrupt(self, **kwargs):
+        self.execution_receipt_calls.append(kwargs)
+        self.call_order.append("interrupt_execution_receipt")
+        if self.receipt_error is not None:
+            raise self.receipt_error
+        return {**{key: kwargs[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+        )}, "execution_recorded": True, "idempotent_replay": False,
+            "lifecycle": _interrupt_lifecycle("awaiting_feedback",
+                prior_executed_request_id=kwargs["request_id"],
+                prior_trigger=kwargs["trigger_class"]),
+            **self.receipt_overrides}
 
 
 @pytest.mark.asyncio
@@ -39719,6 +39753,8 @@ async def test_interrupt_modes_remain_explicit_and_compatible(tmp_path, mode, co
     assert len(runtime.interrupt_calls) == count
     assert len(provider.calls) == (0 if mode == "enforce" else 1)
 
+    assert len(runtime.execution_receipt_calls) == (1 if mode == "enforce" else 0)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [httpx.ReadTimeout("PRIVATE-DEPENDENCY"),
@@ -39733,6 +39769,8 @@ async def test_interrupt_failure_is_optional_and_does_not_bypass_governance(tmp_
     assert policy["status"] == "failed" and policy["response_selected"] is False
     assert "PRIVATE-DEPENDENCY" not in str(policy)
 
+    assert runtime.execution_receipt_calls == []
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrides", [{"owner_id": "wrong"}, {"intervention_text": None},
@@ -39745,6 +39783,8 @@ async def test_interrupt_malformed_authority_never_becomes_a_response(tmp_path, 
     assert out["answer"] == "hello" and len(provider.calls) == 1
     policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
     assert policy["status"] == "failed" and policy["response_selected"] is False
+
+    assert runtime.execution_receipt_calls == []
 
 
 @pytest.mark.asyncio
@@ -39762,6 +39802,8 @@ async def test_interrupt_cannot_replace_a_stronger_timing_stop(tmp_path, timing,
         "prompt_assembly"]["interrupt_policy"]
     assert policy_trace["response_selected"] is False
     assert policy_trace["selection_reason"] == "stronger_timing_outcome"
+
+    assert runtime.execution_receipt_calls == []
 
 
 @pytest.mark.asyncio
@@ -39793,6 +39835,8 @@ async def test_interrupt_deferral_keeps_the_existing_answer_path(tmp_path):
     policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
     assert policy["should_defer"] and not policy["response_selected"]
 
+    assert runtime.execution_receipt_calls == []
+
 
 @pytest.mark.asyncio
 async def test_interrupt_cannot_replace_spoken_action_acknowledgment(tmp_path):
@@ -39808,6 +39852,8 @@ async def test_interrupt_cannot_replace_spoken_action_acknowledgment(tmp_path):
     policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
     assert not policy["response_selected"]
     assert policy["selection_reason"] == "action_acknowledgment_reserved"
+
+    assert runtime.execution_receipt_calls == []
 
 
 @pytest.mark.asyncio
@@ -39852,6 +39898,8 @@ async def test_selected_interrupt_failure_never_replays_or_starts_generation(tmp
         assert [item for item in memory.added_messages if item["role"] == "assistant"] == []
     else:
         assert len([item for item in memory.added_messages if item["role"] == "assistant"]) == 1
+
+    assert len(runtime.execution_receipt_calls) == (1 if failure == "trace" else 0)
 
 
 @pytest.mark.asyncio
@@ -39904,6 +39952,8 @@ async def test_interrupt_cannot_hijack_pending_confirmation_execution(tmp_path, 
     assert not policy["response_selected"]
     assert policy["selection_reason"] == "pending_action_continuation"
 
+    assert runtime.execution_receipt_calls == []
+
 
 @pytest.mark.asyncio
 async def test_interrupt_does_not_rewrite_candidate_to_bypass_presence_limits(tmp_path):
@@ -39918,6 +39968,8 @@ async def test_interrupt_does_not_rewrite_candidate_to_bypass_presence_limits(tm
     assert out["answer"] == "hello" and len(provider.calls) == 1
     assert not policy["response_selected"]
     assert policy["selection_reason"] == "stricter_output_policy"
+
+    assert runtime.execution_receipt_calls == []
 
 
 @pytest.mark.asyncio
@@ -39963,3 +40015,308 @@ async def test_interrupt_http_failure_is_bounded_and_optional(tmp_path):
     policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
     assert policy["failure_category"] == "dependency_http_failure"
     assert "PRIVATE" not in str(policy)
+
+@pytest.mark.asyncio
+async def test_interrupt_receipt_order_after_commit_before_trace_and_work(
+    tmp_path,
+):
+    runtime = EnforceInterruptRuntime()
+    memory = FakeMemoryStore()
+    original_trace, original_work = memory.create_trace, memory.transition_work
+
+    async def trace(**kwargs):
+        runtime.call_order.append("trace_persistence")
+        return await original_trace(**kwargs)
+
+    async def work(**kwargs):
+        if kwargs["state"] == "completed":
+            runtime.call_order.append("work_completion")
+        return await original_work(**kwargs)
+
+    memory.create_trace, memory.transition_work = trace, work
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        runtime=runtime,
+        memory=memory,
+        provider=FakeLiteLLM(fail_first=True),
+        interrupt_policy_mode="enforce",
+        capability_registry_enabled=True,
+        claim_record_capture_enabled=True,
+    )
+    assert out["status"] == "ok" and out["answer"] == runtime.intervention_text
+    assert out["selected_model"] == "not_called"
+    order = [
+        runtime.call_order.index(label)
+        for label in (
+            "assistant_persistence",
+            "complete_turn:completed",
+            "interrupt_execution_receipt",
+            "trace_persistence",
+            "work_completion",
+        )
+    ]
+    assert order == sorted(order) and len(set(order)) == 5
+    assert (
+        len(runtime.execution_receipt_calls)
+        == len(runtime.turn_complete_calls)
+        == len(runtime.timing_calls)
+        == 1
+    )
+    assert (
+        provider.calls == runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    )
+    assert memory.claim_record_calls == []
+    assert [kind for kind, _ in memory.work_calls].count("completed") == 1
+    expected = {
+        key: runtime.interrupt_calls[0][key]
+        for key in (
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+        )
+    }
+    assert runtime.execution_receipt_calls == [
+        {
+            **expected,
+            "trigger_class": "repetitive_branching",
+            "style_selected": "next_step_forcing",
+            "intervention_text": runtime.intervention_text,
+        }
+    ]
+    assistant = [row for row in memory.added_messages if row["role"] == "assistant"]
+    assert len(assistant) == 1 and assistant[0]["content"] == out["answer"]
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["lifecycle"] == _interrupt_lifecycle()
+    receipt = policy["execution_receipt"]
+    assert (
+        receipt["attempted"]
+        and receipt["status"] == "recorded"
+        and receipt["idempotent_replay"] is False
+    )
+    assert receipt["lifecycle"]["state"] == "awaiting_feedback"
+    for forbidden in (
+        runtime.intervention_text,
+        "PRIVATE-CR-DIAGNOSTIC",
+        "intervention_text",
+        "candidate_digest",
+        "input_digest",
+        "debug",
+        "recent_messages",
+        "response_body",
+    ):
+        assert forbidden not in str(policy)
+
+
+def _receipt_http_error(status):
+    request = httpx.Request("POST", "http://runtime.local/v1/interrupt/execute")
+    return httpx.HTTPStatusError(
+        "PRIVATE-ENDPOINT-REJECTION",
+        request=request,
+        response=httpx.Response(status, request=request, json={"private": "PRIVATE-ERROR-BODY"}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,overrides,status,category",
+    [
+        (_receipt_http_error(404), None, "rejected", "not_found"),
+        (_receipt_http_error(409), None, "rejected", "conflict"),
+        (_receipt_http_error(503), None, "unconfirmed", "dependency_http_failure"),
+        (httpx.ReadTimeout("PRIVATE-TIMEOUT"), None, "unconfirmed", "transport_timeout"),
+        (httpx.ConnectError("PRIVATE-TRANSPORT"), None, "unconfirmed", "transport_failure"),
+        (RuntimeError("PRIVATE-DEPENDENCY"), None, "unconfirmed", "dependency_unavailable"),
+        (ValueError("PRIVATE-JSON-ERROR"), None, "unconfirmed", "response_invalid"),
+        (None, {"execution_recorded": False}, "unconfirmed", "response_invalid"),
+        (None, {"owner_id": "PRIVATE-WRONG-OWNER"}, "unconfirmed", "response_invalid"),
+        (None, {"lifecycle": []}, "unconfirmed", "response_invalid"),
+        (None, {"raw_response": "PRIVATE-RAW-RESPONSE"}, "unconfirmed", "response_invalid"),
+    ],
+)
+async def test_receipt_failure_after_commit_preserves_intervention_without_any_replay(
+    tmp_path,
+    error,
+    overrides,
+    status,
+    category,
+):
+    runtime = EnforceInterruptRuntime(receipt_error=error, receipt_overrides=overrides)
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        runtime=runtime,
+        provider=FakeLiteLLM(fail_first=True),
+        interrupt_policy_mode="enforce",
+        capability_registry_enabled=True,
+        claim_record_capture_enabled=True,
+    )
+    assert out["status"] == "ok" and out["answer"] == runtime.intervention_text
+    assert out["selected_model"] == "not_called" and out["sources"] == []
+    assert (
+        len(runtime.execution_receipt_calls)
+        == len(runtime.turn_complete_calls)
+        == len(runtime.timing_calls)
+        == 1
+    )
+    assert len(memory.trace_calls) == 1 and memory.work["state"] == "completed"
+    assert [kind for kind, _ in memory.work_calls].count("completed") == 1
+    assert (
+        provider.calls == runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    )
+    assert memory.claim_record_calls == []
+    assistant = [row for row in memory.added_messages if row["role"] == "assistant"]
+    assert len(assistant) == 1 and assistant[0]["content"] == out["answer"]
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["execution_receipt"] == {
+        "attempted": True,
+        "status": status,
+        "failure_category": category,
+    }
+    assert policy["assistant_persistence"] == policy["runtime_completion"] == "succeeded"
+    assert "PRIVATE" not in str(policy) and "not_recorded" not in str(policy)
+    assert runtime.intervention_text not in str(policy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state", ["overridden", "repeat_suppressed", "history_unavailable", "accepted", "recovered"]
+)
+async def test_interrupt_lifecycle_is_traced_without_a_co_state_machine(tmp_path, state):
+    life = _interrupt_lifecycle(state)
+    suppressed = life["candidate_suppressed"]
+    runtime = EnforceInterruptRuntime(
+        interrupt_overrides={
+            "lifecycle": life,
+            "should_interrupt": not suppressed,
+            "should_defer": suppressed,
+            "intervention_text": None if suppressed else "Pick the next move and test it.",
+        }
+    )
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce"
+    )
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["lifecycle"] == life
+    if suppressed:
+        assert out["answer"] == "hello" and len(provider.calls) == 1
+        assert not policy["response_selected"] and runtime.execution_receipt_calls == []
+        assert policy["execution_receipt"] == {"attempted": False, "status": "not_requested"}
+    else:
+        assert out["answer"] == runtime.intervention_text and provider.calls == []
+        assert len(runtime.execution_receipt_calls) == 1
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["trace", "work"])
+async def test_post_receipt_failure_does_not_replay_committed_transitions(tmp_path, failure):
+    runtime = EnforceInterruptRuntime()
+    memory = FakeMemoryStore()
+    attempts = []
+    original = memory.transition_work
+    if failure == "trace":
+
+        async def trace(**kwargs):
+            attempts.append("trace")
+            raise RuntimeError("PRIVATE-TRACE-FAILURE")
+
+        memory.create_trace = trace
+    else:
+
+        async def work(**kwargs):
+            if kwargs["state"] == "completed":
+                attempts.append("work")
+                raise RuntimeError("PRIVATE-WORK-FAILURE")
+            return await original(**kwargs)
+
+        memory.transition_work = work
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, interrupt_policy_mode="enforce"
+    )
+    assert out["status"] == "failed" and "PRIVATE" not in str(out)
+    assert (
+        len(runtime.execution_receipt_calls)
+        == len(runtime.turn_complete_calls)
+        == len(runtime.timing_calls)
+        == 1
+    )
+    assert len([row for row in memory.added_messages if row["role"] == "assistant"]) == 1
+    assert len(attempts) == 1 and provider.calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_only_retains_bounded_lifecycle_without_receipt_or_debug(tmp_path):
+    life = _interrupt_lifecycle("repeat_suppressed")
+    runtime = EnforceInterruptRuntime(
+        interrupt_overrides={
+            "lifecycle": life,
+            "should_interrupt": False,
+            "should_defer": True,
+            "intervention_text": None,
+        }
+    )
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="evaluate_only"
+    )
+    assert (
+        out["answer"] == "hello"
+        and len(provider.calls) == 1
+        and runtime.execution_receipt_calls == []
+    )
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["lifecycle"] == life and policy["execution_receipt"]["status"] == "not_requested"
+    assert "debug" not in policy and "PRIVATE-CR-DIAGNOSTIC" not in str(policy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "life", [None, [], _interrupt_lifecycle("none", candidate_suppressed=True)]
+)
+async def test_invalid_lifecycle_is_optional_policy_failure_not_execution_authority(tmp_path, life):
+    runtime = EnforceInterruptRuntime(interrupt_overrides={"lifecycle": life})
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce"
+    )
+    assert (
+        out["answer"] == "hello"
+        and len(provider.calls) == 1
+        and runtime.execution_receipt_calls == []
+    )
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["status"] == "failed" and policy["failure_category"] == "response_invalid"
+    assert policy["execution_receipt"] == {"attempted": False, "status": "not_requested"}
+
+
+@pytest.mark.asyncio
+async def test_recorded_replay_lifecycle_does_not_change_committed_intervention(tmp_path):
+    runtime = EnforceInterruptRuntime(receipt_overrides={
+        "idempotent_replay": True,
+        "lifecycle": _interrupt_lifecycle("overridden",
+            prior_executed_request_id="rid-timing-flow", repeated_trigger_count=1),
+    })
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce",
+    )
+    assert out["status"] == "ok" and out["answer"] == runtime.intervention_text
+    assert provider.calls == [] and len(runtime.execution_receipt_calls) == 1
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["execution_receipt"]["status"] == "recorded"
+    assert policy["execution_receipt"]["idempotent_replay"] is True
+    assert policy["execution_receipt"]["lifecycle"]["candidate_suppressed"] is True
+
+
+@pytest.mark.asyncio
+async def test_receipt_trace_does_not_copy_current_or_recent_private_input(tmp_path):
+    runtime = EnforceInterruptRuntime()
+    out, _, _, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce",
+        payload=_base_payload(conversation_id="conv-1", messages=[
+            {"role":"assistant","content":"PRIVATE-RECENT-INPUT"},
+            {"role":"user","content":"PRIVATE-CURRENT-INPUT"},
+        ]),
+    )
+    assert out["answer"] == runtime.intervention_text
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert "PRIVATE" not in str(policy)
+    assert "intervention_text" not in str(policy) and "digest" not in str(policy)
