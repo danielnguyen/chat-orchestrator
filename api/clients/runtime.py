@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any, Literal
@@ -13,6 +14,100 @@ from services.privacy_context import validate_privacy_policy_result
 _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
 _COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
 _COMPANION_ENDPOINT_KEY = "_cognitive_runtime_compile_endpoint"
+
+
+_INTERRUPT_TRIGGERS = {
+    "repetitive_branching", "speculative_simulation_with_weak_evidence",
+    "avoidance_disguised_as_analysis", "complexity_expansion_beyond_task_value",
+    "rising_agitation_with_shrinking_informational_gain",
+    "mismatch_between_context_and_answer_depth", "known_recurring_trap_pattern",
+}
+_INTERRUPT_STYLES = {
+    "soft_redirect", "crisp_callout", "constraint_reset", "next_step_forcing",
+    "evidence_anchor", "scene_aware_simplification",
+}
+_INTERRUPT_DEFER_REASONS = {
+    "explicit_exploration_request", "casual_or_low_stakes_context",
+    "confidence_below_interrupt_threshold", "insufficient_context", "no_contract_permitted_style",
+}
+
+
+def validate_interrupt_response(
+    response: Any, *, request_id: str, owner_id: str, conversation_id: str,
+    surface: str, requested_scene: str | None = None,
+) -> dict[str, Any]:
+    """Check the bounded producer contract; never derive an interrupt decision here."""
+    def invalid() -> None:
+        raise RuntimeError("interrupt_response_invalid")
+
+    def labels(value: Any, limit: int) -> bool:
+        return isinstance(value, list) and len(value) <= limit and all(
+            isinstance(item, str) and 0 < len(item) <= 64 and item.strip() for item in value
+        )
+
+    if not isinstance(response, dict):
+        invalid()
+    scope = {"request_id": request_id, "owner_id": owner_id,
+             "conversation_id": conversation_id, "surface": surface}
+    if any(response.get(key) != value for key, value in scope.items()) or (
+        response.get("requested_scene") != requested_scene
+    ):
+        raise RuntimeError("interrupt_response_context_mismatch")
+    confidence = response.get("confidence")
+    interrupt, defer = response.get("should_interrupt"), response.get("should_defer")
+    trigger, style = response.get("trigger_class"), response.get("style_selected")
+    text = response.get("intervention_text")
+    if (type(confidence) not in {int, float} or not 0 <= confidence <= 1
+            or not math.isfinite(confidence)
+            or type(interrupt) is not bool or type(defer) is not bool
+            or interrupt == defer or (trigger is not None and (not isinstance(trigger, str)
+                                      or trigger not in _INTERRUPT_TRIGGERS))
+            or (style is not None and (not isinstance(style, str)
+                                    or style not in _INTERRUPT_STYLES))):
+        invalid()
+    if interrupt:
+        if (trigger is None or style is None or not isinstance(text, str)
+                or not text.strip() or len(text) > 240 or confidence < 0.72):
+            invalid()
+    elif text is not None:
+        invalid()
+    reason = response.get("reason_json")
+    constraints = response.get("contract_constraints_applied")
+    if (not isinstance(reason, dict) or set(reason) - {
+            "defer_reasons", "trigger_class", "requested_scene"}
+            or not labels(reason.get("defer_reasons"), 8)
+            or any(item not in _INTERRUPT_DEFER_REASONS for item in reason["defer_reasons"])
+            or reason.get("trigger_class") != trigger
+            or (interrupt and reason["defer_reasons"])
+            or (reason.get("requested_scene") is not None and (
+                not isinstance(reason["requested_scene"], str)
+                or not 0 < len(reason["requested_scene"]) <= 64))
+            or not isinstance(constraints, dict) or set(constraints) - {
+                "allowed_styles", "disallowed_styles", "matched_contract_style",
+                "blocked_candidates", "defer_condition_matched"}
+            or not labels(response.get("warnings"), 12)):
+        invalid()
+    for key in ("allowed_styles", "disallowed_styles"):
+        if key in constraints and not labels(constraints[key], 8):
+            invalid()
+    for key in ("matched_contract_style", "defer_condition_matched"):
+        if constraints.get(key) is not None and (
+            not isinstance(constraints[key], str) or not 0 < len(constraints[key]) <= 64
+        ):
+            invalid()
+    blocked = constraints.get("blocked_candidates", [])
+    if not isinstance(blocked, list) or len(blocked) > 6:
+        invalid()
+    for item in blocked:
+        if (not isinstance(item, dict) or set(item) - {
+                "style", "blocked_by", "missing_allowed_match"}
+                or not isinstance(item.get("style"), str)
+                or item["style"] not in _INTERRUPT_STYLES):
+            invalid()
+        for key in ("blocked_by", "missing_allowed_match"):
+            if key in item and not labels(item[key], 8):
+                invalid()
+    return response
 
 
 class _ReturnAfterGap(BaseModel):
@@ -2492,7 +2587,11 @@ class RuntimeClient:
             payload["recent_messages"] = recent_messages
         if requested_scene is not None:
             payload["requested_scene"] = requested_scene
-        return await self._post("/v1/interrupt/evaluate", json=payload)
+        response = await self._post("/v1/interrupt/evaluate", json=payload)
+        return validate_interrupt_response(
+            response, request_id=request_id, owner_id=owner_id,
+            conversation_id=conversation_id, surface=surface, requested_scene=requested_scene,
+        )
 
     async def evaluate_interaction_governance(
         self,

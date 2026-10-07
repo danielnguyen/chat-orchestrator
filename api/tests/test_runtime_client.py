@@ -4234,3 +4234,82 @@ def _with_fresh_return_event(response, request_id):
                 prior_continuation_state=None, reason_code="no_completed_turn")},
     }
     return response
+
+
+def _interrupt_response(**overrides):
+    value = {
+        "request_id": "interrupt-request", "owner_id": "owner", "conversation_id": "conversation",
+        "surface": "web", "requested_scene": None, "confidence": 0.95,
+        "trigger_class": "repetitive_branching", "style_selected": "next_step_forcing",
+        "should_interrupt": True, "should_defer": False,
+        "intervention_text": "Pick the next move and test it.",
+        "reason_json": {"defer_reasons": [], "trigger_class": "repetitive_branching",
+                        "requested_scene": None},
+        "contract_constraints_applied": {"matched_contract_style": "soft_redirect"},
+        "warnings": [], "debug": {"advisory_text": "PRIVATE-DIAGNOSTIC-TEXT"},
+    }
+    value.update(overrides)
+    return value
+
+
+@pytest.mark.parametrize("overrides", [
+    {"request_id": "wrong"}, {"owner_id": "wrong"}, {"conversation_id": "wrong"},
+    {"surface": "wrong"}, {"requested_scene": "wrong"},
+    {"confidence": True}, {"confidence": "0.95"}, {"confidence": -1}, {"confidence": 2},
+    {"confidence": float("nan")}, {"confidence": float("inf")},
+    {"should_interrupt": "true"}, {"should_defer": 0}, {"should_defer": True},
+    {"trigger_class": None}, {"trigger_class": []}, {"style_selected": "unknown"},
+    {"style_selected": []}, {"intervention_text": None}, {"intervention_text": True},
+    {"intervention_text": "   "}, {"intervention_text": "x" * 241},
+    {"should_interrupt": False, "should_defer": True}, {"reason_json": []},
+    {"reason_json": {"defer_reasons": "none"}}, {"warnings": "warning"},
+    {"warnings": ["x" * 65]}, {"contract_constraints_applied": []},
+    {"contract_constraints_applied": {"allowed_styles": "soft_redirect"}},
+    {"contract_constraints_applied": {"blocked_candidates": [{}]}},
+])
+def test_interrupt_response_rejects_unbound_or_incoherent_authority(overrides):
+    from clients.runtime import validate_interrupt_response
+
+    with pytest.raises(RuntimeError, match="^interrupt_response_(invalid|context_mismatch)$"):
+        validate_interrupt_response(
+            _interrupt_response(**overrides), request_id="interrupt-request", owner_id="owner",
+            conversation_id="conversation", surface="web",
+        )
+
+
+def test_interrupt_authority_is_independent_of_debug_and_deferred_text_is_null():
+    from clients.runtime import validate_interrupt_response
+
+    scope = dict(request_id="interrupt-request", owner_id="owner",
+                 conversation_id="conversation", surface="web")
+    value = _interrupt_response()
+    del value["debug"]
+    assert validate_interrupt_response(value, **scope)["intervention_text"] == (
+        "Pick the next move and test it."
+    )
+    value.update(should_interrupt=False, should_defer=True, intervention_text=None,
+                 reason_json={"defer_reasons": ["confidence_below_interrupt_threshold"],
+                              "trigger_class": "repetitive_branching"})
+    assert validate_interrupt_response(value, **scope)["intervention_text"] is None
+
+
+@pytest.mark.asyncio
+async def test_interrupt_client_posts_once_and_reuses_transport_after_validation_failure():
+    from clients.runtime import RuntimeClient
+
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    await client.open()
+    transport = factory.clients[0]
+    transport.responses.extend([_interrupt_response(intervention_text=None), _interrupt_response()])
+    scope = dict(request_id="interrupt-request", owner_id="owner",
+                 conversation_id="conversation", surface="web")
+    with pytest.raises(RuntimeError, match="^interrupt_response_invalid$"):
+        await client.evaluate_interrupt(**scope, current_user_text="PRIVATE-USER-TEXT")
+    assert len(transport.posts) == 1
+    response = await client.evaluate_interrupt(**scope, current_user_text="PRIVATE-USER-TEXT")
+    assert response["intervention_text"] == "Pick the next move and test it."
+    assert len(factory.clients) == 1 and len(transport.posts) == 2
+    assert transport.posts[0] == ("/v1/interrupt/evaluate", {**scope,
+                                                        "current_user_text": "PRIVATE-USER-TEXT"})
+    await client.close()

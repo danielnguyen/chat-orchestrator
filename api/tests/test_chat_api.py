@@ -838,3 +838,70 @@ async def test_chat_endpoint_does_not_expose_orchestration_exception_text(monkey
         "message": "The chat request could not be completed.",
     }
     assert "PRIVATE-DIAGNOSTIC-SENTINEL" not in str(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "evaluate_only", "enforce", "unsupported", True, 1])
+async def test_chat_api_interrupt_mode_is_explicit_and_strict(monkeypatch, mode):
+    main = _load_main(monkeypatch)
+    calls = []
+
+    async def cognition(**kwargs):
+        calls.append(kwargs)
+        return {"request_id": kwargs["request_id"], "conversation_id": "conversation",
+                "profile_name": "default", "selected_model": "not_called",
+                "answer": "Bounded response.", "status": "ok", "sources": []}
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://test") as client:
+        response = await client.post("/v1/chat", headers={"X-API-Key": "orch-test"},
+                                     json=_full_chat_payload(interrupt_policy_mode=mode))
+    if mode in ("off", "evaluate_only", "enforce"):
+        assert response.status_code == 200
+        assert calls[0]["interrupt_policy_mode"] == mode
+    else:
+        assert response.status_code == 422 and calls == []
+
+
+def test_chat_interrupt_mode_default_remains_off():
+    from models import ChatRequest
+
+    assert ChatRequest(**_full_chat_payload()).interrupt_policy_mode == "off"
+
+
+@pytest.mark.asyncio
+async def test_chat_api_enforce_returns_exact_durable_server_owned_intervention(
+    monkeypatch, tmp_path,
+):
+    from test_orchestrate_flow import (
+        EnforceInterruptRuntime,
+        FakeLiteLLM,
+        FakeMemoryStore,
+        _write_default_route_files,
+    )
+
+    main = _load_main(monkeypatch)
+    rules, models = _write_default_route_files(tmp_path)
+    memory, provider = FakeMemoryStore(), FakeLiteLLM(fail_first=True)
+    runtime = EnforceInterruptRuntime()
+    monkeypatch.setattr(main, "memory_store", memory)
+    monkeypatch.setattr(main, "litellm", provider)
+    monkeypatch.setattr(main, "runtime", runtime)
+    monkeypatch.setattr(main.settings, "router_rules_path", str(rules))
+    monkeypatch.setattr(main.settings, "model_registry_path", str(models))
+    monkeypatch.setattr(main.settings, "cognitive_runtime_interaction_governance_enabled", True)
+    monkeypatch.setattr(main.settings, "cognitive_runtime_restraint_enabled", True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://test") as client:
+        response = await client.post("/v1/chat", headers={"X-API-Key": "orch-test"},
+                                     json=_full_chat_payload(interrupt_policy_mode="enforce",
+                                          messages=[{
+                                              "role": "user", "content": "Pick the next step?",
+                                          }],
+                                     ))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == runtime.intervention_text and body["status"] == "ok"
+    assert body["selected_model"] == "not_called" and provider.calls == []
+    assert memory.added_messages[-1]["content"] == body["answer"]
+    assert memory.work["state"] == "completed" and len(runtime.turn_complete_calls) == 1

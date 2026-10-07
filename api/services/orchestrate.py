@@ -29,6 +29,7 @@ from clients.memory_store import (
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
     validate_history_followup_policy_response,
+    validate_interrupt_response,
     validate_presence_response,
     validate_return_snapshot,
     validate_timing_request,
@@ -5971,9 +5972,9 @@ async def _resolve_interrupt_policy(
     current_user_text: str,
     recent_messages: list[dict[str, str]],
     requested_scene: str | None = None,
-) -> dict[str, Any] | None:
-    if interrupt_policy_mode != "evaluate_only":
-        return None
+) -> tuple[dict[str, Any] | None, str | None]:
+    if interrupt_policy_mode not in {"evaluate_only", "enforce"}:
+        return None, None
     if runtime is None:
         return {
             "attempted": False,
@@ -5982,7 +5983,7 @@ async def _resolve_interrupt_policy(
             "mode": interrupt_policy_mode,
             "error_type": "RuntimeClientNotConfigured",
             "omission_reason": "runtime_client_not_configured",
-        }
+        }, None
 
     try:
         response = await runtime.evaluate_interrupt(
@@ -5994,7 +5995,29 @@ async def _resolve_interrupt_policy(
             recent_messages=recent_messages,
             requested_scene=requested_scene,
         )
+        if interrupt_policy_mode == "enforce":
+            response = validate_interrupt_response(
+                response, request_id=request_id, owner_id=owner_id,
+                conversation_id=conversation_id, surface=surface, requested_scene=requested_scene,
+            )
     except Exception as e:
+        if interrupt_policy_mode == "enforce":
+            category = "dependency_unavailable"
+            if isinstance(e, (httpx.TimeoutException, TimeoutError)):
+                category = "transport_timeout"
+            elif isinstance(e, httpx.TransportError):
+                category = "transport_failure"
+            elif isinstance(e, httpx.HTTPStatusError):
+                category = "dependency_http_failure"
+            elif isinstance(e, RuntimeError) and str(e) == "interrupt_response_context_mismatch":
+                category = "context_mismatch"
+            elif isinstance(e, (ValueError, RuntimeError, TypeError)):
+                category = "response_invalid"
+            return {
+                "attempted": True, "status": "failed", "included": False,
+                "mode": "enforce", "failure_category": category, "response_selected": False,
+                "omission_reason": "interrupt_policy_unavailable",
+            }, None
         return {
             "attempted": True,
             "status": "failed",
@@ -6002,7 +6025,7 @@ async def _resolve_interrupt_policy(
             "mode": interrupt_policy_mode,
             "error_type": type(e).__name__,
             "omission_reason": "interrupt_policy_unavailable",
-        }
+        }, None
 
     if not isinstance(response, dict):
         return {
@@ -6012,7 +6035,24 @@ async def _resolve_interrupt_policy(
             "mode": interrupt_policy_mode,
             "error_type": type(response).__name__,
             "omission_reason": "malformed_interrupt_policy_response",
-        }
+        }, None
+
+    if interrupt_policy_mode == "enforce":
+        constraints = response["contract_constraints_applied"]
+        return {
+            "attempted": True, "status": "included", "included": True, "mode": "enforce",
+            "trigger_class": response["trigger_class"], "confidence": response["confidence"],
+            "style_selected": response["style_selected"],
+            "should_interrupt": response["should_interrupt"],
+            "should_defer": response["should_defer"],
+            "defer_reasons": response["reason_json"]["defer_reasons"],
+            "constraint_counts": {key: len(constraints.get(key, [])) for key in (
+                "allowed_styles", "disallowed_styles", "blocked_candidates",
+            )},
+            "warning_count": len(response["warnings"]), "response_selected": False,
+            "selection_reason": "deferred" if response["should_defer"] else "pending",
+            "assistant_persistence": "not_requested", "runtime_completion": "not_requested",
+        }, response.get("intervention_text")
 
     return {
         "attempted": True,
@@ -6029,7 +6069,7 @@ async def _resolve_interrupt_policy(
         "warnings": response.get("warnings", []),
         "debug": response.get("debug", {}),
         "user_visible_suppressed": True,
-    }
+    }, None
 
 
 async def _resolve_interaction_governance(
@@ -8290,10 +8330,11 @@ def _select_timing_latency_class(
     return "ordinary_text"
 
 
-def _timing_stop_trace_payload(
+def _server_owned_response_trace_payload(
     *, request_id: str, conversation_id: str, payload: dict[str, Any],
     profile: dict[str, Any] | None, prompt_trace: dict[str, Any],
     status: str, started: float, error: str | None = None,
+    response_source: str = "runtime_timing",
 ) -> dict[str, Any]:
     return {
         "request_id": request_id, "conversation_id": conversation_id,
@@ -8314,7 +8355,7 @@ def _timing_stop_trace_payload(
         "prompt": _trace_prompt(prompt_trace),
         "router_decision": {
             "rule_id": None, "selected_model": "not_called", "provider": "none",
-            "rationale": "runtime_timing", "fallbacks": [],
+            "rationale": response_source, "fallbacks": [],
         },
         "manual_override": {"requested_model": None, "applied": False, "rejection_reason": None},
         "model_call": {"provider": "none", "model": "not_called", "status": "not_called",
@@ -9455,7 +9496,7 @@ async def orchestrate_chat(
             await work.fail_if_unfinished()
             try:
                 await memory_store.create_trace(
-                    request_id=request_id, payload=_timing_stop_trace_payload(
+                    request_id=request_id, payload=_server_owned_response_trace_payload(
                     request_id=request_id, conversation_id=conversation_id, payload=payload,
                     profile=None, status="failed", started=started,
                     error="mandatory_input_unavailable", prompt_trace={
@@ -9523,7 +9564,7 @@ async def orchestrate_chat(
                 if timing_applicable:
                     try:
                         await memory_store.create_trace(
-                            request_id=request_id, payload=_timing_stop_trace_payload(
+                            request_id=request_id, payload=_server_owned_response_trace_payload(
                                 request_id=request_id, conversation_id=conversation_id,
                                 payload=payload, profile=None, status="failed", started=started,
                                 error="message_persistence_unavailable", prompt_trace={
@@ -9589,7 +9630,14 @@ async def orchestrate_chat(
         return_retrieval_bundle = None
         return_context_dependency_unavailable = False
 
-        async def finish_timing_stop(answer: str, *, failed: bool) -> dict[str, Any]:
+        interrupt_trace: dict[str, Any] | None = None
+
+        async def finish_server_owned_response(
+            answer: str, *, failed: bool, response_source: str = "runtime_timing",
+        ) -> dict[str, Any]:
+            interrupt_selected = response_source == "interrupt_policy"
+            outcome_trace = interrupt_trace if interrupt_selected else timing_trace
+            success_status = "ok" if interrupt_selected else "degraded"
             failure_answer = "I couldn’t continue this turn safely. Please try again."
             # A terminal request may commit before its response is lost. Never replay it.
             if turn_state_trace.get("terminal_transition_attempted"):
@@ -9613,12 +9661,20 @@ async def orchestrate_chat(
                     )
                 except Exception:
                     failed, answer = True, failure_answer
-                    timing_trace.update(failure_category="outcome_persistence_failed")
+                    outcome_trace.update(failure_category="outcome_persistence_failed")
+                if interrupt_selected:
+                    outcome_trace["assistant_persistence"] = "failed" if failed else "succeeded"
             turn_state_trace["terminal_transition_attempted"] = True
             await _complete_runtime_turn(
                 runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
                 turn_status="abandoned" if failed else "completed",
             )
+            if interrupt_selected:
+                confirmed = turn_state_trace.get("completed") is True
+                outcome_trace["runtime_completion"] = "succeeded" if confirmed else "unconfirmed"
+                if not confirmed:
+                    failed, answer = True, failure_answer
+                    outcome_trace["failure_category"] = "runtime_completion_unconfirmed"
             stop_prompt_trace = {
                 "status": "not_requested", "layers": [], "message_count": 0,
                 "runtime_session": runtime_session_trace, "turn_state": turn_state_trace,
@@ -9632,27 +9688,41 @@ async def orchestrate_chat(
                                                               {"status": "not_requested"}),
                 "semantic_interpreter": (evidence_acquisition.semantic_interpreter
                                          if evidence_acquisition else {}),
+                **({"interrupt_policy": interrupt_trace} if interrupt_trace is not None else {}),
             }
             try:
                 await memory_store.create_trace(
-                    request_id=request_id, payload=_timing_stop_trace_payload(
+                    request_id=request_id, payload=_server_owned_response_trace_payload(
                         request_id=request_id, conversation_id=conversation_id, payload=payload,
                         profile=profile, prompt_trace=stop_prompt_trace,
-                        status="failed" if failed else "degraded", started=started,
-                        error=timing_trace.get("failure_category") if failed else None,
+                        status="failed" if failed else success_status, started=started,
+                        error=outcome_trace.get("failure_category") if failed else None,
+                        response_source=response_source,
                     ),
                 )
             except Exception:
                 # Required trace persistence failed. Keep the existing terminal outcome,
                 # leave work unfinished for fail_if_unfinished, and do not replay writes.
                 failed, answer = True, failure_answer
+                if interrupt_selected:
+                    outcome_trace["failure_category"] = "trace_persistence_failed"
             if not failed:
-                await work.complete(acknowledgement)
+                try:
+                    await work.complete(acknowledgement)
+                except Exception:
+                    if not interrupt_selected:
+                        raise
+                    failed, answer = True, failure_answer
             return {
                 "request_id": request_id, "conversation_id": conversation_id,
                 "profile_name": profile["profile_name"], "selected_model": "not_called",
-                "answer": answer, "status": "failed" if failed else "degraded", "sources": [],
+                "answer": answer, "status": "failed" if failed else success_status, "sources": [],
             }
+
+        async def finish_timing_stop(answer: str, *, failed: bool) -> dict[str, Any]:
+            if interrupt_trace is not None and interrupt_trace.get("should_interrupt") is True:
+                interrupt_trace["selection_reason"] = "stronger_timing_outcome"
+            return await finish_server_owned_response(answer, failed=failed)
 
         async def timing_failure(category: str) -> dict[str, Any]:
             timing_trace.update(status="failed", failure_category=category, result=None,
@@ -10495,7 +10565,7 @@ async def orchestrate_chat(
             "dependency": memory_recall_dependency_trace,
             "context": recall_context,
         }
-        interrupt_trace = await _resolve_interrupt_policy(
+        interrupt_trace, intervention_text = await _resolve_interrupt_policy(
             runtime=runtime,
             interrupt_policy_mode=interrupt_policy_mode,
             request_id=request_id,
@@ -10506,6 +10576,61 @@ async def orchestrate_chat(
             recent_messages=effective_payload["messages"],
             requested_scene=payload.get("requested_scene"),
         )
+        if intervention_text is not None:
+            # Do not pre-evaluate timing before branch inputs are established, or
+            # take ownership from an already selected continuation/action flow.
+            selection_reason = None
+            if pending_continuation is not None:
+                selection_reason = "pending_action_continuation"
+            elif conversation_resolution_trace.get("outcome") == "resume" or (
+                runtime_presence_trace.get("presence_state") == "returning_after_gap"
+                and (turn_state_trace.get("return_after_gap") or {}).get(
+                    "prior_continuation_state") == "deferred_expansion"
+                and "continuation_context_requested" in (restraint or {}).get("reason_summary", [])
+            ):
+                selection_reason = "continuation_timing_reserved"
+            elif evidence_path_deferred or compound_verification_requested or (
+                capability_registry_enabled
+                and _action_flow_intent(last_user_text) == "preview_requested"
+            ):
+                selection_reason = "branch_preparation_pending"
+            else:
+                try:
+                    spoken = project_timing_facts(payload)["spoken_output"]
+                except (ValueError, TypeError):
+                    selection_reason = "timing_projection_unavailable"
+                else:
+                    if spoken and interaction_kind == "command":
+                        selection_reason = "action_acknowledgment_reserved"
+            if selection_reason is None:
+                timing_stop = await evaluate_admitted_timing([])
+                if timing_stop is not None:
+                    interrupt_trace["selection_reason"] = "stronger_timing_outcome"
+                    return timing_stop
+                if timing_result is not None and timing_result["timing_policy"] not in {
+                    "answer_now", "defer_expansion",
+                }:
+                    selection_reason = "incompatible_timing_outcome"
+                else:
+                    # A bounded candidate cannot override stricter final-output policy.
+                    # If enforcement would change it, retain the governed answer path.
+                    checked, _ = enforce_situated_presence_output(
+                        intervention_text, situated_presence_trace,
+                    )
+                    checked, _ = enforce_runtime_presence_output(
+                        checked, runtime_presence_trace, response_shape_trace,
+                    )
+                    if checked != intervention_text:
+                        selection_reason = "stricter_output_policy"
+                    else:
+                        interrupt_trace.update(
+                            response_selected=True, selection_reason="authorized_intervention",
+                            provider_dispatch="skipped", action_dispatch="skipped",
+                        )
+                        return await finish_server_owned_response(
+                            intervention_text, failed=False, response_source="interrupt_policy",
+                        )
+            interrupt_trace["selection_reason"] = selection_reason
         runtime_identity, runtime_identity_trace = await _resolve_runtime_identity(
             runtime=runtime,
             request_id=request_id,
