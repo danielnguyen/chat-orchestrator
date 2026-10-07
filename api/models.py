@@ -22,7 +22,7 @@ BriefType = Literal[
 ]
 ResponseMode = Literal["normal", "brief"]
 BriefDepth = Literal[0, 1, 2, 3]
-InterruptPolicyMode = Literal["off", "evaluate_only"]
+InterruptPolicyMode = Literal["off", "evaluate_only", "enforce"]
 InteractionMode = Literal["text", "voice_mediated"]
 LatencyPreference = Literal["normal", "low", "lowest"]
 VerbosityTarget = Literal["short", "normal", "detailed"]

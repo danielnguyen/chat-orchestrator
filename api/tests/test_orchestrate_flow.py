@@ -39644,3 +39644,322 @@ async def test_timing_receipt_is_server_owned_and_persisted_without_provider_rec
     trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["runtime_timing"]["acknowledgment_delivery"] == "final_response_only"
     assert len(runtime.turn_complete_calls) == 1
+
+
+class EnforceInterruptRuntime(FakeRuntime):
+    def __init__(self, *, text="Pick the next move and test it.", interrupt_error=None,
+                 interrupt_overrides=None, **kwargs):
+        super().__init__(**kwargs)
+        self.intervention_text = text
+        self.interrupt_error = interrupt_error
+        self.interrupt_overrides = interrupt_overrides or {}
+
+    async def evaluate_interrupt(self, **kwargs):
+        self.interrupt_calls.append(kwargs)
+        self.call_order.append("interrupt")
+        if self.interrupt_error is not None:
+            raise self.interrupt_error
+        return {
+            **{key: kwargs.get(key) for key in (
+                "request_id", "owner_id", "conversation_id", "surface", "requested_scene",
+            )},
+            "confidence": 0.95, "trigger_class": "repetitive_branching",
+            "style_selected": "next_step_forcing", "should_interrupt": True, "should_defer": False,
+            "intervention_text": self.intervention_text,
+            "reason_json": {"defer_reasons": [], "trigger_class": "repetitive_branching"},
+            "contract_constraints_applied": {"matched_contract_style": "soft_redirect"},
+            "warnings": [], "debug": {"advisory_text": "PRIVATE-CR-DIAGNOSTIC"},
+            **self.interrupt_overrides,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["dev", "web", "telegram", "alexa", "car", "unrecognized"])
+async def test_enforce_interrupt_exact_server_response_preempts_generation_and_action(
+    tmp_path, surface,
+):
+    runtime = EnforceInterruptRuntime()
+    memory = FakeMemoryStore()
+    provider = FakeLiteLLM(fail_first=True)
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, provider=provider,
+        interrupt_policy_mode="enforce", capability_registry_enabled=True,
+        payload=_base_payload(conversation_id="conv-1", surface=surface),
+    )
+    assert out["answer"] == runtime.intervention_text
+    assert out["status"] == "ok" and out["selected_model"] == "not_called" and out["sources"] == []
+    assert provider.calls == []  # Neither the primary nor its configured fallback is dispatched.
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len(runtime.turn_complete_calls) == len(runtime.timing_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == "completed"
+    assert runtime.identity_calls == runtime.world_state_calls == []
+    assert runtime.interrupt_calls[0]["surface"] == surface
+    assistant = [item for item in memory.added_messages if item["role"] == "assistant"]
+    assert len(assistant) == 1 and assistant[0]["content"] == out["answer"]
+    trace = memory.trace_calls[0]["payload"]
+    assert trace["router_decision"]["rationale"] == "interrupt_policy"
+    assert trace["model_calls"] == [] and trace["references"] == []
+    assert trace["artifacts"]["artifact_count"] == 0
+    policy = trace["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["mode"] == "enforce" and policy["response_selected"] is True
+    assert policy["assistant_persistence"] == policy["runtime_completion"] == "succeeded"
+    assert "PRIVATE-CR-DIAGNOSTIC" not in str(trace)
+    assert runtime.intervention_text not in str(trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,count,answer", [("off", 0, "hello"),
+                                              ("evaluate_only", 1, "hello"),
+                                              ("enforce", 1, "Pick the next move and test it.")])
+async def test_interrupt_modes_remain_explicit_and_compatible(tmp_path, mode, count, answer):
+    out, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(), interrupt_policy_mode=mode,
+    )
+    assert out["answer"] == answer
+    assert len(runtime.interrupt_calls) == count
+    assert len(provider.calls) == (0 if mode == "enforce" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ReadTimeout("PRIVATE-DEPENDENCY"),
+    httpx.ConnectError("PRIVATE-DEPENDENCY"), RuntimeError("PRIVATE-DEPENDENCY")])
+async def test_interrupt_failure_is_optional_and_does_not_bypass_governance(tmp_path, error):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(interrupt_error=error),
+        interrupt_policy_mode="enforce",
+    )
+    assert out["answer"] == "hello" and len(provider.calls) == len(runtime.timing_calls) == 1
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["status"] == "failed" and policy["response_selected"] is False
+    assert "PRIVATE-DEPENDENCY" not in str(policy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{"owner_id": "wrong"}, {"intervention_text": None},
+                                       {"should_interrupt": "true"}])
+async def test_interrupt_malformed_authority_never_becomes_a_response(tmp_path, overrides):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(interrupt_overrides=overrides),
+        interrupt_policy_mode="enforce",
+    )
+    assert out["answer"] == "hello" and len(provider.calls) == 1
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["status"] == "failed" and policy["response_selected"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing,answer", [
+    ("ask_clarifying_question", "Could you clarify what you want me to do?"),
+    ("pause_or_wait", "I’ll wait before continuing."), ("yield_to_user", "Go ahead."),
+    ("close_turn", "I can’t continue this turn safely.")])
+async def test_interrupt_cannot_replace_a_stronger_timing_stop(tmp_path, timing, answer):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(), policy=timing, interrupt_policy_mode="enforce",
+    )
+    assert out["answer"] == answer and provider.calls == []
+    assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1
+    policy_trace = memory.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"]["interrupt_policy"]
+    assert policy_trace["response_selected"] is False
+    assert policy_trace["selection_reason"] == "stronger_timing_outcome"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scene,text", [
+    ("planning", "Narrow to the next decision. Keep it to the next concrete step."),
+    ("coding_build", "Reset to the immediate objective. Keep it to the next concrete step."),
+    ("overload_recovery", "Reduce optional depth. Keep it to the next concrete step."),
+])
+async def test_interrupt_preserves_scene_text_without_provider_rewrite(tmp_path, scene, text):
+    out, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(text=text), interrupt_policy_mode="enforce",
+        payload=_base_payload(conversation_id="conv-1", requested_scene=scene),
+    )
+    assert out["answer"] == text and provider.calls == []
+    assert runtime.interrupt_calls[0]["requested_scene"] == scene
+
+
+@pytest.mark.asyncio
+async def test_interrupt_deferral_keeps_the_existing_answer_path(tmp_path):
+    runtime = EnforceInterruptRuntime(interrupt_overrides={
+        "should_interrupt": False, "should_defer": True, "intervention_text": None,
+        "reason_json": {"trigger_class": "repetitive_branching",
+                        "defer_reasons": ["explicit_exploration_request"]},
+    })
+    out, _, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce",
+    )
+    assert out["answer"] == "hello" and len(provider.calls) == 1
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["should_defer"] and not policy["response_selected"]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_cannot_replace_spoken_action_acknowledgment(tmp_path):
+    runtime = EnforceInterruptRuntime()
+    runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, policy="acknowledge_then_answer",
+        interrupt_policy_mode="enforce",
+        payload=_base_payload(conversation_id="conv-1", surface_context={"spoken_output": True}),
+    )
+    assert out["answer"] == "Received. hello" and len(provider.calls) == 1
+    assert len(runtime.timing_calls) == 1
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert not policy["response_selected"]
+    assert policy["selection_reason"] == "action_acknowledgment_reserved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["assistant", "trace", "terminal"])
+async def test_selected_interrupt_failure_never_replays_or_starts_generation(tmp_path, failure):
+    runtime = EnforceInterruptRuntime()
+    memory = FakeMemoryStore()
+    attempts = []
+    if failure == "assistant":
+        original = memory.add_message
+
+        async def append(**kwargs):
+            if kwargs["role"] == "assistant":
+                attempts.append("assistant")
+                raise RuntimeError("PRIVATE-PERSISTENCE")
+            return await original(**kwargs)
+        memory.add_message = append
+    elif failure == "trace":
+        async def trace(**kwargs):
+            attempts.append("trace")
+            raise RuntimeError("PRIVATE-PERSISTENCE")
+        memory.create_trace = trace
+    else:
+        async def terminal(**kwargs):
+            runtime.turn_complete_calls.append(kwargs)
+            raise RuntimeError("PRIVATE-TERMINAL")
+        runtime.complete_turn = terminal
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, interrupt_policy_mode="enforce",
+    )
+    assert out["status"] == "failed" and out["answer"] != runtime.intervention_text
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1
+    assert len(attempts) == (0 if failure == "terminal" else 1)
+    assert memory.work["state"] == "failed"
+    assert [kind for kind, _ in memory.work_calls].count("failed") == 1
+    assert "PRIVATE" not in str(out)
+    assert "PRIVATE-PERSISTENCE" not in str(memory.trace_calls)
+    if failure == "assistant":
+        assert runtime.turn_complete_calls[0]["turn_status"] == "abandoned"
+        assert [item for item in memory.added_messages if item["role"] == "assistant"] == []
+    else:
+        assert len([item for item in memory.added_messages if item["role"] == "assistant"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_success_finishes_durable_work_once_without_claims(tmp_path):
+    memory = FakeMemoryStore()
+    out, _, _, memory = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(), memory=memory,
+        interrupt_policy_mode="enforce", claim_record_capture_enabled=True,
+    )
+    assert out["status"] == "ok" and memory.work["state"] == "completed"
+    assert [kind for kind, _ in memory.work_calls].count("completed") == 1
+    assert memory.claim_record_calls == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_cannot_hijack_pending_confirmation_execution(tmp_path, monkeypatch):
+    from test_runtime_client import _interrupt_response
+
+    _install_display_capability(monkeypatch)
+    rules, models = _write_router_files(tmp_path)
+    memory = FakeMemoryStore()
+    runtime = DisplaySettingRuntime()
+    operations = DisplaySettingOperations()
+    connectors = ActionConnectorRegistry((DisplaySettingConnector(operations),))
+    provider = SequenceLiteLLM([_tool_completion(
+        "fixture_display_setting_apply", {"target": "fixture:display", "level": 3},
+    )])
+    options = dict(memory_store=memory, litellm=provider, runtime=runtime,
+                   rules_path=str(rules), model_registry_path=str(models),
+                   allow_manual_override=True, capability_registry_enabled=True,
+                   action_connector_registry=connectors)
+    first = await orchestrate_chat(payload=_display_chat_payload("Apply display level 3."),
+                                   request_id="interrupt-confirm-first", **options)
+    assert "pending_action" in first and operations.apply_inputs == []
+
+    async def interrupt(**kwargs):
+        runtime.interrupt_calls.append(kwargs)
+        return {**_interrupt_response(), **{key: kwargs.get(key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "requested_scene",
+        )}}
+    runtime.evaluate_interrupt = interrupt
+    accepted = await orchestrate_chat(
+        payload=_display_chat_payload("yes", capability_confirmation={
+            "pending_action": first["pending_action"], "confirmed": True,
+        }), request_id="interrupt-confirm-accepted", interrupt_policy_mode="enforce", **options,
+    )
+    assert accepted["answer"] != "Pick the next move and test it."
+    assert len(runtime.confirmation_calls) == len(operations.apply_inputs) == 1
+    policy = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert not policy["response_selected"]
+    assert policy["selection_reason"] == "pending_action_continuation"
+
+
+@pytest.mark.asyncio
+async def test_interrupt_does_not_rewrite_candidate_to_bypass_presence_limits(tmp_path):
+    runtime = EnforceInterruptRuntime(
+        text="Reset the objective. Pick the next move. Keep it concrete.",
+    )
+    out, _, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce",
+        payload=_base_payload(conversation_id="conv-1", surface_context={"active_task_mode": True}),
+    )
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert out["answer"] == "hello" and len(provider.calls) == 1
+    assert not policy["response_selected"]
+    assert policy["selection_reason"] == "stricter_output_policy"
+
+
+@pytest.mark.asyncio
+async def test_selected_interrupt_preempts_a_real_configured_capability_executor(tmp_path):
+    from test_runtime_client import _interrupt_response
+
+    runtime = CapabilityRuntime()
+    runtime.interaction_governance_response["result"].update(
+        interaction_kind="command", action_allowed=True,
+    )
+
+    async def interrupt(**kwargs):
+        runtime.interrupt_calls.append(kwargs)
+        return {**_interrupt_response(), **{key: kwargs.get(key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "requested_scene",
+        )}}
+    runtime.evaluate_interrupt = interrupt
+    out, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, interrupt_policy_mode="enforce",
+        provider=FakeLiteLLM(fail_first=True, completion=_tool_completion(
+            "runtime_world_state_read",
+            {"requested_domains": ["active_repository"], "output_mode": "structured"},
+        )),
+        payload=_first_party_chat_payload("Read current repository state.",
+                                         conversation_id="conv-1", surface_context={
+                                             "spoken_output": False,
+                                         }),
+    )
+    assert out["answer"] == "Pick the next move and test it."
+    assert provider.calls == runtime.capability_authority_calls == []
+    assert runtime.world_state_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_http_failure_is_bounded_and_optional(tmp_path):
+    error = httpx.HTTPStatusError("PRIVATE-HTTP-ERROR", request=httpx.Request("POST", "http://cr"),
+                                 response=httpx.Response(503))
+    out, _, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(interrupt_error=error),
+        interrupt_policy_mode="enforce",
+    )
+    assert out["answer"] == "hello" and len(provider.calls) == 1
+    policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
+    assert policy["failure_category"] == "dependency_http_failure"
+    assert "PRIVATE" not in str(policy)
