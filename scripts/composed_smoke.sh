@@ -3520,6 +3520,137 @@ run_ambient_presence_scenario() {
   echo "Ambient presence: configured_permission_and_mode=true absence_denial_unavailable_no_mode_active_task_opt_out_low_attention_rejected=true no_capture_claim=true"
 }
 
+run_interrupt_enforcement_scenario() {
+  local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  local branching="Should I rewrite this or add an abstraction or split the module or rework the interface or simplify the module or compare every option? Please nudge me back to the next concrete step."
+  local tag owner client surface scene spoken mode text conversation response request trace
+  local decision answer expected calls policy session turn diagnostics interrupt
+  for tag in planning coding overload car unknown evaluate_only defer timing; do
+    surface=web; scene=planning; spoken=false; mode=enforce; text="$branching"; calls=0
+    case "$tag" in
+      coding) surface=telegram; scene=coding_build ;;
+      overload) surface=alexa; scene=overload_recovery; spoken=true ;;
+      car) surface=car; scene=general; spoken=true ;;
+      unknown) surface=unknown; scene=general ;;
+      evaluate_only) mode=evaluate_only; calls=2 ;;
+      defer)
+        calls=1
+        text="Brainstorm possibilities with me. What if we tried several approaches, compared options, and explored edge cases before choosing?" ;;
+      timing) text="I think I broke the server and prod is failing. $branching" ;;
+    esac
+    owner="owner-interrupt-$tag"; client="$surface:interrupt-$tag"
+    conversation="$(create_conversation "$owner" "$client")"
+    # Exact purpose-scoped permission and an explicit current nudge request are
+    # independent inputs. Neither the surface label nor permission alone is consent.
+    configure_surface_permission "$owner" "$surface" true true false
+    provider_post /fixture/reset '{}' >/dev/null
+    expected="The next step is to test one small change."
+    if [ "$tag" = planning ] || [ "$tag" = evaluate_only ]; then
+      queue_provider_answer "$expected" >/dev/null
+      provider_post /fixture/fail-next-primary '{}' >/dev/null
+    elif [ "$tag" = defer ]; then
+      queue_provider_answer "$expected" >/dev/null
+    fi
+    response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" \
+      --arg scene "$scene" --arg conversation "$conversation" --arg text "$text" --arg mode "$mode" \
+      --argjson spoken "$spoken" '
+      {owner_id:$owner,client_id:$client,surface:$surface,conversation_id:$conversation,
+       requested_scene:$scene,interrupt_policy_mode:$mode,sensitivity:"private",
+       messages:[{role:"user",content:$text}],surface_context:{spoken_output:$spoken,active_task_mode:false}}')")"
+    request="$(jq -er .request_id <<<"$response")"
+    trace="$(fetch_trace "$request")"
+    interrupt="$(jq -ec .retrieval.prompt_assembly.interrupt_policy <<<"$trace")"
+    # Independently read the real, stateless CR evaluator with the same bounded
+    # request inputs. No injected policy, contract, detector score or runtime state.
+    decision="$(cr_post /v1/interrupt/evaluate "$(jq -nc --arg request "$request" --arg owner "$owner" \
+      --arg conversation "$conversation" --arg surface "$surface" --arg scene "$scene" --arg text "$text" '
+      {request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface,
+       requested_scene:$scene,current_user_text:$text,recent_messages:[{role:"user",content:$text}]}')")"
+    jq -e --arg mode "$mode" --argjson decision "$decision" '
+      .attempted and .status=="included" and .included and .mode==$mode
+      and .should_interrupt==$decision.should_interrupt and .should_defer==$decision.should_defer
+      and .trigger_class==$decision.trigger_class and .confidence==$decision.confidence
+      and .style_selected==$decision.style_selected' <<<"$interrupt" >/dev/null
+    case "$tag" in
+      evaluate_only)
+        jq -e '.should_interrupt and .should_defer==false and .intervention_text!=null' <<<"$decision" >/dev/null
+        jq -e '.mode=="evaluate_only" and .user_visible_suppressed==true
+          and (.response_selected // false)==false' <<<"$interrupt" >/dev/null
+        jq -e '.status=="degraded" and .selected_model!="not_called"' <<<"$response" >/dev/null
+        jq -e '.fallback.triggered==true and (.model_calls|length)==2' <<<"$trace" >/dev/null ;;
+      defer)
+        jq -e '.should_interrupt==false and .should_defer and .intervention_text==null
+          and (.reason_json.defer_reasons|index("explicit_exploration_request"))!=null' <<<"$decision" >/dev/null
+        jq -e '.response_selected==false and .selection_reason=="deferred"' <<<"$interrupt" >/dev/null
+        jq -e '.status=="ok" and .selected_model!="not_called"' <<<"$response" >/dev/null ;;
+      timing)
+        expected="Could you clarify what you want me to do?"
+        jq -e '.should_interrupt and .intervention_text!=null' <<<"$decision" >/dev/null
+        jq -e '.response_selected==false and .selection_reason=="stronger_timing_outcome"' <<<"$interrupt" >/dev/null
+        jq -e '.status=="degraded" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+        jq -e '.router_decision.rationale=="runtime_timing"
+          and .retrieval.prompt_assembly.runtime_timing.result.timing_policy=="ask_clarifying_question"
+          and .retrieval.prompt_assembly.runtime_timing.result.reason_codes[0]=="unclear_intent_clarification"' <<<"$trace" >/dev/null ;;
+      *)
+        expected="You are branching again. Pick the next move and test it."
+        if [ "$scene" != general ]; then expected+=" Keep it to the next concrete step."; fi
+        jq -e --arg expected "$expected" '.should_interrupt and .should_defer==false
+          and .confidence>=0.85 and .trigger_class=="repetitive_branching"
+          and .style_selected=="next_step_forcing" and .intervention_text==$expected
+          and (.intervention_text|length)<=240
+          and .contract_constraints_applied.matched_contract_style=="soft_redirect"' <<<"$decision" >/dev/null
+        jq -e '.status=="ok" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+        jq -e '.response_selected and .selection_reason=="authorized_intervention"
+          and .assistant_persistence=="succeeded" and .runtime_completion=="succeeded"
+          and .provider_dispatch=="skipped" and .action_dispatch=="skipped"' <<<"$interrupt" >/dev/null
+        jq -e '.router_decision.rationale=="interrupt_policy" and .model_calls==[]
+          and .model_call.status=="not_called" and .fallback.triggered==false
+          and (.retrieval.prompt_assembly.runtime_timing.result.timing_policy
+            | .=="answer_now" or .=="defer_expansion")' <<<"$trace" >/dev/null
+        # Structural traces must not copy the candidate, current input or debug
+        # advisory. Exact CR equality also rules out added relational/filler prose.
+        jq -e --arg input "$text" --arg candidate "$expected" '
+          (tojson|contains($input)|not) and (tojson|contains($candidate)|not)
+          and ([.retrieval.prompt_assembly.interrupt_policy|..|objects|keys[]]
+            | all(.!="debug" and .!="advisory_text" and .!="intervention_text"))' <<<"$trace" >/dev/null
+        if [ "$tag" = unknown ]; then
+          jq -e '(.warnings|index("default_contract_source"))!=null
+            and .interaction_contract.source=="default_compiled"' <<<"$decision" >/dev/null
+          jq -e --argjson count "$(jq '.warnings|length' <<<"$decision")" '.warning_count==$count' <<<"$interrupt" >/dev/null
+        fi ;;
+    esac
+    answer="$(jq -er .answer <<<"$response")"
+    test "$answer" = "$expected"
+    assert_persisted_answer_matches "$conversation" "$request" "$expected"
+    assert_request_persistence_counts "$conversation" "$request" 0
+    test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND client_id='$client';")" = 2
+    test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND role='user' AND metadata->>'surface'='$surface';")" = 1
+    test "$(psql_exec -At -c "SELECT count(*) FROM traces WHERE owner_id='$owner' AND request_id='$request' AND surface='$surface';")" = 1
+    test "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = "$calls"
+    session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+    turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    policy="$(jq -er .retrieval.prompt_assembly.runtime_timing.result.timing_policy <<<"$trace")"
+    jq -e --arg turn "$turn" --arg policy "$policy" '
+      [.events[]|select(.runtime_turn_id==$turn)] as $events
+      | ([$events[]|select(.event_type=="timing_evaluated")]|length)==1
+        and ([$events[]|select(.event_type=="timing_evaluated")][0].event_payload_json.timing_policy==$policy)
+        and ([$events[]|select(.event_type=="turn_completed")]|length)==1
+        and .latest_turn.runtime_turn_id==$turn and .latest_turn.turn_status=="completed"
+        and ([$events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length)==0' <<<"$diagnostics" >/dev/null
+    jq -e '.state=="idle" and .active_runtime_turn_id==null
+      and .active_runtime_session_id==null and .turn_statuses==["completed"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+    # In particular, discard the unused primary-failure switch after preemption.
+    provider_post /fixture/reset '{}' >/dev/null
+    echo "Interrupt enforcement $tag: mode=$mode policy=$policy providers=$calls actions=0 messages=2 traces=1 claims=0 timing_events=1 terminal_events=1 persisted_equal=true"
+  done
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  echo "Interrupt enforcement matrix: enforced_surfaces=5 provider_calls=0 persisted_equal=true timing_precedence=true evaluate_only_fallback=true conservative_defer=true actions=0"
+}
+
 run_situated_presence_case() {
   local tag="$1" text="$2" expected_answer="$3" category="$4"
   local active_task="$5" allows_expansion="$6" expected_kind="$7"
@@ -4463,6 +4594,7 @@ run_surface_permission_scenario
 run_ambient_presence_scenario
 run_return_after_gap_scenario
 run_timing_matrix_scenario
+run_interrupt_enforcement_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
 echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
