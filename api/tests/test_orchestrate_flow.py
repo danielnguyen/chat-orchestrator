@@ -39626,3 +39626,21 @@ async def test_low_attention_timing_caps_fallback_at_common_persistence_seam(tmp
     assert enforcement["length_clamped"] and enforcement["action_taken"] == "filtered"
     assert "resolved_length_limit" in enforcement["reason_codes"]
     assert "proactive_offer_suppressed" in enforcement["reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_timing_receipt_is_server_owned_and_persisted_without_provider_receipt(tmp_path):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy="acknowledge_then_answer",
+        payload=_base_payload(conversation_id="conv-1", surface="alexa",
+                              surface_context={"spoken_output": True},
+                              messages=[{"role": "user", "content": "Write a greeting."}]),
+    )
+    assert out["answer"] == "Received. hello"
+    assert len(provider.calls) == len(runtime.timing_calls) == 1
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assistant = [item for item in memory.added_messages if item["role"] == "assistant"]
+    assert len(assistant) == 1 and assistant[0]["content"] == out["answer"]
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_timing"]["acknowledgment_delivery"] == "final_response_only"
+    assert len(runtime.turn_complete_calls) == 1

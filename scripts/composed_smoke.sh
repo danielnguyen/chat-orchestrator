@@ -3259,6 +3259,7 @@ run_return_after_gap_scenario() {
         and .retrieval.prompt_assembly.return_resume_context.status=="not_requested"' <<<"$trace" >/dev/null
       [ "$(jq -er .conversation_id <<<"$response")" = "$conversation" ]
       [ "$(psql_exec -At -c "SELECT count(*) FROM conversations WHERE owner_id='$owner';")" = 1 ]
+      TURN_TIMING_MATRIX_SELECTOR_RESUME=true
       echo "Selector resume: below_threshold=true primary_reason=continuation_resume deferred_gate=not_requested provider_calls=1 exact_conversation=true"
     fi
     if [ "$tag" = deferred ]; then
@@ -3269,6 +3270,7 @@ run_return_after_gap_scenario() {
         and .retrieval.prompt_assembly.restraint.retrieval_suppressed==false' <<<"$trace" >/dev/null
       jq -e --arg turn "$turn" '.latest_turn|select(.runtime_turn_id==$turn)|.intent_class=="continuation"' <<<"$diagnostics" >/dev/null
     fi
+    if [ "$tag" = deferred ]; then TURN_TIMING_MATRIX_DEFERRED_RESUME=true; fi
     if [ "$expected" = returning_after_gap ]; then
       jq -e '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.content|contains("Do not automatically recap")))' <<<"$calls" >/dev/null
     fi
@@ -3283,9 +3285,177 @@ run_return_after_gap_scenario() {
       jq -e '.retrieval.prompt_assembly.runtime_presence_enforcement.length_clamped==true
         and .retrieval.prompt_assembly.runtime_presence_enforcement.action_taken=="filtered"' <<<"$trace" >/dev/null
     fi
+    if [ "$tag" = paused ]; then TURN_TIMING_MATRIX_DEFER_EXPANSION=true; fi
     echo "Return gap $tag: snapshot_exact=true presence=$expected required_help=true provider_calls=$provider_count persisted_returned_equal=true actions=0"
   done
   echo "Return composition: idle_current_help=true paused_fallback=true no_auto_recap=true canonical_summary=true deferred_resume=true CR_restart_durable=true"
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+}
+
+run_timing_matrix_scenario() {
+  # The full return family already proves defer and both resume origins.
+  test "${TURN_TIMING_MATRIX_DEFER_EXPANSION:-false}" = true
+  test "${TURN_TIMING_MATRIX_SELECTOR_RESUME:-false}" = true
+  test "${TURN_TIMING_MATRIX_DEFERRED_RESUME:-false}" = true
+  local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  local tag owner client surface conversation prior trace response request session turn diagnostics
+  local text answer policy reason calls snapshot durable_before runtime_before thread_before selection updated
+  for tag in answer acknowledgment clarification yield stale_interruption; do
+    owner="owner-timing-matrix-$tag"; client="telegram:timing-$tag"; surface=telegram
+    [ "$tag" != acknowledgment ] || { surface=alexa; client="alexa:timing-$tag"; }
+    conversation="$(create_conversation "$owner" "$client")"
+    configure_surface_permission "$owner" "$surface" true false false
+    provider_post /fixture/reset '{}' >/dev/null
+    if [ "$tag" = yield ] || [ "$tag" = stale_interruption ]; then
+      queue_provider_answer "The input is validated." >/dev/null
+      prior="$(run_distinct_client_chat "$owner" "$client" "$surface" "$conversation" "What does this function do?")"
+      jq -e '.status=="ok"' <<<"$prior" >/dev/null
+      if [ "$tag" = stale_interruption ]; then
+        runtime_backdate_thread "$owner" "$conversation" "$(python3 -c 'from datetime import UTC,datetime,timedelta; print((datetime.now(UTC)-timedelta(seconds=360)).isoformat())')"
+      fi
+      provider_post /fixture/reset '{}' >/dev/null
+    fi
+    text="What is 2+2?"; answer="4."; policy=answer_now; reason=ordinary_ready; calls=1
+    case "$tag" in
+      acknowledgment)
+        # A provider-bound command with no execution-capable capability match.
+        text="Write a greeting."; answer="Received. Hello."; policy=acknowledge_then_answer
+        reason=spoken_action_acknowledgment ;;
+      clarification|stale_interruption)
+        text="I think I broke the server and prod is failing"
+        [ "$tag" != stale_interruption ] || text="hold on"
+        answer="Could you clarify what you want me to do?"; policy=ask_clarifying_question
+        reason=restraint_clarification; calls=0
+        [ "$tag" != clarification ] || reason=unclear_intent_clarification ;;
+      yield)
+        text="hold on"; answer="Go ahead."; policy=yield_to_user; reason=intent_interruption; calls=0 ;;
+    esac
+    if [ "$calls" = 1 ]; then
+      queue_provider_answer "$([ "$tag" = acknowledgment ] && echo Hello. || echo 4.)" >/dev/null
+    fi
+    response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" \
+      --arg conversation "$conversation" --arg text "$text" --arg tag "$tag" '
+      {owner_id:$owner,client_id:$client,surface:$surface,conversation_id:$conversation,sensitivity:"private",
+       messages:[{role:"user",content:$text}],surface_context:{spoken_output:($tag=="acknowledgment")}}')")"
+    request="$(jq -er .request_id <<<"$response")"
+    jq -e --arg answer "$answer" --argjson calls "$calls" '
+      .answer==$answer and (if $calls==0 then .selected_model=="not_called" and .status=="degraded"
+        else .selected_model!="not_called" and .status=="ok" end)' <<<"$response" >/dev/null
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    trace="$(fetch_trace "$request")"
+    jq -e --arg policy "$policy" --arg reason "$reason" '
+      .retrieval.prompt_assembly.runtime_timing as $t
+      | $t.attempted and $t.status=="included" and $t.result.timing_policy==$policy
+        and $t.result.reason_codes[0]==$reason' <<<"$trace" >/dev/null
+    if [ "$tag" = clarification ]; then
+      jq -e '.retrieval.prompt_assembly.interaction_governance.interaction_kind=="tense_debugging"
+        and .retrieval.prompt_assembly.restraint.restraint_policy=="short_answer"
+        and .retrieval.prompt_assembly.restraint.reason=="tense_debugging_tactical_restraint"
+        and .retrieval.prompt_assembly.restraint.clarification_preferred==false
+        and .retrieval.prompt_assembly.runtime_timing.result.continuation_state=="clarification_required"
+        and .retrieval.prompt_assembly.runtime_timing.result.expansion_allowed==false' <<<"$trace" >/dev/null
+    fi
+    session="$(jq -er .retrieval.prompt_assembly.runtime_timing.scope.runtime_session_id <<<"$trace")"
+    turn="$(jq -er .retrieval.prompt_assembly.runtime_timing.scope.runtime_turn_id <<<"$trace")"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    jq -e --arg turn "$turn" --arg policy "$policy" --arg reason "$reason" '
+      [.events[]|select(.runtime_turn_id==$turn)] as $events
+      | ([$events[]|select(.event_type=="timing_evaluated")]|length)==1
+        and ([$events[]|select(.event_type=="timing_evaluated")][0].event_payload_json
+          | .timing_policy==$policy and .reason_codes[0]==$reason)
+        and ([$events[]|select(.event_type=="turn_completed")]|length)==1
+        and .latest_turn.runtime_turn_id==$turn and .latest_turn.turn_status=="completed"
+        and ([$events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length)==0
+    ' <<<"$diagnostics" >/dev/null
+    if [ "$tag" = clarification ]; then
+      jq -e --arg turn "$turn" '.latest_turn.intent_class=="low_confidence_unclear"
+        and ([.events[]|select(.runtime_turn_id==$turn and .event_type=="interaction_governance_evaluated")]
+          | length==1 and .[0].event_payload_json.clarifying_question_allowed==true)' <<<"$diagnostics" >/dev/null
+    fi
+    [ "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = "$calls" ]
+    jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+    if [ "$calls" = 0 ]; then
+      [ "$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE owner_id='$owner' AND request_id='$request';")" = 0 ]
+      jq -e '([.retrieval.prompt_assembly | .. | objects
+        | select(has("forwarded_to_authority") or has("forwarded_to_action_flow"))
+        | (.forwarded_to_authority // false)==false and (.forwarded_to_action_flow // false)==false]
+        | all(.==true))' <<<"$trace" >/dev/null
+    fi
+    local expected_messages=2
+    if [ "$tag" = yield ] || [ "$tag" = stale_interruption ]; then expected_messages=4; fi
+    [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")" = "$expected_messages" ]
+    if [ "$tag" = acknowledgment ]; then
+      jq -e '.retrieval.prompt_assembly.runtime_timing.acknowledgment_delivery=="final_response_only"' <<<"$trace" >/dev/null
+      jq -e '.latest_turn.intent_class=="action_command"' <<<"$diagnostics" >/dev/null
+    fi
+    if [ "$tag" = yield ] || [ "$tag" = stale_interruption ]; then
+      snapshot="$(jq -ec --arg turn "$turn" '[.events[]|select(.runtime_turn_id==$turn and .event_type=="turn_started")][0].event_payload_json.return_after_gap' <<<"$diagnostics")"
+      jq -e --arg tag "$tag" '.prior_terminal_turn_id!=null and
+        .status==(if $tag=="yield" then "below_threshold" else "eligible" end)' <<<"$snapshot" >/dev/null
+      if [ "$tag" = yield ]; then
+        jq -e '.latest_turn.intent_class=="interruption" and .latest_turn.continuation_state=="yielded_to_user"' <<<"$diagnostics" >/dev/null
+        jq -e '.retrieval.prompt_assembly.runtime_timing.result.expansion_allowed==false' <<<"$trace" >/dev/null
+      else
+        jq -e '.latest_turn.intent_class!="interruption"' <<<"$diagnostics" >/dev/null
+      fi
+    fi
+    echo "Timing matrix $tag: policy=$policy stage=admitted_timing primary_reason=$reason providers=$calls actions=0 timing_events=1 terminal_events=1 persisted_returned_equal=true thread_idle=true"
+  done
+
+  # These two policies legitimately terminate at the pre-admission selector.
+  for tag in wait decline; do
+    owner="owner-timing-selector-$tag"; client="telegram:timing-$tag"
+    conversation="$(create_conversation "$owner" "$client")"
+    configure_surface_permission "$owner" telegram true false false
+    if [ "$tag" = wait ]; then
+      prior="$(cr_post /v1/runtime/turns/start "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '
+        {request_id:"matrix-active",owner_id:$owner,conversation_id:$conversation,surface:"telegram"}')")"
+      session="$(jq -er .runtime_session.runtime_session_id <<<"$prior")"
+      turn="$(jq -er .runtime_turn.runtime_turn_id <<<"$prior")"
+      policy=pause_or_wait; reason=active_thread_present
+      answer="Another turn is still in progress. Please try again shortly."
+    else
+      provider_post /fixture/reset '{}' >/dev/null
+      queue_provider_answer "4." >/dev/null
+      run_distinct_client_chat "$owner" "$client" telegram "$conversation" "What is 2+2?" >/dev/null
+      runtime_set_thread_projection "$owner" "$conversation" unavailable
+      policy=close_turn; reason=unavailable_thread_present
+      answer="I couldn’t safely continue a prior conversation. No retained conversation content was used."
+    fi
+    durable_before="$(continuation_durable_snapshot "$owner")"
+    runtime_before="$(runtime_owner_counts "$owner")"
+    thread_before="$(runtime_thread_snapshot "$owner" "$conversation")"
+    updated="$(psql_exec -At -c "SELECT to_json(updated_at) FROM conversations WHERE id='$conversation' AND owner_id='$owner';" | jq -er .)"
+    selection="$(cr_post /v1/runtime/continuations/select "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --arg updated "$updated" '
+      {request_id:"matrix-selector",owner_id:$owner,surface:"telegram",surface_permission_status:"configured",
+       conversation_context_allowed:true,candidate_set_complete:true,stale_after_seconds:1800,
+       candidates:[{conversation_id:$conversation,lifecycle_state:"open",durable_updated_at:$updated}]}')")"
+    jq -e --arg tag "$tag" --arg policy "$policy" --arg reason "$reason" '
+      .result.outcome==$tag and .result.timing_policy==$policy and .result.reason_codes==[$reason]
+      and .result.selected_conversation_id==null' <<<"$selection" >/dev/null
+    provider_post /fixture/reset '{}' >/dev/null
+    response="$(run_omitted_chat "$owner" "$client" telegram "What is 2+2?")"
+    jq -e --arg answer "$answer" --arg tag "$tag" '.answer==$answer and .conversation_id==null
+      and .selected_model=="not_called" and .sources==[]
+      and .status==(if $tag=="wait" then "degraded" else "failed" end)' <<<"$response" >/dev/null
+    request="$(jq -er .request_id <<<"$response")"
+    [ "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = 0 ]
+    [ "$durable_before" = "$(continuation_durable_snapshot "$owner")" ]
+    [ "$runtime_before" = "$(runtime_owner_counts "$owner")" ]
+    [ "$thread_before" = "$(runtime_thread_snapshot "$owner" "$conversation")" ]
+    # Equal event counts prove no timing, action, admission, or terminal event was fabricated.
+    echo "Timing matrix $tag: policy=$policy stage=selector primary_reason=$reason providers=0 actions=0 durable_runtime_unchanged=true admitted_timing_events=0"
+    if [ "$tag" = wait ]; then
+      cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$session" --arg turn "$turn" '
+        {request_id:"matrix-active",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"abandoned"}')" >/dev/null
+    fi
+  done
+  echo "Timing matrix defer: policy=defer_expansion stage=admitted_timing primary_reason=presence_low_attention providers=2 actions=0 bounded_required_help=true persisted_returned_equal=true"
+  echo "Timing matrix resume: policy=resume_previous_thread stage=admitted_timing primary_reasons=continuation_resume,return_deferred_continuation providers=1_each actions=0 canonical_deferred_source=true persisted_returned_equal=true"
+  echo "Turn timing matrix: all_eight=true selector_outcomes=2 admitted_policies=6 stale_interruption_not_yield=true acknowledgment_delivery=final_response_only"
   COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
 }
@@ -4292,6 +4462,7 @@ run_continuation_failure_contention_scenario
 run_surface_permission_scenario
 run_ambient_presence_scenario
 run_return_after_gap_scenario
+run_timing_matrix_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
 echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
