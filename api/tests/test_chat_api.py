@@ -272,7 +272,7 @@ async def test_same_deferred_task_result_is_retrieved_without_recomputation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "cr", "bms"])
+@pytest.mark.parametrize("failure", [None, "cr_open", "cr", "bms_open", "bms"])
 async def test_startup_reconciliation_order_and_fail_closed(monkeypatch, failure):
     main = _load_main(monkeypatch)
     events = []
@@ -280,6 +280,8 @@ async def test_startup_reconciliation_order_and_fail_closed(monkeypatch, failure
     class Runtime:
         async def open(self):
             events.append("open")
+            if failure == "cr_open":
+                raise RuntimeError("runtime_open_failed")
 
         async def reconcile_interrupted_turns(self, request_id):
             assert str(UUID(request_id)) == request_id
@@ -292,6 +294,14 @@ async def test_startup_reconciliation_order_and_fail_closed(monkeypatch, failure
             events.append("close")
 
     class Memory:
+        async def open(self):
+            events.append("bms_open")
+            if failure == "bms_open":
+                raise RuntimeError("memory_store_open_failed")
+
+        async def close(self):
+            events.append("bms_close")
+
         async def reconcile_interrupted_work(self):
             events.append("bms")
             if failure == "bms":
@@ -301,11 +311,19 @@ async def test_startup_reconciliation_order_and_fail_closed(monkeypatch, failure
     monkeypatch.setattr(main, "runtime", Runtime())
     monkeypatch.setattr(main, "memory_store", Memory())
     if failure:
-        with pytest.raises(RuntimeError, match="reconciliation_response_invalid"):
+        with pytest.raises(
+            RuntimeError,
+            match="reconciliation_response_invalid|memory_store_open_failed|runtime_open_failed",
+        ):
             async with main.lifespan(main.app):
                 pytest.fail("startup admitted traffic")
-        assert events == (["open", "cr", "close"] if failure == "cr"
-                          else ["open", "cr", "bms", "close"])
+        expected = {
+            "cr_open": ["open", "close"],
+            "cr": ["open", "cr", "close"],
+            "bms_open": ["open", "cr", "bms_open", "close"],
+            "bms": ["open", "cr", "bms_open", "bms", "bms_close", "close"],
+        }
+        assert events == expected[failure]
     else:
         started = asyncio.Event()
 
@@ -322,7 +340,7 @@ async def test_startup_reconciliation_order_and_fail_closed(monkeypatch, failure
             main._owned_chat_tasks.add(task)
             task.add_done_callback(main._chat_task_done)
             await started.wait()
-        assert events == ["open", "cr", "bms", "yield", "cleanup", "close"]
+        assert events == ["open", "cr", "bms_open", "bms", "yield", "cleanup", "bms_close", "close"]
         assert not main._owned_chat_tasks
 
 
@@ -332,6 +350,12 @@ async def test_startup_without_runtime_still_reconciles_work(monkeypatch):
     events = []
 
     class Memory:
+        async def open(self):
+            events.append("bms_open")
+
+        async def close(self):
+            events.append("bms_close")
+
         async def reconcile_interrupted_work(self):
             events.append("bms")
             return {"interrupted_count": 0}
@@ -339,7 +363,8 @@ async def test_startup_without_runtime_still_reconciles_work(monkeypatch):
     monkeypatch.setattr(main, "runtime", None)
     monkeypatch.setattr(main, "memory_store", Memory())
     async with main.lifespan(main.app):
-        assert events == ["bms"]
+        assert events == ["bms_open", "bms"]
+    assert events == ["bms_open", "bms", "bms_close"]
 
 
 @pytest.mark.parametrize("fields", [
@@ -905,3 +930,42 @@ async def test_chat_api_enforce_returns_exact_durable_server_owned_intervention(
     assert body["selected_model"] == "not_called" and provider.calls == []
     assert memory.added_messages[-1]["content"] == body["answer"]
     assert memory.work["state"] == "completed" and len(runtime.turn_complete_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_bms_shutdown_failure_still_closes_captured_runtime(monkeypatch):
+    main = _load_main(monkeypatch)
+    events = []
+
+    class Runtime:
+        async def open(self):
+            events.append("runtime_open")
+
+        async def reconcile_interrupted_turns(self, request_id):
+            events.append("cr_reconcile")
+            return {"interrupted_count": 0}
+
+        async def close(self):
+            events.append("runtime_close")
+
+    class Memory:
+        async def open(self):
+            events.append("bms_open")
+
+        async def reconcile_interrupted_work(self):
+            events.append("bms_reconcile")
+            return {"interrupted_count": 0}
+
+        async def close(self):
+            events.append("bms_close")
+            raise RuntimeError("memory_close_failed")
+
+    monkeypatch.setattr(main, "runtime", Runtime())
+    monkeypatch.setattr(main, "memory_store", Memory())
+    with pytest.raises(RuntimeError, match="^memory_close_failed$"):
+        async with main.lifespan(main.app):
+            events.append("yield")
+    assert events == [
+        "runtime_open", "cr_reconcile", "bms_open", "bms_reconcile", "yield",
+        "bms_close", "runtime_close",
+    ]

@@ -1,8 +1,11 @@
+import asyncio
 import json
 from copy import deepcopy
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import pytest_asyncio
 from clients.memory_store import MemoryStoreClient, _validate_work_projection
 
 WORK_ID = "00000000-0000-4000-8000-000000000010"
@@ -66,8 +69,8 @@ async def test_reconcile_work_rejects_malformed_without_retry(service, response)
     assert len(calls) == 1
 
 
-@pytest.fixture
-def service(monkeypatch):
+@pytest_asyncio.fixture
+async def service(monkeypatch):
     calls = []
     responses = []
     async_client = httpx.AsyncClient
@@ -87,7 +90,12 @@ def service(monkeypatch):
             transport=httpx.MockTransport(handler),
         ),
     )
-    return MemoryStoreClient("http://memory", "test-key"), responses, calls
+    client = MemoryStoreClient("http://memory", "test-key")
+    await client.open()
+    try:
+        yield client, responses, calls
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -133,6 +141,19 @@ async def test_work_client_all_operations_use_exact_bms_contract(service):
     assert calls[2].url.path == f"/v1/internal/work-items/{WORK_ID}"
     assert all(r.headers["X-API-Key"] == "test-key" for r in calls)
     assert calls[0].headers["X-Request-ID"] == "request-1"
+    assert json.loads(calls[0].content) == ASSOCIATION
+    assert json.loads(calls[2].content) == {
+        "owner_id": "owner", "conversation_id": CONVERSATION_ID,
+        "state": "running", "assistant_message_id": None, "failure_code": None,
+    }
+    assert json.loads(calls[3].content) == {
+        "owner_id": "owner", "conversation_id": CONVERSATION_ID,
+        "state": "completed", "assistant_message_id": MESSAGE_ID, "failure_code": None,
+    }
+    assert json.loads(calls[4].content) == {
+        "owner_id": "owner", "client_id": "web:one", "work_id": WORK_ID,
+    }
+    assert all("X-Request-ID" not in r.headers for r in calls[1:])
     assert b'"content"' not in b"".join(r.content for r in calls)
 
 
@@ -495,3 +516,219 @@ async def test_presence_permission_malformed_fails_without_retry(service, change
     with pytest.raises(RuntimeError, match="surface_permission_"):
         await client.get_presence_surface_permission(owner_id="owner", surface="alexa")
     assert len(calls) == 1
+
+
+@pytest_asyncio.fixture
+async def managed_transport(monkeypatch):
+    constructions, calls, responses = [], [], []
+    async_client = httpx.AsyncClient
+
+    def handler(request):
+        calls.append(request)
+        response = responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, httpx.Response):
+            return response
+        return httpx.Response(200, content=json.dumps(response))
+
+    def factory(**kwargs):
+        client = async_client(**kwargs, transport=httpx.MockTransport(handler))
+        client.aclose = AsyncMock(wraps=client.aclose)
+        constructions.append((kwargs, client))
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    client = MemoryStoreClient("http://memory/", "test-key", timeout_ms=12345)
+    try:
+        yield client, constructions, calls, responses
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_transport_explicit_lifecycle_and_sequential_reuse(managed_transport):
+    client, constructions, calls, responses = managed_transport
+    assert constructions == []
+    with pytest.raises(RuntimeError, match="^memory_store_client_not_started$"):
+        await client._get("/v1/conversations")
+    assert constructions == [] and calls == []
+    await asyncio.gather(client.open(), client.open())
+    await client.open()
+    assert len(constructions) == 1
+    kwargs, transport = constructions[0]
+    assert set(kwargs) == {"timeout", "limits"}
+    assert kwargs["timeout"] == 12.345
+    assert kwargs["limits"].max_connections == 100
+    assert kwargs["limits"].max_keepalive_connections == 20
+    assert kwargs["limits"].keepalive_expiry == 5.0
+    assert client._client is transport
+    responses.extend([{"ok": True}] * 4 + [{"interrupted_count": 0}])
+    assert await client._post("/v1/traces", request_id="request-one", json={"ok": True})
+    assert await client._get("/v1/conversations", params={"owner_id": "owner"})
+    assert await client._work_write("PATCH", "/v1/internal/work-items/one", {"state": "running"})
+    assert await client._work_write("PUT", "/v1/internal/current-work", {"work_id": "one"})
+    assert await client.reconcile_interrupted_work() == {"interrupted_count": 0}
+    assert len(constructions) == 1 and len(calls) == 5
+    assert [call.method for call in calls] == ["POST", "GET", "PATCH", "PUT", "POST"]
+    assert all(call.headers["X-API-Key"] == "test-key" for call in calls)
+    assert calls[0].headers["X-Request-ID"] == "request-one"
+    assert "X-Request-ID" not in calls[1].headers
+    assert dict(calls[1].url.params) == {"owner_id": "owner"}
+    assert calls[-1].content == b""
+    transport.aclose.assert_not_awaited()
+    await asyncio.gather(client.close(), client.close())
+    await client.close()
+    transport.aclose.assert_awaited_once()
+    with pytest.raises(RuntimeError, match="^memory_store_client_closed$"):
+        await client._post("/v1/traces", json={})
+    with pytest.raises(RuntimeError, match="^memory_store_client_closed$"):
+        await client.open()
+    assert len(constructions) == 1 and len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_memory_transport_close_before_open_is_final(managed_transport):
+    client, constructions, calls, _ = managed_transport
+    await client.close()
+    await client.close()
+    with pytest.raises(RuntimeError, match="^memory_store_client_closed$"):
+        await client.open()
+    assert constructions == [] and calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["POST", "GET", "PATCH", "PUT", "RECONCILE"])
+@pytest.mark.parametrize("failure", ["http", "timeout", "transport", "decode", "pool_timeout"])
+async def test_memory_transport_failures_never_replay(
+    managed_transport, method, failure,
+):
+    client, constructions, calls, responses = managed_transport
+    await client.open()
+    if failure == "http":
+        responses.append(httpx.Response(503))
+        expected = httpx.HTTPStatusError
+    elif failure == "timeout":
+        responses.append(httpx.ReadTimeout("private-timeout"))
+        expected = httpx.ReadTimeout
+    elif failure == "pool_timeout":
+        responses.append(httpx.PoolTimeout("private-pool"))
+        expected = httpx.PoolTimeout
+    elif failure == "transport":
+        responses.append(httpx.ConnectError("private-transport"))
+        expected = httpx.ConnectError
+    else:
+        responses.append(httpx.Response(200, content=b"not-json"))
+        expected = ValueError
+    with pytest.raises(expected):
+        if method == "POST":
+            await client._post("/v1/traces", request_id="failed-request", json={"mutation": True})
+        elif method == "GET":
+            await client._get("/v1/conversations", params={"owner_id": "owner"})
+        elif method == "RECONCILE":
+            await client.reconcile_interrupted_work()
+        else:
+            await client._work_write(method, "/v1/internal/work-items/one", {"mutation": True})
+    assert len(calls) == 1
+    assert calls[0].method == ("POST" if method == "RECONCILE" else method)
+    if method == "RECONCILE":
+        assert calls[0].content == b""
+    assert len(constructions) == 1
+    failed_client = constructions[0][1]
+    replace = failure in {"timeout", "transport"}
+    if replace:
+        assert client._client is None
+        failed_client.aclose.assert_awaited_once()
+    else:
+        assert client._client is failed_client
+        failed_client.aclose.assert_not_awaited()
+    responses.append({"ok": True})
+    assert await client._post("/v1/traces", request_id="independent-request", json={"new": True})
+    assert len(calls) == 2 and calls[1].headers["X-Request-ID"] == "independent-request"
+    assert json.loads(calls[1].content) == {"new": True}
+    assert len(constructions) == (2 if replace else 1)
+    assert client._client is constructions[-1][1]
+    if replace:
+        assert client._client is not failed_client
+        failed_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_old_failure_cannot_invalidate_later_replacement(managed_transport):
+    client, constructions, calls, responses = managed_transport
+    await client.open()
+    failed_client = client._client
+    responses.append(httpx.ConnectError("transport-unavailable"))
+    with pytest.raises(httpx.ConnectError):
+        await client._post("/v1/traces", json={"first": True})
+    assert client._client is None and len(calls) == 1
+    responses.append({"ok": True})
+    await client._post("/v1/traces", json={"independent": True})
+    replacement = client._client
+    await asyncio.gather(client._invalidate_client(failed_client), client.open())
+    assert client._client is replacement and len(constructions) == 2
+    failed_client.aclose.assert_awaited_once()
+    replacement.aclose.assert_not_awaited()
+    await client.close()
+    replacement.aclose.assert_awaited_once()
+    with pytest.raises(RuntimeError, match="^memory_store_client_closed$"):
+        await client._get("/v1/conversations")
+    assert len(calls) == 2 and len(constructions) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["invalidate", "close"])
+async def test_transport_cleanup_failure_preserves_original_error(
+    managed_transport, monkeypatch, cleanup,
+):
+    client, constructions, calls, responses = managed_transport
+    await client.open()
+    failed_client = client._client
+    original_close = failed_client.aclose
+    failure = httpx.ReadTimeout("transport-unconfirmed")
+    responses.append(failure)
+    cleanup_failure = AsyncMock(side_effect=RuntimeError("cleanup-unavailable"))
+    if cleanup == "invalidate":
+        monkeypatch.setattr(client, "_invalidate_client", cleanup_failure)
+    else:
+        monkeypatch.setattr(failed_client, "aclose", cleanup_failure)
+    try:
+        with pytest.raises(httpx.ReadTimeout) as caught:
+            await client._post("/v1/traces", json={"mutation": True})
+        assert caught.value is failure
+        assert len(calls) == 1 and len(constructions) == 1
+        cleanup_failure.assert_awaited_once()
+    finally:
+        if cleanup == "close":
+            await original_close()
+
+
+@pytest.mark.asyncio
+async def test_memory_transport_cancellation_propagates_without_replay(managed_transport):
+    client, constructions, calls, responses = managed_transport
+    await client.open()
+    responses.append(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await client._post("/v1/traces", json={"mutation": True})
+    assert len(calls) == 1 and len(constructions) == 1
+    assert client._client is constructions[0][1]
+    constructions[0][1].aclose.assert_not_awaited()
+    responses.append({"ok": True})
+    await client._get("/v1/conversations")
+    assert len(calls) == 2 and len(constructions) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [None, {}, {"interrupted_count": True}])
+async def test_reconciliation_validation_preserves_shared_client(managed_transport, malformed):
+    client, constructions, calls, responses = managed_transport
+    await client.open()
+    responses.append(malformed)
+    with pytest.raises(RuntimeError, match="^work_reconciliation_response_invalid$"):
+        await client.reconcile_interrupted_work()
+    assert len(calls) == 1 and len(constructions) == 1
+    assert client._client is constructions[0][1]
+    constructions[0][1].aclose.assert_not_awaited()
+    responses.append({"interrupted_count": 0})
+    assert await client.reconcile_interrupted_work() == {"interrupted_count": 0}
+    assert len(calls) == 2 and len(constructions) == 1

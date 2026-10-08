@@ -84,20 +84,30 @@ async def _await_chat_delivery(
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     runtime_client = runtime
+    memory_client = memory_store
+    memory_opened = False
     try:
         if runtime_client is not None:
             await runtime_client.open()
             await runtime_client.reconcile_interrupted_turns(str(uuid4()))
-        await memory_store.reconcile_interrupted_work()
+        await memory_client.open()
+        memory_opened = True
+        await memory_client.reconcile_interrupted_work()
         yield
     finally:
-        tasks = tuple(_owned_chat_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        if runtime_client is not None:
-            await runtime_client.close()
+        try:
+            tasks = tuple(_owned_chat_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            try:
+                if memory_opened:
+                    await memory_client.close()
+            finally:
+                if runtime_client is not None:
+                    await runtime_client.close()
 
 
 app = FastAPI(title="Chat Orchestrator", version="0.1.0", lifespan=lifespan)

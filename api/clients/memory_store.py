@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime
 from typing import Any
@@ -197,15 +198,79 @@ class MemoryStoreClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout_ms / 1000
+        self._client: httpx.AsyncClient | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._started = False
+        self._closed = False
+
+    def _new_client(self) -> httpx.AsyncClient:
+        # Pin the measured capacity instead of inheriting future library defaults.
+        return httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=5.0,
+            ),
+        )
+
+    async def open(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("memory_store_client_closed")
+            if self._started:
+                return
+            if self._client is None:
+                self._client = self._new_client()
+            self._started = True
+
+    async def close(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+        if client is not None:
+            await client.aclose()
+
+    async def _client_for_request(self) -> httpx.AsyncClient:
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("memory_store_client_closed")
+            if not self._started:
+                raise RuntimeError("memory_store_client_not_started")
+            if self._client is None:
+                self._client = self._new_client()
+            return self._client
+
+    async def _invalidate_client(self, failed_client: httpx.AsyncClient) -> None:
+        should_close = False
+        async with self._lifecycle_lock:
+            if self._client is failed_client:
+                self._client = None
+                should_close = True
+        if should_close:
+            await failed_client.aclose()
 
     async def reconcile_interrupted_work(self) -> dict[str, int]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        client = await self._client_for_request()
+        try:
             response = await client.post(
                 f"{self.base_url}/v1/internal/work-items/reconcile-interrupted",
                 headers={"X-API-Key": self.api_key},
             )
             response.raise_for_status()
             result = response.json()
+        except httpx.PoolTimeout:
+            # Capacity exhaustion is request-local; preserve the healthy shared pool.
+            raise
+        except httpx.TransportError:
+            try:
+                await self._invalidate_client(client)
+            except Exception:
+                pass
+            raise
         if (
             not isinstance(result, dict)
             or set(result) != {"interrupted_count"}
@@ -241,13 +306,23 @@ class MemoryStoreClient:
     async def _work_write(
         self, method: str, path: str, payload: dict[str, Any],
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        client = await self._client_for_request()
+        try:
             response = await client.request(
                 method, f"{self.base_url}{path}",
                 headers={"X-API-Key": self.api_key}, json=payload,
             )
             response.raise_for_status()
             return response.json()
+        except httpx.PoolTimeout:
+            # Capacity exhaustion is request-local; preserve the healthy shared pool.
+            raise
+        except httpx.TransportError:
+            try:
+                await self._invalidate_client(client)
+            except Exception:
+                pass
+            raise
 
     async def get_work_result(
         self, *, work_id: str, owner_id: str, conversation_id: str,
@@ -321,10 +396,20 @@ class MemoryStoreClient:
         headers = {"X-API-Key": self.api_key}
         if request_id:
             headers["X-Request-ID"] = request_id
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        client = await self._client_for_request()
+        try:
             resp = await client.post(f"{self.base_url}{path}", headers=headers, json=json)
             resp.raise_for_status()
             return resp.json()
+        except httpx.PoolTimeout:
+            # Capacity exhaustion is request-local; preserve the healthy shared pool.
+            raise
+        except httpx.TransportError:
+            try:
+                await self._invalidate_client(client)
+            except Exception:
+                pass
+            raise
 
     async def _get(
         self,
@@ -333,7 +418,8 @@ class MemoryStoreClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         headers = {"X-API-Key": self.api_key}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        client = await self._client_for_request()
+        try:
             resp = await client.get(
                 f"{self.base_url}{path}",
                 headers=headers,
@@ -341,6 +427,15 @@ class MemoryStoreClient:
             )
             resp.raise_for_status()
             return resp.json()
+        except httpx.PoolTimeout:
+            # Capacity exhaustion is request-local; preserve the healthy shared pool.
+            raise
+        except httpx.TransportError:
+            try:
+                await self._invalidate_client(client)
+            except Exception:
+                pass
+            raise
 
     async def get_presence_surface_permission(self, *, owner_id: str, surface: str):
         if (
