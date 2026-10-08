@@ -1389,26 +1389,43 @@ async def test_fastapi_lifespan_opens_and_closes_same_runtime_client(monkeypatch
             return {"interrupted_count": 0}
 
     class Memory:
+        def __init__(self):
+            self.open_calls = 0
+            self.close_calls = 0
+
+        async def open(self):
+            self.open_calls += 1
+
+        async def close(self):
+            self.close_calls += 1
+
         async def reconcile_interrupted_work(self):
             return {"interrupted_count": 0}
 
     configured = ManagedRuntime()
     replacement = ManagedRuntime()
+    memory = Memory()
+    replacement_memory = Memory()
     monkeypatch.setattr(main, "runtime", configured)
-    monkeypatch.setattr(main, "memory_store", Memory())
+    monkeypatch.setattr(main, "memory_store", memory)
 
     async with main.app.router.lifespan_context(main.app):
         assert configured.open_calls == 1
         assert configured.close_calls == 0
+        assert memory.open_calls == 1 and memory.close_calls == 0
         monkeypatch.setattr(main, "runtime", replacement)
+        monkeypatch.setattr(main, "memory_store", replacement_memory)
 
     assert configured.close_calls == 1
     assert replacement.open_calls == 0
     assert replacement.close_calls == 0
 
+    assert memory.close_calls == 1
+    assert replacement_memory.open_calls == 0 and replacement_memory.close_calls == 0
+
 
 @pytest.mark.asyncio
-async def test_runtime_disabled_lifespan_does_not_manage_other_clients(monkeypatch):
+async def test_runtime_disabled_lifespan_only_manages_memory_client(monkeypatch):
     main = _load_main(monkeypatch)
 
     class UnexpectedLifecycle:
@@ -1421,13 +1438,27 @@ async def test_runtime_disabled_lifespan_does_not_manage_other_clients(monkeypat
         async def close(self) -> None:
             raise AssertionError("unexpected close")
 
+    events = []
+
+    class ManagedMemory:
+        async def open(self):
+            events.append("memory_open")
+
+        async def reconcile_interrupted_work(self):
+            events.append("memory_reconcile")
+            return {"interrupted_count": 0}
+
+        async def close(self):
+            events.append("memory_close")
+
     monkeypatch.setattr(main, "runtime", None)
-    monkeypatch.setattr(main, "memory_store", UnexpectedLifecycle())
+    monkeypatch.setattr(main, "memory_store", ManagedMemory())
     monkeypatch.setattr(main, "litellm", UnexpectedLifecycle())
     monkeypatch.setattr(main, "dsa", UnexpectedLifecycle())
 
     async with main.app.router.lifespan_context(main.app):
-        pass
+        assert events == ["memory_open", "memory_reconcile"]
+    assert events == ["memory_open", "memory_reconcile", "memory_close"]
 
 
 @pytest.mark.asyncio
