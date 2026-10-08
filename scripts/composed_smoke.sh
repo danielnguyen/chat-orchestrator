@@ -4909,8 +4909,8 @@ for scenario, budget in budgets.items():
           f"p50_ms={statistics.median(values):.3f} p95_ms={p95:.3f} "
           f"max_ms={max(values):.3f} budget_ms={budget} pass={str(within).lower()}")
     print(f"Latency samples {scenario}: elapsed_ms=" + json.dumps(values, separators=(",", ":")))
-print(f"Persistent transport latency regression: scenarios=5 budgets_pass={str(all_within).lower()} "
-      "behavioral_parity=true")
+print("Persistent transport latency regression: scenarios=5 budgets_"
+      f"pass={str(all_within).lower()} behavioral_parity=true")
 if not all_within:
     raise ValueError("latency_budget_exceeded")
 PYTHON
