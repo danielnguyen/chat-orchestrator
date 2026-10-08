@@ -3748,7 +3748,7 @@ fetch_interrupt_debug() {
     --data-urlencode "owner_id=$owner" --data-urlencode "conversation_id=$conversation" \
     -w $'\n%{http_code}')"
   status="${response##*$'\n'}"
-  test "$status" = "$expected_status"
+  test "$status" = "$expected_status" || return 1
   printf '%s' "${response%$'\n'*}"
 }
 
