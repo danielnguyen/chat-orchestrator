@@ -4844,7 +4844,7 @@ PY
   echo "G2 deferred proof: http=202 delay_ms=18000 request=$request conversation=$conversation work=$work assistant=$(jq -r .result.assistant_message_id <<<"$public") work_count=1 provider_chat=1 polling_provider_delta=0 polling_work_delta=0 pagination_equal=true direct_exact_equal=true identity_unchanged=true"
 }
 
-# Temporary hosted measurement only: budgets are comparisons, never exit gates.
+# Deterministic composed regression: compare unrounded p95 with exact local budgets.
 # Fixture setup, prior-history creation, and assertions are outside the timer.
 latency_measure_chat() {
   local payload="$1" scenario="$2" measured="$3" samples="$4"
@@ -4876,7 +4876,7 @@ print(body.decode())
 PYTHON
 }
 
-latency_measurement_summary() {
+latency_regression_summary() {
   python3 - "$1" <<'PYTHON'
 import json
 import math
@@ -4905,16 +4905,18 @@ for scenario, budget in budgets.items():
     p95 = ordered[lower] + (ordered[math.ceil(position)] - ordered[lower]) * (position - lower)
     within = p95 <= budget
     all_within = all_within and within
-    print(f"Latency measurement {scenario}: samples=10 min_ms={min(values):.3f} "
+    print(f"Latency regression {scenario}: samples=10 min_ms={min(values):.3f} "
           f"p50_ms={statistics.median(values):.3f} p95_ms={p95:.3f} "
-          f"max_ms={max(values):.3f} budget_ms={budget} within_budget={str(within).lower()}")
+          f"max_ms={max(values):.3f} budget_ms={budget} pass={str(within).lower()}")
     print(f"Latency samples {scenario}: elapsed_ms=" + json.dumps(values, separators=(",", ":")))
-print(f"Current composed latency measurement: scenarios=5 within_budget={str(all_within).lower()} "
-      "measurement_only=true behavioral_parity=true")
+print(f"Persistent transport latency regression: scenarios=5 budgets_pass={str(all_within).lower()} "
+      "behavioral_parity=true")
+if not all_within:
+    raise ValueError("latency_budget_exceeded")
 PYTHON
 }
 
-run_current_latency_measurement() {
+run_transport_latency_regression() {
   local scenario index owner client conversation payload question response request answer trace calls diagnostics
   local turn expected_calls expected_timing claims measured recognizer samples expected_users
   local saved_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
@@ -4924,7 +4926,6 @@ run_current_latency_measurement() {
   local saved_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
   samples="$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl"
   : > "$samples"
-  echo "Latency measurement safe_action_preview: measured=false reason=capability_dispatch_disabled_in_existing_topology"
   for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback; do
     # Preserve the established evidence/history fixture policies. Ordinary and
     # fallback use the existing fully governed timing fixture configuration.
@@ -4972,7 +4973,7 @@ run_current_latency_measurement() {
           {external_context_enabled:true,external_context:{enabled:true,source_ids:["records_primary"],
             allowed_sensitivity:"medium",max_results:5,domain_tags:[],exact_source_refs:[]}}
           else {} end')"
-      echo "Latency measurement progress: scenario=$scenario turn=$index of=12"
+      echo "Latency regression progress: scenario=$scenario turn=$index of=12"
       measured=false; [ "$index" -le 2 ] || measured=true
       response="$(latency_measure_chat "$payload" "$scenario" "$measured" "$samples")"
       request="$(jq -er .request_id <<<"$response")"; answer="$(jq -er .answer <<<"$response")"
@@ -5040,7 +5041,7 @@ run_current_latency_measurement() {
     done
     echo "Latency behavior $scenario: warmups=2 measured=10 parity=true actions=0 persisted_equal=true completed=true idle=true"
   done
-  latency_measurement_summary "$samples"
+  latency_regression_summary "$samples"
   export COMPOSED_RESTRAINT_ENABLED="$saved_restraint" COMPOSED_HISTORY_FOLLOWUP_ENABLED="$saved_history"
   export COMPOSED_ALLOW_MANUAL_OVERRIDE="$saved_override" COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$saved_reserve"
   export COMPOSED_PRIVACY_CONTEXT_ENABLED="$saved_privacy"
@@ -5076,7 +5077,7 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: evidence-acquisition-only"
   run_evidence_acquisition_composed_suite
   if [ "${EVIDENCE_SCENARIO:-all}" = all ]; then
-    run_current_latency_measurement
+    run_transport_latency_regression
   fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
   exit 0
