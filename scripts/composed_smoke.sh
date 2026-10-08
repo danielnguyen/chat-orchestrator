@@ -3742,6 +3742,255 @@ run_interrupt_enforcement_scenario() {
   echo "Interrupt enforcement matrix: enforced_surfaces=5 provider_calls=0 persisted_equal=true timing_precedence=true evaluate_only_fallback=true conservative_defer=true malformed_contract=true actions=0"
 }
 
+fetch_interrupt_debug() {
+  local owner="$1" conversation="$2" request="$3" expected_status="${4:-200}" response status
+  response="$(curl -sS -G "http://127.0.0.1:14371/v1/interrupt/debug/$request" \
+    --data-urlencode "owner_id=$owner" --data-urlencode "conversation_id=$conversation" \
+    -w $'\n%{http_code}')"
+  status="${response##*$'\n'}"
+  test "$status" = "$expected_status" || return 1
+  printf '%s' "${response%$'\n'*}"
+}
+
+runtime_interrupt_lifecycle_fixture() {
+  local owner="$1" conversation="$2" mode="$3" original="${4:-}"
+  if [ -z "$original" ]; then original='{}'; fi
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" "$conversation" "$mode" "$original" <<'PYCODE'
+import hashlib
+import json
+import sqlite3
+import sys
+
+owner, conversation, mode, original_json = sys.argv[1:]
+original = json.loads(original_json)
+sentinel = "PRIVATE-INTERRUPT-HISTORY-SENTINEL"
+with sqlite3.connect("file:/data/companion_contracts.sqlite3?mode=rw", uri=True) as conn:
+    conn.row_factory = sqlite3.Row
+    scope = (owner, conversation)
+
+    def rows():
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM interaction_boundary_events WHERE owner_id=? AND conversation_id=? "
+            "AND substr(check_type,1,10)='interrupt_' ORDER BY id", scope
+        )]
+
+    def fingerprint(items):
+        return hashlib.sha256(json.dumps(
+            {"row_count": len(items), "rows": items}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=True
+        ).encode()).hexdigest()
+
+    def structural(items):
+        return [{key: row[key] for key in ("check_type", "result", "surface", "request_id")}
+                for row in items]
+
+    if mode in {"corrupt", "restore"}:
+        assert original["owner_id"] == owner and original["conversation_id"] == conversation
+        current = original["original_reason_json"] if mode == "corrupt" else sentinel
+        replacement = sentinel if mode == "corrupt" else original["original_reason_json"]
+        assert conn.execute(
+            "UPDATE interaction_boundary_events SET reason_json=? WHERE id=? AND owner_id=? "
+            "AND conversation_id=? AND check_type='interrupt_execution' AND reason_json=?",
+            (replacement, original["execution_id"], owner, conversation, current)
+        ).rowcount == 1, "scoped lifecycle fixture changed unexpectedly"
+    else:
+        assert mode in {"inspect", "capture", "snapshot"}, "lifecycle fixture mode invalid"
+    current_rows = rows()
+    result = {"row_count": len(current_rows), "fingerprint": fingerprint(current_rows),
+              "events": structural(current_rows)}
+    if mode == "capture":
+        executions = [row for row in current_rows if row["check_type"] == "interrupt_execution"]
+        assert len(executions) == 1 and executions[0]["result"] == "executed"
+        result.update(owner_id=owner, conversation_id=conversation,
+                      original_ids=[row["id"] for row in current_rows],
+                      execution_id=executions[0]["id"],
+                      original_reason_json=executions[0]["reason_json"])
+    elif mode in {"corrupt", "restore", "snapshot"}:
+        ids = set(original["original_ids"])
+        existing = [row for row in current_rows if row["id"] in ids]
+        assert len(existing) == len(ids), "original lifecycle evidence removed"
+        added = [row for row in current_rows if row["id"] not in ids]
+        result.update(original_fingerprint=fingerprint(existing), added_count=len(added),
+                      added_events=structural(added))
+    print(json.dumps(result, separators=(",", ":")))
+PYCODE
+}
+
+run_interrupt_lifecycle_scenario() {
+  local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  local branching="Should I rewrite this or add an abstraction or split the module or rework the interface or simplify the module or compare every option? Please nudge me back to the next concrete step."
+  local intervention="You are branching again. Pick the next move and test it. Keep it to the next concrete step."
+  local sentinel="PRIVATE-INTERRUPT-HISTORY-SENTINEL"
+  local family owner client conversation steps step turn_number text expected calls state repeats suppressed
+  local response request first_request trace policy session turn diagnostics debug events expected_events
+  local original malformed snapshot before_restart runtime_container runtime_started runtime_volume co_started
+  for family in override acceptance malformed; do
+    owner="owner-interrupt-lifecycle-$family"; client="web:interrupt-lifecycle-$family"
+    conversation="$(create_conversation "$owner" "$client")"
+    configure_surface_permission "$owner" web true true false
+    steps="initial accepted"
+    [ "$family" != override ] || steps="initial overridden repeat_suppressed recovered rearmed"
+    [ "$family" != malformed ] || steps="initial history_unavailable"
+    turn_number=0; first_request=""
+    for step in $steps; do
+      turn_number=$((turn_number + 1))
+      if [ "$family" = override ] && [ "$step" = overridden ]; then
+        before_restart="$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" inspect)"
+        runtime_container="$(docker compose -f "$COMPOSE" ps -q runtime)"
+        runtime_started="$(docker inspect -f '{{.State.StartedAt}}' "$runtime_container")"
+        runtime_volume="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$runtime_container")"
+        test -n "$runtime_volume"
+        co_started="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose -f "$COMPOSE" ps -q orchestrator)")"
+        docker compose -f "$COMPOSE" restart runtime >/dev/null
+        wait_for_http "http://127.0.0.1:14371/healthz"
+        test "$(docker inspect -f '{{.State.StartedAt}}' "$runtime_container")" != "$runtime_started"
+        test "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$runtime_container")" = "$runtime_volume"
+        test "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose -f "$COMPOSE" ps -q orchestrator)")" = "$co_started"
+        test "$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" inspect)" = "$before_restart"
+        jq -e '.execution_state=="executed" and .lifecycle.state=="awaiting_feedback"' \
+          <<<"$(fetch_interrupt_debug "$owner" "$conversation" "$first_request")" >/dev/null
+      fi
+      if [ "$step" = history_unavailable ]; then
+        original="$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" capture)"
+        jq -e '.row_count==2' <<<"$original" >/dev/null
+        malformed="$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" corrupt "$original")"
+        jq -e --arg old "$(jq -er .fingerprint <<<"$original")" '.fingerprint!=$old and .added_count==0' <<<"$malformed" >/dev/null
+      fi
+      text="$branching"; expected="$intervention"; calls=0; state=none; repeats=0; suppressed=false
+      case "$step" in
+        overridden|repeat_suppressed|history_unavailable)
+          expected="Test one small change."; calls=1; state="$step"; suppressed=true
+          [ "$step" != overridden ] || repeats=1
+          [ "$step" != repeat_suppressed ] || repeats=2 ;;
+        accepted|recovered)
+          text="What is 2+2?"; expected="4."; calls=1; state="$step"
+          [ "$step" != recovered ] || repeats=2 ;;
+      esac
+      provider_post /fixture/reset '{}' >/dev/null
+      if [ "$calls" = 1 ]; then queue_provider_answer "$expected" >/dev/null; fi
+      response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" --arg text "$text" '
+        {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"web",
+         requested_scene:"planning",interrupt_policy_mode:"enforce",sensitivity:"private",
+         messages:[{role:"user",content:$text}],surface_context:{spoken_output:false,active_task_mode:false}}')")"
+      request="$(jq -er .request_id <<<"$response")"
+      if [ "$step" = initial ]; then first_request="$request"; fi
+      jq -e --arg answer "$expected" --argjson calls "$calls" '
+        .status=="ok" and .answer==$answer and .sources==[]
+        and (if $calls==0 then .selected_model=="not_called" else .selected_model!="not_called" end)' <<<"$response" >/dev/null
+      trace="$(fetch_trace "$request")"
+      policy="$(jq -ec .retrieval.prompt_assembly.interrupt_policy <<<"$trace")"
+      jq -e --arg state "$state" --argjson repeats "$repeats" --argjson suppressed "$suppressed" '
+        .mode=="enforce" and .status=="included" and .included and .attempted
+        and .lifecycle.state==$state and .lifecycle.repeated_trigger_count==$repeats
+        and .lifecycle.candidate_suppressed==$suppressed' <<<"$policy" >/dev/null
+      if [ "$calls" = 0 ]; then
+        jq -e --arg request "$request" '
+          .response_selected and .selection_reason=="authorized_intervention" and .should_interrupt
+          and .should_defer==false and .trigger_class=="repetitive_branching"
+          and .style_selected=="next_step_forcing" and .confidence>=0.85
+          and .lifecycle.prior_executed_request_id==null and .lifecycle.prior_trigger==null
+          and .assistant_persistence=="succeeded" and .runtime_completion=="succeeded"
+          and .provider_dispatch=="skipped" and .action_dispatch=="skipped"
+          and .execution_receipt.attempted and .execution_receipt.status=="recorded"
+          and .execution_receipt.idempotent_replay==false
+          and .execution_receipt.lifecycle.state=="awaiting_feedback"
+          and .execution_receipt.lifecycle.prior_executed_request_id==$request
+          and .execution_receipt.lifecycle.prior_trigger=="repetitive_branching"' <<<"$policy" >/dev/null
+        jq -e '.router_decision.rationale=="interrupt_policy" and .model_calls==[] and .fallback.triggered==false' <<<"$trace" >/dev/null
+      else
+        jq -e '.should_interrupt==false and .should_defer and .response_selected==false
+          and .execution_receipt=={attempted:false,status:"not_requested"}' <<<"$policy" >/dev/null
+        jq -e '.fallback.triggered==false and (.model_calls|length)==1' <<<"$trace" >/dev/null
+        if [ "$suppressed" = true ]; then
+          jq -e '.trigger_class=="repetitive_branching" and .style_selected=="next_step_forcing" and .confidence>=0.85' <<<"$policy" >/dev/null
+        fi
+        if [ "$step" != history_unavailable ]; then
+          jq -e --arg initial "$first_request" '.lifecycle.prior_executed_request_id==$initial
+            and .lifecycle.prior_trigger=="repetitive_branching"' <<<"$policy" >/dev/null
+        else
+          jq -e '.lifecycle.prior_executed_request_id==null and .lifecycle.prior_trigger==null
+            and .lifecycle.reason_code=="lifecycle_history_invalid"' <<<"$policy" >/dev/null
+        fi
+      fi
+      jq -e --arg input "$text" --arg answer "$intervention" --arg sentinel "$sentinel" '
+        (tojson|contains($input)|not) and (tojson|contains($answer)|not) and (tojson|contains($sentinel)|not)
+        and ([..|objects|keys[]]|all(.!="debug" and .!="advisory_text" and .!="intervention_text"
+          and .!="candidate_digest" and .!="input_digest" and .!="reason_json" and .!="recent_messages"
+          and .!="event_payload_json" and .!="response_body"))' <<<"$policy" >/dev/null
+      jq -e --arg sentinel "$sentinel" '(tojson|contains($sentinel)|not)
+        and (tojson|contains("interrupt_history_invalid")|not)' <<<"$trace" >/dev/null
+      assert_persisted_answer_matches "$conversation" "$request" "$expected"
+      assert_request_persistence_counts "$conversation" "$request" 0
+      test "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND client_id='$client';")" = "$turn_number|$turn_number"
+      test "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = "$calls"
+      session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+      turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+      diagnostics="$(fetch_runtime_diagnostics "$session")"
+      jq -e --arg turn "$turn" '
+        [.events[]|select(.runtime_turn_id==$turn)] as $events
+        | ([$events[]|select(.event_type=="timing_evaluated")]|length)==1
+          and ([$events[]|select(.event_type=="turn_completed")]|length)==1
+          and .latest_turn.runtime_turn_id==$turn and .latest_turn.turn_status=="completed"
+          and ([$events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length)==0' <<<"$diagnostics" >/dev/null
+      jq -e --argjson turns "$turn_number" '.state=="idle" and .active_runtime_turn_id==null
+        and .active_runtime_session_id==null and (.turn_statuses|length)==$turns
+        and (.turn_statuses|all(.=="completed"))' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+      if [ "$step" = history_unavailable ]; then
+        debug="$(fetch_interrupt_debug "$owner" "$conversation" "$first_request" 409)"
+        jq -e '.=={detail:"interrupt_history_unavailable"}' <<<"$debug" >/dev/null
+      else
+        debug="$(fetch_interrupt_debug "$owner" "$conversation" "$([ "$step" = rearmed ] && echo "$request" || echo "$first_request")")"
+        local debug_state="$step" outcome="$step"
+        if [ "$step" = initial ] || [ "$step" = rearmed ]; then debug_state=awaiting_feedback; outcome=""; fi
+        if [ "$step" = repeat_suppressed ]; then outcome=overridden; fi
+        jq -e --arg state "$debug_state" --arg outcome "$outcome" '
+          .evaluation_result=="authorized" and .execution_state=="executed"
+          and .lifecycle.state==$state and .recovery_outcome==(if $outcome=="" then null else $outcome end)' <<<"$debug" >/dev/null
+        jq -e --arg input "$text" --arg answer "$intervention" --arg sentinel "$sentinel" '
+          (tojson|contains($input)|not) and (tojson|contains($answer)|not) and (tojson|contains($sentinel)|not)
+          and ([..|objects|keys[]]|all(.!="intervention_text" and .!="candidate_digest" and .!="input_digest"
+            and .!="reason_json" and .!="detector_signals" and .!="debug"))' <<<"$debug" >/dev/null
+      fi
+      events="$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" inspect)"
+      expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed"]'
+      case "$step" in
+        overridden) expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed","interrupt_recovery:overridden","interrupt_evaluation:repeat_suppressed"]' ;;
+        repeat_suppressed) expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed","interrupt_recovery:overridden","interrupt_evaluation:repeat_suppressed","interrupt_evaluation:repeat_suppressed"]' ;;
+        recovered) expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed","interrupt_recovery:overridden","interrupt_evaluation:repeat_suppressed","interrupt_evaluation:repeat_suppressed","interrupt_recovery:recovered","interrupt_evaluation:deferred"]' ;;
+        rearmed) expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed","interrupt_recovery:overridden","interrupt_evaluation:repeat_suppressed","interrupt_evaluation:repeat_suppressed","interrupt_recovery:recovered","interrupt_evaluation:deferred","interrupt_evaluation:authorized","interrupt_execution:executed"]' ;;
+        accepted) expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed","interrupt_recovery:accepted","interrupt_evaluation:deferred"]' ;;
+        history_unavailable) expected_events='["interrupt_evaluation:authorized","interrupt_execution:executed","interrupt_evaluation:repeat_suppressed"]' ;;
+      esac
+      jq -e --argjson expected "$expected_events" '(.events|map(.check_type+":"+.result))==$expected
+        and .row_count==($expected|length)' <<<"$events" >/dev/null
+      if [ "$step" = history_unavailable ]; then
+        snapshot="$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" snapshot "$original")"
+        jq -e --arg bad "$(jq -er .fingerprint <<<"$malformed")" --arg request "$request" '
+          .original_fingerprint==$bad and .added_count==1 and .row_count==3
+          and .added_events==[{check_type:"interrupt_evaluation",result:"repeat_suppressed",surface:"web",request_id:$request}]' <<<"$snapshot" >/dev/null
+        snapshot="$(runtime_interrupt_lifecycle_fixture "$owner" "$conversation" restore "$original")"
+        jq -e --arg old "$(jq -er .fingerprint <<<"$original")" --arg request "$request" '
+          .original_fingerprint==$old and .added_count==1 and .row_count==3
+          and .added_events==[{check_type:"interrupt_evaluation",result:"repeat_suppressed",surface:"web",request_id:$request}]' <<<"$snapshot" >/dev/null
+        jq -e '.execution_state=="executed" and .lifecycle.state=="awaiting_feedback" and .recovery_outcome==null' \
+          <<<"$(fetch_interrupt_debug "$owner" "$conversation" "$first_request")" >/dev/null
+      fi
+      provider_post /fixture/reset '{}' >/dev/null
+      echo "Interrupt lifecycle $family $step: providers=$calls actions=0 messages_delta=2 traces=1 claims=0 timing_events=1 completions=1 persisted_equal=true thread_idle=true"
+    done
+    case "$family" in
+      override) echo "Interrupt lifecycle override: executed=true restart_durable=true overridden=true repeat_suppressed=true recovered=true rearmed=true executions=2 evaluations=5 recoveries=2" ;;
+      acceptance) echo "Interrupt lifecycle acceptance: executed=true accepted=trigger_not_recurred provider_normal=true executions=1 evaluations=2 recoveries=1" ;;
+      malformed) echo "Interrupt lifecycle malformed: history_unavailable=true no_fabricated_recovery=true provider_normal=true restored=true conservative_evaluation_preserved=true executions=1 evaluations=2 recoveries=0" ;;
+    esac
+  done
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  echo "Interrupt lifecycle matrix: acceptance=true override=true repeat_suppression=true recovery=true restart_durable=true malformed_fail_closed=true"
+}
+
 run_situated_presence_case() {
   local tag="$1" text="$2" expected_answer="$3" category="$4"
   local active_task="$5" allows_expansion="$6" expected_kind="$7"
@@ -4686,6 +4935,7 @@ run_ambient_presence_scenario
 run_return_after_gap_scenario
 run_timing_matrix_scenario
 run_interrupt_enforcement_scenario
+run_interrupt_lifecycle_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
 echo "Continuation C1-04 stale: retirement_policy_non_current=true no_append=true no_provider=true authorized_lifecycle_transition=closed"
 
