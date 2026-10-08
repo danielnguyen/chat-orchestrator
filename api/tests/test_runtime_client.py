@@ -4236,6 +4236,21 @@ def _with_fresh_return_event(response, request_id):
     return response
 
 
+def _interrupt_lifecycle(state="none", **overrides):
+    reasons = {"none": "not_executed", "awaiting_feedback": "execution_recorded",
+               "accepted": "trigger_not_recurred", "overridden": "trigger_recurred",
+               "repeat_suppressed": "repeat_trigger_suppressed", "recovered": "pattern_broken",
+               "history_unavailable": "lifecycle_history_invalid"}
+    prior = state not in {"none", "history_unavailable"}
+    count = 2 if state in {"overridden", "repeat_suppressed", "recovered"} else 0
+    return {"state": state, "prior_executed_request_id": "prior-interrupt" if prior else None,
+            "prior_trigger": "repetitive_branching" if prior else None,
+            "repeated_trigger_count": count,
+            "candidate_suppressed": state in {
+                "overridden", "repeat_suppressed", "history_unavailable"},
+            "reason_code": reasons[state], **overrides}
+
+
 def _interrupt_response(**overrides):
     value = {
         "request_id": "interrupt-request", "owner_id": "owner", "conversation_id": "conversation",
@@ -4246,6 +4261,7 @@ def _interrupt_response(**overrides):
         "reason_json": {"defer_reasons": [], "trigger_class": "repetitive_branching",
                         "requested_scene": None},
         "contract_constraints_applied": {"matched_contract_style": "soft_redirect"},
+        "lifecycle": _interrupt_lifecycle(),
         "warnings": [], "debug": {"advisory_text": "PRIVATE-DIAGNOSTIC-TEXT"},
     }
     value.update(overrides)
@@ -4312,4 +4328,208 @@ async def test_interrupt_client_posts_once_and_reuses_transport_after_validation
     assert len(factory.clients) == 1 and len(transport.posts) == 2
     assert transport.posts[0] == ("/v1/interrupt/evaluate", {**scope,
                                                         "current_user_text": "PRIVATE-USER-TEXT"})
+    await client.close()
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "none",
+        "awaiting_feedback",
+        "accepted",
+        "overridden",
+        "repeat_suppressed",
+        "recovered",
+        "history_unavailable",
+    ],
+)
+def test_interrupt_lifecycle_projection_accepts_producer_states(state):
+    from clients.runtime import validate_interrupt_response
+
+    life = _interrupt_lifecycle(state)
+    suppressed = life["candidate_suppressed"]
+    body = _interrupt_response(
+        lifecycle=life,
+        should_interrupt=not suppressed,
+        should_defer=suppressed,
+        intervention_text=None if suppressed else "Pick the next move.",
+    )
+    assert (
+        validate_interrupt_response(
+            body,
+            request_id="interrupt-request",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )["lifecycle"]
+        == life
+    )
+
+
+@pytest.mark.parametrize(
+    "life",
+    [
+        None,
+        [],
+        "private-lifecycle",
+        True,
+        _interrupt_lifecycle(state="none", state_override="private"),
+        _interrupt_lifecycle(state="none", reason_code="trigger_recurred"),
+        _interrupt_lifecycle(state="none", prior_executed_request_id="forged"),
+        _interrupt_lifecycle(state="history_unavailable", prior_trigger="repetitive_branching"),
+        _interrupt_lifecycle(state="accepted", prior_executed_request_id=None),
+        _interrupt_lifecycle(state="accepted", prior_trigger=None),
+        _interrupt_lifecycle(state="overridden", candidate_suppressed=False),
+        _interrupt_lifecycle(state="none", candidate_suppressed="false"),
+        _interrupt_lifecycle(state="none", repeated_trigger_count=True),
+        _interrupt_lifecycle(state="none", repeated_trigger_count=1.0),
+        _interrupt_lifecycle(state="none", repeated_trigger_count=-1),
+        _interrupt_lifecycle(state="none", repeated_trigger_count=2147483648),
+        _interrupt_lifecycle(state="accepted", repeated_trigger_count=1),
+        _interrupt_lifecycle(state="repeat_suppressed", repeated_trigger_count=0),
+        _interrupt_lifecycle(state="accepted", prior_trigger="private-unknown"),
+        _interrupt_lifecycle(state="accepted", prior_executed_request_id=" "),
+        _interrupt_lifecycle(state="accepted", prior_executed_request_id="x" * 121),
+        _interrupt_lifecycle(state="accepted", prior_trigger=[]),
+        {**_interrupt_lifecycle(), "state": "unknown"},
+        {key: value for key, value in _interrupt_lifecycle().items() if key != "reason_code"},
+    ],
+)
+def test_interrupt_lifecycle_projection_rejects_malformed_or_incoherent_state(life):
+    from clients.runtime import validate_interrupt_lifecycle
+
+    with pytest.raises(RuntimeError, match="^interrupt_lifecycle_invalid$"):
+        validate_interrupt_lifecycle(life)
+
+
+def test_suppression_cannot_coexist_with_an_authorized_intervention():
+    from clients.runtime import validate_interrupt_response
+
+    with pytest.raises(RuntimeError, match="^interrupt_response_invalid$"):
+        validate_interrupt_response(
+            _interrupt_response(lifecycle=_interrupt_lifecycle("overridden")),
+            request_id="interrupt-request",
+            owner_id="owner",
+            conversation_id="conversation",
+            surface="web",
+        )
+
+
+def _execution_response(**overrides):
+    return {
+        "request_id": "interrupt-request",
+        "owner_id": "owner",
+        "conversation_id": "conversation",
+        "surface": "web",
+        "execution_recorded": True,
+        "idempotent_replay": False,
+        "lifecycle": _interrupt_lifecycle(
+            "awaiting_feedback", prior_executed_request_id="interrupt-request"
+        ),
+        **overrides,
+    }
+
+
+def _execution_arguments():
+    return dict(
+        request_id="interrupt-request",
+        owner_id="owner",
+        conversation_id="conversation",
+        surface="web",
+        trigger_class="repetitive_branching",
+        style_selected="next_step_forcing",
+        intervention_text="Pick the next move and test it.",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state", ["awaiting_feedback", "accepted", "overridden", "repeat_suppressed", "recovered"]
+)
+async def test_execution_client_sends_exact_payload_once_and_validates_replays(state):
+    from clients.runtime import RuntimeClient
+
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    await client.open()
+    transport = factory.clients[0]
+    transport.responses.append(
+        _execution_response(
+            idempotent_replay=state != "awaiting_feedback",
+            lifecycle=_interrupt_lifecycle(state, prior_executed_request_id="interrupt-request"),
+        )
+    )
+    value = await client.execute_interrupt(**_execution_arguments())
+    assert value["execution_recorded"] is True
+    assert value["lifecycle"]["state"] == state
+    assert transport.posts == [("/v1/interrupt/execute", _execution_arguments())]
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"request_id": "wrong"},
+        {"owner_id": "wrong"},
+        {"conversation_id": "wrong"},
+        {"surface": "wrong"},
+        {"execution_recorded": False},
+        {"execution_recorded": 1},
+        {"idempotent_replay": 1},
+        {"lifecycle": []},
+        {"private": "RAW-RESPONSE"},
+        {"lifecycle": _interrupt_lifecycle()},
+        {"lifecycle": _interrupt_lifecycle("history_unavailable")},
+        {
+            "lifecycle": _interrupt_lifecycle(
+                "accepted", prior_executed_request_id="interrupt-request"
+            )
+        },
+        {"lifecycle": _interrupt_lifecycle("awaiting_feedback", prior_executed_request_id="other")},
+        {
+            "lifecycle": _interrupt_lifecycle(
+                "awaiting_feedback",
+                prior_executed_request_id="interrupt-request",
+                prior_trigger="known_recurring_trap_pattern",
+            )
+        },
+    ],
+)
+async def test_execution_response_invalidates_no_healthy_transport_and_never_replays(overrides):
+    from clients.runtime import RuntimeClient
+
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    await client.open()
+    transport = factory.clients[0]
+    transport.responses.extend([_execution_response(**overrides), _execution_response()])
+    with pytest.raises(RuntimeError, match="^interrupt_(execution|lifecycle)"):
+        await client.execute_interrupt(**_execution_arguments())
+    assert len(transport.posts) == 1 and transport.close_calls == 0 and len(factory.clients) == 1
+    assert (await client.execute_interrupt(**_execution_arguments()))["execution_recorded"] is True
+    assert len(transport.posts) == 2 and len(factory.clients) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,closed",
+    [
+        (httpx.ReadTimeout("PRIVATE-TIMEOUT"), 1),
+        (httpx.ConnectError("PRIVATE-TRANSPORT"), 1),
+        (httpx.PoolTimeout("PRIVATE-POOL-TIMEOUT"), 0),
+    ],
+)
+async def test_execution_transport_loss_is_not_retried(error, closed):
+    from clients.runtime import RuntimeClient
+
+    factory = _ClientFactory()
+    client = RuntimeClient("http://runtime.local", None, client_factory=factory)
+    await client.open()
+    transport = factory.clients[0]
+    transport.responses.append(error)
+    with pytest.raises(type(error)):
+        await client.execute_interrupt(**_execution_arguments())
+    assert transport.posts == [("/v1/interrupt/execute", _execution_arguments())]
+    assert len(factory.clients) == 1 and transport.close_calls == closed
     await client.close()

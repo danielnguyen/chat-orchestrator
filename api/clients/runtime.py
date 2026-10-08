@@ -32,6 +32,64 @@ _INTERRUPT_DEFER_REASONS = {
 }
 
 
+def validate_interrupt_lifecycle(value: Any) -> dict[str, Any]:
+    """Validate the producer projection, without deriving a lifecycle decision."""
+    fields = {"state", "prior_executed_request_id", "prior_trigger", "repeated_trigger_count",
+              "candidate_suppressed", "reason_code"}
+    reasons = {
+        "none": "not_executed", "awaiting_feedback": "execution_recorded",
+        "accepted": "trigger_not_recurred", "overridden": "trigger_recurred",
+        "repeat_suppressed": "repeat_trigger_suppressed", "recovered": "pattern_broken",
+        "history_unavailable": "lifecycle_history_invalid",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("interrupt_lifecycle_invalid")
+    state = value["state"]
+    if not isinstance(state, str) or state not in reasons:
+        raise RuntimeError("interrupt_lifecycle_invalid")
+    referenced = state not in {"none", "history_unavailable"}
+    suppressed = state in {"overridden", "repeat_suppressed", "history_unavailable"}
+    request, trigger, count = (value["prior_executed_request_id"], value["prior_trigger"],
+                               value["repeated_trigger_count"])
+    valid_reference = (isinstance(request, str) and bool(request.strip()) and len(request) <= 120
+                       and isinstance(trigger, str) and trigger in _INTERRUPT_TRIGGERS)
+    if (value["reason_code"] != reasons[state]
+            or type(value["candidate_suppressed"]) is not bool
+            or value["candidate_suppressed"] != suppressed
+            or (referenced and not valid_reference)
+            or (not referenced and (request is not None or trigger is not None))
+            or type(count) is not int or not 0 <= count <= 2147483647
+            or (state in {"none", "awaiting_feedback", "accepted", "history_unavailable"}
+                and count != 0)
+            or (state in {"overridden", "repeat_suppressed", "recovered"} and count < 1)):
+        raise RuntimeError("interrupt_lifecycle_invalid")
+    return dict(value)
+
+
+def validate_interrupt_execution_response(
+    response: Any, *, request_id: str, owner_id: str, conversation_id: str,
+    surface: str, trigger_class: str,
+) -> dict[str, Any]:
+    scope = {"request_id": request_id, "owner_id": owner_id,
+             "conversation_id": conversation_id, "surface": surface}
+    fields = {*scope, "execution_recorded", "idempotent_replay", "lifecycle"}
+    if not isinstance(response, dict) or set(response) != fields:
+        raise RuntimeError("interrupt_execution_response_invalid")
+    if any(response[key] != value for key, value in scope.items()):
+        raise RuntimeError("interrupt_execution_context_mismatch")
+    if (response["execution_recorded"] is not True
+            or type(response["idempotent_replay"]) is not bool):
+        raise RuntimeError("interrupt_execution_response_invalid")
+    lifecycle = validate_interrupt_lifecycle(response["lifecycle"])
+    states = {"awaiting_feedback", "accepted", "overridden", "repeat_suppressed", "recovered"}
+    if (lifecycle["state"] not in states
+            or (not response["idempotent_replay"] and lifecycle["state"] != "awaiting_feedback")
+            or lifecycle["prior_executed_request_id"] != request_id
+            or lifecycle["prior_trigger"] != trigger_class):
+        raise RuntimeError("interrupt_execution_response_invalid")
+    return {**response, "lifecycle": lifecycle}
+
+
 def validate_interrupt_response(
     response: Any, *, request_id: str, owner_id: str, conversation_id: str,
     surface: str, requested_scene: str | None = None,
@@ -53,6 +111,7 @@ def validate_interrupt_response(
         response.get("requested_scene") != requested_scene
     ):
         raise RuntimeError("interrupt_response_context_mismatch")
+    lifecycle = validate_interrupt_lifecycle(response.get("lifecycle"))
     confidence = response.get("confidence")
     interrupt, defer = response.get("should_interrupt"), response.get("should_defer")
     trigger, style = response.get("trigger_class"), response.get("style_selected")
@@ -64,6 +123,8 @@ def validate_interrupt_response(
                                       or trigger not in _INTERRUPT_TRIGGERS))
             or (style is not None and (not isinstance(style, str)
                                     or style not in _INTERRUPT_STYLES))):
+        invalid()
+    if lifecycle["candidate_suppressed"] and (interrupt or not defer or text is not None):
         invalid()
     if interrupt:
         if (trigger is None or style is None or not isinstance(text, str)
@@ -2591,6 +2652,21 @@ class RuntimeClient:
         return validate_interrupt_response(
             response, request_id=request_id, owner_id=owner_id,
             conversation_id=conversation_id, surface=surface, requested_scene=requested_scene,
+        )
+
+    async def execute_interrupt(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        trigger_class: str, style_selected: str, intervention_text: str,
+    ) -> dict[str, Any]:
+        # State-producing transitions are sent once, even when the response is lost.
+        response = await self._post("/v1/interrupt/execute", json={
+            "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+            "surface": surface, "trigger_class": trigger_class, "style_selected": style_selected,
+            "intervention_text": intervention_text,
+        })
+        return validate_interrupt_execution_response(
+            response, request_id=request_id, owner_id=owner_id,
+            conversation_id=conversation_id, surface=surface, trigger_class=trigger_class,
         )
 
     async def evaluate_interaction_governance(

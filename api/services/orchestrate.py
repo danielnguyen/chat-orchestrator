@@ -29,6 +29,7 @@ from clients.memory_store import (
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
     validate_history_followup_policy_response,
+    validate_interrupt_execution_response,
     validate_interrupt_response,
     validate_presence_response,
     validate_return_snapshot,
@@ -5983,6 +5984,7 @@ async def _resolve_interrupt_policy(
             "mode": interrupt_policy_mode,
             "error_type": "RuntimeClientNotConfigured",
             "omission_reason": "runtime_client_not_configured",
+            "execution_receipt": {"attempted": False, "status": "not_requested"},
         }, None
 
     try:
@@ -5995,11 +5997,10 @@ async def _resolve_interrupt_policy(
             recent_messages=recent_messages,
             requested_scene=requested_scene,
         )
-        if interrupt_policy_mode == "enforce":
-            response = validate_interrupt_response(
-                response, request_id=request_id, owner_id=owner_id,
-                conversation_id=conversation_id, surface=surface, requested_scene=requested_scene,
-            )
+        response = validate_interrupt_response(
+            response, request_id=request_id, owner_id=owner_id,
+            conversation_id=conversation_id, surface=surface, requested_scene=requested_scene,
+        )
     except Exception as e:
         if interrupt_policy_mode == "enforce":
             category = "dependency_unavailable"
@@ -6017,6 +6018,7 @@ async def _resolve_interrupt_policy(
                 "attempted": True, "status": "failed", "included": False,
                 "mode": "enforce", "failure_category": category, "response_selected": False,
                 "omission_reason": "interrupt_policy_unavailable",
+                "execution_receipt": {"attempted": False, "status": "not_requested"},
             }, None
         return {
             "attempted": True,
@@ -6025,51 +6027,69 @@ async def _resolve_interrupt_policy(
             "mode": interrupt_policy_mode,
             "error_type": type(e).__name__,
             "omission_reason": "interrupt_policy_unavailable",
+            "execution_receipt": {"attempted": False, "status": "not_requested"},
         }, None
 
-    if not isinstance(response, dict):
-        return {
-            "attempted": True,
-            "status": "failed",
-            "included": False,
-            "mode": interrupt_policy_mode,
-            "error_type": type(response).__name__,
-            "omission_reason": "malformed_interrupt_policy_response",
-        }, None
-
-    if interrupt_policy_mode == "enforce":
-        constraints = response["contract_constraints_applied"]
-        return {
-            "attempted": True, "status": "included", "included": True, "mode": "enforce",
-            "trigger_class": response["trigger_class"], "confidence": response["confidence"],
-            "style_selected": response["style_selected"],
-            "should_interrupt": response["should_interrupt"],
-            "should_defer": response["should_defer"],
-            "defer_reasons": response["reason_json"]["defer_reasons"],
-            "constraint_counts": {key: len(constraints.get(key, [])) for key in (
-                "allowed_styles", "disallowed_styles", "blocked_candidates",
-            )},
-            "warning_count": len(response["warnings"]), "response_selected": False,
-            "selection_reason": "deferred" if response["should_defer"] else "pending",
-            "assistant_persistence": "not_requested", "runtime_completion": "not_requested",
-        }, response.get("intervention_text")
-
+    constraints = response["contract_constraints_applied"]
     return {
-        "attempted": True,
-        "status": "included",
-        "included": True,
+        "attempted": True, "status": "included", "included": True,
         "mode": interrupt_policy_mode,
-        "trigger_class": response.get("trigger_class"),
-        "confidence": response.get("confidence"),
-        "style_selected": response.get("style_selected"),
-        "should_interrupt": bool(response.get("should_interrupt", False)),
-        "should_defer": bool(response.get("should_defer", True)),
-        "reason_json": response.get("reason_json", {}),
-        "contract_constraints_applied": response.get("contract_constraints_applied", {}),
-        "warnings": response.get("warnings", []),
-        "debug": response.get("debug", {}),
-        "user_visible_suppressed": True,
-    }, None
+        "trigger_class": response["trigger_class"], "confidence": response["confidence"],
+        "style_selected": response["style_selected"],
+        "should_interrupt": response["should_interrupt"], "should_defer": response["should_defer"],
+        "defer_reasons": list(response["reason_json"]["defer_reasons"]),
+        "constraint_counts": {key: len(constraints.get(key, [])) for key in (
+            "allowed_styles", "disallowed_styles", "blocked_candidates",
+        )},
+        "warning_count": len(response["warnings"]), "response_selected": False,
+        "selection_reason": "deferred" if response["should_defer"] else "pending",
+        "assistant_persistence": "not_requested", "runtime_completion": "not_requested",
+        "lifecycle": deepcopy(response["lifecycle"]),
+        "execution_receipt": {"attempted": False, "status": "not_requested"},
+        **({"user_visible_suppressed": True} if interrupt_policy_mode == "evaluate_only" else {}),
+    }, (response.get("intervention_text") if interrupt_policy_mode == "enforce" else None)
+
+
+async def _record_interrupt_execution(
+    *, runtime: Any, request_id: str, owner_id: str, conversation_id: str, surface: str,
+    trigger_class: str, style_selected: str, intervention_text: str,
+) -> dict[str, Any]:
+    trace = {"attempted": True, "status": "unconfirmed"}
+    try:
+        response = await runtime.execute_interrupt(
+            request_id=request_id, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, trigger_class=trigger_class, style_selected=style_selected,
+            intervention_text=intervention_text,
+        )
+        response = validate_interrupt_execution_response(
+            response, request_id=request_id, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, trigger_class=trigger_class,
+        )
+    except Exception as error:
+        category = "dependency_unavailable"
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+            category = "transport_timeout"
+        elif isinstance(error, httpx.TransportError):
+            category = "transport_failure"
+        elif isinstance(error, httpx.HTTPStatusError):
+            status = error.response.status_code
+            rejection = {404: "not_found", 409: "conflict", 400: "invalid_request",
+                         422: "invalid_request", 401: "unauthorized", 403: "unauthorized"}
+            category = rejection.get(status, "dependency_http_failure")
+            if status in rejection:
+                trace["status"] = "rejected"
+        elif isinstance(error, (ValueError, TypeError)) or (
+            isinstance(error, RuntimeError) and str(error) in {
+                "interrupt_execution_response_invalid", "interrupt_lifecycle_invalid",
+                "interrupt_execution_context_mismatch",
+            }
+        ):
+            category = "response_invalid"
+        trace["failure_category"] = category
+        return trace
+    return {"attempted": True, "status": "recorded",
+            "idempotent_replay": response["idempotent_replay"],
+            "lifecycle": deepcopy(response["lifecycle"])}
 
 
 async def _resolve_interaction_governance(
@@ -9675,6 +9695,13 @@ async def orchestrate_chat(
                 if not confirmed:
                     failed, answer = True, failure_answer
                     outcome_trace["failure_category"] = "runtime_completion_unconfirmed"
+                if not failed and outcome_trace.get("assistant_persistence") == "succeeded":
+                    outcome_trace["execution_receipt"] = await _record_interrupt_execution(
+                        runtime=runtime, request_id=request_id, owner_id=payload["owner_id"],
+                        conversation_id=conversation_id, surface=surface,
+                        trigger_class=outcome_trace["trigger_class"],
+                        style_selected=outcome_trace["style_selected"], intervention_text=answer,
+                    )
             stop_prompt_trace = {
                 "status": "not_requested", "layers": [], "message_count": 0,
                 "runtime_session": runtime_session_trace, "turn_state": turn_state_trace,
