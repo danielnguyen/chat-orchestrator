@@ -4844,6 +4844,212 @@ PY
   echo "G2 deferred proof: http=202 delay_ms=18000 request=$request conversation=$conversation work=$work assistant=$(jq -r .result.assistant_message_id <<<"$public") work_count=1 provider_chat=1 polling_provider_delta=0 polling_work_delta=0 pagination_equal=true direct_exact_equal=true identity_unchanged=true"
 }
 
+# Deterministic composed regression: compare unrounded p95 with exact local budgets.
+# Fixture setup, prior-history creation, and assertions are outside the timer.
+latency_measure_chat() {
+  local payload="$1" scenario="$2" measured="$3" samples="$4"
+  LATENCY_PAYLOAD="$payload" python3 - "$scenario" "$measured" "$samples" <<'PYTHON'
+import json
+import os
+import sys
+import time
+import urllib.request
+
+scenario, measured, samples = sys.argv[1:]
+request = urllib.request.Request(
+    "http://127.0.0.1:14361/v1/chat",
+    data=os.environ["LATENCY_PAYLOAD"].encode(),
+    headers={"X-API-Key": "smoke-orchestrator-key", "Content-Type": "application/json"},
+    method="POST",
+)
+started = time.perf_counter_ns()
+with urllib.request.urlopen(request) as response:
+    body = response.read()
+elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+parsed = json.loads(body)
+if not isinstance(parsed, dict):
+    raise ValueError("latency_response_invalid")
+if measured == "true":
+    with open(samples, "a", encoding="utf-8") as output:
+        output.write(json.dumps({"scenario": scenario, "elapsed_ms": elapsed_ms}) + "\n")
+print(body.decode())
+PYTHON
+}
+
+latency_regression_summary() {
+  python3 - "$1" <<'PYTHON'
+import json
+import math
+import statistics
+import sys
+
+budgets = {"ordinary_text": 300, "evidence_governed": 350,
+           "history_deterministic": 160, "history_classified": 160,
+           "provider_fallback": 350}
+with open(sys.argv[1], encoding="utf-8") as source:
+    rows = [json.loads(line) for line in source]
+if len(rows) != 50 or any(set(row) != {"scenario", "elapsed_ms"} for row in rows):
+    raise ValueError("latency_sample_count_invalid")
+if any(row["scenario"] not in budgets or type(row["elapsed_ms"]) not in (int, float)
+       or not math.isfinite(row["elapsed_ms"]) or row["elapsed_ms"] <= 0 for row in rows):
+    raise ValueError("latency_sample_invalid")
+all_within = True
+for scenario, budget in budgets.items():
+    values = [row["elapsed_ms"] for row in rows if row["scenario"] == scenario]
+    if len(values) != 10:
+        raise ValueError("latency_scenario_count_invalid")
+    ordered = sorted(values)
+    # Type-7 percentile: linear interpolation at (n-1)*0.95; no sample discarded.
+    position = (len(ordered) - 1) * 0.95
+    lower = math.floor(position)
+    p95 = ordered[lower] + (ordered[math.ceil(position)] - ordered[lower]) * (position - lower)
+    within = p95 <= budget
+    all_within = all_within and within
+    print(f"Latency regression {scenario}: samples=10 min_ms={min(values):.3f} "
+          f"p50_ms={statistics.median(values):.3f} p95_ms={p95:.3f} "
+          f"max_ms={max(values):.3f} budget_ms={budget} pass={str(within).lower()}")
+    print(f"Latency samples {scenario}: elapsed_ms=" + json.dumps(values, separators=(",", ":")))
+print("Persistent transport latency regression: scenarios=5 budgets_"
+      f"pass={str(all_within).lower()} behavioral_parity=true")
+if not all_within:
+    raise ValueError("latency_budget_exceeded")
+PYTHON
+}
+
+run_transport_latency_regression() {
+  local scenario index owner client conversation payload question response request answer trace calls diagnostics
+  local turn expected_calls expected_timing claims measured recognizer samples expected_users
+  local saved_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  local saved_history="${COMPOSED_HISTORY_FOLLOWUP_ENABLED:-false}"
+  local saved_override="${COMPOSED_ALLOW_MANUAL_OVERRIDE:-false}"
+  local saved_reserve="${COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE:-2048}"
+  local saved_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
+  samples="$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl"
+  : > "$samples"
+  for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback; do
+    # Preserve the established evidence/history fixture policies. Ordinary and
+    # fallback use the existing fully governed timing fixture configuration.
+    case "$scenario" in
+      ordinary_text|provider_fallback) export COMPOSED_RESTRAINT_ENABLED=true ;;
+      *) export COMPOSED_RESTRAINT_ENABLED=false ;;
+    esac
+    case "$scenario" in
+      history_*) restart_orchestrator_with_history_followup true ;;
+      *) restart_orchestrator_with_history_followup false ;;
+    esac
+    for index in $(seq 1 12); do
+      owner="owner-latency-$scenario-$index"; client="client-latency-$scenario-$index"
+      configure_surface_permission "$owner" chat true true false
+      conversation="$(create_conversation "$owner" "$client")"
+      question="What is 2+2?"; expected_calls=1; expected_timing=1; claims=0
+      if [[ "$scenario" == history_* ]]; then
+        create_history_original "$owner" "$client" "$conversation" "Verify the migration record for support."
+        question="How are you sure?"; expected_calls=0; expected_timing=0
+        recognizer=deterministic
+        if [ "$scenario" = history_classified ]; then
+          question="Where did that conclusion come from?"; expected_calls=1; recognizer=classifier
+        fi
+      fi
+      provider_post /fixture/reset '{}'
+      reset_source_fixture
+      reset_dsa_audit
+      case "$scenario" in
+        evidence_governed)
+          question="Verify the migration record."; expected_timing=0
+          queue_evidence_candidate supports google_sheets:records_primary:Records!A2:C2 \
+            "The migration record confirms the bounded setting." ;;
+        history_classified) queue_history_classifier support_explanation 0.91 false ;;
+        history_deterministic) ;;
+        provider_fallback)
+          provider_post /fixture/fail-next-primary '{}'
+          queue_provider_answer '4.'; expected_calls=2 ;;
+        *) queue_provider_answer '4.' ;;
+      esac
+      payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" \
+        --arg question "$question" --arg scenario "$scenario" '
+        {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",sensitivity:"private",
+         messages:[{role:"user",content:$question}]}
+        + if $scenario=="evidence_governed" then
+          {external_context_enabled:true,external_context:{enabled:true,source_ids:["records_primary"],
+            allowed_sensitivity:"medium",max_results:5,domain_tags:[],exact_source_refs:[]}}
+          else {} end')"
+      echo "Latency regression progress: scenario=$scenario turn=$index of=12"
+      measured=false; [ "$index" -le 2 ] || measured=true
+      response="$(latency_measure_chat "$payload" "$scenario" "$measured" "$samples")"
+      request="$(jq -er .request_id <<<"$response")"; answer="$(jq -er .answer <<<"$response")"
+      trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
+      diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+      jq -e --argjson expected "$expected_calls" \
+        '([.calls[]|select(.kind=="chat")]|length)==$expected' <<<"$calls" >/dev/null
+      case "$scenario" in
+        ordinary_text|provider_fallback)
+          jq -e '.answer=="4." and .selected_model!="not_called"' <<<"$response" >/dev/null
+          jq -e '.retrieval.prompt_assembly.runtime_timing.status=="included"
+            and .retrieval.prompt_assembly.runtime_timing.result.timing_policy=="answer_now"
+            and .retrieval.prompt_assembly.runtime_timing.result.latency_budget_class=="ordinary_text"' <<<"$trace" >/dev/null
+          if [ "$scenario" = provider_fallback ]; then
+            jq -e '.status=="degraded"' <<<"$response" >/dev/null
+            jq -e '.fallback.triggered==true
+              and .prompt.provider_fallback_context.same_sanitized_messages_reused==true
+              and .prompt.provider_fallback_context.regression_budget_class=="provider_fallback"
+              and .prompt.provider_fallback_context.timing_reevaluated==false' <<<"$trace" >/dev/null
+            jq -e '[.calls[]|select(.kind=="chat")]|.[0].status=="failed" and .[1].status=="ok"' <<<"$calls" >/dev/null
+          else
+            jq -e '.status=="ok"' <<<"$response" >/dev/null
+            jq -e '.fallback.triggered==false' <<<"$trace" >/dev/null
+          fi ;;
+        evidence_governed)
+          claims=1
+          jq -e '.status=="ok" and .selected_model!="not_called"
+            and (.answer|startswith("The retained evidence supports the requested conclusion."))' <<<"$response" >/dev/null
+          jq -e '.fallback.triggered==false and
+            (.prompt.evidence_acquisition|.enabled and .attempted
+              and .shape.task_shape=="targeted_lookup" and .plan.plan_status=="ready"
+              and .acquisition.sources_used==["records_primary"] and .acquisition.item_count==2
+              and .acquisition.prompt_retained_item_count==2
+              and .sufficiency.status=="sufficient_for_declared_scope"
+              and .next_steps.selections[0].selected_next_step=="answer_within_declared_scope")' <<<"$trace" >/dev/null
+          assert_dsa_operation_counts "$(fetch_dsa_audit)" 1 0 0
+          assert_evidence_runtime_events "$diagnostics" "$request" 1 1 1 1 ;;
+        history_*)
+          assert_pure_history_case "$owner" "$conversation" "$response" "$question" \
+            "$recognizer" support_explanation support "$expected_calls"
+          if [ "$scenario" = history_classified ]; then assert_classifier_request "$calls" "$question"; fi ;;
+      esac
+      turn="$(jq -er .latest_turn.runtime_turn_id <<<"$diagnostics")"
+      jq -e --arg turn "$turn" --argjson timing "$expected_timing" '
+        [.events[]|select(.runtime_turn_id==$turn)] as $events
+        | .latest_turn.turn_status=="completed"
+          and ([$events[]|select(.event_type=="turn_completed")]|length)==1
+          and ([$events[]|select(.event_type=="timing_evaluated")]|length)==$timing
+          and ([$events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length)==0
+      ' <<<"$diagnostics" >/dev/null
+      assert_persisted_answer_matches "$conversation" "$request" "$answer"
+      assert_request_persistence_counts "$conversation" "$request" "$claims"
+      expected_users=1; [[ "$scenario" != history_* ]] || expected_users=2
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation' AND role='user';")" = "$expected_users" ]
+      jq -e '.state=="idle" and .active_runtime_turn_id==null' \
+        <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+      if [ "$measured" = true ]; then
+        # Existing coarse durations only: this is not a critical-path span claim.
+        jq -er --arg scenario "$scenario" --argjson diagnostics "$diagnostics" '
+          "Latency structure " + $scenario + ": co_pre_trace_ms=" + (.latency_ms|tostring)
+          + " provider_attempt_ms=" + ([.model_calls[]?.latency_ms // 0]|add // 0|tostring)
+          + " runtime_events=" + ($diagnostics.events|length|tostring)
+        ' <<<"$trace"
+      fi
+    done
+    echo "Latency behavior $scenario: warmups=2 measured=10 parity=true actions=0 persisted_equal=true completed=true idle=true"
+  done
+  latency_regression_summary "$samples"
+  export COMPOSED_RESTRAINT_ENABLED="$saved_restraint" COMPOSED_HISTORY_FOLLOWUP_ENABLED="$saved_history"
+  export COMPOSED_ALLOW_MANUAL_OVERRIDE="$saved_override" COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$saved_reserve"
+  export COMPOSED_PRIVACY_CONTEXT_ENABLED="$saved_privacy"
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http "http://127.0.0.1:14361/healthz"
+  provider_post /fixture/reset '{}'
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 
@@ -4870,6 +5076,9 @@ fi
 if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: evidence-acquisition-only"
   run_evidence_acquisition_composed_suite
+  if [ "${EVIDENCE_SCENARIO:-all}" = all ]; then
+    run_transport_latency_regression
+  fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
   exit 0
 fi
