@@ -4564,3 +4564,318 @@ async def test_execution_transport_loss_is_not_retried(error, closed):
     assert transport.posts == [("/v1/interrupt/execute", _execution_arguments())]
     assert len(factory.clients) == 1 and transport.close_calls == closed
     await client.close()
+
+
+def _strict_information_scope(**overrides):
+    scope = {
+        "request_id": "rid-strict-info",
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "dev",
+        "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1",
+    }
+    scope.update(overrides)
+    return scope
+
+
+def _strict_identity_fixture(
+    scope=None, *, persona="technical_architect", proposal=None, revision=5
+):
+    scope = scope or _strict_information_scope()
+    fields = (
+        "request_id",
+        "owner_id",
+        "conversation_id",
+        "surface",
+        "runtime_session_id",
+        "runtime_turn_id",
+    )
+    fallback = scope["surface"] in {"unknown", "unregistered"}
+    surface_id = "unknown" if fallback else scope["surface"]
+    decision = {
+        **{key: scope[key] for key in fields},
+        "selection_ref": "psel_" + "1" * 32,
+        "thread_revision": revision,
+        "governance_event_ref": "rtevent_governance",
+        "active_persona_id": persona,
+        "selection_source": "conservative_fallback" if fallback else "surface_binding",
+        "selection_reason": "unknown_surface_default" if fallback else "surface_default",
+        "proposed_persona_id": proposal,
+        "proposal_source": "interaction_governance" if proposal else "none",
+        "proposal_status": "advisory" if proposal else "none",
+        "proposal_reason": "contextual_activation_not_enabled"
+        if proposal
+        else "no_contextual_proposal",
+        "requested_selection_status": "not_requested",
+        "contextual_activation": False,
+        "explicit_selection_verified": False,
+    }
+    return {
+        "runtime_session": {
+            **{
+                key: scope[key]
+                for key in (
+                    "runtime_session_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                )
+            },
+            "status": "active",
+        },
+        "surface_binding": {
+            "surface_id": surface_id,
+            "default_persona_id": persona,
+            "surface_type": "developer_surface",
+            "surface_display_name": "Developer",
+            "allow_user_persona_override": False,
+        },
+        "persona": {
+            "persona_id": persona,
+            "capability_domain": "software_architecture",
+            "persona_owns_durable_memory": False,
+        },
+        "runtime_identity": {
+            "active_persona_id": persona,
+            "surface_id": surface_id,
+            "capability_domain": "software_architecture",
+            "persona_owns_durable_memory": False,
+        },
+        "trace": {
+            "runtime_session_id": scope["runtime_session_id"],
+            "active_persona_id": persona,
+            "persona_override_source": "none",
+            "surface_id": surface_id,
+        },
+        "selection_contract": "strict_turn",
+        "persona_selection": decision,
+    }
+
+
+def _strict_containment_fixture(identity=None):
+    identity = identity or _strict_identity_fixture()
+    selection = identity["persona_selection"]
+    return {
+        **{
+            key: selection[key]
+            for key in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "runtime_session_id",
+                "runtime_turn_id",
+            )
+        },
+        "selection_contract": "strict_turn",
+        "persona_selection": deepcopy(selection),
+        "result": {
+            "active_persona_id": selection["active_persona_id"],
+            "capability_domain": "technical",
+            "allowed_memory_domains": ["general", "technical", "project", "infrastructure"],
+            "blocked_memory_domains": ["personal"],
+            "allowed_world_state_domains": ["general", "technical", "project", "infrastructure"],
+            "allowed_relationship_domains": ["general", "technical", "project", "infrastructure"],
+            "allowed_tool_domains": ["general", "technical", "project", "infrastructure"],
+            "cross_scope_access_allowed": False,
+            "cross_scope_reason": "not_requested",
+            "confidence": 0.8,
+            "reason_summary": ["strict_persona_selection"],
+            "artifact_access_policy": {
+                "enforcement_mode": "mandatory",
+                "allowed_content_classes": ["document"],
+                "allowed_domains": ["technical"],
+                "maximum_sensitivity": "medium",
+                "surface_content_capabilities": ["document"],
+                "reason_codes": ["surface_policy"],
+            },
+        },
+    }
+
+
+def _strict_capability_fixture(identity=None, *, discovery=False, reason="matched"):
+    selection = (identity or _strict_identity_fixture())["persona_selection"]
+    record = {
+        "capability_id": "runtime.world_state.read",
+        "display_name": "Read runtime world state",
+        "description": "Reads bounded runtime world-state claims as structured context.",
+        "domain": "software_architecture",
+        "operation_kind": "read_only",
+        "risk_level": "low_read_only",
+        "requires_confirmation": False,
+        "allowed_surfaces": ["dev", "vscode"],
+        "allowed_personas": ["technical_architect"],
+        "reversible": True,
+        "dry_run_supported": True,
+        "verification_supported": True,
+        "audit_required": False,
+    }
+    result = {
+        "capability_matched": reason == "matched",
+        "action_taken": False,
+        "reason_codes": [reason],
+        "capability": record if reason == "matched" else None,
+    }
+    if discovery:
+        result = {
+            "registry_available": True,
+            "action_taken": False,
+            "blocked_examples": [],
+            "allowed_examples": [
+                {
+                    **{
+                        key: record[key]
+                        for key in (
+                            "capability_id",
+                            "display_name",
+                            "description",
+                            "operation_kind",
+                            "risk_level",
+                        )
+                    },
+                    "reason_codes": ["matched"],
+                }
+            ]
+            if reason == "matched"
+            else [],
+        }
+    return {
+        **{key: selection[key] for key in ("request_id", "owner_id", "conversation_id", "surface")},
+        "active_persona_id": selection["active_persona_id"],
+        "selection_contract": "strict_turn",
+        "persona_selection_ref": selection["selection_ref"],
+        "result": result,
+    }
+
+
+@pytest.mark.asyncio
+async def test_strict_client_payloads_preserve_admitted_scope():
+    scope = _strict_information_scope()
+    identity = _strict_identity_fixture(scope)
+    selection = identity["persona_selection"]
+    containment = _strict_containment_fixture(identity)
+    match = _strict_capability_fixture(identity)
+    discovery = _strict_capability_fixture(identity, discovery=True)
+    http = _FakeAsyncClient([identity, containment, match, discovery])
+    factory = _ClientFactory([http])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=factory)
+    await client.open()
+    assert await client.resolve_identity(**scope, persona_selection_mode="strict") == identity
+    bound = {
+        **scope,
+        "persona_selection_mode": "strict",
+        "persona_selection_ref": selection["selection_ref"],
+        "active_persona_id": selection["active_persona_id"],
+        "expected_thread_revision": selection["thread_revision"],
+    }
+    assert await client.evaluate_persona_containment(
+        **bound, current_user_text="Read world state."
+    ) == (containment)
+    assert await client.match_capability(**bound, current_user_text="Read world state.") == match
+    assert await client.discover_capabilities(**bound) == discovery
+    assert [path for path, _ in http.posts] == [
+        "/v1/runtime/identity/resolve",
+        "/v1/runtime/persona-containment/evaluate",
+        "/v1/capabilities/match",
+        "/v1/capabilities/discover",
+    ]
+    assert http.posts[0][1] == {**scope, "persona_selection_mode": "strict"}
+    assert http.posts[1][1] == {**bound, "current_user_text": "Read world state."}
+    assert http.posts[2][1] == {**bound, "current_user_text": "Read world state."}
+    assert http.posts[3][1] == bound
+    assert len(factory.clients) == 1
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "request_id",
+        "owner_id",
+        "conversation_id",
+        "surface",
+        "runtime_session_id",
+        "runtime_turn_id",
+        "active_persona_id",
+        "selection_ref",
+        "thread_revision",
+    ],
+)
+@pytest.mark.parametrize("producer", ["identity", "containment"])
+def test_strict_response_binding_mismatch_fails_closed(field, producer):
+    from clients.runtime import (
+        validate_strict_containment_response,
+        validate_strict_identity_response,
+    )
+
+    scope = _strict_information_scope(expected_thread_revision=5)
+    identity = _strict_identity_fixture(scope)
+    response = identity if producer == "identity" else _strict_containment_fixture(identity)
+    response["persona_selection"][field] = 9 if field == "thread_revision" else "wrong"
+    with pytest.raises(RuntimeError):
+        if producer == "identity":
+            validate_strict_identity_response(response, scope=scope)
+        else:
+            validate_strict_containment_response(
+                response, scope=scope, selection=identity["persona_selection"]
+            )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"contextual_activation": True},
+        {"contextual_activation": 0},
+        {"explicit_selection_verified": True},
+        {"thread_revision": True},
+        {"selection_source": "explicit_user"},
+        {"proposal_status": "activated"},
+        {"proposal_reason": "approved"},
+        {"requested_selection_status": "verified"},
+    ],
+)
+def test_strict_selection_does_not_accept_unverified_authority(mutation):
+    from clients.runtime import validate_strict_identity_response
+
+    scope = _strict_information_scope()
+    response = _strict_identity_fixture(scope)
+    response["persona_selection"].update(mutation)
+    with pytest.raises(RuntimeError):
+        validate_strict_identity_response(response, scope=scope)
+
+
+@pytest.mark.parametrize("producer", ["identity", "containment", "match", "discovery"])
+@pytest.mark.asyncio
+async def test_strict_client_rejects_legacy_response_without_retry(producer):
+    scope = _strict_information_scope()
+    identity = _strict_identity_fixture(scope)
+    response = {
+        "identity": identity,
+        "containment": _strict_containment_fixture(identity),
+        "match": _strict_capability_fixture(identity),
+        "discovery": _strict_capability_fixture(identity, discovery=True),
+    }[producer]
+    response["selection_contract"] = "legacy_unbound"
+    http = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=_ClientFactory([http]))
+    await client.open()
+    bound = {
+        **scope,
+        "persona_selection_mode": "strict",
+        "persona_selection_ref": "psel_" + "1" * 32,
+        "active_persona_id": "technical_architect",
+        "expected_thread_revision": 5,
+    }
+    with pytest.raises(RuntimeError):
+        if producer == "identity":
+            await client.resolve_identity(**scope, persona_selection_mode="strict")
+        elif producer == "containment":
+            await client.evaluate_persona_containment(**bound)
+        elif producer == "match":
+            await client.match_capability(**bound, current_user_text="Read world state.")
+        else:
+            await client.discover_capabilities(**bound)
+    assert len(http.posts) == 1
+    assert http.posts[0][1]["persona_selection_mode"] == "strict"
+    await client.close()
