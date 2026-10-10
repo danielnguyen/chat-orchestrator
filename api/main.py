@@ -297,6 +297,9 @@ async def chat(body: ChatRequest) -> ChatResponse:
             memory_hygiene_enabled=settings.cognitive_runtime_memory_hygiene_enabled,
             privacy_context_enabled=settings.cognitive_runtime_privacy_context_enabled,
             capability_registry_enabled=settings.cognitive_runtime_capability_registry_enabled,
+            strict_capability_information_enabled=getattr(
+                settings, "strict_capability_information_enabled", False,
+            ),
             claim_record_capture_enabled=settings.claim_record_capture_enabled,
             evidence_acquisition_enabled=settings.evidence_acquisition_enabled,
             history_followup_enabled=settings.history_followup_enabled,

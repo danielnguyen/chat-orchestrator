@@ -33,6 +33,9 @@ from clients.runtime import (
     validate_interrupt_response,
     validate_presence_response,
     validate_return_snapshot,
+    validate_strict_capability_response,
+    validate_strict_containment_response,
+    validate_strict_identity_response,
     validate_timing_request,
     validate_timing_response,
 )
@@ -5422,6 +5425,7 @@ async def _complete_runtime_turn(
     turn_state_trace: dict[str, Any],
     request_id: str,
     turn_status: str,
+    expected_scope: dict[str, Any] | None = None,
 ) -> None:
     runtime_session_id = turn_state_trace.get("runtime_session_id")
     runtime_turn_id = turn_state_trace.get("runtime_turn_id")
@@ -5436,6 +5440,16 @@ async def _complete_runtime_turn(
             **({"continuation_state": turn_state_trace["continuation_state"]}
                if isinstance(turn_state_trace.get("continuation_state"), str) else {}),
         )
+        if expected_scope is not None:
+            session = response.get("runtime_session") if isinstance(response, dict) else None
+            turn = response.get("runtime_turn") if isinstance(response, dict) else None
+            if (not isinstance(session, dict) or not isinstance(turn, dict)
+                    or any(session.get(key) != expected_scope[key] for key in (
+                        "runtime_session_id", "owner_id", "conversation_id", "surface",
+                    )) or any(turn.get(key) != expected_scope[key] for key in (
+                        "runtime_session_id", "runtime_turn_id",
+                    )) or turn.get("turn_status") != turn_status):
+                raise RuntimeError("runtime_completion_context_mismatch")
         if isinstance(response, dict):
             turn = response.get("runtime_turn", {}) or {}
             turn_state_trace["turn_status"] = turn.get("turn_status", turn_status)
@@ -6107,6 +6121,7 @@ async def _resolve_interaction_governance(
     current_user_text: str,
     recent_messages: list[dict[str, str]],
     surface_metadata_json: dict[str, Any] | None,
+    strict_turn_binding: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not enabled:
         return None, _interaction_governance_disabled_trace()
@@ -6164,6 +6179,22 @@ async def _resolve_interaction_governance(
             "error_type": "malformed_interaction_governance_payload",
             "omission_reason": "malformed_interaction_governance_response",
         }
+
+    if strict_turn_binding and (
+        any(response.get(key) != value for key, value in {
+            "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+            "surface": surface, "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }.items())
+        or result.get("interaction_kind") not in VALID_INTERACTION_GOVERNANCE_KINDS
+        or result.get("tension_level") not in VALID_INTERACTION_GOVERNANCE_TENSION_LEVELS
+        or any(type(result.get(key)) is not bool for key in (
+            "commentary_allowed", "humor_allowed", "action_allowed", "requires_confirmation",
+            "clarifying_question_allowed",
+        ))
+    ):
+        return None, {"attempted": True, "status": "failed", "included": False,
+                      "omission_reason": "interaction_governance_binding_invalid"}
 
     reason_summary = result.get("reason_summary", [])
     if not isinstance(reason_summary, list):
@@ -8833,6 +8864,443 @@ class _SynchronousWork:
             logging.getLogger(__name__).warning("durable_work_failure_unconfirmed")
 
 
+async def _resolve_strict_capability_information(
+    *,
+    runtime,
+    scope,
+    text,
+    recent_messages,
+    governance,
+    governance_trace,
+    confirmation,
+    dependencies_ready=True,
+):
+    trace = {
+        "mode": "strict",
+        "requested": True,
+        "status": "failed",
+        "selection_status": "not_requested",
+        "containment_status": "not_requested",
+        "information_outcome": "unavailable",
+        "action_dispatch": "suppressed",
+        "provider_dispatch": "suppressed",
+        "reason_code": "dependency_unavailable",
+        "protected_consumer_authority": "not_requested",
+    }
+    selection = containment = None
+    if not dependencies_ready:
+        trace["reason_code"] = "configuration_unavailable"
+        return (
+            selection,
+            containment,
+            trace,
+            "Capability information is unavailable. No action was taken.",
+        )
+    if confirmation:
+        trace.update(
+            information_outcome="confirmation_rejected",
+            reason_code="strict_confirmation_unavailable",
+        )
+        return (
+            selection,
+            containment,
+            trace,
+            (
+                "This capability information path cannot accept action confirmation. "
+                "No action was taken."
+            ),
+        )
+    if governance is None or governance_trace.get("included") is not True:
+        trace["reason_code"] = "governance_unavailable"
+        return (
+            selection,
+            containment,
+            trace,
+            "Capability information is unavailable. No action was taken.",
+        )
+    try:
+        trace["selection_status"] = "requested"
+        response = await runtime.resolve_identity(**scope, persona_selection_mode="strict")
+        selection = deepcopy(validate_strict_identity_response(response, scope=scope))
+        trace.update(
+            selection_status="validated",
+            selection_ref=selection["selection_ref"],
+            active_persona_id=selection["active_persona_id"],
+            thread_revision=selection["thread_revision"],
+            proposal_status=selection["proposal_status"],
+            contextual_activation=False,
+        )
+        bound = {
+            **scope,
+            "expected_thread_revision": selection["thread_revision"],
+            "persona_selection_mode": "strict",
+            "persona_selection_ref": selection["selection_ref"],
+            "active_persona_id": selection["active_persona_id"],
+        }
+        trace["containment_status"] = "requested"
+        response = await runtime.evaluate_persona_containment(
+            **bound,
+            current_user_text=text,
+            recent_messages=recent_messages,
+            interaction_kind=governance["interaction_kind"],
+        )
+        containment = validate_strict_containment_response(
+            response, scope=bound, selection=selection
+        )
+        trace["containment_status"] = "validated"
+        discovery = _capability_discovery_requested(text)
+        trace["operation"] = "discovery" if discovery else "match"
+        response = (
+            await runtime.discover_capabilities(**bound)
+            if discovery
+            else await runtime.match_capability(**bound, current_user_text=text)
+        )
+        result = validate_strict_capability_response(
+            response,
+            scope=bound,
+            selection=selection,
+            discovery=discovery,
+        )
+        trace.update(status="validated", reason_code="authority_validated")
+        if not discovery and result["reason_codes"] == ["no_registered_capability"]:
+            trace.update(
+                status="not_selected",
+                information_outcome="not_selected",
+                provider_dispatch="normal_chat",
+                protected_consumer_authority="legacy_unbound",
+            )
+            return selection, containment, trace, None
+        examples = (
+            result["allowed_examples"]
+            if discovery
+            else ([result["capability"]] if result["capability_matched"] else [])
+        )
+        trace.update(
+            information_outcome="available" if examples else "denied",
+            capability_count=len(examples),
+        )
+        answer = (
+            "Available capability information: "
+            + ", ".join(example["display_name"] for example in examples)
+            + ". This is information only; no action was taken."
+            if examples
+            else "No eligible capability information is available here. No action was taken."
+        )
+        return selection, containment, trace, answer
+    except Exception as error:
+        category = "response_invalid"
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+            category = "transport_timeout"
+        elif isinstance(error, httpx.HTTPStatusError):
+            category = (
+                "authority_conflict"
+                if error.response.status_code == 409
+                else "dependency_http_failure"
+            )
+        elif isinstance(error, httpx.TransportError):
+            category = "transport_failure"
+        elif isinstance(error, AttributeError):
+            category = "dependency_unavailable"
+        elif (
+            isinstance(error, RuntimeError)
+            and str(error) == "strict_capability_registry_unavailable"
+        ):
+            category = "registry_unavailable"
+        elif isinstance(error, RuntimeError) and str(error) == "strict_persona_context_mismatch":
+            category = "context_mismatch"
+        trace.update(status="failed", reason_code=category, information_outcome="unavailable")
+        for key in ("selection_status", "containment_status"):
+            if trace[key] == "requested":
+                trace[key] = "failed"
+        return (
+            selection,
+            containment,
+            trace,
+            "Capability information is unavailable. No action was taken.",
+        )
+
+
+async def _finish_strict_capability_information(
+    *,
+    payload,
+    request_id,
+    conversation_id,
+    memory_store,
+    runtime,
+    work,
+    turn_state_trace,
+    runtime_session_trace,
+    governance,
+    governance_trace,
+    selection,
+    containment,
+    information_trace,
+    answer,
+    user_message,
+    user_message_id,
+    surface_permission,
+    conversation_resolution_trace,
+    interrupt_policy_mode,
+    started,
+):
+    """Terminate before protected retrieval or any executable capability branch."""
+    scope = {
+        "request_id": request_id,
+        "owner_id": payload["owner_id"],
+        "conversation_id": conversation_id,
+        "surface": payload.get("surface", "unknown"),
+        "runtime_session_id": runtime_session_trace.get("runtime_session_id"),
+        "runtime_turn_id": turn_state_trace.get("runtime_turn_id"),
+    }
+    failed = information_trace["status"] != "validated"
+    source = "capability_information"
+    timing_trace = {"attempted": False, "status": "not_requested"}
+    interrupt_trace = None
+    metadata, _ = _classify_turn_policy_metadata(
+        persona_containment=containment,
+        relationship_projection={"applied": False},
+        request_sensitivity=payload.get("sensitivity"),
+        interaction_governance=governance,
+    )
+    if user_message is not None:
+        persisted = await _append_current_user_message(
+            memory_store=memory_store,
+            request_id=request_id,
+            message_id=user_message_id,
+            conversation_id=conversation_id,
+            owner_id=payload["owner_id"],
+            client_id=payload.get("client_id"),
+            content=user_message["content"],
+            surface=scope["surface"],
+            policy_metadata=metadata,
+        )
+        if persisted is None:
+            failed, answer = True, _MESSAGE_PERSISTENCE_UNAVAILABLE
+    await work.transition("running")
+    if not failed:
+        restraint, restraint_trace = await _resolve_restraint(
+            runtime=runtime,
+            enabled=True,
+            **scope,
+            current_user_text=_extract_last_user_text(payload["messages"]),
+            recent_messages=_bounded_recent_messages(payload["messages"]),
+            surface_metadata_json=None,
+            interaction_kind=governance["interaction_kind"],
+            response_posture=governance["response_posture"],
+            active_persona_id=selection["active_persona_id"],
+            capability_domain=containment["capability_domain"],
+        )
+        presence_trace = await _resolve_runtime_presence(
+            runtime=runtime,
+            memory_store=memory_store,
+            **scope,
+            surface_context=payload.get("surface_context"),
+            restraint=restraint,
+            surface_permission=surface_permission,
+        )
+        _, situated_trace = await resolve_situated_presence(
+            runtime=runtime,
+            interaction_governance_enabled=True,
+            restraint_enabled=True,
+            **scope,
+            payload=payload,
+            interaction_governance=governance,
+            restraint=restraint,
+        )
+        try:
+            if (
+                restraint_trace.get("included") is not True
+                or not presence_trace["required_help_allowed"]
+            ):
+                raise RuntimeError("mandatory_input_unavailable")
+            facts = project_timing_facts(payload)
+            timing_request = validate_timing_request(
+                {
+                    **scope,
+                    **facts,
+                    "latency_budget_class": _select_timing_latency_class(
+                        [],
+                        spoken_output=facts["spoken_output"],
+                        interaction_kind=governance["interaction_kind"],
+                        provider_dispatch=False,
+                    ),
+                    "dependency_state": (
+                        "degraded" if presence_trace["status"] == "fallback" else "ready"
+                    ),
+                    "continuation_timing_policy": (
+                        conversation_resolution_trace.get("timing_policy")
+                        if conversation_resolution_trace.get("mode")
+                        in {"runtime_selected", "runtime_created"}
+                        else None
+                    ),
+                }
+            )
+            timing_trace.update(attempted=True, status="requested")
+            timing = validate_timing_response(
+                await runtime.evaluate_timing(**timing_request),
+                request=timing_request,
+            )["result"]
+            timing_trace.update(status="included", result=timing)
+            turn_state_trace["continuation_state"] = timing["continuation_state"]
+            stops = {
+                "ask_clarifying_question": "Could you clarify what you want me to do?",
+                "pause_or_wait": "I’ll wait before continuing.",
+                "yield_to_user": "Go ahead.",
+                "close_turn": "I can’t continue this turn safely.",
+            }
+            policy = timing["timing_policy"]
+            interrupt_trace, intervention = await _resolve_interrupt_policy(
+                runtime=runtime,
+                interrupt_policy_mode=interrupt_policy_mode,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=scope["surface"],
+                current_user_text=_extract_last_user_text(payload["messages"]),
+                recent_messages=payload["messages"],
+                requested_scene=payload.get("requested_scene"),
+            )
+            if policy in stops:
+                answer, failed, source = stops[policy], policy == "close_turn", "runtime_timing"
+                information_trace["information_outcome"] = "timing_displaced"
+                if interrupt_trace is not None and interrupt_trace.get("should_interrupt") is True:
+                    interrupt_trace["selection_reason"] = "stronger_timing_outcome"
+            elif (
+                policy == "resume_previous_thread"
+                and timing["reason_codes"][0] == "return_deferred_continuation"
+            ):
+                answer = "I don't have enough retained context to continue that safely."
+                source = "runtime_timing"
+                information_trace["information_outcome"] = "timing_displaced"
+                if interrupt_trace is not None and interrupt_trace.get("should_interrupt") is True:
+                    interrupt_trace["selection_reason"] = "stronger_timing_outcome"
+            else:
+                if intervention is not None and policy in {"answer_now", "defer_expansion"}:
+                    checked, _ = enforce_situated_presence_output(intervention, situated_trace)
+                    checked, _ = enforce_runtime_presence_output(checked, presence_trace, {})
+                    if checked == intervention:
+                        answer, source = intervention, "interrupt_policy"
+                        interrupt_trace.update(
+                            response_selected=True,
+                            selection_reason="authorized_intervention",
+                            provider_dispatch="skipped",
+                            action_dispatch="skipped",
+                        )
+                        information_trace["information_outcome"] = "interrupt_displaced"
+                    else:
+                        interrupt_trace["selection_reason"] = "stricter_output_policy"
+                elif policy == "acknowledge_then_answer":
+                    if interrupt_trace is not None:
+                        interrupt_trace["selection_reason"] = "action_acknowledgment_reserved"
+                    answer = "Received. " + answer
+            if source != "interrupt_policy":
+                answer, _ = enforce_situated_presence_output(answer, situated_trace)
+                answer, _ = enforce_runtime_presence_output(answer, presence_trace, {})
+        except Exception:
+            failed = True
+            answer = "Capability information is unavailable. No action was taken."
+            timing_trace.update(
+                status="failed", failure_category="mandatory_dependency_unavailable"
+            )
+            information_trace.update(
+                information_outcome="unavailable", reason_code="timing_unavailable"
+            )
+    acknowledgement = None
+    try:
+        await _advance_runtime_turn(
+            runtime=runtime,
+            turn_state_trace=turn_state_trace,
+            request_id=request_id,
+            turn_status="responding",
+        )
+        acknowledgement = await memory_store.add_message(
+            conversation_id=conversation_id,
+            owner_id=payload["owner_id"],
+            role="assistant",
+            content=answer,
+            client_id=payload.get("client_id"),
+            metadata={"request_id": request_id, "selected_model": "not_called"},
+            policy_metadata=metadata,
+        )
+        if not isinstance(acknowledgement, dict) or not acknowledgement.get("message_id"):
+            raise RuntimeError("assistant_persistence_unconfirmed")
+        information_trace["assistant_persistence"] = "succeeded"
+    except Exception:
+        failed = True
+        information_trace["assistant_persistence"] = "failed"
+        information_trace["reason_code"] = "response_persistence_failed"
+    turn_state_trace["terminal_transition_attempted"] = True
+    await _complete_runtime_turn(
+        runtime=runtime,
+        turn_state_trace=turn_state_trace,
+        request_id=request_id,
+        turn_status="abandoned" if failed else "completed",
+        expected_scope=scope,
+    )
+    information_trace["runtime_completion"] = (
+        "succeeded" if turn_state_trace.get("completed") else "unconfirmed"
+    )
+    if not turn_state_trace.get("completed"):
+        failed = True
+        information_trace["reason_code"] = "runtime_completion_unconfirmed"
+    if source == "interrupt_policy":
+        interrupt_trace["assistant_persistence"] = information_trace["assistant_persistence"]
+        interrupt_trace["runtime_completion"] = information_trace["runtime_completion"]
+        if not failed:
+            interrupt_trace["execution_receipt"] = await _record_interrupt_execution(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=scope["surface"],
+                trigger_class=interrupt_trace["trigger_class"],
+                style_selected=interrupt_trace["style_selected"],
+                intervention_text=answer,
+            )
+    information_trace["response_status"] = "failed" if failed else "committed"
+    prompt_trace = {
+        "status": "not_requested",
+        "layers": [],
+        "message_count": 0,
+        "runtime_session": runtime_session_trace,
+        "turn_state": turn_state_trace,
+        "interaction_governance": governance_trace,
+        "capability_information": information_trace,
+        "runtime_timing": timing_trace,
+    }
+    if interrupt_trace is not None:
+        prompt_trace["interrupt_policy"] = interrupt_trace
+    try:
+        await memory_store.create_trace(
+            request_id=request_id,
+            payload=_server_owned_response_trace_payload(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                payload=payload,
+                profile=None,
+                prompt_trace=prompt_trace,
+                status="failed" if failed else "degraded" if source == "runtime_timing" else "ok",
+                started=started,
+                response_source=source,
+            ),
+        )
+    except Exception:
+        failed = True
+    if not failed:
+        await work.complete(acknowledgement)
+    else:
+        work.failure_code = "dependency_unavailable"
+    return {
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "profile_name": "unresolved",
+        "selected_model": "not_called",
+        "answer": answer,
+        "status": "failed" if failed else "degraded" if source == "runtime_timing" else "ok",
+        "sources": [],
+    }
+
+
 async def orchestrate_chat(
     *,
     payload: dict[str, Any],
@@ -8852,6 +9320,7 @@ async def orchestrate_chat(
     memory_hygiene_enabled: bool = False,
     privacy_context_enabled: bool = False,
     capability_registry_enabled: bool = False,
+    strict_capability_information_enabled: bool = False,
     claim_record_capture_enabled: bool = False,
     evidence_acquisition_enabled: bool = False,
     general_evidence_reasoning_enabled: bool | None = None,
@@ -8909,8 +9378,9 @@ async def orchestrate_chat(
         if action_connector_registry is not None
         else ActionConnectorRegistry((JellyfinActionConnector(jellyfin_operations),))
     )
-    pending_continuation, pending_error = parse_pending_action_confirmation(
-        payload.get("capability_confirmation")
+    pending_continuation, pending_error = (
+        (None, None) if strict_capability_information_enabled
+        else parse_pending_action_confirmation(payload.get("capability_confirmation"))
     )
     pending_capability_request: ParsedCapabilityRequest | None = None
     if pending_continuation is not None:
@@ -9338,30 +9808,91 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
+            strict_turn_binding=strict_capability_information_enabled,
         )
-        persona_containment, persona_containment_trace = await _resolve_persona_containment(
-            runtime=runtime,
-            enabled=persona_containment_enabled,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-            runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
-            persona_scope_hint=(
-                interaction_governance.get("persona_scope_hint")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            interaction_kind=(
-                interaction_governance.get("interaction_kind")
-                if isinstance(interaction_governance, dict)
-                else None
-            ),
-            current_user_text=last_user_text,
-            recent_messages=recent_messages,
-            surface_metadata_json=surface_metadata_json,
-        )
+        if strict_capability_information_enabled:
+            scope = {
+                "request_id": request_id,
+                "owner_id": payload["owner_id"],
+                "conversation_id": conversation_id,
+                "surface": surface,
+                "runtime_session_id": runtime_session_trace.get("runtime_session_id"),
+                "runtime_turn_id": turn_state_trace.get("runtime_turn_id"),
+            }
+            (
+                selection,
+                persona_containment,
+                information_trace,
+                information_answer,
+            ) = await _resolve_strict_capability_information(
+                runtime=runtime,
+                scope=scope,
+                text=last_user_text,
+                recent_messages=recent_messages,
+                governance=interaction_governance,
+                governance_trace=interaction_governance_trace,
+                confirmation=payload.get("capability_confirmation") is not None,
+                dependencies_ready=bool(runtime is not None and all((
+                    interaction_governance_enabled, persona_containment_enabled,
+                    capability_registry_enabled, restraint_enabled,
+                ))),
+            )
+            turn_state_trace["capability_information"] = information_trace
+            if information_answer is not None:
+                return await _finish_strict_capability_information(
+                    payload=payload,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    memory_store=memory_store,
+                    runtime=runtime,
+                    work=work,
+                    turn_state_trace=turn_state_trace,
+                    runtime_session_trace=runtime_session_trace,
+                    governance=interaction_governance,
+                    governance_trace=interaction_governance_trace,
+                    selection=selection,
+                    containment=persona_containment,
+                    information_trace=information_trace,
+                    answer=information_answer,
+                    user_message=current_user_message,
+                    user_message_id=current_user_message_id,
+                    surface_permission=surface_permission,
+                    conversation_resolution_trace=conversation_resolution_trace,
+                    interrupt_policy_mode=interrupt_policy_mode,
+                    started=started,
+                )
+            # Non-capability turns keep normal chat policy without executable capability exposure.
+            persona_containment_trace = {
+                "attempted": True,
+                "status": "included",
+                "included": True,
+                "retrieval_scope_status": "not_enforced",
+                "protected_consumer_authority": "legacy_unbound",
+            }
+        else:
+            persona_containment, persona_containment_trace = await _resolve_persona_containment(
+                runtime=runtime,
+                enabled=persona_containment_enabled,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+                runtime_turn_id=turn_state_trace.get("runtime_turn_id"),
+                persona_scope_hint=(
+                    interaction_governance.get("persona_scope_hint")
+                    if isinstance(interaction_governance, dict)
+                    else None
+                ),
+                interaction_kind=(
+                    interaction_governance.get("interaction_kind")
+                    if isinstance(interaction_governance, dict)
+                    else None
+                ),
+                current_user_text=last_user_text,
+                recent_messages=recent_messages,
+                surface_metadata_json=surface_metadata_json,
+            )
         if persona_containment_enabled:
             mandatory_policy = await _resolve_mandatory_retrieval_policy(
                 runtime=runtime,
@@ -10703,7 +11234,11 @@ async def orchestrate_chat(
                 )
             return timing_stop_response is not None
 
-        if pending_continuation is not None:
+        if strict_capability_information_enabled:
+            capability_registry_trace = _capability_registry_base_trace(
+                enabled=True, reason="strict_information_not_selected",
+            )
+        elif pending_continuation is not None:
             capability_registry_messages, capability_registry_trace = (
                 await _resolve_capability_continuation_policy(
                     timing_barrier=before_action_authority,

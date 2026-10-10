@@ -40320,3 +40320,628 @@ async def test_receipt_trace_does_not_copy_current_or_recent_private_input(tmp_p
     policy = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["interrupt_policy"]
     assert "PRIVATE" not in str(policy)
     assert "intervention_text" not in str(policy) and "digest" not in str(policy)
+
+
+class StrictInformationRuntime(EnforceInterruptRuntime):
+    def __init__(
+        self,
+        *,
+        reason="matched",
+        persona="technical_architect",
+        proposal=None,
+        mutation=None,
+        failure=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.information_reason = reason
+        self.selected_persona = persona
+        self.proposal = proposal
+        self.mutation = mutation
+        self.information_failure = failure
+        self.selection_committed = False
+        self.strict_forbidden_calls = []
+        self.containment_committed = False
+        self.strict_identity = None
+        self.strict_scope = None
+
+    def _response(self, stage, response):
+        if self.information_failure and self.information_failure[0] == stage:
+            raise self.information_failure[1]
+        if self.mutation and self.mutation[0] == stage:
+            target = response
+            for key in self.mutation[1][:-1]:
+                target = target[key]
+            target[self.mutation[1][-1]] = self.mutation[2]
+        return response
+
+    async def evaluate_interaction_governance(self, **kwargs):
+        self.strict_scope = {
+            key: kwargs[key]
+            for key in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "runtime_session_id",
+                "runtime_turn_id",
+            )
+        }
+        response = await super().evaluate_interaction_governance(**kwargs)
+        response = {**self.strict_scope, "result": copy.deepcopy(response["result"])}
+        return self._response("governance", response)
+
+    async def resolve_identity(self, **kwargs):
+        if kwargs.get("persona_selection_mode") != "strict":
+            return await super().resolve_identity(**kwargs)
+        from test_runtime_client import _strict_identity_fixture
+
+        assert self.interaction_governance_calls, "selection cannot precede persisted governance"
+        assert {key: kwargs[key] for key in self.strict_scope} == self.strict_scope
+        assert "expected_thread_revision" not in kwargs  # A prior-return snapshot is not current.
+        self.identity_calls.append(kwargs)
+        self.call_order.append("strict_selection")
+        self.strict_identity = _strict_identity_fixture(
+            self.strict_scope,
+            persona=self.selected_persona,
+            proposal=self.proposal,
+        )
+        self.selection_committed = True
+        return self._response("identity", copy.deepcopy(self.strict_identity))
+
+    async def evaluate_persona_containment(self, **kwargs):
+        if kwargs.get("persona_selection_mode") != "strict":
+            return await super().evaluate_persona_containment(**kwargs)
+        from test_runtime_client import _strict_containment_fixture
+
+        assert self.selection_committed, "containment cannot manufacture selection"
+        selection = self.strict_identity["persona_selection"]
+        assert kwargs["persona_selection_ref"] == selection["selection_ref"]
+        assert kwargs["expected_thread_revision"] == selection["thread_revision"]
+        assert kwargs["active_persona_id"] == self.selected_persona
+        assert "persona_scope_hint" not in kwargs and "requested_persona_id" not in kwargs
+        self.persona_containment_calls.append(kwargs)
+        self.call_order.append("strict_containment")
+        self.containment_committed = True
+        return self._response("containment", _strict_containment_fixture(self.strict_identity))
+
+    async def _information(self, kwargs, discovery):
+        from test_runtime_client import _strict_capability_fixture
+
+        assert self.selection_committed and self.containment_committed
+        assert kwargs["persona_selection_mode"] == "strict"
+        assert {key: kwargs[key] for key in self.strict_scope} == self.strict_scope
+        assert kwargs["active_persona_id"] == self.selected_persona
+        assert (
+            kwargs["expected_thread_revision"]
+            == self.strict_identity["persona_selection"]["thread_revision"]
+        )
+        assert (
+            kwargs["persona_selection_ref"]
+            == self.strict_identity["persona_selection"]["selection_ref"]
+        )
+        calls = self.capability_discovery_calls if discovery else self.capability_match_calls
+        calls.append(kwargs)
+        self.call_order.append("strict_information")
+        return self._response(
+            "capability",
+            _strict_capability_fixture(
+                self.strict_identity,
+                discovery=discovery,
+                reason=self.information_reason,
+            ),
+        )
+
+    async def match_capability(self, **kwargs):
+        if kwargs.get("persona_selection_mode") != "strict":
+            raise AssertionError("strict information must not downgrade to legacy matching")
+        return await self._information(kwargs, False)
+
+    async def discover_capabilities(self, **kwargs):
+        if kwargs.get("persona_selection_mode") != "strict":
+            raise AssertionError("strict information must not downgrade to legacy discovery")
+        return await self._information(kwargs, True)
+
+    async def complete_turn(self, **kwargs):
+        response = await super().complete_turn(**kwargs)
+        response["runtime_session"].update(
+            {
+                key: self.strict_scope[key]
+                for key in (
+                    "runtime_session_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                )
+            }
+        )
+        response["runtime_turn"]["runtime_session_id"] = kwargs["runtime_session_id"]
+        return self._response("completion", response)
+
+    async def authorize_capability(self, **kwargs):
+        self.strict_forbidden_calls.append("authorization")
+        raise AssertionError("informational policy cannot authorize execution")
+
+    async def record_capability_confirmation(self, **kwargs):
+        self.strict_forbidden_calls.append("confirmation")
+        raise AssertionError("information cannot consume a confirmation challenge")
+
+
+class InformationOnlyMemory(FakeMemoryStore):
+    async def resolve_profile(self, **kwargs):
+        raise AssertionError("information must precede legacy profile/context consumption")
+
+    async def retrieve_bundle(self, **kwargs):
+        raise AssertionError("information must not retrieve protected memory")
+
+
+def _assert_information_barriers(out, runtime, provider, memory):
+    assert out["selected_model"] == "not_called"
+    assert out["sources"] == []
+    assert not provider.calls
+    assert not runtime.capability_authority_calls
+    assert not runtime.capability_flow_calls
+    assert not runtime.strict_forbidden_calls
+    assert not runtime.world_state_calls
+    assert not runtime.relationship_calls
+    assert not runtime.claim_calibration_calls
+    assert not memory.retrieve_calls
+    assert not memory.claim_record_calls
+    assert len(runtime.turn_complete_calls) == 1
+    assert len(memory.trace_calls) == 1
+    assert [message["role"] for message in memory.added_messages] == ["user", "assistant"]
+    assert memory.added_messages[-1]["content"] == out["answer"]
+    trace = memory.trace_calls[-1]["payload"]
+    _assert_bms_trace_create_shape(trace)
+    info = trace["retrieval"]["prompt_assembly"]["capability_information"]
+    assert info["requested"] is True and info["mode"] == "strict"
+    assert info["action_dispatch"] == "suppressed"
+    assert "PRIVATE-" not in json.dumps(trace)
+    assert "current_user_text" not in info and "recent_messages" not in info
+    assert "artifact_access_policy" not in info and "allowed_memory_domains" not in info
+    return info
+
+
+async def _run_information_turn(tmp_path, *, runtime=None, memory=None, payload=None, **options):
+    return await _run_timing_turn(
+        tmp_path,
+        runtime=runtime or StrictInformationRuntime(),
+        memory=memory or InformationOnlyMemory(),
+        payload=payload
+        or _base_payload(
+            conversation_id="conv-1",
+            surface="dev",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Read runtime world state. PRIVATE-INPUT",
+                }
+            ],
+        ),
+        capability_registry_enabled=True,
+        persona_containment_enabled=True,
+        strict_capability_information_enabled=True,
+        **options,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discovery", [False, True])
+async def test_strict_capability_information_same_turn_order(tmp_path, discovery):
+    payload = _base_payload(
+        conversation_id="conv-1",
+        surface="dev",
+        messages=[
+            {
+                "role": "user",
+                "content": "What can you do?" if discovery else "Read runtime world state.",
+            }
+        ],
+    )
+    out, runtime, provider, memory = await _run_information_turn(tmp_path, payload=payload)
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert out["status"] == "ok"
+    assert "Read runtime world state" in out["answer"]
+    assert "no action was taken" in out["answer"]
+    assert info["status"] == "validated"
+    assert info["selection_status"] == info["containment_status"] == "validated"
+    assert info["operation"] == ("discovery" if discovery else "match")
+    order = [
+        runtime.call_order.index(key)
+        for key in (
+            "start_turn",
+            "interaction_governance",
+            "strict_selection",
+            "strict_containment",
+            "strict_information",
+            "timing",
+            "assistant_persistence",
+            "complete_turn:completed",
+        )
+    ]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    assert (
+        len(runtime.capability_discovery_calls if discovery else runtime.capability_match_calls)
+        == 1
+    )
+    assert len(runtime.timing_calls) == 1
+    assert memory.work["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_strict_information_precedes_protected_reads(tmp_path, monkeypatch):
+    import services.orchestrate as service
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("information cannot reach providers, protected context or executors")
+
+    for name in (
+        "authorize_and_execute_capability",
+        "filter_capability_descriptors_for_exposure",
+        "_resolve_world_state",
+        "_resolve_relationship_context",
+        "_resolve_mandatory_retrieval_policy",
+        "_resolve_capability_registry_context",
+        "restore_pending_action_request",
+    ):
+        monkeypatch.setattr(service, name, forbidden)
+    out, runtime, provider, memory = await _run_information_turn(tmp_path)
+    assert out["status"] == "ok"
+    _assert_information_barriers(out, runtime, provider, memory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proposal", ["technical_architect", "personal_companion"])
+async def test_advisory_proposal_does_not_change_information_persona(tmp_path, proposal):
+    runtime = StrictInformationRuntime(proposal=proposal)
+    payload = _base_payload(
+        conversation_id="conv-1",
+        surface="dev",
+        active_persona_id="home_operator",
+        requested_persona_id="home_operator",
+        persona_scope_hint="supportive_listener",
+        messages=[{"role": "user", "content": "Read runtime world state."}],
+    )
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path, runtime=runtime, payload=payload
+    )
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert out["status"] == "ok"
+    assert info["active_persona_id"] == "technical_architect"
+    assert info["proposal_status"] == "advisory"
+    assert info["contextual_activation"] is False
+    for call in runtime.capability_match_calls + runtime.persona_containment_calls:
+        assert call["active_persona_id"] == "technical_architect"
+        assert "requested_persona_id" not in call and "persona_scope_hint" not in call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "surface,reason",
+    [
+        ("web", "persona_not_allowed"),
+        ("unregistered", "surface_not_allowed"),
+        ("unknown", "surface_not_allowed"),
+    ],
+)
+async def test_strict_information_denial_exposes_no_descriptor(tmp_path, surface, reason):
+    runtime = StrictInformationRuntime(reason=reason, persona="general_assistant")
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path,
+        runtime=runtime,
+        payload=_base_payload(
+            conversation_id="conv-1",
+            surface=surface,
+            messages=[{"role": "user", "content": "Read world state."}],
+        ),
+    )
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert out["status"] == "ok"
+    assert info["information_outcome"] == "denied" and info["capability_count"] == 0
+    assert "runtime.world_state.read" not in out["answer"]
+    assert "Read runtime world state" not in out["answer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage,field",
+    [
+        ("identity", key)
+        for key in (
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "runtime_session_id",
+            "runtime_turn_id",
+            "active_persona_id",
+            "selection_ref",
+        )
+    ]
+    + [
+        ("containment", key)
+        for key in (
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "runtime_session_id",
+            "runtime_turn_id",
+            "active_persona_id",
+            "selection_ref",
+            "thread_revision",
+        )
+    ],
+)
+async def test_strict_response_binding_mismatch_fails_closed(tmp_path, stage, field):
+    mutation = (stage, ("persona_selection", field), 99 if field == "thread_revision" else "wrong")
+    runtime = StrictInformationRuntime(mutation=mutation)
+    out, runtime, provider, memory = await _run_information_turn(tmp_path, runtime=runtime)
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert out["status"] == "failed"
+    assert info["status"] == "failed"
+    assert runtime.capability_match_calls == []
+    if stage == "identity":
+        assert runtime.persona_containment_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["governance", "identity", "containment", "capability"])
+@pytest.mark.parametrize("kind", ["timeout", "conflict", "malformed"])
+async def test_strict_information_dependency_failure_never_downgrades(tmp_path, stage, kind):
+    if kind == "malformed":
+        mutation = (stage, ("result",) if stage == "governance" else ("selection_contract",), None)
+        runtime = StrictInformationRuntime(mutation=mutation)
+    else:
+        request = httpx.Request("POST", "http://runtime.local/policy")
+        error = (
+            httpx.ReadTimeout("PRIVATE-DEPENDENCY")
+            if kind == "timeout"
+            else httpx.HTTPStatusError(
+                "PRIVATE-DEPENDENCY", request=request, response=httpx.Response(409, request=request)
+            )
+        )
+        runtime = StrictInformationRuntime(failure=(stage, error))
+    out, runtime, provider, memory = await _run_information_turn(tmp_path, runtime=runtime)
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert out["status"] == "failed"
+    assert info["status"] == "failed"
+    assert all(
+        call.get("persona_selection_mode") == "strict"
+        for call in (
+            runtime.identity_calls
+            + runtime.persona_containment_calls
+            + runtime.capability_match_calls
+        )
+    )
+    assert len(runtime.capability_match_calls) <= 1
+    assert memory.work["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_strict_confirmation_input_does_not_consume_challenge(tmp_path, monkeypatch):
+    import services.orchestrate as service
+
+    challenge = {
+        "challenge_ref": "PRIVATE-CHALLENGE",
+        "capability_id": "jellyfin_restart",
+        "target": "jellyfin",
+        "argument_digest": "PRIVATE-DIGEST",
+        "confirmed": True,
+        "challenge_expires_at": "2099-01-01T00:00:00+00:00",
+    }
+    before = copy.deepcopy(challenge)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("strict input cannot restore or consume a legacy confirmation")
+
+    monkeypatch.setattr(service, "restore_pending_action_request", forbidden)
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path,
+        payload=_base_payload(
+            conversation_id="conv-1", surface="dev", capability_confirmation=challenge
+        ),
+    )
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert challenge == before
+    assert out["status"] == "failed"
+    assert info["information_outcome"] == "confirmation_rejected"
+    assert not runtime.identity_calls and not runtime.capability_match_calls
+    assert not runtime.execution_receipt_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy", ["ask_clarifying_question", "pause_or_wait", "close_turn", "answer_now"]
+)
+async def test_strict_information_timing_interrupt_and_completion(tmp_path, policy):
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path,
+        policy=policy,
+        interrupt_policy_mode="enforce",
+    )
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert len(runtime.timing_calls) == 1
+    if policy == "answer_now":
+        assert out["answer"] == runtime.intervention_text
+        assert info["information_outcome"] == "interrupt_displaced"
+        assert len(runtime.execution_receipt_calls) == 1
+        assert runtime.call_order.index("complete_turn:completed") < runtime.call_order.index(
+            "interrupt_execution_receipt"
+        )
+    else:
+        assert not runtime.execution_receipt_calls
+        assert info["information_outcome"] == "timing_displaced"
+        assert out["status"] == ("failed" if policy == "close_turn" else "degraded")
+
+
+@pytest.mark.asyncio
+async def test_strict_information_gate_disabled_preserves_legacy(tmp_path):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path,
+        payload=_base_payload(conversation_id="conv-1", surface="dev"),
+        strict_capability_information_enabled=False,
+    )
+    assert out["answer"] == "hello" and len(provider.calls) == 1
+    assert not any(
+        call.get("persona_selection_mode") == "strict" for call in runtime.identity_calls
+    )
+    assert (
+        "capability_information"
+        not in memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_noncapability_turn_is_not_claimed_strict_and_exposes_no_executable_tools(tmp_path):
+    runtime = StrictInformationRuntime(reason="no_registered_capability")
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path,
+        runtime=runtime,
+        memory=FakeMemoryStore(),
+        payload=_base_payload(
+            conversation_id="conv-1",
+            surface="dev",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "What is 2+2?",
+                }
+            ],
+        ),
+    )
+    assert out["answer"] == "hello" and len(provider.calls) == 1
+    assert not provider.calls[0].get("tools")
+    assert len(runtime.capability_match_calls) == 1
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    prompt = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt["turn_state"]["capability_information"]["information_outcome"] == "not_selected"
+    assert prompt["turn_state"]["capability_information"]["protected_consumer_authority"] == (
+        "legacy_unbound"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["matched", "persona_not_allowed", "surface_not_allowed"])
+async def test_strict_information_has_zero_execution_calls(tmp_path, reason, monkeypatch):
+    import services.orchestrate as service
+
+    attempted = []
+
+    def forbidden(*args, **kwargs):
+        attempted.append("executor_or_descriptor")
+        raise AssertionError("no information turn may enter execution")
+
+    monkeypatch.setattr(service, "authorize_and_execute_capability", forbidden)
+    monkeypatch.setattr(service, "filter_capability_descriptors_for_exposure", forbidden)
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path,
+        runtime=StrictInformationRuntime(reason=reason),
+    )
+    assert out["status"] == "ok"
+    _assert_information_barriers(out, runtime, provider, memory)
+    assert attempted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage,field,value",
+    [
+        ("containment", ("result", "active_persona_id"), "home_operator"),
+        ("containment", ("result", "allowed_tool_domains"), None),
+        ("containment", ("result", "artifact_access_policy"), None),
+        ("containment", ("result", "cross_scope_access_allowed"), True),
+        ("capability", ("request_id",), "old-request:capability-match"),
+        ("capability", ("owner_id",), "other-owner"),
+        ("capability", ("conversation_id",), "other-conversation"),
+        ("capability", ("surface",), "web"),
+        ("capability", ("active_persona_id",), "home_operator"),
+        ("capability", ("persona_selection_ref",), "psel_" + "2" * 32),
+        ("capability", ("result", "action_taken"), True),
+        ("capability", ("result", "capability_matched"), 1),
+        ("capability", ("result", "capability"), {"private": "PRIVATE-CONTENT"}),
+    ],
+)
+async def test_strict_information_rejects_inconsistent_containment_or_capability(
+    tmp_path,
+    stage,
+    field,
+    value,
+):
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path,
+        runtime=StrictInformationRuntime(mutation=(stage, field, value)),
+    )
+    info = _assert_information_barriers(out, runtime, provider, memory)
+    assert out["status"] == "failed"
+    assert info["status"] == "failed"
+    if stage == "containment":
+        assert runtime.capability_match_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["assistant", "trace", "completion"])
+async def test_strict_information_terminal_failures_do_not_replay(tmp_path, failure):
+    runtime, memory = StrictInformationRuntime(), InformationOnlyMemory()
+    attempts = []
+    if failure == "completion":
+        runtime.information_failure = ("completion", httpx.ReadTimeout("PRIVATE-COMPLETION"))
+    elif failure == "assistant":
+        original = memory.add_message
+
+        async def append(**kwargs):
+            attempts.append(kwargs["role"])
+            if kwargs["role"] == "assistant":
+                raise httpx.ReadTimeout("PRIVATE-PERSISTENCE")
+            return await original(**kwargs)
+
+        memory.add_message = append
+    else:
+
+        async def trace(**kwargs):
+            attempts.append("trace")
+            raise httpx.ReadTimeout("PRIVATE-TRACE")
+
+        memory.create_trace = trace
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path, runtime=runtime, memory=memory
+    )
+    assert out["status"] == "failed"
+    assert not provider.calls and not runtime.strict_forbidden_calls
+    assert len(runtime.turn_complete_calls) == 1
+    assert not runtime.execution_receipt_calls
+    assert "PRIVATE-" not in json.dumps(out)
+    assert attempts.count("assistant") == int(failure == "assistant")
+    assert attempts.count("trace") == int(failure == "trace")
+
+
+@pytest.mark.asyncio
+async def test_strict_information_durable_order_before_work_completion(tmp_path):
+    runtime, memory = StrictInformationRuntime(), InformationOnlyMemory()
+    original_trace, original_transition = memory.create_trace, memory.transition_work
+
+    async def trace(**kwargs):
+        runtime.call_order.append("trace_persistence")
+        return await original_trace(**kwargs)
+
+    async def transition(**kwargs):
+        if kwargs["state"] == "completed":
+            runtime.call_order.append("work_completion")
+        return await original_transition(**kwargs)
+
+    memory.create_trace, memory.transition_work = trace, transition
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path, runtime=runtime, memory=memory
+    )
+    assert out["status"] == "ok"
+    _assert_information_barriers(out, runtime, provider, memory)
+    order = [
+        runtime.call_order.index(key)
+        for key in (
+            "assistant_persistence",
+            "complete_turn:completed",
+            "trace_persistence",
+            "work_completion",
+        )
+    ]
+    assert order == sorted(order) and len(set(order)) == len(order)
