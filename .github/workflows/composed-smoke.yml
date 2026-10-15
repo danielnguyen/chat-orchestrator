@@ -236,3 +236,289 @@ jobs:
           path: /tmp/chat-orchestrator-bounded-logs
           if-no-files-found: ignore
           retention-days: 3
+
+  same-runner-latency-diagnostic:
+    # Temporary diagnostic: never runs on ordinary PRs, main, or manual dispatch.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.repository == 'danielnguyen/chat-orchestrator' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'diagnostic-co184-same-runner' &&
+      github.base_ref == 'main'
+    name: same-runner-measurement-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DIAGNOSTIC_CO_A: d478d0b60398079c6aefdcb52a574c14a4569cc1
+      DIAGNOSTIC_CO_B: 6e51d25f9c85f8ba75d497e150441e4d9af02a62
+      DIAGNOSTIC_CR: 8f358b576e7eb1f3c5afcc1776bc6d674107e923
+      DIAGNOSTIC_BMS: b26880799a642fdb9c1348fce115f3ec5a96cd33
+      DIAGNOSTIC_DSA: 57389cab54481d1c768d403fb9213cc2748103d3
+    steps:
+      - name: Checkout exact base
+        uses: actions/checkout@v4
+        with:
+          ref: d478d0b60398079c6aefdcb52a574c14a4569cc1
+          path: chat-orchestrator
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout pinned runtime
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/cognitive-runtime
+          ref: 8f358b576e7eb1f3c5afcc1776bc6d674107e923
+          path: cognitive-runtime
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout pinned memory store
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/basic-memory-store
+          ref: b26880799a642fdb9c1348fce115f3ec5a96cd33
+          path: basic-memory-store
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout pinned source aggregator
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/data-source-aggregator
+          ref: 57389cab54481d1c768d403fb9213cc2748103d3
+          path: data-source-aggregator
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select compatible host Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record bounded runner facts and verify pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/co184-abba-evidence"
+          mkdir -p "$evidence"
+          {
+            printf 'runner=%s os=%s arch=%s run=%s job=%s\n' \
+              "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH" "$GITHUB_RUN_ID" "$GITHUB_JOB"
+            printf 'region='
+            curl --silent --fail --noproxy '*' --connect-timeout 2 --max-time 3 \
+              -H Metadata:true \
+              'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text' \
+              || printf 'unavailable; see GitHub Set up job log'
+            printf '\n'
+            lscpu
+            free -h
+            df -h /
+            uptime
+            python3 --version
+            docker version
+            docker compose version
+          } > "$evidence/runner.txt"
+          python3 -c 'import sys; assert sys.version_info >= (3, 11)'
+          test -z "$(docker ps -aq)"
+          test -z "$(docker volume ls -q)"
+          if ss -ltnH | awk '{print $4}' | grep -Eq ':(14321|14351|14361|14371|14374|14381|14391)$'; then
+            echo 'diagnostic_port_conflict' >&2
+            exit 1
+          fi
+          for binding in "cognitive-runtime:$DIAGNOSTIC_CR" \
+            "basic-memory-store:$DIAGNOSTIC_BMS" "data-source-aggregator:$DIAGNOSTIC_DSA"; do
+            repository="${binding%%:*}"; revision="${binding#*:}"
+            git -C "$repository" cat-file -e "$revision^{commit}"
+            test "$(git -C "$repository" rev-parse HEAD)" = "$revision"
+            test -z "$(git -C "$repository" status --porcelain=v1)"
+            git -C "$repository" branch --force main "$revision"
+            printf '%s %s\n' "$repository" "$revision" >> "$evidence/pins.txt"
+          done
+          git -C chat-orchestrator cat-file -e "$DIAGNOSTIC_CO_A^{commit}"
+          git -C chat-orchestrator cat-file -e "$DIAGNOSTIC_CO_B^{commit}"
+          git -C chat-orchestrator merge-base --is-ancestor "$DIAGNOSTIC_CO_A" "$DIAGNOSTIC_CO_B"
+          printf 'A %s\nB %s\n' "$DIAGNOSTIC_CO_A" "$DIAGNOSTIC_CO_B" >> "$evidence/pins.txt"
+          cd chat-orchestrator
+          sha256sum scripts/composed_smoke.sh scripts/evidence_acquisition_composed.sh \
+            docker-compose.composed-smoke.yml api/requirements.txt > "$evidence/fixture-checksums.txt"
+
+      - name: Collect sequential A B B A measurements
+        shell: bash
+        working-directory: chat-orchestrator
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/co184-abba-evidence"
+          private="$RUNNER_TEMP/co184-abba-private"
+          mkdir -p "$private" "$private/cleanup"
+          for label in A1 B1 B2 A2; do
+            revision="$DIAGNOSTIC_CO_A"
+            if [[ "$label" == B* ]]; then revision="$DIAGNOSTIC_CO_B"; fi
+            git switch --detach "$revision"
+            test "$(git rev-parse HEAD)" = "$revision"
+            test -z "$(git status --porcelain=v1)"
+            sha256sum --check "$evidence/fixture-checksums.txt"
+            for binding in "../cognitive-runtime:$DIAGNOSTIC_CR" \
+              "../basic-memory-store:$DIAGNOSTIC_BMS" "../data-source-aggregator:$DIAGNOSTIC_DSA"; do
+              repository="${binding%%:*}"; expected="${binding#*:}"
+              test "$(git -C "$repository" rev-parse HEAD)" = "$expected"
+              test "$(git -C "$repository" rev-parse main)" = "$expected"
+              test -z "$(git -C "$repository" status --porcelain=v1)"
+            done
+            test -z "$(docker ps -aq)"
+            test -z "$(docker volume ls -q)"
+            mkdir -p "$evidence/$label" "$private/$label"
+            printf '%s\n' "$revision" > "$evidence/$label/co-revision.txt"
+            { date -u; uptime; free -h; } > "$evidence/$label/resources-before.txt"
+            vmstat -t 5 > "$evidence/$label/vmstat.txt" & monitor_pid=$!
+            trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+            # Preserve the script's own exit status; budget failure never skips the next run.
+            set +e
+            EVIDENCE_ACQUISITION_ONLY=1 EVIDENCE_SCENARIO=all \
+              COMPOSED_SMOKE_LOG_DIR="$private/$label/diagnostics" \
+              bash scripts/composed_smoke.sh > "$private/$label/benchmark.log" 2>&1
+            benchmark_exit=$?
+            set -e
+            kill "$monitor_pid" 2>/dev/null || true
+            wait "$monitor_pid" 2>/dev/null || true
+            trap - EXIT
+            printf '%s\n' "$benchmark_exit" > "$evidence/$label/benchmark-exit-code.txt"
+            { date -u; uptime; free -h; } > "$evidence/$label/resources-after.txt"
+            # Never upload raw benchmark output, environment dumps, or service logs.
+            grep -E '^Latency (regression|samples|structure|behavior) |^Persistent transport latency regression:' \
+              "$private/$label/benchmark.log" > "$evidence/$label/latency.txt" || true
+            reason=other_benchmark_failure
+            if [[ "$benchmark_exit" == 0 ]]; then reason=success
+            elif grep -q '^ValueError: latency_budget_exceeded$' "$private/$label/benchmark.log"; then
+              reason=latency_budget_exceeded
+            elif grep -q 'dependency failed to start' "$private/$label/benchmark.log"; then
+              reason=service_startup_failed
+            fi
+            printf '%s\n' "$reason" > "$evidence/$label/outcome.txt"
+            # Reduce existing failure diagnostics to service state, without IDs or labels.
+            python3 - "$private/$label/diagnostics/service-status.jsonl" \
+              "$evidence/$label/service-status.json" "$private/$label/benchmark.log" <<'PY'
+          import collections, json, pathlib, re, sys
+          source, destination, benchmark = map(pathlib.Path, sys.argv[1:])
+          rows = []
+          if source.exists():
+              for line in source.read_text().splitlines():
+                  row = json.loads(line)
+                  rows.append({key: row.get(key) for key in ("Service", "State", "Health", "ExitCode")})
+          signals = collections.Counter(re.findall(
+              r"^\s*Container chat-orchestrator-composed-smoke-"
+              r"(postgres|qdrant|provider|source-fixture|dsa|bms|runtime|orchestrator|bms-migrate)-1 "
+              r"(Healthy|Started|Exited|Error)\b", benchmark.read_text(), re.M))
+          destination.write_text(json.dumps({"failure_snapshot_available": source.exists(), "services": rows,
+              "lifecycle_signals": [{"service": service, "signal": signal, "count": count}
+                                    for (service, signal), count in sorted(signals.items())]}))
+          PY
+            for image in runtime bms bms-migrate dsa orchestrator provider source-fixture; do
+              docker image inspect "chat-orchestrator-composed-smoke-$image" --format '{{.Id}}' \
+                > "$evidence/$label/image-$image.txt" 2>/dev/null || true
+            done
+            for image in postgres:16-alpine qdrant/qdrant:latest-unprivileged; do
+              docker image inspect "$image" --format '{{.Id}}' \
+                >> "$evidence/$label/external-images.txt" 2>/dev/null || true
+            done
+            set +e
+            COMPOSED_SMOKE_TMP="$private/cleanup" docker compose -f docker-compose.composed-smoke.yml \
+              down -v --remove-orphans > "$private/$label/cleanup.log" 2>&1
+            cleanup_exit=$?
+            set -e
+            printf '%s\n' "$cleanup_exit" > "$evidence/$label/cleanup-exit-code.txt"
+            containers="$(docker ps -aq --filter label=com.docker.compose.project=chat-orchestrator-composed-smoke)"
+            volumes="$(docker volume ls -q --filter label=com.docker.compose.project=chat-orchestrator-composed-smoke)"
+            if [[ "$cleanup_exit" != 0 || -n "$containers" || -n "$volumes" ]]; then
+              echo 'diagnostic_cleanup_failed' > "$evidence/$label/cleanup-state.txt"
+              exit 1
+            fi
+            echo clean > "$evidence/$label/cleanup-state.txt"
+            test -z "$(git status --porcelain=v1)"
+            printf 'Diagnostic %s: benchmark_exit=%s outcome=%s cleanup=clean\n' \
+              "$label" "$benchmark_exit" "$reason"
+          done
+
+      - name: Validate and summarize logged measurements
+        if: always()
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/co184-abba-evidence" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, math, pathlib, re, statistics, sys
+          root = pathlib.Path(sys.argv[1])
+          root.mkdir(parents=True, exist_ok=True)
+          budgets = {"ordinary_text": 300, "evidence_governed": 350,
+                     "history_deterministic": 160, "history_classified": 160, "provider_fallback": 350}
+          results, blockers = {}, []
+          for label in ("A1", "B1", "B2", "A2"):
+              folder = root / label
+              if not (folder / "latency.txt").exists():
+                  blockers.append(label + ":measurement_not_collected")
+                  continue
+              text = (folder / "latency.txt").read_text()
+              code = int((folder / "benchmark-exit-code.txt").read_text())
+              reason = (folder / "outcome.txt").read_text().strip()
+              scenarios = {}
+              for scenario, raw in re.findall(r"^Latency samples (\w+): elapsed_ms=(\[[^\n]+\])$", text, re.M):
+                  values = json.loads(raw)
+                  if scenario not in budgets or scenario in scenarios or len(values) != 10 or any(
+                      type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in values
+                  ):
+                      raise ValueError("diagnostic_samples_invalid")
+                  parity = (f"Latency behavior {scenario}: warmups=2 measured=10 parity=true "
+                            "actions=0 persisted_equal=true completed=true idle=true") in text
+                  structure = re.findall(r"^Latency structure " + scenario +
+                      r": co_pre_trace_ms=(\d+) provider_attempt_ms=(\d+) runtime_events=(\d+)$", text, re.M)
+                  if not parity or len(structure) != 10:
+                      blockers.append(label + ":" + scenario + ":behavior_or_structure_invalid")
+                  ordered = sorted(values)
+                  position = (len(ordered) - 1) * 0.95
+                  lower = math.floor(position)
+                  p95 = ordered[lower] + (ordered[math.ceil(position)] - ordered[lower]) * (position - lower)
+                  scenarios[scenario] = {"samples_ms": values, "count": 10,
+                      "p50_ms": statistics.median(values), "p95_ms": p95, "max_ms": max(values),
+                      "budget_ms": budgets[scenario], "within_budget": p95 <= budgets[scenario],
+                      "behavioral_parity": parity,
+                      "coarse": [dict(zip(("pre_trace_ms", "provider_attempt_ms", "runtime_events"),
+                                          map(int, row))) for row in structure]}
+              if set(scenarios) != set(budgets):
+                  blockers.append(label + ":" + reason + ":incomplete_samples")
+              if code != 0 and reason != "latency_budget_exceeded":
+                  blockers.append(label + ":" + reason)
+              cleanup = folder / "cleanup-state.txt"
+              if not cleanup.exists() or cleanup.read_text().strip() != "clean":
+                  blockers.append(label + ":cleanup_failed")
+              results[label] = {"benchmark_exit_code": code, "outcome": reason, "scenarios": scenarios}
+          if len(results) == 4:
+              for image in ("runtime", "bms", "bms-migrate", "dsa"):
+                  identities = {(root / label / ("image-" + image + ".txt")).read_text().strip()
+                                for label in results}
+                  if len(identities) != 1 or not all(identities):
+                      blockers.append("dependency_image_changed:" + image)
+              if len({(root / label / "external-images.txt").read_text() for label in results}) != 1:
+                  blockers.append("external_images_changed")
+          report = {"measurement_only": True, "runs": results, "blockers": blockers}
+          (root / "results.json").write_text(json.dumps(report, indent=2))
+          lines = ["## Same-runner diagnostic (not composition acceptance)", "",
+                   "Original benchmark exits and budgets are preserved. Budget misses do not gate collection.", "",
+                   "| Run | Scenario | Count | p50 ms | p95 ms | Max ms | Budget ms | Within budget |",
+                   "|---|---|---:|---:|---:|---:|---:|---|"]
+          for label, run in results.items():
+              for scenario, result in run["scenarios"].items():
+                  lines.append(f'| {label} (exit {run["benchmark_exit_code"]}) | {scenario} | 10 | '
+                      f'{result["p50_ms"]:.3f} | {result["p95_ms"]:.3f} | {result["max_ms"]:.3f} | '
+                      f'{result["budget_ms"]} | {str(result["within_budget"]).lower()} |')
+          lines.extend(["", "Structural blockers: " + (", ".join(blockers) if blockers else "none")])
+          with open(sys.argv[2], "a") as summary:
+              summary.write("\n".join(lines) + "\n")
+          if blockers:
+              raise SystemExit("diagnostic_evidence_incomplete")
+          PY
+
+      - name: Upload bounded same-runner evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: co184-same-runner-abba
+          path: ${{ runner.temp }}/co184-abba-evidence
+          if-no-files-found: error
+          retention-days: 3
