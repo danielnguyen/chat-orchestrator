@@ -3339,3 +3339,32 @@ def test_strict_world_state_capability_ceiling_reuses_registry_requirements():
     assert _strict_world_state_capability_reason(action, claims[:-1]) == (
         "validated_world_state_required"
     )
+
+
+@pytest.mark.asyncio
+async def test_strict_world_state_reference_projection_never_normalizes_registry_identity():
+    from clients.runtime import validate_strict_world_state_response
+    from services.orchestrate import _bounded_world_state_claims, _resolve_world_state
+    from test_runtime_client import _relationship_scope, _strict_world_state_fixture
+
+    response = _strict_world_state_fixture()
+    claim = response["included_claims"][0]
+    claim["entity_id"] = " repository_fixture "
+    validate_strict_world_state_response(response, scope=_relationship_scope())
+    # Literal producer identifiers are valid; they must not be promoted to a
+    # different identifier through the legacy trace-string sanitizer.
+    assert _bounded_world_state_claims([claim])[0]["entity_id"] == "repository_fixture"
+    scope = _relationship_scope()
+    runtime = FakeRuntime(world_state_response=response)
+    context, trace = await _resolve_world_state(
+        runtime=runtime, strict_scope=scope,
+        **{key: scope[key] for key in ("request_id", "owner_id", "conversation_id", "surface",
+                                      "runtime_session_id", "active_persona_id")},
+    )
+    assert context["prompt_content"] == response["prompt_content"]
+    ref, = trace["world_state_claim_refs"]
+    assert ref == {"domain": claim["domain"], "entity_id": claim["entity_id"],
+                   "attribute": claim["attribute"], "claim_id": claim["world_state_claim_id"],
+                   "value_digest": claim["value_digest"]}
+    assert ref["entity_id"] != "repository_fixture"
+    assert len(runtime.world_state_calls) == 1

@@ -5707,7 +5707,9 @@ async def _resolve_world_state(
         "expired_count": trace.get("expired_count", 0),
         "conflicted_count": trace.get("conflicted_count", 0),
         "confirmation_required": bool(trace.get("confirmation_required", False)),
-        "world_state_claim_refs": _bounded_world_state_claims(included_claims),
+        "world_state_claim_refs": _bounded_world_state_claims(
+            included_claims, exact=strict_scope is not None,
+        ),
     }
     if not isinstance(prompt_content, str) or not prompt_content:
         return None, {
@@ -5735,7 +5737,7 @@ async def _resolve_world_state(
     }
 
 
-def _bounded_world_state_claims(claims: Any) -> list[dict[str, str]]:
+def _bounded_world_state_claims(claims: Any, *, exact: bool = False) -> list[dict[str, str]]:
     if not isinstance(claims, list):
         return []
     refs: list[dict[str, str]] = []
@@ -5747,6 +5749,16 @@ def _bounded_world_state_claims(claims: Any) -> list[dict[str, str]]:
             or claim.get("superseded_by_claim_id") is not None
             or bool(claim.get("conflict_claim_ids"))
         ):
+            continue
+        if exact:
+            # Strict producer identifiers must never become different registry keys.
+            material = {key: claim.get(source) for key, source in (
+                ("domain", "domain"), ("entity_id", "entity_id"), ("attribute", "attribute"),
+                ("claim_id", "world_state_claim_id"), ("value_digest", "value_digest"),
+            )}
+            if all(isinstance(value, str) and 0 < len(value) <= 120
+                   for value in material.values()):
+                refs.append(material)
             continue
         domain = _sanitize_trace_string(claim.get("domain"), max_length=120)
         entity_id = _sanitize_trace_string(claim.get("entity_id"), max_length=120)
