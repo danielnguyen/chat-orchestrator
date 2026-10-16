@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     strict_capability_information_enabled: bool = Field(
         default=False, alias="STRICT_CAPABILITY_INFORMATION_ENABLED",
     )
+    strict_world_state_authority_enabled: bool = Field(
+        default=False, alias="STRICT_WORLD_STATE_AUTHORITY_ENABLED",
+    )
     strict_relationship_retrieval_enabled: bool = Field(
         default=False, alias="STRICT_RELATIONSHIP_RETRIEVAL_ENABLED",
     )
@@ -138,6 +141,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_claim_capture_runtime(self) -> Settings:
+        if self.strict_world_state_authority_enabled and (
+            not self.cognitive_runtime_base_url or not all((
+                self.cognitive_runtime_interaction_governance_enabled,
+                self.cognitive_runtime_persona_containment_enabled,
+            ))
+        ):
+            raise ValueError("strict world state requires runtime, governance and containment")
         if self.strict_relationship_retrieval_enabled and (
             not self.cognitive_runtime_base_url or not all((
                 self.cognitive_runtime_interaction_governance_enabled,

@@ -3320,3 +3320,22 @@ def test_chat_forwards_only_server_owned_information_gate(monkeypatch, enabled):
     assert response.status_code == 200
     assert calls[0]["strict_capability_information_enabled"] is enabled
     assert "strict_capability_information_enabled" not in calls[0]["payload"]
+
+
+def test_strict_world_state_capability_ceiling_reuses_registry_requirements():
+    from services.orchestrate import _strict_world_state_capability_reason
+
+    entries = {entry.capability_id: entry for entry in production_capability_registry()}
+    assert _strict_world_state_capability_reason(entries["runtime.world_state.read"], []) == (
+        "strict_world_state_context_only"
+    )
+    assert _strict_world_state_capability_reason(entries["draft.local_message"], []) is None
+    action = entries["jellyfin_restart"]
+    assert _strict_world_state_capability_reason(action, []) == "validated_world_state_required"
+    requirements = action.authorization_requirements["world_state_requirements"]
+    claims = [{**requirement, "claim_id": f"claim-{index}", "value_digest": "digest"}
+              for index, requirement in enumerate(requirements)]
+    assert _strict_world_state_capability_reason(action, claims) is None
+    assert _strict_world_state_capability_reason(action, claims[:-1]) == (
+        "validated_world_state_required"
+    )

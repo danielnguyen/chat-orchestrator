@@ -84,6 +84,13 @@ if [ "${STRICT_RELATIONSHIP_RETRIEVAL_ONLY:-}" = "1" ]; then
   export COMPOSED_INDEX_ASSISTANT_MESSAGES=true
 fi
 
+if [ "${STRICT_WORLD_STATE_AUTHORITY_ONLY:-}" = "1" ]; then
+  shopt -s inherit_errexit
+  export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=true
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true COMPOSED_RESTRAINT_ENABLED=true
+  export COMPOSED_INDEX_ASSISTANT_MESSAGES=true
+fi
+
 cleanup() {
   local status="$?"
   if [ -n "$G2_CONTAINER" ]; then
@@ -5111,7 +5118,7 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
                  "confirmation_challenge_evaluated"):
         assert not events(kind), "forbidden_action_or_confirmation"
     exposure = events("capability_authorization_evaluated")
-    if operation == "relationship" and valid == "true":
+    if operation in {"relationship", "world_state"} and valid == "true":
         # Ordinary chat may expose its existing read/draft tools. Exposure is
         # neither execution nor a new strict action-authorization claim.
         for _, decision in exposure:
@@ -5178,7 +5185,7 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
                     "SELECT default_persona_id FROM surface_bindings WHERE surface_id='unknown'"
                 ).fetchone()
             assert binding[0] == persona, "surface_bound_persona"
-        if operation != "relationship":
+        if operation not in {"relationship", "world_state"}:
             records = [item.record for item in _CAPABILITY_REGISTRY]
             if operation == "match":
                 records = [r for r in records if r.capability_id == "runtime.world_state.read"]
@@ -5213,6 +5220,7 @@ text = sys.stdin.read()
 counts = {p: len(re.findall(r"\"POST " + re.escape(p) + r" HTTP/", text)) for p in paths}
 counts["protected_memory_retrieval"] = len(re.findall(r"\"POST /v2/conversations/[^ /]+/retrieve HTTP/", text))
 counts["identity_conflicts"] = len(re.findall(r"\"POST /v1/runtime/identity/resolve HTTP/[^\"]+\" 409", text))
+counts["world_state_conflicts"] = len(re.findall(r"\"POST /v1/world-state/resolve HTTP/[^\"]+\" 409", text))
 print(json.dumps(counts))'
 }
 
@@ -5636,8 +5644,213 @@ run_strict_relationship_scenario() {
   echo 'Strict relationship matrix: actual_services=true authority_ordered=true scope_restricted=true empty_valid=true advisory_only=true malformed_fail_closed=true fixture_restored=true both_gates=true refusal_durable=true default_legacy=true actions=0 contextual_activation=false latency_benchmark=false'
 }
 
+# Bounded disposable world-state records; values are neutral test sentinels.
+strict_world_state_seed() {
+  local owner="$1" conversation="$2" kind domain value freshness sensitivity entity attribute body
+  local result='[]' response
+  for kind in project repository secret stale expired conflict_a conflict_b health; do
+    domain=active_repository; freshness=fresh; sensitivity=medium
+    entity="fixture-$kind"; attribute=state; value="WORLD_FIXTURE_$kind"
+    case "$kind" in
+      project) domain=active_project ;;
+      secret) sensitivity=restricted ;;
+      stale) freshness=stale ;;
+      expired) freshness=expired ;;
+      health) domain=active_health_observation ;;
+      conflict_*) entity=fixture-conflict ;;
+    esac
+    body="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --arg domain "$domain" \
+      --arg entity "$entity" --arg attribute "$attribute" --arg value "$value" \
+      --arg freshness "$freshness" --arg sensitivity "$sensitivity" \
+      --arg now "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
+      '{request_id:"fixture-world-state",owner_id:$owner,conversation_id:$conversation,surface:"dev",
+        claim:{entity_id:$entity,entity_type:"fixture",domain:$domain,attribute:$attribute,
+          value_json:$value,source_type:"user_report",source_ref:"disposable-fixture",confidence:0.9,
+          freshness_state:$freshness,state_authority:"observed_user_report",observed_at:$now,
+          confirmation_policy:(if $freshness=="stale" then "reverify_before_use" else "none" end),
+          sensitivity:$sensitivity}}')"
+    response="$(cr_post /v1/world-state/claims/upsert "$body")"
+    result="$(jq -c --arg kind "$kind" --arg value "$value" --argjson claim "$(jq .claim <<<"$response")" \
+      '.+[{kind:$kind,value:$value,id:$claim.world_state_claim_id}]' <<<"$result")"
+  done
+  echo "$result"
+}
+
+# Corrupt only a disposable owner's row, then restore the entire row exactly.
+strict_world_state_fixture() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "$2" "${3:-null}" <<'PYCODE'
+import json, sqlite3, sys
+mode, owner, original = sys.argv[1:]
+with sqlite3.connect('/data/runtime_state.sqlite3') as db:
+    db.row_factory = sqlite3.Row
+    if mode == 'corrupt':
+        row = dict(db.execute("SELECT * FROM runtime_world_state_claims WHERE owner_id=? "
+                              "AND entity_id='fixture-repository'", (owner,)).fetchone())
+        assert row['freshness_state'] == 'fresh'
+        db.execute("UPDATE runtime_world_state_claims SET freshness_state='invalid_fixture' "
+                   "WHERE owner_id=? AND world_state_claim_id=?", (owner,row['world_state_claim_id']))
+        print(json.dumps(row))
+    else:
+        row = json.loads(original)
+        assert row['owner_id'] == owner
+        db.execute("UPDATE runtime_world_state_claims SET freshness_state=? WHERE owner_id=? "
+                   "AND world_state_claim_id=? AND freshness_state='invalid_fixture'",
+                   (row['freshness_state'],owner,row['world_state_claim_id']))
+        restored = dict(db.execute("SELECT * FROM runtime_world_state_claims WHERE owner_id=? "
+                                   "AND world_state_claim_id=?",(owner,row['world_state_claim_id'])).fetchone())
+        assert restored == row, 'fixture_restoration'
+        print('{"fixture_restored":true}')
+PYCODE
+}
+
+run_strict_world_state_case() (
+  local tag="$1" surface="$2" persona="$3" proposal="${4:-any}" empty="${5:-false}"
+  local owner="strict-world-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  local conversation fixture='[]' response request answer trace authority session turn scope calls records
+  local before after work result original text='What do we know about this project?' omitted=false
+  conversation="$(create_conversation "$owner" strict-world-client)"
+  configure_surface_permission "$owner" "$surface" true true false
+  if [ "$empty" != true ]; then fixture="$(strict_world_state_seed "$owner" "$conversation")"; fi
+  if [ "$tag" = malformed_context ]; then
+    original="$(strict_world_state_fixture corrupt "$owner")"
+    trap 'strict_world_state_fixture restore "$owner" "$original" >/dev/null' EXIT
+    omitted=true
+  fi
+  if [ "$tag" = technical ]; then text='This server keeps failing!! What do you remember about this project?'; fi
+  if [ "$tag" = supportive ]; then text='What do you remember about this project? I got this wrong.'; fi
+  if [ "$tag" = required_claims ]; then text='What would happen if you restart Jellyfin?'; fi
+  provider_post /fixture/reset '{}'
+  provider_post /fixture/next-answer '{"answer":"The bounded context was considered. No action was taken."}'
+  before="$(strict_information_http_counts)"
+  response="$(co_post "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg text "$text" '{owner_id:$owner,client_id:"strict-world-client",
+      conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],
+      sensitivity:"private"}')")"
+  request="$(jq -er .request_id <<<"$response")"; answer="$(jq -er .answer <<<"$response")"
+  trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
+  after="$(strict_information_http_counts)"
+  authority="$(jq -ce '.retrieval.prompt_assembly.turn_state |
+    .relationship_authority // .world_state_authority' <<<"$trace")"
+  session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+  turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+  scope="$(jq -nc --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg session "$session" --arg turn "$turn" \
+    '{request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface,
+      runtime_session_id:$session,runtime_turn_id:$turn}')"
+  if [ "$tag" = malformed_authority ]; then
+    jq -e '.status=="failed" and .selected_model=="not_called"' <<<"$response" >/dev/null
+    records="$(strict_information_records "$scope" "$authority" "$persona" any world_state false)"
+    jq -e '.calls==[]' <<<"$calls" >/dev/null
+    test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation' AND role='assistant';")" = 0
+    jq -en --argjson a "$after" --argjson b "$before" '
+      $a.identity_conflicts-$b.identity_conflicts==1
+      and $a.protected_memory_retrieval==$b.protected_memory_retrieval
+      and $a["/v1/world-state/resolve"]==$b["/v1/world-state/resolve"]' >/dev/null
+  else
+    jq -e '.status|IN("ok","degraded")' <<<"$response" >/dev/null
+    records="$(strict_information_records "$scope" "$authority" "$persona" "$proposal" world_state true)"
+    # Stronger existing timing stops remain authoritative for advisory requests.
+    if jq -e '.selected_model=="not_called"' <<<"$response" >/dev/null; then
+      jq -e '.retrieval.prompt_assembly.runtime_timing.result.timing_policy |
+        IN("ask_clarifying_question","pause_or_wait","yield_to_user","close_turn")' <<<"$trace" >/dev/null
+      jq -e '.calls==[]' <<<"$calls" >/dev/null
+    else
+      jq -e '.calls|length==1' <<<"$calls" >/dev/null
+      if [ "$omitted" = true ]; then
+        jq -e '.retrieval.prompt_assembly.world_state | .mode=="strict"
+          and .authority_status=="unverified" and .outcome=="omitted_optional_context"
+          and .included==false' <<<"$trace" >/dev/null
+        jq -en --argjson a "$after" --argjson b "$before" '
+          $a.world_state_conflicts-$b.world_state_conflicts==1
+          and $a["/v1/world-state/resolve"]-$b["/v1/world-state/resolve"]==1' >/dev/null
+      else
+        jq -e --arg persona "$persona" --arg surface "$surface" --argjson empty "$empty" '
+          .retrieval.prompt_assembly.world_state | .mode=="strict"
+          and .authority_status=="validated" and .active_persona_id==$persona
+          and .included_claim_count==(if $empty then 0 elif $persona=="technical_architect" then 4
+            elif $surface=="web" then 1 else 0 end)' <<<"$trace" >/dev/null
+      fi
+      jq -en --argjson fixture "$fixture" --argjson calls "$calls" --argjson trace "$trace" \
+        --arg answer "$answer" --arg surface "$surface" --argjson omitted "$omitted" '
+        ($calls.calls|map(.normalized_messages[]?.content)|join("\n")) as $prompt |
+        all($fixture[]; . as $item |
+          (if $omitted or ([$item.kind]|inside(["secret","expired","health","conflict_a","conflict_b"]))
+             or ($surface!="dev" and ($surface!="web" or $item.kind!="project"))
+           then (($prompt|contains($item.value))|not) else ($prompt|contains($item.value)) end)
+          and (($trace|tojson|contains($item.value))|not)
+          and (($answer|contains($item.value))|not))' >/dev/null
+      jq -e '.retrieval.prompt_assembly.capabilities.executor_call_count==0
+        and .retrieval.prompt_assembly.capabilities.dispatch_completed==false' <<<"$trace" >/dev/null
+      if [ "$tag" = required_claims ]; then
+        jq -e '.retrieval.prompt_assembly.capability_registry.reason=="validated_world_state_required"' <<<"$trace" >/dev/null
+      fi
+    fi
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    assert_request_persistence_counts "$conversation" "$request" 0
+  fi
+  jq -en --argjson a "$after" --argjson b "$before" --arg tag "$tag" '
+    $a["/v1/runtime/identity/resolve"]-$b["/v1/runtime/identity/resolve"]==1
+    and $a["/v1/runtime/persona-containment/evaluate"]-$b["/v1/runtime/persona-containment/evaluate"]==(if $tag=="malformed_authority" then 0 else 1 end)
+    and all(["/v1/capabilities/authority","/v1/capabilities/flow","/v1/capabilities/confirm"][]; $a[.] == $b[.])' >/dev/null
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND request_id='$request';")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  assert_public_work "$result" "$work" "$conversation" "$request"
+  if [ "$tag" = malformed_authority ]; then
+    jq -e '.state=="failed" and .result==null' <<<"$result" >/dev/null
+  else
+    jq -e --arg answer "$answer" '.state=="completed" and .result.answer==$answer' <<<"$result" >/dev/null
+    assert_exact_canonical_result "$result"
+  fi
+  jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  echo "Strict world state $tag: records_checked=true optional_omitted=$omitted providers=$(jq '.calls|length' <<<"$calls") actions=0 challenges=0 work=$(jq -r .state <<<"$result") idle=true"
+)
+
+run_strict_world_state_scenario() {
+  run_strict_world_state_case developer dev technical_architect
+  run_strict_world_state_case web web general_assistant
+  run_strict_world_state_case unknown unregistered_surface general_assistant
+  run_strict_world_state_case empty dev technical_architect any true
+  run_strict_world_state_case technical web general_assistant technical_architect
+  run_strict_world_state_case supportive dev technical_architect personal_companion
+  run_strict_world_state_case malformed_context dev technical_architect
+  (
+    local original
+    original="$(strict_information_binding_fixture corrupt)"
+    trap 'strict_information_binding_fixture restore "$original" >/dev/null' EXIT
+    run_strict_world_state_case malformed_authority dev technical_architect any true
+  )
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_strict_world_state_case required_claims dev technical_architect any true
+  export COMPOSED_STRICT_RELATIONSHIP_RETRIEVAL_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_strict_world_state_case relationship dev technical_architect
+  export COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_strict_world_state_case all dev technical_architect
+  run_strict_information_case dev_match dev technical_architect any match 'What does read runtime world state do?'
+  run_strict_information_case confirmation dev technical_architect any match 'What does read runtime world state do?' false
+  # Existing relationship matrix also exercises the default-disabled legacy path.
+  export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=false
+  export COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED=false COMPOSED_CAPABILITY_REGISTRY_ENABLED=false
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_strict_relationship_scenario
+  echo 'Strict world state matrix: actual_services=true current_authority=true contextual_activation=false no_legacy_retry=true fixtures_restored=true default_legacy=true latency_benchmark=false'
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+
+if [ "${STRICT_WORLD_STATE_AUTHORITY_ONLY:-}" = "1" ]; then
+  set -E
+  trap 'echo "Strict world state assertion failed: line=$LINENO" >&2' ERR
+  run_strict_world_state_scenario
+  exit 0
+fi
 
 if [ "${STRICT_RELATIONSHIP_RETRIEVAL_ONLY:-}" = "1" ]; then
   set -E

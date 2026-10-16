@@ -301,6 +301,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
                 settings, "strict_capability_information_enabled", False,
             ),
             strict_relationship_retrieval_enabled=settings.strict_relationship_retrieval_enabled,
+            strict_world_state_authority_enabled=settings.strict_world_state_authority_enabled,
             claim_record_capture_enabled=settings.claim_record_capture_enabled,
             evidence_acquisition_enabled=settings.evidence_acquisition_enabled,
             history_followup_enabled=settings.history_followup_enabled,
