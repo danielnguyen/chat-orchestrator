@@ -5707,7 +5707,7 @@ run_strict_world_state_case() (
   local tag="$1" surface="$2" persona="$3" proposal="${4:-any}" empty="${5:-false}"
   local owner="strict-world-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   local conversation fixture='[]' response request answer trace authority session turn scope calls records
-  local before after work result original text='What do we know about this project?' omitted=false
+  local auxiliary before after work result original text='What do we know about this project?' omitted=false
   conversation="$(create_conversation "$owner" strict-world-client)"
   configure_surface_permission "$owner" "$surface" true true false
   if [ "$empty" != true ]; then fixture="$(strict_world_state_seed "$owner" "$conversation")"; fi
@@ -5749,13 +5749,19 @@ run_strict_world_state_case() (
   else
     jq -e '.status|IN("ok","degraded")' <<<"$response" >/dev/null
     records="$(strict_information_records "$scope" "$authority" "$persona" "$proposal" world_state true)"
+    # Catalog-backed classification is distinct from response generation. The
+    # existing fixture contract proves a bounded, tool-free closed-schema call.
+    auxiliary="$(jq '[.calls[] | select(.kind=="semantic_interpreter")]|length' <<<"$calls")"
+    test "$auxiliary" -le 1
+    assert_semantic_interpreter_calls "$calls" "$auxiliary"
+    jq -e 'all(.calls[]; .kind=="semantic_interpreter" or .kind=="chat")' <<<"$calls" >/dev/null
     # Stronger existing timing stops remain authoritative for advisory requests.
     if jq -e '.selected_model=="not_called"' <<<"$response" >/dev/null; then
       jq -e '.retrieval.prompt_assembly.runtime_timing.result.timing_policy |
         IN("ask_clarifying_question","pause_or_wait","yield_to_user","close_turn")' <<<"$trace" >/dev/null
-      jq -e '.calls==[]' <<<"$calls" >/dev/null
+      jq -e '[.calls[] | select(.kind=="chat")]|length==0' <<<"$calls" >/dev/null
     else
-      jq -e '.calls|length==1' <<<"$calls" >/dev/null
+      jq -e '[.calls[] | select(.kind=="chat")]|length==1' <<<"$calls" >/dev/null
       if [ "$omitted" = true ]; then
         jq -e '.retrieval.prompt_assembly.world_state | .mode=="strict"
           and .authority_status=="unverified" and .outcome=="omitted_optional_context"
@@ -5802,7 +5808,7 @@ run_strict_world_state_case() (
     assert_exact_canonical_result "$result"
   fi
   jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
-  echo "Strict world state $tag: records_checked=true optional_omitted=$omitted providers=$(jq '.calls|length' <<<"$calls") actions=0 challenges=0 work=$(jq -r .state <<<"$result") idle=true"
+  echo "Strict world state $tag: records_checked=true optional_omitted=$omitted providers=$(jq '.calls|length' <<<"$calls") classifiers=${auxiliary:-0} actions=0 challenges=0 work=$(jq -r .state <<<"$result") idle=true"
 )
 
 run_strict_world_state_scenario() {
@@ -5833,12 +5839,31 @@ run_strict_world_state_scenario() {
   run_strict_world_state_case all dev technical_architect
   run_strict_information_case dev_match dev technical_architect any match 'What does read runtime world state do?'
   run_strict_information_case confirmation dev technical_architect any match 'What does read runtime world state do?' false
-  # Existing relationship matrix also exercises the default-disabled legacy path.
+  # Default-disabled compatibility, without changing historical focused suites.
   export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=false
+  export COMPOSED_STRICT_RELATIONSHIP_RETRIEVAL_ENABLED=false
   export COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED=false COMPOSED_CAPABILITY_REGISTRY_ENABLED=false
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=false COMPOSED_RESTRAINT_ENABLED=false
   docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http http://127.0.0.1:14361/healthz
-  run_strict_relationship_scenario
+  local owner="strict-world-legacy" conversation response request trace diagnostics work result
+  conversation="$(create_conversation "$owner" legacy-client)"
+  configure_surface_permission "$owner" dev true true false
+  provider_post /fixture/reset '{}'
+  response="$(co_post "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+    '{owner_id:$owner,conversation_id:$conversation,surface:"dev",
+      messages:[{role:"user",content:"What does this function do?"}]}')")"
+  jq -e '.status=="ok"' <<<"$response" >/dev/null
+  request="$(jq -er .request_id <<<"$response")"; trace="$(fetch_trace "$request")"
+  jq -e '.retrieval.prompt_assembly.turn_state | .world_state_authority==null
+    and .relationship_authority==null and .capability_information==null' <<<"$trace" >/dev/null
+  diagnostics="$(fetch_runtime_diagnostics "$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")")"
+  jq -e '[.events[]|select(.event_type=="persona_selection_resolved")]|length==0' <<<"$diagnostics" >/dev/null
+  assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .answer <<<"$response")"
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND request_id='$request';")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  jq -e '.state=="completed"' <<<"$result" >/dev/null
+  assert_exact_canonical_result "$result"
   echo 'Strict world state matrix: actual_services=true current_authority=true contextual_activation=false no_legacy_retry=true fixtures_restored=true default_legacy=true latency_benchmark=false'
 }
 
