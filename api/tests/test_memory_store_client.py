@@ -732,3 +732,103 @@ async def test_reconciliation_validation_preserves_shared_client(managed_transpo
     responses.append({"interrupted_count": 0})
     assert await client.reconcile_interrupted_work() == {"interrupted_count": 0}
     assert len(calls) == 2 and len(constructions) == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_timing_covers_all_transport_seams_and_redacts_paths(service, caplog):
+    from clients.runtime import observe_request_timings
+
+    client, responses, calls = service
+    responses.extend([{}, {}, {}, {"interrupted_count": 0}])
+
+    @observe_request_timings
+    async def run(*, request_id):
+        await client._post("/v1/profiles/resolve", json={"secret": "private-payload"})
+        await client._get("/v1/conversations/private-conversation")
+        await client._work_write("PATCH", "/v1/internal/work-items/private-work", {})
+        await client.reconcile_interrupted_work()
+
+    with caplog.at_level("INFO"):
+        await run(request_id="origin-memory")
+    event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
+                            for r in caplog.records if "dependency_timings " in r.message))
+    spans = [s for s in event["spans"] if s["dependency"] == "bms"]
+    assert [s["operation"] for s in spans] == [
+        "POST /v1/profiles/resolve", "GET /v1/conversations/{id}",
+        "PATCH /v1/internal/work-items/{id}",
+        "POST /v1/internal/work-items/reconcile-interrupted",
+    ]
+    assert len(calls) == 4 and all(s["outcome"] == "success" for s in spans)
+    assert "private" not in json.dumps(event) and "test-key" not in json.dumps(event)
+
+
+@pytest.mark.asyncio
+async def test_trace_timing_snapshot_is_additive_copy_and_final_log_covers_write(service, caplog):
+    from clients.runtime import observe_request_timings
+
+    client, responses, calls = service
+    responses.extend([{}, {"trace_id": "trace"}])
+    original = {"retrieval": {"existing": True}, "request_id": "trace-origin"}
+
+    @observe_request_timings
+    async def run(*, request_id):
+        await client._get("/v1/proactive/preferences")
+        return await client.create_trace(request_id=request_id, payload=original)
+
+    with caplog.at_level("INFO"):
+        assert await run(request_id="trace-origin") == {"trace_id": "trace"}
+    assert original == {"retrieval": {"existing": True}, "request_id": "trace-origin"}
+    sent = json.loads(calls[-1].content)
+    timing = sent["retrieval"]["dependency_timings"]
+    assert sent["retrieval"]["existing"] is True
+    assert timing["request_id"] == "trace-origin"
+    assert timing["boundary"] == "before_trace_write"
+    assert not any(s["operation"] == "POST /v1/traces" for s in timing["spans"])
+    event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
+                            for r in caplog.records if "dependency_timings " in r.message))
+    assert any(s["operation"] == "POST /v1/traces" for s in event["spans"])
+    assert any(s["operation"] == "trace_persistence" for s in event["spans"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,outcome,replaced", [
+    (httpx.HTTPStatusError("private", request=httpx.Request("POST", "http://memory"),
+                           response=httpx.Response(500)), "http_error", False),
+    (httpx.ReadTimeout("private"), "timeout", True),
+    (httpx.PoolTimeout("private"), "timeout", False),
+    (httpx.ConnectError("private"), "transport_error", True),
+    (ValueError("private"), "decode_error", False),
+    (asyncio.CancelledError("private"), "cancelled", False),
+])
+async def test_memory_timing_preserves_failure_no_replay_and_pool_behavior(
+    monkeypatch, caplog, failure, outcome, replaced,
+):
+    from clients.runtime import observe_request_timings
+
+    attempts = []
+    http = AsyncMock()
+    response = AsyncMock()
+    response.raise_for_status = lambda: None
+
+    async def post(*args, **kwargs):
+        attempts.append(1)
+        raise failure
+
+    http.post = post
+    client = MemoryStoreClient("http://memory", "private-key")
+    client._client = http
+    client._started = True
+
+    @observe_request_timings
+    async def run(*, request_id):
+        await client._post("/v1/internal/work-items", json={})
+
+    with caplog.at_level("INFO"), pytest.raises(type(failure)) as caught:
+        await run(request_id="memory-failure")
+    assert caught.value is failure and attempts == [1]
+    assert (client._client is None) == replaced
+    assert http.aclose.await_count == int(replaced)
+    event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
+                            for r in caplog.records if "dependency_timings " in r.message))
+    assert event["spans"][0]["outcome"] == outcome
+    assert "private" not in json.dumps(event)

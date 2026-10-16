@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -667,3 +669,63 @@ data_source_aggregator._request_logger.info(
 
     assert "CO_CHAT_CORRELATION_VISIBILITY_SENTINEL" in output
     assert "CO_DSA_CORRELATION_VISIBILITY_SENTINEL" in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("outcome", ["success", "http_error", "timeout", "transport_error",
+                                      "decode_error", "cancelled"])
+async def test_dsa_timings_include_client_lifecycle_and_preserve_outcome(
+    monkeypatch, caplog, method, outcome,
+):
+    from clients.runtime import observe_request_timings
+
+    lifecycle = []
+    attempts = []
+    request = httpx.Request(method, "http://dsa/v1/sources")
+    errors = {"timeout": httpx.ReadTimeout("private"),
+              "transport_error": httpx.ConnectError("private"),
+              "cancelled": asyncio.CancelledError("private")}
+
+    class Http:
+        async def __aenter__(self):
+            lifecycle.append("open")
+            return self
+
+        async def __aexit__(self, *args):
+            lifecycle.append("close")
+
+        async def get(self, *args, **kwargs):
+            attempts.append(method)
+            if outcome in errors:
+                raise errors[outcome]
+            content = b"private-invalid" if outcome == "decode_error" else b"{}"
+            return httpx.Response(500 if outcome == "http_error" else 200,
+                                  content=content, request=request)
+
+        post = get
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Http())
+    client = DataSourceAggregatorClient("http://dsa", api_key="private-key")
+
+    @observe_request_timings
+    async def run(*, request_id):
+        if method == "GET":
+            return await client._get("/v1/sources", request_id="stage-id")
+        return await client._post("/v1/sources", json={"private": "payload"})
+
+    with caplog.at_level("INFO"):
+        if outcome == "success":
+            assert await run(request_id="dsa-origin") == {}
+        else:
+            expected = {"http_error": DataSourceAggregatorFailure,
+                        "decode_error": ValueError}.get(outcome, type(errors.get(outcome)))
+            with pytest.raises(expected):
+                await run(request_id="dsa-origin")
+    event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
+                            for r in caplog.records if "dependency_timings " in r.message))
+    assert attempts == [method] and lifecycle == ["open", "close"]
+    assert event["request_id"] == "dsa-origin"
+    assert event["spans"][0]["operation"] == method + " /v1/sources"
+    assert event["spans"][0]["outcome"] == outcome
+    assert "private" not in json.dumps(event) and "stage-id" not in json.dumps(event)
