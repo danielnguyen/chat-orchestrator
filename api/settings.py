@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     strict_capability_information_enabled: bool = Field(
         default=False, alias="STRICT_CAPABILITY_INFORMATION_ENABLED",
     )
+    strict_relationship_retrieval_enabled: bool = Field(
+        default=False, alias="STRICT_RELATIONSHIP_RETRIEVAL_ENABLED",
+    )
     claim_record_capture_enabled: bool = Field(
         default=False,
         alias="CLAIM_RECORD_CAPTURE_ENABLED",
@@ -135,6 +138,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_claim_capture_runtime(self) -> Settings:
+        if self.strict_relationship_retrieval_enabled and (
+            not self.cognitive_runtime_base_url or not all((
+                self.cognitive_runtime_interaction_governance_enabled,
+                self.cognitive_runtime_persona_containment_enabled,
+            ))
+        ):
+            raise ValueError(
+                "strict relationship retrieval requires runtime, governance and containment"
+            )
         if self.strict_capability_information_enabled:
             if not self.cognitive_runtime_base_url or not all((
                 self.cognitive_runtime_interaction_governance_enabled,

@@ -76,6 +76,14 @@ if [ "${STRICT_CAPABILITY_INFORMATION_ONLY:-}" = "1" ]; then
   export COMPOSED_RESTRAINT_ENABLED=true
 fi
 
+if [ "${STRICT_RELATIONSHIP_RETRIEVAL_ONLY:-}" = "1" ]; then
+  shopt -s inherit_errexit
+  export COMPOSED_STRICT_RELATIONSHIP_RETRIEVAL_ENABLED=true
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true
+  export COMPOSED_RESTRAINT_ENABLED=true
+  export COMPOSED_INDEX_ASSISTANT_MESSAGES=true
+fi
+
 cleanup() {
   local status="$?"
   if [ -n "$G2_CONTAINER" ]; then
@@ -5062,17 +5070,19 @@ run_transport_latency_regression() {
 # Completed turns are inspected as historical evidence, never reused as authority.
 strict_information_records() {
   local scope="$1" trace="$2" persona="$3" proposal="$4" operation="$5" valid="$6"
+  local retrieval_at="${7:-}"
   docker compose -f "$COMPOSE" exec -T runtime python - \
-    "$scope" "$trace" "$persona" "$proposal" "$operation" "$valid" <<'PYCODE'
+    "$scope" "$trace" "$persona" "$proposal" "$operation" "$valid" "$retrieval_at" <<'PYCODE'
 import json
 import sqlite3
 import sys
+from datetime import datetime
 
 from models import PersonaContainmentAuthority, PersonaSelectionDecision
 from services.capability_authorization import _CAPABILITY_REGISTRY, _eligible_reason
 
 scope, info = map(json.loads, sys.argv[1:3])
-persona, proposal, operation, valid = sys.argv[3:]
+persona, proposal, operation, valid, retrieval_at = sys.argv[3:]
 with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as conn:
     conn.row_factory = sqlite3.Row
     session = conn.execute(
@@ -5086,7 +5096,7 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
         (scope["runtime_turn_id"],),
     ).fetchone()
     assert turn["runtime_session_id"] == scope["runtime_session_id"], "turn_binding"
-    handled_refusal = info["information_outcome"] == "confirmation_rejected"
+    handled_refusal = info.get("information_outcome") == "confirmation_rejected"
     assert turn["turn_status"] == ("completed" if valid == "true" or handled_refusal else "abandoned")
     rows = conn.execute(
         "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id=? ORDER BY id",
@@ -5098,8 +5108,21 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
     assert started[1]["request_id"] == scope["request_id"], "admitted_request"
     assert len(events("turn_completed")) == 1, "terminal_count"
     for kind in ("action_authority_evaluated", "action_flow_evaluated",
-                 "capability_authorization_evaluated", "confirmation_challenge_evaluated"):
+                 "confirmation_challenge_evaluated"):
         assert not events(kind), "forbidden_action_or_confirmation"
+    exposure = events("capability_authorization_evaluated")
+    if operation == "relationship" and valid == "true":
+        # Ordinary chat may expose its existing read/draft tools. Exposure is
+        # neither execution nor a new strict action-authorization claim.
+        for _, decision in exposure:
+            assert decision["capability_id"] in {
+                "runtime.world_state.read", "runtime.relationship_context.read", "draft.local_message",
+            }
+            assert decision["operation_class"] in {"read", "draft"}
+            assert decision["confirmation_state"] == "not_required"
+            assert decision["challenge_ref"] is None
+    else:
+        assert not exposure, "forbidden_capability_authorization"
     table = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='capability_confirmation_challenges'"
     ).fetchone()
@@ -5125,6 +5148,11 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
             assert getattr(containment, key) == value, "containment_binding"
         assert selection.governance_event_ref == governance[0]["event_id"]
         assert selection.thread_revision == containment.thread_revision == info["thread_revision"]
+        thread = conn.execute(
+            "SELECT revision FROM conversation_runtime_threads WHERE owner_id=? AND conversation_id=?",
+            (scope["owner_id"], scope["conversation_id"]),
+        ).fetchone()
+        assert thread["revision"] == selection.thread_revision + 1, "terminal_revision"
         assert selection.selection_ref == containment.persona_selection_ref == info["selection_ref"]
         assert selection.active_persona_id == containment.result.active_persona_id == persona
         assert containment_payload["active_persona_id"] == info["active_persona_id"] == persona
@@ -5134,6 +5162,11 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
             assert selection.proposal_status == "advisory", "advisory_only"
         assert governance[0]["id"] < selection_row["id"] < containment_row["id"]
         assert containment_row["id"] < events("turn_completed")[0][0]["id"]
+        if retrieval_at:
+            # Same-host service timestamps corroborate ordering, not latency spans.
+            assert datetime.fromisoformat(containment_row["created_at"]) < (
+                datetime.fromisoformat(retrieval_at)
+            ) < datetime.fromisoformat(events("turn_completed")[0][0]["created_at"])
         with sqlite3.connect("file:/data/companion_contracts.sqlite3?mode=ro", uri=True) as contracts:
             binding = contracts.execute(
                 "SELECT default_persona_id FROM surface_bindings WHERE surface_id=?",
@@ -5145,20 +5178,21 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as co
                     "SELECT default_persona_id FROM surface_bindings WHERE surface_id='unknown'"
                 ).fetchone()
             assert binding[0] == persona, "surface_bound_persona"
-        records = [item.record for item in _CAPABILITY_REGISTRY]
-        if operation == "match":
-            records = [r for r in records if r.capability_id == "runtime.world_state.read"]
-            assert len(records) == 1, "registered_fixture"
-        expected = [r.display_name for r in records if _eligible_reason(
-            r, surface=surface, active_persona_id=persona,
-        ) is None]
-        assert info["capability_count"] == len(expected), "registry_ceiling"
+        if operation != "relationship":
+            records = [item.record for item in _CAPABILITY_REGISTRY]
+            if operation == "match":
+                records = [r for r in records if r.capability_id == "runtime.world_state.read"]
+                assert len(records) == 1, "registered_fixture"
+            expected = [r.display_name for r in records if _eligible_reason(
+                r, surface=surface, active_persona_id=persona,
+            ) is None]
+            assert info["capability_count"] == len(expected), "registry_ceiling"
         assert len(events("timing_evaluated")) == 1, "mandatory_timing"
     else:
         assert not events("persona_selection_resolved")
         assert not events("persona_containment_evaluated")
         assert not events("timing_evaluated")
-    print(json.dumps({"examples": expected, "authority_records_verified": True,
+    print(json.dumps({"examples": expected, "exposure_decisions": len(exposure), "authority_records_verified": True,
                       "actions": 0, "challenges": 0, "terminal_events": 1}))
 PYCODE
 }
@@ -5178,6 +5212,7 @@ paths = ["/v1/runtime/identity/resolve", "/v1/runtime/persona-containment/evalua
 text = sys.stdin.read()
 counts = {p: len(re.findall(r"\"POST " + re.escape(p) + r" HTTP/", text)) for p in paths}
 counts["protected_memory_retrieval"] = len(re.findall(r"\"POST /v2/conversations/[^ /]+/retrieve HTTP/", text))
+counts["identity_conflicts"] = len(re.findall(r"\"POST /v1/runtime/identity/resolve HTTP/[^\"]+\" 409", text))
 print(json.dumps(counts))'
 }
 
@@ -5285,6 +5320,7 @@ run_strict_information_case() {
       (if .=="/v1/runtime/identity/resolve" then (if $tag=="confirmation" then 0 else 1 end)
        elif .=="/v1/runtime/persona-containment/evaluate" then (if $valid then 1 else 0 end)
        elif .==("/v1/capabilities/"+$operation) then (if $valid then 1 else 0 end)
+       elif .=="identity_conflicts" then (if $valid or $tag=="confirmation" then 0 else 1 end)
        else 0 end))' >/dev/null
   jq -e '.calls==[]' <<<"$(fetch_provider_calls "$request")" >/dev/null
   test "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND request_id='$request';")" = 1
@@ -5337,8 +5373,278 @@ run_strict_capability_information_scenario() {
   echo "Strict capability information matrix: actual_services=true selection_containment_bound=true advisory_only=true discovery_bounded=true timing_precedence=true confirmation_rejected=true malformed_fail_closed=true fixture_restored=true executors=0 latency_benchmark=false"
 }
 
+# Register real relationship policy and canonical memory through their owners.
+strict_relationship_seed() {
+  local owner="$1" client="$2" memory_conversation="$3" empty="$4" fixture='[]'
+  local kind scope sensitivity mentionability personas label text entity relationship message row
+  if [ "$empty" = true ]; then echo '[]'; return; fi
+  for kind in project operations personal persona restricted suppressed; do
+    scope=project_context sensitivity=medium mentionability=mentionable personas='[]'
+    label="PRIVATE-RELATIONSHIP-$kind" text="PRIVATE-RELATIONSHIP-$kind"
+    case "$kind" in
+      project) label='Permitted project anchor'; text='Allowed relationship note: the project repository is ready.' ;;
+      operations) scope=operations_context; label='OPERATIONS-RELATIONSHIP-NOTE'; text="$label" ;;
+      personal) scope=personal_context ;;
+      persona) personas='["personal_companion"]' ;;
+      restricted) sensitivity=restricted ;;
+      suppressed) mentionability=suppress_by_default ;;
+    esac
+    relationship="rel-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    for entity in "$relationship-subject" "$relationship-object"; do
+      cr_post /v1/relationships/entities/upsert "$(jq -nc --arg owner "$owner" \
+        --arg entity "$entity" --arg entity_label "$label" --arg conversation "$memory_conversation" '{request_id:"fixture-register",
+          owner_id:$owner,conversation_id:$conversation,surface:"dev",entity:{entity_id:$entity,entity_type:"project",
+          canonical_label:$entity_label,domain:"project",source_type:"trusted_config",source_ref:"fixture"}}')" >/dev/null
+    done
+    cr_post /v1/relationships/edges/upsert "$(jq -nc --arg owner "$owner" \
+      --arg relationship "$relationship" --arg scope "$scope" --arg sensitivity "$sensitivity" --arg conversation "$memory_conversation" \
+      --arg mentionability "$mentionability" --argjson personas "$personas" '{
+        request_id:"fixture-register",owner_id:$owner,conversation_id:$conversation,surface:"dev",edge:{
+          relationship_id:$relationship,subject_entity_id:($relationship+"-subject"),
+          object_entity_id:($relationship+"-object"),relationship_type:"uses",
+          relationship_scope:$scope,source_type:"trusted_config",source_refs_json:["fixture"],
+          confidence:0.95,status:"active",sensitivity_level:$sensitivity,
+          mentionability:$mentionability,allowed_persona_scopes_json:$personas}}')" >/dev/null
+    # Every record has the same permitted general domain and medium sensitivity.
+    # Denials below must therefore come from relationship filtering, not this tag.
+    message="$(bms_post "/v1/conversations/$memory_conversation/messages" "$(jq -nc \
+      --arg owner "$owner" --arg client "$client" --arg text "$text" \
+      --arg relationship "$relationship" --arg scope "$scope" '{owner_id:$owner,
+        client_id:$client,role:"assistant",content:$text,policy_metadata:{
+          memory_domains:["general"],sensitivity:"medium",content_class:"document",
+          relationship_ids:[$relationship],relationship_scopes:[$scope]}}')" | jq -er .message_id)"
+    insert_memory_item "$owner" message "$message" active
+    row="$(jq -nc --arg kind "$kind" --arg relationship "$relationship" --arg message "$message" \
+      --arg text "$text" '{kind:$kind,relationship:$relationship,message:$message,text:$text}')"
+    fixture="$(jq -nc --argjson fixture "$fixture" --argjson row "$row" '$fixture+[$row]')"
+  done
+  echo "$fixture"
+}
+
+run_strict_relationship_case() {
+  local tag="$1" surface="$2" persona="$3" proposal="$4" text="$5" empty="${6:-false}" valid="${7:-true}"
+  local owner="strict-rel-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')" client="strict-rel-client"
+  local conversation memory_conversation fixture response request answer trace authority session turn scope
+  local before after work result calls records expected_ids expected_relationships expected_answer bms_record='' response_file pid
+  local advisory_stop=false retrieved=false bms_verified=false
+  conversation="$(create_conversation "$owner" "$client")"
+  # Containment may narrow owner retrieval to this conversation. Seed inside
+  # that existing ceiling rather than weakening it to reach another thread.
+  memory_conversation="$conversation"
+  configure_surface_permission "$owner" "$surface" true true false
+  fixture="$(strict_relationship_seed "$owner" "$client" "$memory_conversation" "$empty")"
+  expected_ids="$(jq -c --arg surface "$surface" '[.[] | select(.kind=="project" or (.kind=="operations" and $surface=="dev")) | .message] | sort' <<<"$fixture")"
+  expected_relationships="$(jq -c --arg surface "$surface" '[.[] | select(.kind=="project" or (.kind=="operations" and $surface=="dev")) | .relationship] | sort' <<<"$fixture")"
+  expected_answer='Allowed relationship note: the project repository is ready.'
+  if [ "$empty" = true ]; then expected_answer='No retained relationship context was found.'; fi
+  provider_post /fixture/reset '{}'
+  provider_post /fixture/next-answer "$(jq -nc --arg answer "$expected_answer" '{answer:$answer}')"
+  if [ "$valid" = true ]; then
+    # Observe BMS's actual committed retrieval diagnostic before CO replaces it
+    # with final trace data. This is an inspection window, never a latency sample.
+    provider_post /fixture/delay-next-primary '{"delay_ms":5000}'
+  fi
+  before="$(strict_information_http_counts)"
+  response_file="$COMPOSED_SMOKE_TMP/relationship-$tag.json"
+  co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg text "$text" '{owner_id:$owner,client_id:$client,
+      conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],
+      sensitivity:"private",retrieval:{k:8,min_score:0,scope:"owner",time_window:"all",retrieval_mode:"balanced"}}')" >"$response_file" &
+  pid=$!
+  if [ "$valid" = true ]; then
+    for _ in $(seq 1 100); do
+      bms_record="$(psql_exec -At -c "SELECT json_build_object('request_id',request_id,'created_at',created_at,'retrieval',retrieval_json) FROM traces WHERE owner_id='$owner' AND conversation_id='$conversation' AND surface='bms-retrieval';")"
+      if [ -n "$bms_record" ]; then break; fi
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.05
+    done
+  fi
+  wait "$pid"
+  response="$(cat "$response_file")"
+  after="$(strict_information_http_counts)"
+  request="$(jq -er .request_id <<<"$response")"
+  answer="$(jq -er .answer <<<"$response")"
+  trace="$(fetch_trace "$request")"
+  authority="$(jq -ce .retrieval.prompt_assembly.turn_state.relationship_authority <<<"$trace")"
+  session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+  turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+  scope="$(jq -nc --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg session "$session" --arg turn "$turn" \
+    '{request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface,
+      runtime_session_id:$session,runtime_turn_id:$turn}')"
+  calls="$(fetch_provider_calls "$request")"
+  jq -nc --arg tag "$tag" --argjson response "$response" --argjson calls "$calls" \
+    --arg expected "$expected_answer" '{check:"relationship_response",case:$tag,status:$response.status,
+      provider_called:($response.selected_model!="not_called"),answer_matches:($response.answer==$expected),
+      provider_calls:($calls.calls|length)}'
+  retrieved="$(jq -nr --argjson before "$before" --argjson after "$after" \
+    '$after.protected_memory_retrieval-$before.protected_memory_retrieval==1')"
+  jq -nc --arg tag "$tag" --argjson before "$before" --argjson after "$after" \
+    '{check:"relationship_http",case:$tag,counts:($after|with_entries(.value-=$before[.key]))}'
+  if [[ "$tag" = technical || "$tag" = supportive ]] && \
+      jq -e '.status=="degraded" and .selected_model=="not_called"' <<<"$response" >/dev/null; then
+    # Advisory classification may truthfully select a stronger server-owned
+    # timing outcome. It must not be weakened merely to exercise a provider.
+    advisory_stop=true
+  fi
+  if [ "$advisory_stop" = true ]; then
+    jq -e '.status=="validated" and .selection_status=="validated"
+      and .containment_status=="validated" and .relationship_status=="validated"
+      and .contextual_activation==false' <<<"$authority" >/dev/null
+    jq -e '.retrieval.prompt_assembly.runtime_timing.result.timing_policy |
+      IN("ask_clarifying_question","pause_or_wait","yield_to_user","close_turn")' <<<"$trace" >/dev/null
+    records="$(strict_information_records "$scope" "$authority" "$persona" "$proposal" relationship true)"
+    jq -e '.calls==[]' <<<"$calls" >/dev/null
+    if [ -n "$bms_record" ]; then
+      jq -e '.retrieval.reason_codes|index("mandatory_containment_applied")!=null' <<<"$bms_record" >/dev/null
+      bms_verified=true
+    fi
+    jq -en --argjson fixture "$fixture" --arg answer "$answer" --argjson trace "$trace" '
+      all($fixture[] | select(.kind!="project"); . as $item |
+        (($answer|contains($item.text))|not) and (($trace|tojson|contains($item.text))|not))' >/dev/null
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    assert_request_persistence_counts "$conversation" "$request" 0
+  elif [ "$valid" = true ]; then
+    jq -e '.status=="ok" and .selected_model!="not_called"' <<<"$response" >/dev/null
+    test "$answer" = "$expected_answer"
+    jq -e '.status=="validated" and .relationship_status=="validated"
+      and .selection_status=="validated" and .containment_status=="validated"
+      and .contextual_activation==false' <<<"$authority" >/dev/null
+    # Captured directly from BMS, not CO. It proves BMS received mandatory policy.
+    test -n "$bms_record"
+    jq -e --arg request "$request" '.request_id==$request
+      and .retrieval.status=="ok" and (.retrieval.reason_codes|index("mandatory_containment_applied"))!=null' <<<"$bms_record" >/dev/null
+    bms_verified=true
+    records="$(strict_information_records "$scope" "$authority" "$persona" "$proposal" relationship true \
+      "$(jq -er .created_at <<<"$bms_record")")"
+    jq -c --argjson ids "$expected_ids" --argjson relationships "$expected_relationships" --arg persona "$persona" '{
+      check:"relationship_consumer",semantic_count:(.retrieval.bundle.semantic|length),expected_count:($ids|length),
+      semantic_equal:(([.retrieval.bundle.semantic[].message_id]|sort)==$ids),
+      persona_equal:(.retrieval.prompt_assembly.runtime_identity.active_persona_id==$persona),
+      strict_contract:(.retrieval.prompt_assembly.relationship_context.selection_contract=="strict_turn"),
+      relationships_equal:((.retrieval.prompt_assembly.relationship_context.relationship_edges_used|sort)==$relationships),
+      projection_equal:((.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_ids|sort)==$relationships),
+      retrieval_issued:.retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued,
+      suppression_reason:.retrieval.prompt_assembly.retrieval_dispatch.suppression_or_dependency_reason,
+      restraint_policy:.retrieval.prompt_assembly.restraint.restraint_policy,
+      result_boundary:.retrieval.prompt_assembly.result_boundary}' <<<"$trace"
+    jq -c '{check:"bms_retrieval",canonical_used:.retrieval.canonical_used,
+      reasons:.retrieval.reason_codes,provenance:.retrieval.provenance_summary,
+      validation:.retrieval.validation}' <<<"$bms_record"
+    jq -e --argjson ids "$expected_ids" --argjson relationships "$expected_relationships" --arg persona "$persona" '
+      ([.retrieval.bundle.semantic[].message_id]|sort)==$ids
+      and .retrieval.prompt_assembly.runtime_identity.active_persona_id==$persona
+      and .retrieval.prompt_assembly.relationship_context.selection_contract=="strict_turn"
+      and .retrieval.prompt_assembly.relationship_context.persona_selection_ref==.retrieval.prompt_assembly.turn_state.relationship_authority.selection_ref
+      and (.retrieval.prompt_assembly.relationship_context.relationship_edges_used|sort)==$relationships
+      and .retrieval.prompt_assembly.retrieval_dispatch.bms_retrieval_call_issued==true
+      and (.retrieval.prompt_assembly.retrieval_dispatch.relationship_scope_projection.relationship_ids|sort)==$relationships
+      and .retrieval.prompt_assembly.retrieval_dispatch.relationship_projection_applied==($relationships|length>0)' <<<"$trace" >/dev/null
+    jq -e --argjson fixture "$fixture" --argjson ids "$expected_ids" '
+      ([.retrieval.bundle.recent[].message_id,.retrieval.bundle.semantic[].message_id]|unique) as $retained |
+      all($fixture[]; . as $item | (($retained|index($item.message))!=null)==(($ids|index($item.message))!=null))
+      and .retrieval.prompt_assembly.result_boundary.input_counts==.retrieval.prompt_assembly.result_boundary.retained_counts
+      and .retrieval.prompt_assembly.result_boundary.omission_counts_by_reason=={}
+      and .retrieval.prompt_assembly.capabilities.executor_call_count==0
+      and .retrieval.prompt_assembly.capabilities.dispatch_completed==false' <<<"$trace" >/dev/null
+    jq -e '.calls|length==1 and all(.[]; .kind=="chat" and .tool_count<=3 and .status=="ok")' <<<"$calls" >/dev/null
+    jq -en --argjson fixture "$fixture" --argjson ids "$expected_ids" --argjson calls "$calls" \
+      --argjson trace "$trace" --arg answer "$answer" '
+      ($calls.calls[0].normalized_messages|map(.content)|join("\n")) as $prompt |
+      all($fixture[]; . as $item | if ($ids|index($item.message)) then ($prompt|contains($item.text))
+        else (($prompt|contains($item.text))|not) and (($answer|contains($item.text))|not)
+          and (($trace|tojson|contains($item.text))|not) end)' >/dev/null
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    assert_request_persistence_counts "$conversation" "$request" 0
+  else
+    jq -e '.status=="failed" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+    test "$answer" = 'Relationship context is unavailable. No action was taken.'
+    jq -e '.status=="failed" and .selection_status=="failed"
+      and .containment_status=="not_requested" and .relationship_status=="not_requested"
+      and .runtime_completion=="succeeded"' <<<"$authority" >/dev/null
+    records="$(strict_information_records "$scope" "$authority" "$persona" any relationship false)"
+    jq -e '.calls==[]' <<<"$calls" >/dev/null
+    test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation' AND role='assistant';")" = 0
+    test "$(psql_exec -At -c "SELECT count(*) FROM traces WHERE conversation_id='$conversation' AND request_id='$request';")" = 1
+  fi
+  # Actual HTTP counts prove no second selection, legacy retry or action path.
+  jq -en --argjson before "$before" --argjson after "$after" --argjson valid "$valid" \
+    --argjson both "${COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED:-false}" \
+    --argjson advisory_stop "$advisory_stop" --argjson retrieved "$retrieved" \
+    --argjson exposures "$(jq .exposure_decisions <<<"$records")" '
+    ($after["/v1/runtime/identity/resolve"]-$before["/v1/runtime/identity/resolve"])==1
+    and ($after.identity_conflicts-$before.identity_conflicts)==(if $valid then 0 else 1 end)
+    and ($after["/v1/runtime/persona-containment/evaluate"]-$before["/v1/runtime/persona-containment/evaluate"])==(if $valid then 1 else 0 end)
+    and ($after["/v1/relationships/select"]-$before["/v1/relationships/select"])==(if $valid then 1 else 0 end)
+    and ($after.protected_memory_retrieval-$before.protected_memory_retrieval)==(if $retrieved then 1 else 0 end)
+    and ($after["/v1/capabilities/match"]-$before["/v1/capabilities/match"])==(if $valid and $both then 1 else 0 end)
+    and ($after["/v1/capabilities/authorize"]-$before["/v1/capabilities/authorize"])==$exposures
+    and (if $advisory_stop then ($after["/v1/world-state/resolve"]-$before["/v1/world-state/resolve"]|IN(0,1))
+      else ($after["/v1/world-state/resolve"]-$before["/v1/world-state/resolve"])==(if $valid then 1 else 0 end) end)
+    and all(["/v1/capabilities/authority","/v1/capabilities/flow","/v1/capabilities/confirm"][]; $after[.] == $before[.])
+    and (if $valid then true else all(["/v1/profiles/resolve","/v1/internal/recall/select",
+      "/v1/internal/episodes/retrieve","/v1/internal/immediate-history/resolve"][]; $after[.] == $before[.]) end)' >/dev/null
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND request_id='$request';")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  assert_public_work "$result" "$work" "$conversation" "$request"
+  if [ "$valid" = true ]; then
+    jq -e --arg answer "$answer" '.state=="completed" and .result.answer==$answer' <<<"$result" >/dev/null
+    assert_exact_canonical_result "$result"
+  else
+    jq -e '.state=="failed" and .result==null and .failure_code=="dependency_unavailable"' <<<"$result" >/dev/null
+  fi
+  jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  echo "Strict relationship $tag: authority_records_verified=true eligible_scope_only=true bms_policy_verified=$bms_verified timing_stop=$advisory_stop providers=$(jq '.calls|length' <<<"$calls") actions=0 challenges=0 no_downgrade=true work=$(jq -r .state <<<"$result") idle=true"
+}
+
+run_strict_relationship_scenario() {
+  run_strict_relationship_case authorized dev technical_architect any 'What do you remember about this project?'
+  run_strict_relationship_case web web general_assistant any 'What do you remember about this project?'
+  run_strict_relationship_case unknown unregistered_surface general_assistant any 'What do you remember about this project?'
+  run_strict_relationship_case empty dev technical_architect any 'What do you remember about this project?' true
+  run_strict_relationship_case technical web general_assistant technical_architect 'This server keeps failing!! What do you remember about this project?'
+  run_strict_relationship_case supportive dev technical_architect personal_companion 'What do you remember about this project? I got this wrong.'
+  (
+    original="$(strict_information_binding_fixture corrupt)"
+    trap 'strict_information_binding_fixture restore "$original" >/dev/null' EXIT
+    run_strict_relationship_case malformed dev technical_architect any 'What do you remember about this project?' true false
+  )
+  export COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED=true COMPOSED_CAPABILITY_REGISTRY_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_strict_relationship_case both dev technical_architect any 'What do you remember about this project?'
+  run_strict_information_case dev_match dev technical_architect any match 'What does read runtime world state do?'
+  run_strict_information_case confirmation dev technical_architect any match 'What does read runtime world state do?' false
+  # Exercise the ordinary default-disabled policy after the focused opt-in.
+  export COMPOSED_STRICT_RELATIONSHIP_RETRIEVAL_ENABLED=false COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED=false
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED=false COMPOSED_PERSONA_CONTAINMENT_ENABLED=false COMPOSED_RESTRAINT_ENABLED=false
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  local owner="strict-rel-legacy" conversation response request trace diagnostics
+  conversation="$(create_conversation "$owner" legacy-client)"
+  configure_surface_permission "$owner" dev true true false
+  provider_post /fixture/reset '{}'
+  response="$(co_post "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '{owner_id:$owner,
+    conversation_id:$conversation,surface:"dev",messages:[{role:"user",content:"What does this function do?"}]}')")"
+  jq -e '.status=="ok"' <<<"$response" >/dev/null
+  request="$(jq -er .request_id <<<"$response")"
+  trace="$(fetch_trace "$request")"
+  jq -e '.retrieval.prompt_assembly.turn_state.relationship_authority==null' <<<"$trace" >/dev/null
+  diagnostics="$(fetch_runtime_diagnostics "$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")")"
+  jq -e '[.events[]|select(.event_type=="persona_selection_resolved")]|length==0' <<<"$diagnostics" >/dev/null
+  assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .answer <<<"$response")"
+  echo 'Strict relationship matrix: actual_services=true authority_ordered=true scope_restricted=true empty_valid=true advisory_only=true malformed_fail_closed=true fixture_restored=true both_gates=true refusal_durable=true default_legacy=true actions=0 contextual_activation=false latency_benchmark=false'
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+
+if [ "${STRICT_RELATIONSHIP_RETRIEVAL_ONLY:-}" = "1" ]; then
+  set -E
+  trap 'echo "Strict relationship assertion failed: line=$LINENO" >&2' ERR
+  run_strict_relationship_scenario
+  exit 0
+fi
 
 if [ "${STRICT_CAPABILITY_INFORMATION_ONLY:-}" = "1" ]; then
   set -E

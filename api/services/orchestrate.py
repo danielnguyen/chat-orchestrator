@@ -36,6 +36,7 @@ from clients.runtime import (
     validate_strict_capability_response,
     validate_strict_containment_response,
     validate_strict_identity_response,
+    validate_strict_relationship_response,
     validate_timing_request,
     validate_timing_response,
 )
@@ -5509,6 +5510,11 @@ async def _resolve_runtime_identity(
             "error_type": "malformed_identity_payload",
             "omission_reason": "malformed_runtime_identity_response",
         }
+    return _runtime_identity_result(response)
+
+
+def _runtime_identity_result(response):
+    identity, trace = response["runtime_identity"], response.get("trace") or {}
     return identity, {
         "attempted": True,
         "status": "included",
@@ -5781,6 +5787,7 @@ async def _resolve_relationship_context(
     surface: str,
     runtime_session_id: str | None,
     active_persona_id: str | None,
+    strict_scope: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if runtime is None:
         return None, {
@@ -5798,6 +5805,10 @@ async def _resolve_relationship_context(
             surface=surface,
             runtime_session_id=runtime_session_id,
             active_persona_id=active_persona_id,
+            **({key: strict_scope[key] for key in (
+                "persona_selection_mode", "persona_selection_ref", "runtime_turn_id",
+                "expected_thread_revision",
+            )} if strict_scope is not None else {}),
         )
     except Exception as e:
         return None, {
@@ -5815,6 +5826,8 @@ async def _resolve_relationship_context(
             "error_type": type(response).__name__,
             "omission_reason": "malformed_relationship_context_response",
         }
+    if strict_scope is not None:
+        validate_strict_relationship_response(response, scope=strict_scope)
     trace = response.get("trace")
     selected_relationships = response.get("selected_relationships")
     prompt_content = response.get("prompt_content")
@@ -5829,6 +5842,9 @@ async def _resolve_relationship_context(
         }
     base_trace = {
         "attempted": True,
+        **({"selection_contract": "strict_turn",
+            "persona_selection_ref": strict_scope["persona_selection_ref"]}
+           if strict_scope is not None else {}),
         "selected_relationship_count": trace.get("selected_relationship_count", 0),
         "excluded_relationship_count": trace.get("excluded_relationship_count", 0),
         "relationship_edges_used": trace.get("relationship_edges_used", []),
@@ -5887,6 +5903,7 @@ async def _resolve_mandatory_retrieval_policy(
     surface: str,
     runtime_session_id: str | None,
     persona_containment: dict[str, Any] | None,
+    strict_scope: dict[str, Any] | None = None,
 ) -> MandatoryRetrievalPolicy:
     base_policy, validation_trace = _validate_persona_containment_policy(persona_containment)
     if base_policy is None:
@@ -5914,6 +5931,7 @@ async def _resolve_mandatory_retrieval_policy(
         surface=surface,
         runtime_session_id=runtime_session_id,
         active_persona_id=persona_containment.get("active_persona_id"),
+        **({"strict_scope": strict_scope} if strict_scope is not None else {}),
     )
     projection_raw = relationship_trace.get("retrieval_scope_projection_raw")
     if projection_raw is None and isinstance(relationship_trace, dict):
@@ -8864,6 +8882,83 @@ class _SynchronousWork:
             logging.getLogger(__name__).warning("durable_work_failure_unconfirmed")
 
 
+async def _prepare_strict_persona_context(*, runtime, scope, text, recent_messages,
+                                          governance, trace, context):
+    trace["selection_status"] = "requested"
+    response = context.get("identity_response")
+    if response is None:
+        response = await runtime.resolve_identity(**scope, persona_selection_mode="strict")
+    selection = deepcopy(validate_strict_identity_response(response, scope=scope))
+    trace.update(
+        selection_status="validated", selection_ref=selection["selection_ref"],
+        active_persona_id=selection["active_persona_id"],
+        thread_revision=selection["thread_revision"], proposal_status=selection["proposal_status"],
+        contextual_activation=False,
+    )
+    bound = {
+        **scope, "expected_thread_revision": selection["thread_revision"],
+        "persona_selection_mode": "strict", "persona_selection_ref": selection["selection_ref"],
+        "active_persona_id": selection["active_persona_id"],
+    }
+    trace["containment_status"] = "requested"
+    containment_response = context.get("containment_response")
+    if containment_response is None:
+        containment_response = await runtime.evaluate_persona_containment(
+            **bound, current_user_text=text, recent_messages=recent_messages,
+            interaction_kind=governance["interaction_kind"],
+        )
+    containment = validate_strict_containment_response(
+        containment_response, scope=bound, selection=selection,
+    )
+    trace["containment_status"] = "validated"
+    context.update(identity_response=deepcopy(response),
+                   containment_response=deepcopy(containment_response))
+    return selection, containment, bound
+
+
+async def _finish_strict_relationship_failure(
+    *, payload, request_id, conversation_id, memory_store, runtime, work,
+    turn_state_trace, runtime_session_trace, user_message, user_message_id, scope, trace, started,
+):
+    """A genuine authority failure never publishes a canonical assistant result."""
+    work.failure_code = "dependency_unavailable"
+    if user_message is not None:
+        persisted = await _append_current_user_message(
+            memory_store=memory_store, request_id=request_id, message_id=user_message_id,
+            conversation_id=conversation_id, owner_id=payload["owner_id"],
+            client_id=payload.get("client_id"), content=user_message["content"],
+            surface=scope["surface"], policy_metadata=None,
+        )
+        trace["user_persistence"] = "succeeded" if persisted else "failed"
+    turn_state_trace["terminal_transition_attempted"] = True
+    await _complete_runtime_turn(
+        runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
+        turn_status="abandoned", expected_scope=scope,
+    )
+    trace["runtime_completion"] = (
+        "succeeded" if turn_state_trace.get("completed") else "unconfirmed"
+    )
+    try:
+        await memory_store.create_trace(
+            request_id=request_id,
+            payload=_server_owned_response_trace_payload(
+                request_id=request_id, conversation_id=conversation_id, payload=payload,
+                profile=None, started=started, status="failed",
+                response_source="relationship_authority",
+                prompt_trace={"status": "not_requested", "layers": [], "message_count": 0,
+                              "runtime_session": runtime_session_trace,
+                              "turn_state": turn_state_trace},
+            ),
+        )
+    except Exception:
+        logging.getLogger(__name__).warning("relationship_failure_trace_unconfirmed")
+    return {
+        "request_id": request_id, "conversation_id": conversation_id, "profile_name": "unresolved",
+        "selected_model": "not_called", "status": "failed", "sources": [],
+        "answer": "Relationship context is unavailable. No action was taken.",
+    }
+
+
 async def _resolve_strict_capability_information(
     *,
     runtime,
@@ -8874,6 +8969,7 @@ async def _resolve_strict_capability_information(
     governance_trace,
     confirmation,
     dependencies_ready=True,
+    persona_context=None,
 ):
     trace = {
         "mode": "strict",
@@ -8919,35 +9015,11 @@ async def _resolve_strict_capability_information(
             "Capability information is unavailable. No action was taken.",
         )
     try:
-        trace["selection_status"] = "requested"
-        response = await runtime.resolve_identity(**scope, persona_selection_mode="strict")
-        selection = deepcopy(validate_strict_identity_response(response, scope=scope))
-        trace.update(
-            selection_status="validated",
-            selection_ref=selection["selection_ref"],
-            active_persona_id=selection["active_persona_id"],
-            thread_revision=selection["thread_revision"],
-            proposal_status=selection["proposal_status"],
-            contextual_activation=False,
+        selection, containment, bound = await _prepare_strict_persona_context(
+            runtime=runtime, scope=scope, text=text, recent_messages=recent_messages,
+            governance=governance, trace=trace,
+            context=persona_context if persona_context is not None else {},
         )
-        bound = {
-            **scope,
-            "expected_thread_revision": selection["thread_revision"],
-            "persona_selection_mode": "strict",
-            "persona_selection_ref": selection["selection_ref"],
-            "active_persona_id": selection["active_persona_id"],
-        }
-        trace["containment_status"] = "requested"
-        response = await runtime.evaluate_persona_containment(
-            **bound,
-            current_user_text=text,
-            recent_messages=recent_messages,
-            interaction_kind=governance["interaction_kind"],
-        )
-        containment = validate_strict_containment_response(
-            response, scope=bound, selection=selection
-        )
-        trace["containment_status"] = "validated"
         discovery = _capability_discovery_requested(text)
         trace["operation"] = "discovery" if discovery else "match"
         response = (
@@ -9341,6 +9413,7 @@ async def orchestrate_chat(
     privacy_context_enabled: bool = False,
     capability_registry_enabled: bool = False,
     strict_capability_information_enabled: bool = False,
+    strict_relationship_retrieval_enabled: bool = False,
     claim_record_capture_enabled: bool = False,
     evidence_acquisition_enabled: bool = False,
     general_evidence_reasoning_enabled: bool | None = None,
@@ -9828,8 +9901,12 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
-            strict_turn_binding=strict_capability_information_enabled,
+            strict_turn_binding=(strict_capability_information_enabled
+                                 or strict_relationship_retrieval_enabled),
         )
+        strict_persona_context = {}
+        strict_relationship_scope = None
+        relationship_authority_trace = None
         if strict_capability_information_enabled:
             scope = {
                 "request_id": request_id,
@@ -9852,6 +9929,9 @@ async def orchestrate_chat(
                 governance=interaction_governance,
                 governance_trace=interaction_governance_trace,
                 confirmation=payload.get("capability_confirmation") is not None,
+                persona_context=(
+                    strict_persona_context if strict_relationship_retrieval_enabled else None
+                ),
                 dependencies_ready=bool(runtime is not None and all((
                     interaction_governance_enabled, persona_containment_enabled,
                     capability_registry_enabled, restraint_enabled,
@@ -9889,7 +9969,7 @@ async def orchestrate_chat(
                 "retrieval_scope_status": "not_enforced",
                 "protected_consumer_authority": "legacy_unbound",
             }
-        else:
+        elif not strict_relationship_retrieval_enabled:
             persona_containment, persona_containment_trace = await _resolve_persona_containment(
                 runtime=runtime,
                 enabled=persona_containment_enabled,
@@ -9913,7 +9993,72 @@ async def orchestrate_chat(
                 recent_messages=recent_messages,
                 surface_metadata_json=surface_metadata_json,
             )
-        if persona_containment_enabled:
+        if strict_relationship_retrieval_enabled:
+            scope = {
+                "request_id": request_id, "owner_id": payload["owner_id"],
+                "conversation_id": conversation_id, "surface": surface,
+                "runtime_session_id": runtime_session_trace.get("runtime_session_id"),
+                "runtime_turn_id": turn_state_trace.get("runtime_turn_id"),
+            }
+            relationship_authority_trace = {
+                "mode": "strict", "status": "failed", "selection_status": "not_requested",
+                "containment_status": "not_requested", "relationship_status": "not_requested",
+                "reason_code": "governance_unavailable",
+            }
+            turn_state_trace["relationship_authority"] = relationship_authority_trace
+            try:
+                if (runtime is None or not interaction_governance_enabled
+                        or not persona_containment_enabled or interaction_governance is None
+                        or interaction_governance_trace.get("included") is not True):
+                    raise RuntimeError("strict_relationship_governance_unavailable")
+                selection, persona_containment, strict_relationship_scope = (
+                    await _prepare_strict_persona_context(
+                        runtime=runtime, scope=scope, text=last_user_text,
+                        recent_messages=recent_messages,
+                        governance=interaction_governance, trace=relationship_authority_trace,
+                        context=strict_persona_context,
+                    )
+                )
+                persona_containment_trace = {
+                    "attempted": True, "status": "included", "included": True,
+                    "selection_contract": "strict_turn",
+                    "protected_consumer_authority": "relationship_only",
+                    "retrieval_scope_status": "not_enforced",
+                }
+                relationship_authority_trace["relationship_status"] = "requested"
+                mandatory_policy = await _resolve_mandatory_retrieval_policy(
+                    runtime=runtime, request_id=request_id, owner_id=payload["owner_id"],
+                    conversation_id=conversation_id, surface=surface,
+                    runtime_session_id=scope["runtime_session_id"],
+                    persona_containment=persona_containment,
+                    strict_scope=strict_relationship_scope,
+                )
+                if mandatory_policy.containment_policy is None:
+                    raise RuntimeError("strict_relationship_policy_invalid")
+                persona_containment_trace.update(mandatory_policy.validation_trace)
+                relationship_authority_trace.update(
+                    status="validated", relationship_status="validated",
+                    reason_code="authority_validated",
+                )
+            except Exception:
+                relationship_authority_trace["reason_code"] = (
+                    "governance_unavailable"
+                    if relationship_authority_trace["selection_status"] == "not_requested"
+                    else "mandatory_authority_unavailable"
+                )
+                for key in ("selection_status", "containment_status", "relationship_status"):
+                    if relationship_authority_trace[key] == "requested":
+                        relationship_authority_trace[key] = "failed"
+                return await _finish_strict_relationship_failure(
+                    payload=payload, request_id=request_id, conversation_id=conversation_id,
+                    memory_store=memory_store, runtime=runtime, work=work,
+                    turn_state_trace=turn_state_trace,
+                    runtime_session_trace=runtime_session_trace, user_message=current_user_message,
+                    user_message_id=current_user_message_id, scope=scope,
+                    trace=relationship_authority_trace,
+                    started=started,
+                )
+        elif persona_containment_enabled:
             mandatory_policy = await _resolve_mandatory_retrieval_policy(
                 runtime=runtime,
                 request_id=request_id,
@@ -11209,14 +11354,20 @@ async def orchestrate_chat(
                             intervention_text, failed=False, response_source="interrupt_policy",
                         )
             interrupt_trace["selection_reason"] = selection_reason
-        runtime_identity, runtime_identity_trace = await _resolve_runtime_identity(
-            runtime=runtime,
-            request_id=request_id,
-            owner_id=payload["owner_id"],
-            conversation_id=conversation_id,
-            surface=surface,
-            runtime_session_id=runtime_session_trace.get("runtime_session_id"),
-        )
+        if strict_relationship_retrieval_enabled:
+            # Carry the same validated CR response; never resolve a replacement persona.
+            runtime_identity, runtime_identity_trace = _runtime_identity_result(
+                strict_persona_context["identity_response"],
+            )
+        else:
+            runtime_identity, runtime_identity_trace = await _resolve_runtime_identity(
+                runtime=runtime,
+                request_id=request_id,
+                owner_id=payload["owner_id"],
+                conversation_id=conversation_id,
+                surface=surface,
+                runtime_session_id=runtime_session_trace.get("runtime_session_id"),
+            )
         world_state, world_state_trace = await _resolve_world_state(
             runtime=runtime,
             request_id=request_id,
@@ -11227,6 +11378,15 @@ async def orchestrate_chat(
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
         )
         world_state_claim_refs = world_state_trace.pop("world_state_claim_refs", [])
+        if strict_relationship_retrieval_enabled and world_state_trace.get("active_persona_id") != (
+            strict_relationship_scope["active_persona_id"]
+        ):
+            # This remains an optional legacy consumer, never strict world-state authority.
+            world_state, world_state_claim_refs = None, []
+            world_state_trace = {
+                "attempted": world_state_trace.get("attempted", False), "status": "failed",
+                "included": False, "omission_reason": "world_state_persona_unverified",
+            }
         if persona_containment_enabled:
             relationship_context = mandatory_policy.relationship_context
             relationship_context_trace = mandatory_policy.relationship_trace

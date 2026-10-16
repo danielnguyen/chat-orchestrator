@@ -41051,3 +41051,330 @@ async def test_strict_information_durable_order_before_work_completion(tmp_path)
         )
     ]
     assert order == sorted(order) and len(set(order)) == len(order)
+
+
+class StrictRelationshipRuntime(StrictInformationRuntime):
+    def __init__(self, *, empty=False, relationship_error=None, relationship_mutation=None,
+                 barrier=None, **kwargs):
+        kwargs.setdefault("restraint_response", _allowed_restraint_response())
+        super().__init__(reason="no_registered_capability", **kwargs)
+        self.empty = empty
+        self.relationship_error = relationship_error
+        self.relationship_mutation = relationship_mutation
+        self.barrier = barrier
+        self.relationship_records = []
+
+    async def resolve_identity(self, **kwargs):
+        assert kwargs.get("persona_selection_mode") == "strict", "no replacement legacy identity"
+        return await super().resolve_identity(**kwargs)
+
+    async def relationship_select(self, **kwargs):
+        from test_runtime_client import _strict_relationship_fixture
+
+        assert self.selection_committed and self.containment_committed
+        selection = self.strict_identity["persona_selection"]
+        assert {key: kwargs[key] for key in self.strict_scope} == self.strict_scope
+        assert kwargs["persona_selection_mode"] == "strict"
+        assert kwargs["persona_selection_ref"] == selection["selection_ref"]
+        assert kwargs["expected_thread_revision"] == selection["thread_revision"]
+        assert kwargs["active_persona_id"] == selection["active_persona_id"]
+        self.relationship_calls.append(kwargs)
+        self.call_order.append("strict_relationship")
+        if self.relationship_error:
+            raise self.relationship_error
+        response = _strict_relationship_fixture(self.strict_identity, empty=self.empty)
+        if self.relationship_mutation:
+            target = response
+            field, value = self.relationship_mutation
+            for key in field[:-1]:
+                target = target[key]
+            target[field[-1]] = value
+        self.relationship_records.append(copy.deepcopy(response))
+        if self.barrier:
+            entered, release = self.barrier
+            entered.set()
+            await release.wait()
+        return response
+
+    async def world_state_resolve(self, **kwargs):
+        assert kwargs["active_persona_id"] == self.selected_persona
+        return await super().world_state_resolve(**kwargs)
+
+
+class RelationshipPolicyMemory(FakeMemoryStore):
+    def __init__(self, runtime):
+        super().__init__()
+        self.runtime = runtime
+
+    async def retrieve_bundle(self, **kwargs):
+        assert self.runtime.relationship_records
+        policy = kwargs["containment_policy"]
+        expected = self.runtime.relationship_records[-1]["retrieval_scope_projection"]
+        assert policy["relationship_scope_projection"] == expected
+        self.runtime.call_order.append("contained_retrieval")
+        return await super().retrieve_bundle(**kwargs)
+
+
+async def _run_relationship_turn(tmp_path, *, runtime=None, memory=None, payload=None, **options):
+    runtime = runtime or StrictRelationshipRuntime()
+    return await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory or RelationshipPolicyMemory(runtime),
+        payload=payload or _base_payload(
+            conversation_id="conv-1", surface="dev",
+            messages=[{"role": "user", "content": "What do we know about this project?"}],
+        ),
+        persona_containment_enabled=True, strict_relationship_retrieval_enabled=True,
+        **options,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("both", [False, True])
+async def test_strict_relationship_sequence_and_shared_information_authority(tmp_path, empty, both):
+    runtime = StrictRelationshipRuntime(empty=empty)
+    out, runtime, provider, memory = await _run_relationship_turn(
+        tmp_path, runtime=runtime, strict_capability_information_enabled=both,
+        capability_registry_enabled=both,
+    )
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    order = [runtime.call_order.index(key) for key in (
+        "start_turn", "interaction_governance", "strict_selection", "strict_containment",
+        "strict_relationship", "contained_retrieval", "answer_generation", "assistant_persistence",
+        "complete_turn:completed",
+    )]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    assert len(runtime.identity_calls) == len(runtime.persona_containment_calls) == 1
+    assert len(runtime.relationship_calls) == len(memory.retrieve_calls) == 1
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    info = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    authority = info["turn_state"]["relationship_authority"]
+    assert authority["status"] == authority["relationship_status"] == "validated"
+    assert authority["active_persona_id"] == info["runtime_identity"]["active_persona_id"]
+    selection = runtime.strict_identity["persona_selection"]
+    request = runtime.relationship_calls[0]
+    for key in runtime.strict_scope:
+        assert request[key] == selection[key]
+    assert request["expected_thread_revision"] == selection["thread_revision"]
+    assert authority["selection_ref"] == request["persona_selection_ref"]
+    assert memory.work["state"] == "completed"
+    assert memory.added_messages[-1]["content"] == out["answer"]
+    assert info["relationship_context"]["selection_contract"] == "strict_turn"
+    projection = memory.retrieve_calls[0]["containment_policy"]["relationship_scope_projection"]
+    assert projection["applied"] is not empty
+
+
+@pytest.mark.asyncio
+async def test_strict_relationship_await_barrier_prevents_early_retrieval(tmp_path):
+    import asyncio
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    runtime = StrictRelationshipRuntime(barrier=(entered, release))
+    memory = RelationshipPolicyMemory(runtime)
+    provider = FakeLiteLLM()
+    task = asyncio.create_task(_run_relationship_turn(
+        tmp_path, runtime=runtime, memory=memory, provider=provider,
+    ))
+    try:
+        await entered.wait()
+        assert memory.retrieve_calls == provider.calls == []
+        assert runtime.turn_complete_calls == []
+        release.set()
+        out, _, _, _ = await task
+        assert out["status"] == "ok" and len(memory.retrieve_calls) == 1
+    finally:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proposal", ["technical_architect", "personal_companion"])
+async def test_strict_relationship_advisory_and_caller_persona_do_not_replace_authority(
+    tmp_path, proposal,
+):
+    runtime = StrictRelationshipRuntime(proposal=proposal)
+    payload = _base_payload(conversation_id="conv-1", surface="dev",
+                            active_persona_id="home_operator", requested_persona_id="home_operator")
+    out, runtime, _, memory = await _run_relationship_turn(
+        tmp_path, runtime=runtime, payload=payload,
+    )
+    assert out["status"] == "ok"
+    assert runtime.relationship_calls[0]["active_persona_id"] == "technical_architect"
+    assert runtime.world_state_calls[0]["active_persona_id"] == "technical_architect"
+    assert len(runtime.identity_calls) == 1
+    assert memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["runtime_identity"][
+        "active_persona_id"
+    ] == "technical_architect"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage,field", [
+    (stage, key) for stage in ("identity", "containment")
+    for key in ("request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                "runtime_turn_id", "active_persona_id", "selection_ref", "thread_revision")
+])
+async def test_strict_relationship_binding_failure_prevents_all_consumers(tmp_path, stage, field):
+    mutation = (stage, ("persona_selection", field), 99 if field == "thread_revision" else "wrong")
+    runtime = StrictRelationshipRuntime(mutation=mutation)
+    out, runtime, provider, memory = await _run_relationship_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "failed" and out["selected_model"] == "not_called"
+    assert memory.retrieve_calls == memory.profile_calls == provider.calls == []
+    assert runtime.world_state_calls == runtime.relationship_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert memory.work["state"] == "failed"
+    assert all(item["role"] == "user" for item in memory.added_messages)
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == "abandoned"
+    _assert_bms_trace_create_shape(memory.trace_calls[0]["payload"])
+    assert "wrong" not in json.dumps(out)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["governance", "identity", "containment", "relationship"])
+@pytest.mark.parametrize("kind", ["timeout", "conflict", "malformed"])
+async def test_strict_relationship_dependency_failure_has_no_legacy_escape(tmp_path, stage, kind):
+    runtime = StrictRelationshipRuntime()
+    if kind == "malformed":
+        if stage == "relationship":
+            runtime.relationship_mutation = (("selection_contract",), "legacy_unbound")
+        else:
+            runtime.mutation = (stage, ("result",) if stage == "governance"
+                                else ("selection_contract",), None)
+    else:
+        error = httpx.ReadTimeout("PRIVATE-ERROR") if kind == "timeout" else _http_status_error(409)
+        if stage == "relationship":
+            runtime.relationship_error = error
+        else:
+            runtime.information_failure = (stage, error)
+    out, runtime, provider, memory = await _run_relationship_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "failed" and memory.work["state"] == "failed"
+    assert memory.retrieve_calls == memory.profile_calls == provider.calls == []
+    assert runtime.world_state_calls == []
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert len(runtime.identity_calls) <= 1 and len(runtime.relationship_calls) <= 1
+    assert "PRIVATE-" not in json.dumps(memory.trace_calls + [out])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    (("persona_selection_ref",), "psel_" + "0" * 32),
+    (("trace", "active_persona_id"), "home_operator"),
+    (("retrieval_scope_projection", "relationship_ids"), ["PRIVATE-RELATIONSHIP"]),
+    (("retrieval_scope_projection", "applied"), False),
+    (("trace", "selected_relationship_count"), True),
+])
+async def test_strict_relationship_invalid_projection_never_reaches_retrieval(
+    tmp_path, field, value,
+):
+    runtime = StrictRelationshipRuntime(relationship_mutation=(field, value))
+    out, runtime, provider, memory = await _run_relationship_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "failed"
+    assert memory.retrieve_calls == provider.calls == []
+    assert len(runtime.relationship_calls) == 1
+    assert "PRIVATE-" not in json.dumps(memory.trace_calls + [out])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation", [False, True])
+async def test_strict_relationship_gate_preserves_information_early_returns(tmp_path, confirmation):
+    runtime = StrictRelationshipRuntime()
+    runtime.information_reason = "matched"
+    payload = _base_payload(conversation_id="conv-1", surface="dev")
+    if confirmation:
+        payload["capability_confirmation"] = {"confirmed": True, "challenge_ref": "unissued"}
+    out, runtime, provider, memory = await _run_relationship_turn(
+        tmp_path, runtime=runtime, payload=payload, strict_capability_information_enabled=True,
+        capability_registry_enabled=True,
+    )
+    _assert_information_barriers(out, runtime, provider, memory)
+    assert memory.work["state"] == "completed"
+    assert runtime.relationship_calls == memory.retrieve_calls == []
+    assert len(runtime.identity_calls) == (0 if confirmation else 1)
+    assert len(runtime.persona_containment_calls) == (0 if confirmation else 1)
+
+
+@pytest.mark.asyncio
+async def test_relationship_rollout_disabled_keeps_legacy_flow(tmp_path):
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, persona_containment_enabled=True, strict_relationship_retrieval_enabled=False,
+    )
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert "relationship_authority" not in memory.trace_calls[0]["payload"]["retrieval"][
+        "prompt_assembly"
+    ]["turn_state"]
+    assert all("persona_selection_mode" not in call for call in runtime.relationship_calls)
+
+
+@pytest.mark.parametrize("missing", ["runtime", "governance", "containment"])
+def test_strict_relationship_setting_requires_its_dependencies(missing):
+    from pydantic import ValidationError
+    from settings import Settings
+
+    values = dict(ORCH_API_KEY="key", MEMORY_STORE_BASE_URL="http://memory",
+                  MEMORY_STORE_API_KEY="key", LITELLM_BASE_URL="http://provider",
+                  COGNITIVE_RUNTIME_BASE_URL="http://runtime",
+                  COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=True,
+                  COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=True,
+                  STRICT_RELATIONSHIP_RETRIEVAL_ENABLED=True)
+    field = {"runtime": "COGNITIVE_RUNTIME_BASE_URL",
+             "governance": "COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED",
+             "containment": "COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED"}[missing]
+    values[field] = None if missing == "runtime" else False
+    with pytest.raises(ValidationError, match="strict relationship retrieval requires"):
+        Settings(_env_file=None, **values)
+
+
+@pytest.mark.asyncio
+async def test_strict_relationship_ignores_different_legacy_world_persona(tmp_path):
+    runtime = StrictRelationshipRuntime()
+    runtime.world_state_response = copy.deepcopy(runtime.world_state_response)
+    runtime.world_state_response["trace"]["active_persona_id"] = "home_operator"
+    runtime.world_state_response["prompt_content"] = "PRIVATE-OTHER-PERSONA"
+    out, runtime, provider, memory = await _run_relationship_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "ok" and len(runtime.identity_calls) == 1
+    assert runtime.world_state_calls[0]["active_persona_id"] == "technical_architect"
+    assert "persona_selection_mode" not in runtime.world_state_calls[0]  # No strict migration.
+    assert "PRIVATE-" not in json.dumps(provider.calls + memory.trace_calls + [out])
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["runtime_identity"]["active_persona_id"] == "technical_architect"
+    assert trace["world_state"]["included"] is False
+    assert trace["world_state"]["omission_reason"] == "world_state_persona_unverified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_relationship_gate_only_uses_server_setting(monkeypatch, enabled):
+    import main
+    from fastapi.testclient import TestClient
+    from models import ChatRequest
+    from settings import Settings
+
+    defaults = Settings(_env_file=None, ORCH_API_KEY="key", MEMORY_STORE_BASE_URL="http://memory",
+                        MEMORY_STORE_API_KEY="key", LITELLM_BASE_URL="http://provider")
+    assert defaults.strict_relationship_retrieval_enabled is False
+    payload = {"owner_id": "owner", "surface": "web",
+               "messages": [{"role": "user", "content": "hello"}],
+               "strict_relationship_retrieval_enabled": not enabled}
+    assert "strict_relationship_retrieval_enabled" not in ChatRequest(**payload).model_dump()
+    calls = []
+
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        return {"request_id": kwargs["request_id"], "conversation_id": "conv-1",
+                "profile_name": "unresolved", "selected_model": "not_called", "answer": "hello",
+                "status": "ok", "sources": []}
+
+    monkeypatch.setattr(main, "orchestrate_chat", fake)
+    monkeypatch.setattr(main, "settings", main.settings.model_copy(
+        update={"strict_relationship_retrieval_enabled": enabled},
+    ))
+    response = TestClient(main.app).post(
+        "/v1/chat", headers={"X-API-Key": main.settings.orch_api_key}, json=payload,
+    )
+    assert response.status_code == 200
+    assert calls[0]["strict_relationship_retrieval_enabled"] is enabled
+    assert "strict_relationship_retrieval_enabled" not in calls[0]["payload"]
