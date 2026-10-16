@@ -40475,6 +40475,50 @@ class InformationOnlyMemory(FakeMemoryStore):
         raise AssertionError("information must not retrieve protected memory")
 
 
+class DurableInformationMemory(InformationOnlyMemory):
+    """Model BMS's provisional assistant cleanup independently of append logs."""
+
+    def __init__(self, runtime, fail_at=None):
+        super().__init__()
+        self.runtime = runtime
+        self.fail_at = fail_at
+        self.retained_assistant = None
+        self.trace_committed = False
+        self.persistence_attempts = []
+
+    async def add_message(self, **kwargs):
+        self.persistence_attempts.append(kwargs["role"])
+        if self.fail_at == kwargs["role"]:
+            raise RuntimeError("PRIVATE-PERSISTENCE")
+        acknowledgement = await super().add_message(**kwargs)
+        if kwargs["role"] == "assistant":
+            self.retained_assistant = {**kwargs, **acknowledgement}
+        return acknowledgement
+
+    async def create_trace(self, **kwargs):
+        self.persistence_attempts.append("trace")
+        self.runtime.call_order.append("trace_persistence")
+        if self.fail_at == "trace":
+            raise RuntimeError("PRIVATE-TRACE")
+        response = await super().create_trace(**kwargs)
+        self.trace_committed = True
+        return response
+
+    async def transition_work(self, **kwargs):
+        state = kwargs["state"]
+        self.runtime.call_order.append(f"work:{state}")
+        if state == "completed":
+            assert self.trace_committed
+            assert kwargs["assistant_message_id"] == self.retained_assistant["message_id"]
+            for key in ("owner_id", "conversation_id"):
+                assert self.retained_assistant[key] == self.work[key]
+            assert self.retained_assistant["metadata"]["request_id"] == self.work["request_id"]
+        response = await super().transition_work(**kwargs)
+        if state == "failed":
+            self.retained_assistant = None
+        return response
+
+
 def _assert_information_barriers(out, runtime, provider, memory):
     assert out["selected_model"] == "not_called"
     assert out["sources"] == []
@@ -40736,8 +40780,12 @@ async def test_strict_confirmation_input_does_not_consume_challenge(tmp_path, mo
         raise AssertionError("strict input cannot restore or consume a legacy confirmation")
 
     monkeypatch.setattr(service, "restore_pending_action_request", forbidden)
+    runtime = StrictInformationRuntime()
+    memory = DurableInformationMemory(runtime)
     out, runtime, provider, memory = await _run_information_turn(
         tmp_path,
+        runtime=runtime,
+        memory=memory,
         payload=_base_payload(
             conversation_id="conv-1", surface="dev", capability_confirmation=challenge
         ),
@@ -40748,6 +40796,64 @@ async def test_strict_confirmation_input_does_not_consume_challenge(tmp_path, mo
     assert info["information_outcome"] == "confirmation_rejected"
     assert not runtime.identity_calls and not runtime.capability_match_calls
     assert not runtime.execution_receipt_calls
+    assert not runtime.persona_containment_calls and "timing" not in runtime.call_order
+    assert info["status"] == "failed"  # Refusal is never relabeled authorized.
+    assert info["reason_code"] == "strict_confirmation_unavailable"
+    assert info["selection_status"] == info["containment_status"] == "not_requested"
+    assert info["response_status"] == "committed"
+    assert memory.trace_calls[0]["payload"]["status"] == "failed"
+    assert memory.work["state"] == "completed" and memory.work["failure_code"] is None
+    assert memory.retained_assistant["content"] == out["answer"]
+    assert memory.work["assistant_message_id"] == memory.retained_assistant["message_id"]
+    assert runtime.turn_complete_calls[0]["turn_status"] == "completed"
+    order = [runtime.call_order.index(key) for key in (
+        "assistant_persistence", "complete_turn:completed", "trace_persistence", "work:completed",
+    )]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    assert [state for state, _ in memory.work_calls] == ["create", "running", "completed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["user", "assistant", "trace", "completion_timeout", "completion_mismatch",
+                "governance"],
+)
+async def test_strict_information_true_failure_cleans_provisional_response(
+    tmp_path, confirmation, failure,
+):
+    runtime = StrictInformationRuntime()
+    memory = DurableInformationMemory(runtime, fail_at=failure)
+    if failure == "completion_timeout":
+        runtime.information_failure = ("completion", httpx.ReadTimeout("PRIVATE-COMPLETION"))
+    elif failure == "completion_mismatch":
+        runtime.mutation = ("completion", ("runtime_session", "owner_id"), "PRIVATE-WRONG")
+    elif failure == "governance":
+        runtime.information_failure = ("governance", httpx.ReadTimeout("PRIVATE-GOVERNANCE"))
+    payload = _base_payload(conversation_id="conv-1", surface="dev")
+    if confirmation:
+        payload["capability_confirmation"] = {
+            "challenge_ref": "unissued-challenge", "capability_id": "jellyfin_restart",
+            "argument_digest": "unverified-digest", "confirmed": True,
+        }
+    out, runtime, provider, memory = await _run_information_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=payload,
+    )
+    assert out["status"] == "failed"
+    assert memory.work["state"] == "failed" and memory.work["assistant_message_id"] is None
+    assert memory.retained_assistant is None
+    assert [state for state, _ in memory.work_calls] == ["create", "running", "failed"]
+    assert memory.persistence_attempts.count("user") == 1
+    assert memory.persistence_attempts.count("assistant") == 1
+    assert memory.persistence_attempts.count("trace") == 1
+    assert len(runtime.turn_complete_calls) == 1
+    assert not provider.calls and not runtime.strict_forbidden_calls
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert not runtime.world_state_calls and not runtime.relationship_calls
+    assert not memory.retrieve_calls and not runtime.execution_receipt_calls
+    if confirmation:
+        assert not runtime.identity_calls and not runtime.capability_match_calls
+    assert "PRIVATE-" not in json.dumps(out)
 
 
 @pytest.mark.asyncio

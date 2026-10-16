@@ -68,6 +68,14 @@ if [ "${DISTINCT_CLIENT_MEMORY_ONLY:-}" = "1" ]; then
   export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true
 fi
 
+if [ "${STRICT_CAPABILITY_INFORMATION_ONLY:-}" = "1" ]; then
+  # Disposable, server-configured opt-in; ordinary smoke behavior stays disabled.
+  export COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED=true
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED=true
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true
+  export COMPOSED_RESTRAINT_ENABLED=true
+fi
+
 cleanup() {
   local status="$?"
   if [ -n "$G2_CONTAINER" ]; then
@@ -5050,8 +5058,294 @@ run_transport_latency_regression() {
   provider_post /fixture/reset '{}'
 }
 
+# Read actual committed authority, not a CO trace's claim of strict success.
+# Completed turns are inspected as historical evidence, never reused as authority.
+strict_information_records() {
+  local scope="$1" trace="$2" persona="$3" proposal="$4" operation="$5" valid="$6"
+  docker compose -f "$COMPOSE" exec -T runtime python - \
+    "$scope" "$trace" "$persona" "$proposal" "$operation" "$valid" <<'PYCODE'
+import json
+import sqlite3
+import sys
+
+from models import PersonaContainmentAuthority, PersonaSelectionDecision
+from services.capability_authorization import _CAPABILITY_REGISTRY, _eligible_reason
+
+scope, info = map(json.loads, sys.argv[1:3])
+persona, proposal, operation, valid = sys.argv[3:]
+with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as conn:
+    conn.row_factory = sqlite3.Row
+    session = conn.execute(
+        "SELECT * FROM conversation_runtime_sessions WHERE runtime_session_id=?",
+        (scope["runtime_session_id"],),
+    ).fetchone()
+    for key in ("owner_id", "conversation_id", "surface"):
+        assert session[key] == scope[key], "session_binding"
+    turn = conn.execute(
+        "SELECT * FROM conversation_runtime_turns WHERE runtime_turn_id=?",
+        (scope["runtime_turn_id"],),
+    ).fetchone()
+    assert turn["runtime_session_id"] == scope["runtime_session_id"], "turn_binding"
+    handled_refusal = info["information_outcome"] == "confirmation_rejected"
+    assert turn["turn_status"] == ("completed" if valid == "true" or handled_refusal else "abandoned")
+    rows = conn.execute(
+        "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id=? ORDER BY id",
+        (scope["runtime_turn_id"],),
+    ).fetchall()
+    def events(kind):
+        return [(r, json.loads(r["event_payload_json"])) for r in rows if r["event_type"] == kind]
+    started, = events("turn_started")
+    assert started[1]["request_id"] == scope["request_id"], "admitted_request"
+    assert len(events("turn_completed")) == 1, "terminal_count"
+    for kind in ("action_authority_evaluated", "action_flow_evaluated",
+                 "capability_authorization_evaluated", "confirmation_challenge_evaluated"):
+        assert not events(kind), "forbidden_action_or_confirmation"
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='capability_confirmation_challenges'"
+    ).fetchone()
+    if table:
+        assert conn.execute(
+            "SELECT count(*) FROM capability_confirmation_challenges WHERE owner_id=? AND conversation_id=?",
+            (scope["owner_id"], scope["conversation_id"]),
+        ).fetchone()[0] == 0, "challenge_mutation"
+    governance, = events("interaction_governance_evaluated")
+    assert governance[1]["request_id"] == scope["request_id"], "governance_request"
+    expected = []
+    if valid == "true":
+        selection_row, selection_payload = events("persona_selection_resolved")[0]
+        assert len(events("persona_selection_resolved")) == 1
+        selection = PersonaSelectionDecision.model_validate(selection_payload, strict=True)
+        containment_row, containment_payload = events("persona_containment_evaluated")[0]
+        assert len(events("persona_containment_evaluated")) == 1
+        containment = PersonaContainmentAuthority.model_validate(
+            containment_payload["strict_containment"], strict=True,
+        )
+        for key, value in scope.items():
+            assert getattr(selection, key) == value, "selection_binding"
+            assert getattr(containment, key) == value, "containment_binding"
+        assert selection.governance_event_ref == governance[0]["event_id"]
+        assert selection.thread_revision == containment.thread_revision == info["thread_revision"]
+        assert selection.selection_ref == containment.persona_selection_ref == info["selection_ref"]
+        assert selection.active_persona_id == containment.result.active_persona_id == persona
+        assert containment_payload["active_persona_id"] == info["active_persona_id"] == persona
+        assert not selection.contextual_activation and not selection.explicit_selection_verified
+        if proposal != "any":
+            assert selection.proposed_persona_id == proposal, "expected_governance_proposal"
+            assert selection.proposal_status == "advisory", "advisory_only"
+        assert governance[0]["id"] < selection_row["id"] < containment_row["id"]
+        assert containment_row["id"] < events("turn_completed")[0][0]["id"]
+        with sqlite3.connect("file:/data/companion_contracts.sqlite3?mode=ro", uri=True) as contracts:
+            binding = contracts.execute(
+                "SELECT default_persona_id FROM surface_bindings WHERE surface_id=?",
+                (scope["surface"],),
+            ).fetchone()
+            surface = scope["surface"] if binding else "unknown"
+            if not binding:
+                binding = contracts.execute(
+                    "SELECT default_persona_id FROM surface_bindings WHERE surface_id='unknown'"
+                ).fetchone()
+            assert binding[0] == persona, "surface_bound_persona"
+        records = [item.record for item in _CAPABILITY_REGISTRY]
+        if operation == "match":
+            records = [r for r in records if r.capability_id == "runtime.world_state.read"]
+            assert len(records) == 1, "registered_fixture"
+        expected = [r.display_name for r in records if _eligible_reason(
+            r, surface=surface, active_persona_id=persona,
+        ) is None]
+        assert info["capability_count"] == len(expected), "registry_ceiling"
+        assert len(events("timing_evaluated")) == 1, "mandatory_timing"
+    else:
+        assert not events("persona_selection_resolved")
+        assert not events("persona_containment_evaluated")
+        assert not events("timing_evaluated")
+    print(json.dumps({"examples": expected, "authority_records_verified": True,
+                      "actions": 0, "challenges": 0, "terminal_events": 1}))
+PYCODE
+}
+
+# Access logs establish which real HTTP seams ran. No bodies or private logs
+# leave this helper. In particular the read executor would call world-state.
+strict_information_http_counts() {
+  docker compose -f "$COMPOSE" logs --no-color runtime bms | python3 -c '
+import json, re, sys
+paths = ["/v1/runtime/identity/resolve", "/v1/runtime/persona-containment/evaluate",
+         "/v1/capabilities/match", "/v1/capabilities/discover",
+         "/v1/world-state/resolve", "/v1/relationships/select",
+         "/v1/capabilities/authorize", "/v1/capabilities/authority",
+         "/v1/capabilities/flow", "/v1/capabilities/confirm",
+         "/v1/profiles/resolve", "/v1/internal/recall/select",
+         "/v1/internal/episodes/retrieve", "/v1/internal/immediate-history/resolve"]
+text = sys.stdin.read()
+counts = {p: len(re.findall(r"\"POST " + re.escape(p) + r" HTTP/", text)) for p in paths}
+counts["protected_memory_retrieval"] = len(re.findall(r"\"POST /v2/conversations/[^ /]+/retrieve HTTP/", text))
+print(json.dumps(counts))'
+}
+
+strict_information_binding_fixture() {
+  local mode="$1" original="${2:-null}"
+  docker compose -f "$COMPOSE" exec -T runtime python - "$mode" "$original" <<'PYCODE'
+import json
+import sqlite3
+import sys
+
+mode, snapshot = sys.argv[1:]
+with sqlite3.connect("file:/data/companion_contracts.sqlite3?mode=rw", uri=True) as conn:
+    conn.row_factory = sqlite3.Row
+    def row():
+        return dict(conn.execute("SELECT * FROM surface_bindings WHERE surface_id='dev'").fetchone())
+    if mode == "corrupt":
+        original = row()
+        assert original["surface_type"] == "developer_surface"
+        assert conn.execute(
+            "UPDATE surface_bindings SET surface_type='' WHERE surface_id='dev' AND surface_type=?",
+            (original["surface_type"],),
+        ).rowcount == 1
+        assert row() != original
+        print(json.dumps(original, sort_keys=True))
+    else:
+        original = json.loads(snapshot)
+        assert conn.execute(
+            "UPDATE surface_bindings SET surface_type=? WHERE surface_id='dev' AND surface_type=''",
+            (original["surface_type"],),
+        ).rowcount == 1
+        assert row() == original, "exact_fixture_restore"
+PYCODE
+}
+
+run_strict_information_case() {
+  local tag="$1" surface="$2" persona="$3" proposal="$4" operation="$5" text="$6"
+  local valid="${7:-true}" confirmation='null'
+  local owner="strict-info-$tag-owner" client="strict-info-$tag-client"
+  local conversation response request answer trace info session turn scope records expected before after
+  local work result retained=1
+  if [ "$tag" = confirmation ]; then
+    confirmation='{"challenge_ref":"disposable-unissued-challenge","capability_id":"jellyfin_restart","argument_digest":"fixture-digest","confirmed":true}'
+  fi
+  conversation="$(create_conversation "$owner" "$client")"
+  configure_surface_permission "$owner" "$surface" true true false
+  provider_post /fixture/reset '{}'
+  before="$(strict_information_http_counts)"
+  response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" \
+    --arg conversation "$conversation" --arg surface "$surface" --arg text "$text" \
+    --argjson confirmation "$confirmation" '{owner_id:$owner,client_id:$client,
+      conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],
+      capability_confirmation:$confirmation}')")"
+  after="$(strict_information_http_counts)"
+  request="$(jq -er .request_id <<<"$response")"
+  answer="$(jq -er .answer <<<"$response")"
+  jq -e '.selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+  trace="$(fetch_trace "$request")"
+  info="$(jq -ce .retrieval.prompt_assembly.capability_information <<<"$trace")"
+  jq -e '.mode=="strict" and .requested==true and .action_dispatch=="suppressed"
+    and .provider_dispatch=="suppressed" and .protected_consumer_authority=="not_requested"
+    and .assistant_persistence=="succeeded" and .runtime_completion=="succeeded"' <<<"$info" >/dev/null
+  session="$(jq -er .retrieval.prompt_assembly.runtime_session.runtime_session_id <<<"$trace")"
+  turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+  scope="$(jq -nc --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg session "$session" --arg turn "$turn" \
+    '{request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface,
+      runtime_session_id:$session,runtime_turn_id:$turn}')"
+  records="$(strict_information_records "$scope" "$info" "$persona" "$proposal" "$operation" "$valid")"
+  if [ "$valid" = true ]; then
+    jq -e '.status=="validated" and .selection_status=="validated"
+      and .containment_status=="validated" and .contextual_activation==false
+      and .response_status=="committed"' <<<"$info" >/dev/null
+    expected="$(jq -er 'if (.examples|length)>0 then
+      "Available capability information: " + (.examples|join(", ")) + ". This is information only; no action was taken."
+      else "No eligible capability information is available here. No action was taken." end' <<<"$records")"
+    # Preserve stronger timing outcomes instead of weakening policy for a fixture.
+    if [ "$(jq -r .information_outcome <<<"$info")" = timing_displaced ]; then
+      [[ "$tag" = dev_timing || "$tag" = technical_proposal ]]
+      jq -e '.status=="degraded"' <<<"$response" >/dev/null
+      jq -e '.retrieval.prompt_assembly.runtime_timing.result.timing_policy
+        | IN("ask_clarifying_question","pause_or_wait","yield_to_user","close_turn")' <<<"$trace" >/dev/null
+      test "$answer" != "$expected"
+    else
+      test "$tag" != dev_timing
+      test "$answer" = "$expected"
+      jq -e '.status=="ok"' <<<"$response" >/dev/null
+    fi
+  elif [ "$tag" = confirmation ]; then
+    jq -e '.status=="failed"' <<<"$response" >/dev/null
+    test "$answer" = "This capability information path cannot accept action confirmation. No action was taken."
+    jq -e '.information_outcome=="confirmation_rejected" and .selection_status=="not_requested"
+      and .containment_status=="not_requested" and .reason_code=="strict_confirmation_unavailable"
+      and .status=="failed" and .response_status=="committed"' <<<"$info" >/dev/null
+  else
+    jq -e '.status=="failed"' <<<"$response" >/dev/null
+    test "$answer" = "Capability information is unavailable. No action was taken."
+    jq -e '.status=="failed" and .selection_status=="failed" and .containment_status=="not_requested"
+      and .reason_code=="authority_conflict" and .response_status=="failed"' <<<"$info" >/dev/null
+    retained=0
+  fi
+  # An executor or legacy downgrade would cross one of these HTTP barriers.
+  jq -en --argjson before "$before" --argjson after "$after" --arg tag "$tag" \
+    --arg operation "$operation" --argjson valid "$valid" '
+    all($after|keys[]; ($after[.]-$before[.]) ==
+      (if .=="/v1/runtime/identity/resolve" then (if $tag=="confirmation" then 0 else 1 end)
+       elif .=="/v1/runtime/persona-containment/evaluate" then (if $valid then 1 else 0 end)
+       elif .==("/v1/capabilities/"+$operation) then (if $valid then 1 else 0 end)
+       else 0 end))' >/dev/null
+  jq -e '.calls==[]' <<<"$(fetch_provider_calls "$request")" >/dev/null
+  test "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND request_id='$request';")" = 1
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND request_id='$request';")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  assert_public_work "$result" "$work" "$conversation" "$request"
+  if [ "$retained" = 1 ]; then
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    assert_request_persistence_counts "$conversation" "$request" 0
+    jq -e --arg answer "$answer" '.state=="completed" and .result.answer==$answer' <<<"$result" >/dev/null
+    assert_exact_canonical_result "$result"
+  else
+    # Genuine failed work must retain BMS's existing provisional-message cleanup.
+    jq -e '.state=="failed" and .failure_code=="dependency_unavailable" and .result==null' <<<"$result" >/dev/null
+    test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation' AND role='assistant';")" = 0
+    test "$(psql_exec -At -c "SELECT count(*) FROM traces WHERE conversation_id='$conversation' AND request_id='$request';")" = 1
+    test "$(psql_exec -At -c "SELECT count(*) FROM claim_records WHERE conversation_id='$conversation' AND request_id='$request';")" = 0
+  fi
+  test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$conversation' AND role='user';")" = 1
+  jq -e '.state=="idle" and .active_runtime_turn_id==null' \
+    <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  # Strict structural trace contains neither descriptors nor private input/policy.
+  jq -e --arg text "$text" '((tojson|contains($text))|not)
+    and all(keys[]; IN("mode","requested","status","selection_status","containment_status",
+      "information_outcome","action_dispatch","provider_dispatch","reason_code",
+      "protected_consumer_authority","selection_ref","active_persona_id","thread_revision",
+      "proposal_status","contextual_activation","operation","capability_count",
+      "assistant_persistence","runtime_completion","response_status"))' <<<"$info" >/dev/null
+  echo "Strict capability information $tag: durable_records_verified=true authority_status=$(jq -r .status <<<"$info") outcome=$(jq -r .information_outcome <<<"$info") work=$(jq -r .state <<<"$result") providers=0 actions=0 challenges=0 assistant_messages=$retained traces=1 claims=0 terminal_events=1 idle=true"
+}
+
+run_strict_capability_information_scenario() {
+  run_strict_information_case dev_match dev technical_architect any match 'What does read runtime world state do?'
+  run_strict_information_case dev_timing dev technical_architect any match 'Read runtime world state.'
+  run_strict_information_case web_match web general_assistant any match 'What does read runtime world state do?'
+  run_strict_information_case unknown_match unknown general_assistant any match 'What does read runtime world state do?'
+  run_strict_information_case unregistered_match unregistered_surface general_assistant any match 'What does read runtime world state do?'
+  run_strict_information_case technical_proposal web general_assistant technical_architect match 'This keeps failing!! Read runtime world state.'
+  run_strict_information_case supportive_proposal dev technical_architect personal_companion match 'Read runtime world state. That was wrong in the report.'
+  run_strict_information_case dev_discovery dev technical_architect any discover 'What can you do?'
+  run_strict_information_case web_discovery web general_assistant any discover 'What can you do?'
+  run_strict_information_case confirmation dev technical_architect any match 'What does read runtime world state do?' false
+  (
+    # Restore only our changed field, including on assertion failure; parent trap
+    # still owns disposal of the entire isolated composition.
+    original="$(strict_information_binding_fixture corrupt)"
+    trap 'strict_information_binding_fixture restore "$original" >/dev/null' EXIT
+    run_strict_information_case malformed_binding dev technical_architect any match 'What does read runtime world state do?' false
+  )
+  echo "Strict capability information matrix: actual_services=true selection_containment_bound=true advisory_only=true discovery_bounded=true timing_precedence=true confirmation_rejected=true malformed_fail_closed=true fixture_restored=true executors=0 latency_benchmark=false"
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+
+if [ "${STRICT_CAPABILITY_INFORMATION_ONLY:-}" = "1" ]; then
+  set -E
+  trap 'echo "Strict information assertion failed: line=$LINENO" >&2' ERR
+  run_strict_capability_information_scenario
+  exit 0
+fi
 
 if [ "${G2_DEFERRED_ONLY:-}" = "1" ]; then
   run_g2_deferred_scenario

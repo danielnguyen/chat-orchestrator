@@ -9052,7 +9052,21 @@ async def _finish_strict_capability_information(
         "runtime_session_id": runtime_session_trace.get("runtime_session_id"),
         "runtime_turn_id": turn_state_trace.get("runtime_turn_id"),
     }
-    failed = information_trace["status"] != "validated"
+    # A refused confirmation is handled without granting authority. Complete its
+    # durable response, while leaving actual policy/dependency failures failed.
+    confirmation_rejected = (
+        payload.get("capability_confirmation") is not None
+        and information_trace["status"] == "failed"
+        and information_trace["information_outcome"] == "confirmation_rejected"
+        and information_trace["reason_code"] == "strict_confirmation_unavailable"
+        and information_trace["selection_status"] == "not_requested"
+        and information_trace["containment_status"] == "not_requested"
+        and governance is not None
+        and governance_trace.get("included") is True
+        and selection is None
+        and containment is None
+    )
+    failed = information_trace["status"] != "validated" and not confirmation_rejected
     source = "capability_information"
     timing_trace = {"attempted": False, "status": "not_requested"}
     interrupt_trace = None
@@ -9077,7 +9091,7 @@ async def _finish_strict_capability_information(
         if persisted is None:
             failed, answer = True, _MESSAGE_PERSISTENCE_UNAVAILABLE
     await work.transition("running")
-    if not failed:
+    if not failed and not confirmation_rejected:
         restraint, restraint_trace = await _resolve_restraint(
             runtime=runtime,
             enabled=True,
@@ -9279,7 +9293,10 @@ async def _finish_strict_capability_information(
                 payload=payload,
                 profile=None,
                 prompt_trace=prompt_trace,
-                status="failed" if failed else "degraded" if source == "runtime_timing" else "ok",
+                status=(
+                    "failed" if failed or confirmation_rejected
+                    else "degraded" if source == "runtime_timing" else "ok"
+                ),
                 started=started,
                 response_source=source,
             ),
@@ -9296,7 +9313,10 @@ async def _finish_strict_capability_information(
         "profile_name": "unresolved",
         "selected_model": "not_called",
         "answer": answer,
-        "status": "failed" if failed else "degraded" if source == "runtime_timing" else "ok",
+        "status": (
+            "failed" if failed or confirmation_rejected
+            else "degraded" if source == "runtime_timing" else "ok"
+        ),
         "sources": [],
     }
 
