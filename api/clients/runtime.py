@@ -1544,6 +1544,133 @@ def validate_strict_containment_response(response, *, scope, selection=None):
     return result
 
 
+def validate_strict_relationship_response(response, *, scope):
+    """Validate the published consumer envelope, not a second relationship policy.
+
+    CR does not echo request/session/turn/revision in this response. Those are
+    bound by the strict request to committed CR selection/containment evidence.
+    """
+    invalid = "strict_relationship_response_invalid"
+    if not isinstance(response, dict) or set(response) != {
+        "selected_entities", "selected_relationships", "excluded_relationship_summaries",
+        "prompt_content", "trace", "retrieval_scope_projection", "selection_contract",
+        "persona_selection_ref",
+    }:
+        raise RuntimeError(invalid)
+    if (response["selection_contract"] != "strict_turn"
+            or response["persona_selection_ref"] != scope["persona_selection_ref"]):
+        raise RuntimeError("strict_persona_context_mismatch")
+    ref = response["persona_selection_ref"]
+    if (not isinstance(ref, str) or len(ref) != 37 or not ref.startswith("psel_")
+            or any(ch not in "0123456789abcdef" for ch in ref[5:])):
+        raise RuntimeError(invalid)
+    trace, projection = response["trace"], response["retrieval_scope_projection"]
+    if not isinstance(trace, dict) or set(trace) != {
+        "relationship_edges_used", "relationship_edges_excluded", "relationship_exclusion_reasons",
+        "relationship_context_overlay_applied", "relationship_conflicts",
+        "relationship_confirmation_required", "selected_relationship_count",
+        "excluded_relationship_count", "active_persona_id", "allowed_relationship_scopes",
+    }:
+        raise RuntimeError(invalid)
+    if (not _bounded_runtime_identifier(trace["active_persona_id"])
+            or (scope.get("active_persona_id") is not None
+                and trace["active_persona_id"] != scope["active_persona_id"])):
+        raise RuntimeError("strict_persona_context_mismatch")
+
+    def refs(value, limit=64):
+        if (not isinstance(value, list) or len(value) > limit
+                or any(not _bounded_runtime_identifier(item) for item in value)
+                or len(value) != len(set(value))):
+            raise RuntimeError(invalid)
+        return set(value)
+
+    used = refs(trace["relationship_edges_used"])
+    excluded = refs(trace["relationship_edges_excluded"])
+    refs(trace["relationship_conflicts"])
+    allowed = refs(trace["allowed_relationship_scopes"], 16)
+    reasons = trace["relationship_exclusion_reasons"]
+    if (not isinstance(reasons, dict) or any(
+        not _bounded_runtime_identifier(k) or not _bounded_runtime_identifier(v)
+        for k, v in reasons.items()
+    )):
+        raise RuntimeError(invalid)
+    prompt = response["prompt_content"]
+    if prompt is not None and not isinstance(prompt, str):
+        raise RuntimeError(invalid)
+    if (type(trace["relationship_confirmation_required"]) is not bool
+            or type(trace["relationship_context_overlay_applied"]) is not bool
+            or trace["relationship_context_overlay_applied"] != bool(prompt)):
+        raise RuntimeError(invalid)
+    relationships = response["selected_relationships"]
+    entities = response["selected_entities"]
+    omitted = response["excluded_relationship_summaries"]
+    if any(not isinstance(items, list) for items in (relationships, entities, omitted)):
+        raise RuntimeError(invalid)
+    for count, items in (("selected_relationship_count", relationships),
+                         ("excluded_relationship_count", omitted)):
+        if type(trace[count]) is not int or trace[count] != len(items):
+            raise RuntimeError(invalid)
+    selected_ids, selected_entities, selected_scopes = set(), set(), set()
+    by_id = {}
+    for edge in relationships:
+        if not isinstance(edge, dict) or edge.get("owner_id") != scope["owner_id"]:
+            raise RuntimeError(invalid)
+        for key in (
+            "relationship_id", "subject_entity_id", "object_entity_id", "relationship_scope",
+        ):
+            if not _bounded_runtime_identifier(edge.get(key)):
+                raise RuntimeError(invalid)
+        if (edge["relationship_id"] in selected_ids or edge["relationship_scope"] not in allowed
+                or not _bounded_runtime_identifier(edge.get("relationship_type"))
+                or not _bounded_runtime_identifier(edge.get("status"))
+                or not _bounded_runtime_identifier(edge.get("mentionability"))
+                or type(edge.get("confidence")) not in {float, int}
+                or not math.isfinite(edge["confidence"])):
+            raise RuntimeError(invalid)
+        selected_ids.add(edge["relationship_id"])
+        by_id[edge["relationship_id"]] = edge
+        selected_entities.update((edge["subject_entity_id"], edge["object_entity_id"]))
+        selected_scopes.add(edge["relationship_scope"])
+    if selected_ids != used or used & excluded:
+        raise RuntimeError(invalid)
+    entity_ids = []
+    for entity in entities:
+        if not isinstance(entity, dict) or entity.get("owner_id") != scope["owner_id"]:
+            raise RuntimeError(invalid)
+        entity_ids.append(entity.get("entity_id"))
+    if not refs(entity_ids, 128) <= selected_entities:
+        raise RuntimeError(invalid)
+    excluded_ids = []
+    for edge in omitted:
+        if not isinstance(edge, dict):
+            raise RuntimeError(invalid)
+        excluded_ids.append(edge.get("relationship_id"))
+    if refs(excluded_ids) != excluded:
+        raise RuntimeError(invalid)
+    if not isinstance(projection, dict) or set(projection) != {
+        "applied", "relationship_ids", "entity_ids", "relationship_scopes", "reason_codes",
+    } or type(projection["applied"]) is not bool:
+        raise RuntimeError(invalid)
+    ids = refs(projection["relationship_ids"])
+    entity_refs = refs(projection["entity_ids"])
+    scopes = refs(projection["relationship_scopes"], 16)
+    refs(projection["reason_codes"], 8)
+    if (not ids <= used or not entity_refs <= selected_entities or not scopes <= selected_scopes
+            or (scope.get("requested_scopes")
+                and not selected_scopes <= set(scope["requested_scopes"]))
+            or (projection["applied"] and (not ids or not entity_refs or not scopes))
+            or (not projection["applied"] and (ids or entity_refs or scopes))
+            or (not relationships and prompt)):
+        raise RuntimeError(invalid)
+    projected = [by_id[key] for key in ids]
+    if entity_refs != {edge[key] for edge in projected
+                       for key in ("subject_entity_id", "object_entity_id")} or (
+        scopes != {edge["relationship_scope"] for edge in projected}
+    ):
+        raise RuntimeError(invalid)
+    return response
+
+
 def validate_strict_capability_response(response, *, scope, selection=None, discovery=False):
     if (
         not isinstance(response, dict)
@@ -2806,6 +2933,8 @@ class RuntimeClient:
         requested_scopes: list[str] | None = None,
         entity_ids: list[str] | None = None,
         relationship_types: list[str] | None = None,
+        persona_selection_mode: str = "legacy", persona_selection_ref: str | None = None,
+        runtime_turn_id: str | None = None, expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -2823,7 +2952,15 @@ class RuntimeClient:
             payload["entity_ids"] = entity_ids
         if relationship_types:
             payload["relationship_types"] = relationship_types
-        return await self._post("/v1/relationships/select", json=payload)
+        payload.update(_strict_persona_request_fields(
+            persona_selection_mode, runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id, persona_selection_ref=persona_selection_ref,
+            expected_thread_revision=expected_thread_revision, selection_required=True,
+        ))
+        response = await self._post("/v1/relationships/select", json=payload)
+        if persona_selection_mode == "strict":
+            validate_strict_relationship_response(response, scope=payload)
+        return response
 
     async def authorize_capability(
         self,

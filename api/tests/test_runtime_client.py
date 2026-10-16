@@ -4879,3 +4879,137 @@ async def test_strict_client_rejects_legacy_response_without_retry(producer):
     assert len(http.posts) == 1
     assert http.posts[0][1]["persona_selection_mode"] == "strict"
     await client.close()
+
+
+def _strict_relationship_fixture(identity=None, *, empty=False):
+    """Published CR relationship envelope: scope is proven by its strict request."""
+    selection = (identity or _strict_identity_fixture())["persona_selection"]
+    owner = selection["owner_id"]
+    edge = {
+        "relationship_id": "rel_project", "owner_id": owner,
+        "subject_entity_id": "entity_project", "object_entity_id": "entity_repo",
+        "relationship_type": "uses", "relationship_scope": "project_context",
+        "source_type": "trusted_config", "source_refs_json": ["fixture"],
+        "source_refs_redacted": False, "confidence": 0.95, "status": "active",
+        "sensitivity_level": "medium", "mentionability": "mentionable",
+        "allowed_persona_scopes_json": [], "blocked_persona_scopes_json": [],
+        "valid_from": None, "valid_until": None, "superseded_by_relationship_id": None,
+        "created_at": "2026-10-01T00:00:00+00:00", "updated_at": "2026-10-01T00:00:00+00:00",
+        "revoked_at": None,
+    }
+    return {
+        "selected_entities": [], "selected_relationships": [] if empty else [edge],
+        "excluded_relationship_summaries": [],
+        "prompt_content": None if empty else "Relationship context:\n- Bounded project repository.",
+        "selection_contract": "strict_turn", "persona_selection_ref": selection["selection_ref"],
+        "retrieval_scope_projection": {
+            "applied": not empty, "relationship_ids": [] if empty else ["rel_project"],
+            "entity_ids": [] if empty else ["entity_project", "entity_repo"],
+            "relationship_scopes": [] if empty else ["project_context"],
+            "reason_codes": ["no_eligible_relationship_scope" if empty
+                             else "eligible_relationship_scope_selected"],
+        },
+        "trace": {
+            "relationship_edges_used": [] if empty else ["rel_project"],
+            "relationship_edges_excluded": [], "relationship_exclusion_reasons": {},
+            "relationship_context_overlay_applied": not empty, "relationship_conflicts": [],
+            "relationship_confirmation_required": False,
+            "selected_relationship_count": 0 if empty else 1, "excluded_relationship_count": 0,
+            "active_persona_id": selection["active_persona_id"],
+            "allowed_relationship_scopes": ["project_context"],
+        },
+    }
+
+
+def _relationship_scope(identity=None):
+    selection = (identity or _strict_identity_fixture())["persona_selection"]
+    return {
+        **{key: selection[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id",
+        )},
+        "persona_selection_mode": "strict", "persona_selection_ref": selection["selection_ref"],
+        "active_persona_id": selection["active_persona_id"],
+        "expected_thread_revision": selection["thread_revision"],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_strict_relationship_client_posts_exact_admitted_scope(empty):
+    response = _strict_relationship_fixture(empty=empty)
+    http = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=_ClientFactory([http]))
+    await client.open()
+    scope = {**_relationship_scope(), "requested_scopes": ["project_context"]}
+    assert await client.relationship_select(**scope) == response
+    assert http.posts == [("/v1/relationships/select", scope)]
+    await client.close()
+
+
+@pytest.mark.parametrize("field,value", [
+    (("selection_contract",), "legacy_unbound"),
+    (("persona_selection_ref",), "psel_" + "0" * 32),
+    (("trace", "active_persona_id"), "home_operator"),
+    (("trace", "selected_relationship_count"), True),
+    (("trace", "relationship_confirmation_required"), 1),
+    (("trace", "relationship_edges_used"), ["outside"]),
+    (("selected_relationships",), [{"owner_id": "other"}]),
+    (("selected_entities",), [{"owner_id": "other", "entity_id": "private"}]),
+    (("retrieval_scope_projection", "entity_ids"), ["private"]),
+    (("retrieval_scope_projection", "relationship_ids"), ["private"]),
+    (("retrieval_scope_projection", "relationship_scopes"), ["personal_context"]),
+    (("retrieval_scope_projection", "applied"), False),
+    (("retrieval_scope_projection", "reason_codes"), "private"),
+    (("prompt_content",), {"private": "content"}),
+    (("trace",), None),
+])
+def test_strict_relationship_response_rejects_inconsistent_envelope(field, value):
+    from clients.runtime import validate_strict_relationship_response
+
+    response = _strict_relationship_fixture()
+    target = response
+    for key in field[:-1]:
+        target = target[key]
+    target[field[-1]] = value
+    with pytest.raises(RuntimeError, match="strict_"):
+        validate_strict_relationship_response(response, scope=_relationship_scope())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ReadTimeout("private"), httpx.ConnectError("private"),
+                                   (409, {"detail": "relationship_authority_rejected"})])
+async def test_strict_relationship_client_failure_is_one_attempt(error):
+    http = _FakeAsyncClient([error])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=_ClientFactory([http]))
+    await client.open()
+    with pytest.raises(httpx.HTTPError):
+        await client.relationship_select(**_relationship_scope())
+    assert len(http.posts) == 1 and http.posts[0][1]["persona_selection_mode"] == "strict"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_strict_relationship_response_failure_keeps_healthy_transport_without_downgrade():
+    http = _FakeAsyncClient([{}, _strict_relationship_fixture()])
+    factory = _ClientFactory([http])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=factory)
+    await client.open()
+    with pytest.raises(RuntimeError):
+        await client.relationship_select(**_relationship_scope())
+    assert len(http.posts) == 1 and http.close_calls == 0
+    await client.relationship_select(**_relationship_scope())
+    assert len(factory.clients) == 1 and len(http.posts) == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_relationship_client_legacy_payload_unchanged():
+    http = _FakeAsyncClient([{"legacy": True}])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=_ClientFactory([http]))
+    await client.open()
+    scope = _strict_information_scope()
+    scope.pop("runtime_turn_id")
+    assert await client.relationship_select(**scope) == {"legacy": True}
+    assert http.posts == [("/v1/relationships/select", scope)]
+    await client.close()
