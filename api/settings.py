@@ -50,6 +50,9 @@ class Settings(BaseSettings):
         default=False,
         alias="COGNITIVE_RUNTIME_CAPABILITY_REGISTRY_ENABLED",
     )
+    strict_capability_information_enabled: bool = Field(
+        default=False, alias="STRICT_CAPABILITY_INFORMATION_ENABLED",
+    )
     claim_record_capture_enabled: bool = Field(
         default=False,
         alias="CLAIM_RECORD_CAPTURE_ENABLED",
@@ -132,6 +135,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_claim_capture_runtime(self) -> Settings:
+        if self.strict_capability_information_enabled:
+            if not self.cognitive_runtime_base_url or not all((
+                self.cognitive_runtime_interaction_governance_enabled,
+                self.cognitive_runtime_persona_containment_enabled,
+                self.cognitive_runtime_capability_registry_enabled,
+                self.cognitive_runtime_restraint_enabled,
+            )):
+                raise ValueError(
+                    "strict capability information requires runtime, governance, containment, "
+                    "capability registry and restraint"
+                )
         if self.claim_record_capture_enabled and not self.cognitive_runtime_base_url:
             raise ValueError("claim record capture requires Cognitive Runtime")
         if self.evidence_acquisition_enabled:

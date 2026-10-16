@@ -3223,3 +3223,100 @@ async def test_jellyfin_failure_outcomes_never_retry_or_claim_verified_success(
     post_calls = [item for item in adapter.status_inputs if item["purpose"] == "post_restart"]
     assert len(post_calls) == verify_count
     assert "verified it is healthy" not in result.response_text
+
+
+@pytest.mark.parametrize(
+    "missing", ["runtime", "governance", "containment", "registry", "restraint"]
+)
+def test_strict_capability_gate_requires_authoritative_dependencies(missing):
+    from settings import Settings
+
+    values = {
+        "ORCH_API_KEY": "test",
+        "MEMORY_STORE_BASE_URL": "http://memory",
+        "MEMORY_STORE_API_KEY": "test",
+        "LITELLM_BASE_URL": "http://provider",
+        "COGNITIVE_RUNTIME_BASE_URL": "http://runtime",
+        "COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED": True,
+        "COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED": True,
+        "COGNITIVE_RUNTIME_CAPABILITY_REGISTRY_ENABLED": True,
+        "COGNITIVE_RUNTIME_RESTRAINT_ENABLED": True,
+        "STRICT_CAPABILITY_INFORMATION_ENABLED": True,
+    }
+    field = {
+        "runtime": "COGNITIVE_RUNTIME_BASE_URL",
+        "governance": "COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED",
+        "containment": "COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED",
+        "registry": "COGNITIVE_RUNTIME_CAPABILITY_REGISTRY_ENABLED",
+        "restraint": "COGNITIVE_RUNTIME_RESTRAINT_ENABLED",
+    }[missing]
+    values[field] = None if missing == "runtime" else False
+    with pytest.raises(ValidationError, match="strict capability information requires"):
+        Settings(_env_file=None, **values)
+
+
+def test_strict_capability_gate_is_server_owned_and_disabled_by_default():
+    from settings import Settings
+
+    settings = Settings(
+        _env_file=None,
+        ORCH_API_KEY="test",
+        MEMORY_STORE_BASE_URL="http://memory",
+        MEMORY_STORE_API_KEY="test",
+        LITELLM_BASE_URL="http://provider",
+        STRICT_CAPABILITY_INFORMATION_ENABLED=False,
+    )
+    assert settings.strict_capability_information_enabled is False
+    request = ChatRequest(
+        owner_id="owner",
+        client_id="web",
+        surface="web",
+        messages=[{"role": "user", "content": "What can you do?"}],
+        strict_capability_information_enabled=True,
+    )
+    assert "strict_capability_information_enabled" not in request.model_dump()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_chat_forwards_only_server_owned_information_gate(monkeypatch, enabled):
+    import main
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        return {
+            "request_id": kwargs["request_id"],
+            "conversation_id": "conv-1",
+            "profile_name": "unresolved",
+            "selected_model": "not_called",
+            "answer": "Information only.",
+            "status": "ok",
+            "sources": [],
+        }
+
+    monkeypatch.setattr(main, "orchestrate_chat", fake)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        main.settings.model_copy(
+            update={
+                "strict_capability_information_enabled": enabled,
+            }
+        ),
+    )
+    response = TestClient(main.app).post(
+        "/v1/chat",
+        headers={"X-API-Key": main.settings.orch_api_key},
+        json={
+            "owner_id": "owner",
+            "client_id": "web",
+            "surface": "web",
+            "messages": [{"role": "user", "content": "What can you do?"}],
+            "strict_capability_information_enabled": not enabled,
+        },
+    )
+    assert response.status_code == 200
+    assert calls[0]["strict_capability_information_enabled"] is enabled
+    assert "strict_capability_information_enabled" not in calls[0]["payload"]

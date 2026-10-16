@@ -1272,6 +1272,479 @@ def validate_history_followup_policy_response(
     return policy.model_dump()
 
 
+_PERSONA_SCOPE_FIELDS = (
+    "request_id",
+    "owner_id",
+    "conversation_id",
+    "surface",
+    "runtime_session_id",
+    "runtime_turn_id",
+)
+
+
+def validate_strict_persona_selection(response, *, scope, selection=None):
+    """Validate CR's published turn binding; this does not establish user consent."""
+    if not isinstance(response, dict) or response.get("selection_contract") != "strict_turn":
+        raise RuntimeError("strict_persona_response_invalid")
+    decision = response.get("persona_selection")
+    fields = {
+        *_PERSONA_SCOPE_FIELDS,
+        "selection_ref",
+        "thread_revision",
+        "governance_event_ref",
+        "active_persona_id",
+        "selection_source",
+        "selection_reason",
+        "proposed_persona_id",
+        "proposal_source",
+        "proposal_status",
+        "proposal_reason",
+        "requested_selection_status",
+        "contextual_activation",
+        "explicit_selection_verified",
+    }
+    if not isinstance(decision, dict) or set(decision) != fields:
+        raise RuntimeError("strict_persona_response_invalid")
+    if (
+        any(
+            not _bounded_runtime_identifier(decision[key])
+            for key in (
+                *_PERSONA_SCOPE_FIELDS,
+                "governance_event_ref",
+                "active_persona_id",
+            )
+        )
+        or len(decision["surface"]) > 64
+    ):
+        raise RuntimeError("strict_persona_response_invalid")
+    ref = decision["selection_ref"]
+    if (
+        not isinstance(ref, str)
+        or len(ref) != 37
+        or not ref.startswith("psel_")
+        or any(ch not in "0123456789abcdef" for ch in ref[5:])
+    ):
+        raise RuntimeError("strict_persona_response_invalid")
+    revision = decision["thread_revision"]
+    if (
+        type(revision) is not int
+        or revision < 0
+        or decision["contextual_activation"] is not False
+        or decision["explicit_selection_verified"] is not False
+        or decision["requested_selection_status"] != "not_requested"
+    ):
+        raise RuntimeError("strict_persona_response_invalid")
+    if (
+        any(decision[key] != scope[key] for key in _PERSONA_SCOPE_FIELDS)
+        or (
+            scope.get("expected_thread_revision") is not None
+            and revision != scope["expected_thread_revision"]
+        )
+        or (selection is not None and decision != selection)
+    ):
+        raise RuntimeError("strict_persona_context_mismatch")
+    if any(
+        type(decision[key]) is not str
+        for key in (
+            "selection_source",
+            "selection_reason",
+            "proposal_source",
+            "proposal_status",
+            "proposal_reason",
+        )
+    ):
+        raise RuntimeError("strict_persona_response_invalid")
+    source_reason = {
+        "surface_binding": {"surface_default"},
+        "conservative_fallback": {"unknown_surface_default", "bound_persona_unavailable"},
+    }
+    if decision["selection_reason"] not in source_reason.get(decision["selection_source"], set()):
+        raise RuntimeError("strict_persona_response_invalid")
+    proposal = decision["proposed_persona_id"]
+    status = decision["proposal_status"]
+    if status == "none":
+        coherent = (
+            proposal is None
+            and decision["proposal_source"] == "none"
+            and decision["proposal_reason"] == "no_contextual_proposal"
+        )
+    else:
+        coherent = (
+            status in {"advisory", "rejected"}
+            and decision["proposal_source"] == "interaction_governance"
+            and (proposal is None or _bounded_runtime_identifier(proposal))
+            and decision["proposal_reason"]
+            == (
+                "contextual_activation_not_enabled" if status == "advisory" else "proposal_unmapped"
+            )
+            and (status != "advisory" or proposal is not None)
+        )
+    if not coherent:
+        raise RuntimeError("strict_persona_response_invalid")
+    return decision
+
+
+def validate_strict_identity_response(response, *, scope):
+    decision = validate_strict_persona_selection(response, scope=scope)
+    session = response.get("runtime_session")
+    persona = response.get("persona")
+    identity = response.get("runtime_identity")
+    binding = response.get("surface_binding")
+    if any(not isinstance(item, dict) for item in (session, persona, identity, binding)):
+        raise RuntimeError("strict_persona_response_invalid")
+    if (
+        any(
+            session.get(key) != scope[key]
+            for key in (
+                "runtime_session_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+            )
+        )
+        or session.get("status") != "active"
+    ):
+        raise RuntimeError("strict_persona_context_mismatch")
+    persona_id = decision["active_persona_id"]
+    if (
+        persona.get("persona_id") != persona_id
+        or identity.get("active_persona_id") != persona_id
+        or persona.get("persona_owns_durable_memory") is not False
+        or identity.get("persona_owns_durable_memory") is not False
+        or identity.get("surface_id") != binding.get("surface_id")
+    ):
+        raise RuntimeError("strict_persona_context_mismatch")
+    if binding.get("surface_id") not in {scope["surface"], "unknown"} or (
+        decision["selection_reason"] != "bound_persona_unavailable"
+        and binding.get("default_persona_id") != persona_id
+    ):
+        raise RuntimeError("strict_persona_context_mismatch")
+    trace = response.get("trace")
+    if (
+        not isinstance(trace, dict)
+        or trace.get("runtime_session_id") != scope["runtime_session_id"]
+        or trace.get("active_persona_id") != persona_id
+        or trace.get("persona_override_source") != "none"
+        or trace.get("surface_id") != binding["surface_id"]
+        or not _bounded_runtime_identifier(binding.get("surface_type"))
+        or not _bounded_runtime_identifier(binding.get("surface_display_name"))
+        or type(binding.get("allow_user_persona_override")) is not bool
+        or not _bounded_runtime_identifier(persona.get("capability_domain"))
+        or identity.get("capability_domain") != persona["capability_domain"]
+    ):
+        raise RuntimeError("strict_persona_response_invalid")
+    if (
+        decision["selection_source"] == "surface_binding"
+        and binding["surface_id"] != scope["surface"]
+    ) or (
+        decision["selection_reason"] == "unknown_surface_default"
+        and binding["surface_id"] != "unknown"
+    ):
+        raise RuntimeError("strict_persona_context_mismatch")
+    return decision
+
+
+def validate_strict_containment_response(response, *, scope, selection=None):
+    decision = validate_strict_persona_selection(response, scope=scope, selection=selection)
+    if any(response.get(key) != scope[key] for key in _PERSONA_SCOPE_FIELDS):
+        raise RuntimeError("strict_persona_context_mismatch")
+    result = response.get("result")
+    keys = {
+        "active_persona_id",
+        "capability_domain",
+        "allowed_memory_domains",
+        "blocked_memory_domains",
+        "allowed_world_state_domains",
+        "allowed_relationship_domains",
+        "allowed_tool_domains",
+        "cross_scope_access_allowed",
+        "cross_scope_reason",
+        "confidence",
+        "reason_summary",
+        "artifact_access_policy",
+    }
+    if not isinstance(result, dict) or set(result) != keys:
+        raise RuntimeError("strict_containment_response_invalid")
+    if result["active_persona_id"] != decision["active_persona_id"]:
+        raise RuntimeError("strict_persona_context_mismatch")
+    for key in keys - {
+        "artifact_access_policy",
+        "confidence",
+        "cross_scope_access_allowed",
+        "active_persona_id",
+        "capability_domain",
+        "cross_scope_reason",
+    }:
+        value = result[key]
+        if (
+            not isinstance(value, list)
+            or len(value) > 16
+            or any(not _bounded_runtime_identifier(item) for item in value)
+            or len(value) != len(set(value))
+        ):
+            raise RuntimeError("strict_containment_response_invalid")
+    if (
+        not _bounded_runtime_identifier(result["capability_domain"])
+        or not _bounded_runtime_identifier(result["cross_scope_reason"])
+        or result["cross_scope_access_allowed"] is not False
+        or type(result["confidence"]) not in {float, int}
+        or not 0 <= result["confidence"] <= 1
+    ):
+        raise RuntimeError("strict_containment_response_invalid")
+    for key in (
+        "allowed_memory_domains",
+        "allowed_world_state_domains",
+        "allowed_relationship_domains",
+        "allowed_tool_domains",
+    ):
+        if set(result[key]) & set(result["blocked_memory_domains"]):
+            raise RuntimeError("strict_containment_response_invalid")
+    artifact = result["artifact_access_policy"]
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact)
+        != {
+            "enforcement_mode",
+            "allowed_content_classes",
+            "allowed_domains",
+            "maximum_sensitivity",
+            "surface_content_capabilities",
+            "reason_codes",
+        }
+        or artifact["enforcement_mode"] != "mandatory"
+        or artifact["maximum_sensitivity"]
+        not in {
+            "low",
+            "medium",
+            "high",
+            "restricted",
+        }
+    ):
+        raise RuntimeError("strict_containment_response_invalid")
+    for key in (
+        "allowed_content_classes",
+        "allowed_domains",
+        "surface_content_capabilities",
+        "reason_codes",
+    ):
+        value = artifact[key]
+        if (
+            not isinstance(value, list)
+            or len(value) > 16
+            or any(not _bounded_runtime_identifier(item) for item in value)
+        ):
+            raise RuntimeError("strict_containment_response_invalid")
+    classes = {"document", "code", "image", "screenshot", "audio", "video", "other"}
+    if any(
+        item not in classes
+        for key in ("allowed_content_classes", "surface_content_capabilities")
+        for item in artifact[key]
+    ):
+        raise RuntimeError("strict_containment_response_invalid")
+    return result
+
+
+def validate_strict_capability_response(response, *, scope, selection=None, discovery=False):
+    if (
+        not isinstance(response, dict)
+        or set(response)
+        != {
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "active_persona_id",
+            "result",
+            "selection_contract",
+            "persona_selection_ref",
+        }
+        or response.get("selection_contract") != "strict_turn"
+    ):
+        raise RuntimeError("strict_capability_response_invalid")
+    if any(
+        response.get(key) != scope[key]
+        for key in (
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "active_persona_id",
+            "persona_selection_ref",
+        )
+    ):
+        raise RuntimeError("strict_persona_context_mismatch")
+    result = response["result"]
+    if not isinstance(result, dict) or result.get("action_taken") is not False:
+        raise RuntimeError("strict_capability_response_invalid")
+    if discovery:
+        if set(result) != {
+            "registry_available",
+            "action_taken",
+            "allowed_examples",
+            "blocked_examples",
+        }:
+            raise RuntimeError("strict_capability_response_invalid")
+        if (
+            result["registry_available"] is False
+            and result["allowed_examples"] == []
+            and result["blocked_examples"] == []
+        ):
+            raise RuntimeError("strict_capability_registry_unavailable")
+        if result["registry_available"] is not True or result["blocked_examples"] != []:
+            raise RuntimeError("strict_capability_response_invalid")
+        examples = result["allowed_examples"]
+        if not isinstance(examples, list) or len(examples) > 16:
+            raise RuntimeError("strict_capability_response_invalid")
+    else:
+        if set(result) != {"capability_matched", "action_taken", "reason_codes", "capability"}:
+            raise RuntimeError("strict_capability_response_invalid")
+        if type(result["capability_matched"]) is not bool:
+            raise RuntimeError("strict_capability_response_invalid")
+        reasons = result["reason_codes"]
+        if (
+            reasons == ["registry_unavailable"]
+            and result["capability_matched"] is False
+            and result["capability"] is None
+        ):
+            raise RuntimeError("strict_capability_registry_unavailable")
+        expected = (
+            {"matched"}
+            if result["capability_matched"]
+            else {
+                "no_registered_capability",
+                "surface_not_allowed",
+                "persona_not_allowed",
+                "raw_capability_name_ignored",
+            }
+        )
+        if (
+            not isinstance(reasons, list)
+            or len(reasons) != 1
+            or type(reasons[0]) is not str
+            or reasons[0] not in expected
+        ):
+            raise RuntimeError("strict_capability_response_invalid")
+        examples = [result["capability"]] if result["capability_matched"] else []
+        if not result["capability_matched"] and result["capability"] is not None:
+            raise RuntimeError("strict_capability_response_invalid")
+    ids = []
+    for example in examples:
+        common = {"capability_id", "display_name", "description", "operation_kind", "risk_level"}
+        extra = (
+            {"reason_codes"}
+            if discovery
+            else {
+                "domain",
+                "requires_confirmation",
+                "allowed_surfaces",
+                "allowed_personas",
+                "reversible",
+                "dry_run_supported",
+                "verification_supported",
+                "audit_required",
+            }
+        )
+        if not isinstance(example, dict) or set(example) != common | extra:
+            raise RuntimeError("strict_capability_response_invalid")
+        if (
+            any(
+                not _bounded_runtime_identifier(example[key])
+                for key in (
+                    "capability_id",
+                    "display_name",
+                    "operation_kind",
+                    "risk_level",
+                )
+            )
+            or not isinstance(example["description"], str)
+            or len(example["description"]) > 300
+        ):
+            raise RuntimeError("strict_capability_response_invalid")
+        if example["operation_kind"] not in {
+            "read_only",
+            "draft_or_prepare",
+            "state_change",
+            "restart",
+            "notification",
+            "blocked_external_action",
+        }:
+            raise RuntimeError("strict_capability_response_invalid")
+        if discovery:
+            if example["reason_codes"] != ["matched"]:
+                raise RuntimeError("strict_capability_response_invalid")
+        else:
+            if not _bounded_runtime_identifier(example["domain"]):
+                raise RuntimeError("strict_capability_response_invalid")
+            if any(
+                type(example[key]) is not bool
+                for key in (
+                    "requires_confirmation",
+                    "reversible",
+                    "dry_run_supported",
+                    "verification_supported",
+                    "audit_required",
+                )
+            ):
+                raise RuntimeError("strict_capability_response_invalid")
+            for key in ("allowed_surfaces", "allowed_personas"):
+                if (
+                    not isinstance(example[key], list)
+                    or len(example[key]) > 16
+                    or any(not _bounded_runtime_identifier(item) for item in example[key])
+                ):
+                    raise RuntimeError("strict_capability_response_invalid")
+            surface = (
+                "unknown"
+                if selection is not None
+                and selection["selection_source"] == "conservative_fallback"
+                else scope["surface"]
+            )
+            if scope["active_persona_id"] not in example["allowed_personas"] or (
+                surface not in example["allowed_surfaces"]
+            ):
+                raise RuntimeError("strict_capability_response_invalid")
+        ids.append(example["capability_id"])
+    if len(ids) != len(set(ids)):
+        raise RuntimeError("strict_capability_response_invalid")
+    return result
+
+
+def _strict_persona_request_fields(
+    mode,
+    *,
+    runtime_session_id,
+    runtime_turn_id,
+    persona_selection_ref=None,
+    expected_thread_revision=None,
+    selection_required=False,
+):
+    if mode == "legacy":
+        if persona_selection_ref is not None:
+            raise ValueError("strict_persona_mode_required")
+        return {}
+    if (
+        mode != "strict"
+        or not _bounded_runtime_identifier(runtime_session_id)
+        or not _bounded_runtime_identifier(runtime_turn_id)
+        or (selection_required and not _bounded_runtime_identifier(persona_selection_ref))
+        or (
+            expected_thread_revision is not None
+            and (type(expected_thread_revision) is not int or expected_thread_revision < 0)
+        )
+    ):
+        raise ValueError("strict_persona_binding_required")
+    result = {
+        "persona_selection_mode": "strict",
+        "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+    }
+    if persona_selection_ref is not None:
+        result["persona_selection_ref"] = persona_selection_ref
+    if expected_thread_revision is not None:
+        result["expected_thread_revision"] = expected_thread_revision
+    return result
+
+
 class RuntimeClient:
     def __init__(
         self,
@@ -2225,6 +2698,8 @@ class RuntimeClient:
         conversation_id: str,
         surface: str,
         runtime_session_id: str | None = None,
+        persona_selection_mode: str = "legacy", runtime_turn_id: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -2234,7 +2709,14 @@ class RuntimeClient:
         }
         if runtime_session_id is not None:
             payload["runtime_session_id"] = runtime_session_id
-        return await self._post("/v1/runtime/identity/resolve", json=payload)
+        payload.update(_strict_persona_request_fields(
+            persona_selection_mode, runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id, expected_thread_revision=expected_thread_revision,
+        ))
+        response = await self._post("/v1/runtime/identity/resolve", json=payload)
+        if persona_selection_mode == "strict":
+            validate_strict_identity_response(response, scope=payload)
+        return response
 
     async def world_state_resolve(
         self,
@@ -2396,18 +2878,22 @@ class RuntimeClient:
         surface: str,
         active_persona_id: str,
         current_user_text: str,
+        persona_selection_mode: str = "legacy", persona_selection_ref: str | None = None,
+        runtime_session_id: str | None = None, runtime_turn_id: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
-        return await self._post(
-            "/v1/capabilities/match",
-            json={
-                "request_id": request_id,
-                "owner_id": owner_id,
-                "conversation_id": conversation_id,
-                "surface": surface,
-                "active_persona_id": active_persona_id,
-                "current_user_text": current_user_text,
-            },
-        )
+        payload = {"request_id": request_id, "owner_id": owner_id,
+                   "conversation_id": conversation_id, "surface": surface,
+                   "active_persona_id": active_persona_id, "current_user_text": current_user_text}
+        payload.update(_strict_persona_request_fields(
+            persona_selection_mode, runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id, persona_selection_ref=persona_selection_ref,
+            expected_thread_revision=expected_thread_revision, selection_required=True,
+        ))
+        response = await self._post("/v1/capabilities/match", json=payload)
+        if persona_selection_mode == "strict":
+            validate_strict_capability_response(response, scope=payload, discovery=False)
+        return response
 
     async def discover_capabilities(
         self,
@@ -2417,17 +2903,22 @@ class RuntimeClient:
         conversation_id: str,
         surface: str,
         active_persona_id: str,
+        persona_selection_mode: str = "legacy", persona_selection_ref: str | None = None,
+        runtime_session_id: str | None = None, runtime_turn_id: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
-        return await self._post(
-            "/v1/capabilities/discover",
-            json={
-                "request_id": request_id,
-                "owner_id": owner_id,
-                "conversation_id": conversation_id,
-                "surface": surface,
-                "active_persona_id": active_persona_id,
-            },
-        )
+        payload = {"request_id": request_id, "owner_id": owner_id,
+                   "conversation_id": conversation_id, "surface": surface,
+                   "active_persona_id": active_persona_id}
+        payload.update(_strict_persona_request_fields(
+            persona_selection_mode, runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id, persona_selection_ref=persona_selection_ref,
+            expected_thread_revision=expected_thread_revision, selection_required=True,
+        ))
+        response = await self._post("/v1/capabilities/discover", json=payload)
+        if persona_selection_mode == "strict":
+            validate_strict_capability_response(response, scope=payload, discovery=True)
+        return response
 
     async def action_authority(
         self,
@@ -2740,6 +3231,8 @@ class RuntimeClient:
         current_user_text: str | None = None,
         recent_messages: list[dict[str, Any]] | None = None,
         surface_metadata_json: dict[str, Any] | None = None,
+        persona_selection_mode: str = "legacy", persona_selection_ref: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -2765,7 +3258,20 @@ class RuntimeClient:
             payload["recent_messages"] = recent_messages
         if surface_metadata_json is not None:
             payload["surface_metadata_json"] = surface_metadata_json
-        return await self._post("/v1/runtime/persona-containment/evaluate", json=payload)
+        payload.update(_strict_persona_request_fields(
+            persona_selection_mode, runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id, persona_selection_ref=persona_selection_ref,
+            expected_thread_revision=expected_thread_revision, selection_required=True,
+        ))
+        response = await self._post("/v1/runtime/persona-containment/evaluate", json=payload)
+        if persona_selection_mode == "strict":
+            decision = validate_strict_persona_selection(response, scope=payload)
+            if (decision["selection_ref"] != persona_selection_ref
+                    or (active_persona_id is not None
+                        and decision["active_persona_id"] != active_persona_id)):
+                raise RuntimeError("strict_persona_context_mismatch")
+            validate_strict_containment_response(response, scope=payload)
+        return response
 
     async def evaluate_restraint(
         self,
