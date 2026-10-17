@@ -4870,15 +4870,16 @@ PY
 # Deterministic composed regression: compare unrounded p95 with exact local budgets.
 # Fixture setup, prior-history creation, and assertions are outside the timer.
 latency_measure_chat() {
-  local payload="$1" scenario="$2" measured="$3" samples="$4"
-  LATENCY_PAYLOAD="$payload" python3 - "$scenario" "$measured" "$samples" <<'PYTHON'
+  local payload="$1" scenario="$2" measured="$3" samples="$4" sample_index="$5"
+  LATENCY_PAYLOAD="$payload" python3 - "$scenario" "$measured" "$samples" "$sample_index" <<'PYTHON'
+import hashlib
 import json
 import os
 import sys
 import time
 import urllib.request
 
-scenario, measured, samples = sys.argv[1:]
+scenario, measured, samples, sample_index = sys.argv[1:]
 request = urllib.request.Request(
     "http://127.0.0.1:14361/v1/chat",
     data=os.environ["LATENCY_PAYLOAD"].encode(),
@@ -4893,49 +4894,136 @@ parsed = json.loads(body)
 if not isinstance(parsed, dict):
     raise ValueError("latency_response_invalid")
 if measured == "true":
+    request_id = parsed.get("request_id")
+    if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
+        raise ValueError("latency_request_identity_invalid")
+    # Collection and association remain outside the unchanged HTTP timer.
     with open(samples, "a", encoding="utf-8") as output:
-        output.write(json.dumps({"scenario": scenario, "elapsed_ms": elapsed_ms}) + "\n")
+        output.write(json.dumps({
+            "scenario": scenario, "sample_index": int(sample_index),
+            "request_ref": hashlib.sha256(request_id.encode()).hexdigest(),
+            "elapsed_ms": elapsed_ms,
+        }) + "\n")
 print(body.decode())
 PYTHON
 }
 
 latency_regression_summary() {
-  python3 - "$1" <<'PYTHON'
+  python3 - "$1" "${COMPOSED_LATENCY_POLICY:-enforce}" "${COMPOSED_SMOKE_LOG_DIR:-}" \
+    "$(git -C "$ROOT" rev-parse HEAD)" "$(git -C "$CR" rev-parse HEAD)" \
+    "$(git -C "$BMS" rev-parse HEAD)" "$(git -C "$DSA" rev-parse HEAD)" <<'PYTHON'
+import hashlib
 import json
 import math
+import os
+from pathlib import Path
+import re
 import statistics
 import sys
 
+samples, policy, log_dir, co, cr, bms, dsa = sys.argv[1:]
 budgets = {"ordinary_text": 300, "evidence_governed": 350,
            "history_deterministic": 160, "history_classified": 160,
            "provider_fallback": 350}
-with open(sys.argv[1], encoding="utf-8") as source:
-    rows = [json.loads(line) for line in source]
-if len(rows) != 50 or any(set(row) != {"scenario", "elapsed_ms"} for row in rows):
-    raise ValueError("latency_sample_count_invalid")
-if any(row["scenario"] not in budgets or type(row["elapsed_ms"]) not in (int, float)
-       or not math.isfinite(row["elapsed_ms"]) or row["elapsed_ms"] <= 0 for row in rows):
-    raise ValueError("latency_sample_invalid")
-all_within = True
+
+
+def unique_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("latency_duplicate_field")
+        result[key] = value
+    return result
+
+
+def github_summary(text):
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+            output.write(text)
+
+
+try:
+    if policy not in {"enforce", "report"} or (policy == "report" and not log_dir):
+        raise ValueError("latency_reporting_configuration_invalid")
+    composition = {"co": co, "cr": cr, "bms": bms, "dsa": dsa}
+    if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in composition.values()):
+        raise ValueError("latency_revision_invalid")
+    if Path(samples).stat().st_size > 65536:
+        raise ValueError("latency_evidence_oversized")
+    raw = Path(samples).read_bytes()
+    rows = [json.loads(line, object_pairs_hook=unique_keys) for line in raw.splitlines()]
+    fields = {"scenario", "sample_index", "request_ref", "elapsed_ms"}
+    if len(rows) != 50 or any(type(row) is not dict or set(row) != fields for row in rows):
+        raise ValueError("latency_sample_count_invalid")
+    expected = [(scenario, index) for scenario in budgets for index in range(1, 11)]
+    if any(type(row["sample_index"]) is not int for row in rows) or [
+        (row["scenario"], row["sample_index"]) for row in rows
+    ] != expected:
+        raise ValueError("latency_sample_order_invalid")
+    if any(type(row["elapsed_ms"]) not in (int, float)
+           or not math.isfinite(row["elapsed_ms"]) or row["elapsed_ms"] <= 0
+           or not isinstance(row["request_ref"], str)
+           or re.fullmatch(r"[0-9a-f]{64}", row["request_ref"]) is None for row in rows):
+        raise ValueError("latency_sample_invalid")
+    if len({row["request_ref"] for row in rows}) != 50:
+        raise ValueError("latency_duplicate_request")
+except (OSError, ValueError, TypeError, OverflowError):
+    github_summary("## Latency diagnostic integrity: FAIL (BLOCKING)\n\n"
+                   "Missing or invalid benchmark evidence; no performance acceptance.\n")
+    raise
+
+results = []
 for scenario, budget in budgets.items():
     values = [row["elapsed_ms"] for row in rows if row["scenario"] == scenario]
-    if len(values) != 10:
-        raise ValueError("latency_scenario_count_invalid")
     ordered = sorted(values)
     # Type-7 percentile: linear interpolation at (n-1)*0.95; no sample discarded.
     position = (len(ordered) - 1) * 0.95
     lower = math.floor(position)
     p95 = ordered[lower] + (ordered[math.ceil(position)] - ordered[lower]) * (position - lower)
     within = p95 <= budget
-    all_within = all_within and within
+    results.append({"scenario": scenario, "samples": 10, "min_ms": min(values),
+                    "p50_ms": statistics.median(values), "p95_ms": p95,
+                    "max_ms": max(values), "budget_ms": budget, "within_budget": within})
     print(f"Latency regression {scenario}: samples=10 min_ms={min(values):.3f} "
           f"p50_ms={statistics.median(values):.3f} p95_ms={p95:.3f} "
           f"max_ms={max(values):.3f} budget_ms={budget} pass={str(within).lower()}")
     print(f"Latency samples {scenario}: elapsed_ms=" + json.dumps(values, separators=(",", ":")))
+all_within = all(result["within_budget"] for result in results)
 print("Persistent transport latency regression: scenarios=5 budgets_"
       f"pass={str(all_within).lower()} behavioral_parity=true")
+status = "pass" if all_within else "fail"
+report = {"schema_version": 1, "policy": policy, "composition": composition,
+          "within_budgets": all_within, "behavioral_parity": True, "scenarios": results,
+          "samples_sha256": hashlib.sha256(raw).hexdigest()}
+if log_dir:
+    directory = Path(log_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "latency-samples.jsonl").write_bytes(raw)
+    temporary = directory / "latency-regression.json.tmp"
+    temporary.write_text(json.dumps(report, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(directory / "latency-regression.json")
+label = "NONBLOCKING" if policy == "report" else "ENFORCED"
+summary = f"## Latency performance status: {status.upper()} ({label})\n\n"
+summary += "Budget misses remain performance failures; functional and integrity checks block CI.\n\n"
+summary += "| Scenario | p95 ms | Unchanged budget ms | Result |\n|---|---:|---:|---|\n"
+for result in results:
+    verdict = "PASS" if result["within_budget"] else "FAIL"
+    summary += (f"| {result['scenario']} | {result['p95_ms']:.3f} | "
+                f"{result['budget_ms']} | {verdict} |\n")
+summary += "\nExact tested revisions:\n\n" + "\n".join(
+    f"- {name.upper()}: `{sha}`" for name, sha in composition.items()) + "\n"
 if not all_within:
-    raise ValueError("latency_budget_exceeded")
+    summary += "\n**Performance acceptance NOT achieved.**\n"
+github_summary(summary)
+# Only validated evidence and completed behavioral assertions publish this output.
+if os.environ.get("GITHUB_OUTPUT"):
+    with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+        output.write(f"latency_status={status}\n")
+if not all_within:
+    if policy == "enforce":
+        raise ValueError("latency_budget_exceeded")
+    print("::warning::NONBLOCKING latency performance FAIL: unchanged p95 budgets exceeded; "
+          "functional integration checks continue. Performance acceptance NOT achieved.")
 PYTHON
 }
 
@@ -4949,6 +5037,11 @@ run_transport_latency_regression() {
   local saved_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
   samples="$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl"
   : > "$samples"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    rm -f "$COMPOSED_SMOKE_LOG_DIR/latency-regression.json" \
+      "$COMPOSED_SMOKE_LOG_DIR/latency-samples.jsonl"
+  fi
   for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback; do
     # Preserve the established evidence/history fixture policies. Ordinary and
     # fallback use the existing fully governed timing fixture configuration.
@@ -4998,7 +5091,7 @@ run_transport_latency_regression() {
           else {} end')"
       echo "Latency regression progress: scenario=$scenario turn=$index of=12"
       measured=false; [ "$index" -le 2 ] || measured=true
-      response="$(latency_measure_chat "$payload" "$scenario" "$measured" "$samples")"
+      response="$(latency_measure_chat "$payload" "$scenario" "$measured" "$samples" "$((index - 2))")"
       request="$(jq -er .request_id <<<"$response")"; answer="$(jq -er .answer <<<"$response")"
       trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
       diagnostics="$(runtime_diagnostics_from_trace "$trace")"

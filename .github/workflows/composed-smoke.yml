@@ -126,13 +126,19 @@ jobs:
           chat-orchestrator:history-root-lineage-v2-test python -m pytest -q
 
       - name: Run focused actual-service evidence proof
+        id: focused_evidence
         if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario != 'g2-deferred'
         working-directory: chat-orchestrator
         env:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
           EVIDENCE_ACQUISITION_ONLY: "1"
           EVIDENCE_SCENARIO: ${{ github.event_name == 'workflow_dispatch' && inputs.evidence_scenario || 'all' }}
-        run: make composed-smoke
+          COMPOSED_LATENCY_POLICY: report
+        run: |
+          # Clear only this invocation's latency evidence, including on early functional failure.
+          rm -f "$COMPOSED_SMOKE_LOG_DIR/latency-regression.json" \
+            "$COMPOSED_SMOKE_LOG_DIR/latency-samples.jsonl"
+          make composed-smoke
 
       - name: Run formatted presentation persistence proof
         if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario != 'g2-deferred'
@@ -217,19 +223,31 @@ jobs:
           COMPOSED_SMOKE_LOG_DIR: /tmp/chat-orchestrator-bounded-logs
         run: make composed-smoke
 
-      - name: Record successful tested composition
+      - name: Record tested composition with explicit performance status
         if: github.event_name != 'workflow_dispatch' || inputs.evidence_scenario == 'all'
+        env:
+          LATENCY_STATUS: ${{ steps.focused_evidence.outputs.latency_status }}
         run: |
           co="$(git -C chat-orchestrator rev-parse HEAD)"
           cr="$(git -C cognitive-runtime rev-parse HEAD)"
           bms="$(git -C basic-memory-store rev-parse HEAD)"
           dsa="$(git -C data-source-aggregator rev-parse HEAD)"
-          composition="CCP_TESTED_COMPOSITION co=$co cr=$cr bms=$bms dsa=$dsa"
+          case "$LATENCY_STATUS" in
+            pass)
+              composition="CCP_TESTED_COMPOSITION co=$co cr=$cr bms=$bms dsa=$dsa"
+              heading="Tested CCP composition — functional and latency checks passed"
+              ;;
+            fail)
+              composition="CCP_FUNCTIONAL_TESTED_COMPOSITION co=$co cr=$cr bms=$bms dsa=$dsa latency=FAIL performance_acceptance=false"
+              heading="Functionally tested CCP composition — latency FAIL (NONBLOCKING); performance NOT accepted"
+              ;;
+            *) echo "Missing validated latency status; composition not recorded" >&2; exit 1 ;;
+          esac
           printf '%s\n' "$composition"
-          printf '## Tested CCP composition\n\n`%s`\n' "$composition" >> "$GITHUB_STEP_SUMMARY"
+          printf '## %s\n\n`%s`\n' "$heading" "$composition" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload bounded failure diagnostics
-        if: failure()
+      - name: Upload bounded failure and latency diagnostics
+        if: failure() || steps.focused_evidence.outputs.latency_status == 'fail'
         uses: actions/upload-artifact@v4
         with:
           name: bounded-composed-smoke-diagnostics
