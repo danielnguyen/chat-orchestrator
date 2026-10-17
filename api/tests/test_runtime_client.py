@@ -5013,3 +5013,127 @@ async def test_relationship_client_legacy_payload_unchanged():
     assert await client.relationship_select(**scope) == {"legacy": True}
     assert http.posts == [("/v1/relationships/select", scope)]
     await client.close()
+
+
+def _strict_world_state_fixture(identity=None, *, empty=False, redacted=False):
+    selection = (identity or _strict_identity_fixture())["persona_selection"]
+    claim = {
+        "world_state_claim_id": "wsclaim_fixture", "owner_id": selection["owner_id"],
+        "entity_id": "repository_fixture", "entity_type": "repository",
+        "domain": "active_repository", "attribute": "branch", "value_json": "VALIDATED-BRANCH",
+        "value_redacted": redacted, "value_digest": "wsdigest_fixture",
+        "source_type": "user_report", "source_ref": "fixture", "confidence": 0.9,
+        "freshness_state": "fresh", "effective_freshness_state": "fresh",
+        "state_authority": "observed_user_report", "confirmation_policy": "none",
+        "sensitivity": "restricted" if redacted else "medium", "scope_labels": [],
+        "observed_at": "2026-10-01T00:00:00+00:00", "created_at": "2026-10-01T00:00:00+00:00",
+        "updated_at": "2026-10-01T00:00:00+00:00", "expires_at": None,
+        "last_verified_at": None, "superseded_by_claim_id": None, "conflict_claim_ids": [],
+    }
+    if redacted:
+        claim["value_json"] = None
+    return {
+        "included_claims": [] if empty else [claim], "excluded_claim_summaries": [],
+        "prompt_content": (None if empty else "World state:\n- active_repository/branch: "
+                           + ('[REDACTED]' if redacted else '"VALIDATED-BRANCH"') + " (fresh)"),
+        "selection_contract": "strict_turn", "persona_selection_ref": selection["selection_ref"],
+        "trace": {
+            "active_persona_id": selection["active_persona_id"],
+            "allowed_domains": ["active_repository"], "included_claim_count": 0 if empty else 1,
+            "excluded_claim_count": 0, "stale_count": 0, "aging_count": 0, "expired_count": 0,
+            "conflicted_count": 0, "confirmation_required": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty,redacted", [(False, False), (True, False), (False, True)])
+async def test_strict_world_state_client_exact_binding_and_published_envelope(empty, redacted):
+    response = _strict_world_state_fixture(empty=empty, redacted=redacted)
+    http = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=_ClientFactory([http]))
+    await client.open()
+    scope = {**_relationship_scope(), "requested_domains": ["active_repository"]}
+    assert await client.world_state_resolve(**scope) == response
+    assert http.posts == [("/v1/world-state/resolve", scope)]
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("request_id", ""), ("owner_id", None), ("conversation_id", ""), ("surface", ""),
+    ("runtime_session_id", None), ("runtime_turn_id", ""), ("active_persona_id", None),
+    ("persona_selection_ref", None), ("persona_selection_ref", "not-a-reference"),
+    ("expected_thread_revision", -1), ("expected_thread_revision", True),
+])
+async def test_strict_world_state_invalid_binding_never_calls_http(field, value):
+    http = _FakeAsyncClient([])
+    client = RuntimeClient("http://runtime.local", None, client_factory=_ClientFactory([http]))
+    await client.open()
+    scope = {**_relationship_scope(), field: value}
+    with pytest.raises(ValueError, match="strict_"):
+        await client.world_state_resolve(**scope)
+    assert http.posts == []
+    await client.close()
+
+
+@pytest.mark.parametrize("field,value", [
+    (("selection_contract",), "legacy_unbound"),
+    (("persona_selection_ref",), "psel_" + "0" * 32),
+    (("trace",), {}), (("trace", "active_persona_id"), "personal_companion"),
+    (("trace", "allowed_domains"), ["active_health_observation"]),
+    (("trace", "included_claim_count"), True), (("trace", "excluded_claim_count"), 1),
+    (("trace", "stale_count"), 1), (("trace", "confirmation_required"), True),
+    (("prompt_content",), "PRIVATE-UNVALIDATED"), (("included_claims",), None),
+    (("included_claims", 0, "owner_id"), "another-owner"),
+    (("included_claims", 0, "domain"), "active_health_observation"),
+    (("included_claims", 0, "effective_freshness_state"), "expired"),
+    (("included_claims", 0, "freshness_state"), "superseded"),
+    (("included_claims", 0, "conflict_claim_ids"), ["conflict"]),
+    (("included_claims", 0, "superseded_by_claim_id"), "replacement"),
+    (("included_claims", 0, "sensitivity"), "restricted"),
+    (("included_claims", 0, "value_redacted"), True),
+    (("included_claims", 0, "value_digest"), ""),
+    (("included_claims", 0, "confidence"), float("nan")),
+    (("included_claims", 0, "observed_at"), "yesterday"),
+    (("included_claims", 0, "source_type"), "untrusted"),
+    (("included_claims", 0, "state_authority"), "untrusted"),
+    (("included_claims", 0, "scope_labels"), ["x" * 65]),
+    (("included_claims", 0, "expires_at"), "2020-01-01T00:00:00+00:00"),
+])
+def test_strict_world_state_rejects_contradictory_policy_projection(field, value):
+    from clients.runtime import validate_strict_world_state_response
+
+    response = _strict_world_state_fixture()
+    target = response
+    for key in field[:-1]:
+        target = target[key]
+    target[field[-1]] = value
+    with pytest.raises(RuntimeError, match="strict_world_state"):
+        validate_strict_world_state_response(response, scope=_relationship_scope())
+
+
+def test_strict_world_state_rejects_duplicate_claims_and_unrequested_domains():
+    from clients.runtime import validate_strict_world_state_response
+
+    response = _strict_world_state_fixture()
+    response["included_claims"] *= 2
+    with pytest.raises(RuntimeError):
+        validate_strict_world_state_response(response, scope=_relationship_scope())
+    with pytest.raises(RuntimeError):
+        validate_strict_world_state_response(_strict_world_state_fixture(), scope={
+            **_relationship_scope(), "requested_domains": ["runtime_surface"],
+        })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ReadTimeout("private"), httpx.ConnectError("private"),
+                                   (409, {"detail": "world_state_authority_rejected"}), {}])
+async def test_strict_world_state_failure_never_retries_in_legacy_mode(error):
+    http = _FakeAsyncClient([error])
+    client = RuntimeClient("http://runtime.local", "key", client_factory=_ClientFactory([http]))
+    await client.open()
+    with pytest.raises((httpx.HTTPError, RuntimeError)):
+        await client.world_state_resolve(**_relationship_scope())
+    assert len(http.posts) == 1 and http.posts[0][1]["persona_selection_mode"] == "strict"
+    await client.close()

@@ -37,6 +37,7 @@ from clients.runtime import (
     validate_strict_containment_response,
     validate_strict_identity_response,
     validate_strict_relationship_response,
+    validate_strict_world_state_response,
     validate_timing_request,
     validate_timing_response,
 )
@@ -58,6 +59,7 @@ from services.capabilities import (
     filter_capability_descriptors_for_exposure,
     parse_pending_action_confirmation,
     parse_provider_capability_request,
+    production_capability_registry,
     provider_text,
     restore_pending_action_request,
     validate_and_digest_capability_request,
@@ -3212,6 +3214,7 @@ async def _resolve_capability_registry_context(
     current_user_text: str,
     interaction_governance_trace: dict[str, Any] | None = None,
     timing_barrier: Callable[[], Awaitable[bool]] | None = None,
+    world_state_authority_claims: list[dict[str, str]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not enabled:
         return [], _capability_registry_disabled_trace()
@@ -3302,6 +3305,15 @@ async def _resolve_capability_registry_context(
                 "capability": capability,
                 "reason_codes": reason_codes,
             }
+            if matched is True and capability and world_state_authority_claims is not None:
+                reason = _strict_world_state_capability_reason(
+                    capability_by_id(capability["capability_id"]), world_state_authority_claims,
+                )
+                if reason is not None:
+                    trace.update(status="blocked", reason=reason, context_included=False)
+                    trace["match"].update(matched=False, capability=None,
+                                          matched_capability_id=None, reason_codes=[reason])
+                    return [], trace
             if matched is True and capability:
                 trace["decision_provenance"] = _action_policy_decision_provenance(
                     interaction_governance_trace,
@@ -5617,6 +5629,7 @@ async def _resolve_world_state(
     surface: str,
     runtime_session_id: str | None,
     active_persona_id: str | None,
+    strict_scope: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if runtime is None:
         return None, {
@@ -5634,12 +5647,20 @@ async def _resolve_world_state(
             surface=surface,
             runtime_session_id=runtime_session_id,
             active_persona_id=active_persona_id,
+            **({key: strict_scope[key] for key in (
+                "persona_selection_mode", "persona_selection_ref", "runtime_turn_id",
+                "expected_thread_revision",
+            )} if strict_scope is not None else {}),
         )
+        if strict_scope is not None:
+            validate_strict_world_state_response(response, scope=strict_scope)
     except Exception as e:
         return None, {
             "attempted": True,
-            "status": "failed",
+            "status": "omitted" if strict_scope is not None else "failed",
             "included": False,
+            **({"mode": "strict", "authority_status": "unverified",
+                "outcome": "omitted_optional_context"} if strict_scope is not None else {}),
             "error_type": type(e).__name__,
             "omission_reason": "world_state_unavailable",
         }
@@ -5672,6 +5693,11 @@ async def _resolve_world_state(
         }
     base_trace = {
         "attempted": True,
+        **({"mode": "strict", "authority_status": "validated",
+            "selection_contract": "strict_turn",
+            "persona_selection_ref": response["persona_selection_ref"],
+            "outcome": "validated" if included_claims else "valid_empty"}
+           if strict_scope is not None else {}),
         "active_persona_id": trace.get("active_persona_id"),
         "allowed_domains": trace.get("allowed_domains", []),
         "included_claim_count": trace.get("included_claim_count", 0),
@@ -5681,7 +5707,9 @@ async def _resolve_world_state(
         "expired_count": trace.get("expired_count", 0),
         "conflicted_count": trace.get("conflicted_count", 0),
         "confirmation_required": bool(trace.get("confirmation_required", False)),
-        "world_state_claim_refs": _bounded_world_state_claims(included_claims),
+        "world_state_claim_refs": _bounded_world_state_claims(
+            included_claims, exact=strict_scope is not None,
+        ),
     }
     if not isinstance(prompt_content, str) or not prompt_content:
         return None, {
@@ -5709,7 +5737,7 @@ async def _resolve_world_state(
     }
 
 
-def _bounded_world_state_claims(claims: Any) -> list[dict[str, str]]:
+def _bounded_world_state_claims(claims: Any, *, exact: bool = False) -> list[dict[str, str]]:
     if not isinstance(claims, list):
         return []
     refs: list[dict[str, str]] = []
@@ -5721,6 +5749,16 @@ def _bounded_world_state_claims(claims: Any) -> list[dict[str, str]]:
             or claim.get("superseded_by_claim_id") is not None
             or bool(claim.get("conflict_claim_ids"))
         ):
+            continue
+        if exact:
+            # Strict producer identifiers must never become different registry keys.
+            material = {key: claim.get(source) for key, source in (
+                ("domain", "domain"), ("entity_id", "entity_id"), ("attribute", "attribute"),
+                ("claim_id", "world_state_claim_id"), ("value_digest", "value_digest"),
+            )}
+            if all(isinstance(value, str) and 0 < len(value) <= 120
+                   for value in material.values()):
+                refs.append(material)
             continue
         domain = _sanitize_trace_string(claim.get("domain"), max_length=120)
         entity_id = _sanitize_trace_string(claim.get("entity_id"), max_length=120)
@@ -5746,6 +5784,22 @@ def _bounded_world_state_claims(claims: Any) -> list[dict[str, str]]:
         )
     unique = {item["claim_id"]: item for item in refs}
     return [unique[claim_id] for claim_id in sorted(unique)[:16]]
+
+
+def _strict_world_state_capability_reason(entry, claims):
+    if entry is None:
+        return "capability_requirements_unavailable"
+    # The executable reader uses legacy authority; migrating it is separate.
+    if entry.executor_binding == "cr_world_state_read":
+        return "strict_world_state_context_only"
+    requirements = entry.authorization_requirements.get("world_state_requirements", [])
+    if not isinstance(requirements, list) or any(not isinstance(r, dict) for r in requirements):
+        return "world_state_requirements_unavailable"
+    for requirement in requirements:
+        if not any(all(not requirement.get(key) or claim.get(key) == requirement[key]
+                       for key in ("domain", "entity_id", "attribute")) for claim in claims):
+            return "validated_world_state_required"
+    return None
 
 
 def _select_capability_claim_refs(
@@ -8919,6 +8973,7 @@ async def _prepare_strict_persona_context(*, runtime, scope, text, recent_messag
 async def _finish_strict_relationship_failure(
     *, payload, request_id, conversation_id, memory_store, runtime, work,
     turn_state_trace, runtime_session_trace, user_message, user_message_id, scope, trace, started,
+    failure_source="relationship_authority",
 ):
     """A genuine authority failure never publishes a canonical assistant result."""
     work.failure_code = "dependency_unavailable"
@@ -8944,7 +8999,7 @@ async def _finish_strict_relationship_failure(
             payload=_server_owned_response_trace_payload(
                 request_id=request_id, conversation_id=conversation_id, payload=payload,
                 profile=None, started=started, status="failed",
-                response_source="relationship_authority",
+                response_source=failure_source,
                 prompt_trace={"status": "not_requested", "layers": [], "message_count": 0,
                               "runtime_session": runtime_session_trace,
                               "turn_state": turn_state_trace},
@@ -8955,7 +9010,9 @@ async def _finish_strict_relationship_failure(
     return {
         "request_id": request_id, "conversation_id": conversation_id, "profile_name": "unresolved",
         "selected_model": "not_called", "status": "failed", "sources": [],
-        "answer": "Relationship context is unavailable. No action was taken.",
+        "answer": ("Relationship context is unavailable. No action was taken."
+                   if failure_source == "relationship_authority" else
+                   "World-state authority is unavailable. No action was taken."),
     }
 
 
@@ -9414,6 +9471,7 @@ async def orchestrate_chat(
     capability_registry_enabled: bool = False,
     strict_capability_information_enabled: bool = False,
     strict_relationship_retrieval_enabled: bool = False,
+    strict_world_state_authority_enabled: bool = False,
     claim_record_capture_enabled: bool = False,
     evidence_acquisition_enabled: bool = False,
     general_evidence_reasoning_enabled: bool | None = None,
@@ -9902,10 +9960,11 @@ async def orchestrate_chat(
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
             strict_turn_binding=(strict_capability_information_enabled
-                                 or strict_relationship_retrieval_enabled),
+                                 or strict_relationship_retrieval_enabled
+                                 or strict_world_state_authority_enabled),
         )
         strict_persona_context = {}
-        strict_relationship_scope = None
+        strict_context_scope = None
         relationship_authority_trace = None
         if strict_capability_information_enabled:
             scope = {
@@ -9930,7 +9989,8 @@ async def orchestrate_chat(
                 governance_trace=interaction_governance_trace,
                 confirmation=payload.get("capability_confirmation") is not None,
                 persona_context=(
-                    strict_persona_context if strict_relationship_retrieval_enabled else None
+                    strict_persona_context if (strict_relationship_retrieval_enabled
+                                               or strict_world_state_authority_enabled) else None
                 ),
                 dependencies_ready=bool(runtime is not None and all((
                     interaction_governance_enabled, persona_containment_enabled,
@@ -9969,7 +10029,7 @@ async def orchestrate_chat(
                 "retrieval_scope_status": "not_enforced",
                 "protected_consumer_authority": "legacy_unbound",
             }
-        elif not strict_relationship_retrieval_enabled:
+        elif not (strict_relationship_retrieval_enabled or strict_world_state_authority_enabled):
             persona_containment, persona_containment_trace = await _resolve_persona_containment(
                 runtime=runtime,
                 enabled=persona_containment_enabled,
@@ -9993,7 +10053,7 @@ async def orchestrate_chat(
                 recent_messages=recent_messages,
                 surface_metadata_json=surface_metadata_json,
             )
-        if strict_relationship_retrieval_enabled:
+        if strict_relationship_retrieval_enabled or strict_world_state_authority_enabled:
             scope = {
                 "request_id": request_id, "owner_id": payload["owner_id"],
                 "conversation_id": conversation_id, "surface": surface,
@@ -10005,13 +10065,16 @@ async def orchestrate_chat(
                 "containment_status": "not_requested", "relationship_status": "not_requested",
                 "reason_code": "governance_unavailable",
             }
-            turn_state_trace["relationship_authority"] = relationship_authority_trace
+            turn_state_trace[
+                "relationship_authority" if strict_relationship_retrieval_enabled
+                else "world_state_authority"
+            ] = relationship_authority_trace
             try:
                 if (runtime is None or not interaction_governance_enabled
                         or not persona_containment_enabled or interaction_governance is None
                         or interaction_governance_trace.get("included") is not True):
                     raise RuntimeError("strict_relationship_governance_unavailable")
-                selection, persona_containment, strict_relationship_scope = (
+                selection, persona_containment, strict_context_scope = (
                     await _prepare_strict_persona_context(
                         runtime=runtime, scope=scope, text=last_user_text,
                         recent_messages=recent_messages,
@@ -10019,10 +10082,16 @@ async def orchestrate_chat(
                         context=strict_persona_context,
                     )
                 )
+                if (strict_world_state_authority_enabled
+                        and selection["selection_reason"] == "bound_persona_unavailable"):
+                    raise RuntimeError("strict_persona_authority_unavailable")
                 persona_containment_trace = {
                     "attempted": True, "status": "included", "included": True,
                     "selection_contract": "strict_turn",
-                    "protected_consumer_authority": "relationship_only",
+                    "protected_consumer_authority": (
+                        "relationship_only" if strict_relationship_retrieval_enabled
+                        else "world_state_only"
+                    ),
                     "retrieval_scope_status": "not_enforced",
                 }
                 relationship_authority_trace["relationship_status"] = "requested"
@@ -10031,13 +10100,16 @@ async def orchestrate_chat(
                     conversation_id=conversation_id, surface=surface,
                     runtime_session_id=scope["runtime_session_id"],
                     persona_containment=persona_containment,
-                    strict_scope=strict_relationship_scope,
+                    strict_scope=(strict_context_scope
+                                  if strict_relationship_retrieval_enabled else None),
                 )
                 if mandatory_policy.containment_policy is None:
                     raise RuntimeError("strict_relationship_policy_invalid")
                 persona_containment_trace.update(mandatory_policy.validation_trace)
                 relationship_authority_trace.update(
-                    status="validated", relationship_status="validated",
+                    status="validated",
+                    relationship_status=("validated" if strict_relationship_retrieval_enabled
+                                         else "legacy_unbound"),
                     reason_code="authority_validated",
                 )
             except Exception:
@@ -10056,6 +10128,9 @@ async def orchestrate_chat(
                     runtime_session_trace=runtime_session_trace, user_message=current_user_message,
                     user_message_id=current_user_message_id, scope=scope,
                     trace=relationship_authority_trace,
+                    failure_source=("relationship_authority"
+                                    if strict_relationship_retrieval_enabled
+                                    else "world_state_authority"),
                     started=started,
                 )
         elif persona_containment_enabled:
@@ -11354,7 +11429,7 @@ async def orchestrate_chat(
                             intervention_text, failed=False, response_source="interrupt_policy",
                         )
             interrupt_trace["selection_reason"] = selection_reason
-        if strict_relationship_retrieval_enabled:
+        if strict_relationship_retrieval_enabled or strict_world_state_authority_enabled:
             # Carry the same validated CR response; never resolve a replacement persona.
             runtime_identity, runtime_identity_trace = _runtime_identity_result(
                 strict_persona_context["identity_response"],
@@ -11376,11 +11451,14 @@ async def orchestrate_chat(
             surface=surface,
             runtime_session_id=runtime_session_trace.get("runtime_session_id"),
             active_persona_id=runtime_identity_trace.get("active_persona_id"),
+            **({"strict_scope": strict_context_scope}
+               if strict_world_state_authority_enabled else {}),
         )
         world_state_claim_refs = world_state_trace.pop("world_state_claim_refs", [])
-        if strict_relationship_retrieval_enabled and world_state_trace.get("active_persona_id") != (
-            strict_relationship_scope["active_persona_id"]
-        ):
+        if (strict_relationship_retrieval_enabled and not strict_world_state_authority_enabled
+                and world_state_trace.get("active_persona_id") != (
+            strict_context_scope["active_persona_id"]
+        )):
             # This remains an optional legacy consumer, never strict world-state authority.
             world_state, world_state_claim_refs = None, []
             world_state_trace = {
@@ -11418,6 +11496,13 @@ async def orchestrate_chat(
             capability_registry_trace = _capability_registry_base_trace(
                 enabled=True, reason="strict_information_not_selected",
             )
+        elif (strict_world_state_authority_enabled and pending_continuation is not None
+              and _strict_world_state_capability_reason(
+                  capability_by_id(pending_continuation.capability_id), world_state_claim_refs,
+              ) is not None):
+            capability_registry_trace = _capability_registry_base_trace(
+                enabled=capability_registry_enabled, reason="validated_world_state_required",
+            )
         elif pending_continuation is not None:
             capability_registry_messages, capability_registry_trace = (
                 await _resolve_capability_continuation_policy(
@@ -11450,6 +11535,8 @@ async def orchestrate_chat(
                 active_persona_id=runtime_identity_trace.get("active_persona_id"),
                 current_user_text=last_user_text,
                 interaction_governance_trace=interaction_governance_trace,
+                world_state_authority_claims=(world_state_claim_refs
+                                              if strict_world_state_authority_enabled else None),
             )
             )
         if timing_stop_response is not None:
@@ -11987,6 +12074,22 @@ async def orchestrate_chat(
                 and isinstance(matched_capability_id, str)
                 else None
             )
+            blocked_world_capabilities = {}
+            if strict_world_state_authority_enabled:
+                candidates = production_capability_registry()
+                blocked_world_capabilities = {
+                    entry.capability_id: reason for entry in candidates
+                    if (reason := _strict_world_state_capability_reason(
+                        entry, world_state_claim_refs,
+                    )) is not None
+                }
+                allowed_capability_ids = [entry.capability_id for entry in candidates
+                                          if entry.capability_id not in blocked_world_capabilities
+                                          and (allowed_capability_ids is None
+                                               or entry.capability_id in allowed_capability_ids)]
+                world_state_trace["downstream_capability_blocked"] = bool(
+                    blocked_world_capabilities
+                )
             (
                 capability_descriptors,
                 capability_exposure_trace,
@@ -12006,6 +12109,10 @@ async def orchestrate_chat(
                 connector_registry=connector_registry,
                 allowed_capability_ids=allowed_capability_ids,
             )
+            if blocked_world_capabilities:
+                capability_exposure_trace["world_state_blocked_reasons"] = (
+                    blocked_world_capabilities
+                )
 
         handoff = build_assistant_handoff(
             request_id=request_id,

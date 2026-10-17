@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from collections.abc import Callable
 from datetime import datetime
@@ -1544,6 +1545,136 @@ def validate_strict_containment_response(response, *, scope, selection=None):
     return result
 
 
+def validate_strict_world_state_response(response, *, scope):
+    """Check CR's projection, not a second persona/domain authorization policy.
+
+    CR binds the request to committed turn authority and revalidates it before
+    publication. Its response echoes only the selection reference and persona.
+    Concrete domains below are wire vocabulary, never grants from containment.
+    """
+    invalid = "strict_world_state_response_invalid"
+
+    def require(condition):
+        if not condition:
+            raise RuntimeError(invalid)
+
+    domains = {
+        "active_task", "active_project", "active_repository", "active_artifact",
+        "active_tool_session", "active_external_system", "active_travel_window",
+        "active_device_context", "active_health_observation", "pending_action", "runtime_surface",
+    }
+    freshness = {"fresh", "aging", "stale", "unknown", "expired", "conflicted", "superseded"}
+    require(isinstance(response, dict) and set(response) == {
+        "included_claims", "excluded_claim_summaries", "prompt_content", "trace",
+        "selection_contract", "persona_selection_ref",
+    })
+    require(response["selection_contract"] == "strict_turn"
+            and response["persona_selection_ref"] == scope["persona_selection_ref"])
+    trace = response["trace"]
+    require(isinstance(trace, dict) and set(trace) == {
+        "active_persona_id", "allowed_domains", "included_claim_count", "excluded_claim_count",
+        "stale_count", "aging_count", "expired_count", "conflicted_count", "confirmation_required",
+    })
+    require(trace["active_persona_id"] == scope["active_persona_id"])
+    allowed = trace["allowed_domains"]
+    require(isinstance(allowed, list) and len(allowed) <= 16
+            and all(isinstance(d, str) and d in domains for d in allowed)
+            and len(allowed) == len(set(allowed)))
+    require(not scope.get("requested_domains") or set(allowed) <= set(scope["requested_domains"]))
+    included, excluded = response["included_claims"], response["excluded_claim_summaries"]
+    require(isinstance(included, list) and isinstance(excluded, list)
+            and len(included) <= 128 and len(excluded) <= 256)
+    seen, lines = set(), []
+    for claims, selected in ((included, True), (excluded, False)):
+        for claim in claims:
+            require(isinstance(claim, dict))
+            for key, bound in (("world_state_claim_id", 120), ("entity_id", 120),
+                               ("domain", 64), ("attribute", 64)):
+                require(_bounded_runtime_identifier(claim.get(key)) and len(claim[key]) <= bound)
+            require(claim["world_state_claim_id"] not in seen)
+            seen.add(claim["world_state_claim_id"])
+            require(claim.get("freshness_state") in freshness
+                    and claim.get("effective_freshness_state") in freshness
+                    and claim.get("sensitivity") in {"low", "medium", "high", "restricted"})
+            conflicts = claim.get("conflict_claim_ids")
+            require(isinstance(conflicts, list) and len(conflicts) <= 16
+                    and all(_bounded_runtime_identifier(item) for item in conflicts)
+                    and len(set(conflicts)) == len(conflicts))
+            superseded = claim.get("superseded_by_claim_id")
+            require(superseded is None or _bounded_runtime_identifier(superseded))
+            if not selected:
+                require(_bounded_runtime_identifier(claim.get("reason")))
+                continue
+            require(claim.get("owner_id") == scope["owner_id"] and claim["domain"] in allowed
+                    and not conflicts and superseded is None
+                    and claim["freshness_state"] not in {"expired", "conflicted", "superseded"}
+                    and claim["effective_freshness_state"] in {"fresh", "aging", "stale", "unknown"}
+                    )
+            require(_bounded_runtime_identifier(claim.get("value_digest"))
+                    and _bounded_runtime_identifier(claim.get("entity_type"))
+                    and isinstance(claim.get("source_ref"), str)
+                    and 0 < len(claim["source_ref"]) <= 240
+                    and type(claim.get("confidence")) in {float, int}
+                    and math.isfinite(claim["confidence"]) and 0 <= claim["confidence"] <= 1)
+            require(len(claim["entity_type"]) <= 80 and claim.get("source_type") in {
+                "user_report", "tool_output", "integration_event", "sensor_update",
+                "repository_inspection", "calendar_event", "automation_workflow",
+                "model_inference", "artifact_metadata", "runtime_update",
+            } and claim.get("state_authority") in {
+                "observed_user_report", "verified_tool_output", "trusted_integration_event",
+                "derived_from_multiple_sources", "model_inferred", "unverified_assumption",
+            })
+            labels = claim.get("scope_labels")
+            require(isinstance(labels, list) and len(labels) <= 12
+                    and all(_bounded_runtime_identifier(label) and len(label) <= 64
+                            for label in labels))
+            require(type(claim.get("value_redacted")) is bool
+                    and claim["value_redacted"] == (claim["sensitivity"] in {"high", "restricted"})
+                    and "value_json" in claim
+                    and (not claim["value_redacted"] or claim["value_json"] is None))
+            require(claim.get("confirmation_policy") in {
+                "none", "confirm_before_action", "confirm_before_high_impact_action",
+                "reverify_before_use",
+            })
+            for key in ("observed_at", "created_at", "updated_at",
+                        "last_verified_at", "expires_at"):
+                value = claim.get(key)
+                require((value is None and key in {"last_verified_at", "expires_at"})
+                        or (isinstance(value, str) and len(value) <= 64))
+                if value is not None:
+                    try:
+                        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except ValueError as exc:
+                        raise RuntimeError(invalid) from exc
+                    require(parsed.tzinfo is not None)
+                    if key == "expires_at":
+                        require(parsed > datetime.now(parsed.tzinfo))
+            suffix = claim["effective_freshness_state"]
+            if suffix in {"aging", "stale"}:
+                suffix += f"; last_known; confirmation_policy={claim['confirmation_policy']}"
+            try:
+                value = "[REDACTED]" if claim["value_redacted"] else json.dumps(
+                    claim["value_json"], sort_keys=True, allow_nan=False,
+                )
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError(invalid) from exc
+            require(len(value) <= 16000)
+            lines.append(f"- {claim['domain']}/{claim['attribute']}: {value} ({suffix})")
+    expected = "World state:\n" + "\n".join(lines) if lines else None
+    require(response["prompt_content"] == expected and (expected is None or len(expected) <= 32000))
+    counts = {
+        "included_claim_count": len(included), "excluded_claim_count": len(excluded),
+        **{f"{state}_count": sum(c["effective_freshness_state"] == state for c in claims)
+           for state, claims in (("stale", included), ("aging", included),
+                                 ("expired", excluded), ("conflicted", excluded))},
+    }
+    require(all(type(trace[key]) is int and trace[key] == value for key, value in counts.items()))
+    require(type(trace["confirmation_required"]) is bool and trace["confirmation_required"] == any(
+        claim["confirmation_policy"] != "none" for claim in included
+    ))
+    return response
+
+
 def validate_strict_relationship_response(response, *, scope):
     """Validate the published consumer envelope, not a second relationship policy.
 
@@ -2855,6 +2986,10 @@ class RuntimeClient:
         runtime_session_id: str | None = None,
         active_persona_id: str | None = None,
         requested_domains: list[str] | None = None,
+        persona_selection_mode: str = "legacy",
+        persona_selection_ref: str | None = None,
+        runtime_turn_id: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -2868,7 +3003,28 @@ class RuntimeClient:
             payload["active_persona_id"] = active_persona_id
         if requested_domains:
             payload["requested_domains"] = requested_domains
-        return await self._post("/v1/world-state/resolve", json=payload)
+        payload.update(_strict_persona_request_fields(
+            persona_selection_mode, runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id, persona_selection_ref=persona_selection_ref,
+            expected_thread_revision=expected_thread_revision, selection_required=True,
+        ))
+        if persona_selection_mode == "strict":
+            if (any(not _bounded_runtime_identifier(payload.get(key)) for key in (
+                "request_id", "owner_id", "conversation_id", "surface", "active_persona_id",
+            )) or len(surface) > 64 or not isinstance(persona_selection_ref, str)
+                    or len(persona_selection_ref) != 37
+                    or not persona_selection_ref.startswith("psel_")
+                    or any(c not in "0123456789abcdef" for c in persona_selection_ref[5:])):
+                raise ValueError("strict_persona_binding_required")
+            if requested_domains is not None and (
+                not isinstance(requested_domains, list) or len(requested_domains) > 12
+                or any(not _bounded_runtime_identifier(d) or len(d) > 64 for d in requested_domains)
+            ):
+                raise ValueError("strict_world_state_domains_invalid")
+        response = await self._post("/v1/world-state/resolve", json=payload)
+        if persona_selection_mode == "strict":
+            validate_strict_world_state_response(response, scope=payload)
+        return response
 
     async def world_state_claim_verify(
         self,

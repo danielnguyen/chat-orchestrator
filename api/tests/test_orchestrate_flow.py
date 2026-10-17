@@ -41378,3 +41378,323 @@ async def test_relationship_gate_only_uses_server_setting(monkeypatch, enabled):
     assert response.status_code == 200
     assert calls[0]["strict_relationship_retrieval_enabled"] is enabled
     assert "strict_relationship_retrieval_enabled" not in calls[0]["payload"]
+
+
+class StrictWorldStateRuntime(StrictRelationshipRuntime):
+    def __init__(self, *, world_failure=None, world_mutation=None, world_empty=False, **kwargs):
+        super().__init__(**kwargs)
+        self.capability_authorization_calls = []
+        self.world_failure, self.world_mutation, self.world_empty = (
+            world_failure, world_mutation, world_empty,
+        )
+
+    async def authorize_capability(self, **kwargs):
+        self.capability_authorization_calls.append(kwargs)
+        return {"result": {"allowed": True, "decision_code": "allowed",
+                           "reason_codes": ["allowed"], "relationship_ids_used": [],
+                           "world_state_claim_ids_used": []}}
+
+    async def match_capability(self, **kwargs):
+        if kwargs.get("persona_selection_mode") == "strict":
+            return await super().match_capability(**kwargs)
+        return await FakeRuntime.match_capability(self, **kwargs)
+
+    async def relationship_select(self, **kwargs):
+        if kwargs.get("persona_selection_mode") == "strict":
+            return await super().relationship_select(**kwargs)
+        assert kwargs["active_persona_id"] == self.selected_persona
+        return await FakeRuntime.relationship_select(self, **kwargs)
+
+    async def world_state_resolve(self, **kwargs):
+        from test_runtime_client import _strict_world_state_fixture
+
+        assert self.selection_committed and self.containment_committed
+        expected = self.strict_identity["persona_selection"]
+        assert {key: kwargs[key] for key in self.strict_scope} == self.strict_scope
+        assert kwargs["persona_selection_mode"] == "strict"
+        assert kwargs["persona_selection_ref"] == expected["selection_ref"]
+        assert kwargs["expected_thread_revision"] == expected["thread_revision"]
+        assert kwargs["active_persona_id"] == expected["active_persona_id"]
+        self.world_state_calls.append(kwargs)
+        self.call_order.append("strict_world_state")
+        if self.world_failure:
+            raise self.world_failure
+        response = _strict_world_state_fixture(self.strict_identity, empty=self.world_empty)
+        if self.selected_persona == "general_assistant":
+            response = _strict_world_state_fixture(self.strict_identity, empty=True)
+            response["trace"]["allowed_domains"] = [
+                "active_task", "pending_action", "runtime_surface",
+            ]
+        if self.world_mutation:
+            target = response
+            for key in self.world_mutation[0][:-1]:
+                target = target[key]
+            target[self.world_mutation[0][-1]] = self.world_mutation[1]
+        return response
+
+
+async def _run_world_state_turn(tmp_path, *, runtime=None, memory=None, **options):
+    runtime = runtime or StrictWorldStateRuntime()
+    options.setdefault("payload", _base_payload(
+        conversation_id="conv-1", surface="dev",
+        messages=[{"role": "user", "content": "What do we know about this project?"}],
+    ))
+    return await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory or FakeMemoryStore(),
+        persona_containment_enabled=True, strict_world_state_authority_enabled=True, **options,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relationship,information", [(False, False), (True, False),
+                                                      (False, True), (True, True)])
+@pytest.mark.parametrize("empty", [False, True])
+async def test_strict_world_state_shared_turn_sequence_and_gate_combinations(
+    tmp_path, relationship, information, empty,
+):
+    runtime = StrictWorldStateRuntime(world_empty=empty)
+    out, runtime, provider, memory = await _run_world_state_turn(
+        tmp_path, runtime=runtime, strict_relationship_retrieval_enabled=relationship,
+        strict_capability_information_enabled=information, capability_registry_enabled=information,
+    )
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert len(runtime.identity_calls) == len(runtime.persona_containment_calls) == 1
+    order = [runtime.call_order.index(step) for step in (
+        "start_turn", "interaction_governance", "strict_selection", "strict_containment",
+        "strict_world_state", "answer_generation", "assistant_persistence",
+        "complete_turn:completed",
+    )]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    assert memory.retrieve_calls and len(runtime.world_state_calls) == 1
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["world_state"]["authority_status"] == "validated"
+    assert trace["world_state"]["outcome"] == ("valid_empty" if empty else "validated")
+    prompt = str(provider.calls)
+    assert ("VALIDATED-BRANCH" in prompt) is not empty
+    assert memory.work["state"] == "completed"
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+    assert memory.added_messages[-1]["content"] == out["answer"]
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface,proposal", [("dev", "personal_companion"),
+                                             ("web", "technical_architect"),
+                                             ("unknown", "technical_architect")])
+async def test_strict_world_state_proposals_and_surface_restrictions(tmp_path, surface, proposal):
+    persona = "technical_architect" if surface == "dev" else "general_assistant"
+    runtime = StrictWorldStateRuntime(persona=persona, proposal=proposal)
+    out, runtime, provider, memory = await _run_world_state_turn(
+        tmp_path, runtime=runtime, payload=_base_payload(conversation_id="conv-1", surface=surface),
+    )
+    assert out["status"] == "ok"
+    assert runtime.world_state_calls[0]["active_persona_id"] == persona
+    assert runtime.strict_identity["persona_selection"]["contextual_activation"] is False
+    assert ("VALIDATED-BRANCH" in str(provider.calls)) == (surface == "dev")
+    assert memory.work["state"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,mutation", [
+    (httpx.ReadTimeout("PRIVATE"), None),
+    (httpx.HTTPStatusError("PRIVATE", request=httpx.Request("POST", "http://runtime"),
+                           response=httpx.Response(409)), None),
+    (None, (("selection_contract",), "legacy_unbound")),
+    (None, (("persona_selection_ref",), "wrong")),
+    (None, (("trace", "included_claim_count"), 8)),
+    (None, (("included_claims", 0, "owner_id"), "other-owner")),
+    (None, (("prompt_content",), "PRIVATE-WORLD")),
+])
+async def test_strict_world_state_optional_omission_has_no_content_or_claim_leak(
+    tmp_path, failure, mutation,
+):
+    runtime = StrictWorldStateRuntime(world_failure=failure, world_mutation=mutation)
+    out, runtime, provider, memory = await _run_world_state_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert len(runtime.world_state_calls) == 1  # No legacy retry.
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["world_state"]["authority_status"] == "unverified"
+    assert trace["world_state"]["outcome"] == "omitted_optional_context"
+    assert trace["world_state"]["included"] is False
+    assert "VALIDATED-BRANCH" not in str(provider.calls)
+    assert "PRIVATE" not in str(trace) and "PRIVATE-WORLD" not in out["answer"]
+    assert all(not c.get("selected_world_state_claim_ids")
+               for c in runtime.capability_authorization_calls)
+    assert memory.work["state"] == "completed" and memory.retrieve_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage,field", [
+    (stage, key) for stage in ("identity", "containment")
+    for key in ("request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                "runtime_turn_id", "selection_ref", "thread_revision", "active_persona_id")
+])
+async def test_strict_world_state_mandatory_authority_failure_stops_protected_consumers(
+    tmp_path, stage, field,
+):
+    runtime = StrictWorldStateRuntime(mutation=(
+        stage, ("persona_selection", field), 99 if field == "thread_revision" else "wrong",
+    ))
+    out, runtime, provider, memory = await _run_world_state_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "failed" and provider.calls == []
+    assert memory.retrieve_calls == []
+    assert runtime.world_state_calls == runtime.relationship_calls == []
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert not any(m["role"] == "assistant" for m in memory.added_messages)
+    assert memory.work["state"] == "failed"
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation", [False, True])
+async def test_strict_world_state_preserves_information_early_return(tmp_path, confirmation):
+    runtime = StrictWorldStateRuntime()
+    runtime.information_reason = "matched"
+    payload = _base_payload(conversation_id="conv-1", surface="dev")
+    if confirmation:
+        payload["capability_confirmation"] = {"confirmed": True, "challenge_ref": "unissued"}
+    out, runtime, provider, memory = await _run_world_state_turn(
+        tmp_path, runtime=runtime, payload=payload, strict_relationship_retrieval_enabled=True,
+        strict_capability_information_enabled=True, capability_registry_enabled=True,
+    )
+    assert out["status"] == ("failed" if confirmation else "ok")
+    assert not provider.calls and not runtime.world_state_calls and not runtime.relationship_calls
+    assert memory.work["state"] == "completed"
+    assert not runtime.strict_forbidden_calls
+
+
+@pytest.mark.parametrize("missing", ["cognitive_runtime_base_url",
+                                      "cognitive_runtime_interaction_governance_enabled",
+                                      "cognitive_runtime_persona_containment_enabled"])
+def test_strict_world_state_setting_requires_dependencies(missing):
+    from settings import Settings
+
+    values = dict(ORCH_API_KEY="key", MEMORY_STORE_BASE_URL="http://memory",
+                  MEMORY_STORE_API_KEY="m", LITELLM_BASE_URL="http://provider",
+                  COGNITIVE_RUNTIME_BASE_URL="http://runtime",
+                  COGNITIVE_RUNTIME_INTERACTION_GOVERNANCE_ENABLED=True,
+                  COGNITIVE_RUNTIME_PERSONA_CONTAINMENT_ENABLED=True,
+                  STRICT_WORLD_STATE_AUTHORITY_ENABLED=True)
+    values[missing.upper()] = None if missing.endswith("url") else False
+    with pytest.raises(ValueError, match="strict world state"):
+        Settings(_env_file=None, **values)
+
+
+@pytest.mark.asyncio
+async def test_strict_world_state_read_executor_cannot_reenter_legacy_authority(tmp_path):
+    provider = FakeLiteLLM(completion=_tool_completion("runtime_world_state_read", {}))
+    out, runtime, provider, memory = await _run_world_state_turn(
+        tmp_path, provider=provider,
+    )
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
+    assert trace["executor_call_count"] == 0 and trace["dispatch_completed"] is False
+    assert len(runtime.world_state_calls) == 1
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert all(call["capability_id"] != "runtime.world_state.read"
+               for call in runtime.capability_authorization_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_world_state_gate_only_uses_server_setting(monkeypatch, enabled):
+    import main
+    from fastapi.testclient import TestClient
+    from models import ChatRequest
+    from settings import Settings
+
+    defaults = Settings(_env_file=None, ORCH_API_KEY="key", MEMORY_STORE_BASE_URL="http://memory",
+                        MEMORY_STORE_API_KEY="key", LITELLM_BASE_URL="http://provider")
+    assert defaults.strict_world_state_authority_enabled is False
+    payload = {"owner_id": "owner", "surface": "web",
+               "messages": [{"role": "user", "content": "hello"}],
+               "strict_world_state_authority_enabled": not enabled}
+    assert "strict_world_state_authority_enabled" not in ChatRequest(**payload).model_dump()
+    calls = []
+
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        return {"request_id": kwargs["request_id"], "conversation_id": "conv-1",
+                "profile_name": "unresolved", "selected_model": "not_called", "answer": "hello",
+                "status": "ok", "sources": []}
+
+    monkeypatch.setattr(main, "orchestrate_chat", fake)
+    monkeypatch.setattr(main, "settings", main.settings.model_copy(
+        update={"strict_world_state_authority_enabled": enabled},
+    ))
+    response = TestClient(main.app).post(
+        "/v1/chat", headers={"X-API-Key": main.settings.orch_api_key}, json=payload,
+    )
+    assert response.status_code == 200
+    assert calls[0]["strict_world_state_authority_enabled"] is enabled
+    assert "strict_world_state_authority_enabled" not in calls[0]["payload"]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["governance", "identity", "containment"])
+@pytest.mark.parametrize("error", ["malformed", "timeout", "conflict"])
+async def test_strict_world_state_mandatory_dependency_failure_never_downgrades(
+    tmp_path, stage, error,
+):
+    runtime = StrictWorldStateRuntime()
+    if error == "malformed":
+        runtime.mutation = (
+            stage, ("result",) if stage == "governance" else ("persona_selection",), {},
+        )
+    else:
+        runtime.information_failure = (stage, httpx.ReadTimeout("PRIVATE") if error == "timeout"
+                                       else _http_status_error(409))
+    out, runtime, provider, memory = await _run_world_state_turn(tmp_path, runtime=runtime)
+    assert out["status"] == "failed" and provider.calls == memory.retrieve_calls == []
+    assert runtime.world_state_calls == runtime.relationship_calls == []
+    assert memory.work["state"] == "failed"
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+    assert "PRIVATE" not in json.dumps(out) and not runtime.strict_forbidden_calls
+
+
+@pytest.mark.asyncio
+async def test_strict_world_state_missing_claims_prevent_registry_authority_and_flow():
+    from services.orchestrate import _resolve_capability_registry_context
+
+    runtime = FakeRuntime(capability_match_response=_capability_match_response(
+        capability_id="jellyfin_restart", display_name="Restart Jellyfin",
+        domain="media_operations",
+    ))
+
+    async def forbidden_barrier():
+        raise AssertionError("must block before action policy materialization")
+
+    messages, trace = await _resolve_capability_registry_context(
+        runtime=runtime, enabled=True, request_id="request", owner_id="owner",
+        conversation_id="conversation", surface="dev", runtime_session_id="session",
+        runtime_turn_id="turn", active_persona_id="technical_architect",
+        current_user_text="What would happen if you restart Jellyfin?",
+        world_state_authority_claims=[], timing_barrier=forbidden_barrier,
+    )
+    assert messages == [] and trace["reason"] == "validated_world_state_required"
+    assert trace["match"]["capability"] is None and trace["match"]["matched"] is False
+    assert not trace["context_included"]
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+async def test_strict_world_state_unavailable_bound_persona_stops_before_protected_retrieval(
+    tmp_path,
+):
+    class MissingBoundPersona(StrictWorldStateRuntime):
+        async def resolve_identity(self, **kwargs):
+            response = await super().resolve_identity(**kwargs)
+            response["persona_selection"].update(
+                selection_source="conservative_fallback",
+                selection_reason="bound_persona_unavailable",
+            )
+            response["surface_binding"]["default_persona_id"] = "missing_registry_persona"
+            self.strict_identity = copy.deepcopy(response)
+            return response
+
+    out, runtime, provider, memory = await _run_world_state_turn(
+        tmp_path, runtime=MissingBoundPersona(persona="general_assistant"),
+    )
+    assert out["status"] == "failed" and provider.calls == memory.retrieve_calls == []
+    assert runtime.world_state_calls == runtime.relationship_calls == []
+    assert memory.work["state"] == "failed"
