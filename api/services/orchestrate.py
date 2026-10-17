@@ -9417,6 +9417,7 @@ async def orchestrate_chat(
     on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
+    detailed_dependency_timing_enabled: bool = False,
     companion_policy_enabled: bool = False,
     interaction_governance_enabled: bool = False,
     persona_containment_enabled: bool = False,

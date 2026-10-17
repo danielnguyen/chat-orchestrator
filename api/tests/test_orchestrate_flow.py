@@ -41397,6 +41397,7 @@ async def test_request_timings_cover_normal_completion_without_response_or_actio
             memory_store=memory, litellm=provider, runtime=runtime,
             rules_path=str(rules), model_registry_path=str(models),
             allow_manual_override=True, request_id="timing-origin",
+            detailed_dependency_timing_enabled=True,
         )
     assert result["answer"] == "continued response" and result["status"] == "ok"
     assert len(provider.calls) == len(memory.trace_calls) == 1
@@ -41429,6 +41430,7 @@ async def test_request_timings_keep_early_failures_non_executing(tmp_path, caplo
             memory_store=memory, litellm=provider, runtime=None,
             rules_path=str(rules), model_registry_path=str(models),
             allow_manual_override=True, request_id="early-failure",
+            detailed_dependency_timing_enabled=True,
         )
     assert result["status"] == "failed" and not provider.calls
     assert not memory.retrieve_calls and not memory.added_messages
@@ -41438,3 +41440,37 @@ async def test_request_timings_keep_early_failures_non_executing(tmp_path, caplo
               for r in caplog.records if "dependency_timings " in r.message]
     assert len(events) == 1 and len(events[0]["spans"]) == 1
     assert events[0]["spans"][0]["operation"] == "orchestration"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_false", [False, True])
+async def test_direct_orchestration_timings_default_off_even_with_payload_hint(
+    tmp_path, monkeypatch, caplog, explicit_false,
+):
+    import clients.runtime as timing
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disabled diagnostics allocated or logged")
+
+    monkeypatch.setattr(timing, "_RequestTimings", forbidden)
+    monkeypatch.setattr(timing._timing_logger, "info", forbidden)
+    rules, models = _write_router_files(tmp_path)
+    memory = FakeMemoryStore()
+    memory.exact_conversation_response = _conversation_projection()
+    runtime = FakeRuntime()
+    provider = FakeLiteLLM(content="continued response")
+    options = {"detailed_dependency_timing_enabled": False} if explicit_false else {}
+    result = await orchestrate_chat(
+        payload={**_base_payload(conversation_id="shared-conversation"),
+                 "detailed_dependency_timing_enabled": True},
+        memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, request_id="disabled-origin", **options,
+    )
+    assert result["answer"] == "continued response" and result["status"] == "ok"
+    assert len(provider.calls) == len(memory.trace_calls) == 1
+    assert memory.work_calls[-1][1]["state"] == "completed"
+    assert not runtime.capability_authority_calls and not runtime.capability_flow_calls
+    assert "dependency_timings" not in memory.trace_calls[0]["payload"]["retrieval"]
+    assert timing.request_timing_snapshot("disabled-origin") is None
+    assert not [r for r in caplog.records if "dependency_timings " in r.message]

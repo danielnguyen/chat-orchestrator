@@ -709,19 +709,19 @@ async def test_dsa_timings_include_client_lifecycle_and_preserve_outcome(
     client = DataSourceAggregatorClient("http://dsa", api_key="private-key")
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         if method == "GET":
             return await client._get("/v1/sources", request_id="stage-id")
         return await client._post("/v1/sources", json={"private": "payload"})
 
     with caplog.at_level("INFO"):
         if outcome == "success":
-            assert await run(request_id="dsa-origin") == {}
+            assert await run(request_id="dsa-origin", detailed_dependency_timing_enabled=True) == {}
         else:
             expected = {"http_error": DataSourceAggregatorFailure,
                         "decode_error": ValueError}.get(outcome, type(errors.get(outcome)))
             with pytest.raises(expected):
-                await run(request_id="dsa-origin")
+                await run(request_id="dsa-origin", detailed_dependency_timing_enabled=True)
     event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
                             for r in caplog.records if "dependency_timings " in r.message))
     assert attempts == [method] and lifecycle == ["open", "close"]

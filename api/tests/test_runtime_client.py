@@ -5025,7 +5025,7 @@ async def test_dependency_timings_preserve_origin_and_client_contract(caplog):
     client._started = True
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         assert await client._post("/v1/runtime/overlay", json={"request_id": "stage-id"}) == {
             "ok": True,
         }
@@ -5034,7 +5034,7 @@ async def test_dependency_timings_preserve_origin_and_client_contract(caplog):
         return snapshot
 
     with caplog.at_level("INFO"):
-        snapshot = await run(request_id="origin-id")
+        snapshot = await run(request_id="origin-id", detailed_dependency_timing_enabled=True)
     event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
                             for r in caplog.records if "dependency_timings " in r.message))
     assert snapshot["boundary"] == "before_trace_write"
@@ -5068,11 +5068,11 @@ async def test_dependency_timing_failures_propagate_once(caplog, failure, outcom
     client._started = True
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         return await client._post("/v1/runtime/overlay", json={"secret": "private-body"})
 
     with caplog.at_level("INFO"), pytest.raises(type(failure)) as caught:
-        await run(request_id="request-failure")
+        await run(request_id="request-failure", detailed_dependency_timing_enabled=True)
     assert caught.value is failure and len(http.posts) == 1
     event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
                             for r in caplog.records if "dependency_timings " in r.message))
@@ -5101,14 +5101,16 @@ async def test_dependency_timing_concurrent_requests_and_late_child_isolation(ca
         await late.wait()
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         entered[request_id].set()
         children.append(asyncio.create_task(child(request_id)))
         await wait()
         return request_timing_snapshot(request_id)
 
     with caplog.at_level("INFO"):
-        tasks = [asyncio.create_task(run(request_id=k)) for k in entered]
+        tasks = [asyncio.create_task(run(
+            request_id=k, detailed_dependency_timing_enabled=True,
+        )) for k in entered]
         await asyncio.gather(*(e.wait() for e in child_entered.values()))
         release.set()
         snapshots = await asyncio.gather(*tasks)
@@ -5131,12 +5133,14 @@ async def test_dependency_timing_cancelled_request_resets_context(caplog):
     entered = asyncio.Event()
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         entered.set()
         await asyncio.Event().wait()
 
     with caplog.at_level("INFO"):
-        task = asyncio.create_task(run(request_id="cancelled-request"))
+        task = asyncio.create_task(run(
+            request_id="cancelled-request", detailed_dependency_timing_enabled=True,
+        ))
         await entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -5182,11 +5186,12 @@ async def test_dependency_timing_malformed_request_identity_does_not_change_beha
     from clients.runtime import observe_request_timings
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         return "unchanged"
 
     with caplog.at_level("INFO"):
-        assert await run(request_id=request_id) == "unchanged"
+        result = await run(request_id=request_id, detailed_dependency_timing_enabled=True)
+        assert result == "unchanged"
     assert not [r for r in caplog.records if "dependency_timings " in r.message]
 
 
@@ -5200,10 +5205,11 @@ async def test_dependency_timing_log_failure_preserves_outcome(monkeypatch):
     monkeypatch.setattr(module._timing_logger, "info", fail)
 
     @module.observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         return "unchanged"
 
-    assert await run(request_id="log-failure") == "unchanged"
+    result = await run(request_id="log-failure", detailed_dependency_timing_enabled=True)
+    assert result == "unchanged"
     assert module.request_timing_snapshot("log-failure") is None
 
 
@@ -5227,14 +5233,94 @@ async def test_overlapping_client_calls_use_interval_union_not_duration_sum(capl
     client._started = True
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         await asyncio.gather(*(client._post("/v1/runtime/overlay", json={}) for _ in range(2)))
 
     with caplog.at_level("INFO"):
-        await run(request_id="overlap-request")
+        await run(request_id="overlap-request", detailed_dependency_timing_enabled=True)
     event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
                             for r in caplog.records if "dependency_timings " in r.message))
     assert len(entered) == 2
     assert len([s for s in event["spans"] if s["dependency"] == "runtime"]) == 2
     assert 0 < event["client_union_ms"] < event["client_cumulative_ms"]
     assert event["client_union_ms"] <= event["elapsed_ms"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [None, False, "true", 1])
+@pytest.mark.parametrize("failure", [None, httpx.ReadTimeout("private"), asyncio.CancelledError()])
+async def test_disabled_dependency_timings_skip_collector_and_preserve_transport(
+    monkeypatch, caplog, flag, failure,
+):
+    import clients.runtime as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disabled diagnostics allocated or logged")
+
+    monkeypatch.setattr(module, "_RequestTimings", forbidden)
+    monkeypatch.setattr(module._timing_logger, "info", forbidden)
+    client = RuntimeClient("http://runtime.local", api_key="private-key")
+    http = _FakeAsyncClient([failure] if failure is not None else None)
+    client._client, client._started = http, True
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        assert module.request_timing_snapshot(request_id) is None
+        return await client._post("/v1/runtime/overlay", json={})
+
+    options = {} if flag is None else {"detailed_dependency_timing_enabled": flag}
+    if failure is None:
+        assert await run(request_id="disabled", **options) == {"ok": True}
+    else:
+        with pytest.raises(type(failure)) as caught:
+            await run(request_id="disabled", **options)
+        assert caught.value is failure
+    assert len(http.posts) == 1
+    assert module.request_timing_snapshot("disabled") is None
+    assert not [r for r in caplog.records if "dependency_timings " in r.message]
+
+
+@pytest.mark.asyncio
+async def test_enabled_and_disabled_request_timings_are_isolated(caplog):
+    from clients.runtime import observe_boundary, observe_request_timings, request_timing_snapshot
+
+    entered = {key: asyncio.Event() for key in ("enabled", "disabled")}
+    release = asyncio.Event()
+
+    @observe_boundary("fixture_wait")
+    async def wait():
+        await release.wait()
+
+    @observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        entered[request_id].set()
+        await wait()
+        return request_timing_snapshot(request_id)
+
+    with caplog.at_level("INFO"):
+        tasks = [asyncio.create_task(run(
+            request_id=key, detailed_dependency_timing_enabled=key == "enabled",
+        )) for key in entered]
+        await asyncio.gather(*(event.wait() for event in entered.values()))
+        release.set()
+        enabled, disabled = await asyncio.gather(*tasks)
+    assert enabled["request_id"] == "enabled" and disabled is None
+    events = [json.loads(r.message.split("dependency_timings ", 1)[1])
+              for r in caplog.records if "dependency_timings " in r.message]
+    assert len(events) == 1 and events[0]["request_id"] == "enabled"
+    assert request_timing_snapshot("enabled") is request_timing_snapshot("disabled") is None
+
+
+def test_retrieval_timing_route_is_canonical_and_private_paths_are_bounded():
+    from clients.runtime import _timing_path
+
+    assert _timing_path("bms", "/v2/conversations/private-conversation/retrieve") == (
+        "/v2/conversations/{id}/retrieve"
+    )
+    for path in (
+        "/v2/conversations//retrieve", "/v2/conversations/private/extra/retrieve",
+        "/v2/conversations/private/retrieve?secret=value",
+        "/v2/conversations/private/retrieve#private-content",
+        "http://memory/v2/conversations/private/retrieve", "/private/secret",
+    ):
+        assert _timing_path("bms", path) == "other"

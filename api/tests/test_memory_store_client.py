@@ -739,17 +739,18 @@ async def test_memory_timing_covers_all_transport_seams_and_redacts_paths(servic
     from clients.runtime import observe_request_timings
 
     client, responses, calls = service
-    responses.extend([{}, {}, {}, {"interrupted_count": 0}])
+    responses.extend([{}, {}, {}, {"interrupted_count": 0}, {}])
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         await client._post("/v1/profiles/resolve", json={"secret": "private-payload"})
         await client._get("/v1/conversations/private-conversation")
         await client._work_write("PATCH", "/v1/internal/work-items/private-work", {})
         await client.reconcile_interrupted_work()
+        await client._post("/v2/conversations/private-conversation/retrieve", json={})
 
     with caplog.at_level("INFO"):
-        await run(request_id="origin-memory")
+        await run(request_id="origin-memory", detailed_dependency_timing_enabled=True)
     event = json.loads(next(r.message.split("dependency_timings ", 1)[1]
                             for r in caplog.records if "dependency_timings " in r.message))
     spans = [s for s in event["spans"] if s["dependency"] == "bms"]
@@ -757,8 +758,9 @@ async def test_memory_timing_covers_all_transport_seams_and_redacts_paths(servic
         "POST /v1/profiles/resolve", "GET /v1/conversations/{id}",
         "PATCH /v1/internal/work-items/{id}",
         "POST /v1/internal/work-items/reconcile-interrupted",
+        "POST /v2/conversations/{id}/retrieve",
     ]
-    assert len(calls) == 4 and all(s["outcome"] == "success" for s in spans)
+    assert len(calls) == 5 and all(s["outcome"] == "success" for s in spans)
     assert "private" not in json.dumps(event) and "test-key" not in json.dumps(event)
 
 
@@ -771,12 +773,13 @@ async def test_trace_timing_snapshot_is_additive_copy_and_final_log_covers_write
     original = {"retrieval": {"existing": True}, "request_id": "trace-origin"}
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         await client._get("/v1/proactive/preferences")
         return await client.create_trace(request_id=request_id, payload=original)
 
     with caplog.at_level("INFO"):
-        assert await run(request_id="trace-origin") == {"trace_id": "trace"}
+        result = await run(request_id="trace-origin", detailed_dependency_timing_enabled=True)
+        assert result == {"trace_id": "trace"}
     assert original == {"retrieval": {"existing": True}, "request_id": "trace-origin"}
     sent = json.loads(calls[-1].content)
     timing = sent["retrieval"]["dependency_timings"]
@@ -820,11 +823,11 @@ async def test_memory_timing_preserves_failure_no_replay_and_pool_behavior(
     client._started = True
 
     @observe_request_timings
-    async def run(*, request_id):
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
         await client._post("/v1/internal/work-items", json={})
 
     with caplog.at_level("INFO"), pytest.raises(type(failure)) as caught:
-        await run(request_id="memory-failure")
+        await run(request_id="memory-failure", detailed_dependency_timing_enabled=True)
     assert caught.value is failure and attempts == [1]
     assert (client._client is None) == replaced
     assert http.aclose.await_count == int(replaced)
@@ -832,3 +835,29 @@ async def test_memory_timing_preserves_failure_no_replay_and_pool_behavior(
                             for r in caplog.records if "dependency_timings " in r.message))
     assert event["spans"][0]["outcome"] == outcome
     assert "private" not in json.dumps(event)
+
+
+@pytest.mark.asyncio
+async def test_disabled_trace_timings_preserve_exact_payload_and_emit_no_event(
+    service, monkeypatch, caplog,
+):
+    import clients.runtime as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disabled diagnostics allocated or logged")
+
+    monkeypatch.setattr(module, "_RequestTimings", forbidden)
+    monkeypatch.setattr(module._timing_logger, "info", forbidden)
+    client, responses, calls = service
+    responses.append({"trace_id": "trace"})
+    original = {"request_id": "disabled-trace", "retrieval": {"existing": True}}
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        return await client.create_trace(request_id=request_id, payload=original)
+
+    assert await run(request_id="disabled-trace") == {"trace_id": "trace"}
+    assert json.loads(calls[0].content) == original
+    assert "dependency_timings" not in original["retrieval"]
+    assert module.request_timing_snapshot("disabled-trace") is None
+    assert not [r for r in caplog.records if "dependency_timings " in r.message]

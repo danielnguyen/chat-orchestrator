@@ -64,6 +64,7 @@ _TIMING_PATHS = {
         "/v1/world-state/resolve",
     ),
     "bms": (
+        "/v2/conversations/{id}/retrieve",
         "/v1/conversations",
         "/v1/conversations/resolve",
         "/v1/conversations/{id}",
@@ -209,7 +210,8 @@ def observe_request_timings(function):
     @wraps(function)
     async def observed(*args, **kwargs):
         request_id = kwargs.get("request_id")
-        current = (_RequestTimings(request_id) if type(request_id) is str
+        enabled = kwargs.get("detailed_dependency_timing_enabled") is True
+        current = (_RequestTimings(request_id) if enabled and type(request_id) is str
                    and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", request_id) else None)
         token = _request_timings.set(current)
         try:

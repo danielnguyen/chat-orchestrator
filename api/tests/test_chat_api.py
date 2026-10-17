@@ -969,3 +969,42 @@ async def test_bms_shutdown_failure_still_closes_captured_runtime(monkeypatch):
         "runtime_open", "cr_reconcile", "bms_open", "bms_reconcile", "yield",
         "bms_close", "runtime_close",
     ]
+
+
+def test_dependency_timing_setting_defaults_off_and_accepts_server_environment(monkeypatch):
+    from settings import Settings
+
+    monkeypatch.delenv("DETAILED_DEPENDENCY_TIMING_ENABLED", raising=False)
+    required = {"ORCH_API_KEY": "test", "MEMORY_STORE_BASE_URL": "http://memory",
+                "MEMORY_STORE_API_KEY": "test", "LITELLM_BASE_URL": "http://provider"}
+    assert Settings(_env_file=None, **required).detailed_dependency_timing_enabled is False
+    monkeypatch.setenv("DETAILED_DEPENDENCY_TIMING_ENABLED", "true")
+    assert Settings(_env_file=None, **required).detailed_dependency_timing_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_dependency_timing_api_uses_server_setting_not_payload(monkeypatch, enabled):
+    monkeypatch.delenv("DETAILED_DEPENDENCY_TIMING_ENABLED", raising=False)
+    main = _load_main(monkeypatch)
+    calls = []
+
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        return {"request_id": kwargs["request_id"], "conversation_id": "conversation",
+                "profile_name": "unresolved", "selected_model": "not_called", "answer": "hello",
+                "status": "ok", "sources": []}
+
+    monkeypatch.setattr(main, "orchestrate_chat", fake)
+    monkeypatch.setattr(main, "settings", main.settings.model_copy(
+        update={"detailed_dependency_timing_enabled": enabled},
+    ))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://test") as client:
+        response = await client.post(
+            "/v1/chat", headers={"X-API-Key": "orch-test"},
+            json=_full_chat_payload(detailed_dependency_timing_enabled=not enabled),
+        )
+    assert response.status_code == 200 and len(calls) == 1
+    assert calls[0]["detailed_dependency_timing_enabled"] is enabled
+    assert "detailed_dependency_timing_enabled" not in calls[0]["payload"]
