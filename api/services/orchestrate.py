@@ -28,6 +28,8 @@ from clients.memory_store import (
 )
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
+    observe_boundary,
+    observe_request_timings,
     validate_history_followup_policy_response,
     validate_interrupt_execution_response,
     validate_interrupt_response,
@@ -5352,6 +5354,7 @@ async def _start_runtime_turn(
     return response, trace
 
 
+@observe_boundary("user_persistence")
 async def _append_current_user_message(
     *,
     memory_store: Any,
@@ -5420,6 +5423,7 @@ async def _advance_runtime_turn(
         turn_state_trace.setdefault("warnings", []).append(type(e).__name__)
 
 
+@observe_boundary("runtime_completion")
 async def _complete_runtime_turn(
     *,
     runtime: Any | None,
@@ -5459,6 +5463,7 @@ async def _complete_runtime_turn(
         turn_state_trace.setdefault("warnings", []).append(type(e).__name__)
 
 
+@observe_boundary("identity")
 async def _resolve_runtime_identity(
     *,
     runtime: Any | None,
@@ -5608,6 +5613,7 @@ async def _resolve_runtime_overlay(
     }
 
 
+@observe_boundary("world_state")
 async def _resolve_world_state(
     *,
     runtime: Any | None,
@@ -5894,6 +5900,7 @@ async def _resolve_relationship_context(
     }
 
 
+@observe_boundary("retrieval_policy")
 async def _resolve_mandatory_retrieval_policy(
     *,
     runtime: Any | None,
@@ -8821,6 +8828,7 @@ class _SynchronousWork:
         self.finalizing = False
         self.failure_code = "execution_failed"
 
+    @observe_boundary("work_admission")
     async def admit(self, **association: Any) -> None:
         response = await self.memory_store.create_work(**association)
         self._expect(response, {**association, "state": "pending"})
@@ -8845,6 +8853,7 @@ class _SynchronousWork:
         ):
             raise RuntimeError("work_projection_context_mismatch")
 
+    @observe_boundary("work_transition")
     async def transition(self, state: str, **result: Any) -> None:
         if self.work is None:
             return
@@ -8859,6 +8868,7 @@ class _SynchronousWork:
         self._expect(response, expected)
         self.work = response
 
+    @observe_boundary("work_completion")
     async def complete(self, acknowledgement: Any) -> None:
         if self.work is None:
             return
@@ -8873,6 +8883,7 @@ class _SynchronousWork:
         self.finalizing = True
         await self.transition("completed", assistant_message_id=message_id)
 
+    @observe_boundary("work_cleanup")
     async def fail_if_unfinished(self) -> None:
         if self.work is None or self.finalizing or self.work["state"] in {"completed", "failed"}:
             return
@@ -9393,6 +9404,7 @@ async def _finish_strict_capability_information(
     }
 
 
+@observe_request_timings
 async def orchestrate_chat(
     *,
     payload: dict[str, Any],
@@ -9405,6 +9417,7 @@ async def orchestrate_chat(
     on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
+    detailed_dependency_timing_enabled: bool = False,
     companion_policy_enabled: bool = False,
     interaction_governance_enabled: bool = False,
     persona_containment_enabled: bool = False,

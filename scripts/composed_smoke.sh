@@ -97,7 +97,7 @@ cleanup() {
     docker compose -f "$COMPOSE" ps --format json \
       >"$COMPOSED_SMOKE_LOG_DIR/service-status.jsonl" 2>/dev/null || true
     docker compose -f "$COMPOSE" logs --no-color --tail=300 2>/dev/null \
-      | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+' \
+      | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+|orchestrator-[0-9]+[[:space:]]+\|[[:space:]]+INFO:[[:space:]]+dependency_timings \{' \
       >"$COMPOSED_SMOKE_LOG_DIR/bounded-service.log" || true
   fi
   docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || status=1
@@ -4862,6 +4862,119 @@ PY
 
 # Deterministic composed regression: compare unrounded p95 with exact local budgets.
 # Fixture setup, prior-history creation, and assertions are outside the timer.
+# Inspect existing durable trace metadata and the final request-local log event.
+# These observations run after the original HTTP timer and never change its samples.
+assert_dependency_timing_evidence() {
+  local request="$1" scenario="$2" trace="$3"
+  jq -ce '.retrieval.dependency_timings' <<<"$trace" >"$COMPOSED_SMOKE_TMP/timing-snapshot.json"
+  docker compose -f "$COMPOSE" logs --no-color --tail=200 orchestrator \
+    >"$COMPOSED_SMOKE_TMP/timing-final.log" 2>&1
+  python3 - "$request" "$scenario" "$COMPOSED_SMOKE_TMP" \
+    "${COMPOSED_SMOKE_LOG_DIR:-}" "$ROOT/api/clients/runtime.py" <<'PYTHON'
+import ast
+import collections
+import json
+import math
+import pathlib
+import sys
+
+request, scenario, root, log_dir, runtime_source = sys.argv[1:]
+root = pathlib.Path(root)
+snapshot = json.loads((root / "timing-snapshot.json").read_text())
+finals = []
+for line in (root / "timing-final.log").read_text().splitlines():
+    if "dependency_timings " in line:
+        event = json.loads(line.split("dependency_timings ", 1)[1])
+        if event.get("request_id") == request:
+            finals.append(event)
+assert len(finals) == 1
+final = finals[0]
+for event in (snapshot, final):
+    assert event["schema_version"] == 1 and event["request_id"] == request
+    assert event["clock"] == "perf_counter_ns"
+    assert not event["truncated"] and not event["invalid_clock"]
+    assert event["dropped_spans"] == 0 and 0 < len(event["spans"]) <= 128
+    assert 0 <= event["client_union_ms"] <= event["elapsed_ms"]
+    assert event["client_union_ms"] <= event["client_cumulative_ms"] + 1e-9
+    for span in event["spans"]:
+        assert set(span) == {"dependency", "operation", "start_ns", "end_ns", "elapsed_ms", "outcome"}
+        assert span["dependency"] in {"runtime", "bms", "dsa", "co"}
+        assert type(span["start_ns"]) is int and type(span["end_ns"]) is int
+        assert 0 <= span["start_ns"] <= span["end_ns"] <= event["elapsed_ms"] * 1e6
+        assert math.isfinite(span["elapsed_ms"]) and span["elapsed_ms"] >= 0
+        assert span["outcome"] in {"success", "http_error", "timeout", "transport_error",
+                                   "decode_error", "cancelled", "other_error", "returned"}
+        assert len(span["operation"]) <= 100
+assert snapshot["boundary"] == "before_trace_write"
+assert final["boundary"] == "request_finished" and final["in_flight"] == 0
+assert final["request_outcome"] == "returned"
+operations = {s["operation"] for s in final["spans"]}
+assert {"trace_persistence", "work_completion", "work_cleanup", "orchestration",
+        "POST /v1/traces"} <= operations
+# Earlier trace writes may be present in an updated durable snapshot. Its own
+# write is necessarily absent; the final event records at least that later call.
+assert sum(s["operation"] == "POST /v1/traces" for s in final["spans"]) > sum(
+    s["operation"] == "POST /v1/traces" for s in snapshot["spans"])
+for dependency in ("runtime", "bms", "dsa"):
+    spans = [s for s in final["spans"] if s["dependency"] == dependency]
+    if dependency != "dsa" or scenario == "evidence_governed":
+        assert spans
+    cumulative = sum(s["elapsed_ms"] for s in spans)
+    end = union = 0
+    for span in sorted(spans, key=lambda s: s["start_ns"]):
+        union += max(0, span["end_ns"] - max(end, span["start_ns"]))
+        end = max(end, span["end_ns"])
+    print(f"Dependency timing {scenario}: dependency={dependency} calls={len(spans)} "
+          f"cumulative_ms={cumulative:.3f} union_ms={union/1e6:.3f}")
+print(f"Dependency timing {scenario}: client_union_ms={final['client_union_ms']:.3f} "
+      f"unattributed_wall_ms={final['unattributed_wall_ms']:.3f} "
+      "snapshot_and_final_verified=true critical_path_claim=false")
+if log_dir:
+    # Retain only the validated producer schema and canonical operation labels.
+    # Read the existing route templates without importing application dependencies.
+    routes = next(ast.literal_eval(node.value) for node in ast.parse(
+        pathlib.Path(runtime_source).read_text()).body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_TIMING_PATHS"
+                for target in node.targets))
+    assert set(final) == {
+        "schema_version", "request_id", "clock", "boundary", "request_outcome",
+        "client_boundary", "elapsed_ms", "client_cumulative_ms", "client_union_ms",
+        "unattributed_wall_ms", "truncated", "dropped_spans", "invalid_clock",
+        "in_flight", "spans",
+    }
+    assert final["client_boundary"] == "acquisition_http_status_decode_cleanup"
+    for span in final["spans"]:
+        if span["dependency"] == "co":
+            assert span["operation"] in {
+                "orchestration", "user_persistence", "runtime_completion", "identity",
+                "world_state", "retrieval_policy", "work_admission", "work_transition",
+                "work_completion", "work_cleanup", "message_persistence",
+                "trace_persistence", "claim_persistence",
+            }
+        else:
+            assert span["operation"] in {
+                method + " " + path for method in ("GET", "POST", "PATCH", "PUT", "DELETE")
+                for path in (*routes[span["dependency"]], "other")
+            }
+    evidence = pathlib.Path(log_dir) / "dependency-timings.jsonl"
+    assert evidence.stat().st_size <= 50 * 65536
+    retained = [json.loads(line) for line in evidence.read_text().splitlines()]
+    scenarios = {"ordinary_text", "evidence_governed", "history_deterministic",
+                 "history_classified", "provider_fallback"}
+    assert scenario in scenarios and len(retained) < 50
+    counts = collections.Counter(row["scenario"] for row in retained)
+    assert set(counts) <= scenarios and all(count <= 10 for count in counts.values())
+    assert counts[scenario] < 10
+    requests = [row["event"]["request_id"] for row in retained]
+    assert len(requests) == len(set(requests)) and request not in requests
+    record = json.dumps({"scenario": scenario, "event": final},
+                        separators=(",", ":"), allow_nan=False) + "\n"
+    assert len(record.encode()) <= 65536
+    with evidence.open("a", encoding="utf-8") as output:
+        output.write(record)
+PYTHON
+}
+
 latency_measure_chat() {
   local payload="$1" scenario="$2" measured="$3" samples="$4"
   LATENCY_PAYLOAD="$payload" python3 - "$scenario" "$measured" "$samples" <<'PYTHON'
@@ -4942,6 +5055,11 @@ run_transport_latency_regression() {
   local saved_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
   samples="$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl"
   : > "$samples"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    # Only this invocation's measured requests belong in the diagnostics artifact.
+    : > "$COMPOSED_SMOKE_LOG_DIR/dependency-timings.jsonl"
+  fi
   for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback; do
     # Preserve the established evidence/history fixture policies. Ordinary and
     # fallback use the existing fully governed timing fixture configuration.
@@ -5053,10 +5171,31 @@ run_transport_latency_regression() {
           + " provider_attempt_ms=" + ([.model_calls[]?.latency_ms // 0]|add // 0|tostring)
           + " runtime_events=" + ($diagnostics.events|length|tostring)
         ' <<<"$trace"
+        assert_dependency_timing_evidence "$request" "$scenario" "$trace"
       fi
     done
     echo "Latency behavior $scenario: warmups=2 measured=10 parity=true actions=0 persisted_equal=true completed=true idle=true"
   done
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    python3 - "$samples" "$COMPOSED_SMOKE_LOG_DIR/dependency-timings.jsonl" <<'PYTHON'
+import collections
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    samples = [json.loads(line) for line in source]
+with open(sys.argv[2], encoding="utf-8") as source:
+    retained = [json.loads(line) for line in source]
+expected = {"ordinary_text", "evidence_governed", "history_deterministic",
+            "history_classified", "provider_fallback"}
+counts = collections.Counter(row["scenario"] for row in retained)
+assert len(samples) == len(retained) == 50
+assert counts == {scenario: 10 for scenario in expected}
+assert [row["scenario"] for row in retained] == [row["scenario"] for row in samples]
+assert len({row["event"]["request_id"] for row in retained}) == 50
+print("Dependency timing retention: scenarios=5 measured_requests=50 warmups_excluded=true")
+PYTHON
+  fi
   latency_regression_summary "$samples"
   export COMPOSED_RESTRAINT_ENABLED="$saved_restraint" COMPOSED_HISTORY_FOLLOWUP_ENABLED="$saved_history"
   export COMPOSED_ALLOW_MANUAL_OVERRIDE="$saved_override" COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$saved_reserve"

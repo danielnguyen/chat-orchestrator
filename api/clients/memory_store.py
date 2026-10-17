@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+from clients.runtime import observe_boundary, observe_dependency, request_timing_snapshot
 
 
 def validate_presence_surface_permission(
@@ -253,6 +254,8 @@ class MemoryStoreClient:
         if should_close:
             await failed_client.aclose()
 
+    @observe_dependency("bms", method="POST",
+                        path="/v1/internal/work-items/reconcile-interrupted")
     async def reconcile_interrupted_work(self) -> dict[str, int]:
         client = await self._client_for_request()
         try:
@@ -303,6 +306,7 @@ class MemoryStoreClient:
             "work_id": work_id, "owner_id": owner_id, "conversation_id": conversation_id,
         })
 
+    @observe_dependency("bms")
     async def _work_write(
         self, method: str, path: str, payload: dict[str, Any],
     ) -> dict[str, Any]:
@@ -386,6 +390,7 @@ class MemoryStoreClient:
             "owner_id": owner_id, "client_id": client_id,
         })
 
+    @observe_dependency("bms", method="POST")
     async def _post(
         self,
         path: str,
@@ -411,6 +416,7 @@ class MemoryStoreClient:
                 pass
             raise
 
+    @observe_dependency("bms", method="GET")
     async def _get(
         self,
         path: str,
@@ -608,6 +614,7 @@ class MemoryStoreClient:
             raise RuntimeError("conversation_create_response_invalid")
         return response
 
+    @observe_boundary("message_persistence")
     async def add_message(
         self,
         *,
@@ -755,9 +762,17 @@ class MemoryStoreClient:
             },
         )
 
+    @observe_boundary("trace_persistence")
     async def create_trace(self, *, request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        timing = request_timing_snapshot(request_id)
+        if (timing is not None and isinstance(payload, dict)
+                and isinstance(payload.get("retrieval"), dict)):
+            payload = {**payload, "retrieval": {
+                **payload["retrieval"], "dependency_timings": timing,
+            }}
         return await self._post("/v1/traces", request_id=request_id, json=payload)
 
+    @observe_boundary("claim_persistence")
     async def create_claim_record(
         self,
         *,

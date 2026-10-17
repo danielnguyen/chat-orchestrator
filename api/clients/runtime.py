@@ -1,15 +1,274 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import math
+import re
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
+from functools import wraps
+from time import perf_counter_ns
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from services.privacy_context import validate_privacy_policy_result
+
+# Request-local diagnostic data only; no policy results or payloads are retained.
+_TIMING_LIMIT = 128
+_TIMING_PATHS = {
+    "runtime": (
+        "/v1/capabilities/action-summary",
+        "/v1/capabilities/authority",
+        "/v1/capabilities/authorize",
+        "/v1/capabilities/confirm",
+        "/v1/capabilities/discover",
+        "/v1/capabilities/flow",
+        "/v1/capabilities/match",
+        "/v1/companion/policy/compile",
+        "/v1/companion/profile/compile",
+        "/v1/interrupt/evaluate",
+        "/v1/interrupt/execute",
+        "/v1/relationships/select",
+        "/v1/runtime/claim-calibration/evaluate",
+        "/v1/runtime/claim-support/evaluate",
+        "/v1/runtime/continuations/select",
+        "/v1/runtime/evidence-next-steps/select",
+        "/v1/runtime/evidence-plans/compile",
+        "/v1/runtime/evidence-shapes/derive",
+        "/v1/runtime/evidence-sufficiency/evaluate",
+        "/v1/runtime/identity/resolve",
+        "/v1/runtime/interaction-governance/evaluate",
+        "/v1/runtime/memory-hygiene/evaluate",
+        "/v1/runtime/overlay",
+        "/v1/runtime/persona-containment/evaluate",
+        "/v1/runtime/presence/evaluate",
+        "/v1/runtime/privacy-context/evaluate",
+        "/v1/runtime/restraint/evaluate",
+        "/v1/runtime/retirements/reserve",
+        "/v1/runtime/retirements/{id}",
+        "/v1/runtime/sessions/resolve",
+        "/v1/runtime/situated-presence/evaluate",
+        "/v1/runtime/state/reset",
+        "/v1/runtime/threads/resolve",
+        "/v1/runtime/timing/evaluate",
+        "/v1/runtime/turns/complete",
+        "/v1/runtime/turns/reconcile-interrupted",
+        "/v1/runtime/turns/start",
+        "/v1/runtime/turns/update",
+        "/v1/world-state/claims/verify",
+        "/v1/world-state/resolve",
+    ),
+    "bms": (
+        "/v2/conversations/{id}/retrieve",
+        "/v1/conversations",
+        "/v1/conversations/resolve",
+        "/v1/conversations/{id}",
+        "/v1/conversations/{id}/lifecycle",
+        "/v1/conversations/{id}/messages",
+        "/v1/internal/acquisition-history/resolve",
+        "/v1/internal/claim-records",
+        "/v1/internal/current-work",
+        "/v1/internal/episodes/retrieve",
+        "/v1/internal/immediate-history/resolve",
+        "/v1/internal/recall/select",
+        "/v1/internal/work-items",
+        "/v1/internal/work-items/reconcile-interrupted",
+        "/v1/internal/work-items/{id}",
+        "/v1/internal/work-items/{id}/result",
+        "/v1/presence/surface-permissions",
+        "/v1/proactive/preferences",
+        "/v1/profiles/resolve",
+        "/v1/traces",
+        "/v1/traces/{id}",
+    ),
+    "dsa": (
+        "/v1/context-pack",
+        "/v1/sources",
+        "/v1/sources/context",
+        "/v1/sources/fetch",
+    ),
+}
+_timing_logger = logging.getLogger("uvicorn.error.chat_orchestrator.latency")
+_request_timings: ContextVar[_RequestTimings | None] = ContextVar("request_timings", default=None)
+
+
+def _interval_union_ns(intervals):
+    end = total = 0
+    for start, stop in sorted(intervals):
+        total += max(0, stop - max(start, end))
+        end = max(end, stop)
+    return total
+
+
+def _timing_outcome(error):
+    if error is None:
+        return "success"
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(error, httpx.HTTPStatusError) or type(
+        getattr(error, "service_status_code", None)
+    ) is int:
+        return "http_error"
+    if isinstance(error, httpx.TransportError):
+        return "transport_error"
+    if isinstance(error, ValueError):
+        return "decode_error"
+    return "other_error"
+
+
+def _timing_path(dependency, path):
+    if type(path) is str and len(path) <= 512:
+        for template in _TIMING_PATHS.get(dependency, ()):
+            pattern = re.escape(template).replace(r"\{id\}", r"[^/?#]+")
+            if re.fullmatch(pattern, path):
+                return template
+    return "other"
+
+
+class _RequestTimings:
+    def __init__(self, request_id):
+        self.request_id = request_id
+        self.started = perf_counter_ns()
+        self.spans = []
+        self.dropped = 0
+        self.invalid = False
+        self.closed = False
+        self.outcome = "in_progress"
+        self.in_flight = 0
+
+    @contextmanager
+    def measure(self, dependency, operation):
+        if self.closed:
+            yield
+            return
+        started = perf_counter_ns()
+        self.in_flight += 1
+        error = None
+        try:
+            yield
+        except BaseException as caught:
+            error = caught
+            raise
+        finally:
+            ended = perf_counter_ns()
+            self.in_flight -= 1
+            outcome = _timing_outcome(error)
+            if dependency == "co":
+                if error is None:
+                    outcome = "returned"
+                elif isinstance(error, ValueError):
+                    outcome = "other_error"  # A local ValueError is not proof of HTTP decoding.
+            if dependency == "co" and operation == "orchestration":
+                self.outcome = outcome
+            if not self.closed:
+                if ended < started or started < self.started:
+                    self.invalid = True
+                elif len(self.spans) < _TIMING_LIMIT:
+                    self.spans.append({
+                        "dependency": dependency, "operation": operation,
+                        "start_ns": started - self.started, "end_ns": ended - self.started,
+                        "elapsed_ms": (ended - started) / 1_000_000,
+                        "outcome": outcome,
+                    })
+                else:
+                    self.dropped = min(self.dropped + 1, 2**31 - 1)
+
+    def snapshot(self, boundary):
+        elapsed = max(0, perf_counter_ns() - self.started)
+        client = [s for s in self.spans if s["dependency"] != "co"]
+        union = _interval_union_ns([(s["start_ns"], s["end_ns"]) for s in client])
+        return {
+            "schema_version": 1, "request_id": self.request_id,
+            "clock": "perf_counter_ns", "boundary": boundary,
+            "request_outcome": self.outcome,
+            "client_boundary": "acquisition_http_status_decode_cleanup",
+            "elapsed_ms": elapsed / 1_000_000,
+            "client_cumulative_ms": sum(s["elapsed_ms"] for s in client),
+            "client_union_ms": union / 1_000_000,
+            "unattributed_wall_ms": max(0, elapsed - union) / 1_000_000,
+            "truncated": self.dropped > 0, "dropped_spans": self.dropped,
+            "invalid_clock": self.invalid, "in_flight": self.in_flight,
+            "spans": [dict(s) for s in self.spans],
+        }
+
+
+def request_timing_snapshot(request_id):
+    current = _request_timings.get()
+    if current is None or current.closed or current.request_id != request_id:
+        return None
+    return current.snapshot("before_trace_write")
+
+
+def observe_request_timings(function):
+    @wraps(function)
+    async def observed(*args, **kwargs):
+        request_id = kwargs.get("request_id")
+        enabled = kwargs.get("detailed_dependency_timing_enabled") is True
+        current = (_RequestTimings(request_id) if enabled and type(request_id) is str
+                   and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", request_id) else None)
+        token = _request_timings.set(current)
+        try:
+            if current is None:
+                return await function(*args, **kwargs)
+            with current.measure("co", "orchestration"):
+                return await function(*args, **kwargs)
+        finally:
+            try:
+                if current is not None:
+                    current.closed = True
+                    _timing_logger.info("dependency_timings %s", json.dumps(
+                        current.snapshot("request_finished"), separators=(",", ":"),
+                    ))
+            except Exception:
+                pass  # Observability cannot replace the application outcome.
+            finally:
+                _request_timings.reset(token)
+    return observed
+
+
+def observe_boundary(operation):
+    operation = (operation if type(operation) is str
+                 and re.fullmatch(r"[a-z][a-z_]{0,63}", operation) else "other")
+
+    def decorate(function):
+        @wraps(function)
+        async def observed(*args, **kwargs):
+            current = _request_timings.get()
+            if current is None:
+                return await function(*args, **kwargs)
+            with current.measure("co", operation):
+                return await function(*args, **kwargs)
+        return observed
+    return decorate
+
+
+def observe_dependency(dependency, *, method=None, path=None):
+    def decorate(function):
+        @wraps(function)
+        async def observed(*args, **kwargs):
+            current = _request_timings.get()
+            if current is None:
+                return await function(*args, **kwargs)
+            verb = method if method is not None else (
+                args[1] if len(args) > 1 else kwargs.get("method"))
+            index = 1 if method is not None else 2
+            raw_path = path if path is not None else (
+                args[index] if len(args) > index else kwargs.get("path"))
+            verb = (verb if type(verb) is str
+                    and verb in {"GET", "POST", "PATCH", "PUT", "DELETE"} else "OTHER")
+            operation = verb + " " + _timing_path(dependency, raw_path)
+            with current.measure(dependency, operation):
+                return await function(*args, **kwargs)
+        return observed
+    return decorate
+
 
 _PREFERRED_COMPANION_COMPILE_PATH = "/v1/companion/profile/compile"
 _COMPAT_COMPANION_COMPILE_PATH = "/v1/companion/policy/compile"
@@ -1967,6 +2226,7 @@ class RuntimeClient:
         if should_close:
             await failed_client.aclose()
 
+    @observe_dependency("runtime", method="POST")
     async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
         client = await self._client_for_request()
         try:

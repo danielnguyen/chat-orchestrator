@@ -5,6 +5,7 @@ import re
 from typing import Annotated, Any, Literal
 
 import httpx
+from clients.runtime import observe_dependency
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 
 _request_logger = logging.getLogger("uvicorn.error.chat_orchestrator.dsa")
@@ -93,6 +94,7 @@ class DataSourceAggregatorClient:
             headers["X-Request-ID"] = request_id
         return headers or None
 
+    @observe_dependency("dsa", method="POST")
     async def _post(
         self,
         path: str,
@@ -151,6 +153,7 @@ class DataSourceAggregatorClient:
             )
             return result
 
+    @observe_dependency("dsa", method="GET")
     async def _get(
         self,
         path: str,

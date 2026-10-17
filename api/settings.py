@@ -22,6 +22,9 @@ class Settings(BaseSettings):
         le=30000,
     )
     enable_runtime_overlays: bool = Field(default=False, alias="ENABLE_RUNTIME_OVERLAYS")
+    detailed_dependency_timing_enabled: bool = Field(
+        default=False, alias="DETAILED_DEPENDENCY_TIMING_ENABLED",
+    )
     cognitive_runtime_companion_enabled: bool = Field(
         default=False,
         alias="COGNITIVE_RUNTIME_COMPANION_ENABLED",
