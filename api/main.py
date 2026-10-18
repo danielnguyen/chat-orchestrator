@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
@@ -17,16 +18,20 @@ from clients.memory_store import (
     _validate_work_result,
 )
 from clients.runtime import RuntimeClient
-from fastapi import Depends, FastAPI, HTTPException, Security
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
 from models import (
+    CHAT_FEEDBACK_MEDIA_TYPE,
     BriefGenerateRequest,
     BriefGenerateResponse,
+    ChatFailureResponse,
     ChatRequest,
     ChatResponse,
+    ChatTerminalRecord,
     CurrentWorkStatus,
     DeferredChatResponse,
+    ProcessingCueRecord,
     WorkIdentifier,
     WorkStatus,
     WorkUUID,
@@ -38,6 +43,58 @@ from settings import get_settings
 settings = get_settings()
 _chat_logger = logging.getLogger("uvicorn.error.chat_orchestrator.chat")
 _owned_chat_tasks: set[asyncio.Task] = set()
+
+
+async def _feedback_records(
+    delivery: asyncio.Task, cue: asyncio.Future, request_id: str,
+) -> AsyncIterator[str]:
+    try:
+        await asyncio.wait({delivery, cue}, return_when=asyncio.FIRST_COMPLETED)
+        # A ready terminal always wins, including simultaneous completion.
+        if not delivery.done() and cue.done():
+            yield cue.result().model_dump_json() + "\n"
+        response = await asyncio.shield(delivery)
+        if isinstance(response, JSONResponse):
+            code, body = response.status_code, json.loads(response.body)
+        else:
+            code, body = 200, response
+        record = ChatTerminalRecord(http_status=code, body=body)
+        if (record.body.request_id != request_id or (
+            cue.done() and not cue.cancelled()
+            and getattr(record.body, "conversation_id", None) != cue.result().conversation_id
+            and code != 500
+        )):
+            raise ValueError("terminal_request_mismatch")
+        yield record.model_dump_json() + "\n"
+    except Exception:
+        yield ChatTerminalRecord(
+            http_status=500, body=ChatFailureResponse(request_id=request_id),
+        ).model_dump_json() + "\n"
+    finally:
+        # This is only the HTTP delivery waiter. Existing deferred cognition is
+        # separately owned by _await_chat_delivery and the application lifespan.
+        if not delivery.done():
+            delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        cue.cancel()
+
+
+def _feedback_requested(request: Request | None) -> bool:
+    if request is None or not settings.progressive_feedback_enabled:
+        return False
+    # Require this exact version explicitly; wildcards never opt a client in.
+    for item in request.headers.get("accept", "").split(","):
+        parts = [part.strip().lower() for part in item.split(";")]
+        if parts[0] != CHAT_FEEDBACK_MEDIA_TYPE:
+            continue
+        try:
+            if len(parts) <= 2 and all(part.startswith("q=") for part in parts[1:]) and (
+                not parts[1:] or 0 < float(parts[1][2:]) <= 1
+            ):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _chat_task_done(task: asyncio.Task) -> None:
@@ -255,10 +312,16 @@ async def brief_generate(body: BriefGenerateRequest) -> BriefGenerateResponse:
 @app.post(
     "/v1/chat",
     response_model=ChatResponse,
-    responses={202: {"model": DeferredChatResponse}},
+    responses={
+        200: {"content": {CHAT_FEEDBACK_MEDIA_TYPE: {"schema": {
+            "type": "string",
+            "description": "Optional processing_cue record, then one terminal NDJSON record.",
+        }}}},
+        202: {"model": DeferredChatResponse},
+    },
     dependencies=[Depends(require_api_key)],
 )
-async def chat(body: ChatRequest) -> ChatResponse:
+async def chat(body: ChatRequest, request: Request = None) -> ChatResponse:
     request_id = str(uuid4())
     _chat_logger.info(
         "chat_request_started component=chat-orchestrator request_id=%s",
@@ -272,10 +335,36 @@ async def chat(body: ChatRequest) -> ChatResponse:
             and body.capability_confirmation is None
         )
         admitted = asyncio.get_running_loop().create_future() if eligible else None
+        # Only the existing independently owned, read-only delivery path supports feedback.
+        # Action/confirmation and synchronous-only requests retain their JSON lifecycle.
+        cue = (asyncio.get_running_loop().create_future()
+               if eligible and _feedback_requested(request) else None)
+        admitted_work = None
 
         def on_work_admitted(work: dict[str, Any]) -> None:
+            nonlocal admitted_work
+            admitted_work = work
             if admitted is not None and not admitted.done():
                 admitted.set_result((work, asyncio.get_running_loop().time()))
+
+        def on_processing_eligible(value: dict[str, Any]) -> None:
+            if cue is None or cue.done() or not isinstance(admitted_work, dict):
+                return
+            try:
+                record = ProcessingCueRecord.model_validate(value)
+                expected = {
+                    "request_id": request_id, "owner_id": body.owner_id,
+                    "client_id": body.client_id, "surface": body.surface,
+                    "conversation_id": record.conversation_id,
+                }
+                if (record.request_id != request_id or any(
+                    key not in admitted_work or admitted_work[key] != item
+                    for key, item in expected.items()
+                )):
+                    return
+            except (ValueError, TypeError):
+                return
+            cue.set_result(record)
 
         cognition = orchestrate_chat(
             payload=body.model_dump(exclude={"allow_deferred", "delivery_wait_ms"}),
@@ -316,21 +405,41 @@ async def chat(body: ChatRequest) -> ChatResponse:
             prompt_output_token_reserve=settings.prompt_output_token_reserve,
             prompt_context_safety_margin=settings.prompt_context_safety_margin,
             request_id=request_id,
-            on_work_admitted=on_work_admitted if eligible else None,
+            on_work_admitted=on_work_admitted if eligible or cue is not None else None,
+            **({"on_processing_eligible": on_processing_eligible} if cue is not None else {}),
         )
-        result = (
-            await _await_chat_delivery(cognition, admitted, body)
-            if eligible else await cognition
-        )
-        if isinstance(result, DeferredChatResponse):
-            return JSONResponse(status_code=202, content=result.model_dump())
-        response = ChatResponse(**result)
-        _chat_logger.info(
-            "chat_request_completed component=chat-orchestrator request_id=%s status=%s",
-            request_id,
-            response.status,
-        )
-        return response
+
+        async def deliver():
+            try:
+                result = (
+                    await _await_chat_delivery(cognition, admitted, body)
+                    if eligible else await cognition
+                )
+                if isinstance(result, DeferredChatResponse):
+                    return JSONResponse(status_code=202, content=result.model_dump())
+                response = ChatResponse(**result)
+                _chat_logger.info(
+                    "chat_request_completed component=chat-orchestrator request_id=%s status=%s",
+                    request_id, response.status,
+                )
+                return response
+            except Exception:
+                _chat_logger.info(
+                    "chat_request_failed component=chat-orchestrator request_id=%s "
+                    "error_category=orchestration_exception", request_id,
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content=ChatFailureResponse(request_id=request_id).model_dump(),
+                )
+
+        if cue is not None:
+            return StreamingResponse(
+                _feedback_records(asyncio.create_task(deliver()), cue, request_id),
+                media_type=CHAT_FEEDBACK_MEDIA_TYPE,
+                headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+            )
+        return await deliver()
     except Exception:
         _chat_logger.info(
             "chat_request_failed component=chat-orchestrator request_id=%s "

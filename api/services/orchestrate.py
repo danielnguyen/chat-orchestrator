@@ -41,6 +41,7 @@ from clients.runtime import (
     validate_timing_request,
     validate_timing_response,
 )
+from models import ProcessingCueRecord
 from pydantic import ValidationError
 from router.engine import evaluate_route
 from services.action_connectors import ActionConnectorRegistry
@@ -6194,6 +6195,7 @@ async def _resolve_interaction_governance(
     recent_messages: list[dict[str, str]],
     surface_metadata_json: dict[str, Any] | None,
     strict_turn_binding: bool = False,
+    observe_turn_binding: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not enabled:
         return None, _interaction_governance_disabled_trace()
@@ -6273,6 +6275,11 @@ async def _resolve_interaction_governance(
         reason_summary = []
 
     return result, {
+        **({"turn_binding_validated": all(response.get(key) == value for key, value in {
+            "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+            "surface": surface, "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }.items())} if observe_turn_binding else {}),
         "attempted": True,
         "status": "included",
         "included": True,
@@ -6489,6 +6496,7 @@ async def _resolve_restraint(
     current_user_text: str,
     recent_messages: list[dict[str, str]],
     surface_metadata_json: dict[str, Any] | None,
+    observe_turn_binding: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not enabled:
         return None, _restraint_disabled_trace()
@@ -6546,6 +6554,11 @@ async def _resolve_restraint(
         reason_summary = []
 
     return result, {
+        **({"turn_binding_validated": all(response.get(key) == value for key, value in {
+            "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+            "surface": surface, "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+        }.items())} if observe_turn_binding else {}),
         "attempted": True,
         "status": "included",
         "included": True,
@@ -9460,6 +9473,7 @@ async def orchestrate_chat(
     allow_manual_override: bool,
     request_id: str,
     on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
+    on_processing_eligible: Callable[[dict[str, Any]], None] | None = None,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
@@ -9959,6 +9973,7 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
+            observe_turn_binding=on_processing_eligible is not None,
             strict_turn_binding=(strict_capability_information_enabled
                                  or strict_relationship_retrieval_enabled
                                  or strict_world_state_authority_enabled),
@@ -10176,6 +10191,7 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
+            observe_turn_binding=on_processing_eligible is not None,
         )
         runtime_presence_trace = await _resolve_runtime_presence(
             memory_store=memory_store, runtime=runtime, request_id=request_id,
@@ -13067,6 +13083,56 @@ async def orchestrate_chat(
             elif pending_continuation is not None:
                 completion = {"choices": [{"message": {"content": ""}}]}
             else:
+                if on_processing_eligible is not None:
+                    feedback_trace = {"eligibility": "omitted", "signal": "not_prepared"}
+                    prompt.trace["processing_feedback"] = feedback_trace
+                    # This is a presentation-only projection of already consumed policy.
+                    # Never move a policy call or enable a tool to produce this cue.
+                    if (
+                        not capability_registry_enabled and not provider_tools
+                        and response_action_mode == "shadow"
+                        and payload.get("capability_confirmation") is None
+                        and not grounded_evidence_provider_call and not evidence_provider_call
+                        and not exact_reference_request and not compound_verification_requested
+                        and not claim_explanation.handled
+                        and interaction_governance_trace.get("included") is True
+                        and interaction_governance_trace.get("turn_binding_validated") is True
+                        and (interaction_governance or {}).get("interaction_kind") == "question"
+                        and interaction_governance.get("requires_confirmation") is False
+                        and interaction_governance.get("privacy_sensitivity_hint") == "normal"
+                        and restraint_trace.get("included") is True
+                        and restraint_trace.get("turn_binding_validated") is True
+                        and (restraint or {}).get("proactive_output_suppressed") is False
+                        and restraint.get("clarification_preferred") is False
+                        and restraint.get("restraint_policy") in {
+                            "short_answer", "answer_normally",
+                        }
+                        and runtime_presence_trace.get("status") == "included"
+                        and runtime_presence_trace.get("required_help_allowed") is True
+                        and runtime_presence_trace.get("proactive_output_suppressed") is False
+                        and situated_presence_trace.get("status") == "included"
+                        and (situated_presence or {}).get("silence_preferred") is False
+                        and timing_trace.get("status") == "included"
+                        and (timing_result or {}).get("timing_policy") == "answer_now"
+                        and timing_result.get("degradation_mode") == "none"
+                        and timing_result.get("latency_budget_class") == "voice_provider_dispatch"
+                        and timing_trace.get("inputs", {}).get("spoken_output") is True
+                        and privacy_context_trace.get("included") is True
+                        and not privacy_prompt_suppressed
+                        and (privacy_context or {}).get("voice_detail_allowed") is True
+                        and privacy_context.get("redaction_required") is False
+                        and privacy_context.get("safe_summary_required") is False
+                        and not (interrupt_trace or {}).get("should_interrupt")
+                        and work.work is not None and work.work.get("state") == "running"
+                    ):
+                        try:
+                            cue = ProcessingCueRecord(
+                                request_id=request_id, conversation_id=conversation_id,
+                            )
+                            on_processing_eligible(cue.model_dump())
+                            feedback_trace.update(eligibility="permitted", signal="prepared")
+                        except Exception:
+                            feedback_trace["signal"] = "unavailable"
                 if grounded_evidence_provider_call:
                     completion = await litellm.chat(
                         request_id=request_id,

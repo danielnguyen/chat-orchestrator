@@ -969,3 +969,551 @@ async def test_bms_shutdown_failure_still_closes_captured_runtime(monkeypatch):
         "runtime_open", "cr_reconcile", "bms_open", "bms_reconcile", "yield",
         "bms_close", "runtime_close",
     ]
+
+
+@pytest.fixture
+def feedback_flow(delivery_flow, monkeypatch):
+    from test_orchestrate_flow import _processing_feedback_runtime
+
+    main, memory, provider, entered, release, locators, failed = delivery_flow
+    monkeypatch.setattr(main, "runtime", _processing_feedback_runtime())
+    for setting in (
+        "progressive_feedback_enabled", "cognitive_runtime_interaction_governance_enabled",
+        "cognitive_runtime_restraint_enabled", "cognitive_runtime_privacy_context_enabled",
+    ):
+        monkeypatch.setattr(main.settings, setting, True)
+    return main, memory, provider, entered, release, locators, failed
+
+
+def _feedback_request():
+    from fastapi import Request
+    from models import CHAT_FEEDBACK_MEDIA_TYPE
+
+    return Request({"type": "http", "headers": [(b"accept", CHAT_FEEDBACK_MEDIA_TYPE.encode())]})
+
+
+async def _feedback_response(main, **changes):
+    from models import ChatRequest
+
+    payload = _full_chat_payload(
+        messages=[{"role": "user", "content": "What is a hostname?"}],
+        surface="alexa", allow_deferred=True, delivery_wait_ms=1000,
+        surface_context={"spoken_output": True, "interaction_mode": "voice_mediated",
+                         "surface_category": "voice_private", "output_format": "speech"},
+    )
+    payload.update(changes)
+    return await main.chat(ChatRequest(**payload), _feedback_request())
+
+
+def _feedback_record(line):
+    import json
+
+    from models import ChatTerminalRecord, ProcessingCueRecord
+
+    value = json.loads(line)
+    model = ProcessingCueRecord if value["type"] == "processing_cue" else ChatTerminalRecord
+    return model.model_validate(value)
+
+
+@pytest.mark.asyncio
+async def test_feedback_cue_then_terminal_preserves_canonical_work(feedback_flow):
+    main, memory, provider, entered, release, _, _ = feedback_flow
+    response = await _feedback_response(main)
+    iterator = response.body_iterator
+    try:
+        cue = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        await entered.wait()
+        assert cue.type == "processing_cue" and cue.cue_code == "processing"
+        assert cue.request_id == memory.work["request_id"]
+        assert cue.conversation_id == memory.work["conversation_id"]
+        assert memory.work["state"] == "running" and not release.is_set()
+        assert len(main._owned_chat_tasks) == 1
+        release.set()
+        terminal = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        assert terminal.http_status == 200
+        assert terminal.body.request_id == cue.request_id
+        assert terminal.body.answer == "Canonical delivery answer."
+        assert memory.work["state"] == "completed"
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+        assert [message["role"] for message in memory.added_messages] == ["user", "assistant"]
+        assert len(provider.calls) == 1 and not main._owned_chat_tasks
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_pending_uses_original_deadline_and_read_only_status(feedback_flow):
+    main, memory, provider, _, release, locators, _ = feedback_flow
+    response = await _feedback_response(main, delivery_wait_ms=100)
+    iterator = response.body_iterator
+    try:
+        cue = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        terminal = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        assert terminal.http_status == 202
+        assert terminal.body.work_id == memory.work["work_id"]
+        assert terminal.body.request_id == cue.request_id
+        assert memory.work["state"] == "running" and not provider.cancelled
+        assert len(locators) == 1
+        assert len(main._owned_chat_tasks) == 1
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+        release.set()
+        await asyncio.gather(*main._owned_chat_tasks)
+        assert memory.work["state"] == "completed" and len(provider.calls) == 1
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_disconnect_keeps_owned_cognition_and_canonical_completion(feedback_flow):
+    main, memory, provider, _, release, _, _ = feedback_flow
+    response = await _feedback_response(main)
+    iterator = response.body_iterator
+    assert _feedback_record(
+            await asyncio.wait_for(anext(iterator), 5),
+        ).type == "processing_cue"
+    await iterator.aclose()
+    try:
+        assert len(main._owned_chat_tasks) == 1 and not provider.cancelled
+        release.set()
+        await asyncio.gather(*main._owned_chat_tasks)
+        assert memory.work["state"] == "completed" and len(provider.calls) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_locator_failure_keeps_original_synchronous_result(feedback_flow):
+    main, memory, provider, _, release, _, failed = feedback_flow
+    failed.set()
+    attempted = asyncio.Event()
+    original = memory.set_current_work
+
+    async def locator(**scope):
+        attempted.set()
+        return await original(**scope)
+
+    memory.set_current_work = locator
+    response = await _feedback_response(main, delivery_wait_ms=100)
+    iterator = response.body_iterator
+    try:
+        assert _feedback_record(
+            await asyncio.wait_for(anext(iterator), 5),
+        ).type == "processing_cue"
+        pending = asyncio.create_task(anext(iterator))
+        await asyncio.wait_for(attempted.wait(), 5)
+        assert not pending.done()
+        release.set()
+        terminal = _feedback_record(await asyncio.wait_for(pending, 5))
+        assert terminal.http_status == 200
+        assert memory.work["state"] == "completed" and len(provider.calls) == 1
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [
+    None, "request", "conversation", "extra", "cue", "missing", "owner", "surface", "client",
+])
+async def test_feedback_final_first_and_invalid_callbacks_emit_only_terminal(
+    monkeypatch, defect,
+):
+    from test_memory_store_client import projection
+
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main, "runtime", object())
+
+    called, release = asyncio.Event(), asyncio.Event()
+
+    async def cognition(**kwargs):
+        work = projection(request_id=kwargs["request_id"], client_id="node-red", surface="alexa")
+        if defect in {"owner", "surface", "client"}:
+            field = {"owner": "owner_id", "surface": "surface", "client": "client_id"}[defect]
+            work[field] = "other"
+        kwargs["on_work_admitted"](work)
+        value = {"type": "processing_cue", "request_id": kwargs["request_id"],
+                 "conversation_id": work["conversation_id"], "cue_code": "processing"}
+        if defect == "request":
+            value["request_id"] = "other-request"
+        elif defect == "conversation":
+            value["conversation_id"] = "00000000-0000-4000-8000-000000000099"
+        elif defect == "extra":
+            value["private_context"] = "must-not-leak"
+        elif defect == "cue":
+            value["cue_code"] = "private arbitrary speech"
+        elif defect == "missing":
+            del value["conversation_id"]
+        kwargs["on_processing_eligible"](value)
+        kwargs["on_processing_eligible"](value)
+        called.set()
+        if defect is not None:
+            await release.wait()
+        return dict(request_id=kwargs["request_id"], conversation_id=work["conversation_id"],
+                    profile_name="default", selected_model="test", answer="Same.",
+                    status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    response = await _feedback_response(main)
+    async def collect():
+        return [_feedback_record(line) async for line in response.body_iterator]
+
+    reading = asyncio.create_task(collect())
+    await asyncio.wait_for(called.wait(), 5)
+    release.set()
+    records = await asyncio.wait_for(reading, 5)
+    assert len(records) == 1 and records[0].http_status == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled,accept", [
+    (False, "application/vnd.ccp.chat-feedback.v1+ndjson"),
+    (True, "application/json"), (True, "*/*"),
+    (True, "application/vnd.ccp.chat-feedback.v1+ndjson;q=0"),
+    (True, "application/vnd.ccp.chat-feedback.v1+ndjson;q=nan"),
+    (True, "application/vnd.ccp.chat-feedback.v1+ndjson;q=1;q=0"),
+    (True, "application/vnd.ccp.chat-feedback.v2+ndjson"),
+])
+async def test_feedback_requires_server_gate_and_exact_negotiation(monkeypatch, enabled, accept):
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", enabled)
+
+    async def cognition(**kwargs):
+        assert "on_processing_eligible" not in kwargs
+        return dict(request_id=kwargs["request_id"], profile_name="default", selected_model="test",
+                    answer="Unchanged.", status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://testserver") as client:
+        response = await client.post("/v1/chat", json=_full_chat_payload(),
+                                     headers={"X-API-Key": "orch-test", "Accept": accept})
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert response.json()["answer"] == "Unchanged."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_cue", [False, True])
+async def test_feedback_failure_retains_logical_500_without_private_exception(
+    monkeypatch, after_cue,
+):
+    from test_memory_store_client import projection
+
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main, "runtime", object())
+    release = asyncio.Event()
+
+    async def cognition(**kwargs):
+        work = projection(request_id=kwargs["request_id"], client_id="node-red", surface="alexa")
+        kwargs["on_work_admitted"](work)
+        if after_cue:
+            kwargs["on_processing_eligible"]({
+                "request_id": kwargs["request_id"], "conversation_id": work["conversation_id"],
+            })
+            await release.wait()
+        raise RuntimeError("private credentials and prompt sentinel")
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    response = await _feedback_response(main)
+    iterator = response.body_iterator
+    try:
+        if after_cue:
+            assert _feedback_record(
+            await asyncio.wait_for(anext(iterator), 5),
+        ).type == "processing_cue"
+            release.set()
+        terminal = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        assert terminal.http_status == 500 and terminal.body.status == "failed"
+        assert "private credentials" not in terminal.model_dump_json()
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("missing", ["runtime", "governance", "restraint", "privacy"])
+def test_feedback_configuration_requires_authority(monkeypatch, missing):
+    from pydantic import ValidationError
+    from settings import Settings
+
+    main = _load_main(monkeypatch)
+    value = main.settings.model_dump()
+    value.update(progressive_feedback_enabled=True, cognitive_runtime_base_url="http://runtime",
+                 cognitive_runtime_interaction_governance_enabled=True,
+                 cognitive_runtime_restraint_enabled=True,
+                 cognitive_runtime_privacy_context_enabled=True)
+    field = {"runtime": "cognitive_runtime_base_url",
+             "governance": "cognitive_runtime_interaction_governance_enabled",
+             "restraint": "cognitive_runtime_restraint_enabled",
+             "privacy": "cognitive_runtime_privacy_context_enabled"}[missing]
+    value[field] = None if missing == "runtime" else False
+    # Existing settings accept environment aliases, as production does.
+    aliased = {Settings.model_fields[key].alias or key: item for key, item in value.items()}
+    with pytest.raises(ValidationError, match="progressive feedback requires"):
+        Settings(**aliased)
+
+
+@pytest.mark.asyncio
+async def test_feedback_flushes_on_real_http_before_provider_completion(feedback_flow):
+    import socket
+
+    import uvicorn
+    from models import CHAT_FEEDBACK_MEDIA_TYPE
+
+    main, memory, provider, entered, release, _, _ = feedback_flow
+    started = asyncio.Event()
+
+    class Server(uvicorn.Server):
+        async def startup(self, sockets=None):
+            await super().startup(sockets=sockets)
+            started.set()
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    server = Server(uvicorn.Config(
+        main.app, lifespan="off", access_log=False, log_level=None, log_config=None, ws="none",
+    ))
+    task = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=5) as client:
+            async with client.stream("POST", "/v1/chat", headers={
+                "X-API-Key": "orch-test", "Accept": CHAT_FEEDBACK_MEDIA_TYPE,
+            }, json=_full_chat_payload(
+                messages=[{"role": "user", "content": "What is a hostname?"}], surface="alexa",
+                allow_deferred=True, delivery_wait_ms=1000,
+                surface_context={"spoken_output": True, "interaction_mode": "voice_mediated",
+                                 "surface_category": "voice_private", "output_format": "speech"},
+            )) as response:
+                assert response.headers["content-type"] == CHAT_FEEDBACK_MEDIA_TYPE
+                lines = response.aiter_lines()
+                cue = _feedback_record(await asyncio.wait_for(anext(lines), 5))
+                await entered.wait()
+                assert cue.type == "processing_cue" and not release.is_set()
+                assert memory.work["state"] == "running"
+                release.set()
+                terminal = _feedback_record(await asyncio.wait_for(anext(lines), 5))
+                assert terminal.http_status == 200
+                assert terminal.body.request_id == cue.request_id
+                with pytest.raises(StopAsyncIteration):
+                    await anext(lines)
+        assert memory.work["state"] == "completed" and len(provider.calls) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+        server.should_exit = True
+        await asyncio.wait_for(task, 5)
+        listener.close()
+
+
+@pytest.mark.asyncio
+async def test_feedback_duplicate_callback_emits_one_cue(monkeypatch):
+    from test_memory_store_client import projection
+
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main, "runtime", object())
+    release = asyncio.Event()
+
+    async def cognition(**kwargs):
+        work = projection(request_id=kwargs["request_id"], client_id="node-red", surface="alexa")
+        kwargs["on_work_admitted"](work)
+        value = dict(request_id=kwargs["request_id"], conversation_id=work["conversation_id"])
+        kwargs["on_processing_eligible"](value)
+        kwargs["on_processing_eligible"](value)
+        await release.wait()
+        return dict(request_id=kwargs["request_id"], conversation_id=work["conversation_id"],
+                    profile_name="default", selected_model="test", answer="Once.",
+                    status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    response = await _feedback_response(main)
+    iterator = response.body_iterator
+    try:
+        assert _feedback_record(await asyncio.wait_for(anext(iterator), 5)).type == "processing_cue"
+        release.set()
+        assert _feedback_record(await asyncio.wait_for(anext(iterator), 5)).type == "terminal"
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_waiter_cancellation_preserves_owned_work(feedback_flow):
+    main, memory, provider, _, release, _, _ = feedback_flow
+    response = await _feedback_response(main)
+    iterator = response.body_iterator
+    try:
+        assert _feedback_record(await asyncio.wait_for(anext(iterator), 5)).type == "processing_cue"
+        reading = asyncio.create_task(anext(iterator))
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        await iterator.aclose()
+        assert not provider.cancelled and len(main._owned_chat_tasks) == 1
+        release.set()
+        await asyncio.gather(*main._owned_chat_tasks)
+        assert memory.work["state"] == "completed"
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_shutdown_cancellation_cannot_publish_success(feedback_flow):
+    main, memory, provider, _, release, _, _ = feedback_flow
+    response = await _feedback_response(main)
+    iterator = response.body_iterator
+    try:
+        first = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        assert first.type == "processing_cue"
+        for task in tuple(main._owned_chat_tasks):
+            task.cancel()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+        with pytest.raises(asyncio.CancelledError):
+            await anext(iterator)
+        assert provider.cancelled
+        assert memory.work["state"] == "failed"
+        assert memory.work["assistant_message_id"] is None
+        # A stream missing its terminal record is incomplete, never success.
+    finally:
+        release.set()
+        await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_corrupt_terminal_is_bounded_failure(monkeypatch):
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+
+    async def cognition(**kwargs):
+        return dict(request_id="another-request", profile_name="default", selected_model="test",
+                    answer="PRIVATE WRONG REQUEST ANSWER", status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    monkeypatch.setattr(main, "runtime", object())
+    response = await _feedback_response(main)
+    records = [_feedback_record(line) async for line in response.body_iterator]
+    assert len(records) == 1 and records[0].http_status == 500
+    assert "PRIVATE WRONG" not in records[0].model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_feedback_disabled_negotiation_retains_json_202(feedback_flow, monkeypatch):
+    from models import CHAT_FEEDBACK_MEDIA_TYPE
+
+    main, memory, provider, _, release, _, _ = feedback_flow
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", False)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                     base_url="http://testserver") as client:
+            response = await client.post(
+                "/v1/chat", headers={"X-API-Key": "orch-test", "Accept": CHAT_FEEDBACK_MEDIA_TYPE},
+                json=_full_chat_payload(allow_deferred=True, delivery_wait_ms=100),
+            )
+        assert response.status_code == 202
+        assert response.headers["content-type"] == "application/json"
+        assert set(response.json()) == {
+            "request_id", "conversation_id", "work_id", "delivery_status",
+        }
+        assert response.json()["work_id"] == memory.work["work_id"]
+    finally:
+        release.set()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+    assert len(provider.calls) == 1 and memory.work["state"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["confirmation", "capabilities", "runtime", "synchronous"])
+async def test_feedback_never_changes_ineligible_json_task_ownership(monkeypatch, reason):
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled",
+                        reason == "capabilities")
+    monkeypatch.setattr(main, "runtime", None if reason == "runtime" else object())
+
+    async def cognition(**kwargs):
+        assert "on_processing_eligible" not in kwargs
+        assert kwargs["on_work_admitted"] is None
+        assert not main._owned_chat_tasks
+        return dict(request_id=kwargs["request_id"], profile_name="default", selected_model="test",
+                    answer="Unchanged.", status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    changes = {}
+    if reason == "confirmation":
+        changes["capability_confirmation"] = {"confirmed": True}
+    elif reason == "synchronous":
+        changes.update(allow_deferred=False, delivery_wait_ms=None)
+    result = await _feedback_response(main, **changes)
+    assert result.answer == "Unchanged."
+
+
+@pytest.mark.asyncio
+async def test_feedback_concurrent_requests_keep_independent_correlation(monkeypatch):
+    from test_memory_store_client import projection
+
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main, "runtime", object())
+    release = asyncio.Event()
+    calls = []
+
+    async def cognition(**kwargs):
+        payload, request_id = kwargs["payload"], kwargs["request_id"]
+        calls.append(request_id)
+        work = projection(request_id=request_id, owner_id=payload["owner_id"],
+                          conversation_id=payload["conversation_id"],
+                          client_id="node-red", surface="alexa")
+        kwargs["on_work_admitted"](work)
+        kwargs["on_processing_eligible"]({
+            "request_id": request_id, "conversation_id": work["conversation_id"],
+        })
+        await release.wait()
+        return dict(request_id=request_id, conversation_id=work["conversation_id"],
+                    profile_name="default", selected_model="test", answer=payload["owner_id"],
+                    status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    responses = [await _feedback_response(
+        main, owner_id=f"owner-{index}",
+        conversation_id=f"00000000-0000-4000-8000-00000000000{index}",
+    ) for index in (1, 2)]
+    iterators = [response.body_iterator for response in responses]
+    try:
+        cues = [_feedback_record(line) for line in await asyncio.wait_for(
+            asyncio.gather(*(anext(iterator) for iterator in iterators)), 5,
+        )]
+        assert len(set(cue.request_id for cue in cues)) == len(calls) == 2
+        release.set()
+        for index, (cue, iterator) in enumerate(zip(cues, iterators), 1):
+            terminal = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+            assert terminal.body.answer == f"owner-{index}"
+            assert terminal.body.conversation_id == cue.conversation_id
+            assert terminal.body.request_id == cue.request_id
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+    finally:
+        release.set()
+        for iterator in iterators:
+            await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)

@@ -22,6 +22,9 @@ class Settings(BaseSettings):
         le=30000,
     )
     enable_runtime_overlays: bool = Field(default=False, alias="ENABLE_RUNTIME_OVERLAYS")
+    progressive_feedback_enabled: bool = Field(
+        default=False, alias="PROGRESSIVE_FEEDBACK_ENABLED",
+    )
     cognitive_runtime_companion_enabled: bool = Field(
         default=False,
         alias="COGNITIVE_RUNTIME_COMPANION_ENABLED",
@@ -141,6 +144,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_claim_capture_runtime(self) -> Settings:
+        if self.progressive_feedback_enabled and (
+            not self.cognitive_runtime_base_url or not all((
+                self.cognitive_runtime_interaction_governance_enabled,
+                self.cognitive_runtime_restraint_enabled,
+                self.cognitive_runtime_privacy_context_enabled,
+            ))
+        ):
+            raise ValueError(
+                "progressive feedback requires runtime, governance, restraint and privacy"
+            )
         if self.strict_world_state_authority_enabled and (
             not self.cognitive_runtime_base_url or not all((
                 self.cognitive_runtime_interaction_governance_enabled,

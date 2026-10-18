@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import hashlib
 import importlib
@@ -41698,3 +41699,281 @@ async def test_strict_world_state_unavailable_bound_persona_stops_before_protect
     assert out["status"] == "failed" and provider.calls == memory.retrieve_calls == []
     assert runtime.world_state_calls == runtime.relationship_calls == []
     assert memory.work["state"] == "failed"
+
+
+def _processing_feedback_runtime():
+    runtime = FakeRuntime()
+    runtime.restraint_response["result"].update(
+        restraint_policy="answer_normally", proactive_output_suppressed=False,
+        personalization_suppressed=False, retrieval_suppressed=False,
+    )
+    runtime.situated_presence_response = _situated_runtime_response(
+        commentary=False, humor=False, challenge="none", silence=False,
+        posture="direct", reason="upstream_commentary_suppressed",
+    )
+
+    governance = runtime.evaluate_interaction_governance
+    restraint = runtime.evaluate_restraint
+    situated = runtime.evaluate_situated_presence
+
+    async def current_governance(**scope):
+        response = await governance(**scope)
+        return {**response, **{key: scope[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )}}
+
+    async def current_restraint(**scope):
+        response = await restraint(**scope)
+        return {**response, **{key: scope[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )}}
+
+    async def current_situated(**scope):
+        response = await situated(**scope)
+        return {**response, **{key: scope[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )}}
+
+    runtime.evaluate_situated_presence = current_situated
+    runtime.evaluate_interaction_governance = current_governance
+    runtime.evaluate_restraint = current_restraint
+
+    async def privacy(**scope):
+        runtime.call_order.append("privacy_context")
+        runtime.privacy_context_calls.append(scope)
+        return {
+            **{key: scope[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id",
+            )},
+            "result": {
+                "privacy_zone": "private", "surface_type": scope["surface_category"],
+                "sensitivity_level": scope["sensitivity_level"],
+                "sensitive_detail_allowed": True, "notification_detail_allowed": False,
+                "voice_detail_allowed": True, "screen_detail_allowed": False,
+                "redaction_required": False, "safe_summary_required": False,
+                "reason_codes": ["private_surface"],
+            },
+        }
+
+    runtime.evaluate_privacy_context = privacy
+    return runtime
+
+
+def _processing_feedback_payload(**changes):
+    return _base_payload(
+        surface="alexa", conversation_id="00000000-0000-4000-8000-000000000010",
+        surface_context={"spoken_output": True, "interaction_mode": "voice_mediated",
+                         "surface_category": "voice_private", "output_format": "speech"},
+        **changes,
+    )
+
+
+@pytest.mark.asyncio
+async def test_processing_feedback_policy_barrier_precedes_provider_and_canonical_persistence(
+    tmp_path,
+):
+    runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+    entered, release = asyncio.Event(), asyncio.Event()
+    cues = []
+
+    class Provider(FakeLiteLLM):
+        async def chat(self, **kwargs):
+            entered.set()
+            await release.wait()
+            return await super().chat(**kwargs)
+
+    provider = Provider(content="Canonical answer.")
+
+    def cue(value):
+        assert memory.work["state"] == "running"
+        assert provider.calls == []
+        runtime.call_order.append("processing_cue")
+        cues.append(value)
+
+    task = asyncio.create_task(_run_timing_turn(
+        tmp_path, runtime=runtime, provider=provider, memory=memory,
+        payload=_processing_feedback_payload(), privacy_context_enabled=True,
+        on_processing_eligible=cue,
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert cues == [{"type": "processing_cue", "request_id": "rid-timing-flow",
+                         "conversation_id": memory.work["conversation_id"],
+                         "cue_code": "processing"}]
+        order = runtime.call_order
+        for predecessor in ("start_turn", "interaction_governance", "restraint", "presence",
+                            "situated_presence", "timing", "privacy_context"):
+            assert order.index(predecessor) < order.index("processing_cue")
+        assert order.index("timing") < order.index("privacy_context")
+        assert order.index("processing_cue") < order.index("answer_generation")
+        assert not any(item["role"] == "assistant" for item in memory.added_messages)
+    finally:
+        release.set()
+        out, _, _, _ = await task
+    assert out["answer"] == "Canonical answer."
+    assert len(provider.calls) == len(runtime.timing_calls) == 1
+    assert provider.calls[0].get("tools") == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len([item for item in memory.added_messages if item["role"] == "assistant"]) == 1
+    assert memory.work["state"] == "completed"
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+    assert memory.events[-1] == "work:completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [
+    "governance", "restraint", "timing", "timing_scope", "presence", "privacy", "silence",
+    "privacy_redaction", "privacy_voice", "privacy_malformed", "command", "confirmation",
+    "capabilities", "tools", "interrupt", "text", "disabled", "policy_stop", "low_attention",
+])
+async def test_processing_feedback_exclusions_never_publish_or_upgrade_authority(
+    tmp_path, monkeypatch, defect,
+):
+    runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+    cues, options = [], {"privacy_context_enabled": True}
+    payload, policy = _processing_feedback_payload(), "answer_now"
+    if defect == "governance":
+        runtime.interaction_governance_error = RuntimeError("private governance failure")
+    elif defect == "restraint":
+        runtime.restraint_error = RuntimeError("private restraint failure")
+    elif defect == "timing":
+        options["error"] = RuntimeError("private timing failure")
+    elif defect == "timing_scope":
+        original = runtime.evaluate_timing
+
+        async def changed(**scope):
+            return {**await original(**scope), "request_id": "other-request"}
+
+        runtime.evaluate_timing = changed
+    elif defect == "presence":
+        runtime.presence_error = RuntimeError("private presence failure")
+    elif defect.startswith("privacy"):
+        original = runtime.evaluate_privacy_context
+
+        async def restricted(**scope):
+            if defect == "privacy":
+                raise RuntimeError("private policy unavailable")
+            response = await original(**scope)
+            if defect == "privacy_malformed":
+                response["runtime_turn_id"] = "another-turn"
+            elif defect == "privacy_voice":
+                response["result"]["voice_detail_allowed"] = False
+            else:
+                response["result"].update(redaction_required=True, safe_summary_required=True)
+            return response
+
+        runtime.evaluate_privacy_context = restricted
+    elif defect == "silence":
+        runtime.situated_presence_response["result"]["silence_preferred"] = True
+    elif defect == "command":
+        runtime.interaction_governance_response["result"]["interaction_kind"] = "command"
+        policy = "acknowledge_then_answer"
+    elif defect == "confirmation":
+        payload["capability_confirmation"] = {"confirmed": True}
+    elif defect == "capabilities":
+        options["capability_registry_enabled"] = True
+    elif defect == "tools":
+        original = orchestrate_service.filter_capability_descriptors_for_exposure
+
+        async def exposed(**scope):
+            descriptors, trace = await original(**scope)
+            return [{"type": "function", "function": {"name": "untrusted_tool"}}], trace
+
+        monkeypatch.setattr(
+            orchestrate_service, "filter_capability_descriptors_for_exposure", exposed,
+        )
+    elif defect == "interrupt":
+        options["interrupt_policy_mode"] = "enforce"
+    elif defect == "text":
+        payload["surface_context"]["spoken_output"] = False
+    elif defect == "policy_stop":
+        policy = "ask_clarifying_question"
+    elif defect == "low_attention":
+        policy = "defer_expansion"
+    if defect != "disabled":
+        options["on_processing_eligible"] = cues.append
+    out, _, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=payload, policy=policy, **options,
+    )
+    assert cues == []
+    assert out["status"] in {"ok", "degraded", "failed"}
+    assert runtime.capability_flow_calls == []
+    if defect not in {"capabilities", "tools"}:
+        assert runtime.capability_authority_calls == []
+    assert len(provider.calls) <= 1
+    if defect == "disabled":
+        assert "processing_feedback" not in str(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+async def test_processing_feedback_observer_failure_does_not_fail_or_replay_work(tmp_path):
+    runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+
+    def broken(value):
+        raise RuntimeError("private observer failure")
+
+    out, _, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(),
+        privacy_context_enabled=True, on_processing_eligible=broken,
+    )
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert memory.work["state"] == "completed"
+    assert "private observer failure" not in str(memory.trace_calls)
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["processing_feedback"]["signal"] == "unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["evaluate_interaction_governance", "evaluate_restraint"])
+@pytest.mark.parametrize("field", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id",
+])
+async def test_processing_feedback_wrong_scope_only_omits_cue(tmp_path, method, field):
+    runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+    original = getattr(runtime, method)
+    cues = []
+
+    async def mismatched(**scope):
+        return {**await original(**scope), field: "wrong-scope"}
+
+    setattr(runtime, method, mismatched)
+    out, _, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(),
+        privacy_context_enabled=True, on_processing_eligible=cues.append,
+    )
+    assert cues == []
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert memory.work["state"] == "completed"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+async def test_processing_feedback_cannot_publish_while_privacy_decision_is_pending(tmp_path):
+    runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+    original = runtime.evaluate_privacy_context
+    entered, release = asyncio.Event(), asyncio.Event()
+    provider, cues = FakeLiteLLM(), []
+
+    async def privacy(**scope):
+        entered.set()
+        await release.wait()
+        return await original(**scope)
+
+    runtime.evaluate_privacy_context = privacy
+    task = asyncio.create_task(_run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, provider=provider,
+        payload=_processing_feedback_payload(), privacy_context_enabled=True,
+        on_processing_eligible=cues.append,
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert len(runtime.timing_calls) == 1
+        assert cues == [] and provider.calls == []
+    finally:
+        release.set()
+        await task
+    assert len(cues) == len(provider.calls) == 1
