@@ -13103,14 +13103,15 @@ async def orchestrate_chat(
                         and interaction_governance.get("privacy_sensitivity_hint") == "normal"
                         and restraint_trace.get("included") is True
                         and restraint_trace.get("turn_binding_validated") is True
-                        and (restraint or {}).get("proactive_output_suppressed") is False
-                        and restraint.get("clarification_preferred") is False
+                        and (restraint or {}).get("clarification_preferred") is False
                         and restraint.get("restraint_policy") in {
                             "short_answer", "answer_normally",
                         }
                         and runtime_presence_trace.get("status") == "included"
                         and runtime_presence_trace.get("required_help_allowed") is True
-                        and runtime_presence_trace.get("proactive_output_suppressed") is False
+                        # Proactive suppression does not prohibit requested help.
+                        # Optional feedback still excludes quieter presence states.
+                        and runtime_presence_trace.get("presence_state") == "active_conversation"
                         and situated_presence_trace.get("status") == "included"
                         and (situated_presence or {}).get("silence_preferred") is False
                         and timing_trace.get("status") == "included"

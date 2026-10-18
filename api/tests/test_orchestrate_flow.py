@@ -41704,7 +41704,7 @@ async def test_strict_world_state_unavailable_bound_persona_stops_before_protect
 def _processing_feedback_runtime():
     runtime = FakeRuntime()
     runtime.restraint_response["result"].update(
-        restraint_policy="answer_normally", proactive_output_suppressed=False,
+        restraint_policy="answer_normally", proactive_output_suppressed=True,
         personalization_suppressed=False, retrieval_suppressed=False,
     )
     runtime.situated_presence_response = _situated_runtime_response(
@@ -41715,6 +41715,7 @@ def _processing_feedback_runtime():
     governance = runtime.evaluate_interaction_governance
     restraint = runtime.evaluate_restraint
     situated = runtime.evaluate_situated_presence
+    presence = runtime.evaluate_presence
 
     async def current_governance(**scope):
         response = await governance(**scope)
@@ -41737,6 +41738,21 @@ def _processing_feedback_runtime():
             "runtime_session_id", "runtime_turn_id",
         )}}
 
+    async def current_presence(**scope):
+        response = await presence(**scope)
+        # Ordinary requested help is permitted without proactive surface permission.
+        reasons = ["thread_active", "proactive_suppression_requested"]
+        if (scope["surface_permission_status"] != "configured"
+                or not scope["proactive_presence_allowed"]):
+            reasons.append({
+                "unconfigured": "surface_permission_unconfigured",
+                "unavailable": "surface_permission_unavailable",
+                "configured": "surface_proactive_denied",
+            }[scope["surface_permission_status"]])
+        response["result"].update(proactive_output_suppressed=True, reason_codes=reasons)
+        return response
+
+    runtime.evaluate_presence = current_presence
     runtime.evaluate_situated_presence = current_situated
     runtime.evaluate_interaction_governance = current_governance
     runtime.evaluate_restraint = current_restraint
@@ -41764,6 +41780,7 @@ def _processing_feedback_runtime():
 
 
 def _processing_feedback_payload(**changes):
+    changes.setdefault("messages", [{"role": "user", "content": "What is a hostname?"}])
     return _base_payload(
         surface="alexa", conversation_id="00000000-0000-4000-8000-000000000010",
         surface_context={"spoken_output": True, "interaction_mode": "voice_mediated",
@@ -41773,10 +41790,20 @@ def _processing_feedback_payload(**changes):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permission", ["unconfigured", "denied", "allowed"])
 async def test_processing_feedback_policy_barrier_precedes_provider_and_canonical_persistence(
-    tmp_path,
+    tmp_path, permission,
 ):
     runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+    record = await memory.get_presence_surface_permission(owner_id="owner", surface="alexa")
+    record["proactive_presence_allowed"] = permission == "allowed"
+    if permission == "unconfigured":
+        record.update(configured=False, conversation_context_allowed=False,
+                      created_at=None, updated_at=None)
+    memory.permission_response = record
+    payload = _processing_feedback_payload()
+    if permission == "unconfigured":
+        memory.create_conversation_response = {"conversation_id": payload.pop("conversation_id")}
     entered, release = asyncio.Event(), asyncio.Event()
     cues = []
 
@@ -41796,14 +41823,16 @@ async def test_processing_feedback_policy_barrier_precedes_provider_and_canonica
 
     task = asyncio.create_task(_run_timing_turn(
         tmp_path, runtime=runtime, provider=provider, memory=memory,
-        payload=_processing_feedback_payload(), privacy_context_enabled=True,
-        on_processing_eligible=cue,
+        payload=payload, privacy_context_enabled=True, on_processing_eligible=cue,
     ))
     try:
         await asyncio.wait_for(entered.wait(), 5)
         assert cues == [{"type": "processing_cue", "request_id": "rid-timing-flow",
                          "conversation_id": memory.work["conversation_id"],
                          "cue_code": "processing"}]
+        assert runtime.restraint_response["result"]["proactive_output_suppressed"] is True
+        assert runtime.presence_calls[0]["proactive_output_suppressed"] is True
+        assert runtime.presence_calls[0]["proactive_presence_allowed"] is (permission == "allowed")
         order = runtime.call_order
         for predecessor in ("start_turn", "interaction_governance", "restraint", "presence",
                             "situated_presence", "timing", "privacy_context"):
@@ -41989,3 +42018,62 @@ async def test_processing_feedback_cannot_publish_while_privacy_decision_is_pend
         release.set()
         await task
     assert len(cues) == len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [
+    "do_not_intrude", "low_attention", "driving_or_active_task", "not_present",
+    "idle", "available", "ambient_listening", "returning_after_gap",
+])
+async def test_processing_feedback_requires_active_requested_conversation(tmp_path, state):
+    runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
+    from clients.runtime import validate_presence_response
+
+    original = runtime.evaluate_presence
+    cues, validated_states = [], []
+    if state == "do_not_intrude":
+        original_preferences = memory.get_proactive_preferences
+
+        async def opted_out(**scope):
+            return {**await original_preferences(**scope),
+                    "created_at": "2026-10-05T00:00:00+00:00",
+                    "updated_at": "2026-10-05T00:00:00+00:00"}
+
+        memory.get_proactive_preferences = opted_out
+    elif state == "ambient_listening":
+        record = await memory.get_presence_surface_permission(owner_id="owner", surface="alexa")
+        memory.permission_response = {**record, "ambient_listening_allowed": True}
+
+    async def restricted(**scope):
+        response = await original(**scope)
+        reasons = {
+            "do_not_intrude": "explicit_proactive_opt_out", "low_attention": "session_paused",
+            "driving_or_active_task": "session_active_task_mode",
+            "not_present": "session_not_present",
+            "idle": "session_idle", "available": "session_available",
+            "ambient_listening": "ambient_mode_permitted",
+            "returning_after_gap": "return_gap_elapsed",
+        }
+        response["result"].update(
+            presence_state=state, required_help_allowed=state != "not_present",
+            reason_codes=[reasons[state], *response["result"]["reason_codes"][1:]],
+        )
+        scope_keys = {"request_id", "owner_id", "conversation_id", "surface",
+                      "runtime_session_id", "runtime_turn_id"}
+        validate_presence_response(
+            response, scope={key: scope[key] for key in scope_keys},
+            **{key: value for key, value in scope.items() if key not in scope_keys},
+        )
+        validated_states.append(state)
+        return response
+
+    runtime.evaluate_presence = restricted
+    out, _, _, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(),
+        privacy_context_enabled=True, on_processing_eligible=cues.append,
+    )
+    assert validated_states == [state]
+    assert cues == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert memory.work["state"] in {"completed", "failed"}
+    assert out["status"] in {"ok", "degraded", "failed"}

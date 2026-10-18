@@ -977,6 +977,11 @@ def feedback_flow(delivery_flow, monkeypatch):
 
     main, memory, provider, entered, release, locators, failed = delivery_flow
     monkeypatch.setattr(main, "runtime", _processing_feedback_runtime())
+    memory.permission_response = {
+        "owner_id": "owner", "surface": "alexa", "configured": False,
+        "conversation_context_allowed": False, "proactive_presence_allowed": False,
+        "ambient_listening_allowed": False, "created_at": None, "updated_at": None,
+    }
     for setting in (
         "progressive_feedback_enabled", "cognitive_runtime_interaction_governance_enabled",
         "cognitive_runtime_restraint_enabled", "cognitive_runtime_privacy_context_enabled",
@@ -1024,6 +1029,9 @@ async def test_feedback_cue_then_terminal_preserves_canonical_work(feedback_flow
         cue = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
         await entered.wait()
         assert cue.type == "processing_cue" and cue.cue_code == "processing"
+        assert main.runtime.restraint_response["result"]["proactive_output_suppressed"] is True
+        assert main.runtime.presence_calls[0]["proactive_output_suppressed"] is True
+        assert main.runtime.presence_calls[0]["proactive_presence_allowed"] is False
         assert cue.request_id == memory.work["request_id"]
         assert cue.conversation_id == memory.work["conversation_id"]
         assert memory.work["state"] == "running" and not release.is_set()
