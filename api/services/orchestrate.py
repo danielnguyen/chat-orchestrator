@@ -2742,6 +2742,12 @@ def _capability_completion_claim(text: str) -> bool:
     )
 
 
+_CONVERSATION_ONLY_REFUSAL = (
+    "I can answer questions here, but I can't carry out actions through this interaction. "
+    "No action was taken."
+)
+
+
 def _apply_capability_registry_response_boundary(text: str, trace: dict[str, Any]) -> str:
     override = _capability_registry_forced_response(trace)
     if override is not None:
@@ -9474,6 +9480,7 @@ async def orchestrate_chat(
     request_id: str,
     on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
     on_processing_eligible: Callable[[dict[str, Any]], None] | None = None,
+    non_executing_conversation: bool = False,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
     companion_policy_enabled: bool = False,
@@ -9505,6 +9512,10 @@ async def orchestrate_chat(
     action_connector_registry: ActionConnectorRegistry | None = None,
     message_id_factory: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
+    if type(non_executing_conversation) is not bool or (
+        non_executing_conversation and payload.get("capability_confirmation") is not None
+    ):
+        raise ValueError("invalid_non_executing_conversation")
     if (
         general_evidence_reasoning_enabled is None
         or general_evidence_reasoning_presentation_enabled is None
@@ -9538,13 +9549,13 @@ async def orchestrate_chat(
         seconds=_CONVERSATION_RETIREMENT_AFTER_SECONDS
     )
     surface = payload.get("surface", "unknown")
-    connector_registry = (
+    connector_registry = None if non_executing_conversation else (
         action_connector_registry
         if action_connector_registry is not None
         else ActionConnectorRegistry((JellyfinActionConnector(jellyfin_operations),))
     )
     pending_continuation, pending_error = (
-        (None, None) if strict_capability_information_enabled
+        (None, None) if non_executing_conversation or strict_capability_information_enabled
         else parse_pending_action_confirmation(payload.get("capability_confirmation"))
     )
     pending_capability_request: ParsedCapabilityRequest | None = None
@@ -9925,6 +9936,10 @@ async def orchestrate_chat(
         input_message_id=current_user_message_id,
         expected_thread_revision=expected_thread_revision,
     )
+    if non_executing_conversation:
+        turn_state_trace["non_executing_conversation"] = {
+            "selected": True, "action_dispatch": "blocked",
+        }
     if runtime is not None and turn_response is None:
         return {
             "request_id": request_id,
@@ -9973,7 +9988,7 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
-            observe_turn_binding=on_processing_eligible is not None,
+            observe_turn_binding=non_executing_conversation or on_processing_eligible is not None,
             strict_turn_binding=(strict_capability_information_enabled
                                  or strict_relationship_retrieval_enabled
                                  or strict_world_state_authority_enabled),
@@ -9981,7 +9996,7 @@ async def orchestrate_chat(
         strict_persona_context = {}
         strict_context_scope = None
         relationship_authority_trace = None
-        if strict_capability_information_enabled:
+        if strict_capability_information_enabled and not non_executing_conversation:
             scope = {
                 "request_id": request_id,
                 "owner_id": payload["owner_id"],
@@ -10191,7 +10206,7 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
-            observe_turn_binding=on_processing_eligible is not None,
+            observe_turn_binding=non_executing_conversation or on_processing_eligible is not None,
         )
         runtime_presence_trace = await _resolve_runtime_presence(
             memory_store=memory_store, runtime=runtime, request_id=request_id,
@@ -10476,6 +10491,9 @@ async def orchestrate_chat(
                 runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
                 turn_status="abandoned" if failed else "completed",
             )
+            if non_executing_conversation and turn_state_trace.get("completed") is not True:
+                failed, answer = True, failure_answer
+                outcome_trace["failure_category"] = "runtime_completion_unconfirmed"
             if interrupt_selected:
                 confirmed = turn_state_trace.get("completed") is True
                 outcome_trace["runtime_completion"] = "succeeded" if confirmed else "unconfirmed"
@@ -11508,7 +11526,11 @@ async def orchestrate_chat(
                 )
             return timing_stop_response is not None
 
-        if strict_capability_information_enabled:
+        if non_executing_conversation:
+            capability_registry_trace = _capability_registry_base_trace(
+                enabled=capability_registry_enabled, reason="non_executing_conversation",
+            )
+        elif strict_capability_information_enabled:
             capability_registry_trace = _capability_registry_base_trace(
                 enabled=True, reason="strict_information_not_selected",
             )
@@ -11851,6 +11873,15 @@ async def orchestrate_chat(
         if timing_stop is not None:
             return timing_stop
 
+        if non_executing_conversation and (
+            (interaction_governance or {}).get("interaction_kind") == "command"
+            or (interaction_governance or {}).get("requires_confirmation") is True
+        ):
+            return await finish_server_owned_response(
+                _CONVERSATION_ONLY_REFUSAL, failed=False,
+                response_source="non_executing_conversation",
+            )
+
         runtime_overlay, runtime_trace = await _resolve_runtime_overlay(
             runtime=runtime,
             enable_runtime_overlays=enable_runtime_overlays,
@@ -12050,7 +12081,15 @@ async def orchestrate_chat(
         fallback_used = False
         model_error = None
         model_calls: list[dict[str, Any]] = []
-        if exact_reference_request:
+        if non_executing_conversation:
+            capability_descriptors = []
+            capability_exposure_trace = {
+                "schema_version": "capability-exposure.v1", "status": "not_requested",
+                "reason": "non_executing_conversation", "descriptor_count": 0,
+                "descriptor_fingerprint": None, "exposed_capability_ids": [],
+                "blocked_capability_ids": [], "blocked_reasons": {},
+            }
+        elif exact_reference_request:
             capability_descriptors = []
             capability_exposure_trace = {
                 "schema_version": "capability-exposure.v1",
@@ -13089,7 +13128,8 @@ async def orchestrate_chat(
                     # This is a presentation-only projection of already consumed policy.
                     # Never move a policy call or enable a tool to produce this cue.
                     if (
-                        not capability_registry_enabled and not provider_tools
+                        (non_executing_conversation or not capability_registry_enabled)
+                        and not provider_tools
                         and response_action_mode == "shadow"
                         and interrupt_policy_mode == "off"
                         and payload.get("capability_confirmation") is None
@@ -13120,10 +13160,17 @@ async def orchestrate_chat(
                         and timing_result.get("latency_budget_class") == "voice_provider_dispatch"
                         and timing_trace.get("inputs", {}).get("spoken_output") is True
                         and privacy_context_trace.get("included") is True
-                        and not privacy_prompt_suppressed
-                        and (privacy_context or {}).get("voice_detail_allowed") is True
-                        and privacy_context.get("redaction_required") is False
-                        and privacy_context.get("safe_summary_required") is False
+                        and privacy_context_trace.get("policy_source") == "runtime"
+                        and privacy_context_trace.get("runtime_call_status") == "included"
+                        and privacy_context_trace.get("fallback_applied") is False
+                        # A validated restriction on answer details is not a ban
+                        # on this fixed content-free cue. Final privacy stays intact.
+                        and (non_executing_conversation or (
+                            not privacy_prompt_suppressed
+                            and (privacy_context or {}).get("voice_detail_allowed") is True
+                            and privacy_context.get("redaction_required") is False
+                            and privacy_context.get("safe_summary_required") is False
+                        ))
                         and not (interrupt_trace or {}).get("should_interrupt")
                         and work.work is not None and work.work.get("state") == "running"
                     ):
@@ -13648,7 +13695,8 @@ async def orchestrate_chat(
             capability_request = (
                 None
                 if (
-                    evidence_provider_call
+                    non_executing_conversation
+                    or evidence_provider_call
                     or capability_dispatch_blocked_by_evidence
                 )
                 else (
@@ -13657,7 +13705,23 @@ async def orchestrate_chat(
                     else parse_provider_capability_request(completion)
                 )
             )
-            if evidence_provider_call:
+            if non_executing_conversation:
+                prompt.trace["capabilities"].update(
+                    validation={"validation_status": "not_requested",
+                                "reason_code": "non_executing_conversation"},
+                    execution={"executor_called": False, "executor_call_count": 0,
+                               "response_status": "not_executed",
+                               "failure_reason_code": "non_executing_conversation"},
+                    dispatch_completed=False, executor_call_count=0,
+                )
+                # Do not parse arguments, validate a challenge, or dispatch even
+                # when a provider unexpectedly invents an executable request.
+                message = ((completion.get("choices") or [{}])[0].get("message") or {})
+                if (any(message.get(key) for key in (
+                    "tool_calls", "function_call", "capability_request",
+                )) or _capability_completion_claim(raw_answer)):
+                    raw_answer = _CONVERSATION_ONLY_REFUSAL
+            elif evidence_provider_call:
                 prompt.trace["capabilities"]["validation"] = {
                     "validation_status": "not_requested",
                     "reason_code": "evidence_provider_response",
@@ -13807,7 +13871,8 @@ async def orchestrate_chat(
             prompt.trace["capabilities"]["executor_call_count"] = 0
             raw_answer = "I could not use that capability request safely."
         if (
-            evidence_provider_call
+            non_executing_conversation
+            or evidence_provider_call
             or diagnostic_response is not None
             or capability_dispatch_blocked_by_evidence
         ):
