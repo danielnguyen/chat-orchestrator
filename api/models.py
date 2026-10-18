@@ -310,6 +310,20 @@ class CurrentWorkStatus(BaseModel):
         return self
 
 
+CHAT_FEEDBACK_MEDIA_TYPE = "application/vnd.ccp.chat-feedback.v1+ndjson"
+
+
+class ProcessingCueRecord(BaseModel):
+    """Presentation eligibility only; never a delivery receipt or action grant."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["processing_cue"] = "processing_cue"
+    request_id: WorkIdentifier
+    conversation_id: WorkUUID
+    cue_code: Literal["processing"] = "processing"
+
+
 class ChatResponse(BaseModel):
     request_id: str
     conversation_id: Optional[str] = None
@@ -329,6 +343,40 @@ class ChatResponse(BaseModel):
         if self.conversation_disposition is None:
             serialized.pop("conversation_disposition", None)
         return serialized
+
+
+class ChatFailureError(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    code: Literal["orchestration_error"] = "orchestration_error"
+    message: Literal["The chat request could not be completed."] = (
+        "The chat request could not be completed."
+    )
+
+
+class ChatFailureResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: WorkIdentifier
+    status: Literal["failed"] = "failed"
+    error: ChatFailureError = Field(default_factory=ChatFailureError)
+
+
+class ChatTerminalRecord(BaseModel):
+    """The logical result, independently of the streaming transport's status."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["terminal"] = "terminal"
+    http_status: Literal[200, 202, 500]
+    body: ChatResponse | DeferredChatResponse | ChatFailureResponse
+
+    @model_validator(mode="after")
+    def validate_result(self) -> "ChatTerminalRecord":
+        expected = {200: ChatResponse, 202: DeferredChatResponse, 500: ChatFailureResponse}
+        if not isinstance(self.body, expected[self.http_status]):
+            raise ValueError("terminal_result_invalid")
+        return self
 
 
 class BriefStructuredInput(BaseModel):
