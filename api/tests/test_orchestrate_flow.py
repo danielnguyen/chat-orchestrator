@@ -41829,6 +41829,7 @@ async def test_processing_feedback_policy_barrier_precedes_provider_and_canonica
     "governance", "restraint", "timing", "timing_scope", "presence", "privacy", "silence",
     "privacy_redaction", "privacy_voice", "privacy_malformed", "command", "confirmation",
     "capabilities", "tools", "interrupt", "text", "disabled", "policy_stop", "low_attention",
+    "interrupt_unavailable", "interrupt_malformed", "interrupt_evaluate_only",
 ])
 async def test_processing_feedback_exclusions_never_publish_or_upgrade_authority(
     tmp_path, monkeypatch, defect,
@@ -41888,6 +41889,17 @@ async def test_processing_feedback_exclusions_never_publish_or_upgrade_authority
         )
     elif defect == "interrupt":
         options["interrupt_policy_mode"] = "enforce"
+    elif defect in {"interrupt_unavailable", "interrupt_malformed", "interrupt_evaluate_only"}:
+        options["interrupt_policy_mode"] = (
+            "evaluate_only" if defect == "interrupt_evaluate_only" else "enforce"
+        )
+
+        async def invalid_interrupt(**scope):
+            if defect == "interrupt_malformed":
+                return {"request_id": "another-request"}
+            raise TimeoutError("private interrupt unavailable")
+
+        runtime.evaluate_interrupt = invalid_interrupt
     elif defect == "text":
         payload["surface_context"]["spoken_output"] = False
     elif defect == "policy_stop":

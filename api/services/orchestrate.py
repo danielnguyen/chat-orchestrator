@@ -13091,6 +13091,7 @@ async def orchestrate_chat(
                     if (
                         not capability_registry_enabled and not provider_tools
                         and response_action_mode == "shadow"
+                        and interrupt_policy_mode == "off"
                         and payload.get("capability_confirmation") is None
                         and not grounded_evidence_provider_call and not evidence_provider_call
                         and not exact_reference_request and not compound_verification_requested
