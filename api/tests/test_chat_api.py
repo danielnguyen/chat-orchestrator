@@ -977,6 +977,7 @@ def feedback_flow(delivery_flow, monkeypatch):
 
     main, memory, provider, entered, release, locators, failed = delivery_flow
     monkeypatch.setattr(main, "runtime", _processing_feedback_runtime())
+    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled", True)
     memory.permission_response = {
         "owner_id": "owner", "surface": "alexa", "configured": False,
         "conversation_context_allowed": False, "proactive_presence_allowed": False,
@@ -1431,6 +1432,7 @@ async def test_feedback_disabled_negotiation_retains_json_202(feedback_flow, mon
 
     main, memory, provider, _, release, _, _ = feedback_flow
     monkeypatch.setattr(main.settings, "progressive_feedback_enabled", False)
+    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled", False)
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
                                      base_url="http://testserver") as client:
@@ -1451,12 +1453,11 @@ async def test_feedback_disabled_negotiation_retains_json_202(feedback_flow, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["confirmation", "capabilities", "runtime", "synchronous"])
+@pytest.mark.parametrize("reason", ["confirmation", "runtime", "synchronous"])
 async def test_feedback_never_changes_ineligible_json_task_ownership(monkeypatch, reason):
     main = _load_main(monkeypatch)
     monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
-    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled",
-                        reason == "capabilities")
+    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled", True)
     monkeypatch.setattr(main, "runtime", None if reason == "runtime" else object())
 
     async def cognition(**kwargs):
@@ -1524,4 +1525,90 @@ async def test_feedback_concurrent_requests_keep_independent_correlation(monkeyp
         release.set()
         for iterator in iterators:
             await iterator.aclose()
+        await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_negotiated_non_execution_is_fixed_before_admission(monkeypatch):
+    from test_memory_store_client import projection
+
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled", True)
+    monkeypatch.setattr(main, "runtime", object())
+    calls = []
+
+    async def cognition(**kwargs):
+        assert kwargs["non_executing_conversation"] is True
+        assert kwargs["capability_registry_enabled"] is True
+        assert kwargs["payload"].get("non_executing_conversation") is None
+        work = projection(request_id=kwargs["request_id"],
+                          conversation_id="00000000-0000-4000-8000-000000000010")
+        kwargs["on_work_admitted"](work)
+        calls.append(kwargs["request_id"])
+        return dict(request_id=kwargs["request_id"], conversation_id=work["conversation_id"],
+                    profile_name="default", selected_model="test", answer="Answer.",
+                    status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    response = await _feedback_response(main)
+    records = [_feedback_record(line) async for line in response.body_iterator]
+    assert len(records) == len(calls) == 1
+    assert records[0].type == "terminal" and records[0].http_status == 200
+    assert not main._owned_chat_tasks
+
+
+@pytest.mark.asyncio
+async def test_registry_enabled_json_does_not_select_non_execution(monkeypatch):
+    from models import ChatRequest
+
+    main = _load_main(monkeypatch)
+    monkeypatch.setattr(main.settings, "progressive_feedback_enabled", True)
+    monkeypatch.setattr(main.settings, "cognitive_runtime_capability_registry_enabled", True)
+    monkeypatch.setattr(main, "runtime", object())
+
+    async def cognition(**kwargs):
+        assert "non_executing_conversation" not in kwargs
+        assert kwargs["capability_registry_enabled"] is True
+        assert "on_processing_eligible" not in kwargs
+        assert kwargs["on_work_admitted"] is None
+        assert not main._owned_chat_tasks
+        return dict(request_id=kwargs["request_id"], profile_name="default", selected_model="test",
+                    answer="Existing governed action path.", status="ok", sources=[])
+
+    monkeypatch.setattr(main, "orchestrate_chat", cognition)
+    response = await main.chat(ChatRequest(**_full_chat_payload(
+        allow_deferred=True, delivery_wait_ms=100,
+    )))
+    assert response.answer == "Existing governed action path."
+
+
+@pytest.mark.asyncio
+async def test_unknown_voice_privacy_cues_without_disclosing_answer(feedback_flow):
+    from test_orchestrate_flow import _processing_feedback_runtime
+
+    main, memory, provider, _, release, _, _ = feedback_flow
+    main.runtime = _processing_feedback_runtime(restricted_privacy=True)
+    provider.content = "PRIVATE-ANSWER-MUST-NOT-BE-SPOKEN"
+    response = await _feedback_response(main, surface_context={
+        "surface_type": "alexa", "interaction_mode": "voice_mediated", "spoken_output": True,
+    })
+    iterator = response.body_iterator
+    try:
+        cue = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        assert cue.type == "processing_cue" and not release.is_set()
+        assert main.settings.cognitive_runtime_capability_registry_enabled is True
+        release.set()
+        terminal = _feedback_record(await asyncio.wait_for(anext(iterator), 5))
+        assert terminal.body.answer == "Details cannot safely be shown on this surface."
+        assert "PRIVATE-ANSWER" not in terminal.model_dump_json()
+        assert memory.work["state"] == "completed"
+        assistant = [item for item in memory.added_messages if item["role"] == "assistant"]
+        assert len(assistant) == 1 and assistant[0]["content"] == terminal.body.answer
+        assert provider.calls[0]["tools"] == []
+        assert "PRIVATE-ANSWER" not in str(memory.trace_calls)
+        assert main.runtime.capability_authority_calls == main.runtime.capability_flow_calls == []
+    finally:
+        release.set()
+        await iterator.aclose()
         await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)

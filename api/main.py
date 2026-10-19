@@ -328,17 +328,25 @@ async def chat(body: ChatRequest, request: Request = None) -> ChatResponse:
         request_id,
     )
     try:
+        # Negotiation may only narrow this invocation. Establish the restriction
+        # before constructing cognition or admitting independently owned work.
+        non_executing_conversation = bool(
+            body.allow_deferred and body.delivery_wait_ms is not None
+            and runtime is not None and body.capability_confirmation is None
+            and _feedback_requested(request)
+        )
         eligible = (
             body.allow_deferred and body.delivery_wait_ms is not None
             and runtime is not None
-            and not settings.cognitive_runtime_capability_registry_enabled
+            and (not settings.cognitive_runtime_capability_registry_enabled
+                 or non_executing_conversation)
             and body.capability_confirmation is None
         )
         admitted = asyncio.get_running_loop().create_future() if eligible else None
         # Only the existing independently owned, read-only delivery path supports feedback.
         # Action/confirmation and synchronous-only requests retain their JSON lifecycle.
         cue = (asyncio.get_running_loop().create_future()
-               if eligible and _feedback_requested(request) else None)
+               if non_executing_conversation else None)
         admitted_work = None
 
         def on_work_admitted(work: dict[str, Any]) -> None:
@@ -407,6 +415,7 @@ async def chat(body: ChatRequest, request: Request = None) -> ChatResponse:
             request_id=request_id,
             on_work_admitted=on_work_admitted if eligible or cue is not None else None,
             **({"on_processing_eligible": on_processing_eligible} if cue is not None else {}),
+            **({"non_executing_conversation": True} if non_executing_conversation else {}),
         )
 
         async def deliver():

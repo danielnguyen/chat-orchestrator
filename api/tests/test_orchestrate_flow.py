@@ -37809,8 +37809,13 @@ async def test_durable_work_transition_response_mismatch_is_not_retried(tmp_path
 
 
 async def _run_timing_turn(tmp_path, *, policy="answer_now", error=None, payload=None,
-                           runtime=None, provider=None, memory=None, **options):
+                           runtime=None, provider=None, memory=None, configured_fallback=False,
+                           **options):
     rules, models = _write_default_route_files(tmp_path)
+    if configured_fallback:
+        rules.write_text(rules.read_text().replace(
+            "fallbacks: []", "fallbacks: [{selected_model: gpt-4o-mini, provider: cloud}]",
+        ))
     runtime = runtime or FakeRuntime()
     runtime.timing_policy = policy
     runtime.timing_error = error
@@ -41701,7 +41706,7 @@ async def test_strict_world_state_unavailable_bound_persona_stops_before_protect
     assert memory.work["state"] == "failed"
 
 
-def _processing_feedback_runtime():
+def _processing_feedback_runtime(*, restricted_privacy=False):
     runtime = FakeRuntime()
     runtime.restraint_response["result"].update(
         restraint_policy="answer_normally", proactive_output_suppressed=True,
@@ -41760,6 +41765,21 @@ def _processing_feedback_runtime():
     async def privacy(**scope):
         runtime.call_order.append("privacy_context")
         runtime.privacy_context_calls.append(scope)
+        if restricted_privacy:
+            return {
+                **{key: scope[key] for key in (
+                    "request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id",
+                )},
+                "result": {
+                    "privacy_zone": "unknown", "surface_type": "unknown_surface",
+                    "sensitivity_level": scope["sensitivity_level"],
+                    "sensitive_detail_allowed": False, "notification_detail_allowed": False,
+                    "voice_detail_allowed": False, "screen_detail_allowed": True,
+                    "redaction_required": True, "safe_summary_required": True,
+                    "reason_codes": ["unknown_surface_conservative", "safe_summary_required"],
+                },
+            }
         return {
             **{key: scope[key] for key in (
                 "request_id", "owner_id", "conversation_id", "surface",
@@ -41781,18 +41801,21 @@ def _processing_feedback_runtime():
 
 def _processing_feedback_payload(**changes):
     changes.setdefault("messages", [{"role": "user", "content": "What is a hostname?"}])
+    changes.setdefault("surface_context", {
+        "spoken_output": True, "interaction_mode": "voice_mediated",
+        "surface_category": "voice_private", "output_format": "speech",
+    })
     return _base_payload(
         surface="alexa", conversation_id="00000000-0000-4000-8000-000000000010",
-        surface_context={"spoken_output": True, "interaction_mode": "voice_mediated",
-                         "surface_category": "voice_private", "output_format": "speech"},
         **changes,
     )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_only", [False, True])
 @pytest.mark.parametrize("permission", ["unconfigured", "denied", "allowed"])
 async def test_processing_feedback_policy_barrier_precedes_provider_and_canonical_persistence(
-    tmp_path, permission,
+    tmp_path, permission, conversation_only,
 ):
     runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
     record = await memory.get_presence_surface_permission(owner_id="owner", surface="alexa")
@@ -41823,7 +41846,9 @@ async def test_processing_feedback_policy_barrier_precedes_provider_and_canonica
 
     task = asyncio.create_task(_run_timing_turn(
         tmp_path, runtime=runtime, provider=provider, memory=memory,
-        payload=payload, privacy_context_enabled=True, on_processing_eligible=cue,
+        payload=payload, non_executing_conversation=conversation_only,
+        capability_registry_enabled=conversation_only, privacy_context_enabled=True,
+        on_processing_eligible=cue,
     ))
     try:
         await asyncio.wait_for(entered.wait(), 5)
@@ -41969,11 +41994,14 @@ async def test_processing_feedback_observer_failure_does_not_fail_or_replay_work
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_only", [False, True])
 @pytest.mark.parametrize("method", ["evaluate_interaction_governance", "evaluate_restraint"])
 @pytest.mark.parametrize("field", [
     "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id",
 ])
-async def test_processing_feedback_wrong_scope_only_omits_cue(tmp_path, method, field):
+async def test_processing_feedback_wrong_scope_only_omits_cue(
+    tmp_path, method, field, conversation_only,
+):
     runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
     original = getattr(runtime, method)
     cues = []
@@ -41984,7 +42012,9 @@ async def test_processing_feedback_wrong_scope_only_omits_cue(tmp_path, method, 
     setattr(runtime, method, mismatched)
     out, _, provider, _ = await _run_timing_turn(
         tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(),
-        privacy_context_enabled=True, on_processing_eligible=cues.append,
+        non_executing_conversation=conversation_only,
+        capability_registry_enabled=conversation_only, privacy_context_enabled=True,
+        on_processing_eligible=cues.append,
     )
     assert cues == []
     assert out["status"] == "ok" and len(provider.calls) == 1
@@ -42021,11 +42051,14 @@ async def test_processing_feedback_cannot_publish_while_privacy_decision_is_pend
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_only", [False, True])
 @pytest.mark.parametrize("state", [
     "do_not_intrude", "low_attention", "driving_or_active_task", "not_present",
     "idle", "available", "ambient_listening", "returning_after_gap",
 ])
-async def test_processing_feedback_requires_active_requested_conversation(tmp_path, state):
+async def test_processing_feedback_requires_active_requested_conversation(
+    tmp_path, state, conversation_only,
+):
     runtime, memory = _processing_feedback_runtime(), DurableWorkMemoryStore()
     from clients.runtime import validate_presence_response
 
@@ -42070,10 +42103,233 @@ async def test_processing_feedback_requires_active_requested_conversation(tmp_pa
     runtime.evaluate_presence = restricted
     out, _, _, _ = await _run_timing_turn(
         tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(),
-        privacy_context_enabled=True, on_processing_eligible=cues.append,
+        non_executing_conversation=conversation_only,
+        capability_registry_enabled=conversation_only, privacy_context_enabled=True,
+        on_processing_eligible=cues.append,
     )
     assert validated_states == [state]
     assert cues == []
     assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
     assert memory.work["state"] in {"completed", "failed"}
     assert out["status"] in {"ok", "degraded", "failed"}
+
+
+def _forbid_conversation_actions(monkeypatch, runtime):
+    calls = []
+
+    def guard(label):
+        def forbidden(*args, **kwargs):
+            calls.append(label)
+            raise AssertionError("non_executing_boundary_crossed")
+        return forbidden
+
+    for name in (
+        "parse_pending_action_confirmation", "restore_pending_action_request",
+        "_resolve_strict_capability_information", "_resolve_capability_registry_context",
+        "_resolve_capability_continuation_policy", "filter_capability_descriptors_for_exposure",
+        "validate_and_digest_capability_request", "authorize_and_execute_capability",
+        "_attempt_capability_follow_up", "_compose_action_summary", "JellyfinActionConnector",
+    ):
+        monkeypatch.setattr(orchestrate_service, name, guard(name))
+    for name in (
+        "authorize_capability", "match_capability", "discover_capabilities",
+        "action_authority", "action_flow", "confirm_capability",
+    ):
+        monkeypatch.setattr(runtime, name, guard(name), raising=False)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_information", [False, True])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_non_executing_conversation_isolates_every_action_boundary(
+    tmp_path, monkeypatch, strict_information, fallback,
+):
+    runtime = _processing_feedback_runtime()
+    forbidden = _forbid_conversation_actions(monkeypatch, runtime)
+    memory, cues = DurableWorkMemoryStore(), []
+    provider = FakeLiteLLM(fail_first=fallback, content="A hostname identifies a network device.")
+    out, _, _, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, provider=provider,
+        payload=_processing_feedback_payload(), non_executing_conversation=True,
+        capability_registry_enabled=True, strict_capability_information_enabled=strict_information,
+        configured_fallback=fallback,
+        privacy_context_enabled=True, on_processing_eligible=cues.append,
+    )
+    assert forbidden == []
+    assert len(cues) == 1
+    assert len(provider.calls) == (2 if fallback else 1)
+    assert all(call["tools"] == [] for call in provider.calls)
+    assert out["answer"] == "A hostname identifies a network device."
+    assert memory.work["state"] == "completed"
+    assert len([item for item in memory.added_messages if item["role"] == "assistant"]) == 1
+    prompt = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert prompt["capability_registry"]["enabled"] is True
+    assert prompt["capability_registry"]["reason"] == "non_executing_conversation"
+    assert prompt["capabilities"]["executor_call_count"] == 0
+    assert prompt["capabilities"]["action_summary_call_count"] == 0
+    assert prompt["turn_state"]["non_executing_conversation"]["action_dispatch"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_non_executing_command_refusal_is_durable_and_not_global_unsupported(
+    tmp_path, monkeypatch,
+):
+    runtime = _processing_feedback_runtime()
+    runtime.interaction_governance_response["result"].update(
+        interaction_kind="command", requires_confirmation=True,
+    )
+    forbidden = _forbid_conversation_actions(monkeypatch, runtime)
+    memory, cues = DurableWorkMemoryStore(), []
+    out, _, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(
+            messages=[{"role": "user", "content": "Restart Jellyfin."}],
+        ), policy="acknowledge_then_answer", non_executing_conversation=True,
+        capability_registry_enabled=True, strict_capability_information_enabled=True,
+        privacy_context_enabled=True, on_processing_eligible=cues.append,
+    )
+    assert forbidden == provider.calls == cues == []
+    assert out["answer"] == orchestrate_service._CONVERSATION_ONLY_REFUSAL
+    assert "through this interaction" in out["answer"]
+    assert "unsupported" not in out["answer"]
+    assert out["selected_model"] == "not_called"
+    assert memory.work["state"] == "completed"
+    assistant = [item for item in memory.added_messages if item["role"] == "assistant"]
+    assert len(assistant) == 1 and assistant[0]["content"] == out["answer"]
+    assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+    assert memory.events[-1] == "work:completed"
+    assert "Restart Jellyfin" not in str(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["tool_calls", "function_call", "capability_request", "content"])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_unexpected_provider_action_cannot_escape_non_execution(
+    tmp_path, monkeypatch, field, fallback,
+):
+    runtime = _processing_feedback_runtime()
+    forbidden = _forbid_conversation_actions(monkeypatch, runtime)
+    message = {"content": "I restarted the service. Done."}
+    if field != "content":
+        message[field] = [{"PRIVATE": "ARGUMENTS"}] if field == "tool_calls" else {
+            "PRIVATE": "ARGUMENTS",
+        }
+    provider = FakeLiteLLM(fail_first=fallback, completion={"choices": [{"message": message}]})
+    memory = DurableWorkMemoryStore()
+    out, _, _, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, provider=provider,
+        payload=_processing_feedback_payload(), non_executing_conversation=True,
+        capability_registry_enabled=True, privacy_context_enabled=True,
+        configured_fallback=fallback,
+    )
+    assert forbidden == []
+    assert len(provider.calls) == (2 if fallback else 1)
+    assert all(call["tools"] == [] for call in provider.calls)
+    assert out["answer"] == orchestrate_service._CONVERSATION_ONLY_REFUSAL
+    assert "PRIVATE" not in str(memory.trace_calls)
+    assert memory.work["state"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [
+    "missing", "malformed", "wrong_scope", "sensitive", "silence", "governance",
+    "restraint", "timing", "timing_scope", "interrupt",
+])
+async def test_non_executing_policy_failure_never_authorizes_feedback(
+    tmp_path, monkeypatch, defect,
+):
+    runtime = _processing_feedback_runtime(restricted_privacy=True)
+    options = {}
+    if defect == "sensitive":
+        runtime.interaction_governance_response["result"]["privacy_sensitivity_hint"] = "sensitive"
+    elif defect == "silence":
+        runtime.situated_presence_response["result"]["silence_preferred"] = True
+    elif defect == "governance":
+        runtime.interaction_governance_error = TimeoutError("PRIVATE-FAILURE")
+    elif defect == "restraint":
+        runtime.restraint_error = TimeoutError("PRIVATE-FAILURE")
+    elif defect == "timing":
+        options["error"] = TimeoutError("PRIVATE-FAILURE")
+    elif defect == "timing_scope":
+        original = runtime.evaluate_timing
+
+        async def wrong_timing(**scope):
+            return {**await original(**scope), "request_id": "other-request"}
+
+        runtime.evaluate_timing = wrong_timing
+    elif defect == "interrupt":
+        options["interrupt_policy_mode"] = "enforce"
+    else:
+        original = runtime.evaluate_privacy_context
+
+        async def invalid(**scope):
+            if defect == "missing":
+                raise TimeoutError("PRIVATE-FAILURE")
+            response = await original(**scope)
+            if defect == "malformed":
+                response["result"]["voice_detail_allowed"] = "yes"
+            else:
+                response["runtime_turn_id"] = "other-turn"
+            return response
+
+        runtime.evaluate_privacy_context = invalid
+    forbidden = _forbid_conversation_actions(monkeypatch, runtime)
+    memory, cues = DurableWorkMemoryStore(), []
+    out, _, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(
+            surface_context={"surface_type": "alexa", "spoken_output": True,
+                             "interaction_mode": "voice_mediated"},
+        ),
+        non_executing_conversation=True, capability_registry_enabled=True,
+        privacy_context_enabled=True, on_processing_eligible=cues.append, **options,
+    )
+    assert cues == forbidden == []
+    assert all(call["tools"] == [] for call in provider.calls)
+    assert out["status"] in {"ok", "degraded", "failed"}
+    assert "PRIVATE-FAILURE" not in str(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["assistant", "trace", "runtime_completion"])
+async def test_non_executing_refusal_does_not_complete_failed_work(
+    tmp_path, monkeypatch, failure,
+):
+    runtime = _processing_feedback_runtime()
+    runtime.interaction_governance_response["result"].update(
+        interaction_kind="command", requires_confirmation=True,
+    )
+    if failure == "runtime_completion":
+        async def unavailable(**scope):
+            raise TimeoutError("PRIVATE-FAILURE")
+
+        runtime.complete_turn = unavailable
+    memory = DurableWorkMemoryStore(fail_at=failure)
+    forbidden = _forbid_conversation_actions(monkeypatch, runtime)
+    cues = []
+    out, _, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(),
+        policy="acknowledge_then_answer", non_executing_conversation=True,
+        capability_registry_enabled=True, on_processing_eligible=cues.append,
+    )
+    assert out["status"] == "failed"
+    assert forbidden == provider.calls == cues == []
+    assert memory.work["state"] == "failed"
+    assert memory.work["assistant_message_id"] is None
+    assert "work:completed" not in memory.events
+    assert "PRIVATE-FAILURE" not in str(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+async def test_internal_non_execution_cannot_accept_structured_confirmation(tmp_path, monkeypatch):
+    runtime = _processing_feedback_runtime()
+    forbidden = _forbid_conversation_actions(monkeypatch, runtime)
+    memory = DurableWorkMemoryStore()
+    with pytest.raises(ValueError, match="invalid_non_executing_conversation"):
+        await _run_timing_turn(
+            tmp_path, runtime=runtime, memory=memory, non_executing_conversation=True,
+            capability_registry_enabled=True, payload=_processing_feedback_payload(
+                capability_confirmation={"confirmed": True},
+            ),
+        )
+    assert forbidden == runtime.turn_start_calls == memory.added_messages == []
+    assert not hasattr(memory, "work")
