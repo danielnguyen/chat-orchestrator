@@ -42333,3 +42333,163 @@ async def test_internal_non_execution_cannot_accept_structured_confirmation(tmp_
         )
     assert forbidden == runtime.turn_start_calls == memory.added_messages == []
     assert not hasattr(memory, "work")
+
+
+class RestrainedRecallMemoryStore(MemoryRecallPrivacyMemoryStore):
+    history_text = "What is 9 + 4?"
+
+    def __init__(self):
+        super().__init__()
+        self.recall_calls = []
+        self.episode_calls = []
+
+    async def retrieve_bundle(self, **kwargs):
+        bundle = await super().retrieve_bundle(**kwargs)
+        bundle["bundle"]["recent"] = [
+            {
+                **_memory_item(section="recent", ref_type="message", ref_id="prior-question",
+                               content=self.history_text),
+                "conversation_id": kwargs["conversation_id"], "role": "user",
+            }
+        ]
+        return bundle
+
+    async def select_recall(self, **kwargs):
+        self.recall_calls.append(kwargs)
+        return await super().select_recall(**kwargs)
+
+    async def retrieve_episode_callbacks(self, **kwargs):
+        self.episode_calls.append(kwargs)
+        return await super().retrieve_episode_callbacks(**kwargs)
+
+
+class BoundRecallRestraintRuntime(FakeRuntime):
+    def __init__(self, *, suppressed=True, corruption=None):
+        super().__init__(restraint_response=_allowed_restraint_response())
+        self.suppressed = suppressed
+        self.corruption = corruption
+
+    async def evaluate_restraint(self, **kwargs):
+        result = copy.deepcopy(await super().evaluate_restraint(**kwargs))
+        result.update({key: kwargs[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )})
+        result["result"].update({
+            "personalization_suppressed": self.suppressed,
+            "proactive_output_suppressed": True,
+            "reason_summary": ["continuation_context_requested"],
+        })
+        if self.corruption in result:
+            result[self.corruption] = "wrong-context"
+        elif self.corruption == "missing_permission":
+            del result["result"]["personalization_suppressed"]
+        elif self.corruption == "malformed_permission":
+            result["result"]["personalization_suppressed"] = "false"
+        elif self.corruption == "invalid_confidence":
+            result["result"]["confidence"] = float("nan")
+        elif self.corruption == "missing_reasons":
+            result["result"]["reason_summary"] = None
+        elif self.corruption == "invalid_policy":
+            result["result"]["restraint_policy"] = "invalid"
+        elif self.corruption == "contradictory_policy":
+            result["result"]["restraint_policy"] = "do_not_personalize"
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suppressed", [True, False])
+@pytest.mark.parametrize("fallback", [True, False])
+async def test_restraint_personalization_controls_callbacks_not_conversation_history(
+    tmp_path, suppressed, fallback,
+):
+    rules, models = _route_files_with_fallback(tmp_path)
+    memory = RestrainedRecallMemoryStore()
+    runtime = BoundRecallRestraintRuntime(suppressed=suppressed)
+    provider = FakeLiteLLM(fail_first=fallback, content="You asked: What is 9 + 4?")
+    result = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "What arithmetic question did I just ask you?"}],
+            retrieval={"scope": "owner"},
+        ),
+        memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-personalization-history",
+    )
+    assert len(memory.retrieve_calls) == 1
+    assert memory.retrieve_calls[0]["retrieval"]["scope"] == "conversation"
+    assert len(memory.recall_calls) == len(memory.episode_calls) == (0 if suppressed else 1)
+    assert len(provider.calls) == (2 if fallback else 1)
+    for call in provider.calls:
+        messages = json.dumps(call["messages"])
+        assert memory.history_text in messages
+        assert (memory.episode_text in messages) is (not suppressed)
+        assert ("Memory and episode recall guidance:" in messages) is (not suppressed)
+    if fallback:
+        assert provider.calls[0]["messages"] == provider.calls[1]["messages"]
+    assert result["answer"] == (
+        "You asked: What is 9 + 4?" if suppressed
+        else f"{memory.memory_text}\n\nYou asked: What is 9 + 4?"
+    )
+    assistant = [message for message in memory.added_messages if message["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["content"] == result["answer"]
+    assert memory.work["state"] == "completed"
+    assert memory.work["assistant_message_id"] == "m-1"
+    assert memory.work["request_id"] == result["request_id"]
+    assert assistant[0]["conversation_id"] == memory.work["conversation_id"]
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    composition = trace["memory_episode_recall_composition"]
+    assert composition["personalization_allowed"] is (not suppressed)
+    assert composition["final_callback_applied"] is (not suppressed)
+    assert composition["dependency"]["episode_status"] == (
+        "personalization_withheld" if suppressed else "included"
+    )
+    assert len(runtime.timing_calls) >= 1
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == "completed"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+    "runtime_turn_id", "missing_permission", "malformed_permission", "invalid_policy",
+    "contradictory_policy", "invalid_confidence", "missing_reasons",
+])
+async def test_unbound_or_malformed_restraint_cannot_permit_optional_callbacks(
+    tmp_path, corruption,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory = RestrainedRecallMemoryStore()
+    provider = FakeLiteLLM(content="Bounded answer")
+    runtime = BoundRecallRestraintRuntime(suppressed=False, corruption=corruption)
+    await orchestrate_chat(
+        payload=_base_payload(), memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        interaction_governance_enabled=True, restraint_enabled=True,
+        request_id="rid-invalid-callback-permission",
+    )
+    assert memory.recall_calls == memory.episode_calls == []
+    assert memory.episode_text not in json.dumps(provider.calls)
+    assert "Memory and episode recall guidance:" not in json.dumps(provider.calls)
+    assert memory.episode_text not in json.dumps(memory.added_messages)
+    assert memory.episode_text not in json.dumps(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+async def test_disabled_restraint_preserves_optional_callback_behavior(tmp_path):
+    rules, models = _write_default_route_files(tmp_path)
+    memory = RestrainedRecallMemoryStore()
+    runtime = BoundRecallRestraintRuntime()
+    provider = FakeLiteLLM(content="Answer")
+    result = await orchestrate_chat(
+        payload=_base_payload(), memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        restraint_enabled=False, request_id="rid-legacy-callback",
+    )
+    assert runtime.restraint_calls == []
+    assert len(memory.recall_calls) == len(memory.episode_calls) == 1
+    assert memory.episode_text in json.dumps(provider.calls)
+    assert result["answer"] == f"{memory.memory_text}\n\nAnswer"

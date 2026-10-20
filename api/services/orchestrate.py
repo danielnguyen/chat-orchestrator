@@ -168,6 +168,7 @@ from services.privacy_context import (
 )
 from services.profile_apply import apply_profile_to_request
 from services.prompt_assembly import PromptAssembly, assemble_prompt
+from services.prompt_assembly import restraint_trace as sanitize_restraint_trace
 from services.prompt_budget import PromptBudgetContract, PromptBudgetError
 from services.response_action import ResponseActionInput, apply_response_action
 from services.response_review import (
@@ -10206,7 +10207,7 @@ async def orchestrate_chat(
             current_user_text=last_user_text,
             recent_messages=recent_messages,
             surface_metadata_json=surface_metadata_json,
-            observe_turn_binding=non_executing_conversation or on_processing_eligible is not None,
+            observe_turn_binding=True,
         )
         runtime_presence_trace = await _resolve_runtime_presence(
             memory_store=memory_store, runtime=runtime, request_id=request_id,
@@ -10617,7 +10618,7 @@ async def orchestrate_chat(
         cost_mode = routing_policy.get("cost_mode")
         latency_mode = routing_policy.get("latency_mode")
         if ((turn_state_trace.get("return_after_gap") or {}).get("status") == "eligible"
-                or "continuation_context_requested" in (restraint or {}).get("reason_summary", [])):
+                or "continuation_context_requested" in restraint_trace.get("reason_summary", [])):
             effective_payload["retrieval"] = {**(effective_payload.get("retrieval") or {}),
                                               "scope": "conversation"}
         retrieval_boundary = _apply_persona_containment_retrieval_boundary(
@@ -11346,6 +11347,26 @@ async def orchestrate_chat(
             interaction_governance=interaction_governance,
             companion_trace=companion_trace,
         )
+        # Optional personalization is distinct from authorized conversation history.
+        # Missing or wrong-turn restraint cannot grant permission for callbacks.
+        recall_restraint = sanitize_restraint_trace(restraint)
+        recall_personalization_allowed = not restraint_enabled or (
+            restraint_trace.get("turn_binding_validated") is True
+            and bool(runtime_session_trace.get("runtime_session_id"))
+            and bool(turn_state_trace.get("runtime_turn_id"))
+            and recall_restraint["restraint_policy"] is not None
+            and recall_restraint["restraint_policy"] != "do_not_personalize"
+            and recall_restraint["confidence"] is not None
+            and math.isfinite(recall_restraint["confidence"])
+            and 0 <= recall_restraint["confidence"] <= 1
+            and bool(recall_restraint["domains"])
+            and bool(recall_restraint["reason_summary"])
+            and all(isinstance(recall_restraint[key], bool) for key in (
+                "retrieval_suppressed", "personalization_suppressed",
+                "proactive_output_suppressed", "brevity_preferred", "clarification_preferred",
+            ))
+            and recall_restraint["personalization_suppressed"] is False
+        )
         recall_response = None
         episode_response = None
         memory_recall_dependency_trace: dict[str, Any] = {
@@ -11353,7 +11374,9 @@ async def orchestrate_chat(
             "episode_status": "not_requested",
         }
         recall_candidates = build_recall_candidates(retrieval_bundle)
-        if recall_candidates and hasattr(memory_store, "select_recall"):
+        if not recall_personalization_allowed:
+            memory_recall_dependency_trace["recall_status"] = "personalization_withheld"
+        elif recall_candidates and hasattr(memory_store, "select_recall"):
             try:
                 recall_response = await memory_store.select_recall(
                     request_id=request_id,
@@ -11370,7 +11393,9 @@ async def orchestrate_chat(
                 )
         elif recall_candidates:
             memory_recall_dependency_trace["recall_status"] = "client_unavailable"
-        if hasattr(memory_store, "retrieve_episode_callbacks"):
+        if not recall_personalization_allowed:
+            memory_recall_dependency_trace["episode_status"] = "personalization_withheld"
+        elif hasattr(memory_store, "retrieve_episode_callbacks"):
             try:
                 episode_response = await memory_store.retrieve_episode_callbacks(
                     request_id=request_id,
@@ -11396,6 +11421,7 @@ async def orchestrate_chat(
             **memory_recall_composition.trace,
             "dependency": memory_recall_dependency_trace,
             "context": recall_context,
+            "personalization_allowed": recall_personalization_allowed,
         }
         interrupt_trace, intervention_text = await _resolve_interrupt_policy(
             runtime=runtime,
@@ -11418,7 +11444,7 @@ async def orchestrate_chat(
                 runtime_presence_trace.get("presence_state") == "returning_after_gap"
                 and (turn_state_trace.get("return_after_gap") or {}).get(
                     "prior_continuation_state") == "deferred_expansion"
-                and "continuation_context_requested" in (restraint or {}).get("reason_summary", [])
+                and "continuation_context_requested" in restraint_trace.get("reason_summary", [])
             ):
                 selection_reason = "continuation_timing_reserved"
             elif evidence_path_deferred or compound_verification_requested or (
@@ -11959,7 +11985,8 @@ async def orchestrate_chat(
                 "content": ((runtime_overlay or {}).get("content", "") + "\n" + guidance),
             }
         provider_memory_recall_messages = (
-            [] if privacy_prompt_suppressed else memory_recall_composition.prompt_messages
+            [] if privacy_prompt_suppressed or not recall_personalization_allowed
+            else memory_recall_composition.prompt_messages
         )
         provider_memory_recall_trace = (
             _privacy_safe_memory_recall_trace(memory_recall_trace)
@@ -12508,7 +12535,7 @@ async def orchestrate_chat(
                     )
                     provider_memory_recall_messages = (
                         []
-                        if privacy_prompt_suppressed
+                        if privacy_prompt_suppressed or not recall_personalization_allowed
                         else memory_recall_composition.prompt_messages
                     )
                     provider_memory_recall_trace = (
@@ -13943,6 +13970,7 @@ async def orchestrate_chat(
         if (
             not evidence_provider_call
             and diagnostic_response is None
+            and recall_personalization_allowed
             and memory_recall_composition.explicit_callbacks
             and not privacy_prompt_suppressed
         ):
