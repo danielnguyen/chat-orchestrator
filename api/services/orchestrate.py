@@ -28,6 +28,7 @@ from clients.memory_store import (
 )
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
+    validate_companion_policy_response,
     validate_history_followup_policy_response,
     validate_interrupt_execution_response,
     validate_interrupt_response,
@@ -4959,6 +4960,8 @@ async def _resolve_companion_policy(
     conversation_id: str,
     surface: str,
     requested_scene: str | None = None,
+    admitted_turn: dict[str, Any] | None = None,
+    input_message_id: str | None = None,
 ) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
     if not enabled:
         return None, _companion_disabled_trace()
@@ -4975,12 +4978,36 @@ async def _resolve_companion_policy(
         }
 
     try:
+        admitted = _validate_started_runtime_turn(
+            admitted_turn, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, input_message_id=input_message_id,
+        )
+        session, turn = admitted["runtime_session"], admitted["runtime_turn"]
+        if (any(not _bounded_runtime_id(value) or value.strip() != value for value in (
+                    session.get("runtime_session_id"), turn.get("runtime_turn_id"),
+                ))
+                or session.get("status") != "active" or session.get("closed_at") is not None
+                or turn.get("completed_at") is not None
+                or admitted["event"]["event_payload_json"].get("request_id") != request_id):
+            raise RuntimeError("companion_turn_binding_invalid")
+    except Exception:
+        return None, {
+            "attempted": False, "status": "omitted", "included": False,
+            "omission_reason": "companion_turn_binding_invalid",
+            "cognitive_runtime_compile_status": "omitted",
+            "cognitive_runtime_compile_error": "companion_turn_binding_invalid",
+            "cognitive_runtime_compile_endpoint": None,
+        }
+
+    try:
         response = await runtime.compile_companion_policy(
             request_id=request_id,
             owner_id=owner_id,
             conversation_id=conversation_id,
             surface=surface,
             requested_scene=requested_scene,
+            runtime_session_id=session["runtime_session_id"],
+            runtime_turn_id=turn["runtime_turn_id"],
         )
     except Exception as e:
         return None, {
@@ -4990,7 +5017,7 @@ async def _resolve_companion_policy(
             "error_type": type(e).__name__,
             "omission_reason": "companion_policy_unavailable",
             "cognitive_runtime_compile_status": "failed",
-            "cognitive_runtime_compile_error": str(e) or type(e).__name__,
+            "cognitive_runtime_compile_error": "companion_policy_unavailable",
             "cognitive_runtime_compile_endpoint": getattr(
                 runtime,
                 "last_companion_compile_endpoint",
@@ -5007,6 +5034,20 @@ async def _resolve_companion_policy(
             "omission_reason": "malformed_companion_policy_response",
             "cognitive_runtime_compile_status": "failed",
             "cognitive_runtime_compile_error": type(response).__name__,
+            "cognitive_runtime_compile_endpoint": None,
+        }
+
+    try:
+        validate_companion_policy_response(
+            response, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, runtime_session_id=session["runtime_session_id"],
+        )
+    except Exception:
+        return None, {
+            "attempted": True, "status": "failed", "included": False,
+            "omission_reason": "malformed_companion_policy_response",
+            "cognitive_runtime_compile_status": "failed",
+            "cognitive_runtime_compile_error": "companion_policy_response_invalid",
             "cognitive_runtime_compile_endpoint": None,
         }
 
@@ -11334,6 +11375,8 @@ async def orchestrate_chat(
         companion_overlays, companion_trace = await _resolve_companion_policy(
             runtime=runtime,
             enabled=companion_policy_enabled,
+            admitted_turn=turn_response,
+            input_message_id=current_user_message_id,
             request_id=request_id,
             owner_id=payload["owner_id"],
             conversation_id=conversation_id,

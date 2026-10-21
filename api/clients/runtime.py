@@ -1096,6 +1096,68 @@ def _continuation_outcome_is_coherent(
     return False
 
 
+def validate_companion_policy_response(
+    response: Any, *, owner_id: str, conversation_id: str, surface: str,
+    runtime_session_id: str,
+) -> dict[str, Any]:
+    """Validate the published compilation projection, without selecting a scene."""
+    def label(value: Any, limit: int = 120) -> bool:
+        return isinstance(value, str) and bool(value.strip()) and len(value) <= limit
+
+    if not isinstance(response, dict):
+        raise RuntimeError("companion_policy_response_invalid")
+    state = response.get("runtime_state")
+    # CR persists one state/session pair per owner+conversation+surface. Their
+    # public identifiers share the existing suffix; do not derive a new identity.
+    if (not isinstance(state, dict)
+            or not runtime_session_id.startswith("rtsession_")
+            or state.get("runtime_state_id")
+            != runtime_session_id.replace("rtsession_", "rtstate_", 1)
+            or any(state.get(key) != value for key, value in {
+                "owner_id": owner_id, "conversation_id": conversation_id, "surface": surface,
+            }.items())):
+        raise RuntimeError("companion_policy_context_mismatch")
+    confidence = response.get("scene_confidence")
+    warnings = response.get("warnings")
+    if (any(not label(response.get(key)) for key in ("profile_id", "contract_id", "scene_id"))
+            or any(type(response.get(key)) is not int or response[key] < 1
+                   for key in ("profile_version", "contract_version"))
+            or not label(response["scene_id"], 64)
+            or type(confidence) not in (int, float) or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+            or response.get("scene_source") not in (
+                "requested_scene", "runtime_state", "runtime_interaction_mode",
+                "general", "fallback_general",
+            )
+            or not isinstance(warnings, list) or len(warnings) > 8
+            or any(not label(warning, 64) for warning in warnings)):
+        raise RuntimeError("companion_policy_response_invalid")
+    contract, trace = response.get("interaction_contract"), response.get("contract_trace")
+    if (not isinstance(contract, dict) or not isinstance(trace, dict)
+            or contract.get("owner_id") != owner_id
+            or any(value.get(key) != response[key]
+                   for value in (contract, trace) for key in ("contract_id", "contract_version"))
+            or contract.get("scope") not in ("global_default", "owner_default")
+            or contract.get("source") not in ("default_compiled", "persisted")
+            or any(trace.get(key) != contract[key] for key in ("scope", "source"))):
+        raise RuntimeError("companion_policy_context_mismatch")
+    overlays = response.get("overlays")
+    expected = ["interaction_contract", "companion_profile", "scene_policy"]
+    if not isinstance(overlays, list) or len(overlays) != 3:
+        raise RuntimeError("companion_policy_response_invalid")
+    ids = []
+    for overlay, kind in zip(overlays, expected):
+        if (not isinstance(overlay, dict) or overlay.get("overlay_type") != kind
+                or overlay.get("role") != "system"
+                or overlay.get("priority", "companion_policy") != "companion_policy"
+                or not label(overlay.get("overlay_id")) or not label(overlay.get("content"), 1200)):
+            raise RuntimeError("companion_policy_response_invalid")
+        ids.append(overlay["overlay_id"])
+    if len(set(ids)) != 3:
+        raise RuntimeError("companion_policy_response_invalid")
+    return response
+
+
 def _bounded_runtime_identifier(value: Any) -> bool:
     return isinstance(value, str) and bool(value) and len(value) <= 120
 
@@ -3386,7 +3448,18 @@ class RuntimeClient:
         conversation_id: str,
         surface: str,
         requested_scene: str | None = None,
+        runtime_session_id: str | None = None,
+        runtime_turn_id: str | None = None,
     ) -> dict[str, Any]:
+        bound = runtime_session_id is not None or runtime_turn_id is not None
+        if bound and (
+            not all(_bounded_runtime_identifier(value) and value.strip() == value
+                    for value in (runtime_session_id, runtime_turn_id))
+            or not all(_bounded_runtime_identifier(value) and value.strip() == value
+                       for value in (request_id, owner_id, conversation_id, surface))
+            or len(surface) > 64
+        ):
+            raise ValueError("companion_turn_binding_invalid")
         payload: dict[str, Any] = {
             "request_id": request_id,
             "owner_id": owner_id,
@@ -3396,13 +3469,20 @@ class RuntimeClient:
         if requested_scene is not None:
             payload["requested_scene"] = requested_scene
 
+        if bound:
+            payload.update(runtime_session_id=runtime_session_id, runtime_turn_id=runtime_turn_id)
         self.last_companion_compile_endpoint = _PREFERRED_COMPANION_COMPILE_PATH
         try:
             response = await self._post(_PREFERRED_COMPANION_COMPILE_PATH, json=payload)
+            if bound:
+                response = validate_companion_policy_response(
+                    response, owner_id=owner_id, conversation_id=conversation_id,
+                    surface=surface, runtime_session_id=runtime_session_id,
+                )
             return _with_compile_endpoint(response, _PREFERRED_COMPANION_COMPILE_PATH)
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
-            if status_code not in {404, 405}:
+            if bound or status_code not in {404, 405}:
                 raise
 
         self.last_companion_compile_endpoint = _COMPAT_COMPANION_COMPILE_PATH

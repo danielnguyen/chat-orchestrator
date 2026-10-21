@@ -5137,3 +5137,147 @@ async def test_strict_world_state_failure_never_retries_in_legacy_mode(error):
         await client.world_state_resolve(**_relationship_scope())
     assert len(http.posts) == 1 and http.posts[0][1]["persona_selection_mode"] == "strict"
     await client.close()
+
+
+
+def _bound_companion_fixture():
+    return {
+        "profile_id": "default_companion_profile", "profile_version": 2,
+        "contract_id": "default_interaction_contract", "contract_version": 2,
+        "scene_id": "coding_build", "scene_confidence": 0.6,
+        "scene_source": "runtime_interaction_mode", "warnings": [],
+        "runtime_state": {"runtime_state_id": "rtstate_1", "owner_id": "owner",
+                          "conversation_id": "conv", "surface": "dev"},
+        "interaction_contract": {"contract_id": "default_interaction_contract",
+            "contract_version": 2, "owner_id": "owner", "scope": "global_default",
+            "source": "default_compiled"},
+        "contract_trace": {"contract_id": "default_interaction_contract", "contract_version": 2,
+                           "scope": "global_default", "source": "default_compiled"},
+        "overlays": [
+            {"overlay_id": kind, "overlay_type": kind, "role": "system",
+             "priority": "companion_policy", "content": "Bounded " + kind}
+            for kind in ("interaction_contract", "companion_profile", "scene_policy")
+        ],
+    }
+
+
+def _bound_companion_request():
+    return dict(request_id="original-request", owner_id="owner", conversation_id="conv",
+                surface="dev", runtime_session_id="rtsession_1", runtime_turn_id="rtturn_1")
+
+
+@pytest.mark.asyncio
+async def test_bound_companion_payload_uses_one_preferred_http_request():
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json=_bound_companion_fixture())
+
+    client = RuntimeClient("http://runtime.local", None, client_factory=lambda **kwargs:
+        httpx.AsyncClient(**kwargs, transport=httpx.MockTransport(handler)))
+    await client.open()
+    try:
+        response = await client.compile_companion_policy(
+            **_bound_companion_request(), requested_scene="coding",
+        )
+    finally:
+        await client.close()
+    assert calls == [("/v1/companion/profile/compile", {
+        **_bound_companion_request(), "requested_scene": "coding",
+    })]
+    # CR returns the canonical scene for its registered alias.
+    assert response["scene_id"] == "coding_build"
+    assert response["_cognitive_runtime_compile_endpoint"] == "/v1/companion/profile/compile"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    {"runtime_session_id": None}, {"runtime_turn_id": None},
+    {"runtime_session_id": ""}, {"runtime_turn_id": " "},
+    {"runtime_turn_id": 42}, {"runtime_session_id": "x" * 121},
+    {"owner_id": None}, {"surface": "x" * 65},
+])
+async def test_bound_companion_invalid_pair_never_sends_http(change):
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+
+    async def unexpected(path, **kwargs):
+        calls.append(path)
+        pytest.fail("invalid local binding reached HTTP")
+
+    client._post = unexpected
+    with pytest.raises(ValueError, match="companion_turn_binding_invalid"):
+        await client.compile_companion_policy(**{**_bound_companion_request(), **change})
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [400, 404, 405, 409, 422, 503, "timeout", "transport", "json"])
+async def test_bound_companion_failures_never_retry_or_downgrade(failure):
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, json.loads(request.content)))
+        if failure == "timeout":
+            raise httpx.ReadTimeout("private-diagnostic", request=request)
+        if failure == "transport":
+            raise httpx.ConnectError("private-diagnostic", request=request)
+        if failure == "json":
+            return httpx.Response(200, text="not json")
+        return httpx.Response(failure, json={"detail": "binding_rejected"})
+
+    client = RuntimeClient("http://runtime.local", None, client_factory=lambda **kwargs:
+        httpx.AsyncClient(**kwargs, transport=httpx.MockTransport(handler)))
+    await client.open()
+    try:
+        with pytest.raises((httpx.HTTPError, ValueError)):
+            await client.compile_companion_policy(**_bound_companion_request())
+    finally:
+        await client.close()
+    assert calls == [("/v1/companion/profile/compile", _bound_companion_request())]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [
+    "owner", "conversation", "surface", "state", "contract_owner", "contract_version",
+    "confidence", "source", "warnings", "missing_overlays", "duplicate_overlay", "overlay_role",
+    "oversized_content", "missing_state",
+])
+async def test_bound_companion_malformed_or_mismatched_response_is_not_usable(defect):
+    response = _bound_companion_fixture()
+    if defect in {"owner", "conversation", "surface", "state"}:
+        key = {"owner": "owner_id", "conversation": "conversation_id",
+               "surface": "surface", "state": "runtime_state_id"}[defect]
+        response["runtime_state"][key] = "wrong-context"
+    elif defect == "contract_owner":
+        response["interaction_contract"]["owner_id"] = "wrong-owner"
+    elif defect == "contract_version":
+        response["contract_trace"]["contract_version"] = 9
+    elif defect == "confidence":
+        response["scene_confidence"] = float("nan")
+    elif defect == "source":
+        response["scene_source"] = "caller_selected"
+    elif defect == "warnings":
+        response["warnings"] = ["x" * 65]
+    elif defect == "missing_overlays":
+        response["overlays"] = []
+    elif defect == "duplicate_overlay":
+        response["overlays"][2]["overlay_id"] = response["overlays"][0]["overlay_id"]
+    elif defect == "overlay_role":
+        response["overlays"][0]["role"] = "user"
+    elif defect == "oversized_content":
+        response["overlays"][0]["content"] = "x" * 1201
+    else:
+        del response["runtime_state"]
+    client = RuntimeClient("http://runtime.local", None)
+    calls = []
+
+    async def post(path, **kwargs):
+        calls.append((path, kwargs["json"]))
+        return response
+
+    client._post = post
+    with pytest.raises(RuntimeError, match="companion_policy_"):
+        await client.compile_companion_policy(**_bound_companion_request())
+    assert calls == [("/v1/companion/profile/compile", _bound_companion_request())]
