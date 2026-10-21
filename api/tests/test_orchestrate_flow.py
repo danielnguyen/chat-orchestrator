@@ -1028,7 +1028,24 @@ class FakeRuntime:
         if self.fail:
             raise RuntimeError("runtime unavailable")
         if isinstance(self.companion_response, dict):
-            response = dict(self.companion_response)
+            response = copy.deepcopy(self.companion_response)
+            state = response.setdefault("runtime_state", {})
+            if isinstance(state, dict):
+                for key in ("owner_id", "conversation_id", "surface"):
+                    state.setdefault(key, kwargs[key])
+                state.setdefault("runtime_state_id", kwargs.get(
+                    "runtime_session_id", "rtsession_1",
+                ).replace("rtsession_", "rtstate_", 1))
+            contract = response.setdefault("interaction_contract", {})
+            trace = response.setdefault("contract_trace", {})
+            for key, value in {
+                "contract_id": response.get("contract_id"),
+                "contract_version": response.get("contract_version"),
+                "scope": "global_default", "source": "default_compiled",
+            }.items():
+                contract.setdefault(key, value)
+                trace.setdefault(key, value)
+            contract.setdefault("owner_id", kwargs["owner_id"])
             response.setdefault(
                 "_cognitive_runtime_compile_endpoint",
                 self.companion_endpoint,
@@ -11478,9 +11495,7 @@ async def test_orchestrate_companion_runtime_failure_is_non_fatal(tmp_path):
     assert companion_trace["error_type"] == "RuntimeError"
     assert companion_trace["omission_reason"] == "companion_policy_unavailable"
     assert companion_trace["cognitive_runtime_compile_status"] == "failed"
-    assert companion_trace["cognitive_runtime_compile_error"] == (
-        "sqlite3.OperationalError: unable to open database file"
-    )
+    assert companion_trace["cognitive_runtime_compile_error"] == "companion_policy_unavailable"
     assert companion_trace["cognitive_runtime_compile_endpoint"] == (
         "/v1/companion/profile/compile"
     )
@@ -11540,7 +11555,7 @@ async def test_orchestrate_companion_runtime_400_failure_does_not_trigger_alias_
     ]
     assert companion_trace["status"] == "failed"
     assert companion_trace["cognitive_runtime_compile_status"] == "failed"
-    assert companion_trace["cognitive_runtime_compile_error"] == "400 Bad Request"
+    assert companion_trace["cognitive_runtime_compile_error"] == "companion_policy_unavailable"
     assert companion_trace["cognitive_runtime_compile_endpoint"] == (
         "/v1/companion/profile/compile"
     )
@@ -34391,7 +34406,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
         "contract_version": 9,
         "scene_id": "COMPANION_SCENE_ID_SENTINEL",
         "scene_confidence": 0.92,
-        "scene_source": "explicit",
+        "scene_source": "requested_scene",
         "warnings": ["COMPANION_WARNING_SENTINEL"],
         "interaction_contract": {
             "memory_or_recall_boundaries": ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
@@ -34403,7 +34418,11 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
                 "overlay_type": "interaction_contract",
                 "role": "system",
                 "content": "COMPANION_OVERLAY_TEXT_SENTINEL",
-            }
+            },
+            {"overlay_id": "profile-fixture", "overlay_type": "companion_profile",
+             "role": "system", "content": "Profile fixture guidance."},
+            {"overlay_id": "scene-fixture", "overlay_type": "scene_policy",
+             "role": "system", "content": "Scene fixture guidance."},
         ],
         "future_identifier": "COMPANION_FUTURE_KEY_SENTINEL",
     }
@@ -34657,7 +34676,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
         "companion_policy_warning_count": 1,
         "cognitive_runtime_compile_status": "included",
         "omission_reason": None,
-        "companion_overlay_count": 1,
+        "companion_overlay_count": 3,
         "runtime_overlay_count": 1,
     }
     assert prompt_trace["presentation"]["runtime"] == {
@@ -34667,7 +34686,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
     }
     assert prompt_trace["presentation"]["companion"] == {
         "status": "included",
-        "overlay_count": 1,
+        "overlay_count": 3,
         "omission_reason": None,
     }
     assert prompt_trace["handoff"]["runtime"] == {
@@ -34679,7 +34698,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
     }
     assert prompt_trace["handoff"]["companion"] == {
         "status": "included",
-        "overlay_count": 1,
+        "overlay_count": 3,
         "omission_reason": None,
         "compile_status": "included",
     }
@@ -34727,9 +34746,9 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
         "scene_source_present": True,
         "warning_count": 1,
         "companion_policy_warning_count": 1,
-        "companion_overlay_count": 1,
+        "companion_overlay_count": 3,
         "runtime_overlay_count": 1,
-        "included_overlay_count": 1,
+        "included_overlay_count": 3,
         "omitted_overlay_type_count": 0,
         "cognitive_runtime_compile_status": "included",
         "omission_reason": None,
@@ -34746,6 +34765,8 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
         "contract_id": "COMPANION_CONTRACT_ID_SENTINEL",
         "contract_version": 9,
         "scene_id": "COMPANION_SCENE_ID_SENTINEL",
+        "scene_confidence": 1.0,
+        "scene_source": "requested_scene",
         "warnings": ["COMPANION_WARNING_SENTINEL"],
         "interaction_contract": {
             "memory_or_recall_boundaries": ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
@@ -34757,7 +34778,11 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
                 "overlay_type": "interaction_contract",
                 "role": "system",
                 "content": "COMPANION_OVERLAY_TEXT_SENTINEL",
-            }
+            },
+            {"overlay_id": "profile-fixture", "overlay_type": "companion_profile",
+             "role": "system", "content": "Profile fixture guidance."},
+            {"overlay_id": "scene-fixture", "overlay_type": "scene_policy",
+             "role": "system", "content": "Scene fixture guidance."},
         ],
         "future_identifier": "COMPANION_FUTURE_KEY_SENTINEL",
     }
@@ -34864,7 +34889,9 @@ async def test_orchestrate_unrestricted_privacy_trace_preserves_current_context_
         "memory_or_recall_boundaries"
     ] == ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
     assert prompt_trace["companion_policy"]["contract_trace"] == {
-        "id": "COMPANION_CONTRACT_TRACE_SENTINEL"
+        "id": "COMPANION_CONTRACT_TRACE_SENTINEL",
+        "contract_id": "COMPANION_CONTRACT_ID_SENTINEL", "contract_version": 9,
+        "scope": "global_default", "source": "default_compiled",
     }
     assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
     assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
@@ -34881,6 +34908,9 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
         "contract_id": "COMPANION_CONTRACT_ID_SENTINEL",
         "contract_version": 9,
         "scene_id": "COMPANION_SCENE_ID_SENTINEL",
+        "scene_confidence": 1.0,
+        "scene_source": "requested_scene",
+        "warnings": [],
         "interaction_contract": {
             "memory_or_recall_boundaries": ["COMPANION_CONTRACT_OBJECT_SENTINEL"]
         },
@@ -34891,7 +34921,11 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
                 "overlay_type": "interaction_contract",
                 "role": "system",
                 "content": "COMPANION_OVERLAY_TEXT_SENTINEL",
-            }
+            },
+            {"overlay_id": "profile-fixture", "overlay_type": "companion_profile",
+             "role": "system", "content": "Profile fixture guidance."},
+            {"overlay_id": "scene-fixture", "overlay_type": "scene_policy",
+             "role": "system", "content": "Scene fixture guidance."},
         ],
         "future_identifier": "COMPANION_FUTURE_KEY_SENTINEL",
     }
@@ -34957,7 +34991,9 @@ async def test_orchestrate_disabled_privacy_trace_preserves_current_context_deta
     assert prompt_trace["companion_policy"]["contract_id"] == "COMPANION_CONTRACT_ID_SENTINEL"
     assert prompt_trace["companion_policy"]["scene_id"] == "COMPANION_SCENE_ID_SENTINEL"
     assert prompt_trace["companion_policy"]["contract_trace"] == {
-        "id": "COMPANION_CONTRACT_TRACE_SENTINEL"
+        "id": "COMPANION_CONTRACT_TRACE_SENTINEL",
+        "contract_id": "COMPANION_CONTRACT_ID_SENTINEL", "contract_version": 9,
+        "scope": "global_default", "source": "default_compiled",
     }
     assert trace_payload["dsa"]["sources_used"] == ["DSA_SOURCE_SENTINEL"]
     assert trace_payload["dsa"]["requested_source_ids"] == ["REQUESTED_SOURCE_SENTINEL"]
@@ -42493,3 +42529,131 @@ async def test_disabled_restraint_preserves_optional_callback_behavior(tmp_path)
     assert len(memory.recall_calls) == len(memory.episode_calls) == 1
     assert memory.episode_text in json.dumps(provider.calls)
     assert result["answer"] == f"{memory.memory_text}\n\nAnswer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("scene", "source"), [
+    ("planning", "requested_scene"), ("work_triage", "runtime_state"),
+    ("coding_build", "runtime_interaction_mode"), ("general", "general"),
+])
+async def test_bound_companion_uses_admitted_scope_and_preserves_canonical_result(
+    tmp_path, scene, source,
+):
+    rules, models = _write_router_files(tmp_path)
+    runtime, memory, provider = FakeRuntime(), FakeMemoryStore(), FakeLiteLLM(content="Answer")
+    runtime.companion_response.update(scene_id=scene, scene_source=source)
+    runtime.companion_response["overlays"][2]["content"] = "Scene fixture: " + scene
+    payload = _base_payload(surface="dev")
+    if source == "requested_scene":
+        payload["requested_scene"] = "planning"
+    result = await orchestrate_chat(
+        payload=payload, memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        companion_policy_enabled=True, request_id="original-admitted-request",
+    )
+    assert len(runtime.turn_start_calls) == len(runtime.companion_calls) == 1
+    request = runtime.companion_calls[0]
+    assert request == {
+        "request_id": "original-admitted-request", "owner_id": "owner",
+        "conversation_id": "conv-1", "surface": "dev",
+        "requested_scene": payload.get("requested_scene"),
+        "runtime_session_id": "rtsession_1", "runtime_turn_id": "rtturn_1",
+    }
+    assert runtime.call_order.index("start_turn") < runtime.call_order.index("companion_policy")
+    assert "Scene fixture: " + scene in json.dumps(provider.calls)
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["companion_policy"]
+    assert trace["included"] is True and trace["scene_id"] == scene
+    assert result["answer"] == memory.added_messages[-1]["content"] == "Answer"
+    assert len([m for m in memory.added_messages if m["role"] == "assistant"]) == 1
+    assert memory.work["state"] == "completed"
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [
+    "missing", "owner", "conversation", "surface", "session", "turn", "request",
+    "completed", "malformed_id",
+])
+async def test_companion_invalid_admission_omits_without_calling_runtime(defect):
+    from services.orchestrate import _resolve_companion_policy
+
+    runtime = FakeRuntime()
+    admitted = await runtime.start_turn(
+        request_id="original", owner_id="owner", conversation_id="conv-1", surface="dev",
+        input_message_id=None,
+    )
+    if defect == "missing":
+        admitted = None
+    elif defect in {"owner", "conversation", "surface"}:
+        key = {"owner": "owner_id", "conversation": "conversation_id", "surface": "surface"}[defect]
+        admitted["runtime_session"][key] = "wrong"
+    elif defect == "session":
+        admitted["runtime_turn"]["runtime_session_id"] = "other-session"
+    elif defect == "turn":
+        admitted["event"]["runtime_turn_id"] = "other-turn"
+    elif defect == "request":
+        admitted["event"]["event_payload_json"]["request_id"] = "other-request"
+    elif defect == "completed":
+        admitted["runtime_turn"]["turn_status"] = "completed"
+    else:
+        admitted["runtime_session"]["runtime_session_id"] = " "
+    overlays, trace = await _resolve_companion_policy(
+        runtime=runtime, enabled=True, request_id="original", owner_id="owner",
+        conversation_id="conv-1", surface="dev", admitted_turn=admitted,
+    )
+    assert overlays is None
+    assert trace["included"] is False and trace["attempted"] is False
+    assert trace["omission_reason"] == "companion_turn_binding_invalid"
+    assert runtime.companion_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [
+    "owner", "conversation", "surface", "state", "overlays", "refused",
+])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_rejected_companion_never_reaches_primary_or_fallback_and_still_persists(
+    tmp_path, defect, fallback,
+):
+    rules, models = _write_router_files(tmp_path)
+    if fallback:
+        rules.write_text(rules.read_text().replace(
+            "fallbacks: []", "fallbacks: [{selected_model: gpt-4o-mini, provider: cloud}]",
+        ))
+
+    class InvalidCompanionRuntime(FakeRuntime):
+        async def compile_companion_policy(self, **kwargs):
+            value = await super().compile_companion_policy(**kwargs)
+            if defect == "refused":
+                request = httpx.Request("POST", "http://runtime.local/v1/companion/profile/compile")
+                raise httpx.HTTPStatusError("PRIVATE_ERROR", request=request,
+                    response=httpx.Response(409, request=request))
+            if defect in {"owner", "conversation", "surface", "state"}:
+                key = {"owner": "owner_id", "conversation": "conversation_id",
+                       "surface": "surface", "state": "runtime_state_id"}[defect]
+                value["runtime_state"][key] = "wrong-context"
+            else:
+                value["overlays"] = [{"role": "system", "content": "STALE_SCENE_SENTINEL"}]
+            return value
+
+    runtime = InvalidCompanionRuntime()
+    runtime.companion_response["overlays"][2]["content"] = "STALE_SCENE_SENTINEL"
+    memory, provider = FakeMemoryStore(), FakeLiteLLM(content="Safe answer", fail_first=fallback)
+    result = await orchestrate_chat(
+        payload=_base_payload(surface="dev"), memory_store=memory,
+        litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        companion_policy_enabled=True, request_id="original-denied-scene",
+    )
+    assert len(runtime.companion_calls) == len(runtime.turn_start_calls) == 1
+    assert all(runtime.companion_calls[0][key] for key in ("runtime_session_id", "runtime_turn_id"))
+    assert len(provider.calls) == (2 if fallback else 1)
+    assert "STALE_SCENE_SENTINEL" not in json.dumps(provider.calls)
+    assert "PRIVATE_ERROR" not in json.dumps(memory.trace_calls)
+    assert result["answer"] == memory.added_messages[-1]["content"] == "Safe answer"
+    assert memory.work["state"] == "completed"
+    assert len(runtime.turn_complete_calls) == 1
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["companion_policy"]
+    assert trace["included"] is False
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
