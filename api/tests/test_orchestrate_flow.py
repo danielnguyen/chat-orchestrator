@@ -42657,3 +42657,272 @@ async def test_rejected_companion_never_reaches_primary_or_fallback_and_still_pe
     trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["companion_policy"]
     assert trace["included"] is False
     assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+class PauseMemory(DurableWorkMemoryStore):
+    """Reuse the existing failed-work cleanup fixture for this control response."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.retained_assistant = None
+
+    async def add_message(self, **kwargs):
+        acknowledgement = await super().add_message(**kwargs)
+        if kwargs["role"] == "assistant":
+            self.retained_assistant = {**kwargs, **acknowledgement}
+        return acknowledgement
+
+    async def transition_work(self, **kwargs):
+        response = await super().transition_work(**kwargs)
+        if kwargs["state"] == "failed":
+            self.retained_assistant = None
+        elif kwargs["state"] == "completed":
+            assert self.trace_calls
+            assert kwargs["assistant_message_id"] == self.retained_assistant["message_id"]
+        return response
+
+
+class PauseRuntime(FakeRuntime):
+    """CR-shaped completion, with controllable lost/invalid acknowledgements."""
+
+    def __init__(self, *, completion_error=None, mismatch=None, **kwargs):
+        super().__init__(**kwargs)
+        self.completion_error = completion_error
+        self.pause_mismatch = mismatch
+
+    async def complete_turn(self, **kwargs):
+        from test_runtime_client import _pause_completion_fixture
+
+        await super().complete_turn(**kwargs)
+        if self.completion_error:
+            raise self.completion_error
+        response = _pause_completion_fixture()
+        admission = self.turn_start_calls[-1]
+        response["runtime_session"].update({key: admission[key] for key in (
+            "owner_id", "conversation_id", "surface",
+        )})
+        response["event"]["event_payload_json"]["request_id"] = kwargs["request_id"]
+        if kwargs.get("session_transition") != "pause":
+            response["runtime_session"]["status"] = "active"
+            response["runtime_turn"]["turn_status"] = kwargs["turn_status"]
+        if self.pause_mismatch:
+            part, key = self.pause_mismatch
+            response[part][key] = "wrong"
+        return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_enabled", [False, True])
+async def test_explicit_pause_is_bound_durable_and_never_enters_cognition(
+    tmp_path, monkeypatch, strict_enabled,
+):
+    memory = PauseMemory()
+    runtime = PauseRuntime()
+    provider = FakeLiteLLM()
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("pause entered ordinary policy, retrieval, provider or action processing")
+
+    for method in ("resolve_profile", "retrieve_bundle", "episode_callbacks"):
+        monkeypatch.setattr(memory, method, forbidden, raising=False)
+    for method in ("evaluate_interaction_governance", "evaluate_restraint", "resolve_identity",
+                   "match_capability", "authorize_capability", "record_capability_confirmation",
+                   "evaluate_capability_flow", "world_state_resolve", "compile_companion_policy"):
+        monkeypatch.setattr(runtime, method, forbidden, raising=False)
+    monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", forbidden)
+    result = await _run_durable_work_chat(
+        tmp_path, memory, runtime=runtime, provider=provider,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+        interaction_governance_enabled=True, restraint_enabled=True,
+        privacy_context_enabled=True, capability_registry_enabled=True,
+        strict_capability_information_enabled=strict_enabled,
+        strict_relationship_retrieval_enabled=strict_enabled,
+        strict_world_state_authority_enabled=strict_enabled,
+    )
+    assert result["status"] == "ok"
+    assert result["answer"] == "Paused. Send another message whenever you're ready to continue."
+    assert runtime.turn_complete_calls == [{
+        "request_id": "request-work", "runtime_session_id": "rtsession_1",
+        "runtime_turn_id": "rtturn_1", "turn_status": "completed", "session_transition": "pause",
+    }]
+    assert runtime.turn_start_calls[0]["request_id"] == "request-work"
+    assert len(runtime.turn_start_calls) == 1
+    assert provider.calls == memory.retrieve_calls == []
+    assert memory.events == ["work:pending", "message:user", "work:running",
+                             "message:assistant", "trace:1", "work:completed"]
+    assert memory.work["state"] == "completed"
+    assert memory.work["assistant_message_id"] is not None
+    assert memory.added_messages[-1]["content"] == result["answer"]
+    assert memory.added_messages[-1]["metadata"]["request_id"] == result["request_id"]
+    trace = memory.trace_calls[-1]["payload"]
+    assert trace["status"] == "ok"
+    assert trace["router_decision"]["rationale"] == "session_transition"
+    state = trace["retrieval"]["prompt_assembly"]["turn_state"]
+    assert state["pause"]["runtime_completion"] == "confirmed_paused"
+    assert state["session_status"] == "paused"
+    assert state["completed"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("part,key", [
+    ("runtime_session", "owner_id"), ("runtime_session", "conversation_id"),
+    ("runtime_session", "surface"), ("runtime_session", "runtime_session_id"),
+    ("runtime_session", "status"), ("runtime_turn", "runtime_turn_id"),
+    ("event", "event_type"), ("event", "runtime_session_id"),
+])
+async def test_pause_wrong_scope_cleans_provisional_answer_without_replay(tmp_path, part, key):
+    memory = PauseMemory()
+    runtime = PauseRuntime(mismatch=(part, key))
+    provider = FakeLiteLLM()
+    result = await _run_durable_work_chat(
+        tmp_path, memory, runtime=runtime, provider=provider,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+    )
+    assert result["status"] == "failed" and not result["answer"].startswith("Paused.")
+    assert memory.work["state"] == "failed"
+    assert memory.work["assistant_message_id"] is None
+    assert memory.retained_assistant is None
+    assert len(runtime.turn_complete_calls) == 1
+    assert provider.calls == []
+    assert memory.trace_calls[-1]["payload"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["user", "assistant", "trace", "completed",
+                                     "committed_completion", "timeout", "conflict"])
+async def test_pause_partial_failures_never_report_success_or_repeat_writes(tmp_path, failure):
+    memory = PauseMemory(fail_at=failure)
+    error = (httpx.ReadTimeout("private") if failure == "timeout" else
+             _http_status_error(409) if failure == "conflict" else None)
+    runtime = PauseRuntime(completion_error=error)
+    provider = FakeLiteLLM()
+    result = await _run_durable_work_chat(
+        tmp_path, memory, runtime=runtime, provider=provider,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+    )
+    assert result["status"] == "failed"
+    assert not result["answer"].startswith("Paused.")
+    assert provider.calls == []
+    assert len(runtime.turn_complete_calls) == 1
+    completion = runtime.turn_complete_calls[0]
+    if failure in {"user", "assistant"}:
+        assert completion["turn_status"] == "abandoned"
+        assert "session_transition" not in completion
+    else:
+        assert completion["session_transition"] == "pause"
+    assert len([m for m in memory.added_messages if m["role"] == "assistant"]) <= 1
+    if failure not in {"completed", "committed_completion"}:
+        assert memory.work["state"] == "failed"
+        assert memory.retained_assistant is None
+    else:
+        assert "work:failed" not in memory.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["running", "completed", "failed"])
+async def test_pause_work_replay_never_repeats_completion_or_messages(tmp_path, state):
+    memory = PauseMemory(replay_state=state)
+    runtime = PauseRuntime()
+    with pytest.raises(RuntimeError, match="work_projection_context_mismatch"):
+        await _run_durable_work_chat(
+            tmp_path, memory, runtime=runtime,
+            payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+        )
+    assert memory.added_messages == []
+    assert all("session_transition" not in c for c in runtime.turn_complete_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("condition", ["wrong_owner", "denied_surface", "no_runtime",
+                                       "admission_conflict", "admission_stale"])
+async def test_pause_unauthorized_or_unadmitted_request_cannot_persist(tmp_path, condition):
+    memory = PauseMemory()
+    runtime = PauseRuntime()
+    if condition == "wrong_owner":
+        memory.exact_conversation_response = _conversation_projection("conv-1", owner_id="other")
+    elif condition == "denied_surface":
+        memory.permission_response = {
+            "owner_id": "owner", "surface": "vscode", "configured": True,
+            "conversation_context_allowed": False, "proactive_presence_allowed": False,
+            "ambient_listening_allowed": False,
+            "created_at": "2026-10-05T00:00:00+00:00",
+            "updated_at": "2026-10-05T00:00:00+00:00",
+        }
+    elif condition == "no_runtime":
+        runtime = None
+    else:
+        runtime.turn_start_error = _http_status_error(409)
+    provider = FakeLiteLLM()
+    result = await _run_durable_work_chat(
+        tmp_path, memory, runtime=runtime, provider=provider,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+    )
+    assert result["status"] == "failed"
+    assert memory.added_messages == provider.calls == []
+    assert getattr(memory, "work_calls", []) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_pause_cannot_publish_before_cr_completion_and_never_replays_on_cancel(
+    tmp_path, cancel,
+):
+    import asyncio
+
+    memory, runtime = PauseMemory(), PauseRuntime()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = runtime.complete_turn
+
+    async def held(**kwargs):
+        assert memory.work["state"] == "running"
+        assert memory.retained_assistant is not None
+        entered.set()
+        await release.wait()
+        return await original(**kwargs)
+
+    runtime.complete_turn = held
+    task = asyncio.create_task(_run_durable_work_chat(
+        tmp_path, memory, runtime=runtime,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+    ))
+    await entered.wait()
+    assert not task.done()
+    assert not memory.trace_calls
+    assert "work:completed" not in memory.events
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert runtime.turn_complete_calls == []
+        assert memory.work["state"] == "failed"
+        assert memory.retained_assistant is None
+    else:
+        release.set()
+        result = await task
+        assert result["status"] == "ok"
+        assert memory.work["state"] == "completed"
+        assert len(runtime.turn_complete_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["request_id", "status"])
+async def test_pause_unverified_admission_cannot_publish_or_pause(tmp_path, field):
+    memory, runtime = PauseMemory(), PauseRuntime()
+    original = runtime.start_turn
+
+    async def invalid(**kwargs):
+        response = await original(**kwargs)
+        target = (response["event"]["event_payload_json"] if field == "request_id"
+                  else response["runtime_session"])
+        target[field] = "wrong"
+        return response
+
+    runtime.start_turn = invalid
+    result = await _run_durable_work_chat(
+        tmp_path, memory, runtime=runtime,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+    )
+    assert result["status"] == "failed"
+    assert memory.added_messages == []
+    assert memory.work["state"] == "failed"
+    assert all("session_transition" not in c for c in runtime.turn_complete_calls)

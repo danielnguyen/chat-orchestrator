@@ -2065,6 +2065,52 @@ def _strict_persona_request_fields(
     return result
 
 
+def validate_pause_completion_response(
+    response: Any, *, request_id: str, runtime_session_id: str, runtime_turn_id: str,
+    owner_id: str | None = None, conversation_id: str | None = None,
+    surface: str | None = None,
+) -> None:
+    """A committed pause is distinct from a successful HTTP response."""
+    if not isinstance(response, dict):
+        raise RuntimeError("pause_completion_response_invalid")
+    session, turn, event = (response.get(key) for key in (
+        "runtime_session", "runtime_turn", "event",
+    ))
+    if not all(isinstance(value, dict) for value in (session, turn, event)):
+        raise RuntimeError("pause_completion_response_invalid")
+    for key in ("owner_id", "conversation_id", "surface"):
+        value = session.get(key)
+        if not isinstance(value, str) or not value.strip() or len(value) > 120:
+            raise RuntimeError("pause_completion_response_invalid")
+    try:
+        completed_at = datetime.fromisoformat(turn["completed_at"].replace("Z", "+00:00"))
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise RuntimeError("pause_completion_response_invalid") from None
+    scope = {"runtime_session_id": runtime_session_id, "status": "paused"}
+    for key, value in (("owner_id", owner_id), ("conversation_id", conversation_id),
+                       ("surface", surface)):
+        if value is not None:
+            scope[key] = value
+    expected_turn = {"runtime_session_id": runtime_session_id,
+                     "runtime_turn_id": runtime_turn_id, "turn_status": "completed"}
+    expected_event = {"runtime_session_id": runtime_session_id,
+                      "runtime_turn_id": runtime_turn_id, "event_type": "turn_completed"}
+    payload = event.get("event_payload_json")
+    if (any(session.get(key) != value for key, value in scope.items())
+            or any(turn.get(key) != value for key, value in expected_turn.items())
+            or any(event.get(key) != value for key, value in expected_event.items())
+            or not isinstance(payload, dict)
+            or payload.get("request_id") != request_id
+            or payload.get("session_transition") != "pause"
+            or payload.get("turn_status") != "completed"
+            or payload.get("continuation_state") != turn.get("continuation_state")
+            or not isinstance(turn.get("completed_at"), str) or not turn["completed_at"]
+            or session.get("closed_at") is not None):
+        raise RuntimeError("pause_completion_context_mismatch")
+
+
 class RuntimeClient:
     def __init__(
         self,
@@ -2999,7 +3045,14 @@ class RuntimeClient:
         runtime_turn_id: str,
         turn_status: str,
         continuation_state: str | None = None,
+        session_transition: str | None = None,
     ) -> dict[str, Any]:
+        if session_transition is not None:
+            if session_transition != "pause" or turn_status != "completed" or any(
+                not isinstance(value, str) or not value.strip() or len(value) > 120
+                for value in (request_id, runtime_session_id, runtime_turn_id)
+            ):
+                raise ValueError("pause_completion_request_invalid")
         payload: dict[str, Any] = {
             "request_id": request_id,
             "runtime_session_id": runtime_session_id,
@@ -3008,7 +3061,15 @@ class RuntimeClient:
         }
         if continuation_state is not None:
             payload["continuation_state"] = continuation_state
-        return await self._post("/v1/runtime/turns/complete", json=payload)
+        if session_transition is not None:
+            payload["session_transition"] = session_transition
+        response = await self._post("/v1/runtime/turns/complete", json=payload)
+        if session_transition == "pause":
+            validate_pause_completion_response(
+                response, request_id=request_id, runtime_session_id=runtime_session_id,
+                runtime_turn_id=runtime_turn_id,
+            )
+        return response
 
     async def resolve_identity(
         self,

@@ -5281,3 +5281,126 @@ async def test_bound_companion_malformed_or_mismatched_response_is_not_usable(de
     with pytest.raises(RuntimeError, match="companion_policy_"):
         await client.compile_companion_policy(**_bound_companion_request())
     assert calls == [("/v1/companion/profile/compile", _bound_companion_request())]
+
+
+def _pause_completion_fixture():
+    return {
+        "runtime_session": {"runtime_session_id": "rtsession_1", "owner_id": "owner",
+                            "conversation_id": "conv", "surface": "dev", "status": "paused",
+                            "closed_at": None},
+        "runtime_turn": {"runtime_turn_id": "rtturn_1", "runtime_session_id": "rtsession_1",
+                         "turn_status": "completed", "continuation_state": None,
+                         "completed_at": "2026-10-21T00:00:00+00:00"},
+        "event": {"runtime_session_id": "rtsession_1", "runtime_turn_id": "rtturn_1",
+                  "event_type": "turn_completed", "event_payload_json": {
+                      "request_id": "rid", "turn_status": "completed",
+                      "session_transition": "pause", "continuation_state": None}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_pause_completion_exact_payload_and_legacy_omission():
+    client = RuntimeClient("http://runtime", api_key=None)
+    calls = []
+
+    async def post(path, *, json):
+        calls.append((path, json))
+        return _pause_completion_fixture()
+
+    client._post = post
+    expected = dict(request_id="rid", runtime_session_id="rtsession_1",
+                    runtime_turn_id="rtturn_1", turn_status="completed")
+    await client.complete_turn(**expected)
+    await client.complete_turn(**expected, session_transition="pause")
+    assert calls == [("/v1/runtime/turns/complete", expected),
+                     ("/v1/runtime/turns/complete", {**expected, "session_transition": "pause"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("session_transition", "resume"), ("session_transition", True),
+    ("turn_status", "abandoned"), ("request_id", ""),
+    ("runtime_session_id", None), ("runtime_turn_id", " " ),
+])
+async def test_pause_completion_invalid_input_never_sends(field, value):
+    client = RuntimeClient("http://runtime", api_key=None)
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("invalid pause reached HTTP")
+
+    client._post = forbidden
+    payload = dict(request_id="rid", runtime_session_id="rtsession_1",
+                   runtime_turn_id="rtturn_1", turn_status="completed", session_transition="pause")
+    payload[field] = value
+    with pytest.raises(ValueError, match="pause_completion_request_invalid"):
+        await client.complete_turn(**payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,value", [
+    (("runtime_session",), None), (("event",), []),
+    (("runtime_session", "runtime_session_id"), "other"),
+    (("runtime_session", "status"), "active"),
+    (("runtime_session", "closed_at"), "closed"),
+    (("runtime_turn", "runtime_session_id"), "other"),
+    (("runtime_turn", "runtime_turn_id"), "other"),
+    (("runtime_turn", "turn_status"), "abandoned"),
+    (("runtime_turn", "completed_at"), None),
+    (("event", "runtime_session_id"), "other"),
+    (("event", "runtime_turn_id"), "other"),
+    (("event", "event_type"), "turn_started"),
+    (("event", "event_payload_json"), "invalid"),
+    (("event", "event_payload_json", "request_id"), "other"),
+    (("event", "event_payload_json", "session_transition"), None),
+    (("event", "event_payload_json", "turn_status"), "abandoned"),
+    (("event", "event_payload_json", "continuation_state"), "different"),
+])
+async def test_pause_completion_malformed_result_is_not_success_or_retried(path, value):
+    client = RuntimeClient("http://runtime", api_key=None)
+    response = _pause_completion_fixture()
+    target = response
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    calls = []
+
+    async def post(endpoint, *, json):
+        calls.append((endpoint, json))
+        return response
+
+    client._post = post
+    with pytest.raises(RuntimeError, match="pause_completion"):
+        await client.complete_turn(request_id="rid", runtime_session_id="rtsession_1",
+                                   runtime_turn_id="rtturn_1", turn_status="completed",
+                                   session_transition="pause")
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [400, 404, 405, 409, 422, 503, "timeout", "transport"])
+async def test_pause_completion_http_failure_has_no_retry_or_fallback(failure):
+    request = httpx.Request("POST", "http://runtime/v1/runtime/turns/complete")
+    calls = []
+
+    async def handler(req):
+        calls.append(req)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("private", request=request)
+        if failure == "transport":
+            raise httpx.ConnectError("private", request=request)
+        return httpx.Response(failure, json={"detail": "rejected"})
+
+    client = RuntimeClient("http://runtime", api_key=None)
+    client._client = httpx.AsyncClient(
+        base_url="http://runtime", transport=httpx.MockTransport(handler),
+    )
+    await client.open()
+    try:
+        with pytest.raises(httpx.HTTPError):
+            await client.complete_turn(request_id="rid", runtime_session_id="rtsession_1",
+                                       runtime_turn_id="rtturn_1", turn_status="completed",
+                                       session_transition="pause")
+        assert len(calls) == 1
+        assert json.loads(calls[0].content)["session_transition"] == "pause"
+    finally:
+        await client.close()
