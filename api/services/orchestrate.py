@@ -32,6 +32,7 @@ from clients.runtime import (
     validate_history_followup_policy_response,
     validate_interrupt_execution_response,
     validate_interrupt_response,
+    validate_pause_completion_response,
     validate_presence_response,
     validate_return_snapshot,
     validate_strict_capability_response,
@@ -42,7 +43,7 @@ from clients.runtime import (
     validate_timing_request,
     validate_timing_response,
 )
-from models import ProcessingCueRecord
+from models import ChatRequest, ProcessingCueRecord
 from pydantic import ValidationError
 from router.engine import evaluate_route
 from services.action_connectors import ActionConnectorRegistry
@@ -5488,6 +5489,7 @@ async def _complete_runtime_turn(
     request_id: str,
     turn_status: str,
     expected_scope: dict[str, Any] | None = None,
+    session_transition: str | None = None,
 ) -> None:
     runtime_session_id = turn_state_trace.get("runtime_session_id")
     runtime_turn_id = turn_state_trace.get("runtime_turn_id")
@@ -5499,6 +5501,7 @@ async def _complete_runtime_turn(
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
             turn_status=turn_status,
+            **({"session_transition": session_transition} if session_transition else {}),
             **({"continuation_state": turn_state_trace["continuation_state"]}
                if isinstance(turn_state_trace.get("continuation_state"), str) else {}),
         )
@@ -5512,6 +5515,16 @@ async def _complete_runtime_turn(
                         "runtime_session_id", "runtime_turn_id",
                     )) or turn.get("turn_status") != turn_status):
                 raise RuntimeError("runtime_completion_context_mismatch")
+        if session_transition == "pause":
+            validate_pause_completion_response(
+                response, request_id=request_id, runtime_session_id=runtime_session_id,
+                runtime_turn_id=runtime_turn_id,
+                **({key: expected_scope[key] for key in (
+                    "owner_id", "conversation_id", "surface",
+                )} if expected_scope is not None else {}),
+            )
+            turn_state_trace["session_transition"] = "pause"
+            turn_state_trace["session_status"] = "paused"
         if isinstance(response, dict):
             turn = response.get("runtime_turn", {}) or {}
             turn_state_trace["turn_status"] = turn.get("turn_status", turn_status)
@@ -9031,6 +9044,96 @@ async def _prepare_strict_persona_context(*, runtime, scope, text, recent_messag
     return selection, containment, bound
 
 
+async def _finish_explicit_pause(
+    *, payload, request_id, conversation_id, memory_store, runtime, work,
+    turn_state_trace, turn_response, user_message, user_message_id, started,
+):
+    """Use provisional BMS persistence and one CR completion; never replay either."""
+    answer = "Paused. Send another message whenever you're ready to continue."
+    failure_answer = "I couldn’t confirm the pause. Send another message to continue."
+    scope = {"owner_id": payload["owner_id"], "conversation_id": conversation_id,
+             "surface": payload.get("surface", "unknown"),
+             "runtime_session_id": turn_state_trace["runtime_session_id"],
+             "runtime_turn_id": turn_state_trace["runtime_turn_id"]}
+    pause_trace = {"requested": True, "runtime_completion": "not_attempted",
+                   "assistant_persistence": "not_attempted"}
+    turn_state_trace["pause"] = pause_trace
+    work.failure_code = "dependency_unavailable"
+    failed = True
+    failure_category = None
+    try:
+        admission = turn_response.get("event", {}).get("event_payload_json", {})
+        session = turn_response["runtime_session"]
+        if (admission.get("request_id") != request_id or session.get("status") != "active"
+                or session.get("closed_at") is not None):
+            raise RuntimeError("pause_admission_unconfirmed")
+        persisted = await _append_current_user_message(
+            memory_store=memory_store, request_id=request_id, message_id=user_message_id,
+            conversation_id=conversation_id, owner_id=payload["owner_id"],
+            client_id=payload.get("client_id"), content=user_message["content"],
+            surface=scope["surface"], policy_metadata=None,
+        )
+        if persisted is None:
+            raise RuntimeError("pause_user_persistence_unconfirmed")
+        await work.transition("running")
+        await _advance_runtime_turn(
+            runtime=runtime, turn_state_trace=turn_state_trace,
+            request_id=request_id, turn_status="responding",
+        )
+        acknowledgement = await memory_store.add_message(
+            conversation_id=conversation_id, owner_id=payload["owner_id"], role="assistant",
+            content=answer, client_id=payload.get("client_id"), policy_metadata=None,
+            metadata={"request_id": request_id, "selected_model": "not_called"},
+        )
+        if (not isinstance(acknowledgement, dict)
+                or not isinstance(acknowledgement.get("message_id"), str)
+                or not acknowledgement["message_id"]):
+            raise RuntimeError("pause_assistant_persistence_unconfirmed")
+        pause_trace["assistant_persistence"] = "provisional"
+        turn_state_trace["terminal_transition_attempted"] = True
+        pause_trace["runtime_completion"] = "unconfirmed"
+        await _complete_runtime_turn(
+            runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
+            turn_status="completed", session_transition="pause", expected_scope=scope,
+        )
+        if turn_state_trace.get("session_transition") != "pause":
+            raise RuntimeError("pause_runtime_completion_unconfirmed")
+        pause_trace["runtime_completion"] = "confirmed_paused"
+        failed = False
+    except Exception:
+        failure_category = "pause_outcome_unconfirmed"
+        # A lost completion response may conceal a committed pause. Do not abandon,
+        # resume, retry completion, or publish the provisional assistant as success.
+        if not turn_state_trace.get("terminal_transition_attempted"):
+            turn_state_trace["terminal_transition_attempted"] = True
+            await _complete_runtime_turn(
+                runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
+                turn_status="abandoned", expected_scope=scope,
+            )
+    try:
+        await memory_store.create_trace(
+            request_id=request_id, payload=_server_owned_response_trace_payload(
+                request_id=request_id, conversation_id=conversation_id, payload=payload,
+                profile=None, started=started, status="failed" if failed else "ok",
+                error=failure_category, response_source="session_transition",
+                prompt_trace={"status": "not_requested", "layers": [], "message_count": 0,
+                              "turn_state": turn_state_trace},
+            ),
+        )
+        if not failed:
+            await work.complete(acknowledgement)
+    except Exception:
+        # Work completion can itself have committed before its acknowledgement was
+        # lost. _SynchronousWork preserves that uncertainty without competing writes.
+        failed = True
+    return {
+        "request_id": request_id, "conversation_id": conversation_id,
+        "profile_name": "unresolved", "selected_model": "not_called",
+        "answer": failure_answer if failed else answer,
+        "status": "failed" if failed else "ok", "sources": [],
+    }
+
+
 async def _finish_strict_relationship_failure(
     *, payload, request_id, conversation_id, memory_store, runtime, work,
     turn_state_trace, runtime_session_trace, user_message, user_message_id, scope, trace, started,
@@ -9554,6 +9657,11 @@ async def orchestrate_chat(
     action_connector_registry: ActionConnectorRegistry | None = None,
     message_id_factory: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
+    explicit_pause = payload.get("session_transition") is not None
+    if explicit_pause:
+        ChatRequest.model_validate(payload)
+        if non_executing_conversation:
+            raise ValueError("pause_incompatible_request")
     if type(non_executing_conversation) is not bool or (
         non_executing_conversation and payload.get("capability_confirmation") is not None
     ):
@@ -9591,13 +9699,14 @@ async def orchestrate_chat(
         seconds=_CONVERSATION_RETIREMENT_AFTER_SECONDS
     )
     surface = payload.get("surface", "unknown")
-    connector_registry = None if non_executing_conversation else (
+    connector_registry = None if non_executing_conversation or explicit_pause else (
         action_connector_registry
         if action_connector_registry is not None
         else ActionConnectorRegistry((JellyfinActionConnector(jellyfin_operations),))
     )
     pending_continuation, pending_error = (
-        (None, None) if non_executing_conversation or strict_capability_information_enabled
+        (None, None) if explicit_pause or non_executing_conversation
+        or strict_capability_information_enabled
         else parse_pending_action_confirmation(payload.get("capability_confirmation"))
     )
     pending_capability_request: ParsedCapabilityRequest | None = None
@@ -10013,6 +10122,14 @@ async def orchestrate_chat(
             ),
             error_type=turn_state_trace.get("error_type"),
         )
+        if explicit_pause:
+            return await _finish_explicit_pause(
+                payload=payload, request_id=request_id, conversation_id=conversation_id,
+                memory_store=memory_store, runtime=runtime, work=work,
+                turn_state_trace=turn_state_trace, turn_response=turn_response,
+                user_message=current_user_message,
+                user_message_id=current_user_message_id, started=started,
+            )
         (
             interaction_governance,
             interaction_governance_trace,

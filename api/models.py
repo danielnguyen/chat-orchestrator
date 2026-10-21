@@ -231,8 +231,20 @@ class ChatRequest(BaseModel):
     brief_type: BriefType = "general"
     interrupt_policy_mode: InterruptPolicyMode = "off"
     capability_confirmation: Optional[CapabilityConfirmationInput] = None
+    session_transition: Literal["pause"] | None = None
     allow_deferred: bool = False
     delivery_wait_ms: Optional[int] = Field(default=None, ge=100, le=30000, strict=True)
+
+    @model_validator(mode="after")
+    def validate_session_transition(self) -> "ChatRequest":
+        if self.session_transition is not None:
+            if not isinstance(self.conversation_id, str) or not self.conversation_id.strip():
+                raise ValueError("pause_requires_supplied_conversation")
+            if self.capability_confirmation is not None or self.allow_deferred:
+                raise ValueError("pause_incompatible_request")
+            if not self.messages or self.messages[-1].role != "user":
+                raise ValueError("pause_requires_user_message")
+        return self
 
     @model_validator(mode="after")
     def validate_delivery_wait(self) -> "ChatRequest":

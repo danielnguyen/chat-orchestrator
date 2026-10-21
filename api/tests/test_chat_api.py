@@ -1612,3 +1612,62 @@ async def test_unknown_voice_privacy_cues_without_disclosing_answer(feedback_flo
         release.set()
         await iterator.aclose()
         await asyncio.gather(*main._owned_chat_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("fields", [
+    {"session_transition": "resume"}, {"session_transition": True},
+    {"conversation_id": None}, {"conversation_id": " "},
+    {"capability_confirmation": {"confirmed": True}},
+    {"allow_deferred": True, "delivery_wait_ms": 100},
+    {"messages": []}, {"messages": [{"role": "assistant", "content": "pause"}]},
+])
+def test_explicit_pause_request_rejects_incompatible_control(fields):
+    from models import ChatRequest
+    from pydantic import ValidationError
+
+    payload = _full_chat_payload(conversation_id="conv-1", session_transition="pause")
+    payload.update(fields)
+    with pytest.raises(ValidationError):
+        ChatRequest(**payload)
+
+
+@pytest.mark.asyncio
+async def test_chat_api_explicit_pause_is_authenticated_and_keeps_canonical_answer(
+    monkeypatch, tmp_path,
+):
+    from test_orchestrate_flow import (
+        DurableWorkMemoryStore,
+        FakeLiteLLM,
+        PauseRuntime,
+        _write_router_files,
+    )
+
+    main = _load_main(monkeypatch)
+    memory, provider, runtime = DurableWorkMemoryStore(), FakeLiteLLM(), PauseRuntime()
+    rules, models = _write_router_files(tmp_path)
+    for name, value in (("memory_store", memory), ("litellm", provider), ("runtime", runtime)):
+        monkeypatch.setattr(main, name, value)
+    monkeypatch.setattr(main.settings, "router_rules_path", str(rules))
+    monkeypatch.setattr(main.settings, "model_registry_path", str(models))
+    payload = _full_chat_payload(conversation_id="conv-1", session_transition="pause")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://testserver") as client:
+        denied = await client.post("/v1/chat", json=payload)
+        assert denied.status_code == 401
+        assert getattr(memory, "work_calls", []) == []
+        result = await client.post("/v1/chat", headers={"X-API-Key": "orch-test"}, json=payload)
+    assert result.status_code == 200
+    assert result.json()["status"] == "ok"
+    assert memory.added_messages[-1]["content"] == result.json()["answer"]
+    assert memory.work["state"] == "completed"
+    assert runtime.turn_complete_calls[0]["session_transition"] == "pause"
+    assert runtime.turn_complete_calls[0]["request_id"] == result.json()["request_id"]
+    assert provider.calls == []
+
+
+def test_pause_field_defaults_to_none_and_does_not_infer_text():
+    from models import ChatRequest
+
+    assert ChatRequest(**_full_chat_payload(
+        messages=[{"role": "user", "content": "pause and wait"}],
+    )).session_transition is None
