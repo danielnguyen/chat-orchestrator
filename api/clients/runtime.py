@@ -235,6 +235,60 @@ def validate_return_snapshot(value: Any) -> dict[str, Any]:
         raise RuntimeError("runtime_return_snapshot_invalid") from None
 
 
+def canonical_assistant_message_id(value: Any) -> bool:
+    try:
+        return isinstance(value, str) and len(value) == 36 and str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def validate_prior_assistant_message(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
+    if (not isinstance(value, dict) or set(value) != {"status", "assistant_message_id"}
+            or snapshot.get("prior_terminal_turn_id") is None):
+        raise RuntimeError("prior_assistant_association_invalid")
+    if not ((value["status"] == "available"
+             and canonical_assistant_message_id(value["assistant_message_id"]))
+            or (value["status"] == "unavailable" and value["assistant_message_id"] is None)):
+        raise RuntimeError("prior_assistant_association_invalid")
+    return dict(value)
+
+
+def validate_completion_message_response(
+    response: Any, *, request_id: str, runtime_session_id: str, runtime_turn_id: str,
+    assistant_message_id: str, continuation_state: str | None, session_transition: str | None,
+) -> None:
+    if not isinstance(response, dict):
+        raise RuntimeError("completion_association_invalid")
+    session, turn, event = (response.get(key) for key in (
+        "runtime_session", "runtime_turn", "event",
+    ))
+    if not all(isinstance(value, dict) for value in (session, turn, event)):
+        raise RuntimeError("completion_association_invalid")
+    try:
+        completed_at = datetime.fromisoformat(turn["completed_at"].replace("Z", "+00:00"))
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise RuntimeError("completion_association_invalid") from None
+    payload = event.get("event_payload_json")
+    if (session.get("runtime_session_id") != runtime_session_id
+            or session.get("status") != ("paused" if session_transition == "pause" else "active")
+            or session.get("closed_at") is not None
+            or any(not isinstance(session.get(key), str) or not session[key].strip()
+                   or len(session[key]) > 120 for key in ("owner_id", "conversation_id", "surface"))
+            or any(value.get("runtime_session_id") != runtime_session_id for value in (turn, event))
+            or any(value.get("runtime_turn_id") != runtime_turn_id for value in (turn, event))
+            or turn.get("turn_status") != "completed" or event.get("event_type") != "turn_completed"
+            or turn.get("continuation_state") != continuation_state
+            or not isinstance(payload, dict)
+            or payload.get("request_id") != request_id
+            or payload.get("turn_status") != "completed"
+            or payload.get("continuation_state") != continuation_state
+            or payload.get("session_transition") != session_transition
+            or payload.get("assistant_message_id") != assistant_message_id):
+        raise RuntimeError("completion_association_mismatch")
+
+
 _PRESENCE_STATES = {
     "not_present", "available", "active_conversation", "ambient_listening", "idle",
     "returning_after_gap", "low_attention", "driving_or_active_task", "do_not_intrude",
@@ -3046,6 +3100,7 @@ class RuntimeClient:
         turn_status: str,
         continuation_state: str | None = None,
         session_transition: str | None = None,
+        assistant_message_id: str | None = None,
     ) -> dict[str, Any]:
         if session_transition is not None:
             if session_transition != "pause" or turn_status != "completed" or any(
@@ -3053,6 +3108,12 @@ class RuntimeClient:
                 for value in (request_id, runtime_session_id, runtime_turn_id)
             ):
                 raise ValueError("pause_completion_request_invalid")
+        if assistant_message_id is not None and (
+            not canonical_assistant_message_id(assistant_message_id) or turn_status != "completed"
+            or any(not isinstance(value, str) or not value.strip() or len(value) > 120
+                   for value in (request_id, runtime_session_id, runtime_turn_id))
+        ):
+            raise ValueError("completion_association_request_invalid")
         payload: dict[str, Any] = {
             "request_id": request_id,
             "runtime_session_id": runtime_session_id,
@@ -3063,7 +3124,20 @@ class RuntimeClient:
             payload["continuation_state"] = continuation_state
         if session_transition is not None:
             payload["session_transition"] = session_transition
+        if assistant_message_id is not None:
+            payload["assistant_message_id"] = assistant_message_id
         response = await self._post("/v1/runtime/turns/complete", json=payload)
+        event = response.get("event") if isinstance(response, dict) else None
+        result = event.get("event_payload_json") if isinstance(event, dict) else None
+        if (assistant_message_id is None and isinstance(result, dict)
+                and result.get("assistant_message_id") is not None):
+            raise RuntimeError("completion_association_mismatch")
+        if assistant_message_id is not None:
+            validate_completion_message_response(
+                response, request_id=request_id, runtime_session_id=runtime_session_id,
+                runtime_turn_id=runtime_turn_id, assistant_message_id=assistant_message_id,
+                continuation_state=continuation_state, session_transition=session_transition,
+            )
         if session_transition == "pause":
             validate_pause_completion_response(
                 response, request_id=request_id, runtime_session_id=runtime_session_id,
