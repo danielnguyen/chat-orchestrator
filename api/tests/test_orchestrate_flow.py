@@ -1218,6 +1218,7 @@ class FakeRuntime:
                               key: kwargs.get(key) for key in (
                                   "request_id", "turn_status", "continuation_state",
                                   "session_transition", "assistant_message_id",
+                                  "response_continuation_state",
                               )}},
             }
         return {
@@ -39380,6 +39381,8 @@ class ReturnRuntime(FakeRuntime):
             "event_payload_json": {
                 "request_id": kwargs["request_id"],
                 "return_after_gap": _return_admission_snapshot(),
+                "prior_response_continuation": {"status": "unavailable",
+                                                "response_continuation_state": None},
                 "prior_assistant_message": {"status": "available",
                     "assistant_message_id": "12345678-1234-1234-1234-123456789abc"},
             },
@@ -43264,3 +43267,70 @@ async def test_completion_association_provenance_is_not_fabricated_or_replayed(o
         outcome not in {"abandon", "invalid_ack"}
     )
     assert "PRIVATE-COMPLETION" not in json.dumps(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap", [0, 299, 300, 360])
+@pytest.mark.parametrize("state", ["abbreviated", "expandable", None])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_completed_voice_state_is_consumed_only_with_exact_canonical_answer(
+    tmp_path, gap, state, fallback,
+):
+    class VoiceRuntime(ExactAnswerRuntime):
+        async def start_turn(self, **kwargs):
+            response = await super().start_turn(**kwargs)
+            response["event"]["event_payload_json"]["prior_response_continuation"] = {
+                "status": "available" if state else "unavailable",
+                "response_continuation_state": state,
+            }
+            return response
+
+    runtime = VoiceRuntime(gap, "deferred_expansion" if gap >= 300 else "none")
+    provider = FakeLiteLLM(fail_first=fallback)
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=ExactAnswerMemory(), provider=provider,
+        policy="resume_previous_thread" if gap >= 300 else "answer_now",
+        configured_fallback=fallback,
+        payload=_base_payload(conversation_id="conv-1", messages=[{
+            "role": "user", "content": "Tell me more.",
+        }], surface_context={"spoken_output": True, "interaction_mode": "voice_mediated"}),
+    )
+    assert out["answer"] == "hello"
+    assert len(provider.calls) == (2 if fallback else 1)
+    assert all("backup procedure" in str(call["messages"]) for call in provider.calls)
+    assert all(("whose response policy declared" in str(call["messages"])) == bool(state)
+               for call in provider.calls)
+    assert len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["response_continuation_state"] == "abbreviated"
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["turn_state"]["response_continuation_recording"] == "confirmed"
+    assert trace["return_resume_context"].get("response_continuation_state") == state
+    assert trace["runtime_timing"]["result"]["continuation_state"] != "abbreviated"
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection", [None, {}, {"status": "available",
+    "response_continuation_state": "deferred_expansion"}, {"status": "available",
+    "response_continuation_state": {"private": "content"}}, {"status": "unavailable",
+    "response_continuation_state": "expandable"}])
+async def test_invalid_voice_projection_clarifies_without_provider(tmp_path, projection):
+    class InvalidProjection(ExactAnswerRuntime):
+        async def start_turn(self, **kwargs):
+            response = await super().start_turn(**kwargs)
+            response["event"]["event_payload_json"]["prior_response_continuation"] = projection
+            return response
+
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=InvalidProjection(), memory=ExactAnswerMemory(),
+    )
+    assert "enough retained context" in out["answer"]
+    assert provider.calls == [] and len(runtime.turn_complete_calls) == 1
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert "private" not in json.dumps(trace["turn_state"]["prior_response_continuation"])
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]

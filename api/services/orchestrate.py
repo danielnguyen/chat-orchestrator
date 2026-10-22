@@ -37,6 +37,7 @@ from clients.runtime import (
     validate_pause_completion_response,
     validate_presence_response,
     validate_prior_assistant_message,
+    validate_prior_response_continuation,
     validate_return_snapshot,
     validate_strict_capability_response,
     validate_strict_containment_response,
@@ -186,6 +187,7 @@ from services.response_shape import (
     build_response_shape_guidance_block,
     clamp_response_shape_for_runtime_presence,
     clamp_response_shape_for_timing,
+    completed_response_continuation,
     project_timing_facts,
     resolve_response_shape,
 )
@@ -5224,6 +5226,7 @@ def _return_resume_context(
     bundle: Any,
     conversation_id: str,
     *, association: Any = None, restraint_trace: Any = None, owner_id: str | None = None,
+    response_continuation: Any = None,
 ) -> dict[str, Any]:
     timing = timing if isinstance(timing, dict) else {}
     restraint_trace = restraint_trace if isinstance(restraint_trace, dict) else {}
@@ -5263,6 +5266,10 @@ def _return_resume_context(
                   prior_continuation_state=snapshot["prior_continuation_state"])
     try:
         association = validate_prior_assistant_message(association, snapshot)
+        if response_continuation is not None:
+            response_continuation = validate_prior_response_continuation(
+                response_continuation, snapshot, association,
+            )
     except RuntimeError:
         return result
     message_id = _canonical_prior_assistant_id(
@@ -5276,6 +5283,9 @@ def _return_resume_context(
             source_count=1,
             reason_code="canonical_prior_assistant",
         )
+        if response_continuation and response_continuation["status"] == "available":
+            result["response_continuation_state"] = response_continuation[
+                "response_continuation_state"]
     return result
 
 
@@ -5453,6 +5463,14 @@ async def _start_runtime_turn(
         except RuntimeError:
             trace["prior_assistant_message"] = {"status": "unavailable",
                                                 "assistant_message_id": None}
+        if trace["return_after_gap"]["prior_terminal_turn_id"] is not None:
+            try:
+                trace["prior_response_continuation"] = validate_prior_response_continuation(
+                    event_payload.get("prior_response_continuation"),
+                    trace["return_after_gap"], trace["prior_assistant_message"],
+                )
+            except RuntimeError:
+                trace["prior_response_continuation"] = {"status": "invalid"}
     if expected_thread_revision is not None:
         trace["expected_thread_revision"] = expected_thread_revision
     return response, trace
@@ -5535,6 +5553,7 @@ async def _complete_runtime_turn(
     expected_scope: dict[str, Any] | None = None,
     session_transition: str | None = None,
     assistant_acknowledgement: Any = None,
+    response_continuation_state: str | None = None,
 ) -> None:
     runtime_session_id = turn_state_trace.get("runtime_session_id")
     runtime_turn_id = turn_state_trace.get("runtime_turn_id")
@@ -5544,6 +5563,12 @@ async def _complete_runtime_turn(
         message_id = (assistant_acknowledgement.get("message_id")
                       if isinstance(assistant_acknowledgement, dict) else None)
         associated = turn_status == "completed" and canonical_assistant_message_id(message_id)
+        if response_continuation_state is not None and (
+            response_continuation_state not in ("abbreviated", "expandable") or not associated
+        ):
+            raise ValueError("response_continuation_request_invalid")
+        if response_continuation_state is not None:
+            turn_state_trace["response_continuation_recording"] = "unconfirmed"
         if assistant_acknowledgement is not None:
             turn_state_trace["assistant_message_association"] = "unconfirmed"
         turn_state_trace["terminal_transition_attempted"] = True
@@ -5554,6 +5579,8 @@ async def _complete_runtime_turn(
             turn_status=turn_status,
             **({"session_transition": session_transition} if session_transition else {}),
             **({"assistant_message_id": message_id} if associated else {}),
+            **({"response_continuation_state": response_continuation_state}
+               if response_continuation_state is not None else {}),
             **({"continuation_state": turn_state_trace["continuation_state"]}
                if isinstance(turn_state_trace.get("continuation_state"), str) else {}),
         )
@@ -5563,6 +5590,7 @@ async def _complete_runtime_turn(
                 runtime_turn_id=runtime_turn_id, assistant_message_id=message_id,
                 continuation_state=turn_state_trace.get("continuation_state"),
                 session_transition=session_transition,
+                response_continuation_state=response_continuation_state,
             )
             session = response["runtime_session"]
             if any(session.get(key) != turn_state_trace[key] for key in (
@@ -5570,6 +5598,8 @@ async def _complete_runtime_turn(
             ) if key in turn_state_trace):
                 raise RuntimeError("runtime_completion_context_mismatch")
             turn_state_trace["assistant_message_association"] = "confirmed"
+            if response_continuation_state is not None:
+                turn_state_trace["response_continuation_recording"] = "confirmed"
         if expected_scope is not None:
             session = response.get("runtime_session") if isinstance(response, dict) else None
             turn = response.get("runtime_turn") if isinstance(response, dict) else None
@@ -10819,6 +10849,7 @@ async def orchestrate_chat(
                 return_retrieval_bundle, conversation_id,
                 association=turn_state_trace.get("prior_assistant_message"),
                 restraint_trace=restraint_trace, owner_id=payload["owner_id"],
+                response_continuation=turn_state_trace.get("prior_response_continuation"),
             )
             turn_state_trace["return_resume_context"] = resume_context
             if resume_context["status"] == "unavailable":
@@ -12192,6 +12223,7 @@ async def orchestrate_chat(
             conversation_id,
             association=turn_state_trace.get("prior_assistant_message"),
             restraint_trace=restraint_trace, owner_id=payload["owner_id"],
+            response_continuation=turn_state_trace.get("prior_response_continuation"),
         )
         turn_state_trace["return_resume_context"] = resume_context
         if resume_context["status"] == "unavailable":
@@ -12211,6 +12243,15 @@ async def orchestrate_chat(
                 "source_count": 1 if prior_message_id else 0,
                 "conversation_id": conversation_id,
             }
+        if resume_context.get("response_continuation_state") in ("abbreviated", "expandable"):
+            response_shape_trace = {
+                **response_shape_trace,
+                "resumed_response_continuation_state": resume_context[
+                    "response_continuation_state"],
+            }
+            response_shape_guidance = build_response_shape_guidance_block(
+                response_shape, response_shape_trace,
+            )
         presence_result = runtime_presence_trace
         if presence_result.get("presence_state") == "returning_after_gap":
             guidance = (
@@ -14636,6 +14677,17 @@ async def orchestrate_chat(
             request_id=request_id,
             turn_status="completed",
             assistant_acknowledgement=assistant_message_ack,
+            response_continuation_state=completed_response_continuation(
+                effective_payload, response_shape_trace,
+                withheld=privacy_boundary.enforced,
+                provider_answer=(selected_model != "not_called" and pending_action is None
+                                 and isinstance(assistant_message_ack, dict)
+                                 and canonical_assistant_message_id(
+                                     assistant_message_ack.get("message_id"))
+                                 and capability_request is None
+                                 and not isinstance(prompt.trace.get("capabilities", {}).get(
+                                     "execution"), dict)),
+            ),
         )
         prompt.trace["runtime"] = runtime_trace
         prompt.trace["runtime_session"] = runtime_session_trace

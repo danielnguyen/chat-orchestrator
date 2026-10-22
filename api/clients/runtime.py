@@ -253,10 +253,33 @@ def validate_prior_assistant_message(value: Any, snapshot: dict[str, Any]) -> di
     return dict(value)
 
 
+def validate_prior_response_continuation(
+    value: Any, snapshot: dict[str, Any], association: Any,
+) -> dict[str, Any]:
+    if (not isinstance(value, dict)
+            or set(value) != {"status", "response_continuation_state"}
+            or snapshot.get("prior_terminal_turn_id") is None):
+        raise RuntimeError("prior_response_continuation_invalid")
+    if value["status"] == "available":
+        if (value["response_continuation_state"] not in ("abbreviated", "expandable")
+                or validate_prior_assistant_message(association, snapshot)["status"]
+                != "available"):
+            raise RuntimeError("prior_response_continuation_invalid")
+    elif value["status"] != "unavailable" or value["response_continuation_state"] is not None:
+        raise RuntimeError("prior_response_continuation_invalid")
+    return dict(value)
+
+
 def validate_completion_message_response(
     response: Any, *, request_id: str, runtime_session_id: str, runtime_turn_id: str,
     assistant_message_id: str, continuation_state: str | None, session_transition: str | None,
+    response_continuation_state: str | None = None,
 ) -> None:
+    if response_continuation_state is not None and (
+        response_continuation_state not in ("abbreviated", "expandable")
+        or not canonical_assistant_message_id(assistant_message_id)
+    ):
+        raise RuntimeError("completion_association_invalid")
     if not isinstance(response, dict):
         raise RuntimeError("completion_association_invalid")
     session, turn, event = (response.get(key) for key in (
@@ -285,7 +308,8 @@ def validate_completion_message_response(
             or payload.get("turn_status") != "completed"
             or payload.get("continuation_state") != continuation_state
             or payload.get("session_transition") != session_transition
-            or payload.get("assistant_message_id") != assistant_message_id):
+            or payload.get("assistant_message_id") != assistant_message_id
+            or payload.get("response_continuation_state") != response_continuation_state):
         raise RuntimeError("completion_association_mismatch")
 
 
@@ -3101,7 +3125,14 @@ class RuntimeClient:
         continuation_state: str | None = None,
         session_transition: str | None = None,
         assistant_message_id: str | None = None,
+        response_continuation_state: str | None = None,
     ) -> dict[str, Any]:
+        if response_continuation_state is not None and (
+            response_continuation_state not in ("abbreviated", "expandable")
+            or turn_status != "completed"
+            or not canonical_assistant_message_id(assistant_message_id)
+        ):
+            raise ValueError("response_continuation_request_invalid")
         if session_transition is not None:
             if session_transition != "pause" or turn_status != "completed" or any(
                 not isinstance(value, str) or not value.strip() or len(value) > 120
@@ -3126,9 +3157,14 @@ class RuntimeClient:
             payload["session_transition"] = session_transition
         if assistant_message_id is not None:
             payload["assistant_message_id"] = assistant_message_id
+        if response_continuation_state is not None:
+            payload["response_continuation_state"] = response_continuation_state
         response = await self._post("/v1/runtime/turns/complete", json=payload)
         event = response.get("event") if isinstance(response, dict) else None
         result = event.get("event_payload_json") if isinstance(event, dict) else None
+        if (isinstance(result, dict)
+                and result.get("response_continuation_state") != response_continuation_state):
+            raise RuntimeError("completion_association_mismatch")
         if (assistant_message_id is None and isinstance(result, dict)
                 and result.get("assistant_message_id") is not None):
             raise RuntimeError("completion_association_mismatch")
@@ -3137,6 +3173,7 @@ class RuntimeClient:
                 response, request_id=request_id, runtime_session_id=runtime_session_id,
                 runtime_turn_id=runtime_turn_id, assistant_message_id=assistant_message_id,
                 continuation_state=continuation_state, session_transition=session_transition,
+                response_continuation_state=response_continuation_state,
             )
         if session_transition == "pause":
             validate_pause_completion_response(

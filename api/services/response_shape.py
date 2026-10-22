@@ -235,6 +235,13 @@ def build_response_shape_guidance_block(shape: ResponseShape, trace: dict[str, A
         return ""
 
     lines: list[str] = []
+    if trace.get("resumed_response_continuation_state") in ("abbreviated", "expandable"):
+        lines.append(
+            "- The user requested more detail about the supplied preceding answer, whose "
+            "response policy declared it abbreviated or expandable. Continue only that "
+            "authorized retained answer within the current timing and presentation limits; "
+            "do not invent missing context or claim it was heard."
+        )
 
     if (trace.get("runtime_presence") or {}).get("applied") is True:
         lines.extend([
@@ -298,6 +305,27 @@ def project_timing_facts(payload: dict[str, Any]) -> dict[str, Any]:
         "active_task_mode": context.active_task_mode is True,
         "requested_detail": detail,
     }
+
+
+def completed_response_continuation(
+    payload: dict[str, Any], trace: dict[str, Any], *, withheld: bool, provider_answer: bool,
+) -> str | None:
+    """Declare effective shaping intent, never measured shortening or delivery."""
+    if withheld or not provider_answer or trace.get("included") is not True:
+        return None
+    try:
+        spoken = project_timing_facts(payload)["spoken_output"]
+    except ValueError:
+        return None
+    shape = trace.get("resolved_shape")
+    if not spoken or not isinstance(shape, dict) or (
+        shape.get("spoken_output") is not True or shape.get("concise_first_answer") is not True
+    ):
+        return None
+    state = trace.get("continuation_state")
+    if state in ("abbreviated", "expandable") and shape.get("continuation_state") == state:
+        return state
+    return None
 
 
 def clamp_response_shape_for_timing(

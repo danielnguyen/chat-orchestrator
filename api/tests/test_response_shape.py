@@ -419,3 +419,47 @@ def test_explicit_expanded_detail_timing_does_not_apply_low_attention_cap():
     )
     assert narrowed.max_sentence_count is None
     assert not narrowed.concise_first_answer
+
+
+@pytest.mark.parametrize("state", ["abbreviated", "expandable"])
+@pytest.mark.parametrize("withheld,provider", [(False, True), (True, True), (False, False)])
+def test_completed_response_declaration_is_bounded_intent(state, withheld, provider):
+    from services.response_shape import completed_response_continuation
+
+    payload = {"surface": "web", "surface_context": {
+        "interaction_mode": "voice_mediated", "spoken_output": True,
+        "allows_expansion": state == "expandable", "verbosity_target": "short",
+    }}
+    _, trace = resolve_response_shape(payload, StyleEnvelope())
+    assert completed_response_continuation(
+        payload, trace, withheld=withheld, provider_answer=provider,
+    ) == (state if not withheld and provider else None)
+
+
+def test_surface_name_alone_cannot_declare_completed_voice_response():
+    from services.response_shape import completed_response_continuation
+
+    payload = {"surface": "alexa"}
+    _, trace = resolve_response_shape(payload, StyleEnvelope())
+    assert trace["continuation_state"] == "abbreviated"  # Legacy presentation remains compatible.
+    assert completed_response_continuation(
+        payload, trace, withheld=False, provider_answer=True,
+    ) is None
+
+
+def test_resumed_response_guidance_cannot_expand_current_policy():
+    from services.response_shape import clamp_response_shape_for_timing
+
+    payload = {"surface_context": {"spoken_output": True, "allows_expansion": True,
+                                    "verbosity_target": "short"}}
+    shape, trace = resolve_response_shape(payload, StyleEnvelope())
+    shape, trace = clamp_response_shape_for_timing(shape, trace, {
+        "timing_policy": "defer_expansion", "expansion_allowed": False,
+        "reason_codes": ["presence_low_attention"],
+    })
+    trace["resumed_response_continuation_state"] = "expandable"
+    guidance = build_response_shape_guidance_block(shape, trace)
+    assert "authorized retained answer" in guidance
+    assert "current timing and presentation limits" in guidance
+    assert shape.allows_expansion is False and shape.expansion_marker_allowed is False
+    assert shape.max_sentence_count == 2 and shape.continuation_state == "abbreviated"

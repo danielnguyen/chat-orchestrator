@@ -5960,6 +5960,224 @@ run_strict_world_state_scenario() {
   echo 'Strict world state matrix: actual_services=true current_authority=true contextual_activation=false no_legacy_retry=true fixtures_restored=true default_legacy=true latency_benchmark=false'
 }
 
+run_voice_continuation_scenario() {
+  local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  local previous_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
+  local previous_reserve="${COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE:-2048}"
+  local reserve denied_before observed_calls evidence_file=""
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    evidence_file="$COMPOSED_SMOKE_LOG_DIR/voice-continuation.jsonl"
+    : >"$evidence_file"
+  fi
+  COMPOSED_RESTRAINT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  local tag owner client conversation first response request trace session turn diagnostics
+  local prior_id prior_turn calls expected_count current_surface first_answer expected_answer state
+  for tag in ${VOICE_CONTINUATION_CASES:-immediate deferred restart cross ordinary newer missing unpublished privacy denied corrupt abandoned fallback budget}; do
+    echo "Voice continuation starting: case=$tag"
+    owner="owner-voice-continuation-$tag"; client="web:voice-continuation-$tag"
+    current_surface=web
+    conversation="$(create_conversation "$owner" "$client")"
+    configure_surface_permission "$owner" web true false false
+    provider_post /fixture/reset '{}' >/dev/null
+    first_answer="Save the backup first. Then check the logs."
+    if [ "$tag" = budget ]; then
+      first_answer="$(python3 -c 'print("Bounded backup detail " * 90 + ".")')"
+    fi
+    if [ "$tag" = abandoned ]; then
+      first="$(cr_post /v1/runtime/turns/start "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" '
+        {request_id:"voice-abandoned",owner_id:$owner,conversation_id:$conversation,surface:"web"}')")"
+      session="$(jq -er .runtime_session.runtime_session_id <<<"$first")"
+      prior_turn="$(jq -er .runtime_turn.runtime_turn_id <<<"$first")"
+      cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$session" --arg turn "$prior_turn" '
+        {request_id:"voice-abandoned",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"abandoned"}')" >/dev/null
+      prior_id=""
+    else
+      queue_provider_answer "$first_answer" >/dev/null
+      first="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" --arg tag "$tag" '
+        {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"web",sensitivity:"private",
+         messages:[{role:"user",content:"What is the backup procedure?"}],
+         surface_context:{interaction_mode:"voice_mediated",spoken_output:true,output_format:"speech",
+           active_task_mode:($tag=="deferred"),allows_expansion:true,verbosity_target:"short"}}')")"
+      request="$(jq -er .request_id <<<"$first")"
+      assert_persisted_answer_matches "$conversation" "$request" "$first_answer"
+      [ "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = 1 ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='assistant' AND metadata->>'request_id'='$request';")" = 1 ]
+      trace="$(fetch_trace "$request")"
+      session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
+      prior_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+      prior_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND role='assistant' AND metadata->>'request_id'='$request';")"
+      diagnostics="$(fetch_runtime_diagnostics "$session")"
+      jq -e --arg turn "$prior_turn" --arg message "$prior_id" '
+        [.events[]|select(.event_type=="turn_completed" and .runtime_turn_id==$turn)]
+        | length==1 and .[0].event_payload_json.assistant_message_id==$message
+        and .[0].event_payload_json.response_continuation_state=="abbreviated"' <<<"$diagnostics" >/dev/null
+      jq -e '.retrieval.prompt_assembly.turn_state.response_continuation_recording=="confirmed"' <<<"$trace" >/dev/null
+      if [ "$tag" = deferred ]; then
+        jq -e '.latest_turn.continuation_state=="deferred_expansion"' <<<"$diagnostics" >/dev/null
+      fi
+    fi
+    if [ "$tag" = newer ]; then
+      provider_post /fixture/reset '{}' >/dev/null
+      queue_provider_answer "13." >/dev/null
+      response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" '
+        {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"web",sensitivity:"private",
+         messages:[{role:"user",content:"What is 9 + 4?"}],
+         surface_context:{interaction_mode:"text",spoken_output:false,output_format:"plain_text"}}')")"
+      request="$(jq -er .request_id <<<"$response")"
+      assert_persisted_answer_matches "$conversation" "$request" "13."
+      trace="$(fetch_trace "$request")"
+      prior_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+      prior_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND role='assistant' AND metadata->>'request_id'='$request';")"
+      first_answer="13."
+    fi
+    if [ "$tag" = missing ]; then
+      add_message "$conversation" "$owner" "$client" assistant "Older unrelated answer, not the preceding runtime answer." >/dev/null
+      psql_exec -c "UPDATE messages SET content='' WHERE id='$prior_id' AND owner_id='$owner';" >/dev/null
+    fi
+    if [ "$tag" = unpublished ]; then
+      # Retain the acknowledged message but make its work noncanonical in disposable data.
+      psql_exec -c "UPDATE work_items SET state='failed', assistant_message_id=NULL, failure_code='execution_failed' WHERE owner_id='$owner' AND request_id='$request';" >/dev/null
+      add_message "$conversation" "$owner" "$client" assistant "Older unrelated answer, not the preceding runtime answer." >/dev/null
+    fi
+    if [ "$tag" = corrupt ]; then
+      docker compose -f "$COMPOSE" exec -T runtime python - "$prior_turn" <<'PYFIXTURE'
+import json, sqlite3, sys
+with sqlite3.connect('/data/runtime_state.sqlite3') as connection:
+    row = connection.execute("SELECT id,event_payload_json FROM conversation_runtime_events WHERE runtime_turn_id=? AND event_type='turn_completed'", (sys.argv[1],)).fetchone()
+    payload = json.loads(row[1])
+    payload['assistant_message_id'] = 'malformed'
+    payload['response_continuation_state'] = {'invalid': True}
+    assert connection.execute("UPDATE conversation_runtime_events SET event_payload_json=? WHERE id=?", (json.dumps(payload), row[0])).rowcount == 1
+PYFIXTURE
+    fi
+    if [ "$tag" = deferred ]; then
+      runtime_backdate_thread "$owner" "$conversation" "$(python3 -c 'from datetime import timezone,datetime,timedelta; print((datetime.now(timezone.utc)-timedelta(seconds=360)).isoformat())')"
+    fi
+    if [ "$tag" = restart ]; then
+      docker compose -f "$COMPOSE" restart runtime >/dev/null
+      docker compose -f "$COMPOSE" up -d --wait runtime >/dev/null
+    fi
+    if [ "$tag" = cross ] || [ "$tag" = denied ]; then
+      current_surface=alexa
+      configure_surface_permission "$owner" alexa "$([ "$tag" = cross ] && echo true || echo false)" false false
+      client="alexa:voice-continuation-$tag"
+    fi
+    if [ "$tag" = privacy ]; then
+      COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+      wait_for_http http://127.0.0.1:14361/healthz
+    fi
+    if [ "$tag" = budget ]; then
+      # A test-owned prompt limit: leave the first turn's essential input plus 128 tokens,
+      # while the deliberately long prior answer cannot fit. No latency budget is changed.
+      reserve="$(jq -er '.retrieval.prompt_assembly.prompt_budget |
+        .effective_min_context_limit - .context_safety_margin -
+        (.estimated_tokens_after_budgeting + 128)' <<<"$trace")"
+      [ "$reserve" -gt 0 ]
+      COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$reserve" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+      wait_for_http http://127.0.0.1:14361/healthz
+    fi
+    provider_post /fixture/reset '{}' >/dev/null
+    expected_answer="Check the logs after saving the backup."
+    [ "$tag" != ordinary ] || expected_answer="4."
+    [ "$tag" != newer ] || expected_answer="Thirteen is nine plus four."
+    queue_provider_answer "$expected_answer" >/dev/null
+    if [ "$tag" = fallback ]; then provider_post /fixture/fail-next-primary '{}' >/dev/null; fi
+    if [ "$tag" = denied ]; then
+      denied_before="$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")"
+    fi
+    response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$current_surface" --arg conversation "$conversation" --arg tag "$tag" '
+      {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,sensitivity:"private",
+       messages:[{role:"user",content:(if $tag=="ordinary" then "What is 2+2?" else "Tell me more." end)}],
+       surface_context:{interaction_mode:"voice_mediated",spoken_output:true,output_format:"speech",
+                       active_task_mode:false,allows_expansion:true}}')")"
+    request="$(jq -er .request_id <<<"$response")"
+    if [ "$tag" = denied ]; then
+      jq -e '.status=="failed" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+      [ "$denied_before" = "$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")" ]
+      [ "$(fetch_provider_calls "$request" | jq '[.calls[]|select(.kind=="chat")]|length')" = 0 ]
+      jq -e '.request_events==0 and .action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+      if [ -n "$evidence_file" ]; then
+        jq -nc --arg request "$request" '{scenario:"denied",request_id:$request,current_surface:"alexa",
+          provider_calls:0,declined_before_admission:true,durable_state_unchanged:true,action_events:0}' >>"$evidence_file"
+      fi
+      echo "Voice continuation denied: declined_before_admission=true providers=0 writes=0 actions=0"
+      continue
+    fi
+    trace="$(fetch_trace "$request")"
+    calls="$(fetch_provider_calls "$request")"
+    expected_count=1
+    case "$tag" in missing|unpublished|privacy|denied|corrupt|abandoned|budget) expected_count=0 ;; fallback) expected_count=2 ;; esac
+    observed_calls="$(jq '[.calls[]|select(.kind=="chat")]|length' <<<"$calls")"
+    echo "Voice continuation observed: case=$tag providers=$observed_calls expected=$expected_count status=$(jq -r .status <<<"$response") model=$(jq -r .selected_model <<<"$response")"
+    [ "$observed_calls" = "$expected_count" ]
+    assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .answer <<<"$response")"
+    [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='assistant' AND metadata->>'request_id'='$request';")" = 1 ]
+    session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    jq -e '.latest_turn.turn_status=="completed" and .active_turn==null
+      and ([.events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length==0)' <<<"$diagnostics" >/dev/null
+    jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+    [ "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND request_id='$request' AND state='completed';")" = 1 ]
+    if [ "$tag" = cross ]; then
+      jq -e '.runtime_session.surface=="alexa"' <<<"$diagnostics" >/dev/null
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE id='$prior_id' AND client_id='web:voice-continuation-cross';")" = 1 ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE metadata->>'request_id'='$request' AND role='assistant' AND client_id='$client';")" = 1 ]
+    fi
+    if [ "$expected_count" != 0 ]; then
+      jq -e --arg answer "$expected_answer" --arg tag "$tag" '.answer==$answer
+        and .status==(if $tag=="fallback" then "degraded" else "ok" end)' <<<"$response" >/dev/null
+      if [ "$tag" = fallback ]; then
+        jq -e '([.calls[]|select(.kind=="chat")][0].status)=="failed"' <<<"$calls" >/dev/null
+        jq -e '.selected_model=="chat_deep_openai"' <<<"$response" >/dev/null
+      fi
+      if [ "$tag" = ordinary ]; then
+        jq -e '.retrieval.prompt_assembly.return_resume_context.status=="not_requested"
+          and (.retrieval.prompt_assembly.response_shape|has("resumed_response_continuation_state")|not)' <<<"$trace" >/dev/null
+      else
+        jq -e --arg prior "$prior_id" --arg turn "$prior_turn" '
+          .retrieval.prompt_assembly.return_resume_context.status=="ready"
+          and .retrieval.prompt_assembly.return_resume_context.source_message_ids==[$prior]
+          and .retrieval.prompt_assembly.turn_state.return_after_gap.prior_terminal_turn_id==$turn' <<<"$trace" >/dev/null
+        jq -e --arg content "$first_answer" '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.role=="assistant" and (.content|contains($content))))' <<<"$calls" >/dev/null
+        state=abbreviated; [ "$tag" != newer ] || state=""
+        jq -e --arg request "$request" --arg prior "$prior_id" --arg state "$state" '
+          [.events[]|select(.event_type=="turn_started" and .event_payload_json.request_id==$request)]
+          | length==1 and .[0].event_payload_json.prior_assistant_message.assistant_message_id==$prior
+          and .[0].event_payload_json.prior_response_continuation==
+            (if $state=="" then {status:"unavailable",response_continuation_state:null}
+             else {status:"available",response_continuation_state:$state} end)' <<<"$diagnostics" >/dev/null
+        if [ -n "$state" ]; then
+          jq -e '.retrieval.prompt_assembly.response_shape.resumed_response_continuation_state=="abbreviated"' <<<"$trace" >/dev/null
+        else
+          jq -e '.retrieval.prompt_assembly.turn_state.prior_response_continuation.status=="unavailable"
+            and (.retrieval.prompt_assembly.response_shape|has("resumed_response_continuation_state")|not)' <<<"$trace" >/dev/null
+        fi
+      fi
+    else
+      jq -e --arg private "$first_answer" '.answer!=$private and .selected_model=="not_called"' <<<"$response" >/dev/null
+    fi
+    if [ "$tag" = budget ]; then
+      jq -e '.retrieval.prompt_assembly.turn_state.return_resume_context.reason_code=="required_history_omitted_by_budget"' <<<"$trace" >/dev/null
+      COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$previous_reserve" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+      wait_for_http http://127.0.0.1:14361/healthz
+    fi
+    if [ "$tag" = privacy ]; then
+      COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED="$previous_privacy" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+      wait_for_http http://127.0.0.1:14361/healthz
+    fi
+    if [ -n "$evidence_file" ]; then
+      jq -nc --arg scenario "$tag" --arg request "$request" --arg surface "$current_surface" --argjson calls "$expected_count" '
+        {scenario:$scenario,request_id:$request,historical_surface:"web",current_surface:$surface,
+         provider_calls:$calls,canonical_persistence_equal:true,completed:true,thread_idle:true,action_events:0}' >>"$evidence_file"
+    fi
+    echo "Voice continuation $tag: canonical_persistence=true providers=$expected_count completed=true idle=true actions=0 exact_prior_guard=true"
+  done
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" COMPOSED_PRIVACY_CONTEXT_ENABLED="$previous_privacy" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 
@@ -5989,6 +6207,11 @@ if [ "${G2_DEFERRED_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+if [ "${VOICE_CONTINUATION_ONLY:-}" = "1" ]; then
+  run_voice_continuation_scenario
+  exit 0
+fi
+
 if [ "${CLAIM_TRACE_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: claim-trace-only"
   run_claim_traceability_scenario
@@ -6008,6 +6231,7 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   echo "Composed smoke mode: evidence-acquisition-only"
   run_evidence_acquisition_composed_suite
   if [ "${EVIDENCE_SCENARIO:-all}" = all ]; then
+    run_voice_continuation_scenario
     run_transport_latency_regression
   fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
@@ -6073,6 +6297,7 @@ run_continuation_failure_contention_scenario
 run_surface_permission_scenario
 run_ambient_presence_scenario
 run_return_after_gap_scenario
+run_voice_continuation_scenario
 run_timing_matrix_scenario
 run_interrupt_enforcement_scenario
 run_interrupt_lifecycle_scenario

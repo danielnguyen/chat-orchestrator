@@ -5510,3 +5510,83 @@ async def test_null_completion_association_preserves_legacy_payload():
     await client.complete_turn(**binding)
     await client.complete_turn(**binding, assistant_message_id=None)
     assert calls == [("/v1/runtime/turns/complete", binding)] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["abbreviated", "expandable"])
+@pytest.mark.parametrize("outcome", ["ok", "missing", "different", "malformed", "timeout"])
+async def test_response_continuation_completion_is_exact_and_never_replayed(state, outcome):
+    client = RuntimeClient("http://runtime", api_key=None)
+    calls = []
+    message_id = "12345678-1234-1234-1234-123456789abc"
+
+    async def post(path, *, json):
+        calls.append((path, json))
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("private failure")
+        response = _pause_completion_fixture()
+        response["runtime_session"]["status"] = "active"
+        payload = response["event"]["event_payload_json"]
+        payload.pop("session_transition", None)
+        payload["assistant_message_id"] = message_id
+        if outcome != "missing":
+            payload["response_continuation_state"] = {
+                "ok": state, "different": "none", "malformed": {"state": state},
+            }[outcome]
+        return response
+
+    client._post = post
+    request = dict(request_id="rid", runtime_session_id="rtsession_1",
+                   runtime_turn_id="rtturn_1", turn_status="completed",
+                   assistant_message_id=message_id, response_continuation_state=state)
+    if outcome == "ok":
+        await client.complete_turn(**request)
+    else:
+        with pytest.raises((RuntimeError, httpx.ReadTimeout)):
+            await client.complete_turn(**request)
+    assert calls == [("/v1/runtime/turns/complete", request)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    {"response_continuation_state": "none"}, {"response_continuation_state": "suppressed"},
+    {"response_continuation_state": "deferred_expansion"},
+    {"response_continuation_state": {}}, {"response_continuation_state": True},
+    {"assistant_message_id": None}, {"assistant_message_id": "not-a-uuid"},
+    {"turn_status": "abandoned"},
+])
+async def test_invalid_response_continuation_never_reaches_http(change):
+    client = RuntimeClient("http://runtime", api_key=None)
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("invalid declaration reached HTTP")
+
+    client._post = forbidden
+    with pytest.raises(ValueError):
+        await client.complete_turn(**{
+            "request_id": "rid", "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1", "turn_status": "completed",
+            "assistant_message_id": "12345678-1234-1234-1234-123456789abc",
+            "response_continuation_state": "abbreviated", **change,
+        })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declaration", [{}, {"response_continuation_state": None}])
+async def test_unsupplied_response_declaration_cannot_be_fabricated(declaration):
+    client = RuntimeClient("http://runtime", api_key=None)
+    calls = []
+
+    async def post(path, *, json):
+        calls.append((path, json))
+        response = _pause_completion_fixture()
+        response["event"]["event_payload_json"]["response_continuation_state"] = "abbreviated"
+        return response
+
+    client._post = post
+    request = dict(request_id="rid", runtime_session_id="rtsession_1",
+                   runtime_turn_id="rtturn_1", turn_status="completed",
+                   assistant_message_id="12345678-1234-1234-1234-123456789abc")
+    with pytest.raises(RuntimeError, match="completion_association_mismatch"):
+        await client.complete_turn(**request, **declaration)
+    assert calls == [("/v1/runtime/turns/complete", request)]
