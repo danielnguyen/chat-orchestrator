@@ -6446,8 +6446,211 @@ PYCOMPAT
   wait_for_http http://127.0.0.1:14361/healthz
 }
 
+assert_surface_lifecycle_turn() {
+  local response="$1" owner="$2" conversation="$3" surface="$4" client="$5"
+  local status="$6" expected_calls="$7" request trace session turn diagnostics message input calls
+  jq -e --arg conversation "$conversation" '.status=="ok" and .conversation_id==$conversation
+    and .pending_action==null' <<<"$response" >/dev/null
+  request="$(jq -er .request_id <<<"$response")"
+  trace="$(fetch_trace "$request")"
+  jq -e --arg owner "$owner" --arg conversation "$conversation" --arg surface "$surface" --arg client "$client" \
+    '.owner_id==$owner and .conversation_id==$conversation and .surface==$surface and .client_id==$client' <<<"$trace" >/dev/null
+  if [ "$expected_calls" = 1 ]; then jq -e '.answer=="13."' <<<"$response" >/dev/null; fi
+  session="$(jq -er '(.retrieval.prompt_assembly // .prompt).turn_state.runtime_session_id' <<<"$trace")"
+  turn="$(jq -er '(.retrieval.prompt_assembly // .prompt).turn_state.runtime_turn_id' <<<"$trace")"
+  diagnostics="$(fetch_runtime_diagnostics "$session")"
+  input="$(jq -er .latest_turn.input_message_id <<<"$diagnostics")"
+  message="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w
+    ON w.work_id=m.work_id AND w.assistant_message_id=m.id
+    WHERE m.owner_id='$owner' AND m.conversation_id='$conversation' AND m.client_id='$client'
+      AND m.role='assistant' AND m.metadata->>'request_id'='$request'
+      AND w.owner_id=m.owner_id AND w.request_id='$request' AND w.state='completed';")"
+  [ -n "$message" ]
+  assert_persisted_answer_matches "$conversation" "$request" "$(jq -r .answer <<<"$response")"
+  [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),
+    count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner'
+    AND conversation_id='$conversation' AND client_id='$client' AND id IN ('$input','$message');")" = '1|1' ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner'
+    AND conversation_id='$conversation' AND role='assistant' AND metadata->>'request_id'='$request';")" = 1 ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner'
+    AND conversation_id='$conversation' AND client_id='$client' AND role='user'
+    AND id='$input' AND metadata->>'surface'='$surface';")" = 1 ]
+  jq -e --arg owner "$owner" --arg conversation "$conversation" --arg surface "$surface" \
+    --arg session "$session" --arg turn "$turn" --arg request "$request" \
+    --arg status "$status" --arg message "$message" '
+    .runtime_session as $s | .latest_turn as $t
+    | $s.owner_id==$owner and $s.conversation_id==$conversation and $s.surface==$surface
+      and $s.runtime_session_id==$session and $s.status==$status and .active_turn==null
+      and $t.runtime_turn_id==$turn and $t.runtime_session_id==$session and $t.turn_status=="completed"
+      and ([.events[]|select(.runtime_turn_id==$turn)] as $events
+        | ([$events[]|select(.event_type=="turn_started" and .event_payload_json.request_id==$request)]|length)==1
+          and ([$events[]|select(.event_type=="turn_completed")]|length)==1
+          and ([$events[]|select(.event_type=="turn_completed")][0].event_payload_json
+            | .request_id==$request and .assistant_message_id==$message
+              and (if $status=="paused" then .session_transition=="pause" else .session_transition==null end)))' <<<"$diagnostics" >/dev/null
+  jq -e '.state=="idle" and .active_runtime_session_id==null and .active_runtime_turn_id==null
+    and .active_surface==null and .active_request_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  calls="$(fetch_provider_calls "$request")"
+  [ "$(jq '[.calls[]|select(.kind=="chat")]|length' <<<"$calls")" = "$expected_calls" ]
+  if [ "$expected_calls" = 0 ]; then [ "$(jq '.calls|length' <<<"$calls")" = 0 ]; fi
+  jq -e '.calls | all(.kind|IN("chat","embedding","semantic_interpreter"))
+    and (group_by(.kind)|all(length==1))' <<<"$calls" >/dev/null
+  echo "Surface lifecycle turn: surface=$surface session=$status provider_counts=$(jq -c '[.calls[].kind]|group_by(.)|map({key:.[0],value:length})|from_entries' <<<"$calls")"
+  jq -e '[.calls[]|select(.kind=="chat")]|all(.tool_count==0)' <<<"$calls" >/dev/null
+  jq -e '.action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+  assert_dsa_operation_counts "$(fetch_dsa_audit)" 0 0 0
+}
+
+run_surface_lifecycle_scenario() {
+  # Representative normalized requests; the existing intent/voice suites cover
+  # interruption, deferred return, malformed authority and interrupted delivery.
+  local surface owner client conversation spoken payload response request trace session seed_turn
+  local pause_request pause_turn completion paused fingerprint seed_messages before result code scope
+  local other other_session blocker blocker_turn resumed_turn evidence_file="" log_dir
+  log_dir="$(printenv COMPOSED_SMOKE_LOG_DIR || true)"
+  if [ -n "$log_dir" ]; then
+    mkdir -p "$log_dir"; evidence_file="$log_dir/surface-lifecycle.jsonl"; : >"$evidence_file"
+  fi
+  for surface in web telegram alexa native_realtime_voice_fixture; do
+    echo "Surface lifecycle starting: surface=$surface"
+    owner="owner-surface-lifecycle-$surface"; client="$surface:lifecycle"
+    spoken=false
+    case "$surface" in alexa|native_realtime_voice_fixture) spoken=true ;; esac
+    conversation="$(create_conversation "$owner" "$client")"
+    configure_surface_permission "$owner" "$surface" true false false
+    payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" \
+      --arg conversation "$conversation" --argjson spoken "$spoken" '
+      {owner_id:$owner,client_id:$client,surface:$surface,conversation_id:$conversation,sensitivity:"private",
+       messages:[{role:"user",content:"What is 9 + 4?"}],
+       surface_context:{interaction_mode:(if $spoken then "voice_mediated" else "text" end),
+         spoken_output:$spoken,output_format:(if $spoken then "speech" else "plain_text" end)}}')"
+    provider_post /fixture/reset '{}'; reset_dsa_audit
+    queue_provider_answer '13.'
+    response="$(co_post "$payload")"
+    jq -e '.answer=="13."' <<<"$response" >/dev/null
+    assert_surface_lifecycle_turn "$response" "$owner" "$conversation" "$surface" "$client" active 1
+    request="$(jq -er .request_id <<<"$response")"; trace="$(fetch_trace "$request")"
+    session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
+    seed_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    seed_messages="$(psql_exec -At -c "SELECT json_agg(id) FROM messages WHERE owner_id='$owner';")"
+    fingerprint="$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text,'|' ORDER BY id)) FROM messages m WHERE owner_id='$owner';")"
+    provider_post /fixture/reset '{}'
+    response="$(co_post "$(jq -c '.+{session_transition:"pause",messages:[{role:"user",content:"Explicit session control"}]}' <<<"$payload")")"
+    jq -e --arg answer "Paused. Send another message whenever you're ready to continue." \
+      '.selected_model=="not_called" and .answer==$answer' <<<"$response" >/dev/null
+    assert_surface_lifecycle_turn "$response" "$owner" "$conversation" "$surface" "$client" paused 0
+    pause_request="$(jq -er .request_id <<<"$response")"; trace="$(fetch_trace "$pause_request")"
+    jq -e '.retrieval.prompt_assembly.turn_state.pause.runtime_completion=="confirmed_paused"' <<<"$trace" >/dev/null
+    pause_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    [ "$pause_turn" != "$seed_turn" ]
+    [ "$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")" = "$session" ]
+    paused="$(fetch_runtime_diagnostics "$session")"
+    completion="$(jq -c --arg turn "$pause_turn" '[.events[]|select(.event_type=="turn_completed" and .runtime_turn_id==$turn)][0]
+      | {request_id:.event_payload_json.request_id,runtime_session_id,runtime_turn_id,
+         turn_status:"completed",session_transition:"pause",assistant_message_id:.event_payload_json.assistant_message_id,
+         continuation_state:.event_payload_json.continuation_state}' <<<"$paused")"
+    # Exact completion replay cannot publish another message or completion event.
+    before="$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")"
+    cr_post /v1/runtime/turns/complete "$completion" >/dev/null
+    [ "$paused" = "$(fetch_runtime_diagnostics "$session")" ]
+    [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")" ]
+    if [ "$surface" = native_realtime_voice_fixture ]; then
+      docker compose -f "$COMPOSE" restart runtime >/dev/null
+      wait_for_http http://127.0.0.1:14371/healthz
+      [ "$paused" = "$(fetch_runtime_diagnostics "$session")" ]
+      [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")" ]
+    fi
+    if [ "$surface" = telegram ]; then
+      scope="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" --arg surface "$surface" '
+        {request_id:"surface-lifecycle-rejected",owner_id:$owner,conversation_id:$conversation,surface:$surface}')"
+      # Both a stale admission and malformed/conflicting completion leave the
+      # paused session, event history and durable publication untouched.
+      for other in stale malformed wrong_request; do
+        result="$completion"; code=409
+        case "$other" in
+          stale) result="$(jq -c '.+{expected_thread_revision:0}' <<<"$scope")" ;;
+          malformed) result="$(jq -c '.session_transition="resume"' <<<"$completion")"; code=422 ;;
+          wrong_request) result="$(jq -c '.request_id="unadmitted-request"' <<<"$completion")" ;;
+        esac
+        [ "$(curl -sS --max-time 10 -o "$COMPOSED_SMOKE_TMP/lifecycle-rejection.json" -w '%{http_code}' \
+          -H 'Content-Type: application/json' -d "$result" \
+          "http://127.0.0.1:14371/v1/runtime/turns/$([ "$other" = stale ] && echo start || echo complete)")" = "$code" ]
+        [ "$paused" = "$(fetch_runtime_diagnostics "$session")" ]
+        [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")" ]
+      done
+      configure_surface_permission "$owner" alexa true false false
+      blocker="$(cr_post /v1/runtime/turns/start "$(jq -c '.+{request_id:"surface-lifecycle-blocker",surface:"alexa"}' <<<"$scope")")"
+      other_session="$(jq -er .runtime_session.runtime_session_id <<<"$blocker")"
+      blocker_turn="$(jq -er .runtime_turn.runtime_turn_id <<<"$blocker")"
+      [ "$other_session" != "$session" ]
+      before="$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")"
+      response="$(co_post "$(jq -c --arg client "$client:loser" '.client_id=$client' <<<"$payload")")"
+      assert_continuation_contention_loser "$owner" "$conversation" "$client:loser" "$response"
+      [ "$paused" = "$(fetch_runtime_diagnostics "$session")" ]
+      [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")" ]
+      cr_post /v1/runtime/turns/complete "$(jq -nc --arg session "$other_session" --arg turn "$blocker_turn" '
+        {request_id:"surface-lifecycle-blocker",runtime_session_id:$session,runtime_turn_id:$turn,turn_status:"abandoned"}')" >/dev/null
+      before="$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")"
+      [ "$(curl -sS --max-time 10 -o "$COMPOSED_SMOKE_TMP/lifecycle-rejection.json" -w '%{http_code}' \
+        -H 'Content-Type: application/json' -d "$(jq -nc --arg session "$other_session" --arg turn "$blocker_turn" '
+        {request_id:"surface-lifecycle-blocker",runtime_session_id:$session,runtime_turn_id:$turn,
+         turn_status:"completed",session_transition:"pause"}')" http://127.0.0.1:14371/v1/runtime/turns/complete)" = 409 ]
+      [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")" ]
+      other="$(continuation_durable_snapshot unrelated-lifecycle-owner)|$(runtime_owner_counts unrelated-lifecycle-owner)"
+      response="$(co_post "$(jq -c '.owner_id="unrelated-lifecycle-owner"' <<<"$payload")")"
+      jq -e '.status=="failed" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+      [ "$(fetch_provider_calls "$(jq -er .request_id <<<"$response")" | jq '.calls|length')" = 0 ]
+      [ "$before" = "$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")" ]
+      [ "$other" = "$(continuation_durable_snapshot unrelated-lifecycle-owner)|$(runtime_owner_counts unrelated-lifecycle-owner)" ]
+      [ "$paused" = "$(fetch_runtime_diagnostics "$session")" ]
+      queue_provider_answer '13.'
+      response="$(co_post "$(jq -c '.surface="alexa"|.client_id="alexa:lifecycle-other"|
+        .surface_context={interaction_mode:"voice_mediated",spoken_output:true,output_format:"speech"}' <<<"$payload")")"
+      assert_surface_lifecycle_turn "$response" "$owner" "$conversation" alexa alexa:lifecycle-other active 1
+      trace="$(fetch_trace "$(jq -er .request_id <<<"$response")")"
+      [ "$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")" = "$other_session" ]
+      [ "$paused" = "$(fetch_runtime_diagnostics "$session")" ]
+    fi
+    provider_post /fixture/reset '{}'; queue_provider_answer '13.'
+    response="$(co_post "$payload")"
+    assert_surface_lifecycle_turn "$response" "$owner" "$conversation" "$surface" "$client" active 1
+    request="$(jq -er .request_id <<<"$response")"; trace="$(fetch_trace "$request")"
+    resumed_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    [ "$resumed_turn" != "$pause_turn" ]
+    [ "$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")" = "$session" ]
+    result="$(fetch_runtime_diagnostics "$session")"
+    jq -e --arg turn "$resumed_turn" '[.events[]|select(.event_type=="turn_started" and .runtime_turn_id==$turn)]
+      | length==1 and .[0].event_payload_json.resumed_from_pause==true' <<<"$result" >/dev/null
+    # Compare the exact original rows, not latest-message recency or matching text.
+    [ "$fingerprint" = "$(psql_exec -At -c "SELECT md5(string_agg(row_to_json(m)::text,'|' ORDER BY id)) FROM messages m WHERE owner_id='$owner' AND id::text IN (SELECT jsonb_array_elements_text('$seed_messages'::jsonb));")" ]
+    before="$result|$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")"
+    [ "$(curl -sS --max-time 10 -o "$COMPOSED_SMOKE_TMP/lifecycle-rejection.json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' -d "$completion" http://127.0.0.1:14371/v1/runtime/turns/complete)" = 409 ]
+    [ "$before" = "$(fetch_runtime_diagnostics "$session")|$(runtime_thread_snapshot "$owner" "$conversation")|$(continuation_durable_snapshot "$owner")" ]
+    if [ -n "$evidence_file" ]; then
+      jq -nc --arg surface "$surface" --argjson spoken "$spoken" \
+        '{surface:$surface,normalized_spoken_output:$spoken,admission_completed_idle:true,
+          pause_confirmed:true,automatic_resume_same_session:true,canonical_publication_equal:true,
+          historical_provenance_unchanged:true,pause_provider_calls:0,action_events:0,
+          same_request_pause_replay_idempotent:true,delayed_pause_replay_rejected:true,
+          rejected_controls:(if $surface=="telegram" then
+            ["stale_revision","malformed_transition","wrong_request","contention","abandoned_turn","wrong_owner"] else [] end),
+          restart_preserved:($surface=="native_realtime_voice_fixture"),
+          cross_surface_while_paused:($surface=="telegram"),native_audio_observed:false}' >>"$evidence_file"
+    fi
+    echo "Surface lifecycle $surface: completed_idle=true pause=true resume_same_session=true canonical=true historical_provenance=true actions=0"
+  done
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+if [ "${SURFACE_LIFECYCLE_ONLY:-}" = 1 ]; then
+  set -E
+  trap 'echo "Surface lifecycle failed at line $LINENO" >&2' ERR
+  run_surface_lifecycle_scenario
+  exit 0
+fi
+
 if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
   set -E
   trap 'echo "Surface compatibility assertion failed: line=$LINENO" >&2' ERR
@@ -6575,6 +6778,7 @@ run_return_after_gap_scenario
 run_voice_continuation_scenario
 run_timing_matrix_scenario
 run_surface_compatibility_scenario
+run_surface_lifecycle_scenario
 run_interrupt_enforcement_scenario
 run_interrupt_lifecycle_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
