@@ -5835,6 +5835,7 @@ MATRIX
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "What supported that?")"
   assert_pure_history_case "$owner" "$conversation_id" "$response" "What supported that?" deterministic support_explanation support 0 direct_record 0
   first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
+  first_history_request="$(jq -er '.request_id' <<<"$response")"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
   question="Where did that conclusion come from?"
@@ -5918,13 +5919,168 @@ MATRIX
   assert_dsa_operation_counts "$audit" 1 0 0
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
   assert_claim_calibration_events "$diagnostics" "$request_id" 0
-  serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$calls")$(jq -c . <<<"$diagnostics")$(jq -c . <<<"$audit")"
-  case "$serialized" in
-    *"$root_message_id"*|*history_root_lineage*|*root_assistant_message_id*)
-      echo "H7 exposed root lineage outside the BMS persistence boundary" >&2
-      return 1
-      ;;
-  esac
+  # Only CR's exact, admitted lifecycle association may reference the root ID.
+  # Private lineage remains forbidden in every document, including diagnostics.
+  jq -nc --arg root "$root_message_id" --arg owner "$owner" \
+    --arg conversation "$conversation_id" --arg original_request "$HISTORY_ORIGINAL_REQUEST_ID" \
+    --arg subsequent_request "$first_history_request" \
+    --argjson original_scope "$(fetch_trace "$HISTORY_ORIGINAL_REQUEST_ID" | jq '.prompt.turn_state // .retrieval.prompt_assembly.turn_state')" \
+    --argjson subsequent_scope "$(fetch_trace "$first_history_request" | jq '.prompt.turn_state // .retrieval.prompt_assembly.turn_state')" \
+    --argjson response "$response" --argjson provider "$calls" \
+    --argjson diagnostics "$diagnostics" --argjson dsa "$audit" '
+      {root:$root,owner:$owner,conversation:$conversation,original_request:$original_request,
+       original_scope:$original_scope,subsequent_request:$subsequent_request,subsequent_scope:$subsequent_scope,
+       documents:{response:$response,provider:$provider,diagnostics:$diagnostics,dsa:$dsa}}
+    ' | python3 -c '
+import copy, json, re, sys
+
+data = json.load(sys.stdin)
+root = data["root"]
+scope = data["original_scope"]
+if not isinstance(scope, dict) or not isinstance(data["subsequent_scope"], dict):
+    sys.exit("H7 lifecycle provenance requires both original admitted scopes")
+session_id, turn_id = scope["runtime_session_id"], scope["runtime_turn_id"]
+event_keys = {"event_id", "runtime_session_id", "runtime_turn_id", "event_type",
+              "event_payload_json", "created_at"}
+
+def check(documents):
+    serialized = json.dumps(documents, sort_keys=True)
+    assert all(key not in serialized for key in ("history_root_lineage", "root_assistant_message_id"))
+    assert re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", root)
+    assert re.fullmatch(r"rtsession_[0-9a-f]{16}", session_id)
+    assert re.fullmatch(r"rtturn_[0-9a-f]{16}", turn_id)
+    for category in ("response", "provider", "dsa"):
+        assert root not in json.dumps(documents[category], sort_keys=True)
+    diagnostics = copy.deepcopy(documents["diagnostics"])
+    session = diagnostics["runtime_session"]
+    assert (session["owner_id"], session["conversation_id"], session["surface"],
+            session["runtime_session_id"]) == (data["owner"], data["conversation"], "chat", session_id)
+    events = diagnostics["events"]
+    assert len({event["event_id"] for event in events}) == len(events)
+    starts = [i for i, e in enumerate(events)
+              if e["event_type"] == "turn_started" and e["runtime_turn_id"] == turn_id]
+    completions = [i for i, e in enumerate(events)
+                   if e["event_type"] == "turn_completed" and e["runtime_turn_id"] == turn_id]
+    assert len(starts) == len(completions) == 1 and starts[0] < completions[0]
+    for index, status in ((starts[0], "received"), (completions[0], "completed")):
+        event = events[index]
+        assert set(event) == event_keys and event["runtime_session_id"] == session_id
+        assert event["event_payload_json"]["request_id"] == data["original_request"]
+        assert event["event_payload_json"]["turn_status"] == status
+    completed = events[completions[0]]["event_payload_json"]
+    assert completed["assistant_message_id"] == root
+    assert set(completed) in (
+        {"request_id", "turn_status", "continuation_state", "assistant_message_id"},
+        {"request_id", "turn_status", "continuation_state", "assistant_message_id", "session_transition"})
+    assert completed.get("session_transition") in (None, "pause")
+    assert completed["continuation_state"] in (None, "none", "clarification_required", "waiting",
+        "deferred_expansion", "yielded_to_user", "resuming_previous_thread", "closed")
+    # Remove only this positively verified completion field from the UUID scan.
+    del completed["assistant_message_id"]
+    prior_count = 0
+    for index, event in enumerate(events):
+        payload = event["event_payload_json"]
+        prior = payload.get("prior_assistant_message")
+        if not isinstance(prior, dict) or prior.get("assistant_message_id") != root:
+            continue
+        assert set(event) == event_keys and event["event_type"] == "turn_started"
+        assert event["runtime_session_id"] == session_id and index > completions[0]
+        assert re.fullmatch(r"rtturn_[0-9a-f]{16}", event["runtime_turn_id"])
+        assert event["runtime_turn_id"] != turn_id and payload["turn_status"] == "received"
+        assert event["runtime_turn_id"] == data["subsequent_scope"]["runtime_turn_id"]
+        assert data["subsequent_scope"]["runtime_session_id"] == session_id
+        assert payload["request_id"] == data["subsequent_request"] != data["original_request"]
+        assert sum(e["event_type"] == "turn_started" and e["runtime_turn_id"] == event["runtime_turn_id"]
+                   for e in events) == 1
+        assert prior == {"status": "available", "assistant_message_id": root}
+        snapshot = payload["return_after_gap"]
+        assert snapshot["schema_version"] == "runtime-return-after-gap.v1"
+        assert snapshot["prior_terminal_turn_id"] == turn_id
+        assert snapshot["prior_continuation_state"] == completed["continuation_state"]
+        assert snapshot["prior_thread_state"] == "idle" and snapshot["threshold_seconds"] == 300
+        elapsed = snapshot["elapsed_seconds"]
+        assert type(elapsed) is int and elapsed >= 0
+        eligible = elapsed >= 300
+        assert snapshot["status"] == ("eligible" if eligible else "below_threshold")
+        assert snapshot["threshold_met"] is eligible
+        assert snapshot["reason_code"] == ("return_gap_elapsed" if eligible else "return_gap_below_threshold")
+        # No other prior-assistant keys, event fields or diagnostic paths are exempt.
+        del prior["assistant_message_id"]
+        prior_count += 1
+    assert root not in json.dumps(diagnostics, sort_keys=True)
+    return prior_count
+
+try:
+    documents = data["documents"]
+    prior_count = check(documents)
+    assert prior_count == 1  # H7 has exactly one admission immediately after the root.
+    completion_only = copy.deepcopy(documents)
+    for event in completion_only["diagnostics"]["events"]:
+        if event["event_type"] == "turn_started":
+            event["event_payload_json"].pop("prior_assistant_message", None)
+    assert check(completion_only) == 0
+    # Exercise the same assertion against in-memory mutations, never service data.
+    negative_controls = 0
+    def reject(mutated):
+        global negative_controls
+        try:
+            check(mutated)
+        except (AssertionError, KeyError, TypeError, ValueError):
+            negative_controls += 1
+            return
+        raise RuntimeError("H7 privacy negative control was accepted")
+
+    for category in documents:
+        for forbidden in (root, "history_root_lineage", "root_assistant_message_id"):
+            mutated = copy.deepcopy(documents)
+            if isinstance(mutated[category], list):
+                mutated[category].append({"unexpected": forbidden})
+            else:
+                mutated[category]["unexpected"] = forbidden
+            reject(mutated)
+        for forbidden in ("history_root_lineage", "root_assistant_message_id"):
+            mutated = copy.deepcopy(documents)
+            if isinstance(mutated[category], list):
+                mutated[category].append({forbidden: None})
+            else:
+                mutated[category][forbidden] = None
+            reject(mutated)
+    for index, event in enumerate(documents["diagnostics"]["events"]):
+        payload = event["event_payload_json"]
+        if payload.get("assistant_message_id") != root and (
+                not isinstance(payload.get("prior_assistant_message"), dict)
+                or payload["prior_assistant_message"].get("assistant_message_id") != root):
+            continue
+        for field, value in (("event_type", "turn_updated"), ("runtime_session_id", "wrong"),
+                             ("runtime_turn_id", "rtturn_0000000000000000")):
+            mutated = copy.deepcopy(documents)
+            mutated["diagnostics"]["events"][index][field] = value
+            reject(mutated)
+        for forbidden in (root, "history_root_lineage", "root_assistant_message_id"):
+            mutated = copy.deepcopy(documents)
+            mutated["diagnostics"]["events"][index]["event_payload_json"]["unexpected"] = forbidden
+            reject(mutated)
+        for field, value in (("request_id", "wrong"), ("turn_status", "abandoned")):
+            mutated = copy.deepcopy(documents)
+            mutated["diagnostics"]["events"][index]["event_payload_json"][field] = value
+            reject(mutated)
+        if event["event_type"] == "turn_started":
+            for field, value in (("status", "unavailable"), ("unexpected", root)):
+                mutated = copy.deepcopy(documents)
+                mutated["diagnostics"]["events"][index]["event_payload_json"]["prior_assistant_message"][field] = value
+                reject(mutated)
+            mutated = copy.deepcopy(documents)
+            mutated["diagnostics"]["events"][index]["event_payload_json"]["return_after_gap"]["prior_terminal_turn_id"] = "rtturn_0000000000000000"
+            reject(mutated)
+    print(json.dumps({"check":"history.h7.lifecycle_privacy", "completion_references":1,
+                      "prior_references":prior_count, "negative_controls":negative_controls}))
+except (AssertionError, KeyError, TypeError, ValueError, RuntimeError):
+    failure = sys.exc_info()[2]
+    while failure.tb_next is not None:
+        failure = failure.tb_next
+    sys.exit("H7 exposed root lineage or invalid lifecycle provenance outside the BMS persistence boundary"
+             + " (assertion line " + str(failure.tb_lineno) + ")")
+  '
   test "$(jq -r '.response_digest' <<<"$final_manifest")" = \
     "sha256:$(printf '%s' "$answer" | sha256sum | cut -d' ' -f1)"
   test "$(jq -r '.manifest_id' <<<"$final_manifest")" != \
