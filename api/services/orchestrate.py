@@ -11217,6 +11217,11 @@ async def orchestrate_chat(
                 turn_status="completed",
                 assistant_acknowledgement=assistant_message_ack,
             )
+            # Claim explanations need lifecycle status, not the prior answer's opaque ID.
+            # Keep the admitted association intact for execution; sanitize only this trace copy.
+            claim_turn_state_trace = deepcopy(turn_state_trace)
+            if isinstance(claim_turn_state_trace.get("prior_assistant_message"), dict):
+                claim_turn_state_trace["prior_assistant_message"].pop("assistant_message_id", None)
             trace_payload = {
                 "request_id": request_id,
                 "conversation_id": conversation_id,
@@ -11263,7 +11268,7 @@ async def orchestrate_chat(
                         else {}
                     ),
                     "runtime_session": runtime_session_trace,
-                    "turn_state": turn_state_trace,
+                    "turn_state": claim_turn_state_trace,
                 },
                 "router_decision": {
                     "rule_id": None,
