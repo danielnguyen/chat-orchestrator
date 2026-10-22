@@ -6178,8 +6178,283 @@ PYFIXTURE
   wait_for_http http://127.0.0.1:14361/healthz
 }
 
+
+run_surface_compatibility_scenario() {
+  # Normalized text fixtures only: no native adapter, audio, playback or barge-in.
+  local previous_restraint previous_privacy log_dir evidence_file=""
+  previous_restraint="$(printenv COMPOSED_RESTRAINT_ENABLED || true)"
+  previous_privacy="$(printenv COMPOSED_PRIVACY_CONTEXT_ENABLED || true)"
+  [ -n "$previous_restraint" ] || previous_restraint=false
+  [ -n "$previous_privacy" ] || previous_privacy=false
+  log_dir="$(printenv COMPOSED_SMOKE_LOG_DIR || true)"
+  if [ -n "$log_dir" ]; then
+    mkdir -p "$log_dir"; evidence_file="$log_dir/surface-compatibility.jsonl"
+    : >"$evidence_file"
+  fi
+  COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED=false \
+    docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  local tag surface spoken owner client seed_client seed_surface conversation prior_id prior_turn
+  local seed request response trace session turn diagnostics calls scope result before prior_fingerprint
+  local text answer intent policy reason presence expected_calls historical_conversation budget_class cases
+  cases="$(printenv SURFACE_COMPATIBILITY_CASES || true)"
+  [ -n "$cases" ] || cases="unknown_help native_help unknown_yield native_yield unknown_continuation native_continuation unknown_missing unknown_unavailable unknown_denied native_first native_stale native_deferred unknown_privacy native_malformed"
+  for tag in $cases; do
+    echo "Surface compatibility starting: case=$tag"
+    surface=unknown_compatibility_fixture; spoken=false
+    case "$tag" in native_*) surface=native_realtime_voice_fixture; spoken=true ;; esac
+    owner="owner-surface-compat-$tag"; client="$surface:current"
+    conversation=""; prior_id=""; prior_turn=""; prior_fingerprint=""
+    provider_post /fixture/reset '{}' >/dev/null
+    reset_dsa_audit
+    if [ "$tag" = native_first ]; then
+      conversation="$(create_conversation "$owner" "$client")"
+      configure_surface_permission "$owner" "$surface" true false false
+    else
+      seed_surface=web
+      case "$tag" in *_yield|native_stale|native_deferred|native_malformed) seed_surface="$surface" ;; esac
+      seed_client="$seed_surface:seed"
+      queue_provider_answer "Save the backup first." >/dev/null
+      seed="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$seed_client" \
+        --arg surface "$seed_surface" --arg tag "$tag" '
+        {owner_id:$owner,client_id:$client,surface:$surface,sensitivity:"private",
+         messages:[{role:"user",content:"What is the backup procedure?"}],
+         surface_context:{interaction_mode:(if $tag=="native_deferred" then "voice_mediated" else "text" end),
+           spoken_output:($tag=="native_deferred"),active_task_mode:($tag=="native_deferred"),
+           output_format:(if $tag=="native_deferred" then "speech" else "plain_text" end)}}')")"
+      jq -e '.status=="ok" and .answer=="Save the backup first."' <<<"$seed" >/dev/null
+      conversation="$(jq -er .conversation_id <<<"$seed")"
+      request="$(jq -er .request_id <<<"$seed")"
+      assert_persisted_answer_matches "$conversation" "$request" "Save the backup first."
+      trace="$(fetch_trace "$request")"
+      prior_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+      prior_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND role='assistant' AND metadata->>'request_id'='$request';")"
+      prior_fingerprint="$(psql_exec -At -c "SELECT md5(row_to_json(m)::text) FROM messages m WHERE id='$prior_id';")"
+      [ -n "$prior_fingerprint" ]
+      if [ "$tag" = native_deferred ]; then
+        jq -e '.retrieval.prompt_assembly.runtime_timing.result.continuation_state=="deferred_expansion"' <<<"$trace" >/dev/null
+      fi
+    fi
+    case "$tag" in
+      *_continuation|unknown_privacy) configure_surface_permission "$owner" "$surface" true false false ;;
+      unknown_denied) configure_surface_permission "$owner" "$surface" false false false ;;
+      native_stale|native_deferred)
+        runtime_backdate_thread "$owner" "$conversation" "$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(seconds=360)).isoformat())')" ;;
+    esac
+    provider_post /fixture/reset '{}' >/dev/null
+    reset_dsa_audit
+    if [ "$tag" = native_malformed ]; then
+      # The normal CO API owns its request/admission ID. Corrupt only this
+      # separately admitted disposable CR turn; do not race or mock CO admission.
+      request="surface-compat-malformed"
+      seed="$(cr_post /v1/runtime/turns/start "$(jq -nc --arg owner "$owner" \
+        --arg conversation "$conversation" --arg surface "$surface" --arg request "$request" '
+        {request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface}')")"
+      session="$(jq -er .runtime_session.runtime_session_id <<<"$seed")"
+      turn="$(jq -er .runtime_turn.runtime_turn_id <<<"$seed")"
+      docker compose -f "$COMPOSE" exec -T runtime python - "$turn" <<'PYCOMPAT'
+import json, sqlite3, sys
+with sqlite3.connect('/data/runtime_state.sqlite3') as connection:
+    row = connection.execute(
+        "SELECT event_id,event_payload_json FROM conversation_runtime_events "
+        "WHERE runtime_turn_id=? AND event_type='turn_started'", (sys.argv[1],)
+    ).fetchone()
+    payload = json.loads(row[1])
+    assert payload['return_after_gap']['status'] == 'below_threshold'
+    payload['return_after_gap']['threshold_met'] = 'false'
+    assert connection.execute(
+        "UPDATE conversation_runtime_events SET event_payload_json=? WHERE event_id=?",
+        (json.dumps(payload), row[0])
+    ).rowcount == 1
+PYCOMPAT
+      scope="$(jq -nc --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" \
+        --arg surface "$surface" --arg session "$session" --arg turn "$turn" '
+        {request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:$surface,
+         runtime_session_id:$session,runtime_turn_id:$turn}')"
+      result="$(cr_post /v1/runtime/interaction-governance/evaluate "$(jq -c '.+{current_user_text:"hold on"}' <<<"$scope")")"
+      jq -e '.result.action_allowed==false' <<<"$result" >/dev/null
+      cr_post /v1/runtime/restraint/evaluate "$(jq -c '.+{current_user_text:"hold on",interaction_kind:"ambiguous"}' <<<"$scope")" >/dev/null
+      result="$(cr_post /v1/runtime/presence/evaluate "$(jq -c '.+{surface_permission_status:"unavailable",proactive_presence_allowed:false,ambient_listening_allowed:false}' <<<"$scope")")"
+      jq -e '.result.presence_state=="active_conversation" and .result.required_help_allowed
+        and .result.proactive_output_suppressed' <<<"$result" >/dev/null
+      result="$(cr_post /v1/runtime/timing/evaluate "$(jq -c '.+{spoken_output:true,active_task_mode:false,
+        requested_detail:"unspecified",latency_budget_class:"voice_provider_dispatch",dependency_state:"ready"}' <<<"$scope")")"
+      jq -e '.result.timing_policy=="ask_clarifying_question" and .result.expansion_allowed==false' <<<"$result" >/dev/null
+      diagnostics="$(fetch_runtime_diagnostics "$session")"
+      jq -e '.latest_turn.intent_class=="low_confidence_unclear"' <<<"$diagnostics" >/dev/null
+      cr_post /v1/runtime/turns/complete "$(jq -c '{request_id,runtime_session_id,runtime_turn_id}+{turn_status:"abandoned"}' <<<"$scope")" >/dev/null
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND metadata->>'request_id'='$request';")" = 0 ]
+      [ "$(fetch_provider_calls "$request" | jq '.calls|length')" = 0 ]
+      jq -e '.action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+      jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+      if [ -n "$evidence_file" ]; then
+        jq -nc --arg tag "$tag" '{scenario:$tag,scope:"actual_cr_policy_only",intent:"low_confidence_unclear",
+          timing:"ask_clarifying_question",co_output_observed:false,answer_provider_calls:0,action_events:0}' >>"$evidence_file"
+      fi
+      echo "Surface compatibility $tag: actual_cr_policy_only=true interruption=false abandoned=true provider=0 actions=0"
+      continue
+    fi
+    text="Tell me more."; answer="Then check the logs."; intent=continuation
+    policy=answer_now; reason=ordinary_ready; presence=active_conversation; expected_calls=1
+    case "$tag" in
+      *_help) text="What is 2+2?"; answer="4."; intent=information_request
+        reason=continuation_answer_now ;;
+      *_yield) text="hold on"; answer="Go ahead."; intent=interruption
+        policy=yield_to_user; reason=intent_interruption; expected_calls=0 ;;
+      native_first|native_stale) text="hold on"; answer="Could you clarify what you want me to do?"
+        intent=low_confidence_unclear; policy=ask_clarifying_question; reason=restraint_clarification; expected_calls=0 ;;
+      native_deferred) policy=resume_previous_thread; reason=return_deferred_continuation; presence=returning_after_gap ;;
+      unknown_privacy)
+        expected_calls=0
+        COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED=true \
+          docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+        wait_for_http http://127.0.0.1:14361/healthz ;;
+    esac
+    [ "$tag" != native_stale ] || presence=returning_after_gap
+    if [ "$expected_calls" = 1 ]; then queue_provider_answer "$answer" >/dev/null; fi
+    case "$tag" in
+      unknown_missing|unknown_unavailable|unknown_denied)
+        before="$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")"
+        if [ "$tag" = unknown_unavailable ]; then
+          # Fault only the permission lookup in the owned disposable database.
+          psql_exec -c 'ALTER TABLE presence_surface_permissions RENAME TO unavailable_surface_permission_fixture;' >/dev/null
+          [ "$(curl -sS -o /dev/null -w '%{http_code}' -G -H 'X-API-Key: smoke-memory-key' \
+            --data-urlencode "owner_id=$owner" --data-urlencode "surface=$surface" \
+            http://127.0.0.1:14321/v1/presence/surface-permissions)" = 500 ]
+        fi ;;
+    esac
+    historical_conversation="$conversation"
+    response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" \
+      --arg conversation "$conversation" --arg text "$text" --arg tag "$tag" --argjson spoken "$spoken" '
+      {owner_id:$owner,client_id:$client,surface:$surface,sensitivity:"private",
+       messages:[{role:"user",content:$text}],
+       surface_context:{interaction_mode:(if $spoken then "voice_mediated" else "text" end),
+         spoken_output:$spoken,active_task_mode:false,output_format:(if $spoken then "speech" else "plain_text" end)}}
+      + if ($tag|endswith("_help")) then {} else {conversation_id:$conversation} end')")"
+    request="$(jq -er .request_id <<<"$response")"
+    if [ "$tag" = unknown_unavailable ]; then
+      psql_exec -c 'ALTER TABLE unavailable_surface_permission_fixture RENAME TO presence_surface_permissions;' >/dev/null
+    fi
+    case "$tag" in unknown_missing|unknown_unavailable|unknown_denied)
+      jq -e '.status=="failed" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+      [ "$before" = "$(continuation_durable_snapshot "$owner")|$(runtime_owner_counts "$owner")" ]
+      [ "$(fetch_provider_calls "$request" | jq '.calls|length')" = 0 ]
+      jq -e '.request_events==0 and .action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+      if [ -n "$evidence_file" ]; then
+        jq -nc --arg tag "$tag" '{scenario:$tag,declined_before_admission:true,state_unchanged:true,answer_provider_calls:0,action_events:0}' >>"$evidence_file"
+      fi
+      echo "Surface compatibility $tag: declined_before_admission=true writes=0 provider=0 actions=0"
+      continue ;;
+    esac
+    conversation="$(jq -er .conversation_id <<<"$response")"
+    trace="$(fetch_trace "$request")"
+    calls="$(fetch_provider_calls "$request")"
+    [ "$(jq '[.calls[]|select(.kind=="chat")]|length' <<<"$calls")" = "$expected_calls" ]
+    if [ "$expected_calls" = 0 ] && [ "$tag" != unknown_privacy ]; then
+      jq -e '.calls|length==0' <<<"$calls" >/dev/null
+    fi
+    if [ "$tag" = unknown_privacy ]; then
+      # Upstream query embedding/advisory is distinct from generating an answer.
+      # Keep the all-provider zero check above for interruption/clarification.
+      jq -e '[.calls[]|select(.kind!="embedding" and .kind!="semantic_interpreter")]|length==0' <<<"$calls" >/dev/null
+      jq -c '{scenario:"unknown_privacy",provider_kinds:[.calls[].kind]}' <<<"$calls"
+    fi
+    if [ "$tag" != unknown_privacy ]; then
+      jq -e --arg answer "$answer" --argjson count "$expected_calls" '.answer==$answer
+        and .status==(if $count==0 then "degraded" else "ok" end)' <<<"$response" >/dev/null
+    else
+      jq -e '.selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
+      ! grep -Fq 'Save the backup first.' <<<"$response$calls"
+    fi
+    assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .answer <<<"$response")"
+    [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND role='assistant' AND metadata->>'request_id'='$request' AND client_id='$client';")" = 1 ]
+    [ "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND request_id='$request' AND state='completed';")" = 1 ]
+    session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
+    turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    jq -c --arg tag "$tag" --arg turn "$turn" '
+      {scenario:$tag,intent:.latest_turn.intent_class,timing:.latest_turn.timing_policy,
+       events:[.events[]|select(.runtime_turn_id==$turn)|{type:.event_type,
+         timing:.event_payload_json.timing_policy,presence:.event_payload_json.presence_state,
+         reasons:.event_payload_json.reason_codes}]}' <<<"$diagnostics"
+    jq -e --arg owner "$owner" --arg conversation "$conversation" --arg surface "$surface" \
+      --arg session "$session" --arg turn "$turn" --arg intent "$intent" --arg policy "$policy" \
+      --arg reason "$reason" --arg request "$request" --arg presence "$presence" '
+      .runtime_session as $s | .latest_turn as $t
+      | $s.owner_id==$owner and $s.conversation_id==$conversation and $s.surface==$surface
+        and $s.runtime_session_id==$session and $t.runtime_turn_id==$turn
+        and $t.intent_class==$intent and $t.turn_status=="completed" and $t.timing_policy==$policy
+        and ([.events[]|select(.runtime_turn_id==$turn)] as $e
+          | ([$e[]|select(.event_type=="turn_started" and .event_payload_json.request_id==$request)]|length)==1
+          and ([$e[]|select(.event_type=="interaction_governance_evaluated")]|length)==1
+          and ([$e[]|select(.event_type=="restraint_evaluated")]|length)==1
+          and ([$e[]|select(.event_type=="timing_evaluated" and .event_payload_json.timing_policy==$policy
+            and .event_payload_json.reason_codes[0]==$reason)]|length)==1
+          and ([$e[]|select(.event_type=="presence_evaluated" and .event_payload_json.presence_state==$presence)]|length)==1
+          and ([$e[]|select(.event_type=="turn_completed" and .event_payload_json.request_id==$request)]|length)==1)' <<<"$diagnostics" >/dev/null
+    jq -e --arg presence "$presence" --arg policy "$policy" '.retrieval.prompt_assembly as $p
+      | $p.runtime_presence.presence_state==$presence and $p.runtime_presence.required_help_allowed
+        and $p.runtime_presence.proactive_output_suppressed and $p.runtime_timing.result.timing_policy==$policy
+        and $p.interaction_governance.action_allowed==false' <<<"$trace" >/dev/null
+    jq -e '.action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+    jq -e '[.events[]|select(.event_type=="capability_authorization_evaluated")]
+      | all(.event_payload_json.decision_code=="authorization_denied")' <<<"$diagnostics" >/dev/null
+    jq -e '[.calls[]|select(.kind=="chat")]|all(.tool_count==0)' <<<"$calls" >/dev/null
+    jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+    assert_dsa_operation_counts "$(fetch_dsa_audit)" 0 0 0
+    case "$tag" in
+      *_help)
+        [ "$conversation" != "$historical_conversation" ]
+        jq -e '.retrieval.prompt_assembly.turn_state.conversation_resolution
+          | .outcome=="create_new" and (.reason_codes|index("surface_permission_absent")!=null)' <<<"$trace" >/dev/null
+        ! grep -Fq 'Save the backup first.' <<<"$calls"
+        budget_class=ordinary_text; [ "$spoken" != true ] || budget_class=voice_provider_dispatch
+        jq -e --arg class "$budget_class" '.retrieval.prompt_assembly.runtime_timing.result.latency_budget_class==$class' <<<"$trace" >/dev/null ;;
+      *_continuation|native_deferred)
+        jq -e --arg prior "$prior_id" --arg turn "$prior_turn" '.retrieval.prompt_assembly as $p
+          | $p.return_resume_context.status=="ready" and $p.return_resume_context.source_message_ids==[$prior]
+            and $p.turn_state.return_after_gap.prior_terminal_turn_id==$turn
+            and $p.restraint.retrieval_suppressed==false
+            and ($p.restraint.reason_summary|index("continuation_context_requested")!=null)' <<<"$trace" >/dev/null
+        jq -e '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.role=="assistant" and (.content|contains("Save the backup first."))))' <<<"$calls" >/dev/null ;;
+    esac
+    if [ -n "$prior_id" ]; then
+      [ "$prior_fingerprint" = "$(psql_exec -At -c "SELECT md5(row_to_json(m)::text) FROM messages m WHERE id='$prior_id';")" ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='user' AND client_id='$seed_client' AND metadata->>'surface'='$seed_surface';")" = 1 ]
+    fi
+    if [ "$tag" = unknown_privacy ]; then
+      jq -e --arg turn "$turn" '[.events[]|select(.runtime_turn_id==$turn and .event_type=="privacy_context_evaluated")]
+        | length==1 and (.[0].event_payload_json | .surface_type=="unknown_surface"
+          and .privacy_zone=="unknown" and .sensitive_detail_allowed==false
+          and .voice_detail_allowed==false and .redaction_required and .safe_summary_required)' <<<"$diagnostics" >/dev/null
+      COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED=false \
+        docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+      wait_for_http http://127.0.0.1:14361/healthz
+    fi
+    if [ -n "$evidence_file" ]; then
+      jq -nc --arg tag "$tag" --arg surface "$surface" --arg intent "$intent" --arg policy "$policy" \
+        --arg presence "$presence" --argjson calls "$expected_calls" --argjson spoken "$spoken" \
+        --argjson provider_counts "$(jq -c '[.calls[].kind]|group_by(.)|map({key:.[0],value:length})|from_entries' <<<"$calls")" '
+        {scenario:$tag,surface:$surface,normalized_spoken_output:$spoken,intent:$intent,timing:$policy,
+         presence:$presence,answer_provider_calls:$calls,provider_call_counts:$provider_counts,canonical_persistence_equal:true,thread_idle:true,
+         historical_provenance_unchanged:true,action_events:0,native_audio_observed:false}' >>"$evidence_file"
+    fi
+    echo "Surface compatibility $tag: intent=$intent timing=$policy presence=$presence answer_provider=$expected_calls canonical=true idle=true actions=0"
+  done
+  COMPOSED_RESTRAINT_ENABLED="$previous_restraint" COMPOSED_PRIVACY_CONTEXT_ENABLED="$previous_privacy" \
+    docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
+  set -E
+  trap 'echo "Surface compatibility assertion failed: line=$LINENO" >&2' ERR
+  run_surface_compatibility_scenario
+  exit 0
+fi
+
 
 if [ "${STRICT_WORLD_STATE_AUTHORITY_ONLY:-}" = "1" ]; then
   set -E
@@ -6299,6 +6574,7 @@ run_ambient_presence_scenario
 run_return_after_gap_scenario
 run_voice_continuation_scenario
 run_timing_matrix_scenario
+run_surface_compatibility_scenario
 run_interrupt_enforcement_scenario
 run_interrupt_lifecycle_scenario
 echo "Continuation C1-03: multiple=clarify active=wait stale_only=create_new incomplete=clarify contended=decline unavailable=decline inconsistent=decline insufficient_confidence=deterministic_no_unique_eligible_proof"
