@@ -1200,6 +1200,26 @@ class FakeRuntime:
         self.call_order.append(f"complete_turn:{kwargs['turn_status']}")
         if self.fail:
             raise RuntimeError("runtime unavailable")
+        if kwargs.get("assistant_message_id") is not None:
+            scope = self.turn_start_calls[-1]
+            return {
+                "runtime_session": {"runtime_session_id": kwargs["runtime_session_id"],
+                                    "status": "active", "closed_at": None,
+                                    **{key: scope[key] for key in (
+                                        "owner_id", "conversation_id", "surface",
+                                    )}},
+                "runtime_turn": {"completed_at": "2026-10-22T00:00:00+00:00",
+                                 **{key: kwargs.get(key) for key in (
+                    "runtime_session_id", "runtime_turn_id", "turn_status", "continuation_state",
+                )}},
+                "event": {"runtime_session_id": kwargs["runtime_session_id"],
+                          "runtime_turn_id": kwargs["runtime_turn_id"],
+                          "event_type": "turn_completed", "event_payload_json": {
+                              key: kwargs.get(key) for key in (
+                                  "request_id", "turn_status", "continuation_state",
+                                  "session_transition", "assistant_message_id",
+                              )}},
+            }
         return {
             **self.turn_response,
             "runtime_turn": {
@@ -39267,6 +39287,8 @@ class ReturnRuntime(FakeRuntime):
             "event_payload_json": {
                 "request_id": kwargs["request_id"],
                 "return_after_gap": _return_admission_snapshot(),
+                "prior_assistant_message": {"status": "available",
+                    "assistant_message_id": "12345678-1234-1234-1234-123456789abc"},
             },
         }
         return response
@@ -42702,6 +42724,10 @@ class PauseRuntime(FakeRuntime):
             "owner_id", "conversation_id", "surface",
         )})
         response["event"]["event_payload_json"]["request_id"] = kwargs["request_id"]
+        if kwargs.get("assistant_message_id"):
+            response["event"]["event_payload_json"]["assistant_message_id"] = (
+                kwargs["assistant_message_id"]
+            )
         if kwargs.get("session_transition") != "pause":
             response["runtime_session"]["status"] = "active"
             response["runtime_turn"]["turn_status"] = kwargs["turn_status"]
@@ -42744,6 +42770,7 @@ async def test_explicit_pause_is_bound_durable_and_never_enters_cognition(
     assert runtime.turn_complete_calls == [{
         "request_id": "request-work", "runtime_session_id": "rtsession_1",
         "runtime_turn_id": "rtturn_1", "turn_status": "completed", "session_transition": "pause",
+        "assistant_message_id": "00000000-0000-4000-8000-000000000002",
     }]
     assert runtime.turn_start_calls[0]["request_id"] == "request-work"
     assert len(runtime.turn_start_calls) == 1
@@ -42924,5 +42951,215 @@ async def test_pause_unverified_admission_cannot_publish_or_pause(tmp_path, fiel
     )
     assert result["status"] == "failed"
     assert memory.added_messages == []
-    assert memory.work["state"] == "failed"
+    if field == "request_id":
+        assert not hasattr(memory, "work")  # Rejected before work admission.
+    else:
+        assert memory.work["state"] == "failed"
     assert all("session_transition" not in c for c in runtime.turn_complete_calls)
+
+
+class ExactAnswerRuntime(ReturnRuntime):
+    def __init__(self, gap=0, prior_state="none"):
+        super().__init__()
+        self.gap, self.prior_state = gap, prior_state
+
+    async def start_turn(self, **kwargs):
+        response = await super().start_turn(**kwargs)
+        response["event"]["event_payload_json"]["return_after_gap"][
+            "prior_continuation_state"] = self.prior_state
+        if self.gap < 300:
+            response["event"]["event_payload_json"]["return_after_gap"].update(
+                status="below_threshold", threshold_met=False, elapsed_seconds=self.gap,
+                reason_code="return_gap_below_threshold", prior_continuation_state=self.prior_state,
+            )
+        return response
+
+    async def evaluate_presence(self, **kwargs):
+        if self.gap < 300:
+            return await FakeRuntime.evaluate_presence(self, **kwargs)
+        return await super().evaluate_presence(**kwargs)
+
+    async def evaluate_restraint(self, **kwargs):
+        response = copy.deepcopy(await super().evaluate_restraint(**kwargs))
+        response.update({key: kwargs[key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )})
+        response["result"].update(reason_summary=["continuation_context_requested"],
+                                  personalization_suppressed=True)
+        return response
+
+
+class ExactAnswerMemory(ReturnMemoryStore):
+    async def add_message(self, **kwargs):
+        result = await super().add_message(**kwargs)
+        if kwargs["role"] == "assistant":
+            result["message_id"] = "87654321-4321-4321-4321-cba987654321"
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap,prior_state", [
+    (gap, state) for gap in (0, 60, 299, 300, 301)
+    for state in ("none", "deferred_expansion") if gap < 300 or state == "deferred_expansion"
+])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_exact_answer_continuation_uses_retained_source(tmp_path, gap, prior_state, fallback):
+    runtime = ExactAnswerRuntime(gap, prior_state)
+    provider = FakeLiteLLM(fail_first=fallback)
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=ExactAnswerMemory(), provider=provider,
+        policy="resume_previous_thread" if gap >= 300 else "answer_now",
+        configured_fallback=fallback,
+        payload=_base_payload(conversation_id="conv-1", messages=[{
+            "role": "user", "content": "Tell me more.",
+        }], surface_context={"spoken_output": True}),
+    )
+    assert out["answer"] == "hello"
+    assert len(provider.calls) == (2 if fallback else 1)
+    assert all("backup procedure" in str(call["messages"]) for call in provider.calls)
+    assert len(runtime.turn_start_calls) == len(runtime.turn_complete_calls) == 1
+    assert runtime.turn_complete_calls[0]["request_id"] == out["request_id"]
+    assert runtime.turn_complete_calls[0]["assistant_message_id"] == (
+        "87654321-4321-4321-4321-cba987654321"
+    )
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["return_resume_context"]["source_message_ids"] == [
+        "12345678-1234-1234-1234-123456789abc"
+    ]
+    assert trace["turn_state"]["assistant_message_association"] == "confirmed"
+    assert trace["runtime_timing"]["result"]["timing_policy"] == (
+        "resume_previous_thread" if gap >= 300 else "answer_now"
+    )
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["missing", "older", "owner", "conversation", "ref",
+                                  "noncanonical", "empty", "association", "unavailable",
+                                  "retrieval", "malformed", "budget", "restraint_binding"])
+async def test_exact_answer_unavailable_clarifies_before_provider(tmp_path, fault):
+    runtime = ExactAnswerRuntime()
+    if fault in {"association", "unavailable"}:
+        start = runtime.start_turn
+
+        async def invalid(**kwargs):
+            response = await start(**kwargs)
+            response["event"]["event_payload_json"]["prior_assistant_message"] = (
+                {"status": "available", "assistant_message_id": "malformed"}
+                if fault == "association" else {
+                    "status": "unavailable", "assistant_message_id": None,
+                }
+            )
+            return response
+
+        runtime.start_turn = invalid
+    if fault == "restraint_binding":
+        evaluate = runtime.evaluate_restraint
+
+        async def wrong_binding(**kwargs):
+            response = await evaluate(**kwargs)
+            response["runtime_turn_id"] = "wrong"
+            return response
+
+        runtime.evaluate_restraint = wrong_binding
+
+    class MissingExactMemory(ExactAnswerMemory):
+        async def retrieve_bundle(self, **kwargs):
+            result = await super().retrieve_bundle(**kwargs)
+            if fault == "retrieval":
+                raise httpx.ReadTimeout("private transport detail")
+            if fault == "malformed":
+                return None
+            item = result["bundle"]["recent"][0]
+            if fault == "missing":
+                result["bundle"]["recent"] = []
+            elif fault == "older":
+                item["message_id"] = "00000000-0000-4000-8000-000000000001"
+                item["source_ref"]["ref_id"] = item["message_id"]
+            elif fault in {"owner", "conversation", "ref", "noncanonical", "empty"}:
+                item[{"owner": "owner_id", "conversation": "conversation_id", "ref": "source_ref",
+                      "noncanonical": "evidence_role", "empty": "content"}[fault]] = (
+                    "" if fault == "empty" else "wrong"
+                )
+            elif fault == "budget":
+                item["content"] = "prior-answer " * 60000
+            return result
+
+    out, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=MissingExactMemory(),
+        payload=_base_payload(conversation_id="conv-1", messages=[{
+            "role": "user", "content": "Tell me more.",
+        }]),
+    )
+    assert "enough retained context" in out["answer"]
+    assert out["selected_model"] == "not_called" and provider.calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len(runtime.turn_complete_calls) == 1
+    assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["return_resume_context"]["status"] == "unavailable"
+    assert "prior-answer" not in json.dumps(trace["return_resume_context"])
+    assert "private transport detail" not in json.dumps(memory.trace_calls)
+
+
+@pytest.mark.asyncio
+async def test_exact_answer_budget_guard_cannot_use_identical_older_text(tmp_path, monkeypatch):
+    assemble = orchestrate_service.assemble_prompt
+
+    def budgeted(**kwargs):
+        prompt = assemble(**kwargs)
+        # Existing budgeting drops recent entries from the front. The same words
+        # surviving in a different message must not stand in for the omitted ID.
+        prompt.trace["prompt_budget"]["dropped_context"]["by_layer"]["recent_history"] = 1
+        return prompt
+
+    monkeypatch.setattr(orchestrate_service, "assemble_prompt", budgeted)
+
+    class IdenticalOlderMemory(ExactAnswerMemory):
+        async def retrieve_bundle(self, **kwargs):
+            result = await super().retrieve_bundle(**kwargs)
+            older = copy.deepcopy(result["bundle"]["recent"][0])
+            older["message_id"] = "00000000-0000-4000-8000-000000000001"
+            older["source_ref"]["ref_id"] = older["message_id"]
+            result["bundle"]["recent"].append(older)
+            return result
+
+    out, runtime, provider, _ = await _run_timing_turn(
+        tmp_path, runtime=ExactAnswerRuntime(), memory=IdenticalOlderMemory(),
+    )
+    assert "enough retained context" in out["answer"] and provider.calls == []
+    assert len(runtime.turn_complete_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["mismatch", "timeout", "abandon", "invalid_ack"])
+async def test_completion_association_provenance_is_not_fabricated_or_replayed(outcome):
+    class Completion:
+        calls = []
+
+        async def complete_turn(self, **kwargs):
+            self.calls.append(kwargs)
+            if outcome == "timeout":
+                raise httpx.ReadTimeout("PRIVATE-COMPLETION")
+            return {"runtime_turn": {"turn_status": kwargs["turn_status"]}}
+
+    runtime = Completion()
+    state = {"runtime_session_id": "rtsession_1", "runtime_turn_id": "rtturn_1"}
+    await orchestrate_service._complete_runtime_turn(
+        runtime=runtime, turn_state_trace=state, request_id="original",
+        turn_status="abandoned" if outcome == "abandon" else "completed",
+        assistant_acknowledgement={"message_id": "m-1" if outcome == "invalid_ack"
+                                  else "12345678-1234-1234-1234-123456789abc"},
+    )
+    assert len(runtime.calls) == 1 and state["terminal_transition_attempted"] is True
+    assert state["assistant_message_association"] == "unconfirmed"
+    assert ("assistant_message_id" in runtime.calls[0]) == (
+        outcome not in {"abandon", "invalid_ack"}
+    )
+    assert "PRIVATE-COMPLETION" not in json.dumps(state)

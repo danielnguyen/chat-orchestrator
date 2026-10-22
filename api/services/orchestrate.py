@@ -28,12 +28,15 @@ from clients.memory_store import (
 )
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
+    canonical_assistant_message_id,
     validate_companion_policy_response,
+    validate_completion_message_response,
     validate_history_followup_policy_response,
     validate_interrupt_execution_response,
     validate_interrupt_response,
     validate_pause_completion_response,
     validate_presence_response,
+    validate_prior_assistant_message,
     validate_return_snapshot,
     validate_strict_capability_response,
     validate_strict_containment_response,
@@ -5220,30 +5223,52 @@ def _return_resume_context(
     timing: Any,
     bundle: Any,
     conversation_id: str,
+    *, association: Any = None, restraint_trace: Any = None, owner_id: str | None = None,
 ) -> dict[str, Any]:
-    if not (isinstance(timing, dict) and timing.get("timing_policy") == "resume_previous_thread"):
+    timing = timing if isinstance(timing, dict) else {}
+    restraint_trace = restraint_trace if isinstance(restraint_trace, dict) else {}
+    reasons = timing.get("reason_codes")
+    origin = reasons[0] if isinstance(reasons, list) and reasons else None
+    if origin == "continuation_resume":
+        return {"status": "not_requested"}
+    immediate = (
+        "continuation_context_requested" in restraint_trace.get("reason_summary", [])
+        and isinstance(snapshot, dict) and snapshot.get("status") == "below_threshold"
+        and timing.get("timing_policy") in {"answer_now", "defer_expansion",
+                                            "acknowledge_then_answer"}
+    )
+    if not immediate and timing.get("timing_policy") != "resume_previous_thread":
         return {"status": "not_requested"}
     result = {
         "status": "unavailable", "source_message_ids": [], "source_count": 0,
         "conversation_id": conversation_id, "reason_code": "retained_context_unavailable",
     }
-    reasons = timing.get("reason_codes")
-    origin = reasons[0] if isinstance(reasons, list) and reasons else None
-    if origin == "continuation_resume":
-        return {"status": "not_requested"}
-    if origin != "return_deferred_continuation":
+    if not immediate and origin != "return_deferred_continuation":
         return result
     try:
         snapshot = validate_return_snapshot(snapshot)
     except RuntimeError:
         return result
-    if (snapshot["status"] != "eligible"
-            or snapshot["prior_continuation_state"] != "deferred_expansion"
-            or snapshot["prior_terminal_turn_id"] is None):
+    if snapshot["prior_terminal_turn_id"] is None:
+        return result
+    if immediate:
+        if (snapshot["status"] != "below_threshold"
+                or restraint_trace.get("turn_binding_validated") is not True
+                or restraint_trace.get("included") is not True):
+            return result
+    elif (snapshot["status"] != "eligible"
+          or snapshot["prior_continuation_state"] != "deferred_expansion"):
         return result
     result.update(prior_runtime_turn_id=snapshot["prior_terminal_turn_id"],
-                  prior_continuation_state="deferred_expansion")
-    message_id = _canonical_prior_assistant_id(bundle, conversation_id)
+                  prior_continuation_state=snapshot["prior_continuation_state"])
+    try:
+        association = validate_prior_assistant_message(association, snapshot)
+    except RuntimeError:
+        return result
+    message_id = _canonical_prior_assistant_id(
+        bundle, conversation_id, expected_message_id=association["assistant_message_id"],
+        owner_id=owner_id,
+    )
     if message_id:
         result.update(
             status="ready",
@@ -5254,7 +5279,10 @@ def _return_resume_context(
     return result
 
 
-def _canonical_prior_assistant_id(bundle: Any, conversation_id: str) -> str | None:
+def _canonical_prior_assistant_id(
+    bundle: Any, conversation_id: str, *, expected_message_id: str | None = None,
+    owner_id: str | None = None,
+) -> str | None:
     if not isinstance(bundle, dict) or bundle.get("conversation_id") != conversation_id:
         return None
     material = bundle.get("bundle")
@@ -5262,6 +5290,8 @@ def _canonical_prior_assistant_id(bundle: Any, conversation_id: str) -> str | No
         return None
     recent = material.get("recent")
     if not isinstance(recent, list):
+        return None
+    if not canonical_assistant_message_id(expected_message_id):
         return None
     valid = []
     for item in recent:
@@ -5279,6 +5309,8 @@ def _canonical_prior_assistant_id(bundle: Any, conversation_id: str) -> str | No
             continue
         if (
             item.get("conversation_id") == conversation_id
+            and (owner_id is None or item.get("owner_id") == owner_id)
+            and (expected_message_id is None or message_id == expected_message_id)
             and item.get("role") == "assistant"
             and item.get("evidence_role") == "canonical"
             and isinstance(ref, dict)
@@ -5288,7 +5320,7 @@ def _canonical_prior_assistant_id(bundle: Any, conversation_id: str) -> str | No
             and item["content"].strip()
         ):
             valid.append((created, message_id))
-    return max(valid)[1] if valid else None
+    return expected_message_id if len(valid) == 1 else None
 def _validate_started_runtime_turn(
     response: Any,
     *,
@@ -5296,6 +5328,7 @@ def _validate_started_runtime_turn(
     conversation_id: str,
     surface: str,
     input_message_id: str | None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(response, dict):
         raise RuntimeError("runtime_turn_response_invalid")
@@ -5338,6 +5371,8 @@ def _validate_started_runtime_turn(
     event_payload = event.get("event_payload_json") if isinstance(event, dict) else None
     if not isinstance(event_payload, dict) or "return_after_gap" not in event_payload:
         raise RuntimeError("runtime_return_snapshot_invalid")
+    if request_id is not None and event_payload.get("request_id") != request_id:
+        raise RuntimeError("runtime_turn_response_context_mismatch")
     validate_return_snapshot(event_payload["return_after_gap"])
     return response
 
@@ -5379,6 +5414,7 @@ async def _start_runtime_turn(
                 conversation_id=conversation_id,
                 surface=surface,
                 input_message_id=input_message_id,
+                request_id=request_id,
             )
             break
         except Exception as error:
@@ -5405,10 +5441,18 @@ async def _start_runtime_turn(
         "runtime_turn_id": turn.get("runtime_turn_id"),
         "input_message_id": turn.get("input_message_id"),
         "turn_status": turn.get("turn_status"),
+        "owner_id": owner_id, "conversation_id": conversation_id, "surface": surface,
     }
     event_payload = (response.get("event") or {}).get("event_payload_json") or {}
     if "return_after_gap" in event_payload:
         trace["return_after_gap"] = validate_return_snapshot(event_payload["return_after_gap"])
+        try:
+            trace["prior_assistant_message"] = validate_prior_assistant_message(
+                event_payload.get("prior_assistant_message"), trace["return_after_gap"],
+            )
+        except RuntimeError:
+            trace["prior_assistant_message"] = {"status": "unavailable",
+                                                "assistant_message_id": None}
     if expected_thread_revision is not None:
         trace["expected_thread_revision"] = expected_thread_revision
     return response, trace
@@ -5490,21 +5534,42 @@ async def _complete_runtime_turn(
     turn_status: str,
     expected_scope: dict[str, Any] | None = None,
     session_transition: str | None = None,
+    assistant_acknowledgement: Any = None,
 ) -> None:
     runtime_session_id = turn_state_trace.get("runtime_session_id")
     runtime_turn_id = turn_state_trace.get("runtime_turn_id")
     if runtime is None or not runtime_session_id or not runtime_turn_id:
         return
     try:
+        message_id = (assistant_acknowledgement.get("message_id")
+                      if isinstance(assistant_acknowledgement, dict) else None)
+        associated = turn_status == "completed" and canonical_assistant_message_id(message_id)
+        if assistant_acknowledgement is not None:
+            turn_state_trace["assistant_message_association"] = "unconfirmed"
+        turn_state_trace["terminal_transition_attempted"] = True
         response = await runtime.complete_turn(
             request_id=request_id,
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
             turn_status=turn_status,
             **({"session_transition": session_transition} if session_transition else {}),
+            **({"assistant_message_id": message_id} if associated else {}),
             **({"continuation_state": turn_state_trace["continuation_state"]}
                if isinstance(turn_state_trace.get("continuation_state"), str) else {}),
         )
+        if associated:
+            validate_completion_message_response(
+                response, request_id=request_id, runtime_session_id=runtime_session_id,
+                runtime_turn_id=runtime_turn_id, assistant_message_id=message_id,
+                continuation_state=turn_state_trace.get("continuation_state"),
+                session_transition=session_transition,
+            )
+            session = response["runtime_session"]
+            if any(session.get(key) != turn_state_trace[key] for key in (
+                "owner_id", "conversation_id", "surface",
+            ) if key in turn_state_trace):
+                raise RuntimeError("runtime_completion_context_mismatch")
+            turn_state_trace["assistant_message_association"] = "confirmed"
         if expected_scope is not None:
             session = response.get("runtime_session") if isinstance(response, dict) else None
             turn = response.get("runtime_turn") if isinstance(response, dict) else None
@@ -9095,6 +9160,7 @@ async def _finish_explicit_pause(
         await _complete_runtime_turn(
             runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
             turn_status="completed", session_transition="pause", expected_scope=scope,
+            assistant_acknowledgement=acknowledgement,
         )
         if turn_state_trace.get("session_transition") != "pause":
             raise RuntimeError("pause_runtime_completion_unconfirmed")
@@ -9543,6 +9609,7 @@ async def _finish_strict_capability_information(
         request_id=request_id,
         turn_status="abandoned" if failed else "completed",
         expected_scope=scope,
+        assistant_acknowledgement=acknowledgement if not failed else None,
     )
     information_trace["runtime_completion"] = (
         "succeeded" if turn_state_trace.get("completed") else "unconfirmed"
@@ -10649,6 +10716,7 @@ async def orchestrate_chat(
             await _complete_runtime_turn(
                 runtime=runtime, turn_state_trace=turn_state_trace, request_id=request_id,
                 turn_status="abandoned" if failed else "completed",
+                assistant_acknowledgement=acknowledgement if not failed else None,
             )
             if non_executing_conversation and turn_state_trace.get("completed") is not True:
                 failed, answer = True, failure_answer
@@ -10749,6 +10817,8 @@ async def orchestrate_chat(
             resume_context = _return_resume_context(
                 turn_state_trace.get("return_after_gap"), timing_result,
                 return_retrieval_bundle, conversation_id,
+                association=turn_state_trace.get("prior_assistant_message"),
+                restraint_trace=restraint_trace, owner_id=payload["owner_id"],
             )
             turn_state_trace["return_resume_context"] = resume_context
             if resume_context["status"] == "unavailable":
@@ -11145,6 +11215,7 @@ async def orchestrate_chat(
                 turn_state_trace=turn_state_trace,
                 request_id=request_id,
                 turn_status="completed",
+                assistant_acknowledgement=assistant_message_ack,
             )
             trace_payload = {
                 "request_id": request_id,
@@ -11338,8 +11409,10 @@ async def orchestrate_chat(
                 retrieval_bundle = await memory_store.retrieve_bundle(**retrieve_bundle_kwargs)
             except Exception:
                 snapshot = turn_state_trace.get("return_after_gap") or {}
-                if (snapshot.get("status") != "eligible"
-                        or snapshot.get("prior_continuation_state") != "deferred_expansion"):
+                if not (snapshot.get("status") == "eligible"
+                        and snapshot.get("prior_continuation_state") == "deferred_expansion"
+                        or "continuation_context_requested" in restraint_trace.get(
+                            "reason_summary", [])):
                     raise
                 return_context_dependency_unavailable = True
                 retrieval_bundle = _empty_retrieval_bundle(
@@ -11352,8 +11425,10 @@ async def orchestrate_chat(
                 and mandatory_policy.containment_policy is None
             ):
                 snapshot = turn_state_trace.get("return_after_gap") or {}
-                if (snapshot.get("status") != "eligible"
-                        or snapshot.get("prior_continuation_state") != "deferred_expansion"):
+                if not (snapshot.get("status") == "eligible"
+                        and snapshot.get("prior_continuation_state") == "deferred_expansion"
+                        or "continuation_context_requested" in restraint_trace.get(
+                            "reason_summary", [])):
                     raise RuntimeError("malformed_retrieval_response")
                 return_context_dependency_unavailable = True
                 retrieval_bundle = _empty_retrieval_bundle(
@@ -12110,6 +12185,8 @@ async def orchestrate_chat(
             timing_result,
             provider_retrieval_bundle,
             conversation_id,
+            association=turn_state_trace.get("prior_assistant_message"),
+            restraint_trace=restraint_trace, owner_id=payload["owner_id"],
         )
         turn_state_trace["return_resume_context"] = resume_context
         if resume_context["status"] == "unavailable":
@@ -12121,6 +12198,8 @@ async def orchestrate_chat(
         if (turn_state_trace.get("return_after_gap") or {}).get("status") == "eligible":
             prior_message_id = _canonical_prior_assistant_id(
                 provider_retrieval_bundle, conversation_id,
+                expected_message_id=(turn_state_trace.get("prior_assistant_message") or {}).get(
+                    "assistant_message_id"), owner_id=payload["owner_id"],
             )
             turn_state_trace["return_thread_context"] = {
                 "source_message_ids": [prior_message_id] if prior_message_id else [],
@@ -12442,14 +12521,28 @@ async def orchestrate_chat(
             prompt.trace["return_resume_context"] = deepcopy(resume_context)
             if resume_context["status"] == "ready":
                 source_ids = set(resume_context["source_message_ids"])
+                dropped_recent = ((prompt.trace.get("prompt_budget") or {}).get(
+                    "dropped_context") or {}).get("by_layer", {}).get("recent_history", 0)
+                recent = provider_retrieval_bundle["bundle"]["recent"]
+                retained = {**provider_retrieval_bundle, "bundle": {
+                    **provider_retrieval_bundle["bundle"],
+                    "recent": recent[dropped_recent:] if type(dropped_recent) is int
+                    and 0 <= dropped_recent <= len(recent) else [],
+                }}
+                retained_id = _canonical_prior_assistant_id(
+                    retained, conversation_id, expected_message_id=next(iter(source_ids)),
+                    owner_id=payload["owner_id"],
+                )
                 source_text = [item["content"] for item in
                                provider_retrieval_bundle["bundle"]["recent"]
                                if item.get("message_id") in source_ids]
-                if not all(any(message["role"] == "assistant" and text in message["content"]
+                if retained_id is None or not all(any(
+                               message["role"] == "assistant" and text in message["content"]
                                for message in prompt.messages) for text in source_text):
                     turn_state_trace["return_resume_context"].update(
                         status="unavailable", source_message_ids=[], source_count=0,
-                        reason_code="retained_context_unavailable",
+                        reason_code=("required_history_omitted_by_budget" if retained_id is None
+                                     else "required_history_not_in_prompt"),
                     )
                     return await finish_timing_stop(
                         "I don't have enough retained context to continue that safely. "
@@ -14537,6 +14630,7 @@ async def orchestrate_chat(
             turn_state_trace=turn_state_trace,
             request_id=request_id,
             turn_status="completed",
+            assistant_acknowledgement=assistant_message_ack,
         )
         prompt.trace["runtime"] = runtime_trace
         prompt.trace["runtime_session"] = runtime_session_trace
