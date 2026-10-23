@@ -13,6 +13,7 @@ CO_COMMIT="636ac64084584aef395e066c86415e230a57630d"
 G2="$ROOT/../g2-gateway"
 G2_CONTAINER=""
 G2_IMAGE=""
+SCENE_ORCHESTRATOR=""
 
 # shellcheck source=scripts/evidence_acquisition_composed.sh
 source "$ROOT/scripts/evidence_acquisition_composed.sh"
@@ -93,6 +94,9 @@ fi
 
 cleanup() {
   local status="$?"
+  if [ -n "$SCENE_ORCHESTRATOR" ]; then
+    docker rm -f "$SCENE_ORCHESTRATOR" >/dev/null || status=1
+  fi
   if [ -n "$G2_CONTAINER" ]; then
     docker rm -f "$G2_CONTAINER" >/dev/null || status=1
   fi
@@ -5960,6 +5964,305 @@ run_strict_world_state_scenario() {
   echo 'Strict world state matrix: actual_services=true current_authority=true contextual_activation=false no_legacy_retry=true fixtures_restored=true default_legacy=true latency_benchmark=false'
 }
 
+scene_runtime_snapshot() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "$2" <<'PY'
+import json
+import sqlite3
+import sys
+
+owner, conversation = sys.argv[1:]
+with sqlite3.connect('file:/data/runtime_state.sqlite3?mode=ro', uri=True) as db:
+    db.row_factory = sqlite3.Row
+    sessions = [dict(row) for row in db.execute(
+        'SELECT * FROM conversation_runtime_sessions WHERE owner_id=? AND conversation_id=? ORDER BY id',
+        (owner, conversation))]
+    events = [dict(row) for row in db.execute('''SELECT e.* FROM conversation_runtime_events e
+        JOIN conversation_runtime_sessions s USING(runtime_session_id)
+        WHERE s.owner_id=? AND s.conversation_id=? ORDER BY e.id''', (owner, conversation))]
+with sqlite3.connect('file:/data/companion_contracts.sqlite3?mode=ro', uri=True) as db:
+    db.row_factory = sqlite3.Row
+    transitions = [dict(row) for row in db.execute('''SELECT * FROM scene_resolution_events
+        WHERE owner_id=? AND conversation_id=? ORDER BY id''', (owner, conversation))]
+print(json.dumps({'sessions': sessions, 'events': events, 'transitions': transitions}, sort_keys=True))
+PY
+}
+
+scene_override_request() {
+  local body="$1" expected="$2" status
+  status="$(curl -sS -o "$COMPOSED_SMOKE_TMP/scene-override.json" -w '%{http_code}' \
+    -H 'Content-Type: application/json' -d "$body" \
+    http://127.0.0.1:14371/v1/companion/scene/override)"
+  [ "$status" = "$expected" ] || {
+    echo "Scene override expected HTTP $expected, received $status" >&2
+    return 1
+  }
+}
+
+scene_policy_failure_fixture() {
+  # Fault only disposable registry data, never synthesize a policy response or trace.
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "${2:-null}" <<'PY'
+import json
+import sqlite3
+import sys
+
+mode, original = sys.argv[1:]
+with sqlite3.connect('file:/data/companion_contracts.sqlite3?mode=rw', uri=True) as db:
+    if mode == 'unavailable':
+        db.execute('ALTER TABLE scene_policies RENAME TO unavailable_scene_policies_fixture')
+    elif mode == 'restore_unavailable':
+        db.execute('ALTER TABLE unavailable_scene_policies_fixture RENAME TO scene_policies')
+    elif mode == 'malformed':
+        rows = db.execute("SELECT id,content FROM scene_policies WHERE scene_id='planning'").fetchall()
+        assert len(rows) == 1 and rows[0][1]
+        db.execute("UPDATE scene_policies SET content='' WHERE scene_id='planning'")
+        print(json.dumps(rows))
+    else:
+        for identifier, content in json.loads(original):
+            assert db.execute("UPDATE scene_policies SET content=? WHERE id=? AND content=''",
+                              (content, identifier)).rowcount == 1
+            assert db.execute('SELECT content FROM scene_policies WHERE id=?',
+                              (identifier,)).fetchone()[0] == content
+PY
+}
+
+scene_conversation_turn() {
+  local scene="$1" source="$2" requested="$3" change="$4" saved="$5" negatives="${6:-false}"
+  local owner=owner-scene-conversation client=client-scene-conversation surface=web
+  local payload pid thread request session turn binding calls trace response diagnostics assistant snapshot work history
+  history="$(psql_exec -At -c "SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages
+    WHERE owner_id='$owner' AND conversation_id='$SCENE_CONVERSATION'
+    ORDER BY created_at,id LIMIT $((SCENE_TURNS*2))) m;")"
+  payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$SCENE_CONVERSATION" \
+    --arg requested "$requested" '{owner_id:$owner,client_id:$client,conversation_id:$conversation,
+      surface:"web",sensitivity:"private",messages:[{role:"user",content:"Help me organize the next step."}]}
+      + (if $requested=="none" then {} else {requested_scene:$requested} end)')"
+  if [ "$change" != unchanged ]; then provider_post /fixture/delay-next-primary '{"delay_ms":8000}'; fi
+  co_post "$payload" >"$COMPOSED_SMOKE_TMP/scene-turn.json" & pid="$!"
+  if [ "$change" != unchanged ]; then
+    # Observe the actual provider input before applying a CR-owned choice for the next turn.
+    for _ in $(seq 1 100); do
+      thread="$(runtime_thread_snapshot "$owner" "$SCENE_CONVERSATION" 2>/dev/null || true)"
+      if [ -z "$thread" ]; then thread='{}'; fi
+      request="$(jq -r '.active_request_id // empty' <<<"$thread")"
+      if [ -n "$request" ] && fetch_provider_calls "$request" | jq -e \
+        --arg scene "$scene" '.calls|any(.status=="pending" and .scene_policy_match.scene_id==$scene)' >/dev/null; then break; fi
+      sleep 0.1
+    done
+    calls="$(fetch_provider_calls "$request")"
+    jq -e --arg scene "$scene" '.calls|any(.status=="pending" and .scene_policy_match.scene_id==$scene)' <<<"$calls" >/dev/null
+    session="$(jq -er .active_runtime_session_id <<<"$thread")"
+    turn="$(jq -er .active_runtime_turn_id <<<"$thread")"
+    binding="$(jq -nc --arg owner "$owner" --arg conversation "$SCENE_CONVERSATION" \
+      --arg request "$request" --arg session "$session" --arg turn "$turn" \
+      '{request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:"web",
+        runtime_session_id:$session,runtime_turn_id:$turn,scene_id:"planning"}')"
+    if [ "$negatives" = true ]; then
+      snapshot="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")"
+      scene_override_request "$(jq '.owner_id="wrong-scene-owner"' <<<"$binding")" 400
+      scene_override_request "$(jq '.conversation_id="wrong-scene-conversation"' <<<"$binding")" 400
+      scene_override_request "$(jq '.runtime_turn_id="missing-scene-turn"' <<<"$binding")" 404
+      scene_override_request "$(jq --arg turn "$SCENE_PREVIOUS_TURN" '.runtime_turn_id=$turn' <<<"$binding")" 409
+      scene_override_request "$(jq '.scene_id="unknown-scene-private-sentinel"' <<<"$binding")" 400
+      scene_override_request "$(jq '.scene_id={private:"scene-private-sentinel"}' <<<"$binding")" 422
+      [ "$snapshot" = "$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")" ]
+      # Repeating an identical saved choice is idempotent, including transition history.
+      scene_override_request "$binding" 200
+      [ "$snapshot" = "$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")" ]
+    fi
+    binding="$(jq --arg change "$change" '.scene_id=(if $change=="clear" then null else $change end)' <<<"$binding")"
+    scene_override_request "$binding" 200
+    jq -e --arg saved "$saved" '.runtime_state.active_scene==(if $saved=="none" then null else $saved end)' \
+      "$COMPOSED_SMOKE_TMP/scene-override.json" >/dev/null
+  fi
+  wait "$pid"
+  response="$(cat "$COMPOSED_SMOKE_TMP/scene-turn.json")"
+  request="$(jq -er .request_id <<<"$response")"
+  trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
+  jq -e --arg conversation "$SCENE_CONVERSATION" --arg answer "$(jq -r --arg scene "$scene" \
+    '.[]|select(.scene_id==$scene)|.answer' <<<"$SCENE_POLICIES")" \
+    '.status=="ok" and .conversation_id==$conversation and .answer==$answer and .pending_action==null' <<<"$response" >/dev/null
+  jq -e --arg scene "$scene" --arg source "$source" --arg owner "$owner" --arg client "$client" \
+    --arg conversation "$SCENE_CONVERSATION" '.owner_id==$owner and .client_id==$client
+      and .conversation_id==$conversation and .surface=="web"
+      and (.retrieval.prompt_assembly.companion_policy | if $scene=="absent" then
+        .included==false and .cognitive_runtime_compile_error=="companion_policy_unavailable"
+        else .included==true and .scene_id==$scene and .scene_source==$source end)' <<<"$trace" >/dev/null
+  jq -e --arg scene "$scene" --argjson policies "$SCENE_POLICIES" '
+    [.calls[]|select(.kind=="chat")] | length==1 and (.[0] | .status=="ok" and .tool_count==0
+      and .scene_policy_match.scene_id==$scene
+      and (if $scene=="absent" then
+        all(.normalized_messages[]; . as $message | all($policies[]|select(.content!=""); .content!=$message.content))
+        else ($policies[]|select(.scene_id==$scene)|.content) as $policy
+          | any(.normalized_messages[]; .role=="system" and .content==$policy) end))' <<<"$calls" >/dev/null
+  jq -e '[.calls[]|select(.kind=="chat")]|all(.sentinel_presence.scene_private==false)' <<<"$calls" >/dev/null
+  case "$response|$trace|$calls" in *SCENE-OTHER-OWNER-PRIVATE*) return 1 ;; esac
+  session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
+  turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+  if [ -n "$SCENE_SESSION" ]; then [ "$session" = "$SCENE_SESSION" ]; fi
+  SCENE_SESSION="$session"; SCENE_PREVIOUS_TURN="$turn"
+  diagnostics="$(fetch_runtime_diagnostics "$session")"
+  assistant="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w ON w.assistant_message_id=m.id
+    AND w.work_id=m.work_id WHERE m.owner_id='$owner' AND m.conversation_id='$SCENE_CONVERSATION'
+    AND m.role='assistant' AND m.metadata->>'request_id'='$request' AND w.request_id='$request' AND w.state='completed';")"
+  [ -n "$assistant" ]
+  jq -e --arg request "$request" --arg turn "$turn" --arg assistant "$assistant" --arg saved "$saved" \
+    --arg owner "$owner" --arg conversation "$SCENE_CONVERSATION" '
+    .runtime_session.owner_id==$owner and .runtime_session.conversation_id==$conversation
+    and .runtime_session.surface=="web" and .runtime_session.status=="active" and .active_turn==null
+    and .latest_turn.runtime_turn_id==$turn and .latest_turn.turn_status=="completed"
+    and ([.events[]|select(.runtime_turn_id==$turn and .event_type=="turn_completed")]
+      | length==1 and (.[0].event_payload_json | .request_id==$request and .assistant_message_id==$assistant))' <<<"$diagnostics" >/dev/null
+  jq -e --arg saved "$saved" '.sessions|length==1 and
+    .[0].active_scene==(if $saved=="none" then null else $saved end)' \
+    <<<"$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")" >/dev/null
+  assert_persisted_answer_matches "$SCENE_CONVERSATION" "$request" "$(jq -r .answer <<<"$response")"
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner'
+    AND conversation_id='$SCENE_CONVERSATION' AND request_id='$request' AND assistant_message_id='$assistant';")"
+  jq -e --arg message "$assistant" --arg request "$request" '.state=="completed"
+    and .request_id==$request and .result.assistant_message_id==$message' \
+    <<<"$(co_work_result "$owner" "$SCENE_CONVERSATION" "$work")" >/dev/null
+  jq -e '.state=="idle" and .active_runtime_turn_id==null' <<<"$(runtime_thread_snapshot "$owner" "$SCENE_CONVERSATION")" >/dev/null
+  jq -e '.action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+  if [ "$scene" != absent ]; then
+    snapshot="$(jq -c '.retrieval.prompt_assembly.companion_policy|
+      [.profile_id,.profile_version,.contract_id,.contract_version,.interaction_contract]' <<<"$trace")"
+    if [ -n "$SCENE_IDENTITY" ]; then [ "$snapshot" = "$SCENE_IDENTITY" ]; fi
+    SCENE_IDENTITY="$snapshot"
+  fi
+  [ "$history" = "$(psql_exec -At -c "SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages
+    WHERE owner_id='$owner' AND conversation_id='$SCENE_CONVERSATION'
+    ORDER BY created_at,id LIMIT $((SCENE_TURNS*2))) m;")" ]
+  SCENE_TURNS=$((SCENE_TURNS+1))
+  [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant')
+    FROM messages WHERE owner_id='$owner' AND conversation_id='$SCENE_CONVERSATION'
+    AND client_id='$client';")" = "$SCENE_TURNS|$SCENE_TURNS" ]
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner'
+    AND conversation_id='$SCENE_CONVERSATION' AND role='user' AND metadata->>'surface'='web';")" = "$SCENE_TURNS" ]
+  echo "Scene conversation: effective=$scene source=$source saved=$saved canonical=true provider_policy_matched=true actions=0"
+}
+
+run_scene_transition_scenario() {
+  local owner=owner-scene-conversation client=client-scene-conversation policy content answer
+  local before messages transitions original status private_conversation inferred_turn general_turn state
+  SCENE_CONVERSATION="$(resolve_conversation "$owner" "$client" scene-conversation)"
+  SCENE_SESSION=""; SCENE_PREVIOUS_TURN=""; SCENE_IDENTITY=""; SCENE_TURNS=0; SCENE_POLICIES='[]'
+  configure_surface_permission "$owner" web true true false
+  provider_post /fixture/reset '{}'; reset_dsa_audit
+  private_conversation="$(resolve_conversation owner-scene-private client-scene-private scene-private)"
+  seed_canonical "$private_conversation" owner-scene-private client-scene-private \
+    'SCENE-OTHER-OWNER-PRIVATE Help me organize the next step.' active >/dev/null
+  provider_post /fixture/sentinels '{"sentinels":{"scene_private":"SCENE-OTHER-OWNER-PRIVATE"}}'
+  for policy in general planning work_triage; do
+    content="$(curl -fsS "http://127.0.0.1:14371/v1/companion/scene/$policy" | jq -er .content)"
+    case "$policy" in
+      general) answer='Choose one bounded next step.' ;;
+      planning) answer='Clarify the goal, then sequence the next steps.' ;;
+      work_triage) answer='Identify the owner, risk, and dependency before escalation.' ;;
+    esac
+    SCENE_POLICIES="$(jq -c --arg scene "$policy" --arg content "$content" --arg answer "$answer" \
+      '.+[{scene_id:$scene,content:$content,answer:$answer}]' <<<"$SCENE_POLICIES")"
+  done
+  provider_post /fixture/next-answer "$(jq -nc --argjson policies "$SCENE_POLICIES" '{scene_policies:$policies}')"
+  # Reuse the existing service and settings flag; the ordinary composition remains unchanged.
+  docker compose -f "$COMPOSE" stop orchestrator >/dev/null
+  SCENE_ORCHESTRATOR="$(docker compose -f "$COMPOSE" run -d --no-deps --service-ports \
+    -e COGNITIVE_RUNTIME_COMPANION_ENABLED=true orchestrator)"
+  wait_for_http http://127.0.0.1:14361/healthz
+  scene_conversation_turn general general none planning planning
+  scene_conversation_turn planning runtime_state none work_triage work_triage true
+  before="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")"
+  messages="$(psql_exec -At -c "SELECT md5(json_agg(m ORDER BY id)::text) FROM messages m WHERE owner_id='$owner' AND conversation_id='$SCENE_CONVERSATION';")"
+  docker compose -f "$COMPOSE" restart runtime >/dev/null
+  wait_for_http http://127.0.0.1:14371/healthz
+  [ "$before" = "$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")" ]
+  [ "$messages" = "$(psql_exec -At -c "SELECT md5(json_agg(m ORDER BY id)::text) FROM messages m WHERE owner_id='$owner' AND conversation_id='$SCENE_CONVERSATION';")" ]
+  scene_conversation_turn work_triage runtime_state none clear none
+  before="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")"
+  jq -e --arg session "$SCENE_SESSION" '.sessions|length==1 and
+    .[0].runtime_session_id==$session and .[0].active_scene==null' <<<"$before" >/dev/null
+  state="$(jq -er '.sessions[0].runtime_state_id' <<<"$before")"
+  cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$SCENE_CONVERSATION" \
+    '{request_id:"scene-inference-update",owner_id:$owner,conversation_id:$conversation,surface:"web",
+      updates:{interaction_mode:"work_triage"}}')" \
+    | jq -e --arg state "$state" '.runtime_state|.runtime_state_id==$state
+      and .active_scene==null and .interaction_mode=="work_triage"' >/dev/null
+  # No saved choice or requested_scene: the registered runtime work mode owns selection.
+  scene_conversation_turn work_triage runtime_interaction_mode none unchanged none
+  inferred_turn="$SCENE_PREVIOUS_TURN"
+  cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$SCENE_CONVERSATION" \
+    '{request_id:"scene-inference-reset",owner_id:$owner,conversation_id:$conversation,surface:"web",
+      updates:{interaction_mode:"ordinary"}}')" \
+    | jq -e --arg state "$state" '.runtime_state|.runtime_state_id==$state
+      and .active_scene==null and .interaction_mode=="ordinary"' >/dev/null
+  scene_conversation_turn general general none planning planning
+  general_turn="$SCENE_PREVIOUS_TURN"
+  scene_conversation_turn work_triage requested_scene work_triage unchanged planning
+  scene_conversation_turn planning runtime_state none unchanged planning
+  before="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION" | jq -c .transitions)"
+  scene_conversation_turn planning runtime_state none unchanged planning
+  [ "$before" = "$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION" | jq -c .transitions)" ]
+  scene_conversation_turn general fallback_general unknown-scene-private-sentinel unchanged planning
+  scene_conversation_turn planning runtime_state none unchanged planning
+  transitions="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")"
+  jq -e --arg session "$SCENE_SESSION" --arg inferred "$inferred_turn" --arg general "$general_turn" \
+    --argjson policies "$SCENE_POLICIES" \
+    '.transitions|map(.signals_json|fromjson) as $events
+    | ($events|map(.transition|[.previous_scene_id,.scene_id]))==[
+      ["general","planning"],["planning","work_triage"],["work_triage","general"],
+      ["general","work_triage"],["work_triage","general"],
+      ["general","planning"],["planning","work_triage"],["work_triage","planning"],
+      ["planning","general"],["general","planning"]]
+    and all($events[]; .runtime_session_id==$session and (.runtime_turn_id|length)>0
+      and .scene_version==1 and .transition.scene_version==1
+      and (.transition.policy_delta|keys)==["content"]
+      and (.transition as $t | .policy_snapshot.content==($policies[]|select(.scene_id==$t.scene_id)|.content)
+        and $t.policy_delta.content.current==($policies[]|select(.scene_id==$t.scene_id)|.content)
+        and $t.policy_delta.content.previous==($policies[]|select(.scene_id==$t.previous_scene_id)|.content)))
+    and ([$events[]|select(.runtime_turn_id==$inferred and .transition.previous_scene_id=="general"
+      and .transition.scene_id=="work_triage" and .transition.source=="runtime_interaction_mode")]|length)==1
+    and ([$events[]|select(.runtime_turn_id==$general and .transition.previous_scene_id=="work_triage"
+      and .transition.scene_id=="general" and .transition.source=="general")]|length)==1
+    and ($events|any(.transition.source=="fallback_general" and .transition.fallback_reason=="unknown_requested_scene"))' <<<"$transitions" >/dev/null
+  echo "Scene inference transitions: general->work_triage source=runtime_interaction_mode turn=$inferred_turn work_triage->general source=general turn=$general_turn session=$SCENE_SESSION policy_delta=content"
+  case "$(jq -c .transitions <<<"$transitions")" in
+    *unknown-scene-private-sentinel*|*'Help me organize'*) return 1 ;;
+  esac
+  # A wrong owner cannot append to the durable authorized conversation.
+  configure_surface_permission wrong-scene-owner web true true false
+  before="$(psql_exec -At -c "SELECT count(*) FROM messages;")"
+  status="$(curl -sS -o "$COMPOSED_SMOKE_TMP/scene-wrong-owner.json" -w '%{http_code}' \
+    -H 'X-API-Key: smoke-orchestrator-key' -H 'Content-Type: application/json' -H 'X-Request-ID: scene-wrong-owner' \
+    -d "$(jq -nc --arg conversation "$SCENE_CONVERSATION" '{owner_id:"wrong-scene-owner",client_id:"wrong-scene-client",
+      conversation_id:$conversation,surface:"web",messages:[{role:"user",content:"Help me organize the next step."}]}')" http://127.0.0.1:14361/v1/chat)"
+  [ "$status" = 200 ] || { echo "Wrong-owner scene request: HTTP $status" >&2; return 1; }
+  jq -e '.status=="failed" and .selected_model=="not_called" and .sources==[] and .pending_action==null
+    and .answer=="I could not continue that conversation safely. No retained conversation content was used."' \
+    "$COMPOSED_SMOKE_TMP/scene-wrong-owner.json" >/dev/null
+  messages="$(psql_exec -At -c "SELECT count(*) FROM messages;")"
+  [ "$before" = "$messages" ] || { echo "Wrong-owner message counts: before=$before after=$messages" >&2; return 1; }
+  jq -e '.calls==[]' <<<"$(fetch_provider_calls scene-wrong-owner)" >/dev/null
+  # Missing/malformed registry policy must not reach the provider as a scene instruction.
+  SCENE_POLICIES="$(jq -c '.+[{scene_id:"absent",content:"",answer:"No scene-specific instruction is available."}]' <<<"$SCENE_POLICIES")"
+  provider_post /fixture/next-answer "$(jq -nc --argjson policies "$SCENE_POLICIES" '{scene_policies:$policies}')"
+  scene_policy_failure_fixture unavailable
+  scene_conversation_turn absent unavailable none unchanged planning
+  scene_policy_failure_fixture restore_unavailable
+  original="$(scene_policy_failure_fixture malformed)"
+  scene_conversation_turn absent malformed none unchanged planning
+  scene_policy_failure_fixture restore "$original"
+  scene_conversation_turn planning runtime_state none unchanged planning
+  # Every historical message retained its original surface/client/owner association.
+  [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id='$SCENE_CONVERSATION'
+    AND (owner_id!='$owner' OR client_id!='$client'
+      OR (role='user' AND metadata->>'surface' IS DISTINCT FROM 'web'));")" = 0 ]
+  assert_dsa_operation_counts "$(fetch_dsa_audit)" 0 0 0
+  docker rm -f "$SCENE_ORCHESTRATOR" >/dev/null; SCENE_ORCHESTRATOR=""
+  docker compose -f "$COMPOSE" start orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  provider_post /fixture/reset '{}'
+  echo 'Scene conversation acceptance: persistent_override=true clear=true temporary_precedence=true restart_preserved=true negative_controls=true deterministic_policy_consumption=true model_quality_measured=false performance_benchmark=false'
+}
+
 run_voice_continuation_scenario() {
   local previous_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
   local previous_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
@@ -6739,6 +7042,12 @@ run_surface_lifecycle_scenario() {
 
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+if [ "${SCENE_TRANSITIONS_ONLY:-}" = 1 ]; then
+  set -E
+  trap 'echo "Scene conversation assertion failed: line=$LINENO" >&2' ERR
+  run_scene_transition_scenario
+  exit 0
+fi
 if [ "${SURFACE_LIFECYCLE_ONLY:-}" = 1 ]; then
   set -E
   trap 'echo "Surface lifecycle failed at line $LINENO" >&2' ERR
@@ -6860,6 +7169,7 @@ if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+run_scene_transition_scenario
 run_runtime_admission_composition_scenario telegram-alexa telegram:admission alexa:admission telegram alexa
 run_omitted_continuation_scenario
 run_conversation_retirement_scenario

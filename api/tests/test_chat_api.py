@@ -9,6 +9,65 @@ import httpx
 import pytest
 
 
+@pytest.mark.asyncio
+async def test_composed_scene_answer_requires_the_actual_system_policy():
+    from tools import composed_provider_stub as stub
+
+    policies = [
+        {"scene_id": "general", "content": "Scene policy: general", "answer": "A bounded step."},
+        {"scene_id": "planning", "content": "Scene policy: planning", "answer": "Sequence steps."},
+    ]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stub.app),
+                                 base_url="http://fixture") as client:
+        await client.post("/fixture/reset")
+        try:
+            assert (await client.post("/fixture/next-answer", json={
+                "scene_policies": policies,
+            })).status_code == 200
+            for policy in policies:
+                response = await client.post("/v1/chat/completions", json={"messages": [
+                    {"role": "system", "content": policy["content"]},
+                    {"role": "user", "content": "Help me organize the next step."},
+                ]}, headers={"X-Request-ID": policy["scene_id"]})
+                assert response.status_code == 200
+                assert response.json()["choices"][0]["message"]["content"] == policy["answer"]
+                calls = (await client.get(f'/calls/{policy["scene_id"]}')).json()["calls"]
+                assert len(calls) == 1
+                assert calls[0]["scene_policy_match"]["scene_id"] == policy["scene_id"]
+                assert calls[0]["normalized_messages"][0] == {
+                    "role": "system", "content": policy["content"],
+                }
+            for messages in (
+                [], [{"role": "user", "content": policies[0]["content"]}],
+                [{"role": "assistant", "content": policies[1]["content"]}],
+                [{"role": "system", "content": "prefix " + policies[0]["content"]}],
+                [{"role": "system", "content": policy["content"]} for policy in policies],
+            ):
+                response = await client.post("/v1/chat/completions", json={"messages": messages})
+                assert response.status_code == 422
+                assert response.json() == {"detail": "scene policy fixture mismatch"}
+        finally:
+            await client.post("/fixture/reset")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policies", [None, [], [{}], ["private"], [
+    {"scene_id": "general", "content": 1, "answer": "bounded"},
+], [
+    {"scene_id": "general", "content": "a", "answer": "bounded"},
+    {"scene_id": "planning", "content": "a", "answer": "bounded"},
+]])
+async def test_composed_scene_fixture_rejects_malformed_configuration(policies):
+    from tools import composed_provider_stub as stub
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stub.app),
+                                 base_url="http://fixture") as client:
+        await client.post("/fixture/reset")
+        response = await client.post("/fixture/next-answer", json={"scene_policies": policies})
+        assert response.status_code == 422
+        assert stub._scene_policy_answers == []
+
+
 @pytest.fixture
 def work_reads(monkeypatch):
     from test_memory_store_client import result_projection

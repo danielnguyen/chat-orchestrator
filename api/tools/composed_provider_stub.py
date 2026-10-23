@@ -18,6 +18,8 @@ _next_primary_delay_ms = 0
 _watched_sentinels: dict[str, str] = {}
 _next_answers: list[str] = []
 _next_semantic_interpretations: list[dict[str, Any]] = []
+_scene_policy_answers: list[dict[str, str]] = []
+_pending_scene_calls: dict[str, dict[str, Any]] = {}
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 _FIXTURE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 _SEMANTIC_STATUSES = {"resolved", "ambiguous", "no_match"}
@@ -54,6 +56,30 @@ def _bounded_excerpt(value: str) -> str:
         return normalized
     boundary = normalized.rfind(" ", 0, 501)
     return normalized[: boundary if boundary > 0 else 500]
+
+
+def _scene_policy_answer(
+    messages: list[dict[str, str]],
+) -> tuple[str | None, dict[str, str] | None]:
+    """Select a fixture answer only from an exact system-policy match."""
+    if not _scene_policy_answers:
+        return None, None
+    matches = [
+        policy for policy in _scene_policy_answers
+        if policy["content"] and any(
+            message["role"] == "system" and message["content"] == policy["content"]
+            for message in messages
+        )
+    ]
+    if not matches:
+        matches = [policy for policy in _scene_policy_answers if not policy["content"]]
+    if len(matches) != 1:
+        raise HTTPException(status_code=422, detail="scene policy fixture mismatch")
+    policy = matches[0]
+    return policy["answer"], {
+        "scene_id": policy["scene_id"],
+        "policy_sha256": hashlib.sha256(policy["content"].encode()).hexdigest(),
+    }
 
 
 def _governed_evidence_candidate(prompt_text: str) -> str | None:
@@ -301,10 +327,6 @@ async def chat_completions(
             ],
             "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
         }
-    delay_ms = _next_primary_delay_ms
-    _next_primary_delay_ms = 0
-    if delay_ms:
-        await asyncio.sleep(delay_ms / 1000)
     prompt_text = "\n".join(
         message.get("content", "")
         for message in messages
@@ -327,6 +349,19 @@ async def chat_completions(
         for message in messages
         if isinstance(message, dict)
     ]
+    scene_answer, scene_match = _scene_policy_answer(normalized_messages)
+    delay_ms = _next_primary_delay_ms
+    _next_primary_delay_ms = 0
+    if delay_ms:
+        if scene_match is not None:
+            _pending_scene_calls[request_id] = {
+                "kind": "chat", "status": "pending", "request_id": request_id,
+                "scene_policy_match": scene_match,
+            }
+        try:
+            await asyncio.sleep(delay_ms / 1000)
+        finally:
+            _pending_scene_calls.pop(request_id, None)
     latest_user_text = next(
         (
             message["content"]
@@ -390,7 +425,9 @@ async def chat_completions(
         )
         raise HTTPException(status_code=503, detail="primary failure fixture")
     governed_candidate = _governed_evidence_candidate(prompt_text)
-    if _next_answers:
+    if scene_answer is not None:
+        answer = scene_answer
+    elif _next_answers:
         answer = _next_answers.pop(0)
     elif governed_candidate is not None:
         answer = governed_candidate
@@ -421,6 +458,7 @@ async def chat_completions(
             "sentinel_presence": sentinel_presence,
             "sentinel_in_user_messages": sentinel_in_user_messages,
             "status": "ok",
+            "scene_policy_match": scene_match,
         }
     )
     return {
@@ -464,7 +502,8 @@ async def embeddings(
 
 @app.get("/calls/{request_id}")
 async def calls(request_id: str) -> dict[str, Any]:
-    return {"request_id": request_id, "calls": _calls.get(request_id, [])}
+    pending = [_pending_scene_calls[request_id]] if request_id in _pending_scene_calls else []
+    return {"request_id": request_id, "calls": [*_calls.get(request_id, []), *pending]}
 
 
 @app.post("/fixture/reset")
@@ -472,6 +511,7 @@ async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
     global _fail_next_primary, _next_primary_delay_ms
     _next_primary_delay_ms = 0
     _next_semantic_interpretations.clear()
+    _scene_policy_answers.clear()
     request_id = (body or {}).get("request_id")
     if isinstance(request_id, str) and request_id:
         _calls.pop(request_id, None)
@@ -526,6 +566,27 @@ async def fixture_sentinels(body: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/fixture/next-answer")
 async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
+    if "scene_policies" in body:
+        policies = body["scene_policies"]
+        if (
+            set(body) != {"scene_policies"} or not isinstance(policies, list)
+            or not 1 <= len(policies) <= 4
+            or any(
+                not isinstance(policy, dict)
+                or set(policy) != {"scene_id", "content", "answer"}
+                or any(not isinstance(value, str) for value in policy.values())
+                or not policy["scene_id"] or len(policy["scene_id"]) > 64
+                or len(policy["content"]) > 2000
+                or not policy["answer"] or len(policy["answer"]) > 2000
+                for policy in policies
+            )
+            or len({policy["scene_id"] for policy in policies}) != len(policies)
+            or len({policy["content"] for policy in policies}) != len(policies)
+            or _next_answers
+        ):
+            raise HTTPException(status_code=422, detail="invalid scene policy fixture")
+        _scene_policy_answers[:] = [dict(policy) for policy in policies]
+        return {"status": "ok", "queued": len(policies)}
     answer = body.get("answer")
     if not isinstance(answer, str) or not answer or len(answer) > 2_000:
         raise HTTPException(status_code=422, detail="invalid fixture answer")
