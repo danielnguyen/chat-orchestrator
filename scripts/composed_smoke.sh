@@ -6143,7 +6143,7 @@ scene_conversation_turn() {
 
 run_scene_transition_scenario() {
   local owner=owner-scene-conversation client=client-scene-conversation policy content answer
-  local before messages transitions original status private_conversation
+  local before messages transitions original status private_conversation inferred_turn general_turn state
   SCENE_CONVERSATION="$(resolve_conversation "$owner" "$client" scene-conversation)"
   SCENE_SESSION=""; SCENE_PREVIOUS_TURN=""; SCENE_IDENTITY=""; SCENE_TURNS=0; SCENE_POLICIES='[]'
   configure_surface_permission "$owner" web true true false
@@ -6177,7 +6177,25 @@ run_scene_transition_scenario() {
   [ "$before" = "$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")" ]
   [ "$messages" = "$(psql_exec -At -c "SELECT md5(json_agg(m ORDER BY id)::text) FROM messages m WHERE owner_id='$owner' AND conversation_id='$SCENE_CONVERSATION';")" ]
   scene_conversation_turn work_triage runtime_state none clear none
+  before="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")"
+  jq -e --arg session "$SCENE_SESSION" '.sessions|length==1 and
+    .[0].runtime_session_id==$session and .[0].active_scene==null' <<<"$before" >/dev/null
+  state="$(jq -er '.sessions[0].runtime_state_id' <<<"$before")"
+  cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$SCENE_CONVERSATION" \
+    '{request_id:"scene-inference-update",owner_id:$owner,conversation_id:$conversation,surface:"web",
+      updates:{interaction_mode:"work_triage"}}')" \
+    | jq -e --arg state "$state" '.runtime_state|.runtime_state_id==$state
+      and .active_scene==null and .interaction_mode=="work_triage"' >/dev/null
+  # No saved choice or requested_scene: the registered runtime work mode owns selection.
+  scene_conversation_turn work_triage runtime_interaction_mode none unchanged none
+  inferred_turn="$SCENE_PREVIOUS_TURN"
+  cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$SCENE_CONVERSATION" \
+    '{request_id:"scene-inference-reset",owner_id:$owner,conversation_id:$conversation,surface:"web",
+      updates:{interaction_mode:"ordinary"}}')" \
+    | jq -e --arg state "$state" '.runtime_state|.runtime_state_id==$state
+      and .active_scene==null and .interaction_mode=="ordinary"' >/dev/null
   scene_conversation_turn general general none planning planning
+  general_turn="$SCENE_PREVIOUS_TURN"
   scene_conversation_turn work_triage requested_scene work_triage unchanged planning
   scene_conversation_turn planning runtime_state none unchanged planning
   before="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION" | jq -c .transitions)"
@@ -6186,10 +6204,12 @@ run_scene_transition_scenario() {
   scene_conversation_turn general fallback_general unknown-scene-private-sentinel unchanged planning
   scene_conversation_turn planning runtime_state none unchanged planning
   transitions="$(scene_runtime_snapshot "$owner" "$SCENE_CONVERSATION")"
-  jq -e --arg session "$SCENE_SESSION" --argjson policies "$SCENE_POLICIES" \
+  jq -e --arg session "$SCENE_SESSION" --arg inferred "$inferred_turn" --arg general "$general_turn" \
+    --argjson policies "$SCENE_POLICIES" \
     '.transitions|map(.signals_json|fromjson) as $events
     | ($events|map(.transition|[.previous_scene_id,.scene_id]))==[
       ["general","planning"],["planning","work_triage"],["work_triage","general"],
+      ["general","work_triage"],["work_triage","general"],
       ["general","planning"],["planning","work_triage"],["work_triage","planning"],
       ["planning","general"],["general","planning"]]
     and all($events[]; .runtime_session_id==$session and (.runtime_turn_id|length)>0
@@ -6198,7 +6218,12 @@ run_scene_transition_scenario() {
       and (.transition as $t | .policy_snapshot.content==($policies[]|select(.scene_id==$t.scene_id)|.content)
         and $t.policy_delta.content.current==($policies[]|select(.scene_id==$t.scene_id)|.content)
         and $t.policy_delta.content.previous==($policies[]|select(.scene_id==$t.previous_scene_id)|.content)))
+    and ([$events[]|select(.runtime_turn_id==$inferred and .transition.previous_scene_id=="general"
+      and .transition.scene_id=="work_triage" and .transition.source=="runtime_interaction_mode")]|length)==1
+    and ([$events[]|select(.runtime_turn_id==$general and .transition.previous_scene_id=="work_triage"
+      and .transition.scene_id=="general" and .transition.source=="general")]|length)==1
     and ($events|any(.transition.source=="fallback_general" and .transition.fallback_reason=="unknown_requested_scene"))' <<<"$transitions" >/dev/null
+  echo "Scene inference transitions: general->work_triage source=runtime_interaction_mode turn=$inferred_turn work_triage->general source=general turn=$general_turn session=$SCENE_SESSION policy_delta=content"
   case "$(jq -c .transitions <<<"$transitions")" in
     *unknown-scene-private-sentinel*|*'Help me organize'*) return 1 ;;
   esac
