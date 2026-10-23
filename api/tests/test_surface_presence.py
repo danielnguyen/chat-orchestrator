@@ -1,6 +1,14 @@
+from copy import deepcopy
+from typing import get_args
+
+import pytest
 from models import StyleEnvelope
 from services.response_shape import resolve_response_shape
-from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
+from services.surface_presence import (
+    PresenceState,
+    apply_surface_presence_outcome,
+    resolve_surface_presence,
+)
 
 BANNED_TOKENS = ["R26", "R27", "Cluster11", "11D"]
 
@@ -154,3 +162,278 @@ def test_surface_presence_trace_keys_do_not_use_banned_identifiers():
     assert keys
     for token in BANNED_TOKENS:
         assert all(token not in key for key in keys)
+
+
+def _surface_turn(surface="web"):
+    payload = {"owner_id": "owner", "conversation_id": "conversation", "surface": surface}
+    shape, _ = resolve_response_shape(payload, StyleEnvelope(), {})
+    admitted = {
+        "runtime_session": {"owner_id": "owner", "conversation_id": "conversation",
+                            "surface": surface, "status": "active",
+                            "runtime_session_id": "session"},
+        "runtime_turn": {"runtime_session_id": "session", "runtime_turn_id": "turn",
+                         "turn_status": "responding"},
+        "event": {"event_type": "turn_started", "runtime_session_id": "session",
+                  "runtime_turn_id": "turn", "event_payload_json": {"request_id": "request"}},
+    }
+    return payload, shape, admitted
+
+
+def _processing(surface="web"):
+    payload, shape, admitted = _surface_turn(surface)
+    return resolve_surface_presence(payload, shape, admitted_turn=admitted, request_id="request")
+
+
+def test_surface_presence_vocabulary_is_distinct_from_runtime_presence():
+    assert set(get_args(PresenceState)) == {
+        "idle", "listening", "thinking", "briefing", "alerting", "awaiting_confirmation",
+        "suppressed", "unavailable", "fallback",
+    }
+    for state in ("ambient_listening", "active_conversation", "do_not_intrude", "unknown"):
+        result = apply_surface_presence_outcome({"presence_state": state})
+        assert result["presence_state"] == "fallback"
+        assert result["reason"] == "unknown_presence_state"
+
+
+@pytest.mark.parametrize("surface,completed", [("web", "idle"), ("car", "briefing")])
+def test_admitted_processing_transitions_to_completed_presentation(surface, completed):
+    trace = _processing(surface)
+    assert trace["presence_state"] == "thinking"
+    assert trace["previous_state"] is None
+    assert trace["transition_status"] == "initialized"
+    assert trace["source_fields"][-1] == "runtime_turn.turn_status"
+    result = apply_surface_presence_outcome(trace, outcome="completed")
+    assert result["presence_state"] == completed
+    assert result["previous_state"] == "thinking"
+    assert result["transition_status"] == "accepted"
+    assert result["source_fields"][-1] == "response.completed"
+    assert trace["presence_state"] == "thinking"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("owner_id", "other"), ("conversation_id", "other"), ("surface", "other"),
+    ("status", "closed"), ("closed_at", "2026-01-01T00:00:00Z"),
+    ("runtime_session_id", ""),
+])
+def test_processing_rejects_mismatched_or_invalid_session(field, value):
+    payload, shape, admitted = _surface_turn()
+    admitted["runtime_session"][field] = value
+    before = deepcopy(admitted)
+    result = resolve_surface_presence(payload, shape, admitted_turn=admitted, request_id="request")
+    assert result["presence_state"] == "fallback"
+    assert result["reason"] == "invalid_runtime_binding"
+    assert admitted == before
+
+
+@pytest.mark.parametrize("target,field,value", [
+    ("runtime_turn", "turn_status", "completed"),
+    ("runtime_turn", "turn_status", {}),
+    ("runtime_turn", "completed_at", "2026-01-01T00:00:00Z"),
+    ("runtime_turn", "runtime_turn_id", ""),
+    ("runtime_turn", "runtime_session_id", "other"),
+    ("event", "runtime_turn_id", "other"),
+    ("event", "event_type", "turn_completed"),
+    ("event", "event_payload_json", {"request_id": "stale-request"}),
+    ("event", "event_payload_json", None),
+])
+def test_processing_rejects_stale_malformed_and_wrong_turn_events(target, field, value):
+    payload, shape, admitted = _surface_turn()
+    admitted[target][field] = value
+    assert resolve_surface_presence(
+        payload, shape, admitted_turn=admitted, request_id="request",
+    )["presence_state"] == "fallback"
+
+
+@pytest.mark.parametrize("surface", ["web", "voice", "alexa", "car"])
+def test_client_state_and_voice_labels_never_establish_capture(surface):
+    payload, shape, _ = _surface_turn(surface)
+    payload.update(presence_state="listening", outcome="intervention",
+                   runtime_presence={"presence_state": "ambient_listening"})
+    payload["surface_context"] = {"listening": True, "capture_active": True}
+    assert resolve_surface_presence(payload, shape)["presence_state"] in {"idle", "briefing"}
+    trace = _processing(surface)
+    trace["presence_state"] = "listening"
+    result = apply_surface_presence_outcome(trace, outcome="completed")
+    assert result["presence_state"] == "fallback"
+    assert result["reason"] == "listening_signal_unavailable"
+
+
+@pytest.mark.parametrize("outcome,state,source", [
+    ("completed", "idle", "response.completed"),
+    ("confirmation_pending", "awaiting_confirmation", "capabilities.pending_confirmation"),
+    ("intervention", "alerting", "interrupt_policy.response_selected"),
+    ("suppressed", "suppressed", "runtime_timing.result"),
+    ("privacy_withheld", "suppressed", "privacy_context.enforcement"),
+])
+def test_server_outcome_projection_is_bounded_and_does_not_mutate_input(outcome, state, source):
+    trace = _processing()
+    before = deepcopy(trace)
+    result = apply_surface_presence_outcome(trace, outcome=outcome)
+    assert result["presence_state"] == state
+    assert result["previous_state"] == "thinking"
+    assert result["source_fields"][-1] == source
+    assert trace == before
+    repeated = apply_surface_presence_outcome(result, outcome=outcome)
+    assert repeated["presence_state"] == state
+    assert repeated["transition_status"] == "unchanged"
+    assert len(repeated["source_fields"]) == len(set(repeated["source_fields"]))
+
+
+@pytest.mark.parametrize("outcome", ["completed", "confirmation_pending", "intervention"])
+def test_suppression_and_terminal_failure_cannot_be_reactivated(outcome):
+    for state in ("suppressed", "unavailable"):
+        trace = apply_surface_presence_outcome(
+            _processing(), outcome="privacy_withheld", unavailable=state == "unavailable",
+        )
+        result = apply_surface_presence_outcome(trace, outcome=outcome)
+        assert result["presence_state"] == state
+        assert result["transition_status"] == "rejected"
+        assert result["reason"] == "invalid_transition"
+
+
+@pytest.mark.parametrize("outcome", ["listening", "ambient_listening", "private-detail", {}, []])
+def test_unknown_and_malformed_transitions_fail_without_exposing_input(outcome):
+    result = apply_surface_presence_outcome(_processing(), outcome=outcome)
+    assert result["presence_state"] == "fallback"
+    assert result["reason"] == "invalid_presence_signal"
+    assert "private-detail" not in str(result)
+
+
+@pytest.mark.parametrize("change", [
+    {"presence_state": "PRIVATE-UNKNOWN"}, {"reason": "PRIVATE-REASON"},
+    {"source_fields": ["PRIVATE-SOURCE"]}, {"source_fields": [None]},
+    {"spoken_output": "false"}, {"fallback_active": 1}, {"fallback_active": True},
+])
+def test_malformed_trace_falls_back_without_raw_content(change):
+    result = apply_surface_presence_outcome({**_processing(), **change})
+    assert result["presence_state"] == "fallback"
+    assert "PRIVATE-" not in str(result)
+
+
+def test_failure_and_privacy_take_precedence_over_provider_fallback():
+    trace = _processing()
+    unavailable = apply_surface_presence_outcome(trace, fallback_active=True, unavailable=True)
+    assert unavailable["presence_state"] == "unavailable"
+    assert unavailable["fallback_active"] is False
+    suppressed = apply_surface_presence_outcome(
+        trace, fallback_active=True, outcome="privacy_withheld",
+    )
+    assert suppressed["presence_state"] == "suppressed"
+    assert suppressed["fallback_active"] is True
+    repeated = apply_surface_presence_outcome(suppressed, outcome="completed")
+    assert repeated["presence_state"] == "suppressed"
+    assert repeated["fallback_active"] is True
+
+
+def test_completed_provider_fallback_is_not_rewritten_as_ordinary_success():
+    trace = apply_surface_presence_outcome(_processing(), fallback_active=True)
+    result = apply_surface_presence_outcome(trace, outcome="completed")
+    assert result["presence_state"] == "fallback" and result["fallback_active"] is True
+    assert result["reason"] == "provider_fallback_used"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy,expected", [
+    ("answer_now", "idle"), ("pause_or_wait", "suppressed"),
+    ("yield_to_user", "suppressed"), ("close_turn", "unavailable"),
+])
+async def test_normal_orchestration_consumes_current_timing_outcome(tmp_path, policy, expected):
+    from test_orchestrate_flow import _run_timing_turn
+
+    result, runtime, provider, memory = await _run_timing_turn(tmp_path, policy=policy)
+    trace = memory.trace_calls[0]["payload"]
+    presence = trace["retrieval"]["prompt_assembly"]["surface_presence"]
+    assert presence["presence_state"] == expected
+    assert presence["previous_state"] == "thinking"
+    assert trace["owner_id"] == "owner" and trace["conversation_id"] == "conv-1"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    if policy != "answer_now":
+        assert provider.calls == []
+        assert "not_called" == result["selected_model"]
+
+
+@pytest.mark.asyncio
+async def test_only_selected_intervention_projects_alerting(tmp_path):
+    from test_orchestrate_flow import EnforceInterruptRuntime, _run_timing_turn
+
+    result, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=EnforceInterruptRuntime(), interrupt_policy_mode="enforce",
+    )
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["surface_presence"]["presence_state"] == "alerting"
+    assert trace["interrupt_policy"]["response_selected"] is True
+    assert result["answer"] == runtime.intervention_text
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pending_action_presentation_does_not_confirm_or_dispatch(tmp_path, monkeypatch):
+    from test_orchestrate_flow import (
+        ActionConnectorRegistry,
+        DisplaySettingConnector,
+        DisplaySettingOperations,
+        DisplaySettingRuntime,
+        FakeMemoryStore,
+        SequenceLiteLLM,
+        _display_chat_payload,
+        _install_display_capability,
+        _run_durable_work_chat,
+        _tool_completion,
+    )
+
+    _install_display_capability(monkeypatch)
+    runtime, memory = DisplaySettingRuntime(), FakeMemoryStore()
+    operations = DisplaySettingOperations()
+    provider = SequenceLiteLLM([_tool_completion(
+        "fixture_display_setting_apply", {"target": "fixture:display", "level": 3},
+    )])
+    result = await _run_durable_work_chat(
+        tmp_path, memory, provider=provider, runtime=runtime,
+        payload=_display_chat_payload("Apply display level 3."), capability_registry_enabled=True,
+        action_connector_registry=ActionConnectorRegistry((DisplaySettingConnector(operations),)),
+    )
+    assert result["pending_action"]["status"] == "pending_confirmation"
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["surface_presence"]["presence_state"] == "awaiting_confirmation"
+    assert runtime.confirmation_calls == [] and runtime.dispatch_count == 0
+    assert operations.apply_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_actual_privacy_withholding_projects_suppression(tmp_path):
+    from test_orchestrate_flow import FakeRuntime, _privacy_runtime_response, _run_timing_turn
+
+    runtime = FakeRuntime(privacy_context_response=_privacy_runtime_response(
+        surface_type="unknown_surface", privacy_zone="unknown", sensitive_detail_allowed=False,
+        screen_detail_allowed=False, redaction_required=True, safe_summary_required=True,
+    ))
+    result, runtime, _, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, privacy_context_enabled=True,
+    )
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["surface_presence"]["presence_state"] == "suppressed"
+    assert "privacy_context.enforcement" in trace["surface_presence"]["source_fields"]
+    assert result["answer"] and "Details cannot safely be shown" in result["answer"]
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.parametrize("context", [[], "capture", {"spoken_output": "true"},
+                                        {"active_task_mode": 1}, {"surface_type": {}}])
+def test_malformed_surface_metadata_cannot_invent_activity(context):
+    payload, shape, _ = _surface_turn()
+    payload["surface_context"] = context
+    result = resolve_surface_presence(payload, shape)
+    assert result["presence_state"] == "fallback"
+    assert result["reason"] == "invalid_presence_signal"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ['{"presence_state":"alerting"}', "Now listening."])
+async def test_model_text_does_not_select_surface_state(tmp_path, content):
+    from test_orchestrate_flow import FakeLiteLLM, _run_timing_turn
+
+    _, runtime, _, memory = await _run_timing_turn(tmp_path, provider=FakeLiteLLM(content=content))
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["surface_presence"]["presence_state"] == "idle"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
