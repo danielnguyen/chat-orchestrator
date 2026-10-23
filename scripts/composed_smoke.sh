@@ -5974,12 +5974,21 @@ run_voice_continuation_scenario() {
   wait_for_http http://127.0.0.1:14361/healthz
   local tag owner client conversation first response request trace session turn diagnostics
   local prior_id prior_turn calls expected_count current_surface first_answer expected_answer state
-  for tag in ${VOICE_CONTINUATION_CASES:-immediate deferred restart cross ordinary newer missing unpublished privacy denied corrupt abandoned fallback budget}; do
+  local declared_state first_request prior_event prior_messages prior_thread prior_work prior_session prior_input current_id
+  for tag in ${VOICE_CONTINUATION_CASES:-immediate deferred restart cross ordinary newer missing unpublished privacy denied corrupt abandoned fallback budget expandable}; do
     echo "Voice continuation starting: case=$tag"
     owner="owner-voice-continuation-$tag"; client="web:voice-continuation-$tag"
     current_surface=web
     conversation="$(create_conversation "$owner" "$client")"
-    configure_surface_permission "$owner" web true false false
+    declared_state=abbreviated
+    if [ "$tag" = expandable ]; then
+      # Per-owner permission and an explicit invitation in the first request are
+      # both necessary; permission alone must not override R46 suppression.
+      configure_surface_permission "$owner" web true true false
+      declared_state=expandable
+    else
+      configure_surface_permission "$owner" web true false false
+    fi
     provider_post /fixture/reset '{}' >/dev/null
     first_answer="Save the backup first. Then check the logs."
     if [ "$tag" = budget ]; then
@@ -5997,7 +6006,9 @@ run_voice_continuation_scenario() {
       queue_provider_answer "$first_answer" >/dev/null
       first="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" --arg tag "$tag" '
         {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"web",sensitivity:"private",
-         messages:[{role:"user",content:"What is the backup procedure?"}],
+         messages:[{role:"user",content:(if $tag=="expandable" then
+           "What is the backup procedure? Include a follow up suggestion."
+           else "What is the backup procedure?" end)}],
          surface_context:{interaction_mode:"voice_mediated",spoken_output:true,output_format:"speech",
            active_task_mode:($tag=="deferred"),allows_expansion:true,verbosity_target:"short"}}')")"
       request="$(jq -er .request_id <<<"$first")"
@@ -6009,11 +6020,49 @@ run_voice_continuation_scenario() {
       prior_turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
       prior_id="$(psql_exec -At -c "SELECT id FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND role='assistant' AND metadata->>'request_id'='$request';")"
       diagnostics="$(fetch_runtime_diagnostics "$session")"
-      jq -e --arg turn "$prior_turn" --arg message "$prior_id" '
+      if [ "$tag" = expandable ]; then
+        # Record the actual final policy before asserting reachability. Never
+        # replace a suppressed declaration or edit CR metadata to force a pass.
+        jq -c '.retrieval.prompt_assembly | {expandable_first_policy:{
+          restraint:.restraint.restraint_policy, proactive_suppressed:.runtime_presence.proactive_output_suppressed,
+          presence:.runtime_presence.presence_state, timing:.runtime_timing.result,
+          response_shape:.response_shape}}' <<<"$trace"
+        jq -e '.retrieval.prompt_assembly as $p
+          | $p.restraint.included and $p.restraint.proactive_output_suppressed==false
+            and $p.runtime_presence.status=="included" and $p.runtime_presence.presence_state=="active_conversation"
+            and $p.runtime_presence.proactive_output_suppressed==false
+            and $p.runtime_timing.status=="included" and $p.runtime_timing.result.timing_policy=="answer_now"
+            and $p.runtime_timing.result.expansion_allowed==true
+            and $p.response_shape.continuation_state=="expandable"
+            and $p.response_shape.resolved_shape.continuation_state=="expandable"
+            and $p.response_shape.resolved_shape.expansion_marker_allowed==true' <<<"$trace" >/dev/null
+      fi
+      jq -e --arg turn "$prior_turn" --arg message "$prior_id" --arg state "$declared_state" '
         [.events[]|select(.event_type=="turn_completed" and .runtime_turn_id==$turn)]
         | length==1 and .[0].event_payload_json.assistant_message_id==$message
-        and .[0].event_payload_json.response_continuation_state=="abbreviated"' <<<"$diagnostics" >/dev/null
+        and .[0].event_payload_json.response_continuation_state==$state' <<<"$diagnostics" >/dev/null
       jq -e '.retrieval.prompt_assembly.turn_state.response_continuation_recording=="confirmed"' <<<"$trace" >/dev/null
+      if [ "$tag" = expandable ]; then
+        first_request="$request"; prior_session="$session"
+        prior_input="$(jq -er .latest_turn.input_message_id <<<"$diagnostics")"
+        jq -e --arg owner "$owner" --arg conversation "$conversation" --arg turn "$prior_turn" '
+          .runtime_session.owner_id==$owner and .runtime_session.conversation_id==$conversation
+            and .runtime_session.surface=="web" and .latest_turn.runtime_turn_id==$turn
+            and ([.events[]|select(.runtime_turn_id==$turn and .event_type=="presence_evaluated")]
+              | length==1 and .[0].event_payload_json.proactive_output_suppressed==false)
+            and ([.events[]|select(.runtime_turn_id==$turn and .event_type=="timing_evaluated")]
+              | length==1 and .[0].event_payload_json.timing_policy=="answer_now"
+                and .[0].event_payload_json.expansion_allowed==true)' <<<"$diagnostics" >/dev/null
+        jq -e '.action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$first_request")" >/dev/null
+        jq -e '.calls|all(.kind|IN("chat","embedding","semantic_interpreter"))' <<<"$(fetch_provider_calls "$first_request")" >/dev/null
+        jq -e '[.calls[]|select(.kind=="chat")]|all(.tool_count==0)' <<<"$(fetch_provider_calls "$first_request")" >/dev/null
+        prior_event="$(jq -c --arg turn "$prior_turn" '[.events[]|select(.event_type=="turn_completed" and .runtime_turn_id==$turn)][0]' <<<"$diagnostics")"
+        prior_messages="$(psql_exec -At -c "SELECT json_agg(row_to_json(m) ORDER BY created_at,id) FROM messages m WHERE owner_id='$owner' AND conversation_id='$conversation';")"
+        prior_work="$(psql_exec -At -c "SELECT row_to_json(w) FROM work_items w WHERE owner_id='$owner' AND conversation_id='$conversation' AND request_id='$first_request' AND state='completed' AND assistant_message_id='$prior_id';")"
+        [ -n "$prior_work" ]
+        prior_thread="$(runtime_thread_snapshot "$owner" "$conversation")"
+        jq -e '.state=="idle" and .turn_statuses==["completed"]' <<<"$prior_thread" >/dev/null
+      fi
       if [ "$tag" = deferred ]; then
         jq -e '.latest_turn.continuation_state=="deferred_expansion"' <<<"$diagnostics" >/dev/null
       fi
@@ -6055,9 +6104,15 @@ PYFIXTURE
     if [ "$tag" = deferred ]; then
       runtime_backdate_thread "$owner" "$conversation" "$(python3 -c 'from datetime import timezone,datetime,timedelta; print((datetime.now(timezone.utc)-timedelta(seconds=360)).isoformat())')"
     fi
-    if [ "$tag" = restart ]; then
+    if [ "$tag" = restart ] || [ "$tag" = expandable ]; then
       docker compose -f "$COMPOSE" restart runtime >/dev/null
       docker compose -f "$COMPOSE" up -d --wait runtime >/dev/null
+      if [ "$tag" = expandable ]; then
+        [ "$diagnostics" = "$(fetch_runtime_diagnostics "$session")" ]
+        [ "$prior_thread" = "$(runtime_thread_snapshot "$owner" "$conversation")" ]
+        [ "$prior_messages" = "$(psql_exec -At -c "SELECT json_agg(row_to_json(m) ORDER BY created_at,id) FROM messages m WHERE owner_id='$owner' AND conversation_id='$conversation';")" ]
+        [ "$prior_work" = "$(psql_exec -At -c "SELECT row_to_json(w) FROM work_items w WHERE owner_id='$owner' AND conversation_id='$conversation' AND request_id='$first_request';")" ]
+      fi
     fi
     if [ "$tag" = cross ] || [ "$tag" = denied ]; then
       current_surface=alexa
@@ -6141,7 +6196,7 @@ PYFIXTURE
           and .retrieval.prompt_assembly.return_resume_context.source_message_ids==[$prior]
           and .retrieval.prompt_assembly.turn_state.return_after_gap.prior_terminal_turn_id==$turn' <<<"$trace" >/dev/null
         jq -e --arg content "$first_answer" '[.calls[]|select(.kind=="chat")]|all(.normalized_messages|any(.role=="assistant" and (.content|contains($content))))' <<<"$calls" >/dev/null
-        state=abbreviated; [ "$tag" != newer ] || state=""
+        state="$declared_state"; [ "$tag" != newer ] || state=""
         jq -e --arg request "$request" --arg prior "$prior_id" --arg state "$state" '
           [.events[]|select(.event_type=="turn_started" and .event_payload_json.request_id==$request)]
           | length==1 and .[0].event_payload_json.prior_assistant_message.assistant_message_id==$prior
@@ -6149,7 +6204,7 @@ PYFIXTURE
             (if $state=="" then {status:"unavailable",response_continuation_state:null}
              else {status:"available",response_continuation_state:$state} end)' <<<"$diagnostics" >/dev/null
         if [ -n "$state" ]; then
-          jq -e '.retrieval.prompt_assembly.response_shape.resumed_response_continuation_state=="abbreviated"' <<<"$trace" >/dev/null
+          jq -e --arg state "$state" '.retrieval.prompt_assembly.response_shape.resumed_response_continuation_state==$state' <<<"$trace" >/dev/null
         else
           jq -e '.retrieval.prompt_assembly.turn_state.prior_response_continuation.status=="unavailable"
             and (.retrieval.prompt_assembly.response_shape|has("resumed_response_continuation_state")|not)' <<<"$trace" >/dev/null
@@ -6157,6 +6212,43 @@ PYFIXTURE
       fi
     else
       jq -e --arg private "$first_answer" '.answer!=$private and .selected_model=="not_called"' <<<"$response" >/dev/null
+    fi
+    if [ "$tag" = expandable ]; then
+      turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+      [ "$session" = "$prior_session" ]; [ "$turn" != "$prior_turn" ]
+      current_id="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w ON w.work_id=m.work_id AND w.assistant_message_id=m.id WHERE m.owner_id='$owner' AND m.conversation_id='$conversation' AND m.client_id='$client' AND m.role='assistant' AND m.metadata->>'request_id'='$request' AND w.owner_id=m.owner_id AND w.request_id='$request' AND w.state='completed';")"
+      [ -n "$current_id" ]; [ "$current_id" != "$prior_id" ]
+      jq -e --arg owner "$owner" --arg conversation "$conversation" --arg client "$client" \
+        '.owner_id==$owner and .conversation_id==$conversation and .client_id==$client and .surface=="web"
+          and (.retrieval.prompt_assembly as $p
+            | $p.return_resume_context.response_continuation_state=="expandable"
+              and $p.return_resume_context.conversation_id==$conversation
+              and $p.turn_state.assistant_message_association=="confirmed"
+              and $p.turn_state.response_continuation_recording=="confirmed"
+              and $p.response_shape.continuation_state=="abbreviated"
+              and $p.response_shape.resolved_shape.expansion_marker_allowed==false
+              and $p.runtime_presence.proactive_output_suppressed==true)' <<<"$trace" >/dev/null
+      jq -e --arg owner "$owner" --arg conversation "$conversation" --arg session "$session" \
+        --arg turn "$turn" --arg request "$request" --arg message "$current_id" '
+        .runtime_session.owner_id==$owner and .runtime_session.conversation_id==$conversation
+          and .runtime_session.surface=="web" and .runtime_session.runtime_session_id==$session
+          and .latest_turn.runtime_session_id==$session and .latest_turn.runtime_turn_id==$turn
+          and .latest_turn.intent_class=="continuation" and .latest_turn.turn_status=="completed"
+          and ([.events[]|select(.event_type=="turn_started" and .runtime_turn_id==$turn
+            and .runtime_session_id==$session and .event_payload_json.request_id==$request)]|length)==1
+          and ([.events[]|select(.event_type=="turn_completed" and .runtime_turn_id==$turn)]
+            | length==1 and .[0].event_payload_json.request_id==$request
+              and .[0].event_payload_json.assistant_message_id==$message
+              and .[0].event_payload_json.response_continuation_state=="abbreviated")' <<<"$diagnostics" >/dev/null
+      [ "$prior_event" = "$(jq -c --arg turn "$prior_turn" '[.events[]|select(.event_type=="turn_completed" and .runtime_turn_id==$turn)][0]' <<<"$diagnostics")" ]
+      [ "$prior_messages" = "$(psql_exec -At -c "SELECT json_agg(row_to_json(m) ORDER BY created_at,id) FROM messages m WHERE owner_id='$owner' AND conversation_id='$conversation' AND id IN ('$prior_input','$prior_id');")" ]
+      [ "$prior_work" = "$(psql_exec -At -c "SELECT row_to_json(w) FROM work_items w WHERE owner_id='$owner' AND conversation_id='$conversation' AND request_id='$first_request';")" ]
+      [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation'),(SELECT count(*) FROM work_items WHERE owner_id='$owner' AND conversation_id='$conversation' AND state='completed'),(SELECT count(*) FROM conversations WHERE owner_id='$owner');")" = '4|2|1' ]
+      [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation' AND client_id='$client' AND role='user' AND metadata->>'surface'='web' AND id IN ('$prior_input','$(jq -er .latest_turn.input_message_id <<<"$diagnostics")');")" = 2 ]
+      jq -e '.action_events==0 and .confirmations==0' <<<"$(runtime_continuation_effect_counts "$owner" "$request")" >/dev/null
+      jq -e '.calls|all(.kind|IN("chat","embedding","semantic_interpreter"))' <<<"$calls" >/dev/null
+      jq -e '[.calls[]|select(.kind=="chat")]|all(.tool_count==0)' <<<"$calls" >/dev/null
+      echo "Voice continuation expandable: first_shape=expandable restart_unchanged=true prior_marker=expandable current_shape=abbreviated canonical_source=true historical_provenance_unchanged=true"
     fi
     if [ "$tag" = budget ]; then
       jq -e '.retrieval.prompt_assembly.turn_state.return_resume_context.reason_code=="required_history_omitted_by_budget"' <<<"$trace" >/dev/null
@@ -6170,7 +6262,10 @@ PYFIXTURE
     if [ -n "$evidence_file" ]; then
       jq -nc --arg scenario "$tag" --arg request "$request" --arg surface "$current_surface" --argjson calls "$expected_count" '
         {scenario:$scenario,request_id:$request,historical_surface:"web",current_surface:$surface,
-         provider_calls:$calls,canonical_persistence_equal:true,completed:true,thread_idle:true,action_events:0}' >>"$evidence_file"
+         provider_calls:$calls,canonical_persistence_equal:true,completed:true,thread_idle:true,action_events:0}
+         + (if $scenario=="expandable" then {first_response_marker:"expandable",restart_unchanged:true,
+           resumed_response_marker:"expandable",current_response_marker:"abbreviated",
+           historical_provenance_unchanged:true} else {} end)' >>"$evidence_file"
     fi
     echo "Voice continuation $tag: canonical_persistence=true providers=$expected_count completed=true idle=true actions=0 exact_prior_guard=true"
   done
