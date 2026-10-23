@@ -5064,6 +5064,11 @@ async def _resolve_companion_policy(
         warnings = ["malformed_companion_policy_warnings"]
     base_trace = {
         "attempted": True,
+        "turn_binding": {
+            "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+            "surface": surface, "runtime_session_id": session["runtime_session_id"],
+            "runtime_turn_id": turn["runtime_turn_id"],
+        },
         "profile_id": response.get("profile_id"),
         "profile_version": response.get("profile_version"),
         "contract_id": response.get("contract_id"),
@@ -8740,6 +8745,7 @@ async def _create_error_trace(
                         surface_presence_trace,
                         fallback_active=fallback_used,
                         unavailable=True,
+                        outcome="privacy_withheld" if enforce_privacy else None,
                     ),
                 },
             },
@@ -10707,6 +10713,7 @@ async def orchestrate_chat(
         timing_consumed = False
         return_retrieval_bundle = None
         return_context_dependency_unavailable = False
+        privacy_context = None
 
         interrupt_trace: dict[str, Any] | None = None
 
@@ -10714,6 +10721,9 @@ async def orchestrate_chat(
             answer: str, *, failed: bool, response_source: str = "runtime_timing",
         ) -> dict[str, Any]:
             interrupt_selected = response_source == "interrupt_policy"
+            privacy_withheld = privacy_context_enabled and privacy_policy_requires_suppression(
+                privacy_context
+            )
             outcome_trace = interrupt_trace if interrupt_selected else timing_trace
             success_status = "ok" if interrupt_selected else "degraded"
             failure_answer = "I couldn’t continue this turn safely. Please try again."
@@ -10774,7 +10784,8 @@ async def orchestrate_chat(
                 "response_shape": response_shape_trace,
                 "surface_presence": apply_surface_presence_outcome(
                     surface_presence_trace, unavailable=failed,
-                    outcome=("intervention" if interrupt_selected else "suppressed"
+                    outcome=("privacy_withheld" if privacy_withheld else "intervention"
+                             if interrupt_selected else "suppressed"
                              if (timing_result or {}).get("timing_policy") in {
                                  "pause_or_wait", "yield_to_user", "close_turn",
                              } else "completed"),
@@ -10920,7 +10931,6 @@ async def orchestrate_chat(
             normalized_external_config.get("exact_source_refs")
         )
         memory_hygiene_result = None
-        privacy_context = None
         privacy_context_trace = _privacy_context_disabled_trace()
         evidence_acquisition: EvidenceAcquisitionState | None = None
         diagnostic_response: str | None = None
@@ -11620,6 +11630,10 @@ async def orchestrate_chat(
             conversation_id=conversation_id,
             surface=surface,
             requested_scene=payload.get("requested_scene"),
+        )
+        surface_presence_trace = resolve_surface_presence(
+            {**effective_payload, "conversation_id": conversation_id}, response_shape,
+            admitted_turn=turn_response, request_id=request_id, companion_policy=companion_trace,
         )
         recall_context = _recall_context(
             surface=surface,

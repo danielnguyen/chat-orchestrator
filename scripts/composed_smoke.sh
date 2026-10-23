@@ -6099,6 +6099,7 @@ scene_conversation_turn() {
   session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
   turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
   if [ -n "$SCENE_SESSION" ]; then [ "$session" = "$SCENE_SESSION" ]; fi
+  assert_surface_presence_context "$trace" idle
   SCENE_SESSION="$session"; SCENE_PREVIOUS_TURN="$turn"
   diagnostics="$(fetch_runtime_diagnostics "$session")"
   assistant="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w ON w.assistant_message_id=m.id
@@ -6577,6 +6578,31 @@ PYFIXTURE
 }
 
 
+assert_surface_presence_context() {
+  local trace="$1" expected="$2"
+  jq -e --arg expected "$expected" '
+    . as $trace | .retrieval.prompt_assembly as $prompt | $prompt.surface_presence as $presence
+    | $presence.presence_state==$expected and $presence.previous_state=="thinking"
+      and $presence.turn_context=={
+        request_id:$trace.request_id,owner_id:$trace.owner_id,conversation_id:$trace.conversation_id,
+        surface:$trace.surface,runtime_session_id:$prompt.turn_state.runtime_session_id,
+        runtime_turn_id:$prompt.turn_state.runtime_turn_id}
+      and $presence.surface_type==$trace.surface
+      and (if $prompt.privacy_context.enforcement_required then
+        ($presence|has("companion")|not)
+        elif $prompt.companion_policy.included then
+        $presence.turn_context==$prompt.companion_policy.turn_binding
+        and $presence.companion==($prompt.companion_policy|{profile_id,profile_version,scene_id,scene_source})
+        else ($presence|has("companion")|not) end)' <<<"$trace" >/dev/null || {
+    jq -c --arg expected "$expected" '{expected:$expected,surface,request_id,
+      turn_state:(.retrieval.prompt_assembly.turn_state|{runtime_session_id,runtime_turn_id}),
+      presence:(.retrieval.prompt_assembly.surface_presence|del(.companion)),
+      privacy_enforced:.retrieval.prompt_assembly.privacy_context.enforcement_required,
+      companion_included:.retrieval.prompt_assembly.companion_policy.included}' <<<"$trace" >&2
+    return 1
+  }
+}
+
 run_surface_compatibility_scenario() {
   # Normalized text fixtures only: no native adapter, audio, playback or barge-in.
   local previous_restraint previous_privacy log_dir evidence_file=""
@@ -6595,6 +6621,7 @@ run_surface_compatibility_scenario() {
   local tag surface spoken owner client seed_client seed_surface conversation prior_id prior_turn
   local seed request response trace session turn diagnostics calls scope result before prior_fingerprint
   local text answer intent policy reason presence expected_calls historical_conversation budget_class cases
+  local projection
   cases="$(printenv SURFACE_COMPATIBILITY_CASES || true)"
   [ -n "$cases" ] || cases="unknown_help native_help unknown_yield native_yield unknown_continuation native_continuation unknown_missing unknown_unavailable unknown_denied native_first native_stale native_deferred unknown_privacy native_malformed"
   for tag in $cases; do
@@ -6769,6 +6796,12 @@ PYCOMPAT
     [ "$(psql_exec -At -c "SELECT count(*) FROM work_items WHERE owner_id='$owner' AND request_id='$request' AND state='completed';")" = 1 ]
     session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
     turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
+    projection=idle
+    if [ "$spoken" = true ]; then projection=briefing; fi
+    # Restrictive resolved privacy withholds retained context even when a safe
+    # clarification completes the turn. Timing yield also suppresses output.
+    case "$tag" in *_yield|unknown_privacy) projection=suppressed ;; esac
+    assert_surface_presence_context "$trace" "$projection"
     diagnostics="$(fetch_runtime_diagnostics "$session")"
     jq -c --arg tag "$tag" --arg turn "$turn" '
       {scenario:$tag,intent:.latest_turn.intent_class,timing:.latest_turn.timing_policy,
@@ -6839,6 +6872,109 @@ PYCOMPAT
     fi
     echo "Surface compatibility $tag: intent=$intent timing=$policy presence=$presence answer_provider=$expected_calls canonical=true idle=true actions=0"
   done
+  # Reuse the same normalized surface harness and deterministic scene-policy provider.
+  # One durable thread, distinct clients, and CR-owned sessions; no adapter state owner.
+  local policies='[]' scene content profile source context fingerprint count=0
+  local web_session="" surface_session
+  owner=owner-surface-composition
+  conversation="$(create_conversation "$owner" web:composition)"
+  profile="$(curl -fsS http://127.0.0.1:14371/v1/companion/profile/active | jq -c '{profile_id,profile_version}')"
+  for scene in general planning work_triage; do
+    content="$(curl -fsS "http://127.0.0.1:14371/v1/companion/scene/$scene" | jq -er .content)"
+    case "$scene" in
+      general) answer='Choose one bounded next step.' ;;
+      planning) answer='Clarify the goal, then sequence the next steps.' ;;
+      work_triage) answer='Identify the owner, risk, and dependency before escalation.' ;;
+    esac
+    policies="$(jq -c --arg scene "$scene" --arg content "$content" --arg answer "$answer" \
+      '.+[{scene_id:$scene,content:$content,answer:$answer}]' <<<"$policies")"
+  done
+  docker compose -f "$COMPOSE" stop orchestrator >/dev/null
+  SCENE_ORCHESTRATOR="$(docker compose -f "$COMPOSE" run -d --no-deps --service-ports \
+    -e COGNITIVE_RUNTIME_COMPANION_ENABLED=true -e COGNITIVE_RUNTIME_RESTRAINT_ENABLED=true orchestrator)"
+  wait_for_http http://127.0.0.1:14361/healthz
+  for tag in chat telegram alexa car voice active unknown; do
+    surface=web; spoken=false; scene=general; source=requested_scene
+    context='{"interaction_mode":"text","spoken_output":false,"active_task_mode":false,"surface_type":"car"}'
+    case "$tag" in
+      chat) source=general ;;
+      telegram) surface=telegram; scene=planning ;;
+      alexa|car) surface="$tag"; spoken=true ;;
+      voice) spoken=true; scene=planning ;;
+      active)
+        scene=work_triage; source=runtime_interaction_mode
+        cr_post /v1/runtime/state/update "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+          '{request_id:"surface-inferred-scene",owner_id:$owner,conversation_id:$conversation,surface:"web",
+            updates:{interaction_mode:"work_triage"}}')" | jq -e '.runtime_state.active_scene==null' >/dev/null ;;
+      unknown) surface=unknown_compatibility_fixture; source=fallback_general ;;
+    esac
+    context="$(jq -c --argjson spoken "$spoken" --arg tag "$tag" '.spoken_output=$spoken
+      | .interaction_mode=(if $spoken then "voice_mediated" else "text" end)
+      | .output_format=(if $spoken then "speech" else "plain_text" end)
+      | .active_task_mode=($tag=="active" or $tag=="car")' <<<"$context")"
+    client="$surface:composition-$tag"
+    configure_surface_permission "$owner" "$surface" true false false
+    fingerprint="$(psql_exec -At -c "SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages
+      WHERE owner_id='$owner' AND conversation_id='$conversation' ORDER BY created_at,id LIMIT $((count*2))) m;")"
+    provider_post /fixture/reset '{}' >/dev/null
+    provider_post /fixture/next-answer "$(jq -nc --argjson policies "$policies" '{scene_policies:$policies}')" >/dev/null
+    response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$surface" \
+      --arg conversation "$conversation" --arg scene "$scene" --arg tag "$tag" --argjson context "$context" '
+      {owner_id:$owner,client_id:$client,surface:$surface,conversation_id:$conversation,sensitivity:"private",
+       messages:[{role:"user",content:"What is the next step?"}],surface_context:$context}
+      + (if $tag=="chat" or $tag=="active" then {} else
+        {requested_scene:(if $tag=="unknown" then "unknown-private-scene" else $scene end)} end)')")"
+    request="$(jq -er .request_id <<<"$response")"; trace="$(fetch_trace "$request")"
+    calls="$(fetch_provider_calls "$request")"
+    answer="$(jq -r --arg scene "$scene" '.[]|select(.scene_id==$scene)|.answer' <<<"$policies")"
+    jq -e --arg answer "$answer" --arg conversation "$conversation" '.status=="ok" and .answer==$answer
+      and .conversation_id==$conversation and .pending_action==null' <<<"$response" >/dev/null || {
+      jq -c --arg tag "$tag" '{scenario:$tag,status,selected_model,answer_length:(.answer|length)}' <<<"$response" >&2
+      jq -c '.retrieval.prompt_assembly|{timing:.runtime_timing.result.timing_policy,
+        companion:(.companion_policy|{status,included})}' <<<"$trace" >&2
+      return 1
+    }
+    projection=idle; if [ "$spoken" = true ]; then projection=briefing; fi
+    assert_surface_presence_context "$trace" "$projection"
+    jq -e --argjson profile "$profile" --arg scene "$scene" --arg source "$source" \
+      --argjson context "$context" '.retrieval.prompt_assembly as $p
+      | ($p.surface_presence.companion|{profile_id,profile_version})==$profile
+        and $p.surface_presence.companion.scene_id==$scene and $p.surface_presence.companion.scene_source==$source
+        and $p.surface_presence.spoken_output==$context.spoken_output
+        and $p.surface_presence.active_task_mode==$context.active_task_mode
+        and $p.response_shape.resolved_shape.spoken_output==$context.spoken_output
+        and $p.response_shape.resolved_shape.active_task_mode==$context.active_task_mode' <<<"$trace" >/dev/null
+    jq -e --arg scene "$scene" --argjson policies "$policies" '
+      [.calls[]|select(.kind=="chat")]|length==1 and (.[0]|.status=="ok" and .tool_count==0
+        and .scene_policy_match.scene_id==$scene
+        and (($policies[]|select(.scene_id==$scene)|.content) as $content
+          | any(.normalized_messages[]; .role=="system" and .content==$content)))' <<<"$calls" >/dev/null
+    if [ "$spoken" = true ]; then
+      jq -e '.calls|any(.kind=="chat" and any(.normalized_messages[];
+        .role=="system" and (.content|contains("Write for spoken delivery with plain, speakable text."))))' <<<"$calls" >/dev/null
+    fi
+    assert_persisted_answer_matches "$conversation" "$request" "$answer"
+    assert_surface_lifecycle_turn "$response" "$owner" "$conversation" "$surface" "$client" active 1 "$answer"
+    surface_session="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_session_id <<<"$trace")"
+    if [ "$surface" = web ]; then
+      if [ -n "$web_session" ]; then [ "$surface_session" = "$web_session" ]; fi
+      web_session="$surface_session"
+    else
+      [ "$surface_session" != "$web_session" ]
+    fi
+    [ "$fingerprint" = "$(psql_exec -At -c "SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages
+      WHERE owner_id='$owner' AND conversation_id='$conversation' ORDER BY created_at,id LIMIT $((count*2))) m;")" ]
+    count=$((count+1))
+    [ "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE owner_id='$owner' AND conversation_id='$conversation';")" = "$((count*2))" ]
+    if [ -n "$evidence_file" ]; then
+      jq -nc --arg tag "$tag" --arg request "$request" --argjson presence "$(jq -c .retrieval.prompt_assembly.surface_presence <<<"$trace")" \
+        '{scenario:("composition_"+$tag),request_id:$request,surface_presence:$presence,
+          provider_policy_matched:true,canonical_persistence_equal:true,historical_provenance_unchanged:true,
+          action_events:0,confirmations:0}' >>"$evidence_file"
+    fi
+    echo "Surface composition $tag: state=$projection scene=$scene source=$source canonical=true provider_policy_matched=true actions=0"
+  done
+  docker rm -f "$SCENE_ORCHESTRATOR" >/dev/null; SCENE_ORCHESTRATOR=""
   COMPOSED_RESTRAINT_ENABLED="$previous_restraint" COMPOSED_PRIVACY_CONTEXT_ENABLED="$previous_privacy" \
     docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http http://127.0.0.1:14361/healthz
@@ -6847,13 +6983,16 @@ PYCOMPAT
 assert_surface_lifecycle_turn() {
   local response="$1" owner="$2" conversation="$3" surface="$4" client="$5"
   local status="$6" expected_calls="$7" request trace session turn diagnostics message input calls
+  local expected_answer="${8:-13.}"
   jq -e --arg conversation "$conversation" '.status=="ok" and .conversation_id==$conversation
     and .pending_action==null' <<<"$response" >/dev/null
   request="$(jq -er .request_id <<<"$response")"
   trace="$(fetch_trace "$request")"
   jq -e --arg owner "$owner" --arg conversation "$conversation" --arg surface "$surface" --arg client "$client" \
     '.owner_id==$owner and .conversation_id==$conversation and .surface==$surface and .client_id==$client' <<<"$trace" >/dev/null
-  if [ "$expected_calls" = 1 ]; then jq -e '.answer=="13."' <<<"$response" >/dev/null; fi
+  if [ "$expected_calls" = 1 ]; then
+    jq -e --arg answer "$expected_answer" '.answer==$answer' <<<"$response" >/dev/null
+  fi
   session="$(jq -er '(.retrieval.prompt_assembly // .prompt).turn_state.runtime_session_id' <<<"$trace")"
   turn="$(jq -er '(.retrieval.prompt_assembly // .prompt).turn_state.runtime_turn_id' <<<"$trace")"
   diagnostics="$(fetch_runtime_diagnostics "$session")"
