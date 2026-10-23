@@ -10771,7 +10771,14 @@ async def orchestrate_chat(
                 "runtime_presence": runtime_presence_trace,
                 "interaction_governance": interaction_governance_trace,
                 "restraint": restraint_trace, "situated_presence": situated_presence_trace,
-                "response_shape": response_shape_trace, "surface_presence": surface_presence_trace,
+                "response_shape": response_shape_trace,
+                "surface_presence": apply_surface_presence_outcome(
+                    surface_presence_trace, unavailable=failed,
+                    outcome=("intervention" if interrupt_selected else "suppressed"
+                             if (timing_result or {}).get("timing_policy") in {
+                                 "pause_or_wait", "yield_to_user", "close_turn",
+                             } else "completed"),
+                ),
                 "history_followup": history_followup_trace,
                 "return_resume_context": turn_state_trace.get("return_resume_context",
                                                               {"status": "not_requested"}),
@@ -10869,7 +10876,10 @@ async def orchestrate_chat(
                 timing_trace["acknowledgment_delivery"] = "final_response_only"
             return None
 
-        surface_presence_trace = resolve_surface_presence(effective_payload, response_shape)
+        surface_presence_trace = resolve_surface_presence(
+            {**effective_payload, "conversation_id": conversation_id}, response_shape,
+            admitted_turn=turn_response, request_id=request_id,
+        )
         routing_policy = profile.get("routing_policy", {}) or {}
         sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
         profile_local_only = bool(routing_policy.get("local_only", False))
@@ -14703,6 +14713,8 @@ async def orchestrate_chat(
         prompt.trace["surface_presence"] = apply_surface_presence_outcome(
             surface_presence_trace,
             fallback_active=fallback_used,
+            outcome=("privacy_withheld" if privacy_boundary.enforced else "confirmation_pending"
+                     if pending_action is not None else "completed"),
         )
         persisted_prompt_trace = (
             sanitize_prompt_trace_for_privacy(prompt.trace, retrieval_bundle)
