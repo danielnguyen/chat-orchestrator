@@ -6798,9 +6798,9 @@ PYCOMPAT
     turn="$(jq -er .retrieval.prompt_assembly.turn_state.runtime_turn_id <<<"$trace")"
     projection=idle
     if [ "$spoken" = true ]; then projection=briefing; fi
-    # Missing retained context produces a clarification, not a fabricated
-    # privacy-withheld outcome. Only the selected timing yield suppresses here.
-    case "$tag" in *_yield) projection=suppressed ;; esac
+    # Restrictive resolved privacy withholds retained context even when a safe
+    # clarification completes the turn. Timing yield also suppresses output.
+    case "$tag" in *_yield|unknown_privacy) projection=suppressed ;; esac
     assert_surface_presence_context "$trace" "$projection"
     diagnostics="$(fetch_runtime_diagnostics "$session")"
     jq -c --arg tag "$tag" --arg turn "$turn" '

@@ -572,3 +572,122 @@ def test_identity_scene_and_surface_never_override_authoritative_outcome(outcome
         unavailable = apply_surface_presence_outcome(trace, unavailable=True)
         assert fallback["presence_state"] == "fallback"
         assert unavailable["presence_state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("assistant_failure", [False, True])
+async def test_server_owned_private_continuation_redacts_persisted_presence(
+    tmp_path, assistant_failure,
+):
+    from test_orchestrate_flow import (
+        ExactAnswerMemory,
+        ExactAnswerRuntime,
+        _base_payload,
+        _privacy_runtime_response,
+        _run_timing_turn,
+    )
+
+    class Memory(ExactAnswerMemory):
+        async def add_message(self, **kwargs):
+            if assistant_failure and kwargs["role"] == "assistant":
+                raise RuntimeError("assistant persistence unavailable")
+            return await super().add_message(**kwargs)
+
+    runtime = ExactAnswerRuntime()
+    runtime.privacy_context_response = _privacy_runtime_response(
+        surface_type="unknown_surface", privacy_zone="unknown", sensitive_detail_allowed=False,
+        screen_detail_allowed=False, redaction_required=True, safe_summary_required=True,
+    )
+    result, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=Memory(), companion_policy_enabled=True,
+        privacy_context_enabled=True, payload=_base_payload(
+            conversation_id="conv-1", surface="web",
+            messages=[{"role": "user", "content": "Tell me more."}],
+        ),
+    )
+    trace = memory.trace_calls[-1]["payload"]
+    prompt = trace["retrieval"]["prompt_assembly"]
+    presence = prompt["surface_presence"]
+    assert len(runtime.companion_calls) == len(runtime.privacy_context_calls) == 1
+    assert (runtime.call_order.index("companion_policy")
+            < runtime.call_order.index("privacy_context"))
+    assert prompt["return_resume_context"]["status"] == "unavailable"
+    assert presence["presence_state"] == ("unavailable" if assistant_failure else "suppressed")
+    assert "companion" not in presence
+    assert "companion_policy.validated" not in presence["source_fields"]
+    assert "profile_id" not in str(presence) and "scene_id" not in str(presence)
+    assert presence["turn_context"]["request_id"] == result["request_id"]
+    assert presence["turn_context"]["owner_id"] == trace["owner_id"] == "owner"
+    assert presence["turn_context"]["conversation_id"] == trace["conversation_id"] == "conv-1"
+    for field in ("runtime_session_id", "runtime_turn_id"):
+        assert presence["turn_context"][field] == prompt["turn_state"][field]
+    assert provider.calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assistants = [m["content"] for m in memory.added_messages if m["role"] == "assistant"]
+    if assistant_failure:
+        assert result["status"] == "failed" and assistants == []
+        assert runtime.turn_complete_calls[-1]["turn_status"] == "abandoned"
+    else:
+        assert result["answer"] == (
+            "I don't have enough retained context to continue that safely. "
+            "Tell me what you'd like me to continue from."
+        )
+        assert assistants == [result["answer"]]
+        assert runtime.turn_complete_calls[-1]["turn_status"] == "completed"
+    assert "backup procedure" not in str(trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy,state", [
+    ("yield_to_user", "suppressed"), ("close_turn", "unavailable"),
+])
+async def test_early_timing_stop_before_privacy_resolution_is_safe(tmp_path, policy, state):
+    from test_orchestrate_flow import _run_timing_turn
+
+    _, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, policy=policy, companion_policy_enabled=True, privacy_context_enabled=True,
+    )
+    presence = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["surface_presence"]
+    assert presence["presence_state"] == state and provider.calls == []
+    assert runtime.privacy_context_calls == []
+    assert "privacy_context.enforcement" not in presence["source_fields"]
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolved_privacy_is_not_reused_by_another_request(tmp_path):
+    from test_orchestrate_flow import (
+        ExactAnswerMemory,
+        ExactAnswerRuntime,
+        _privacy_runtime_response,
+        _run_timing_turn,
+    )
+
+    runtime = ExactAnswerRuntime()
+    runtime.privacy_context_response = _privacy_runtime_response(
+        surface_type="unknown_surface", privacy_zone="unknown", sensitive_detail_allowed=False,
+        screen_detail_allowed=False, redaction_required=True, safe_summary_required=True,
+    )
+    _, _, _, first = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=ExactAnswerMemory(),
+        privacy_context_enabled=True, companion_policy_enabled=True,
+    )
+    presence = first.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["surface_presence"]
+    assert presence["presence_state"] == "suppressed" and "companion" not in presence
+    _, _, provider, second = await _run_timing_turn(
+        tmp_path, runtime=runtime, policy="yield_to_user",
+        privacy_context_enabled=True, companion_policy_enabled=True,
+    )
+    assert len(runtime.privacy_context_calls) == 1 and provider.calls == []
+    presence = second.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["surface_presence"]
+    assert presence["presence_state"] == "suppressed" and "companion" in presence
+    assert "privacy_context.enforcement" not in presence["source_fields"]
+    result, _, provider, third = await _run_timing_turn(
+        tmp_path, runtime=runtime, memory=ExactAnswerMemory(), companion_policy_enabled=True,
+    )
+    presence = third.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["surface_presence"]
+    assert presence["presence_state"] == "idle" and "companion" in presence
+    assert "privacy_context.enforcement" not in presence["source_fields"]
+    assert len(runtime.privacy_context_calls) == 1 and len(provider.calls) == 1
+    assert result["answer"] == third.added_messages[-1]["content"] == "hello"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []

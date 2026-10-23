@@ -10713,6 +10713,7 @@ async def orchestrate_chat(
         timing_consumed = False
         return_retrieval_bundle = None
         return_context_dependency_unavailable = False
+        privacy_context = None
 
         interrupt_trace: dict[str, Any] | None = None
 
@@ -10720,6 +10721,9 @@ async def orchestrate_chat(
             answer: str, *, failed: bool, response_source: str = "runtime_timing",
         ) -> dict[str, Any]:
             interrupt_selected = response_source == "interrupt_policy"
+            privacy_withheld = privacy_context_enabled and privacy_policy_requires_suppression(
+                privacy_context
+            )
             outcome_trace = interrupt_trace if interrupt_selected else timing_trace
             success_status = "ok" if interrupt_selected else "degraded"
             failure_answer = "I couldn’t continue this turn safely. Please try again."
@@ -10780,7 +10784,8 @@ async def orchestrate_chat(
                 "response_shape": response_shape_trace,
                 "surface_presence": apply_surface_presence_outcome(
                     surface_presence_trace, unavailable=failed,
-                    outcome=("intervention" if interrupt_selected else "suppressed"
+                    outcome=("privacy_withheld" if privacy_withheld else "intervention"
+                             if interrupt_selected else "suppressed"
                              if (timing_result or {}).get("timing_policy") in {
                                  "pause_or_wait", "yield_to_user", "close_turn",
                              } else "completed"),
@@ -10926,7 +10931,6 @@ async def orchestrate_chat(
             normalized_external_config.get("exact_source_refs")
         )
         memory_hygiene_result = None
-        privacy_context = None
         privacy_context_trace = _privacy_context_disabled_trace()
         evidence_acquisition: EvidenceAcquisitionState | None = None
         diagnostic_response: str | None = None
