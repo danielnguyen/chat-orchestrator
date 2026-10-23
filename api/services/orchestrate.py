@@ -5064,6 +5064,11 @@ async def _resolve_companion_policy(
         warnings = ["malformed_companion_policy_warnings"]
     base_trace = {
         "attempted": True,
+        "turn_binding": {
+            "request_id": request_id, "owner_id": owner_id, "conversation_id": conversation_id,
+            "surface": surface, "runtime_session_id": session["runtime_session_id"],
+            "runtime_turn_id": turn["runtime_turn_id"],
+        },
         "profile_id": response.get("profile_id"),
         "profile_version": response.get("profile_version"),
         "contract_id": response.get("contract_id"),
@@ -8740,6 +8745,7 @@ async def _create_error_trace(
                         surface_presence_trace,
                         fallback_active=fallback_used,
                         unavailable=True,
+                        outcome="privacy_withheld" if enforce_privacy else None,
                     ),
                 },
             },
@@ -11620,6 +11626,10 @@ async def orchestrate_chat(
             conversation_id=conversation_id,
             surface=surface,
             requested_scene=payload.get("requested_scene"),
+        )
+        surface_presence_trace = resolve_surface_presence(
+            {**effective_payload, "conversation_id": conversation_id}, response_shape,
+            admitted_turn=turn_response, request_id=request_id, companion_policy=companion_trace,
         )
         recall_context = _recall_context(
             surface=surface,

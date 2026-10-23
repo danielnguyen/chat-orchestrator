@@ -32,7 +32,7 @@ _SOURCES = {
     "surface_context.active_task_mode", "response_shape.resolved_shape", "model_call.fallback",
     "runtime_turn.turn_status", "response.completed", "capabilities.pending_confirmation",
     "interrupt_policy.response_selected", "runtime_timing.result", "privacy_context.enforcement",
-    "surface_presence.transition",
+    "surface_presence.transition", "companion_policy.validated",
 }
 _REASONS = {
     "default_completed_turn", "spoken_output_surface", "provider_fallback_used", "request_failed",
@@ -40,6 +40,29 @@ _REASONS = {
     "policy_output_withheld", "unknown_presence_state", "invalid_presence_signal",
     "invalid_runtime_binding", "invalid_transition", "listening_signal_unavailable",
 }
+
+
+class PresenceTurnContext(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str = Field(min_length=1, max_length=120)
+
+
+class PresenceCompanionContext(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    profile_id: str = Field(min_length=1, max_length=120)
+    profile_version: int = Field(ge=1)
+    scene_id: str = Field(min_length=1, max_length=64)
+    scene_source: Literal[
+        "requested_scene", "runtime_state", "runtime_interaction_mode",
+        "general", "fallback_general",
+    ]
 
 
 class SurfacePresence(BaseModel):
@@ -52,6 +75,8 @@ class SurfacePresence(BaseModel):
     fallback_active: bool = False
     reason: str | None = None
     source_fields: list[str] = Field(default_factory=list)
+    turn_context: PresenceTurnContext | None = None
+    companion: PresenceCompanionContext | None = None
 
 
 def _normalize_surface_type(value: Any) -> str | None:
@@ -132,6 +157,8 @@ def surface_presence_trace_metadata(
         "spoken_output": presence.spoken_output,
         "active_task_mode": presence.active_task_mode,
         "fallback_active": presence.fallback_active,
+        **({"turn_context": presence.turn_context.model_dump()} if presence.turn_context else {}),
+        **({"companion": presence.companion.model_dump()} if presence.companion else {}),
     }
 
 
@@ -141,6 +168,7 @@ def resolve_surface_presence(
     *,
     admitted_turn: dict[str, Any] | None = None,
     request_id: str | None = None,
+    companion_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(response_shape, ResponseShape):
         return _project(SurfacePresence(), "fallback", "invalid_presence_signal",
@@ -162,15 +190,12 @@ def resolve_surface_presence(
         return _project(SurfacePresence(), "fallback", "invalid_presence_signal",
                         "surface_presence.transition")
 
-    surface_type = _normalize_surface_type(surface_context.get("surface_type"))
-    if surface_type is None:
-        surface_type = _normalize_surface_type(payload.get("surface"))
+    # Delivery hints cannot relabel the admitted integration surface.
+    surface_type = _normalize_surface_type(payload.get("surface"))
 
     source_fields: list[str] = []
     if payload.get("surface"):
         source_fields.append("surface")
-    if surface_context.get("surface_type") is not None:
-        source_fields.append("surface_context.surface_type")
     if surface_context.get("spoken_output") is not None:
         source_fields.append("surface_context.spoken_output")
     if surface_context.get("active_task_mode") is not None:
@@ -201,6 +226,30 @@ def resolve_surface_presence(
         if not _valid_admission(payload, admitted_turn, request_id):
             return _project(presence, "fallback", "invalid_runtime_binding",
                             "surface_presence.transition")
+        try:
+            presence.turn_context = PresenceTurnContext(
+                request_id=request_id, owner_id=payload["owner_id"],
+                conversation_id=payload["conversation_id"],
+                surface=payload.get("surface", "unknown"),
+                runtime_session_id=admitted_turn["runtime_session"]["runtime_session_id"],
+                runtime_turn_id=admitted_turn["runtime_turn"]["runtime_turn_id"],
+            )
+        except ValidationError:
+            return _project(presence, "fallback", "invalid_runtime_binding",
+                            "surface_presence.transition")
+        # Only the internal, already validated compile result can supply identity.
+        # An omitted/failed policy never borrows labels from client scene/context.
+        if (isinstance(companion_policy, dict) and companion_policy.get("included") is True
+                and companion_policy.get("status") == "included"
+                and companion_policy.get("turn_binding") == presence.turn_context.model_dump()):
+            try:
+                presence.companion = PresenceCompanionContext.model_validate({
+                    key: companion_policy.get(key) for key in PresenceCompanionContext.model_fields
+                })
+            except ValidationError:
+                pass
+            else:
+                presence.source_fields.append("companion_policy.validated")
         return {
             **_project(presence.model_copy(update={"presence_state": "idle"}),
                        "thinking", "admitted_turn_processing", "runtime_turn.turn_status"),
@@ -246,6 +295,11 @@ def apply_surface_presence_outcome(
             return _project(presence, "fallback", "provider_fallback_used", "model_call.fallback")
         return _project(presence, "fallback", "unknown_presence_state",
                         "surface_presence.transition")
+    if outcome == "privacy_withheld":
+        presence.companion = None
+        presence.source_fields = [
+            s for s in presence.source_fields if s != "companion_policy.validated"
+        ]
     if unavailable:
         presence.fallback_active = False
         return _project(presence, "unavailable", "request_failed", "model_call.fallback")

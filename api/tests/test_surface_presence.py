@@ -437,3 +437,138 @@ async def test_model_text_does_not_select_surface_state(tmp_path, content):
     trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["surface_presence"]["presence_state"] == "idle"
     assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+def _presence_policy(payload, admitted):
+    return {
+        "status": "included", "included": True, "profile_id": "canonical", "profile_version": 2,
+        "scene_id": "planning", "scene_source": "runtime_state",
+        "turn_binding": {
+            "request_id": "request", "owner_id": payload["owner_id"],
+            "conversation_id": payload["conversation_id"], "surface": payload["surface"],
+            "runtime_session_id": admitted["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": admitted["runtime_turn"]["runtime_turn_id"],
+        },
+    }
+
+
+@pytest.mark.parametrize("surface,spoken,active,state", [
+    ("web", False, False, "idle"), ("telegram", False, False, "idle"),
+    ("alexa", True, False, "briefing"), ("car", True, True, "briefing"),
+    ("web", True, False, "briefing"), ("web", False, True, "idle"),
+    ("unknown", False, False, "idle"),
+])
+def test_presence_composes_validated_identity_without_changing_activity(
+    surface, spoken, active, state,
+):
+    payload, shape, admitted = _surface_turn(surface)
+    payload["requested_scene"] = "CLIENT-PRIVATE-SCENE"
+    payload["surface_context"] = {"surface_type": "alexa", "profile_id": "client-profile"}
+    shape = shape.model_copy(update={"spoken_output": spoken, "active_task_mode": active})
+    policy = _presence_policy(payload, admitted)
+    trace = resolve_surface_presence(
+        payload, shape, admitted_turn=admitted, request_id="request", companion_policy=policy,
+    )
+    result = apply_surface_presence_outcome(trace, outcome="completed")
+    assert result["presence_state"] == state
+    assert result["companion"] == {
+        "profile_id": "canonical", "profile_version": 2,
+        "scene_id": "planning", "scene_source": "runtime_state",
+    }
+    assert result["turn_context"] == policy["turn_binding"]
+    assert result["surface_type"] == (None if surface == "unknown" else surface)
+    assert result["active_task_mode"] is active
+    assert "CLIENT-PRIVATE" not in str(result) and "client-profile" not in str(result)
+
+
+@pytest.mark.parametrize("field", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id",
+])
+def test_wrong_turn_companion_context_is_omitted(field):
+    payload, shape, admitted = _surface_turn()
+    policy = _presence_policy(payload, admitted)
+    policy["turn_binding"][field] = "PRIVATE-WRONG-BINDING"
+    result = resolve_surface_presence(
+        payload, shape, admitted_turn=admitted, request_id="request", companion_policy=policy,
+    )
+    assert result["presence_state"] == "thinking" and "companion" not in result
+    assert "PRIVATE-WRONG" not in str(result)
+
+
+@pytest.mark.parametrize("change", [
+    {"included": False}, {"status": "denied"}, {"profile_version": True},
+    {"profile_version": 0}, {"profile_id": None}, {"scene_id": {}},
+    {"scene_source": "PRIVATE-CLIENT-SOURCE"}, {"turn_binding": None},
+])
+def test_missing_or_malformed_companion_does_not_invent_identity(change):
+    payload, shape, admitted = _surface_turn()
+    policy = {**_presence_policy(payload, admitted), **change}
+    result = resolve_surface_presence(
+        payload, shape, admitted_turn=admitted, request_id="request", companion_policy=policy,
+    )
+    assert "companion" not in result and "PRIVATE-CLIENT" not in str(result)
+    assert result["presence_state"] == "thinking"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "unavailable", "denied", "malformed", "wrong_owner"])
+async def test_orchestration_binds_only_validated_current_companion_policy(tmp_path, failure):
+    from test_orchestrate_flow import FakeRuntime, _run_timing_turn
+
+    runtime = FakeRuntime(companion_error=RuntimeError(failure) if failure in {
+        "unavailable", "denied",
+    } else None)
+    if failure == "malformed":
+        runtime.companion_response["profile_version"] = False
+    if failure == "wrong_owner":
+        runtime.companion_response["runtime_state"]["owner_id"] = "other-private-owner"
+    result, runtime, provider, memory = await _run_timing_turn(
+        tmp_path, runtime=runtime, companion_policy_enabled=True,
+    )
+    prompt = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    presence, policy = prompt["surface_presence"], prompt["companion_policy"]
+    assert presence["presence_state"] == "idle"
+    assert result["answer"] == memory.added_messages[-1]["content"] == "hello"
+    assert len(provider.calls) == 1
+    if failure is None:
+        assert presence["turn_context"] == policy["turn_binding"]
+        assert presence["companion"] == {key: policy[key] for key in (
+            "profile_id", "profile_version", "scene_id", "scene_source",
+        )}
+        system = [m["content"] for m in provider.calls[0]["messages"] if m["role"] == "system"]
+        assert "scene text" in system and "profile companion text" in system
+    else:
+        assert "companion" not in presence and policy["included"] is False
+    assert result.get("pending_action") is None
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.parametrize("outcome,state", [
+    ("privacy_withheld", "suppressed"), ("suppressed", "suppressed"),
+    ("confirmation_pending", "awaiting_confirmation"), ("intervention", "alerting"),
+])
+def test_identity_scene_and_surface_never_override_authoritative_outcome(outcome, state):
+    payload, shape, admitted = _surface_turn()
+    for profile, version, scene, source in [
+        ("canonical", 1, "planning", "requested_scene"),
+        ("canonical", 2, "work_triage", "runtime_interaction_mode"),
+    ]:
+        policy = {**_presence_policy(payload, admitted), "profile_id": profile,
+                  "profile_version": version, "scene_id": scene, "scene_source": source}
+        trace = resolve_surface_presence(
+            payload, shape, admitted_turn=admitted, request_id="request", companion_policy=policy,
+        )
+        assert trace["presence_state"] == "thinking"
+        result = apply_surface_presence_outcome(trace, outcome=outcome)
+        assert result["presence_state"] == state
+        if outcome == "privacy_withheld":
+            assert "companion" not in result
+            assert "companion_policy.validated" not in result["source_fields"]
+            failed = apply_surface_presence_outcome(trace, outcome=outcome, unavailable=True)
+            assert "companion" not in failed and failed["presence_state"] == "unavailable"
+        else:
+            assert result["companion"]["profile_version"] == version
+        fallback = apply_surface_presence_outcome(trace, fallback_active=True)
+        unavailable = apply_surface_presence_outcome(trace, unavailable=True)
+        assert fallback["presence_state"] == "fallback"
+        assert unavailable["presence_state"] == "unavailable"
