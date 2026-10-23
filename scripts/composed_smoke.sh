@@ -2592,9 +2592,12 @@ run_continuation_failure_contention_scenario() {
   before="$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)"
   configure_surface_permission "$owner" alexa true true false
   loser="$(run_distinct_client_chat "$owner" alexa:failure-loser alexa "$conversation" "neutral competing input")"
-  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
-  [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
-  jq -e '.state == "active" and .active_surface == "telegram"' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  # Interrupt at the observed contention boundary. The durable loser checks
+  # below must not consume the existing provider-delay window before the kill.
+  jq -e '.status=="failed" and .selected_model=="not_called"' <<<"$loser" >/dev/null
+  [ "$(fetch_provider_calls "$(jq -r .request_id <<<"$loser")" | jq '[.calls[]|select(.kind=="chat")]|length')" = 0 ]
+  jq -e --arg session "$session" '.state == "active" and .active_surface == "telegram"
+    and .active_runtime_session_id==$session' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
   docker compose -f "$COMPOSE" kill -s SIGKILL provider >/dev/null
   wait "$winner_pid"
   [ "$(cat "$COMPOSED_SMOKE_TMP/contention-failure-status")" = 500 ]
@@ -2609,16 +2612,30 @@ run_continuation_failure_contention_scenario() {
     and all(.model_calls[]; .status == "failed")' <<<"$diagnostics" >/dev/null
   docker compose -f "$COMPOSE" start provider >/dev/null
   docker compose -f "$COMPOSE" up -d --wait provider >/dev/null
+  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
+  [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
   diagnostics="$(fetch_runtime_diagnostics "$session")"
   jq -e '.latest_turn.turn_status == "abandoned"
     and ([.events[] | select(.event_type == "turn_completed")] | length) == 1
     and ([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
+  jq -e --arg request "$request" '[.events[]|select(.event_type=="surface_presence_published"
+    and .event_payload_json.stage=="terminal" and .event_payload_json.state=="unavailable"
+    and .event_payload_json.request_id==$request)]|length==1' <<<"$diagnostics" >/dev/null
+  curl -fsS -G http://127.0.0.1:14361/v1/presence/current \
+    -H 'X-API-Key: smoke-orchestrator-key' --data-urlencode "owner_id=$owner" \
+    --data-urlencode "conversation_id=$conversation" --data-urlencode surface=telegram \
+    | jq -e '.state=="unavailable" and keys==["cursor","state"]' >/dev/null
   jq -e '.state == "idle" and .revision == 2 and .session_count == 1 and .surfaces == ["telegram"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
   [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='user'),(SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='assistant'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='failed');")" = '1|0|0|1' ]
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
   configure_surface_permission "$owner" alexa true true false
   fresh="$(run_distinct_client_chat "$owner" alexa:failure-fresh alexa "$conversation" "What does this function do?")"
   jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$fresh" >/dev/null
+  assert_persisted_answer_matches "$conversation" "$(jq -r .request_id <<<"$fresh")" "$(jq -r .answer <<<"$fresh")"
+  curl -fsS -G http://127.0.0.1:14361/v1/presence/current \
+    -H 'X-API-Key: smoke-orchestrator-key' --data-urlencode "owner_id=$owner" \
+    --data-urlencode "conversation_id=$conversation" --data-urlencode surface=alexa \
+    | jq -e '.state=="briefing" and keys==["cursor","state"]' >/dev/null
   [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$fresh")" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '2|1' ]
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE state='failed'),count(*) FILTER (WHERE state='completed'),count(*) FROM work_items WHERE owner_id='$owner';")" = '1|1|2' ]
@@ -2626,6 +2643,12 @@ run_continuation_failure_contention_scenario() {
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
   [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '2|0|0' ]
   echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_attempts=failed_primary,failed_fallback,fresh_one primary_fallback_successes=0 assistant_publications=1 work_failed=1 work_completed=1 traces=2 claims=0 canonical_facts=0 action_events=0 confirmations=0 fresh_admission_once=true"
+  echo "Presence failure consumer: terminal=unavailable recovery=briefing canonical=true actions=0"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    jq -nc '{scenario:"provider_failure",terminal:"unavailable",recovery:"briefing",
+      canonical_equal:true,failed_provider_attempts:2,action_events:0,confirmations:0}' \
+      >>"$COMPOSED_SMOKE_LOG_DIR/presence-consumer.jsonl"
+  fi
   provider_post /fixture/reset '{}'
 }
 
@@ -7535,7 +7558,10 @@ PYPRESENCE
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
 if [ "${PRESENCE_EVENTS_ONLY:-}" = 1 ]; then
+  set -E
+  trap 'echo "Presence consumer assertion failed: line=$LINENO" >&2' ERR
   run_presence_event_scenario
+  run_continuation_failure_contention_scenario
   exit 0
 fi
 if [ "${SCENE_TRANSITIONS_ONLY:-}" = 1 ]; then
@@ -7665,6 +7691,8 @@ if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+set -E
+trap 'echo "Composed smoke assertion failed: line=$LINENO" >&2' ERR
 run_presence_event_scenario
 run_scene_transition_scenario
 run_runtime_admission_composition_scenario telegram-alexa telegram:admission alexa:admission telegram alexa
