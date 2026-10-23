@@ -718,6 +718,36 @@ async def test_resolved_privacy_is_not_reused_by_another_request(tmp_path):
     assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
 
 
+@pytest.mark.asyncio
+async def test_presence_observes_server_owned_pause_without_entering_cognition(tmp_path):
+    from test_orchestrate_flow import (
+        FakeLiteLLM,
+        PauseMemory,
+        PauseRuntime,
+        _base_payload,
+        _run_durable_work_chat,
+    )
+
+    class Runtime(PauseRuntime):
+        publications = []
+
+        async def publish_surface_presence(self, **body):
+            self.publications.append(body)
+
+    memory, runtime, provider = PauseMemory(), Runtime(), FakeLiteLLM()
+    result = await _run_durable_work_chat(
+        tmp_path, memory, runtime=runtime, provider=provider,
+        payload=_base_payload(conversation_id="conv-1", session_transition="pause"),
+    )
+    assert result["status"] == "ok" and memory.work["state"] == "completed"
+    assert [p["state"] for p in runtime.publications] == ["thinking", "idle"]
+    assert [p["stage"] for p in runtime.publications] == ["processing", "terminal"]
+    assert all(p["request_id"] == result["request_id"] for p in runtime.publications)
+    assert result["answer"] == memory.added_messages[-1]["content"]
+    assert provider.calls == memory.retrieve_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
 def _presence_batch(state="thinking", cursor="pe_" + "a" * 32, events=()):
     from models import PresenceProjection, PresenceRuntimeBatch
 

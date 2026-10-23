@@ -7502,6 +7502,24 @@ recovered = chat("The input is checked.", text="How is the input checked?")
 canonical(recovered)
 assert current()["state"] == "idle"
 evidence.append(dict(scenario="interruption_and_outage", interrupted="unavailable", recovered="idle"))
+# Short server-owned returns use the same admitted lifecycle, without cognition.
+before_pause = current()
+paused = http(co, "/v1/chat", {**scope, "client_id": "desktop_private:presence",
+    "sensitivity": "private", "session_transition": "pause",
+    "messages": [{"role": "user", "content": "Pause the conversation."}]}, key)
+assert paused["status"] == "ok" and paused["selected_model"] == "not_called"
+canonical(paused)
+assert current()["state"] == "idle"
+assert diagnostics(session)["runtime_session"]["status"] == "paused"
+pause_events = stream(before_pause["cursor"], count=2)
+assert [event[1]["state"] for event in pause_events] == ["thinking", "idle"]
+assert diagnostics(session)["runtime_session"]["status"] == "paused"  # reads never resume
+resumed = chat("7.", text="What is 3+4?")
+canonical(resumed)
+assert current()["state"] == "idle" and read()["runtime_session_id"] == session
+assert diagnostics(session)["runtime_session"]["status"] == "active"
+evidence.append(dict(scenario="server_owned_pause", paused="idle", resumed="idle",
+    same_session=True, read_did_not_resume=True, canonical_equal=True))
 persisted = subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T", "runtime",
     "python", "-c", """
 import json, sqlite3, sys
@@ -7511,7 +7529,7 @@ with sqlite3.connect('file:/data/runtime_state.sqlite3?mode=ro',uri=True) as c:
         'FROM conversation_runtime_events e JOIN conversation_runtime_sessions s USING(runtime_session_id) '
         'WHERE s.owner_id=? AND s.conversation_id=? AND e.event_type=? ORDER BY e.id',
         (owner,conversation,'surface_presence_published')).fetchall()
-    assert len(rows)==9
+    assert len(rows)==13
     cursors=[]
     for sequence,session,turn,raw,surface in rows:
         payload=json.loads(raw)

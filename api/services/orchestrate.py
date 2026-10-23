@@ -184,6 +184,7 @@ from services.response_review import (
     review_response,
 )
 from services.response_shape import (
+    ResponseShape,
     build_response_shape_guidance_block,
     clamp_response_shape_for_runtime_presence,
     clamp_response_shape_for_timing,
@@ -10232,6 +10233,24 @@ async def orchestrate_chat(
             ),
             error_type=turn_state_trace.get("error_type"),
         )
+        # Observe every admitted path, including server-owned returns before
+        # cognition. These validated delivery facts do not select runtime policy.
+        try:
+            admission_facts = project_timing_facts(payload)
+            admission_shape = ResponseShape(
+                spoken_output=admission_facts["spoken_output"],
+                active_task_mode=admission_facts["active_task_mode"],
+            )
+            surface_presence_trace = resolve_surface_presence(
+                {**payload, "conversation_id": conversation_id}, admission_shape,
+                admitted_turn=turn_response, request_id=request_id,
+            )
+        except (ValueError, TypeError):
+            surface_presence_trace = None
+        await publish_surface_presence(
+            runtime=runtime, memory_store=memory_store,
+            trace=surface_presence_trace, stage="processing",
+        )
         if explicit_pause:
             return await _finish_explicit_pause(
                 payload=payload, request_id=request_id, conversation_id=conversation_id,
@@ -10898,10 +10917,6 @@ async def orchestrate_chat(
         surface_presence_trace = resolve_surface_presence(
             {**effective_payload, "conversation_id": conversation_id}, response_shape,
             admitted_turn=turn_response, request_id=request_id,
-        )
-        await publish_surface_presence(
-            runtime=runtime, memory_store=memory_store,
-            trace=surface_presence_trace, stage="processing",
         )
         routing_policy = profile.get("routing_policy", {}) or {}
         sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
