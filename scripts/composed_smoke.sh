@@ -5983,7 +5983,7 @@ run_voice_continuation_scenario() {
     declared_state=abbreviated
     if [ "$tag" = expandable ]; then
       # Per-owner permission and an explicit invitation in the first request are
-      # both necessary; permission alone must not override R46 suppression.
+      # both necessary; permission alone must not override restraint suppression.
       configure_surface_permission "$owner" web true true false
       declared_state=expandable
     else
