@@ -201,7 +201,11 @@ from services.style_envelope import (
     clamp_style_envelope,
     resolve_style_envelope,
 )
-from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
+from services.surface_presence import (
+    apply_surface_presence_outcome,
+    publish_surface_presence,
+    resolve_surface_presence,
+)
 from settings import get_settings
 
 _HISTORY_CLARIFICATION = (
@@ -10143,6 +10147,9 @@ async def orchestrate_chat(
     last_user_message_id = None
     turn_response: dict[str, Any] | None = None
     turn_state_trace: dict[str, Any] = _turn_state_disabled_trace()
+    surface_presence_trace: dict[str, Any] | None = None
+    terminal_presence_trace: dict[str, Any] | None = None
+    privacy_context = None
     runtime_session_trace: dict[str, Any] = _runtime_session_disabled_trace()
     interaction_governance: dict[str, Any] | None = None
     interaction_governance_trace: dict[str, Any] = _interaction_governance_disabled_trace()
@@ -10713,13 +10720,13 @@ async def orchestrate_chat(
         timing_consumed = False
         return_retrieval_bundle = None
         return_context_dependency_unavailable = False
-        privacy_context = None
 
         interrupt_trace: dict[str, Any] | None = None
 
         async def finish_server_owned_response(
             answer: str, *, failed: bool, response_source: str = "runtime_timing",
         ) -> dict[str, Any]:
+            nonlocal terminal_presence_trace
             interrupt_selected = response_source == "interrupt_policy"
             privacy_withheld = privacy_context_enabled and privacy_policy_requires_suppression(
                 privacy_context
@@ -10797,6 +10804,7 @@ async def orchestrate_chat(
                                          if evidence_acquisition else {}),
                 **({"interrupt_policy": interrupt_trace} if interrupt_trace is not None else {}),
             }
+            terminal_presence_trace = stop_prompt_trace["surface_presence"]
             try:
                 await memory_store.create_trace(
                     request_id=request_id, payload=_server_owned_response_trace_payload(
@@ -10890,6 +10898,10 @@ async def orchestrate_chat(
         surface_presence_trace = resolve_surface_presence(
             {**effective_payload, "conversation_id": conversation_id}, response_shape,
             admitted_turn=turn_response, request_id=request_id,
+        )
+        await publish_surface_presence(
+            runtime=runtime, memory_store=memory_store,
+            trace=surface_presence_trace, stage="processing",
         )
         routing_policy = profile.get("routing_policy", {}) or {}
         sensitivity_local_only = effective_payload.get("sensitivity") == "local_only"
@@ -14730,6 +14742,7 @@ async def orchestrate_chat(
             outcome=("privacy_withheld" if privacy_boundary.enforced else "confirmation_pending"
                      if pending_action is not None else "completed"),
         )
+        terminal_presence_trace = prompt.trace["surface_presence"]
         persisted_prompt_trace = (
             sanitize_prompt_trace_for_privacy(prompt.trace, retrieval_bundle)
             if privacy_boundary.enforced
@@ -15001,3 +15014,18 @@ async def orchestrate_chat(
         raise
     finally:
         await work.fail_if_unfinished()
+        completed_work = work.work is not None and work.work.get("state") == "completed"
+        if terminal_presence_trace is None:
+            terminal_presence_trace = apply_surface_presence_outcome(
+                surface_presence_trace, unavailable=not completed_work,
+                outcome=("privacy_withheld" if privacy_context_enabled
+                         and privacy_policy_requires_suppression(privacy_context) else "completed"),
+            )
+        elif not completed_work:
+            terminal_presence_trace = apply_surface_presence_outcome(
+                terminal_presence_trace, unavailable=True,
+            )
+        await publish_surface_presence(
+            runtime=runtime, memory_store=memory_store,
+            trace=terminal_presence_trace, stage="terminal",
+        )

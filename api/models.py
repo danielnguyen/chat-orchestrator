@@ -275,6 +275,32 @@ class DeferredChatResponse(BaseModel):
 WorkIdentifier = Annotated[
     str, Field(strict=True, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
 ]
+
+PresentationState = Literal[
+    "thinking", "idle", "briefing", "alerting", "awaiting_confirmation",
+    "suppressed", "fallback", "unavailable",
+]
+PresentationCursor = Annotated[str, Field(pattern=r"^p[0e]_[a-f0-9]{32}$", max_length=35)]
+
+
+class PresenceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    state: PresentationState
+    cursor: PresentationCursor
+
+
+class PresenceRuntimeBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    owner_id: WorkIdentifier
+    conversation_id: WorkIdentifier
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: WorkIdentifier
+    current: PresenceProjection | None
+    cursor: PresentationCursor
+    events: list[PresenceProjection] = Field(max_length=50)
+    has_more: bool
 WorkUUID = Annotated[
     str, Field(
         strict=True, pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",

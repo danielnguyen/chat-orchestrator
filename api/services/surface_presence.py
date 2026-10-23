@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from time import monotonic
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from services.response_shape import ResponseShape
+
+PRESENCE_STREAM_SECONDS = 15.0
+PRESENCE_STREAM_POLL_SECONDS = 0.5
+PRESENCE_STREAM_MAX_EVENTS = 100
 
 PresenceState = Literal[
     "idle", "listening", "thinking", "briefing", "alerting", "awaiting_confirmation",
@@ -334,3 +340,84 @@ def apply_surface_presence_outcome(
                         "spoken_output_surface" if spoken else "default_completed_turn",
                         "response.completed")
     return surface_presence_trace_metadata(presence=presence, included=True)
+
+
+async def publish_surface_presence(
+    *, runtime: Any, memory_store: Any, trace: dict[str, Any] | None, stage: str,
+) -> bool:
+    """Observe a CO-selected outcome over the owner-accepted internal trust boundary.
+
+    This does not authenticate CR's callers or authorize any action. Failure must
+    not alter canonical chat; lifecycle-aware readers report unavailable instead.
+    """
+    if not callable(getattr(runtime, "publish_surface_presence", None)):
+        return False
+    try:
+        presence = SurfacePresence.model_validate({
+            key: value for key, value in (trace or {}).items()
+            if key in SurfacePresence.model_fields
+        })
+        if presence.turn_context is None or presence.presence_state == "listening":
+            return False
+        binding = presence.turn_context.model_dump()
+        conversation = await asyncio.wait_for(memory_store.get_conversation(
+            owner_id=binding["owner_id"], conversation_id=binding["conversation_id"],
+        ), timeout=1.0)
+        if any(conversation.get(key) != binding[key] for key in ("owner_id", "conversation_id")):
+            return False
+        if conversation.get("lifecycle_state") != "open":
+            return False
+        # No identity, scene, text, reason, provider or trace data crosses this seam.
+        await asyncio.wait_for(runtime.publish_surface_presence(
+            **binding, stage=stage, state=presence.presence_state,
+        ), timeout=1.0)
+        return True
+    except Exception:
+        return False
+
+
+async def stream_surface_presence(*, request: Any, initial: Any, read: Any, after: str | None):
+    """Bounded pull stream: no worker, task registry, queue or cross-client state."""
+    from models import PresenceProjection
+
+    def frame(kind, projection):
+        identifier = f"id: {projection.cursor}\n" if kind != "unavailable" else ""
+        return f"{identifier}event: {kind}\ndata: {projection.model_dump_json()}\n\n"
+
+    deadline = monotonic() + PRESENCE_STREAM_SECONDS
+    cursor = after or initial.cursor
+    emitted = 0
+    unavailable_cursor = None
+    batch = initial
+    if after is None:
+        projection = initial.current or PresenceProjection(
+            state="unavailable", cursor=initial.cursor,
+        )
+        yield frame("snapshot", projection)
+        emitted += 1
+        unavailable_cursor = initial.cursor if initial.current is None else None
+    while emitted < PRESENCE_STREAM_MAX_EVENTS and monotonic() < deadline:
+        if await request.is_disconnected():
+            return
+        for event in batch.events:
+            if emitted >= PRESENCE_STREAM_MAX_EVENTS:
+                return
+            yield frame("transition", event)
+            cursor = event.cursor
+            emitted += 1
+            unavailable_cursor = None
+        if batch.current is None and not batch.has_more and unavailable_cursor != cursor:
+            yield frame("unavailable", PresenceProjection(state="unavailable", cursor=cursor))
+            emitted += 1
+            unavailable_cursor = cursor
+        if not batch.has_more:
+            await asyncio.sleep(PRESENCE_STREAM_POLL_SECONDS)
+        if await request.is_disconnected() or monotonic() >= deadline:
+            return
+        try:
+            batch = await asyncio.wait_for(read(cursor), timeout=2.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            yield frame("unavailable", PresenceProjection(state="unavailable", cursor=cursor))
+            return

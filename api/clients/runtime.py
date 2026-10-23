@@ -2190,6 +2190,43 @@ def validate_pause_completion_response(
 
 
 class RuntimeClient:
+    async def publish_surface_presence(self, **binding: Any) -> dict[str, Any]:
+        from models import PresenceProjection
+
+        response = await self._post("/v1/runtime/surface-presence/publish", json=binding)
+        if (not isinstance(response, dict) or set(response) != {"binding", "event"}
+                or response["binding"] != binding):
+            raise RuntimeError("surface_presence_publication_invalid")
+        event = PresenceProjection.model_validate(response["event"])
+        if event.state != binding.get("state") or not event.cursor.startswith("pe_"):
+            raise RuntimeError("surface_presence_publication_invalid")
+        return response
+
+    async def read_surface_presence(
+        self, *, owner_id: str, conversation_id: str, surface: str, after: str | None = None,
+    ):
+        from models import PresenceRuntimeBatch
+
+        try:
+            response = await self._post("/v1/runtime/surface-presence/read", json={
+                "owner_id": owner_id, "conversation_id": conversation_id, "surface": surface,
+                "after": after, "limit": 50,
+            })
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400:
+                raise ValueError("presence_cursor_invalid") from None
+            raise
+        result = PresenceRuntimeBatch.model_validate(response)
+        if (result.owner_id != owner_id or result.conversation_id != conversation_id
+                or result.surface != surface
+                or len({e.cursor for e in result.events}) != len(result.events)
+                or (result.events and result.cursor != result.events[-1].cursor)
+                or (after is not None and not result.events and result.cursor != after)
+                or any(e.cursor == after for e in result.events)
+                or (result.has_more and not result.events)):
+            raise RuntimeError("surface_presence_read_invalid")
+        return result
+
     def __init__(
         self,
         base_url: str,

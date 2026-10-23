@@ -7179,8 +7179,352 @@ run_surface_lifecycle_scenario() {
   done
 }
 
+run_presence_event_scenario() {
+  # Real API consumer; the existing disposable topology owns all service data.
+  local owner=owner-presence-events conversation
+  conversation="$(create_conversation "$owner" desktop_private:presence)"
+  configure_surface_permission "$owner" desktop_private true true false
+  configure_surface_permission "$owner" unknown_presence_fixture true false false
+  docker compose -f "$COMPOSE" stop orchestrator >/dev/null
+  SCENE_ORCHESTRATOR="$(docker compose -f "$COMPOSE" run -d --no-deps --service-ports \
+    -e COGNITIVE_RUNTIME_COMPANION_ENABLED=true -e COGNITIVE_RUNTIME_RESTRAINT_ENABLED=true \
+    -e COGNITIVE_RUNTIME_PRIVACY_CONTEXT_ENABLED=true orchestrator)"
+  wait_for_http http://127.0.0.1:14361/healthz
+  python3 - "$owner" "$conversation" "$COMPOSE" "$SCENE_ORCHESTRATOR" <<'PYPRESENCE'
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+owner, conversation, compose, orchestrator = sys.argv[1:]
+scope = dict(owner_id=owner, conversation_id=conversation, surface="desktop_private")
+co = "http://127.0.0.1:14361"
+cr = "http://127.0.0.1:14371"
+bms = "http://127.0.0.1:14321"
+provider = "http://127.0.0.1:14381"
+key = {"X-API-Key": "smoke-orchestrator-key"}
+memory_key = {"X-API-Key": "smoke-memory-key"}
+evidence = []
+
+
+def http(base, path, body=None, headers=None, expected=200):
+    request = urllib.request.Request(base + path, headers=headers or {},
+        data=json.dumps(body).encode() if body is not None else None)
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        response = urllib.request.urlopen(request, timeout=35)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        raw = response.read()
+        assert response.status == expected, (path, response.status, raw[:400])
+        if path.startswith(("/v1/presence/current?", "/v1/presence/stream?")):
+            assert response.headers.get("Cache-Control") == "no-store"
+        return json.loads(raw) if raw else None
+
+
+def current(selected=scope, expected=200, headers=key):
+    return http(co, "/v1/presence/current?" + urllib.parse.urlencode(selected),
+                headers=headers, expected=expected)
+
+
+def read(after=None, selected=scope):
+    return http(cr, "/v1/runtime/surface-presence/read", {**selected, "after": after})
+
+
+def stream(after=None, count=1, selected=scope, ready=None):
+    headers = dict(key)
+    if after:
+        headers["Last-Event-ID"] = after
+    request = urllib.request.Request(co + "/v1/presence/stream?" +
+        urllib.parse.urlencode(selected), headers=headers)
+    frames = []
+    with urllib.request.urlopen(request, timeout=20) as response:
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get_content_type() == "text/event-stream"
+        frame = {}
+        for raw in response:
+            line = raw.decode().rstrip("\r\n")
+            if not line:
+                if "data" in frame:
+                    projection = json.loads(frame["data"])
+                    assert set(projection) == {"state", "cursor"}, projection
+                    assert re.fullmatch(r"p[0e]_[a-f0-9]{32}", projection["cursor"])
+                    if frame["event"] != "unavailable":
+                        assert frame["id"] == projection["cursor"]
+                    frames.append((frame["event"], projection))
+                    if ready is not None:
+                        ready.set()
+                    if len(frames) == count:
+                        return frames  # closing the connection exercises disconnect cleanup
+                frame = {}
+            else:
+                name, value = line.split(":", 1)
+                frame[name] = value.strip()
+    assert len(frames) == count, frames
+    return frames
+
+
+def wait(predicate):
+    for _ in range(120):
+        try:
+            result = predicate()
+            if result:
+                return result
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(.1)
+    raise AssertionError("bounded presence wait expired")
+
+
+def chat(answer="Save the backup first.", surface="desktop_private", text="What is the backup procedure?", scene=None):
+    if answer is not None:
+        http(provider, "/fixture/next-answer", {"answer": answer})
+    result = http(co, "/v1/chat", {**scope, "surface": surface,
+        "client_id": surface + ":presence", "sensitivity": "private",
+        "messages": [{"role": "user", "content": text}],
+        **({"requested_scene": scene} if scene else {})}, key)
+    if answer is not None:
+        assert result["status"] == "ok" and result["answer"] == answer, result
+    return result
+
+
+def trace(result):
+    return http(bms, "/v1/traces/" + result["request_id"], headers=memory_key)
+
+
+def diagnostics(session):
+    return http(cr, "/v1/runtime/sessions/" + session)
+
+
+def binding(result, stage="terminal", state="idle"):
+    turn = trace(result)["retrieval"]["prompt_assembly"]["turn_state"]
+    return {**scope, "request_id": result["request_id"],
+        "runtime_session_id": turn["runtime_session_id"],
+        "runtime_turn_id": turn["runtime_turn_id"], "stage": stage, "state": state}
+
+
+def sql(statement):
+    return subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T",
+        "postgres", "psql", "-U", "smoke", "-d", "memory", "-Atc", statement], text=True).strip()
+
+
+def canonical(result):
+    request = result["request_id"]
+    stored = sql(f"SELECT json_build_object('answer',m.content,'state',w.state)::text "
+        f"FROM messages m JOIN work_items w ON w.assistant_message_id=m.id AND w.work_id=m.work_id "
+        f"WHERE m.owner_id='{owner}' AND m.conversation_id='{conversation}' "
+        f"AND m.metadata->>'request_id'='{request}' AND w.request_id='{request}';")
+    assert json.loads(stored) == {"answer": result["answer"], "state": "completed"}
+    assert sql(f"SELECT count(*) FROM messages WHERE owner_id='{owner}' AND "
+        f"conversation_id='{conversation}' AND role='assistant' AND metadata->>'request_id'='{request}';") == "1"
+
+
+# No record is not an invented idle; reads do not create a runtime session.
+current(expected=503)
+current(expected=401, headers={})
+first = chat()
+canonical(first)
+assert trace(first)["retrieval"]["prompt_assembly"]["companion_policy"]["included"] is True
+saved = current()
+assert saved["state"] == "idle" and set(saved) == {"state", "cursor"}
+first_binding = binding(first)
+session = first_binding["runtime_session_id"]
+origin_events = diagnostics(session)["events"]
+history = [e for e in origin_events if e["event_type"] == "surface_presence_published"]
+assert [e["event_payload_json"]["state"] for e in history] == ["thinking", "idle"]
+assert saved["cursor"] == history[-1]["event_payload_json"]["cursor"]
+fingerprint = sql(f"SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages "
+    f"WHERE conversation_id='{conversation}' ORDER BY created_at,id LIMIT 2) m;")
+
+# Snapshot followed by a delayed real turn proves the subscription gap is closed.
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    ready = threading.Event()
+    observed = pool.submit(stream, None, 3, scope, ready)
+    assert ready.wait(5), "initial stream snapshot not received"
+    http(provider, "/fixture/delay-next-primary", {"delay_ms": 3500})
+    pending = pool.submit(chat, "Check the logs next.", "desktop_private", "What should I check next?")
+    wait(lambda: current()["state"] == "thinking")
+    processing = read()["current"]
+    second = pending.result()
+    frames = observed.result()
+canonical(second)
+assert [item[1]["state"] for item in frames] == ["idle", "thinking", "idle"], frames
+assert [item[0] for item in frames] == ["snapshot", "transition", "transition"]
+assert frames[0][1] == saved and frames[1][1] == processing
+terminal = current()
+assert frames[-1][1] == terminal
+assert stream(processing["cursor"]) == [("transition", terminal)]
+assert read(saved["cursor"])["events"] == [processing, terminal]
+
+# The server-selected projection is idempotent, not a client-writable CO API.
+second_binding = binding(second)
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    duplicates = list(pool.map(lambda _: http(cr, "/v1/runtime/surface-presence/publish",
+        second_binding), range(16)))
+assert all(result["event"] == terminal for result in duplicates)
+for field in ("owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id", "request_id"):
+    http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, field: "wrong"}, expected=409)
+http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, "state": "fallback"}, expected=409)
+http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, "state": "listening"}, expected=422)
+http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, "private": "do not store"}, expected=422)
+http(co, "/v1/presence/update", {"state": "thinking"}, key, expected=404)
+current({**scope, "owner_id": "wrong"}, expected=503)
+current({**scope, "surface": "wrong"}, expected=503)
+for cursor in ("bad", "pe_" + "0" * 32):
+    http(co, "/v1/presence/stream?" + urllib.parse.urlencode({**scope, "cursor": cursor}),
+        headers=key, expected=400)
+assert current() == terminal
+assert len([e for e in diagnostics(session)["events"] if e["event_type"] == "surface_presence_published"]) == 4
+
+# Restart the disposable CR process with the same existing SQLite volume.
+subprocess.run(["docker", "compose", "-f", compose, "restart", "runtime"], check=True, stdout=subprocess.DEVNULL)
+wait(lambda: http(cr, "/healthz"))
+assert current() == terminal
+assert read(saved["cursor"])["events"] == [processing, terminal]
+assert stream(processing["cursor"]) == [("transition", terminal)]
+assert fingerprint == sql(f"SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages "
+    f"WHERE conversation_id='{conversation}' ORDER BY created_at,id LIMIT 2) m;")
+evidence.append(dict(scenario="ordered_restart_replay", states=["idle", "thinking", "idle"],
+    duplicate_requests=16, committed_events=4, canonical_equal=True, historical_provenance_unchanged=True))
+
+# Restrictive authoritative privacy, including the corrected server-owned return.
+private_scope = {**scope, "surface": "unknown_presence_fixture"}
+private = chat(None, private_scope["surface"], "Tell me more.", scene="planning")
+canonical(private)
+prompt = trace(private)["retrieval"]["prompt_assembly"]
+assert private["selected_model"] == "not_called" and private["sources"] == []
+assert "Save the backup first." not in json.dumps(private)
+presence = prompt["surface_presence"]
+assert presence["presence_state"] == "suppressed" and "companion" not in presence
+assert "companion_policy.validated" not in presence["source_fields"]
+calls = http(provider, "/calls/" + private["request_id"])["calls"]
+assert not [c for c in calls if c["kind"] not in {"embedding", "semantic_interpreter"}]
+private_current = current(private_scope)
+assert private_current["state"] == "suppressed"
+private_batch = read(selected=private_scope)
+private_diagnostics = diagnostics(private_batch["runtime_session_id"])
+privacy_events = [e["event_payload_json"] for e in private_diagnostics["events"]
+    if e["event_type"] == "privacy_context_evaluated"]
+assert len(privacy_events) == 1
+assert privacy_events[0]["surface_type"] == "unknown_surface"
+assert privacy_events[0]["redaction_required"] and privacy_events[0]["safe_summary_required"]
+assert not privacy_events[0]["sensitive_detail_allowed"]
+# The server-owned trace intentionally omits the compilation/decision payloads.
+# Verify actual compilation through its existing CR scene-resolution record.
+compiled = subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T", "runtime",
+    "python", "-c", "import sqlite3,sys; "
+    "c=sqlite3.connect('file:/data/companion_contracts.sqlite3?mode=ro',uri=True); "
+    "print(c.execute('SELECT count(*) FROM scene_resolution_events WHERE request_id=? "
+    "AND owner_id=? AND conversation_id=? AND surface=?',sys.argv[1:]).fetchone()[0])",
+    private["request_id"], owner, conversation, private_scope["surface"]], text=True).strip()
+assert compiled == "1", "expected actual registered scene compilation for the private turn"
+private_events = [e for e in private_diagnostics["events"] if e["event_type"] == "surface_presence_published"]
+assert [e["event_payload_json"]["state"] for e in private_events] == ["thinking", "suppressed"]
+assert stream(private_events[0]["event_payload_json"]["cursor"], selected=private_scope) == [("transition", private_current)]
+http(co, "/v1/presence/stream?" + urllib.parse.urlencode({**private_scope, "cursor": terminal["cursor"]}),
+    headers=key, expected=400)
+for event in history + private_events:
+    assert set(event["event_payload_json"]) == {"request_id", "stage", "state", "cursor"}
+    assert event["runtime_session_id"] in {session, private_batch["runtime_session_id"]}
+assert not [e for e in private_diagnostics["events"] if e["event_type"] in
+    {"action_authority_evaluated", "action_flow_evaluated", "capability_confirmation_created"}]
+evidence.append(dict(scenario="privacy_server_owned", state="suppressed", answer_provider_calls=0,
+    public_keys=["state", "cursor"], persisted_payload_keys=["request_id", "stage", "state", "cursor"]))
+
+# Interrupted processing cannot remain a current thinking claim after recovery.
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    http(provider, "/fixture/delay-next-primary", {"delay_ms": 8000})
+    pending = pool.submit(chat, "The input is checked.", "desktop_private", "How is the input checked?")
+    wait(lambda: current()["state"] == "thinking")
+    interrupted = current()
+    subprocess.run(["docker", "kill", orchestrator], check=True, stdout=subprocess.DEVNULL)
+    try:
+        pending.result()
+        raise AssertionError("killed request unexpectedly completed")
+    except (OSError, urllib.error.URLError):
+        pass
+    subprocess.run(["docker", "start", orchestrator], check=True, stdout=subprocess.DEVNULL)
+    wait(lambda: http(co, "/healthz"))
+assert current()["state"] == "unavailable"
+assert stream(interrupted["cursor"]) == [("unavailable", {"state": "unavailable", "cursor": interrupted["cursor"]})]
+subprocess.run(["docker", "compose", "-f", compose, "stop", "runtime"], check=True, stdout=subprocess.DEVNULL)
+current(expected=503)
+subprocess.run(["docker", "compose", "-f", compose, "start", "runtime"], check=True, stdout=subprocess.DEVNULL)
+wait(lambda: http(cr, "/healthz"))
+assert current()["state"] == "unavailable"
+http(provider, "/fixture/reset", {})
+recovered = chat("The input is checked.", text="How is the input checked?")
+canonical(recovered)
+assert current()["state"] == "idle"
+evidence.append(dict(scenario="interruption_and_outage", interrupted="unavailable", recovered="idle"))
+persisted = subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T", "runtime",
+    "python", "-c", """
+import json, sqlite3, sys
+owner, conversation = sys.argv[1:]
+with sqlite3.connect('file:/data/runtime_state.sqlite3?mode=ro',uri=True) as c:
+    rows=c.execute('SELECT e.id,e.runtime_session_id,e.runtime_turn_id,e.event_payload_json,s.surface '
+        'FROM conversation_runtime_events e JOIN conversation_runtime_sessions s USING(runtime_session_id) '
+        'WHERE s.owner_id=? AND s.conversation_id=? AND e.event_type=? ORDER BY e.id',
+        (owner,conversation,'surface_presence_published')).fetchall()
+    assert len(rows)==9
+    cursors=[]
+    for sequence,session,turn,raw,surface in rows:
+        payload=json.loads(raw)
+        assert set(payload)=={'request_id','stage','state','cursor'}
+        assert surface in {'desktop_private','unknown_presence_fixture'}
+        admission=c.execute('SELECT event_payload_json FROM conversation_runtime_events '
+            'WHERE runtime_session_id=? AND runtime_turn_id=? AND event_type=?',
+            (session,turn,'turn_started')).fetchone()
+        assert json.loads(admission[0])['request_id']==payload['request_id']
+        if payload['stage']=='terminal':
+            completion=c.execute('SELECT event_payload_json FROM conversation_runtime_events '
+                'WHERE runtime_session_id=? AND runtime_turn_id=? AND event_type=?',
+                (session,turn,'turn_completed')).fetchone()
+            assert json.loads(completion[0])['request_id']==payload['request_id']
+        cursors.append(payload['cursor'])
+    assert len(set(cursors))==len(rows)
+    actions=c.execute('SELECT count(*) FROM conversation_runtime_events e '
+        'JOIN conversation_runtime_sessions s USING(runtime_session_id) '
+        'WHERE s.owner_id=? AND e.event_type IN (?,?)',
+        (owner,'action_authority_evaluated','action_flow_evaluated')).fetchone()[0]
+    assert actions==0
+print(json.dumps({'persisted_events':len(rows),'exact_binding':True,'action_events':actions}))
+""", owner, conversation], text=True)
+evidence.append(json.loads(persisted))
+for row in evidence:
+    print("Presence consumer: " + json.dumps(row, sort_keys=True), flush=True)
+log_dir = os.environ.get("COMPOSED_SMOKE_LOG_DIR")
+if log_dir:
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "presence-consumer.jsonl"), "w") as output:
+        for row in evidence:
+            output.write(json.dumps(row, sort_keys=True) + "\n")
+PYPRESENCE
+  jq -e '.action_events==0 and .confirmations==0' \
+    <<<"$(runtime_continuation_effect_counts "$owner" presence-consumer-check)" >/dev/null
+  jq -e '.state=="idle" and .active_runtime_turn_id==null' \
+    <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  docker rm -f "$SCENE_ORCHESTRATOR" >/dev/null
+  SCENE_ORCHESTRATOR=""
+  docker compose -f "$COMPOSE" start orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+if [ "${PRESENCE_EVENTS_ONLY:-}" = 1 ]; then
+  run_presence_event_scenario
+  exit 0
+fi
 if [ "${SCENE_TRANSITIONS_ONLY:-}" = 1 ]; then
   set -E
   trap 'echo "Scene conversation assertion failed: line=$LINENO" >&2' ERR
@@ -7308,6 +7652,7 @@ if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+run_presence_event_scenario
 run_scene_transition_scenario
 run_runtime_admission_composition_scenario telegram-alexa telegram:admission alexa:admission telegram alexa
 run_omitted_continuation_scenario

@@ -8,6 +8,7 @@ from services.surface_presence import (
     PresenceState,
     apply_surface_presence_outcome,
     resolve_surface_presence,
+    stream_surface_presence,
 )
 
 BANNED_TOKENS = ["R26", "R27", "Cluster11", "11D"]
@@ -353,6 +354,30 @@ async def test_normal_orchestration_consumes_current_timing_outcome(tmp_path, po
 
 
 @pytest.mark.asyncio
+async def test_presence_publication_timeout_cancels_observation_without_changing_chat(tmp_path):
+    import asyncio
+
+    from test_orchestrate_flow import FakeRuntime, _run_timing_turn
+
+    class Runtime(FakeRuntime):
+        cancelled = 0
+
+        async def publish_surface_presence(self, **body):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled += 1
+
+    result, runtime, _, memory = await asyncio.wait_for(
+        _run_timing_turn(tmp_path, runtime=Runtime()), timeout=4,
+    )
+    assert runtime.cancelled == 2
+    assert memory.work["state"] == "completed"
+    assert result["answer"] == memory.added_messages[-1]["content"] == "hello"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+@pytest.mark.asyncio
 async def test_only_selected_intervention_projects_alerting(tmp_path):
     from test_orchestrate_flow import EnforceInterruptRuntime, _run_timing_turn
 
@@ -690,4 +715,253 @@ async def test_resolved_privacy_is_not_reused_by_another_request(tmp_path):
     assert "privacy_context.enforcement" not in presence["source_fields"]
     assert len(runtime.privacy_context_calls) == 1 and len(provider.calls) == 1
     assert result["answer"] == third.added_messages[-1]["content"] == "hello"
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+
+
+def _presence_batch(state="thinking", cursor="pe_" + "a" * 32, events=()):
+    from models import PresenceProjection, PresenceRuntimeBatch
+
+    return PresenceRuntimeBatch(
+        owner_id="owner", conversation_id="conv-1", surface="web", runtime_session_id="rtsession_1",
+        current=PresenceProjection(state=state, cursor=cursor) if state else None,
+        cursor=cursor, events=[PresenceProjection(**e) for e in events], has_more=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_presence_stream_lifetime_bounds_blocked_transport_and_closes_producer(monkeypatch):
+    import asyncio
+
+    from test_chat_api import _load_main
+
+    main = _load_main(monkeypatch)
+    closed = asyncio.Event()
+
+    async def body():
+        try:
+            yield "bounded frame"
+        finally:
+            closed.set()
+
+    async def blocked_send(message):
+        if message["type"] == "http.response.body":
+            await asyncio.Event().wait()
+
+    response = main._PresenceStreamingResponse(body())
+    response.max_duration = .01
+    await asyncio.wait_for(response.stream_response(blocked_send), timeout=.5)
+    assert closed.is_set()
+
+
+def _presence_conversation():
+    return {"owner_id": "owner", "conversation_id": "conv-1", "client_id": "client",
+            "title": None, "lifecycle_state": "open", "superseded_by_conversation_id": None,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_public_presence_scope_auth_allowlist_and_no_writable_update(monkeypatch):
+    import httpx
+    from test_chat_api import _load_main
+
+    main = _load_main(monkeypatch)
+
+    class Memory:
+        async def get_conversation(self, **scope):
+            return _presence_conversation()
+
+    class Runtime:
+        result = _presence_batch()
+
+        async def read_surface_presence(self, **scope):
+            return self.result
+
+    runtime = Runtime()
+    monkeypatch.setattr(main, "runtime", runtime)
+    monkeypatch.setattr(main, "memory_store", Memory())
+    monkeypatch.setattr(main.settings, "orch_api_key", "presence-test-key")
+    params = {"owner_id": "owner", "conversation_id": "conv-1", "surface": "web"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+    ) as c:
+        denied = await c.get("/v1/presence/current", params=params)
+        assert denied.status_code == 401 and denied.headers["cache-control"] == "no-store"
+        headers = {"X-API-Key": "presence-test-key"}
+        for endpoint in ("current", "stream"):
+            for missing in params:
+                incomplete = {k: v for k, v in params.items() if k != missing}
+                response = await c.get("/v1/presence/" + endpoint, params=incomplete,
+                                       headers=headers)
+                assert response.status_code == 400
+                assert response.json() == {"detail": "presence_scope_or_cursor_invalid"}
+                assert response.headers["cache-control"] == "no-store"
+        response = await c.get("/v1/presence/current", params=params, headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"state": "thinking", "cursor": "pe_" + "a" * 32}
+        assert response.headers["cache-control"] == "no-store"
+        runtime.result = _presence_batch(state=None, cursor="p0_" + "a" * 32)
+        response = await c.get("/v1/presence/current", params=params, headers=headers)
+        assert response.json()["state"] == "unavailable"
+        runtime.result = _presence_batch().model_copy(update={"owner_id": "private-owner"})
+        response = await c.get("/v1/presence/current", params=params, headers=headers)
+        assert response.status_code == 503 and "private-owner" not in response.text
+        response = await c.post("/v1/presence/update", headers=headers,
+                                json={**params, "state": "alerting"})
+        assert response.status_code in (404, 405)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ["retired", "owner", "missing", "runtime", "malformed"])
+async def test_public_presence_dependency_and_scope_failures_are_bounded(monkeypatch, defect):
+    import httpx
+    from test_chat_api import _load_main
+
+    main = _load_main(monkeypatch)
+
+    class Memory:
+        async def get_conversation(self, **scope):
+            if defect == "missing":
+                raise RuntimeError("PRIVATE CONTENT")
+            result = _presence_conversation()
+            if defect == "owner":
+                result["owner_id"] = "PRIVATE OWNER"
+            if defect == "retired":
+                result["lifecycle_state"] = "closed"
+            return result
+
+    class Runtime:
+        async def read_surface_presence(self, **scope):
+            if defect == "malformed":
+                return {"content": "PRIVATE CONTENT", "state": "listening"}
+            raise RuntimeError("PRIVATE ERROR")
+
+    monkeypatch.setattr(main, "runtime", Runtime())
+    monkeypatch.setattr(main, "memory_store", Memory())
+    monkeypatch.setattr(main.settings, "orch_api_key", "presence-test-key")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+    ) as c:
+        response = await c.get("/v1/presence/current", headers={"X-API-Key": "presence-test-key"},
+                               params={"owner_id": "owner", "conversation_id": "conv-1",
+                                       "surface": "web"})
+    assert response.status_code == 503 and "PRIVATE" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_presence_stream_snapshot_race_replay_and_bounded_public_shape(monkeypatch):
+    import httpx
+    from test_chat_api import _load_main
+
+    main = _load_main(monkeypatch)
+    import services.surface_presence as service
+
+    class Memory:
+        async def get_conversation(self, **scope):
+            return _presence_conversation()
+
+    a, b = "pe_" + "a" * 32, "pe_" + "b" * 32
+
+    class Runtime:
+        async def read_surface_presence(self, **scope):
+            if scope["after"] is None:
+                return _presence_batch(cursor=a)
+            if scope["after"] == a:
+                return _presence_batch(state="suppressed", cursor=b, events=[{
+                    "state": "suppressed", "cursor": b,
+                }])
+            if scope["after"] == b:
+                return _presence_batch(state="suppressed", cursor=b)
+            raise ValueError("presence_cursor_invalid")
+
+    monkeypatch.setattr(main, "runtime", Runtime())
+    monkeypatch.setattr(main, "memory_store", Memory())
+    monkeypatch.setattr(main.settings, "orch_api_key", "presence-test-key")
+    monkeypatch.setattr(service, "PRESENCE_STREAM_SECONDS", .03)
+    monkeypatch.setattr(service, "PRESENCE_STREAM_POLL_SECONDS", .001)
+    params = {"owner_id": "owner", "conversation_id": "conv-1", "surface": "web"}
+    headers = {"X-API-Key": "presence-test-key"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+    ) as c:
+        first = await c.get("/v1/presence/stream", params=params, headers=headers)
+        assert first.status_code == 200 and first.headers["cache-control"] == "no-store"
+        assert first.text.count("event: snapshot") == first.text.count("event: transition") == 1
+        assert first.text.index(a) < first.text.index(b)
+        resumed = await c.get("/v1/presence/stream", params=params,
+                              headers={**headers, "Last-Event-ID": a})
+        assert "event: snapshot" not in resumed.text and a not in resumed.text
+        assert resumed.text.count("event: transition") == 1 and b in resumed.text
+        for cursor in ("malformed-private", "pe_" + "c" * 32):
+            bad = await c.get("/v1/presence/stream", params={**params, "cursor": cursor},
+                              headers=headers)
+            assert bad.status_code == 400 and cursor not in bad.text
+        conflict = await c.get("/v1/presence/stream", params={**params, "cursor": b},
+                               headers={**headers, "Last-Event-ID": a})
+        assert conflict.status_code == 400
+    import json
+    for line in first.text.splitlines():
+        if line.startswith("data: "):
+            assert set(json.loads(line[6:])) == {"state", "cursor"}
+    assert all(secret not in first.text for secret in ("owner", "conv-1", "rtsession", "profile"))
+
+
+@pytest.mark.asyncio
+async def test_presence_stream_disconnect_failure_and_backpressure_limit(monkeypatch):
+    import services.surface_presence as service
+
+    class Request:
+        closed = False
+
+        async def is_disconnected(self):
+            return self.closed
+
+    request, calls = Request(), []
+
+    async def failed(cursor):
+        calls.append(cursor)
+        raise RuntimeError("PRIVATE FAILURE")
+
+    monkeypatch.setattr(service, "PRESENCE_STREAM_POLL_SECONDS", .001)
+    stream = stream_surface_presence(request=request, initial=_presence_batch(),
+                                     read=failed, after=None)
+    assert "snapshot" in await anext(stream)
+    request.closed = True
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert calls == []
+    request.closed = False
+    frames = [f async for f in stream_surface_presence(
+        request=request, initial=_presence_batch(), read=failed, after=None,
+    )]
+    assert len(frames) == 2 and "event: unavailable" in frames[-1]
+    assert "PRIVATE" not in str(frames)
+    monkeypatch.setattr(service, "PRESENCE_STREAM_MAX_EVENTS", 3)
+    events = [{"state": "idle", "cursor": "pe_" + str(i) * 32} for i in range(5)]
+    initial = _presence_batch(events=events)
+    frames = [f async for f in stream_surface_presence(
+        request=request, initial=initial, read=failed, after="p0_" + "a" * 32,
+    )]
+    assert len(frames) == 3
+
+
+@pytest.mark.asyncio
+async def test_presence_publication_is_allowlisted_and_failure_does_not_change_chat(tmp_path):
+    from test_orchestrate_flow import FakeRuntime, _run_timing_turn
+
+    class Runtime(FakeRuntime):
+        publications = []
+
+        async def publish_surface_presence(self, **body):
+            self.publications.append(body)
+            raise RuntimeError("publication unavailable")
+
+    result, runtime, _, memory = await _run_timing_turn(tmp_path, runtime=Runtime())
+    assert result["answer"] == memory.added_messages[-1]["content"] == "hello"
+    assert memory.work["state"] == "completed"
+    assert [p["stage"] for p in runtime.publications] == ["processing", "terminal"]
+    assert [p["state"] for p in runtime.publications] == ["thinking", "idle"]
+    assert all(set(p) == {"owner_id", "conversation_id", "surface", "request_id",
+                          "runtime_session_id", "runtime_turn_id", "stage", "state"}
+               for p in runtime.publications)
     assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
