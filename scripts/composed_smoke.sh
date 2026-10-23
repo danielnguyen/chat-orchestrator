@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BMS="$ROOT/../basic-memory-store"
-CR="$ROOT/../cognitive-runtime"
+# A clean runtime worktree may identify source-verified prebuilt candidate images.
+# Compose's established build contexts and minimum baseline controls stay fixed.
+CR="${COMPOSED_CR_SOURCE:-$ROOT/../cognitive-runtime}"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="f7d0f77ba572b13f10f38b563469bef367964a35"
@@ -26,11 +28,19 @@ for command in git docker curl jq python3; do
 done
 
 for repository in "$BMS" "$CR" "$DSA"; do
-  test -d "$repository/.git" || {
+  git -C "$repository" rev-parse --show-toplevel >/dev/null 2>&1 || {
     echo "composed-smoke prerequisite missing: sibling repository $repository" >&2
     exit 2
   }
 done
+
+if [ -n "${COMPOSED_CR_SOURCE:-}" ]; then
+  [ "${COMPOSED_SKIP_BUILD:-}" = 1 ] && [ -z "$(git -C "$CR" status --porcelain)" ] || {
+    echo "composed-smoke runtime source override requires a clean worktree and verified prebuilt images" >&2
+    exit 2
+  }
+  git -C "$CR" merge-base --is-ancestor "$CR_COMMIT" HEAD
+fi
 
 git -C "$BMS" merge-base --is-ancestor "$BMS_COMMIT" main || {
   echo "basic-memory-store/main does not contain required merge $BMS_COMMIT" >&2
@@ -7190,7 +7200,9 @@ run_presence_event_scenario() {
     -e COGNITIVE_RUNTIME_COMPANION_ENABLED=true -e COGNITIVE_RUNTIME_RESTRAINT_ENABLED=true \
     -e COGNITIVE_RUNTIME_PRIVACY_CONTEXT_ENABLED=true orchestrator)"
   wait_for_http http://127.0.0.1:14361/healthz
-  python3 - "$owner" "$conversation" "$COMPOSE" "$SCENE_ORCHESTRATOR" <<'PYPRESENCE'
+  python3 - "$owner" "$conversation" "$COMPOSE" "$SCENE_ORCHESTRATOR" \
+    "$(git -C "$ROOT" rev-parse HEAD)" "$(git -C "$CR" rev-parse HEAD)" \
+    "$(git -C "$BMS" rev-parse HEAD)" "$(git -C "$DSA" rev-parse HEAD)" <<'PYPRESENCE'
 import concurrent.futures
 import json
 import os
@@ -7203,7 +7215,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-owner, conversation, compose, orchestrator = sys.argv[1:]
+owner, conversation, compose, orchestrator, co_revision, cr_revision, bms_revision, dsa_revision = sys.argv[1:]
 scope = dict(owner_id=owner, conversation_id=conversation, surface="desktop_private")
 co = "http://127.0.0.1:14361"
 cr = "http://127.0.0.1:14371"
@@ -7211,7 +7223,8 @@ bms = "http://127.0.0.1:14321"
 provider = "http://127.0.0.1:14381"
 key = {"X-API-Key": "smoke-orchestrator-key"}
 memory_key = {"X-API-Key": "smoke-memory-key"}
-evidence = []
+evidence = [dict(scenario="composition", co=co_revision, cr=cr_revision,
+    bms=bms_revision, dsa=dsa_revision)]
 
 
 def http(base, path, body=None, headers=None, expected=200):
