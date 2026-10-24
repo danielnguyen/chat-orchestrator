@@ -1074,14 +1074,18 @@ async def test_public_stream_cap_qualifies_history_without_skipping_reconnect(
             if cursor == history[-1]["cursor"]:
                 break
         assert delivered == history[2:]
+        main.runtime.fail_after_current = True
+        start = 99 if current_state is not None else 100
+        response = await client.get("/v1/presence/stream", params=params,
+            headers={**headers, "Last-Event-ID": history[start]["cursor"]})
+        final = frames(response)
+        assert len(final) == 100
+        transitions = [frame for frame in final if frame["event"] == "transition"]
+        assert [json.loads(frame["data"]) for frame in transitions] == history[start + 1:]
         if current_state is not None:
-            main.runtime.fail_after_current = True
-            response = await client.get("/v1/presence/stream", params=params,
-                headers={**headers, "Last-Event-ID": history[99]["cursor"]})
-            final = frames(response)
-            assert len(final) == 100
             assert all(frame["event"] == "transition" for frame in final)
-            assert [json.loads(frame["data"]) for frame in final] == history[100:]
+        else:
+            assert final[-1]["event"] == "unavailable" and "id" not in final[-1]
         for invalid in ("", "malformed", "pe_" + "f" * 32):
             response = await client.get("/v1/presence/stream", params={**params, "cursor": invalid},
                                         headers=headers)
