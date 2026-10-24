@@ -2637,6 +2637,11 @@ class RuntimeClient:
             payload["active_mode"] = active_mode
         return await self._post("/v1/runtime/sessions/resolve", json=payload)
 
+    async def start_turn_with_presence(self, **scope: Any) -> dict[str, Any]:
+        # CO selects processing presentation; CR commits it with actual admission.
+        # No public request field or modality hint can choose this state.
+        return await self.start_turn(**scope, surface_presence_state="thinking")
+
     async def start_turn(
         self,
         *,
@@ -2647,6 +2652,7 @@ class RuntimeClient:
         input_message_id: str | None = None,
         intent_class: str | None = None,
         expected_thread_revision: int | None = None,
+        surface_presence_state: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -2666,6 +2672,10 @@ class RuntimeClient:
             ):
                 raise ValueError("expected_thread_revision_invalid")
             payload["expected_thread_revision"] = expected_thread_revision
+        if surface_presence_state is not None:
+            if surface_presence_state != "thinking":
+                raise ValueError("surface_presence_transition_invalid")
+            payload["surface_presence_state"] = surface_presence_state
         response = await self._post("/v1/runtime/turns/start", json=payload)
         if not isinstance(response, dict):
             raise RuntimeError("runtime_turn_response_invalid")

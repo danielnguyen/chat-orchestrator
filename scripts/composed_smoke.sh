@@ -7276,7 +7276,7 @@ def read(after=None, selected=scope):
     return http(cr, "/v1/runtime/surface-presence/read", {**selected, "after": after})
 
 
-def stream(after=None, count=1, selected=scope, ready=None):
+def stream(after=None, count=1, selected=scope, ready=None, terminal_state=None):
     headers = dict(key)
     if after:
         headers["Last-Event-ID"] = after
@@ -7296,16 +7296,20 @@ def stream(after=None, count=1, selected=scope, ready=None):
                     assert re.fullmatch(r"p[0e]_[a-f0-9]{32}", projection["cursor"])
                     if frame["event"] != "unavailable":
                         assert frame["id"] == projection["cursor"]
+                    else:
+                        assert "id" not in frame
                     frames.append((frame["event"], projection))
                     if ready is not None:
                         ready.set()
-                    if len(frames) == count:
+                    if len(frames) >= count and (terminal_state is None
+                            or projection["state"] == terminal_state):
                         return frames  # closing the connection exercises disconnect cleanup
                 frame = {}
             else:
                 name, value = line.split(":", 1)
                 frame[name] = value.strip()
-    assert len(frames) == count, frames
+    assert len(frames) >= count, frames
+    assert terminal_state is None or frames[-1][1]["state"] == terminal_state, frames
     return frames
 
 
@@ -7370,6 +7374,7 @@ current(expected=401, headers={})
 first = chat()
 canonical(first)
 assert trace(first)["retrieval"]["prompt_assembly"]["companion_policy"]["included"] is True
+wait(lambda: current()["state"] == "idle")
 saved = current()
 assert saved["state"] == "idle" and set(saved) == {"state", "cursor"}
 first_binding = binding(first)
@@ -7384,7 +7389,7 @@ fingerprint = sql(f"SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages "
 # Snapshot followed by a delayed real turn proves the subscription gap is closed.
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
     ready = threading.Event()
-    observed = pool.submit(stream, None, 3, scope, ready)
+    observed = pool.submit(stream, None, 3, scope, ready, "idle")
     assert ready.wait(5), "initial stream snapshot not received"
     http(provider, "/fixture/delay-next-primary", {"delay_ms": 3500})
     pending = pool.submit(chat, "Check the logs next.", "desktop_private", "What should I check next?")
@@ -7393,6 +7398,9 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
     second = pending.result()
     frames = observed.result()
 canonical(second)
+# A pending best-effort terminal observation may truthfully qualify current
+# availability; it is not an invented ledger transition and has no event ID.
+frames = [item for item in frames if item[0] != "unavailable"]
 assert [item[1]["state"] for item in frames] == ["idle", "thinking", "idle"], frames
 assert [item[0] for item in frames] == ["snapshot", "transition", "transition"]
 assert frames[0][1] == saved and frames[1][1] == processing
@@ -7444,6 +7452,7 @@ assert presence["presence_state"] == "suppressed" and "companion" not in presenc
 assert "companion_policy.validated" not in presence["source_fields"]
 calls = http(provider, "/calls/" + private["request_id"])["calls"]
 assert not [c for c in calls if c["kind"] not in {"embedding", "semantic_interpreter"}]
+wait(lambda: current(selected=private_scope)["state"] == "suppressed")
 private_current = current(private_scope)
 assert private_current["state"] == "suppressed"
 private_batch = read(selected=private_scope)
@@ -7482,6 +7491,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
     pending = pool.submit(chat, "The input is checked.", "desktop_private", "How is the input checked?")
     wait(lambda: current()["state"] == "thinking")
     interrupted = current()
+    interrupted_diagnostics = diagnostics(session)
+    interrupted_turn = interrupted_diagnostics["active_turn"]["runtime_turn_id"]
+    interrupted_request = next(e["event_payload_json"]["request_id"]
+        for e in interrupted_diagnostics["events"]
+        if e["runtime_turn_id"] == interrupted_turn and e["event_type"] == "turn_started")
     subprocess.run(["docker", "kill", orchestrator], check=True, stdout=subprocess.DEVNULL)
     try:
         pending.result()
@@ -7500,8 +7514,15 @@ assert current()["state"] == "unavailable"
 http(provider, "/fixture/reset", {})
 recovered = chat("The input is checked.", text="How is the input checked?")
 canonical(recovered)
+wait(lambda: current()["state"] == "idle")
 assert current()["state"] == "idle"
-evidence.append(dict(scenario="interruption_and_outage", interrupted="unavailable", recovered="idle"))
+# A delayed observation for the older interrupted turn cannot overwrite recovery.
+http(cr, "/v1/runtime/surface-presence/publish", {**scope,
+    "runtime_session_id": session, "runtime_turn_id": interrupted_turn,
+    "request_id": interrupted_request, "stage": "terminal", "state": "unavailable"}, expected=409)
+assert current()["state"] == "idle"
+evidence.append(dict(scenario="interruption_and_outage", interrupted="unavailable", recovered="idle",
+    late_terminal_rejected=True))
 # Short server-owned returns use the same admitted lifecycle, without cognition.
 before_pause = current()
 paused = http(co, "/v1/chat", {**scope, "client_id": "desktop_private:presence",
@@ -7509,6 +7530,7 @@ paused = http(co, "/v1/chat", {**scope, "client_id": "desktop_private:presence",
     "messages": [{"role": "user", "content": "Pause the conversation."}]}, key)
 assert paused["status"] == "ok" and paused["selected_model"] == "not_called"
 canonical(paused)
+wait(lambda: current()["state"] == "idle")
 assert current()["state"] == "idle"
 assert diagnostics(session)["runtime_session"]["status"] == "paused"
 pause_events = stream(before_pause["cursor"], count=2)
@@ -7516,6 +7538,7 @@ assert [event[1]["state"] for event in pause_events] == ["thinking", "idle"]
 assert diagnostics(session)["runtime_session"]["status"] == "paused"  # reads never resume
 resumed = chat("7.", text="What is 3+4?")
 canonical(resumed)
+wait(lambda: current()["state"] == "idle")
 assert current()["state"] == "idle" and read()["runtime_session_id"] == session
 assert diagnostics(session)["runtime_session"]["status"] == "active"
 evidence.append(dict(scenario="server_owned_pause", paused="idle", resumed="idle",
@@ -7554,6 +7577,60 @@ with sqlite3.connect('file:/data/runtime_state.sqlite3?mode=ro',uri=True) as c:
 print(json.dumps({'persisted_events':len(rows),'exact_binding':True,'action_events':actions}))
 """, owner, conversation], text=True)
 evidence.append(json.loads(persisted))
+
+# A full replay window consists of real admitted/completed CO turns, not seeded
+# event rows. An admitted but unobserved newer turn makes current unavailable.
+original_conversation = conversation
+conversation = http(bms, "/v1/conversations", {
+    "owner_id": owner, "client_id": "desktop_private:presence-cap",
+}, memory_key)["conversation_id"]
+scope["conversation_id"] = conversation
+http(cr, "/v1/runtime/sessions/resolve", {**scope, "request_id": "presence-cap-session"})
+genesis = read()["cursor"]
+for index in range(100):
+    chat("7.", text="What is 3+4?")
+    wait(lambda: current()["state"] == "idle")
+assert json.loads(sql(f"SELECT json_build_object('count',count(*),'equal',bool_and(m.content='7.' "
+    f"AND w.state='completed'))::text FROM messages m JOIN work_items w "
+    f"ON w.assistant_message_id=m.id WHERE m.owner_id='{owner}' "
+    f"AND m.conversation_id='{conversation}' AND m.role='assistant';")) == {"count": 100, "equal": True}
+cap_session = read()["runtime_session_id"]
+unobserved_request = "presence-cap-unobserved"
+unobserved = http(cr, "/v1/runtime/turns/start", {**scope, "request_id": unobserved_request})
+assert current()["state"] == "unavailable"
+history = []
+position = genesis
+while True:
+    page = read(position)
+    history.extend(page["events"])
+    position = page["cursor"]
+    if not page["has_more"]:
+        break
+assert len(history) == 200 and len({e["cursor"] for e in history}) == 200
+assert [e["state"] for e in history] == ["thinking", "idle"] * 100
+capped = stream(history[1]["cursor"], count=100)
+assert len(capped) == 100 and capped[-2][1]["state"] == "thinking"
+assert capped[-1] == ("unavailable", {"state": "unavailable", "cursor": capped[-2][1]["cursor"]})
+assert [e[1] for e in capped[:-1]] == history[2:101]
+subprocess.run(["docker", "compose", "-f", compose, "restart", "runtime"],
+               check=True, stdout=subprocess.DEVNULL)
+wait(lambda: http(cr, "/healthz"))
+assert current()["state"] == "unavailable"
+reconnected = stream(capped[-2][1]["cursor"], count=100)
+assert [e[1] for e in reconnected[:-1]] == history[101:]
+assert reconnected[-1] == ("unavailable", {"state": "unavailable", "cursor": history[-1]["cursor"]})
+assert len({e[1]["cursor"] for e in capped[:-1] + reconnected[:-1]}) == 198
+http(cr, "/v1/runtime/turns/complete", {
+    "request_id": unobserved_request,
+    "runtime_session_id": cap_session,
+    "runtime_turn_id": unobserved["runtime_turn"]["runtime_turn_id"], "turn_status": "abandoned",
+})
+evidence.append(dict(scenario="capped_replay", real_events=200, frame_cap=100,
+    first_transitions=99, reconnect_transitions=99, final_history="thinking",
+    qualification="unavailable", cursor_advanced_by_qualification=False,
+    lost=0, duplicates=0, reordered=0, runtime_restart_preserved=True, canonical_equal=True))
+conversation = original_conversation
+scope["conversation_id"] = conversation
 for row in evidence:
     print("Presence consumer: " + json.dumps(row, sort_keys=True), flush=True)
 log_dir = os.environ.get("COMPOSED_SMOKE_LOG_DIR")
@@ -7575,6 +7652,11 @@ PYPRESENCE
 
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+# Reuse the unchanged workload/budgets for a single matched source comparison.
+if [ "${TRANSPORT_LATENCY_ONLY:-}" = 1 ]; then
+  run_transport_latency_regression
+  exit 0
+fi
 if [ "${PRESENCE_EVENTS_ONLY:-}" = 1 ]; then
   set -E
   trap 'echo "Presence consumer assertion failed: line=$LINENO" >&2' ERR

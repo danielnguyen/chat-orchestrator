@@ -400,7 +400,11 @@ async def stream_surface_presence(*, request: Any, initial: Any, read: Any, afte
         if await request.is_disconnected():
             return
         for event in batch.events:
-            if emitted >= PRESENCE_STREAM_MAX_EVENTS:
+            # Reserve the final frame for a cursor-neutral qualification unless
+            # this transition itself reaches the authoritative current event.
+            caught_up = batch.current is not None and event.cursor == batch.current.cursor
+            if emitted == PRESENCE_STREAM_MAX_EVENTS - 1 and not caught_up:
+                yield frame("unavailable", PresenceProjection(state="unavailable", cursor=cursor))
                 return
             yield frame("transition", event)
             cursor = event.cursor
@@ -412,7 +416,12 @@ async def stream_surface_presence(*, request: Any, initial: Any, read: Any, afte
             unavailable_cursor = cursor
         if not batch.has_more:
             await asyncio.sleep(PRESENCE_STREAM_POLL_SECONDS)
-        if await request.is_disconnected() or monotonic() >= deadline:
+        if await request.is_disconnected():
+            return
+        if monotonic() >= deadline:
+            if (emitted < PRESENCE_STREAM_MAX_EVENTS and unavailable_cursor != cursor
+                    and (batch.has_more or batch.current is None)):
+                yield frame("unavailable", PresenceProjection(state="unavailable", cursor=cursor))
             return
         try:
             batch = await asyncio.wait_for(read(cursor), timeout=2.0)

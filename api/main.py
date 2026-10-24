@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -41,12 +42,46 @@ from models import (
 )
 from services.briefing import generate_brief
 from services.orchestrate import orchestrate_chat
-from services.surface_presence import stream_surface_presence
+from services.surface_presence import publish_surface_presence, stream_surface_presence
 from settings import get_settings
 
 settings = get_settings()
 _chat_logger = logging.getLogger("uvicorn.error.chat_orchestrator.chat")
 _owned_chat_tasks: set[asyncio.Task] = set()
+_owned_presence_tasks: set[asyncio.Task] = set()
+_presence_stopping = False
+_PRESENCE_OBSERVER_LIMIT = 32
+_PRESENCE_OBSERVER_SECONDS = 2.1
+
+
+def _presence_observation_done(task: asyncio.Task) -> None:
+    _owned_presence_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _chat_logger.warning("presence_observation_failed")
+
+
+def _schedule_presence_observation(trace: dict[str, Any] | None) -> None:
+    # No queue or retry: saturation/shutdown can lose an observation. CR readers
+    # qualify missing terminal observations as unavailable, never successful idle.
+    if _presence_stopping or len(_owned_presence_tasks) >= _PRESENCE_OBSERVER_LIMIT:
+        return
+    snapshot = deepcopy(trace)
+    runtime_client, memory_client = runtime, memory_store
+    deadline = asyncio.get_running_loop().time() + _PRESENCE_OBSERVER_SECONDS
+
+    async def observe() -> None:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await publish_surface_presence(
+                    runtime=runtime_client, memory_store=memory_client,
+                    trace=snapshot, stage="terminal",
+                )
+        except TimeoutError:
+            pass
+
+    task = asyncio.create_task(observe(), name="surface-presence-observation")
+    _owned_presence_tasks.add(task)
+    task.add_done_callback(_presence_observation_done)
 
 
 async def _feedback_records(
@@ -144,6 +179,9 @@ async def _await_chat_delivery(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    global _presence_stopping
+
+    _presence_stopping = False
     runtime_client = runtime
     memory_client = memory_store
     memory_opened = False
@@ -156,12 +194,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await memory_client.reconcile_interrupted_work()
         yield
     finally:
+        _presence_stopping = True
         try:
             tasks = tuple(_owned_chat_tasks)
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            observations = tuple(_owned_presence_tasks)
+            for task in observations:
+                task.cancel()
+            if observations:
+                await asyncio.gather(*observations, return_exceptions=True)
         finally:
             try:
                 if memory_opened:
@@ -535,6 +579,7 @@ async def chat(body: ChatRequest, request: Request = None) -> ChatResponse:
             prompt_context_safety_margin=settings.prompt_context_safety_margin,
             request_id=request_id,
             on_work_admitted=on_work_admitted if eligible or cue is not None else None,
+            on_presence_observation=_schedule_presence_observation,
             **({"on_processing_eligible": on_processing_eligible} if cue is not None else {}),
             **({"non_executing_conversation": True} if non_executing_conversation else {}),
         )

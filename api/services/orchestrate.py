@@ -5416,11 +5416,13 @@ async def _start_runtime_turn(
             "error_type": "RuntimeClientNotConfigured",
             "omission_reason": "runtime_client_not_configured",
         }
+    start_with_presence = getattr(runtime, "start_turn_with_presence", None)
+    start = start_with_presence if callable(start_with_presence) else runtime.start_turn
     attempts = 0
     while attempts < 2:
         attempts += 1
         try:
-            response = await runtime.start_turn(
+            response = await start(
                 request_id=request_id,
                 owner_id=owner_id,
                 conversation_id=conversation_id,
@@ -5457,6 +5459,7 @@ async def _start_runtime_turn(
         "status": "included",
         "included": True,
         "admission_protected": True,
+        "processing_presence_recorded": callable(start_with_presence),
         "runtime_session_id": session.get("runtime_session_id"),
         "runtime_turn_id": turn.get("runtime_turn_id"),
         "input_message_id": turn.get("input_message_id"),
@@ -9733,6 +9736,7 @@ async def orchestrate_chat(
     request_id: str,
     on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
     on_processing_eligible: Callable[[dict[str, Any]], None] | None = None,
+    on_presence_observation: Callable[[dict[str, Any] | None], None] | None = None,
     non_executing_conversation: bool = False,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
@@ -10247,10 +10251,11 @@ async def orchestrate_chat(
             )
         except (ValueError, TypeError):
             surface_presence_trace = None
-        await publish_surface_presence(
-            runtime=runtime, memory_store=memory_store,
-            trace=surface_presence_trace, stage="processing",
-        )
+        if not turn_state_trace.get("processing_presence_recorded"):
+            await publish_surface_presence(
+                runtime=runtime, memory_store=memory_store,
+                trace=surface_presence_trace, stage="processing",
+            )
         if explicit_pause:
             return await _finish_explicit_pause(
                 payload=payload, request_id=request_id, conversation_id=conversation_id,
@@ -15040,7 +15045,15 @@ async def orchestrate_chat(
             terminal_presence_trace = apply_surface_presence_outcome(
                 terminal_presence_trace, unavailable=True,
             )
-        await publish_surface_presence(
-            runtime=runtime, memory_store=memory_store,
-            trace=terminal_presence_trace, stage="terminal",
-        )
+        if on_presence_observation is not None:
+            try:
+                on_presence_observation(terminal_presence_trace)
+            except Exception:
+                logging.getLogger(__name__).warning("presence_observation_not_scheduled")
+        else:
+            # Preserve internal callers that synchronously observe completion.
+            # The public API always supplies its bounded application-owned callback.
+            await publish_surface_presence(
+                runtime=runtime, memory_store=memory_store,
+                trace=terminal_presence_trace, stage="terminal",
+            )
