@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -14,6 +15,7 @@ from clients.data_source_aggregator import DataSourceAggregatorClient
 from clients.litellm import LiteLLMClient
 from clients.memory_store import (
     MemoryStoreClient,
+    _validate_conversation_projection,
     _validate_current_work,
     _validate_work_result,
 )
@@ -31,6 +33,8 @@ from models import (
     ChatTerminalRecord,
     CurrentWorkStatus,
     DeferredChatResponse,
+    PresenceProjection,
+    PresenceRuntimeBatch,
     ProcessingCueRecord,
     WorkIdentifier,
     WorkStatus,
@@ -38,11 +42,46 @@ from models import (
 )
 from services.briefing import generate_brief
 from services.orchestrate import orchestrate_chat
+from services.surface_presence import publish_surface_presence, stream_surface_presence
 from settings import get_settings
 
 settings = get_settings()
 _chat_logger = logging.getLogger("uvicorn.error.chat_orchestrator.chat")
 _owned_chat_tasks: set[asyncio.Task] = set()
+_owned_presence_tasks: set[asyncio.Task] = set()
+_presence_stopping = False
+_PRESENCE_OBSERVER_LIMIT = 32
+_PRESENCE_OBSERVER_SECONDS = 2.1
+
+
+def _presence_observation_done(task: asyncio.Task) -> None:
+    _owned_presence_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _chat_logger.warning("presence_observation_failed")
+
+
+def _schedule_presence_observation(trace: dict[str, Any] | None) -> None:
+    # No queue or retry: saturation/shutdown can lose an observation. CR readers
+    # qualify missing terminal observations as unavailable, never successful idle.
+    if _presence_stopping or len(_owned_presence_tasks) >= _PRESENCE_OBSERVER_LIMIT:
+        return
+    snapshot = deepcopy(trace)
+    runtime_client, memory_client = runtime, memory_store
+    deadline = asyncio.get_running_loop().time() + _PRESENCE_OBSERVER_SECONDS
+
+    async def observe() -> None:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await publish_surface_presence(
+                    runtime=runtime_client, memory_store=memory_client,
+                    trace=snapshot, stage="terminal",
+                )
+        except TimeoutError:
+            pass
+
+    task = asyncio.create_task(observe(), name="surface-presence-observation")
+    _owned_presence_tasks.add(task)
+    task.add_done_callback(_presence_observation_done)
 
 
 async def _feedback_records(
@@ -140,6 +179,9 @@ async def _await_chat_delivery(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    global _presence_stopping
+
+    _presence_stopping = False
     runtime_client = runtime
     memory_client = memory_store
     memory_opened = False
@@ -152,12 +194,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await memory_client.reconcile_interrupted_work()
         yield
     finally:
+        _presence_stopping = True
         try:
             tasks = tuple(_owned_chat_tasks)
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            observations = tuple(_owned_presence_tasks)
+            for task in observations:
+                task.cancel()
+            if observations:
+                await asyncio.gather(*observations, return_exceptions=True)
         finally:
             try:
                 if memory_opened:
@@ -262,6 +310,123 @@ async def current_work_status(
         return CurrentWorkStatus(status="resolved", work=_public_work_result(value, **expected))
     except Exception:
         raise HTTPException(status_code=503, detail="work_unavailable") from None
+
+
+_PRESENCE_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+
+
+class _PresenceStreamingResponse(StreamingResponse):
+    # Includes the producer's 15-second polling horizon and a bounded in-flight read.
+    max_duration = 17.0
+
+    async def stream_response(self, send):
+        try:
+            await asyncio.wait_for(super().stream_response(send), timeout=self.max_duration)
+        except TimeoutError:
+            try:
+                await asyncio.wait_for(send({
+                    "type": "http.response.body", "body": b"", "more_body": False,
+                }), timeout=.1)
+            except Exception:
+                pass
+        finally:
+            close = getattr(self.body_iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await asyncio.wait_for(close(), timeout=.1)
+                except Exception:
+                    pass
+
+
+async def _presence_access(api_key: str | None = Security(api_key_header)):
+    try:
+        await require_api_key(api_key)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="Unauthorized",
+                            headers=_PRESENCE_HEADERS) from None
+
+
+async def _read_presence(owner_id: str, conversation_id: str, surface: str, after: str | None):
+    import re
+
+    from pydantic import TypeAdapter
+
+    try:
+        TypeAdapter(WorkIdentifier).validate_python(owner_id)
+        TypeAdapter(WorkIdentifier).validate_python(conversation_id)
+        if not isinstance(surface, str) or not 1 <= len(surface) <= 64 or re.search(r"\s", surface):
+            raise ValueError
+        if after is not None and re.fullmatch(r"p[0e]_[a-f0-9]{32}", after) is None:
+            raise ValueError
+    except Exception:
+        raise HTTPException(status_code=400, detail="presence_scope_or_cursor_invalid",
+                            headers=_PRESENCE_HEADERS) from None
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="presence_unavailable",
+                            headers=_PRESENCE_HEADERS)
+    try:
+        conversation = _validate_conversation_projection(
+            await memory_store.get_conversation(owner_id=owner_id, conversation_id=conversation_id),
+            owner_id=owner_id, conversation_id=conversation_id,
+        )
+        if conversation["lifecycle_state"] != "open":
+            raise RuntimeError("conversation_not_open")
+        result = PresenceRuntimeBatch.model_validate(await runtime.read_surface_presence(
+            owner_id=owner_id, conversation_id=conversation_id, surface=surface, after=after,
+        ))
+        if any(getattr(result, key) != value for key, value in (
+            ("owner_id", owner_id), ("conversation_id", conversation_id), ("surface", surface),
+        )):
+            raise RuntimeError("presence_scope_mismatch")
+        return result
+    except ValueError as exc:
+        if str(exc) == "presence_cursor_invalid":
+            raise HTTPException(status_code=400, detail="presence_cursor_invalid",
+                                headers=_PRESENCE_HEADERS) from None
+        raise HTTPException(status_code=503, detail="presence_unavailable",
+                            headers=_PRESENCE_HEADERS) from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="presence_unavailable",
+                            headers=_PRESENCE_HEADERS) from None
+
+
+@app.get("/v1/presence/current", response_model=PresenceProjection,
+         dependencies=[Depends(_presence_access)])
+async def current_presence(owner_id: str | None = None, conversation_id: str | None = None,
+                           surface: str | None = None):
+    try:
+        batch = await asyncio.wait_for(
+            _read_presence(owner_id, conversation_id, surface, None), 2.0,
+        )
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="presence_unavailable",
+                            headers=_PRESENCE_HEADERS) from None
+    projection = batch.current or PresenceProjection(state="unavailable", cursor=batch.cursor)
+    return JSONResponse(projection.model_dump(), headers=_PRESENCE_HEADERS)
+
+
+@app.get("/v1/presence/stream", dependencies=[Depends(_presence_access)])
+async def presence_stream(request: Request, owner_id: str | None = None,
+                          conversation_id: str | None = None, surface: str | None = None,
+                          cursor: str | None = None):
+    last = request.headers.get("last-event-id")
+    if last is not None and cursor is not None and last != cursor:
+        raise HTTPException(status_code=400, detail="presence_cursor_invalid",
+                            headers=_PRESENCE_HEADERS)
+    after = cursor if cursor is not None else last
+
+    async def read(position):
+        return await _read_presence(owner_id, conversation_id, surface, position)
+
+    try:
+        batch = await asyncio.wait_for(read(after), 2.0)
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="presence_unavailable",
+                            headers=_PRESENCE_HEADERS) from None
+    return _PresenceStreamingResponse(
+        stream_surface_presence(request=request, initial=batch, read=read, after=after),
+        media_type="text/event-stream", headers=_PRESENCE_HEADERS,
+    )
 
 
 @app.get("/healthz")
@@ -414,6 +579,7 @@ async def chat(body: ChatRequest, request: Request = None) -> ChatResponse:
             prompt_context_safety_margin=settings.prompt_context_safety_margin,
             request_id=request_id,
             on_work_admitted=on_work_admitted if eligible or cue is not None else None,
+            on_presence_observation=_schedule_presence_observation,
             **({"on_processing_eligible": on_processing_eligible} if cue is not None else {}),
             **({"non_executing_conversation": True} if non_executing_conversation else {}),
         )

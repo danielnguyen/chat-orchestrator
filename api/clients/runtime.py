@@ -2190,6 +2190,43 @@ def validate_pause_completion_response(
 
 
 class RuntimeClient:
+    async def publish_surface_presence(self, **binding: Any) -> dict[str, Any]:
+        from models import PresenceProjection
+
+        response = await self._post("/v1/runtime/surface-presence/publish", json=binding)
+        if (not isinstance(response, dict) or set(response) != {"binding", "event"}
+                or response["binding"] != binding):
+            raise RuntimeError("surface_presence_publication_invalid")
+        event = PresenceProjection.model_validate(response["event"])
+        if event.state != binding.get("state") or not event.cursor.startswith("pe_"):
+            raise RuntimeError("surface_presence_publication_invalid")
+        return response
+
+    async def read_surface_presence(
+        self, *, owner_id: str, conversation_id: str, surface: str, after: str | None = None,
+    ):
+        from models import PresenceRuntimeBatch
+
+        try:
+            response = await self._post("/v1/runtime/surface-presence/read", json={
+                "owner_id": owner_id, "conversation_id": conversation_id, "surface": surface,
+                "after": after, "limit": 50,
+            })
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400:
+                raise ValueError("presence_cursor_invalid") from None
+            raise
+        result = PresenceRuntimeBatch.model_validate(response)
+        if (result.owner_id != owner_id or result.conversation_id != conversation_id
+                or result.surface != surface
+                or len({e.cursor for e in result.events}) != len(result.events)
+                or (result.events and result.cursor != result.events[-1].cursor)
+                or (after is not None and not result.events and result.cursor != after)
+                or any(e.cursor == after for e in result.events)
+                or (result.has_more and not result.events)):
+            raise RuntimeError("surface_presence_read_invalid")
+        return result
+
     def __init__(
         self,
         base_url: str,
@@ -2600,6 +2637,11 @@ class RuntimeClient:
             payload["active_mode"] = active_mode
         return await self._post("/v1/runtime/sessions/resolve", json=payload)
 
+    async def start_turn_with_presence(self, **scope: Any) -> dict[str, Any]:
+        # CO selects processing presentation; CR commits it with actual admission.
+        # No public request field or modality hint can choose this state.
+        return await self.start_turn(**scope, surface_presence_state="thinking")
+
     async def start_turn(
         self,
         *,
@@ -2610,6 +2652,7 @@ class RuntimeClient:
         input_message_id: str | None = None,
         intent_class: str | None = None,
         expected_thread_revision: int | None = None,
+        surface_presence_state: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "request_id": request_id,
@@ -2629,6 +2672,10 @@ class RuntimeClient:
             ):
                 raise ValueError("expected_thread_revision_invalid")
             payload["expected_thread_revision"] = expected_thread_revision
+        if surface_presence_state is not None:
+            if surface_presence_state != "thinking":
+                raise ValueError("surface_presence_transition_invalid")
+            payload["surface_presence_state"] = surface_presence_state
         response = await self._post("/v1/runtime/turns/start", json=payload)
         if not isinstance(response, dict):
             raise RuntimeError("runtime_turn_response_invalid")

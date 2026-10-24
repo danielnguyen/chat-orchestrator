@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BMS="$ROOT/../basic-memory-store"
-CR="$ROOT/../cognitive-runtime"
+# A clean runtime worktree may identify source-verified prebuilt candidate images.
+# Compose's established build contexts and minimum baseline controls stay fixed.
+CR="${COMPOSED_CR_SOURCE:-$ROOT/../cognitive-runtime}"
 DSA="$ROOT/../data-source-aggregator"
 COMPOSE="$ROOT/docker-compose.composed-smoke.yml"
 BMS_COMMIT="f7d0f77ba572b13f10f38b563469bef367964a35"
@@ -26,11 +28,19 @@ for command in git docker curl jq python3; do
 done
 
 for repository in "$BMS" "$CR" "$DSA"; do
-  test -d "$repository/.git" || {
+  git -C "$repository" rev-parse --show-toplevel >/dev/null 2>&1 || {
     echo "composed-smoke prerequisite missing: sibling repository $repository" >&2
     exit 2
   }
 done
+
+if [ -n "${COMPOSED_CR_SOURCE:-}" ]; then
+  [ "${COMPOSED_SKIP_BUILD:-}" = 1 ] && [ -z "$(git -C "$CR" status --porcelain)" ] || {
+    echo "composed-smoke runtime source override requires a clean worktree and verified prebuilt images" >&2
+    exit 2
+  }
+  git -C "$CR" merge-base --is-ancestor "$CR_COMMIT" HEAD
+fi
 
 git -C "$BMS" merge-base --is-ancestor "$BMS_COMMIT" main || {
   echo "basic-memory-store/main does not contain required merge $BMS_COMMIT" >&2
@@ -2582,9 +2592,12 @@ run_continuation_failure_contention_scenario() {
   before="$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)"
   configure_surface_permission "$owner" alexa true true false
   loser="$(run_distinct_client_chat "$owner" alexa:failure-loser alexa "$conversation" "neutral competing input")"
-  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
-  [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
-  jq -e '.state == "active" and .active_surface == "telegram"' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  # Interrupt at the observed contention boundary. The durable loser checks
+  # below must not consume the existing provider-delay window before the kill.
+  jq -e '.status=="failed" and .selected_model=="not_called"' <<<"$loser" >/dev/null
+  [ "$(fetch_provider_calls "$(jq -r .request_id <<<"$loser")" | jq '[.calls[]|select(.kind=="chat")]|length')" = 0 ]
+  jq -e --arg session "$session" '.state == "active" and .active_surface == "telegram"
+    and .active_runtime_session_id==$session' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
   docker compose -f "$COMPOSE" kill -s SIGKILL provider >/dev/null
   wait "$winner_pid"
   [ "$(cat "$COMPOSED_SMOKE_TMP/contention-failure-status")" = 500 ]
@@ -2599,16 +2612,30 @@ run_continuation_failure_contention_scenario() {
     and all(.model_calls[]; .status == "failed")' <<<"$diagnostics" >/dev/null
   docker compose -f "$COMPOSE" start provider >/dev/null
   docker compose -f "$COMPOSE" up -d --wait provider >/dev/null
+  assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
+  [ "$before" = "$(runtime_owner_counts "$owner" | cut -d'|' -f1-3)" ]
   diagnostics="$(fetch_runtime_diagnostics "$session")"
   jq -e '.latest_turn.turn_status == "abandoned"
     and ([.events[] | select(.event_type == "turn_completed")] | length) == 1
     and ([.events[] | select(.event_type == "action_authority_evaluated" or .event_type == "action_flow_evaluated")] | length) == 0' <<<"$diagnostics" >/dev/null
+  jq -e --arg request "$request" '[.events[]|select(.event_type=="surface_presence_published"
+    and .event_payload_json.stage=="terminal" and .event_payload_json.state=="unavailable"
+    and .event_payload_json.request_id==$request)]|length==1' <<<"$diagnostics" >/dev/null
+  curl -fsS -G http://127.0.0.1:14361/v1/presence/current \
+    -H 'X-API-Key: smoke-orchestrator-key' --data-urlencode "owner_id=$owner" \
+    --data-urlencode "conversation_id=$conversation" --data-urlencode surface=telegram \
+    | jq -e '.state=="unavailable" and keys==["cursor","state"]' >/dev/null
   jq -e '.state == "idle" and .revision == 2 and .session_count == 1 and .surfaces == ["telegram"]' <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
   [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='user'),(SELECT count(*) FROM messages WHERE owner_id='$owner' AND role='assistant'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM work_items WHERE owner_id='$owner' AND state='failed');")" = '1|0|0|1' ]
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
   configure_surface_permission "$owner" alexa true true false
   fresh="$(run_distinct_client_chat "$owner" alexa:failure-fresh alexa "$conversation" "What does this function do?")"
   jq -e --arg conversation "$conversation" '.status == "ok" and .conversation_id == $conversation' <<<"$fresh" >/dev/null
+  assert_persisted_answer_matches "$conversation" "$(jq -r .request_id <<<"$fresh")" "$(jq -r .answer <<<"$fresh")"
+  curl -fsS -G http://127.0.0.1:14361/v1/presence/current \
+    -H 'X-API-Key: smoke-orchestrator-key' --data-urlencode "owner_id=$owner" \
+    --data-urlencode "conversation_id=$conversation" --data-urlencode surface=alexa \
+    | jq -e '.state=="briefing" and keys==["cursor","state"]' >/dev/null
   [ "$(fetch_provider_calls "$(jq -r '.request_id' <<<"$fresh")" | jq '[.calls[] | select(.kind == "chat")] | length')" = 1 ]
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM messages WHERE owner_id='$owner';")" = '2|1' ]
   [ "$(psql_exec -At -F '|' -c "SELECT count(*) FILTER (WHERE state='failed'),count(*) FILTER (WHERE state='completed'),count(*) FROM work_items WHERE owner_id='$owner';")" = '1|1|2' ]
@@ -2616,6 +2643,12 @@ run_continuation_failure_contention_scenario() {
   assert_continuation_contention_loser "$owner" "$conversation" alexa:failure-loser "$loser"
   [ "$(psql_exec -At -F '|' -c "SELECT (SELECT count(*) FROM traces WHERE owner_id='$owner'),(SELECT count(*) FROM claim_records WHERE owner_id='$owner'),(SELECT count(*) FROM memory_items WHERE owner_id='$owner');")" = '2|0|0' ]
   echo "Continuation C1-06 failure_contention: winner_abandoned=true loser_promoted=false loser_side_effects=0 provider_attempts=failed_primary,failed_fallback,fresh_one primary_fallback_successes=0 assistant_publications=1 work_failed=1 work_completed=1 traces=2 claims=0 canonical_facts=0 action_events=0 confirmations=0 fresh_admission_once=true"
+  echo "Presence failure consumer: terminal=unavailable recovery=briefing canonical=true actions=0"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    jq -nc '{scenario:"provider_failure",terminal:"unavailable",recovery:"briefing",
+      canonical_equal:true,failed_provider_attempts:2,action_events:0,confirmations:0}' \
+      >>"$COMPOSED_SMOKE_LOG_DIR/presence-consumer.jsonl"
+  fi
   provider_post /fixture/reset '{}'
 }
 
@@ -7179,8 +7212,465 @@ run_surface_lifecycle_scenario() {
   done
 }
 
+run_presence_event_scenario() {
+  # Real API consumer; the existing disposable topology owns all service data.
+  local owner=owner-presence-events conversation
+  conversation="$(create_conversation "$owner" desktop_private:presence)"
+  configure_surface_permission "$owner" desktop_private true true false
+  configure_surface_permission "$owner" unknown_presence_fixture true false false
+  docker compose -f "$COMPOSE" stop orchestrator >/dev/null
+  SCENE_ORCHESTRATOR="$(docker compose -f "$COMPOSE" run -d --no-deps --service-ports \
+    -e COGNITIVE_RUNTIME_COMPANION_ENABLED=true -e COGNITIVE_RUNTIME_RESTRAINT_ENABLED=true \
+    -e COGNITIVE_RUNTIME_PRIVACY_CONTEXT_ENABLED=true orchestrator)"
+  wait_for_http http://127.0.0.1:14361/healthz
+  python3 - "$owner" "$conversation" "$COMPOSE" "$SCENE_ORCHESTRATOR" \
+    "$(git -C "$ROOT" rev-parse HEAD)" "$(git -C "$CR" rev-parse HEAD)" \
+    "$(git -C "$BMS" rev-parse HEAD)" "$(git -C "$DSA" rev-parse HEAD)" <<'PYPRESENCE'
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+owner, conversation, compose, orchestrator, co_revision, cr_revision, bms_revision, dsa_revision = sys.argv[1:]
+scope = dict(owner_id=owner, conversation_id=conversation, surface="desktop_private")
+co = "http://127.0.0.1:14361"
+cr = "http://127.0.0.1:14371"
+bms = "http://127.0.0.1:14321"
+provider = "http://127.0.0.1:14381"
+key = {"X-API-Key": "smoke-orchestrator-key"}
+memory_key = {"X-API-Key": "smoke-memory-key"}
+evidence = [dict(scenario="composition", co=co_revision, cr=cr_revision,
+    bms=bms_revision, dsa=dsa_revision)]
+
+
+def http(base, path, body=None, headers=None, expected=200):
+    request = urllib.request.Request(base + path, headers=headers or {},
+        data=json.dumps(body).encode() if body is not None else None)
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        response = urllib.request.urlopen(request, timeout=35)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        raw = response.read()
+        assert response.status == expected, (path, response.status, raw[:400])
+        if path.startswith(("/v1/presence/current?", "/v1/presence/stream?")):
+            assert response.headers.get("Cache-Control") == "no-store"
+        return json.loads(raw) if raw else None
+
+
+def current(selected=scope, expected=200, headers=key):
+    return http(co, "/v1/presence/current?" + urllib.parse.urlencode(selected),
+                headers=headers, expected=expected)
+
+
+def read(after=None, selected=scope):
+    return http(cr, "/v1/runtime/surface-presence/read", {**selected, "after": after})
+
+
+def stream(after=None, count=1, selected=scope, ready=None, terminal_state=None, read_to_end=False):
+    headers = dict(key)
+    if after:
+        headers["Last-Event-ID"] = after
+    request = urllib.request.Request(co + "/v1/presence/stream?" +
+        urllib.parse.urlencode(selected), headers=headers)
+    frames = []
+    with urllib.request.urlopen(request, timeout=20) as response:
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get_content_type() == "text/event-stream"
+        frame = {}
+        for raw in response:
+            line = raw.decode().rstrip("\r\n")
+            if not line:
+                if "data" in frame:
+                    projection = json.loads(frame["data"])
+                    assert set(projection) == {"state", "cursor"}, projection
+                    assert re.fullmatch(r"p[0e]_[a-f0-9]{32}", projection["cursor"])
+                    if frame["event"] != "unavailable":
+                        assert frame["id"] == projection["cursor"]
+                    else:
+                        assert "id" not in frame
+                    frames.append((frame["event"], projection))
+                    if ready is not None:
+                        ready.set()
+                    if not read_to_end and len(frames) >= count and (terminal_state is None
+                            or projection["state"] == terminal_state):
+                        return frames  # closing the connection exercises disconnect cleanup
+                frame = {}
+            else:
+                name, value = line.split(":", 1)
+                frame[name] = value.strip()
+    assert len(frames) == count if read_to_end else len(frames) >= count, frames
+    assert terminal_state is None or frames[-1][1]["state"] == terminal_state, frames
+    return frames
+
+
+def wait(predicate):
+    for _ in range(120):
+        try:
+            result = predicate()
+            if result:
+                return result
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(.1)
+    raise AssertionError("bounded presence wait expired")
+
+
+def chat(answer="Save the backup first.", surface="desktop_private", text="What is the backup procedure?", scene=None):
+    if answer is not None:
+        http(provider, "/fixture/next-answer", {"answer": answer})
+    result = http(co, "/v1/chat", {**scope, "surface": surface,
+        "client_id": surface + ":presence", "sensitivity": "private",
+        "messages": [{"role": "user", "content": text}],
+        **({"requested_scene": scene} if scene else {})}, key)
+    if answer is not None:
+        assert result["status"] == "ok" and result["answer"] == answer, result
+    return result
+
+
+def trace(result):
+    return http(bms, "/v1/traces/" + result["request_id"], headers=memory_key)
+
+
+def diagnostics(session):
+    return http(cr, "/v1/runtime/sessions/" + session)
+
+
+def binding(result, stage="terminal", state="idle"):
+    turn = trace(result)["retrieval"]["prompt_assembly"]["turn_state"]
+    return {**scope, "request_id": result["request_id"],
+        "runtime_session_id": turn["runtime_session_id"],
+        "runtime_turn_id": turn["runtime_turn_id"], "stage": stage, "state": state}
+
+
+def sql(statement):
+    return subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T",
+        "postgres", "psql", "-U", "smoke", "-d", "memory", "-Atc", statement], text=True).strip()
+
+
+def canonical(result):
+    request = result["request_id"]
+    stored = sql(f"SELECT json_build_object('answer',m.content,'state',w.state)::text "
+        f"FROM messages m JOIN work_items w ON w.assistant_message_id=m.id AND w.work_id=m.work_id "
+        f"WHERE m.owner_id='{owner}' AND m.conversation_id='{conversation}' "
+        f"AND m.metadata->>'request_id'='{request}' AND w.request_id='{request}';")
+    assert json.loads(stored) == {"answer": result["answer"], "state": "completed"}
+    assert sql(f"SELECT count(*) FROM messages WHERE owner_id='{owner}' AND "
+        f"conversation_id='{conversation}' AND role='assistant' AND metadata->>'request_id'='{request}';") == "1"
+
+
+# No record is not an invented idle; reads do not create a runtime session.
+current(expected=503)
+current(expected=401, headers={})
+first = chat()
+canonical(first)
+assert trace(first)["retrieval"]["prompt_assembly"]["companion_policy"]["included"] is True
+wait(lambda: current()["state"] == "idle")
+saved = current()
+assert saved["state"] == "idle" and set(saved) == {"state", "cursor"}
+first_binding = binding(first)
+session = first_binding["runtime_session_id"]
+origin_events = diagnostics(session)["events"]
+history = [e for e in origin_events if e["event_type"] == "surface_presence_published"]
+assert [e["event_payload_json"]["state"] for e in history] == ["thinking", "idle"]
+assert saved["cursor"] == history[-1]["event_payload_json"]["cursor"]
+fingerprint = sql(f"SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages "
+    f"WHERE conversation_id='{conversation}' ORDER BY created_at,id LIMIT 2) m;")
+
+# Snapshot followed by a delayed real turn proves the subscription gap is closed.
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    ready = threading.Event()
+    observed = pool.submit(stream, None, 3, scope, ready, "idle")
+    assert ready.wait(5), "initial stream snapshot not received"
+    http(provider, "/fixture/delay-next-primary", {"delay_ms": 3500})
+    pending = pool.submit(chat, "Check the logs next.", "desktop_private", "What should I check next?")
+    wait(lambda: current()["state"] == "thinking")
+    processing = read()["current"]
+    second = pending.result()
+    frames = observed.result()
+canonical(second)
+# A pending best-effort terminal observation may truthfully qualify current
+# availability; it is not an invented ledger transition and has no event ID.
+frames = [item for item in frames if item[0] != "unavailable"]
+assert [item[1]["state"] for item in frames] == ["idle", "thinking", "idle"], frames
+assert [item[0] for item in frames] == ["snapshot", "transition", "transition"]
+assert frames[0][1] == saved and frames[1][1] == processing
+terminal = current()
+assert frames[-1][1] == terminal
+assert stream(processing["cursor"]) == [("transition", terminal)]
+assert read(saved["cursor"])["events"] == [processing, terminal]
+
+# The server-selected projection is idempotent, not a client-writable CO API.
+second_binding = binding(second)
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    duplicates = list(pool.map(lambda _: http(cr, "/v1/runtime/surface-presence/publish",
+        second_binding), range(16)))
+assert all(result["event"] == terminal for result in duplicates)
+for field in ("owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id", "request_id"):
+    http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, field: "wrong"}, expected=409)
+http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, "state": "fallback"}, expected=409)
+http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, "state": "listening"}, expected=422)
+http(cr, "/v1/runtime/surface-presence/publish", {**second_binding, "private": "do not store"}, expected=422)
+http(co, "/v1/presence/update", {"state": "thinking"}, key, expected=404)
+current({**scope, "owner_id": "wrong"}, expected=503)
+current({**scope, "surface": "wrong"}, expected=503)
+for cursor in ("bad", "pe_" + "0" * 32):
+    http(co, "/v1/presence/stream?" + urllib.parse.urlencode({**scope, "cursor": cursor}),
+        headers=key, expected=400)
+assert current() == terminal
+assert len([e for e in diagnostics(session)["events"] if e["event_type"] == "surface_presence_published"]) == 4
+
+# Restart the disposable CR process with the same existing SQLite volume.
+subprocess.run(["docker", "compose", "-f", compose, "restart", "runtime"], check=True, stdout=subprocess.DEVNULL)
+wait(lambda: http(cr, "/healthz"))
+assert current() == terminal
+assert read(saved["cursor"])["events"] == [processing, terminal]
+assert stream(processing["cursor"]) == [("transition", terminal)]
+assert fingerprint == sql(f"SELECT md5(json_agg(m)::text) FROM (SELECT * FROM messages "
+    f"WHERE conversation_id='{conversation}' ORDER BY created_at,id LIMIT 2) m;")
+evidence.append(dict(scenario="ordered_restart_replay", states=["idle", "thinking", "idle"],
+    duplicate_requests=16, committed_events=4, canonical_equal=True, historical_provenance_unchanged=True))
+
+# Restrictive authoritative privacy, including the corrected server-owned return.
+private_scope = {**scope, "surface": "unknown_presence_fixture"}
+private = chat(None, private_scope["surface"], "Tell me more.", scene="planning")
+canonical(private)
+prompt = trace(private)["retrieval"]["prompt_assembly"]
+assert private["selected_model"] == "not_called" and private["sources"] == []
+assert "Save the backup first." not in json.dumps(private)
+presence = prompt["surface_presence"]
+assert presence["presence_state"] == "suppressed" and "companion" not in presence
+assert "companion_policy.validated" not in presence["source_fields"]
+calls = http(provider, "/calls/" + private["request_id"])["calls"]
+assert not [c for c in calls if c["kind"] not in {"embedding", "semantic_interpreter"}]
+wait(lambda: current(selected=private_scope)["state"] == "suppressed")
+private_current = current(private_scope)
+assert private_current["state"] == "suppressed"
+private_batch = read(selected=private_scope)
+private_diagnostics = diagnostics(private_batch["runtime_session_id"])
+privacy_events = [e["event_payload_json"] for e in private_diagnostics["events"]
+    if e["event_type"] == "privacy_context_evaluated"]
+assert len(privacy_events) == 1
+assert privacy_events[0]["surface_type"] == "unknown_surface"
+assert privacy_events[0]["redaction_required"] and privacy_events[0]["safe_summary_required"]
+assert not privacy_events[0]["sensitive_detail_allowed"]
+# The server-owned trace intentionally omits the compilation/decision payloads.
+# Verify actual compilation through its existing CR scene-resolution record.
+compiled = subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T", "runtime",
+    "python", "-c", "import sqlite3,sys; "
+    "c=sqlite3.connect('file:/data/companion_contracts.sqlite3?mode=ro',uri=True); "
+    "print(c.execute('SELECT count(*) FROM scene_resolution_events WHERE request_id=? "
+    "AND owner_id=? AND conversation_id=? AND surface=?',sys.argv[1:]).fetchone()[0])",
+    private["request_id"], owner, conversation, private_scope["surface"]], text=True).strip()
+assert compiled == "1", "expected actual registered scene compilation for the private turn"
+private_events = [e for e in private_diagnostics["events"] if e["event_type"] == "surface_presence_published"]
+assert [e["event_payload_json"]["state"] for e in private_events] == ["thinking", "suppressed"]
+assert stream(private_events[0]["event_payload_json"]["cursor"], selected=private_scope) == [("transition", private_current)]
+http(co, "/v1/presence/stream?" + urllib.parse.urlencode({**private_scope, "cursor": terminal["cursor"]}),
+    headers=key, expected=400)
+for event in history + private_events:
+    assert set(event["event_payload_json"]) == {"request_id", "stage", "state", "cursor"}
+    assert event["runtime_session_id"] in {session, private_batch["runtime_session_id"]}
+assert not [e for e in private_diagnostics["events"] if e["event_type"] in
+    {"action_authority_evaluated", "action_flow_evaluated", "capability_confirmation_created"}]
+evidence.append(dict(scenario="privacy_server_owned", state="suppressed", answer_provider_calls=0,
+    public_keys=["state", "cursor"], persisted_payload_keys=["request_id", "stage", "state", "cursor"]))
+
+# Interrupted processing cannot remain a current thinking claim after recovery.
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    http(provider, "/fixture/delay-next-primary", {"delay_ms": 8000})
+    pending = pool.submit(chat, "The input is checked.", "desktop_private", "How is the input checked?")
+    wait(lambda: current()["state"] == "thinking")
+    interrupted = current()
+    interrupted_diagnostics = diagnostics(session)
+    interrupted_turn = interrupted_diagnostics["active_turn"]["runtime_turn_id"]
+    interrupted_request = next(e["event_payload_json"]["request_id"]
+        for e in interrupted_diagnostics["events"]
+        if e["runtime_turn_id"] == interrupted_turn and e["event_type"] == "turn_started")
+    subprocess.run(["docker", "kill", orchestrator], check=True, stdout=subprocess.DEVNULL)
+    try:
+        pending.result()
+        raise AssertionError("killed request unexpectedly completed")
+    except (OSError, urllib.error.URLError):
+        pass
+    subprocess.run(["docker", "start", orchestrator], check=True, stdout=subprocess.DEVNULL)
+    wait(lambda: http(co, "/healthz"))
+assert current()["state"] == "unavailable"
+assert stream(interrupted["cursor"]) == [("unavailable", {"state": "unavailable", "cursor": interrupted["cursor"]})]
+subprocess.run(["docker", "compose", "-f", compose, "stop", "runtime"], check=True, stdout=subprocess.DEVNULL)
+current(expected=503)
+subprocess.run(["docker", "compose", "-f", compose, "start", "runtime"], check=True, stdout=subprocess.DEVNULL)
+wait(lambda: http(cr, "/healthz"))
+assert current()["state"] == "unavailable"
+http(provider, "/fixture/reset", {})
+recovered = chat("The input is checked.", text="How is the input checked?")
+canonical(recovered)
+wait(lambda: current()["state"] == "idle")
+assert current()["state"] == "idle"
+# A delayed observation for the older interrupted turn cannot overwrite recovery.
+http(cr, "/v1/runtime/surface-presence/publish", {**scope,
+    "runtime_session_id": session, "runtime_turn_id": interrupted_turn,
+    "request_id": interrupted_request, "stage": "terminal", "state": "unavailable"}, expected=409)
+assert current()["state"] == "idle"
+evidence.append(dict(scenario="interruption_and_outage", interrupted="unavailable", recovered="idle",
+    late_terminal_rejected=True))
+# Short server-owned returns use the same admitted lifecycle, without cognition.
+before_pause = current()
+paused = http(co, "/v1/chat", {**scope, "client_id": "desktop_private:presence",
+    "sensitivity": "private", "session_transition": "pause",
+    "messages": [{"role": "user", "content": "Pause the conversation."}]}, key)
+assert paused["status"] == "ok" and paused["selected_model"] == "not_called"
+canonical(paused)
+wait(lambda: current()["state"] == "idle")
+assert current()["state"] == "idle"
+assert diagnostics(session)["runtime_session"]["status"] == "paused"
+pause_events = stream(before_pause["cursor"], count=2)
+assert [event[1]["state"] for event in pause_events] == ["thinking", "idle"]
+assert diagnostics(session)["runtime_session"]["status"] == "paused"  # reads never resume
+resumed = chat("7.", text="What is 3+4?")
+canonical(resumed)
+wait(lambda: current()["state"] == "idle")
+assert current()["state"] == "idle" and read()["runtime_session_id"] == session
+assert diagnostics(session)["runtime_session"]["status"] == "active"
+evidence.append(dict(scenario="server_owned_pause", paused="idle", resumed="idle",
+    same_session=True, read_did_not_resume=True, canonical_equal=True))
+persisted = subprocess.check_output(["docker", "compose", "-f", compose, "exec", "-T", "runtime",
+    "python", "-c", """
+import json, sqlite3, sys
+owner, conversation = sys.argv[1:]
+with sqlite3.connect('file:/data/runtime_state.sqlite3?mode=ro',uri=True) as c:
+    rows=c.execute('SELECT e.id,e.runtime_session_id,e.runtime_turn_id,e.event_payload_json,s.surface '
+        'FROM conversation_runtime_events e JOIN conversation_runtime_sessions s USING(runtime_session_id) '
+        'WHERE s.owner_id=? AND s.conversation_id=? AND e.event_type=? ORDER BY e.id',
+        (owner,conversation,'surface_presence_published')).fetchall()
+    assert len(rows)==13
+    cursors=[]
+    for sequence,session,turn,raw,surface in rows:
+        payload=json.loads(raw)
+        assert set(payload)=={'request_id','stage','state','cursor'}
+        assert surface in {'desktop_private','unknown_presence_fixture'}
+        admission=c.execute('SELECT event_payload_json FROM conversation_runtime_events '
+            'WHERE runtime_session_id=? AND runtime_turn_id=? AND event_type=?',
+            (session,turn,'turn_started')).fetchone()
+        assert json.loads(admission[0])['request_id']==payload['request_id']
+        if payload['stage']=='terminal':
+            completion=c.execute('SELECT event_payload_json FROM conversation_runtime_events '
+                'WHERE runtime_session_id=? AND runtime_turn_id=? AND event_type=?',
+                (session,turn,'turn_completed')).fetchone()
+            assert json.loads(completion[0])['request_id']==payload['request_id']
+        cursors.append(payload['cursor'])
+    assert len(set(cursors))==len(rows)
+    actions=c.execute('SELECT count(*) FROM conversation_runtime_events e '
+        'JOIN conversation_runtime_sessions s USING(runtime_session_id) '
+        'WHERE s.owner_id=? AND e.event_type IN (?,?)',
+        (owner,'action_authority_evaluated','action_flow_evaluated')).fetchone()[0]
+    assert actions==0
+print(json.dumps({'persisted_events':len(rows),'exact_binding':True,'action_events':actions}))
+""", owner, conversation], text=True)
+evidence.append(json.loads(persisted))
+
+# A full replay window consists of real admitted/completed CO turns, not seeded
+# event rows. An admitted but unobserved newer turn makes current unavailable.
+original_conversation = conversation
+conversation = http(bms, "/v1/conversations", {
+    "owner_id": owner, "client_id": "desktop_private:presence-cap",
+}, memory_key)["conversation_id"]
+scope["conversation_id"] = conversation
+http(cr, "/v1/runtime/sessions/resolve", {**scope, "request_id": "presence-cap-session"})
+genesis = read()["cursor"]
+for index in range(100):
+    chat("7.", text="What is 3+4?")
+    wait(lambda: current()["state"] == "idle")
+assert json.loads(sql(f"SELECT json_build_object('count',count(*),'equal',bool_and(m.content='7.' "
+    f"AND w.state='completed'))::text FROM messages m JOIN work_items w "
+    f"ON w.assistant_message_id=m.id WHERE m.owner_id='{owner}' "
+    f"AND m.conversation_id='{conversation}' AND m.role='assistant';")) == {"count": 100, "equal": True}
+cap_session = read()["runtime_session_id"]
+history = []
+position = genesis
+while True:
+    page = read(position)
+    history.extend(page["events"])
+    position = page["cursor"]
+    if not page["has_more"]:
+        break
+assert len(history) == 200 and len({e["cursor"] for e in history}) == 200
+assert [e["state"] for e in history] == ["thinking", "idle"] * 100
+# A caught-up valid current state closes at exactly 100 transitions, without
+# either a stale qualification or a further poll after the cap.
+valid_cap = stream(history[99]["cursor"], count=100, read_to_end=True)
+assert all(kind == "transition" for kind, _ in valid_cap)
+assert [event for _, event in valid_cap] == history[100:]
+assert valid_cap[-1][1]["state"] == "idle"
+unobserved_request = "presence-cap-unobserved"
+unobserved = http(cr, "/v1/runtime/turns/start", {**scope, "request_id": unobserved_request})
+assert current()["state"] == "unavailable"
+capped = stream(history[1]["cursor"], count=100, read_to_end=True)
+assert len(capped) == 100 and capped[-2][1]["state"] == "thinking"
+assert capped[-1] == ("unavailable", {"state": "unavailable", "cursor": capped[-2][1]["cursor"]})
+assert [e[1] for e in capped[:-1]] == history[2:101]
+subprocess.run(["docker", "compose", "-f", compose, "restart", "runtime"],
+               check=True, stdout=subprocess.DEVNULL)
+wait(lambda: http(cr, "/healthz"))
+assert current()["state"] == "unavailable"
+reconnected = stream(capped[-2][1]["cursor"], count=100, read_to_end=True)
+assert [e[1] for e in reconnected[:-1]] == history[101:]
+assert reconnected[-1] == ("unavailable", {"state": "unavailable", "cursor": history[-1]["cursor"]})
+assert len({e[1]["cursor"] for e in capped[:-1] + reconnected[:-1]}) == 198
+http(cr, "/v1/runtime/turns/complete", {
+    "request_id": unobserved_request,
+    "runtime_session_id": cap_session,
+    "runtime_turn_id": unobserved["runtime_turn"]["runtime_turn_id"], "turn_status": "abandoned",
+})
+evidence.append(dict(scenario="capped_replay", real_events=200, frame_cap=100,
+    first_transitions=99, reconnect_transitions=99, final_history="thinking",
+    qualification="unavailable", cursor_advanced_by_qualification=False,
+    lost=0, duplicates=0, reordered=0, runtime_restart_preserved=True, canonical_equal=True,
+    valid_current_cap=True, server_closed_at_cap=True))
+conversation = original_conversation
+scope["conversation_id"] = conversation
+for row in evidence:
+    print("Presence consumer: " + json.dumps(row, sort_keys=True), flush=True)
+log_dir = os.environ.get("COMPOSED_SMOKE_LOG_DIR")
+if log_dir:
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "presence-consumer.jsonl"), "w") as output:
+        for row in evidence:
+            output.write(json.dumps(row, sort_keys=True) + "\n")
+PYPRESENCE
+  jq -e '.action_events==0 and .confirmations==0' \
+    <<<"$(runtime_continuation_effect_counts "$owner" presence-consumer-check)" >/dev/null
+  jq -e '.state=="idle" and .active_runtime_turn_id==null' \
+    <<<"$(runtime_thread_snapshot "$owner" "$conversation")" >/dev/null
+  docker rm -f "$SCENE_ORCHESTRATOR" >/dev/null
+  SCENE_ORCHESTRATOR=""
+  docker compose -f "$COMPOSE" start orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+}
+
 ensure_qdrant_collection
 provider_post "/fixture/reset" '{}'
+# Reuse the unchanged workload/budgets for a single matched source comparison.
+if [ "${TRANSPORT_LATENCY_ONLY:-}" = 1 ]; then
+  run_transport_latency_regression
+  exit 0
+fi
+if [ "${PRESENCE_EVENTS_ONLY:-}" = 1 ]; then
+  set -E
+  trap 'echo "Presence consumer assertion failed: line=$LINENO" >&2' ERR
+  run_presence_event_scenario
+  run_continuation_failure_contention_scenario
+  exit 0
+fi
 if [ "${SCENE_TRANSITIONS_ONLY:-}" = 1 ]; then
   set -E
   trap 'echo "Scene conversation assertion failed: line=$LINENO" >&2' ERR
@@ -7308,6 +7798,9 @@ if [ "${SITUATED_PRESENCE_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+set -E
+trap 'echo "Composed smoke assertion failed: line=$LINENO" >&2' ERR
+run_presence_event_scenario
 run_scene_transition_scenario
 run_runtime_admission_composition_scenario telegram-alexa telegram:admission alexa:admission telegram alexa
 run_omitted_continuation_scenario

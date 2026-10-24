@@ -184,6 +184,7 @@ from services.response_review import (
     review_response,
 )
 from services.response_shape import (
+    ResponseShape,
     build_response_shape_guidance_block,
     clamp_response_shape_for_runtime_presence,
     clamp_response_shape_for_timing,
@@ -201,7 +202,11 @@ from services.style_envelope import (
     clamp_style_envelope,
     resolve_style_envelope,
 )
-from services.surface_presence import apply_surface_presence_outcome, resolve_surface_presence
+from services.surface_presence import (
+    apply_surface_presence_outcome,
+    publish_surface_presence,
+    resolve_surface_presence,
+)
 from settings import get_settings
 
 _HISTORY_CLARIFICATION = (
@@ -5411,11 +5416,13 @@ async def _start_runtime_turn(
             "error_type": "RuntimeClientNotConfigured",
             "omission_reason": "runtime_client_not_configured",
         }
+    start_with_presence = getattr(runtime, "start_turn_with_presence", None)
+    start = start_with_presence if callable(start_with_presence) else runtime.start_turn
     attempts = 0
     while attempts < 2:
         attempts += 1
         try:
-            response = await runtime.start_turn(
+            response = await start(
                 request_id=request_id,
                 owner_id=owner_id,
                 conversation_id=conversation_id,
@@ -5452,6 +5459,7 @@ async def _start_runtime_turn(
         "status": "included",
         "included": True,
         "admission_protected": True,
+        "processing_presence_recorded": callable(start_with_presence),
         "runtime_session_id": session.get("runtime_session_id"),
         "runtime_turn_id": turn.get("runtime_turn_id"),
         "input_message_id": turn.get("input_message_id"),
@@ -9728,6 +9736,7 @@ async def orchestrate_chat(
     request_id: str,
     on_work_admitted: Callable[[dict[str, Any]], None] | None = None,
     on_processing_eligible: Callable[[dict[str, Any]], None] | None = None,
+    on_presence_observation: Callable[[dict[str, Any] | None], None] | None = None,
     non_executing_conversation: bool = False,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
@@ -10143,6 +10152,9 @@ async def orchestrate_chat(
     last_user_message_id = None
     turn_response: dict[str, Any] | None = None
     turn_state_trace: dict[str, Any] = _turn_state_disabled_trace()
+    surface_presence_trace: dict[str, Any] | None = None
+    terminal_presence_trace: dict[str, Any] | None = None
+    privacy_context = None
     runtime_session_trace: dict[str, Any] = _runtime_session_disabled_trace()
     interaction_governance: dict[str, Any] | None = None
     interaction_governance_trace: dict[str, Any] = _interaction_governance_disabled_trace()
@@ -10225,6 +10237,25 @@ async def orchestrate_chat(
             ),
             error_type=turn_state_trace.get("error_type"),
         )
+        # Observe every admitted path, including server-owned returns before
+        # cognition. These validated delivery facts do not select runtime policy.
+        try:
+            admission_facts = project_timing_facts(payload)
+            admission_shape = ResponseShape(
+                spoken_output=admission_facts["spoken_output"],
+                active_task_mode=admission_facts["active_task_mode"],
+            )
+            surface_presence_trace = resolve_surface_presence(
+                {**payload, "conversation_id": conversation_id}, admission_shape,
+                admitted_turn=turn_response, request_id=request_id,
+            )
+        except (ValueError, TypeError):
+            surface_presence_trace = None
+        if not turn_state_trace.get("processing_presence_recorded"):
+            await publish_surface_presence(
+                runtime=runtime, memory_store=memory_store,
+                trace=surface_presence_trace, stage="processing",
+            )
         if explicit_pause:
             return await _finish_explicit_pause(
                 payload=payload, request_id=request_id, conversation_id=conversation_id,
@@ -10713,13 +10744,13 @@ async def orchestrate_chat(
         timing_consumed = False
         return_retrieval_bundle = None
         return_context_dependency_unavailable = False
-        privacy_context = None
 
         interrupt_trace: dict[str, Any] | None = None
 
         async def finish_server_owned_response(
             answer: str, *, failed: bool, response_source: str = "runtime_timing",
         ) -> dict[str, Any]:
+            nonlocal terminal_presence_trace
             interrupt_selected = response_source == "interrupt_policy"
             privacy_withheld = privacy_context_enabled and privacy_policy_requires_suppression(
                 privacy_context
@@ -10797,6 +10828,7 @@ async def orchestrate_chat(
                                          if evidence_acquisition else {}),
                 **({"interrupt_policy": interrupt_trace} if interrupt_trace is not None else {}),
             }
+            terminal_presence_trace = stop_prompt_trace["surface_presence"]
             try:
                 await memory_store.create_trace(
                     request_id=request_id, payload=_server_owned_response_trace_payload(
@@ -14730,6 +14762,7 @@ async def orchestrate_chat(
             outcome=("privacy_withheld" if privacy_boundary.enforced else "confirmation_pending"
                      if pending_action is not None else "completed"),
         )
+        terminal_presence_trace = prompt.trace["surface_presence"]
         persisted_prompt_trace = (
             sanitize_prompt_trace_for_privacy(prompt.trace, retrieval_bundle)
             if privacy_boundary.enforced
@@ -15001,3 +15034,26 @@ async def orchestrate_chat(
         raise
     finally:
         await work.fail_if_unfinished()
+        completed_work = work.work is not None and work.work.get("state") == "completed"
+        if terminal_presence_trace is None:
+            terminal_presence_trace = apply_surface_presence_outcome(
+                surface_presence_trace, unavailable=not completed_work,
+                outcome=("privacy_withheld" if privacy_context_enabled
+                         and privacy_policy_requires_suppression(privacy_context) else "completed"),
+            )
+        elif not completed_work:
+            terminal_presence_trace = apply_surface_presence_outcome(
+                terminal_presence_trace, unavailable=True,
+            )
+        if on_presence_observation is not None:
+            try:
+                on_presence_observation(terminal_presence_trace)
+            except Exception:
+                logging.getLogger(__name__).warning("presence_observation_not_scheduled")
+        else:
+            # Preserve internal callers that synchronously observe completion.
+            # The public API always supplies its bounded application-owned callback.
+            await publish_surface_presence(
+                runtime=runtime, memory_store=memory_store,
+                trace=terminal_presence_trace, stage="terminal",
+            )
