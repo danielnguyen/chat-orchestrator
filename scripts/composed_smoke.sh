@@ -7276,7 +7276,7 @@ def read(after=None, selected=scope):
     return http(cr, "/v1/runtime/surface-presence/read", {**selected, "after": after})
 
 
-def stream(after=None, count=1, selected=scope, ready=None, terminal_state=None):
+def stream(after=None, count=1, selected=scope, ready=None, terminal_state=None, read_to_end=False):
     headers = dict(key)
     if after:
         headers["Last-Event-ID"] = after
@@ -7301,14 +7301,14 @@ def stream(after=None, count=1, selected=scope, ready=None, terminal_state=None)
                     frames.append((frame["event"], projection))
                     if ready is not None:
                         ready.set()
-                    if len(frames) >= count and (terminal_state is None
+                    if not read_to_end and len(frames) >= count and (terminal_state is None
                             or projection["state"] == terminal_state):
                         return frames  # closing the connection exercises disconnect cleanup
                 frame = {}
             else:
                 name, value = line.split(":", 1)
                 frame[name] = value.strip()
-    assert len(frames) >= count, frames
+    assert len(frames) == count if read_to_end else len(frames) >= count, frames
     assert terminal_state is None or frames[-1][1]["state"] == terminal_state, frames
     return frames
 
@@ -7595,9 +7595,6 @@ assert json.loads(sql(f"SELECT json_build_object('count',count(*),'equal',bool_a
     f"ON w.assistant_message_id=m.id WHERE m.owner_id='{owner}' "
     f"AND m.conversation_id='{conversation}' AND m.role='assistant';")) == {"count": 100, "equal": True}
 cap_session = read()["runtime_session_id"]
-unobserved_request = "presence-cap-unobserved"
-unobserved = http(cr, "/v1/runtime/turns/start", {**scope, "request_id": unobserved_request})
-assert current()["state"] == "unavailable"
 history = []
 position = genesis
 while True:
@@ -7608,7 +7605,16 @@ while True:
         break
 assert len(history) == 200 and len({e["cursor"] for e in history}) == 200
 assert [e["state"] for e in history] == ["thinking", "idle"] * 100
-capped = stream(history[1]["cursor"], count=100)
+# A caught-up valid current state closes at exactly 100 transitions, without
+# either a stale qualification or a further poll after the cap.
+valid_cap = stream(history[99]["cursor"], count=100, read_to_end=True)
+assert all(kind == "transition" for kind, _ in valid_cap)
+assert [event for _, event in valid_cap] == history[100:]
+assert valid_cap[-1][1]["state"] == "idle"
+unobserved_request = "presence-cap-unobserved"
+unobserved = http(cr, "/v1/runtime/turns/start", {**scope, "request_id": unobserved_request})
+assert current()["state"] == "unavailable"
+capped = stream(history[1]["cursor"], count=100, read_to_end=True)
 assert len(capped) == 100 and capped[-2][1]["state"] == "thinking"
 assert capped[-1] == ("unavailable", {"state": "unavailable", "cursor": capped[-2][1]["cursor"]})
 assert [e[1] for e in capped[:-1]] == history[2:101]
@@ -7616,7 +7622,7 @@ subprocess.run(["docker", "compose", "-f", compose, "restart", "runtime"],
                check=True, stdout=subprocess.DEVNULL)
 wait(lambda: http(cr, "/healthz"))
 assert current()["state"] == "unavailable"
-reconnected = stream(capped[-2][1]["cursor"], count=100)
+reconnected = stream(capped[-2][1]["cursor"], count=100, read_to_end=True)
 assert [e[1] for e in reconnected[:-1]] == history[101:]
 assert reconnected[-1] == ("unavailable", {"state": "unavailable", "cursor": history[-1]["cursor"]})
 assert len({e[1]["cursor"] for e in capped[:-1] + reconnected[:-1]}) == 198
@@ -7628,7 +7634,8 @@ http(cr, "/v1/runtime/turns/complete", {
 evidence.append(dict(scenario="capped_replay", real_events=200, frame_cap=100,
     first_transitions=99, reconnect_transitions=99, final_history="thinking",
     qualification="unavailable", cursor_advanced_by_qualification=False,
-    lost=0, duplicates=0, reordered=0, runtime_restart_preserved=True, canonical_equal=True))
+    lost=0, duplicates=0, reordered=0, runtime_restart_preserved=True, canonical_equal=True,
+    valid_current_cap=True, server_closed_at_cap=True))
 conversation = original_conversation
 scope["conversation_id"] = conversation
 for row in evidence:

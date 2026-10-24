@@ -1018,8 +1018,12 @@ async def test_public_stream_cap_qualifies_history_without_skipping_reconnect(
             return _presence_conversation()
 
     class Runtime:
+        fail_after_current = False
+
         async def read_surface_presence(self, **scope):
             after = scope["after"]
+            if self.fail_after_current and after == history[-1]["cursor"]:
+                raise RuntimeError("read after cap must not occur")
             if after is None:
                 events, more, cursor = [], False, history[-1]["cursor"]
             else:
@@ -1070,6 +1074,14 @@ async def test_public_stream_cap_qualifies_history_without_skipping_reconnect(
             if cursor == history[-1]["cursor"]:
                 break
         assert delivered == history[2:]
+        if current_state is not None:
+            main.runtime.fail_after_current = True
+            response = await client.get("/v1/presence/stream", params=params,
+                headers={**headers, "Last-Event-ID": history[99]["cursor"]})
+            final = frames(response)
+            assert len(final) == 100
+            assert all(frame["event"] == "transition" for frame in final)
+            assert [json.loads(frame["data"]) for frame in final] == history[100:]
         for invalid in ("", "malformed", "pe_" + "f" * 32):
             response = await client.get("/v1/presence/stream", params={**params, "cursor": invalid},
                                         headers=headers)

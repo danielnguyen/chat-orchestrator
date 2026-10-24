@@ -410,6 +410,8 @@ async def stream_surface_presence(*, request: Any, initial: Any, read: Any, afte
             cursor = event.cursor
             emitted += 1
             unavailable_cursor = None
+        if emitted >= PRESENCE_STREAM_MAX_EVENTS:
+            return
         if batch.current is None and not batch.has_more and unavailable_cursor != cursor:
             yield frame("unavailable", PresenceProjection(state="unavailable", cursor=cursor))
             emitted += 1
