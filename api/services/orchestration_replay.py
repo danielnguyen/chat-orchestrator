@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from clients.runtime import _ExposureCandidate
 from services.capabilities import (
     RevalidationOutput,
     Revalidator,
@@ -772,6 +773,50 @@ class ReplayRuntime:
                 "conflicted_count": 0,
                 "confirmation_required": False,
             },
+        }
+
+    async def authorize_capability_exposure_batch(
+        self, *, candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        # This offline adapter retains each fixture subdecision and its existing
+        # boundary observation; these observations are not HTTP request counts.
+        decisions = []
+        for index, candidate in enumerate(candidates):
+            canonical = _ExposureCandidate.model_validate(candidate).model_dump()
+            response = await self.authorize_capability(**candidate)
+            result = {
+                "phase": "exposure", "confirmation_state": "not_required",
+                "challenge_ref": None, "challenge_expires_at": None,
+                "revalidation_required": False, "revalidation_selector": None,
+                "world_state_claim_ids_used": [], **response["result"],
+            }
+            if result["reason_codes"] == ["missing_relationship_context"]:
+                result["reason_codes"] = ["relationship_required"]
+            material = json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                                  ensure_ascii=True)
+            decisions.append({
+                "input_digest": "sha256:" + hashlib.sha256(material.encode()).hexdigest(),
+                "event_ref": f"fixture-exposure-{index}",
+                "authorization": {
+                    **{key: canonical[key] for key in (
+                        "request_id", "owner_id", "conversation_id", "runtime_session_id",
+                        "runtime_turn_id", "capability_id", "persona_selection_ref",
+                    )},
+                    "selection_contract": "legacy_unbound", "result": result,
+                },
+            })
+        scope = {key: candidates[0][key] for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id",
+        )}
+        material = json.dumps(scope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return {
+            **scope, "schema_version": "capability-exposure-batch.v1",
+            "producer": "/v1/capabilities/authorize",
+            "policy_version": "capability-authorization.v1",
+            "thread_revision": 1,
+            "context_digest": "sha256:" + hashlib.sha256(material.encode()).hexdigest(),
+            "decisions": decisions,
         }
 
     async def authorize_capability(self, **kwargs: Any) -> dict[str, Any]:

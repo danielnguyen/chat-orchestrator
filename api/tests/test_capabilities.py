@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
+import httpx
 import pytest
 import services.capabilities as capability_service
+from clients.runtime import RuntimeClient
 from models import ChatRequest, ChatResponse
 from pydantic import ValidationError
 from services.action_connectors import (
@@ -36,6 +39,11 @@ from services.jellyfin_action_connector import (
 )
 from services.orchestrate import _select_capability_claim_refs
 from test_action_connectors import DisplaySettingConnector, DisplaySettingOperations
+from test_runtime_client import (
+    _EXPOSURE_BATCH_DEFECTS,
+    _corrupt_exposure_batch,
+    _exposure_batch_response,
+)
 
 
 class FakeRuntime:
@@ -84,6 +92,17 @@ class FakeRuntime:
         self.world_state_verification_calls = []
         self.relationship_calls = []
         self.executor_calls = 0
+        self.batch_calls = []
+
+    async def authorize_capability_exposure_batch(self, *, candidates):
+        self.batch_calls.append(deepcopy(candidates))
+        if self.malformed:
+            return {"decisions": "bad"}
+        responses = [await self.authorize_capability(**candidate) for candidate in candidates]
+        for response in responses:
+            if response["result"]["reason_codes"] == ["missing_relationship_context"]:
+                response["result"]["reason_codes"] = ["relationship_required"]
+        return _exposure_batch_response(candidates, responses)
 
     async def authorize_capability(self, **kwargs):
         self.calls.append(kwargs)
@@ -384,7 +403,7 @@ async def test_exposure_authorization_allows_non_relationship_capabilities_witho
     ]
     assert trace["blocked_capability_ids"] == ["runtime.relationship_context.read"]
     assert trace["blocked_reasons"] == {
-        "runtime.relationship_context.read": "missing_relationship_context"
+        "runtime.relationship_context.read": "relationship_required"
     }
     assert len(descriptors) == 2
     assert [call["capability_id"] for call in runtime.calls] == [
@@ -420,12 +439,7 @@ async def test_relationship_gated_descriptor_exposed_with_selected_relationship_
         if call["capability_id"] == "runtime.relationship_context.read"
     ][0]
     assert relationship_call["relationship_requirements"] == [
-        {
-            "relationship_scope": "project_context",
-            "relationship_type": "works_on",
-            "required_status": "active",
-            "minimum_confidence": 0.8,
-        }
+        {"relationship_scope": "project_context", "relationship_type": "works_on"}
     ]
     assert relationship_call["selected_relationship_ids"] == ["rel_project"]
 
@@ -453,7 +467,7 @@ async def test_exposure_denial_removes_descriptor_from_provider_payload():
     ]
     assert trace["blocked_reasons"] == {
         "draft.local_message": "capability_domain_denied",
-        "runtime.relationship_context.read": "missing_relationship_context",
+        "runtime.relationship_context.read": "relationship_required",
     }
 
 
@@ -488,6 +502,124 @@ async def test_exposure_runtime_unavailable_or_malformed_fails_closed():
     assert malformed_descriptors == []
     assert malformed_trace["status"] == "failed_closed"
     assert malformed_trace["status_reason"] == "malformed_exposure_authorization"
+
+
+async def _batch_exposure(runtime, **overrides):
+    return await filter_capability_descriptors_for_exposure(**{
+        "runtime": runtime, "request_id": "admitted-request", "owner_id": "owner",
+        "conversation_id": "conv", "surface": "dev", "runtime_session_id": "session",
+        "runtime_turn_id": "turn", "active_persona_id": "technical_architect", **overrides,
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relationships", [[], ["rel_project"]])
+@pytest.mark.parametrize("denied", [set(), {"draft.local_message"}])
+async def test_batch_exposure_replaces_individual_transport_and_preserves_decisions(
+    relationships, denied,
+):
+    individual = FakeRuntime(denied=denied)
+    transport_calls = []
+    expected_responses = []
+
+    async def post(path, *, json):
+        transport_calls.append((path, deepcopy(json)))
+        for candidate in json["candidates"]:
+            decision = await individual.authorize_capability(**candidate)
+            if decision["result"]["reason_codes"] == ["missing_relationship_context"]:
+                decision["result"]["reason_codes"] = ["relationship_required"]
+            expected_responses.append(decision)
+        return _exposure_batch_response(json["candidates"], expected_responses)
+
+    runtime = RuntimeClient("http://runtime.local", None)
+    runtime._post = post
+    descriptors, trace = await _batch_exposure(runtime, selected_relationship_ids=relationships)
+    assert [path for path, _ in transport_calls] == ["/v1/capabilities/exposure-batch"]
+    sent = transport_calls[0][1]["candidates"]
+    assert [item["capability_id"] for item in sent] == trace["candidate_capability_ids"]
+    assert all(item["request_id"] == "admitted-request" for item in sent)
+    expected_entries = [entry for entry, response in zip(production_capability_registry(),
+                                                       expected_responses)
+                        if response["result"]["allowed"]]
+    assert descriptors == provider_descriptors(expected_entries)
+    assert trace["descriptor_fingerprint"] == descriptor_fingerprint(descriptors)
+    assert trace["exposed_capability_ids"] == [entry.capability_id for entry in expected_entries]
+    assert [item["capability_id"] for item in trace["authorization_batch"]["decisions"]] == [
+        item["capability_id"] for item in sent
+    ]
+    assert individual.confirmation_calls == []
+    assert individual.executor_calls == 0
+    assert individual.world_state_verification_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [
+    (field, value) for field, value in _EXPOSURE_BATCH_DEFECTS if field != "thread_revision"
+])
+async def test_batch_exposure_never_publishes_successful_prefix(field, value):
+    class MalformedBatchRuntime:
+        individual_calls = 0
+        batch_calls = 0
+
+        async def authorize_capability_exposure_batch(self, *, candidates):
+            self.batch_calls += 1
+            response = _exposure_batch_response(candidates)
+            _corrupt_exposure_batch(response, field, value)
+            return response
+
+        async def authorize_capability(self, **kwargs):
+            self.individual_calls += 1
+            raise AssertionError("individual fallback forbidden")
+
+    runtime = MalformedBatchRuntime()
+    descriptors, trace = await _batch_exposure(runtime)
+    assert descriptors == []
+    assert trace["status"] == "failed_closed"
+    assert trace["descriptor_fingerprint"] == descriptor_fingerprint([])
+    assert trace["exposed_capability_ids"] == []
+    assert trace["blocked_capability_ids"] == trace["candidate_capability_ids"]
+    assert runtime.batch_calls == 1
+    assert runtime.individual_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    httpx.ReadTimeout("timeout"), RuntimeError("authority changed"),
+    ValueError("malformed batch"), PermissionError("denied"), RuntimeError("unknown server error"),
+])
+async def test_batch_exposure_error_cannot_fall_back_or_expose_descriptors(failure):
+    class UnavailableBatchRuntime:
+        async def authorize_capability_exposure_batch(self, **kwargs):
+            raise failure
+
+        async def authorize_capability(self, **kwargs):
+            pytest.fail("individual fallback forbidden")
+
+    descriptors, trace = await _batch_exposure(UnavailableBatchRuntime())
+    assert descriptors == []
+    assert trace["status"] == "failed_closed"
+    assert trace["exposed_capability_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_batch_exposure_missing_batch_method_fails_closed():
+    class OldRuntime:
+        async def authorize_capability(self, **kwargs):
+            pytest.fail("missing local method does not verify old server support")
+
+    descriptors, trace = await _batch_exposure(OldRuntime())
+    assert descriptors == []
+    assert trace["status"] == "failed_closed"
+
+
+@pytest.mark.asyncio
+async def test_batch_exposure_empty_candidate_set_makes_no_runtime_request():
+    runtime = FakeRuntime()
+    descriptors, trace = await _batch_exposure(runtime, allowed_capability_ids=[])
+    assert descriptors == []
+    assert trace["status"] == "ok"
+    assert runtime.batch_calls == []
+    assert runtime.calls == []
 
 
 def test_provider_normal_text_has_no_capability_request():
@@ -2017,6 +2149,12 @@ class JellyfinPolicyRuntime:
         self.dispatch_count = 0
         self.consumed = False
         self.selector_claim_id = selector_claim_id
+        self.batch_calls = []
+
+    async def authorize_capability_exposure_batch(self, *, candidates):
+        self.batch_calls.append(deepcopy(candidates))
+        responses = [await self.authorize_capability(**candidate) for candidate in candidates]
+        return _exposure_batch_response(candidates, responses)
 
     async def authorize_capability(self, **kwargs):
         self.authorization_calls.append(kwargs)

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from clients.runtime import validate_capability_exposure_batch
 from services.action_connectors import (
     ActionConnector,
     ActionConnectorRegistry,
@@ -594,13 +595,15 @@ async def filter_capability_descriptors_for_exposure(
         or not runtime_session_id
         or not runtime_turn_id
         or not active_persona_id
-        or not hasattr(runtime, "authorize_capability")
+        or not callable(getattr(runtime, "authorize_capability_exposure_batch", None))
     ):
         trace["status_reason"] = "runtime_context_unavailable"
         return [], trace
 
     exposed: list[CapabilityEntry] = []
     blocked_reasons: dict[str, str] = {}
+    eligible: list[CapabilityEntry] = []
+    authorization_candidates: list[dict[str, Any]] = []
     for entry in candidates:
         if entry.executor_binding == "action_connector":
             local_reason = _connector_local_gate_reason(
@@ -613,15 +616,24 @@ async def filter_capability_descriptors_for_exposure(
             if local_reason is not None:
                 blocked_reasons[entry.capability_id] = local_reason
                 continue
-        try:
-            world_state_requirements = entry.authorization_requirements.get(
-                "world_state_requirements",
-                [],
-            )
-            if entry.executor_binding == "action_connector":
-                world_state_requirements = []
-            response = await runtime.authorize_capability(
-                request_id=f"{request_id}:{entry.capability_id}:exposure",
+        world_state_requirements = entry.authorization_requirements.get(
+            "world_state_requirements",
+            [],
+        )
+        if entry.executor_binding == "action_connector":
+            world_state_requirements = []
+        # These two CO descriptor fields were ignored by the individual CR
+        # request model. Project the same CR requirements into its strict wire
+        # contract; relationship eligibility remains owned by CR's selector.
+        relationship_requirements = [
+            {key: value for key, value in requirement.items()
+             if key not in {"required_status", "minimum_confidence"}}
+            for requirement in entry.authorization_requirements.get("relationship_requirements", [])
+        ]
+        eligible.append(entry)
+        authorization_candidates.append(
+            dict(
+                request_id=request_id,
                 owner_id=owner_id,
                 conversation_id=conversation_id,
                 surface=surface,
@@ -634,26 +646,45 @@ async def filter_capability_descriptors_for_exposure(
                 operation_class=entry.operation_class,
                 argument_digest=None,
                 supported_surfaces=list(entry.supported_surfaces),
-                relationship_requirements=entry.authorization_requirements.get(
-                    "relationship_requirements",
-                    [],
-                ),
+                relationship_requirements=relationship_requirements,
                 selected_relationship_ids=_safe_selected_ids(selected_relationship_ids),
                 world_state_requirements=world_state_requirements,
                 selected_world_state_claim_ids=[],
                 confirmation_challenge_ref=None,
             )
+        )
+
+    if authorization_candidates:
+        try:
+            response = await runtime.authorize_capability_exposure_batch(
+                candidates=authorization_candidates,
+            )
         except Exception:
             trace["status_reason"] = "exposure_authorization_unavailable"
             return [], trace
-        result = response.get("result") if isinstance(response, dict) else None
-        if not isinstance(result, dict) or not isinstance(result.get("allowed"), bool):
+        try:
+            response = validate_capability_exposure_batch(
+                response, candidates=authorization_candidates,
+            )
+        except (ValueError, TypeError):
             trace["status_reason"] = "malformed_exposure_authorization"
             return [], trace
-        if result["allowed"]:
-            exposed.append(entry)
-        else:
-            blocked_reasons[entry.capability_id] = _bounded_reason(result)
+        for entry, decision in zip(eligible, response["decisions"]):
+            result = decision["authorization"]["result"]
+            if result["allowed"]:
+                exposed.append(entry)
+            else:
+                blocked_reasons[entry.capability_id] = _bounded_reason(result)
+        trace["authorization_batch"] = {
+            key: response[key] for key in (
+                "schema_version", "producer", "policy_version", "thread_revision", "context_digest",
+            )
+        }
+        trace["authorization_batch"]["decisions"] = [
+            {"capability_id": decision["authorization"]["capability_id"],
+             "input_digest": decision["input_digest"], "event_ref": decision["event_ref"]}
+            for decision in response["decisions"]
+        ]
 
     descriptors = provider_descriptors(exposed)
     exposed_ids = [entry.capability_id for entry in exposed]
