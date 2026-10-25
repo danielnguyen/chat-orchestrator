@@ -86,7 +86,7 @@ from services.orchestrate import (
     orchestrate_chat,
 )
 from services.prompt_budget import estimate_messages_tokens
-from test_runtime_client import _interrupt_lifecycle
+from test_runtime_client import _exposure_batch_response, _interrupt_lifecycle
 
 BANNED_TRACE_TOKENS = [
     "R26",
@@ -2062,6 +2062,14 @@ class FakeRuntime:
         return {"reset": True}
 
 
+async def _fixture_exposure_batch(runtime, candidates):
+    responses = [await runtime.authorize_capability(**candidate) for candidate in candidates]
+    for response in responses:
+        if response["result"].get("reason_codes") == ["missing_relationship_context"]:
+            response["result"]["reason_codes"] = ["relationship_required"]
+    return _exposure_batch_response(candidates, responses)
+
+
 class CapabilityRuntime(FakeRuntime):
     def __init__(
         self,
@@ -2071,6 +2079,7 @@ class CapabilityRuntime(FakeRuntime):
     ):
         super().__init__(**kwargs)
         self.capability_authorization_calls = []
+        self.capability_exposure_batch_calls = []
         self.world_state_verification_calls = []
         self.phase_decisions = phase_decisions or {
             "exposure": {
@@ -2089,6 +2098,11 @@ class CapabilityRuntime(FakeRuntime):
                 "reason_codes": ["allowed"],
             },
         }
+
+    async def authorize_capability_exposure_batch(self, *, candidates):
+        self.capability_exposure_batch_calls.append(copy.deepcopy(candidates))
+        self.call_order.append("exposure_batch")
+        return await _fixture_exposure_batch(self, candidates)
 
     async def authorize_capability(self, **kwargs):
         self.capability_authorization_calls.append(kwargs)
@@ -29788,6 +29802,96 @@ async def test_orchestrate_live_chat_flow_threads_runtime_identity_and_turn_stat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["allowed", "denied", "malformed", "wrong_owner", "error"])
+async def test_batch_exposure_joins_before_provider_and_never_publishes_invalid_prefix(
+    tmp_path, outcome,
+):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class BatchRuntime(CapabilityRuntime):
+        async def authorize_capability_exposure_batch(self, *, candidates):
+            self.capability_exposure_batch_calls.append(copy.deepcopy(candidates))
+            entered.set()
+            await release.wait()
+            if outcome == "error":
+                raise httpx.ReadTimeout("authority unavailable")
+            response = _exposure_batch_response(candidates)
+            for item in response["decisions"]:
+                if outcome == "denied" or item["authorization"]["capability_id"] != (
+                    "runtime.world_state.read"
+                ):
+                    item["authorization"]["result"].update(
+                        allowed=False, decision_code="authorization_denied",
+                        reason_codes=["capability_domain_denied"],
+                    )
+            if outcome == "malformed":
+                response["decisions"][-1]["authorization"]["result"]["allowed"] = "true"
+            elif outcome == "wrong_owner":
+                response["decisions"][-1]["authorization"]["owner_id"] = "foreign"
+            return response
+
+        async def authorize_capability(self, **kwargs):
+            pytest.fail("ordinary text must not authorize selection, dispatch, or fallback")
+
+    rules, models = _write_default_route_files(tmp_path)
+    runtime, memory, provider = BatchRuntime(), FakeMemoryStore(), FakeLiteLLM(
+        completion=_text_completion("Hello."),
+    )
+    task = asyncio.create_task(orchestrate_chat(
+        payload=_first_party_chat_payload("Hello."), memory_store=memory, litellm=provider,
+        runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, request_id="admitted-request",
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert provider.calls == []
+        assert runtime.capability_authorization_calls == []
+    finally:
+        release.set()
+    out = await task
+    assert out["answer"] == "Hello."
+    assert len(runtime.capability_exposure_batch_calls) == 1
+    candidates = runtime.capability_exposure_batch_calls[0]
+    assert all(candidate["request_id"] == "admitted-request" for candidate in candidates)
+    tools = provider.calls[0].get("tools") or []
+    assert [item["function"]["name"] for item in tools] == (
+        ["runtime_world_state_read"] if outcome == "allowed" else []
+    )
+    exposure = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"][
+        "exposure"
+    ]
+    assert exposure["status"] == ("ok" if outcome in {"allowed", "denied"} else "failed_closed")
+    assert runtime.capability_authorization_calls == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_batch_rejects_provider_tool_after_malformed_allowance(tmp_path):
+    class MalformedRuntime(CapabilityRuntime):
+        async def authorize_capability_exposure_batch(self, *, candidates):
+            response = _exposure_batch_response(candidates)
+            response["decisions"].pop()  # Earlier members were allowed; none may escape.
+            return response
+
+        async def authorize_capability(self, **kwargs):
+            pytest.fail("malformed batch must not reach selection or dispatch")
+
+    rules, models = _write_default_route_files(tmp_path)
+    runtime, memory = MalformedRuntime(), FakeMemoryStore()
+    provider = FakeLiteLLM(completion=_tool_completion("draft_local_message", {"body": "Draft"}))
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload("Draft a message."), memory_store=memory,
+        litellm=provider, runtime=runtime, rules_path=str(rules), model_registry_path=str(models),
+        allow_manual_override=True, request_id="admitted-request",
+    )
+    assert out["answer"] == "I could not use that capability request safely."
+    assert not provider.calls[0].get("tools")
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]["capabilities"]
+    assert trace["validation"]["reason_code"] == "capability_not_exposed"
+    assert trace["execution"]["executor_call_count"] == 0
+    assert runtime.capability_authorization_calls == []
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_executes_world_state_read_after_selection_and_dispatch(tmp_path):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = FakeMemoryStore()
@@ -29980,7 +30084,7 @@ async def test_orchestrate_hides_relationship_gated_descriptor_without_context(t
     assert "runtime.relationship_context.read" in trace["exposure"]["blocked_capability_ids"]
     assert (
         trace["exposure"]["blocked_reasons"]["runtime.relationship_context.read"]
-        == "missing_relationship_context"
+        == "relationship_required"
     )
 
 
@@ -31075,7 +31179,7 @@ class DisplaySettingConnector:
 DISPLAY_CAPABILITY = CapabilityEntry(
     capability_id="fixture.display_setting_apply",
     provider_tool_name="fixture_display_setting_apply",
-    operation_class="state_change",
+    operation_class="external_write",
     capability_domain="display_preferences",
     supported_surfaces=("dev",),
     executor_binding="action_connector",
@@ -41547,6 +41651,9 @@ class StrictWorldStateRuntime(StrictRelationshipRuntime):
         self.world_failure, self.world_mutation, self.world_empty = (
             world_failure, world_mutation, world_empty,
         )
+
+    async def authorize_capability_exposure_batch(self, *, candidates):
+        return await _fixture_exposure_batch(self, candidates)
 
     async def authorize_capability(self, **kwargs):
         self.capability_authorization_calls.append(kwargs)

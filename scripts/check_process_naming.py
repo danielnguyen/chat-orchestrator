@@ -40,6 +40,19 @@ _BASE_TERMS = (
     "clus" + "ter",
 )
 
+# Match only authorization-stage fields, including exact mutation-test keys.
+# Capture the field's term so other markers on the same line stay visible.
+_AUTHORIZATION_TERM = "pha" + "se"
+_AUTHORIZATION_FIELDS = tuple(re.compile(pattern) for pattern in (
+    rf'''(?<![\w.])(?:authorization_)?(?P<term>{_AUTHORIZATION_TERM})\s*:\s*Literal\[\s*'''
+    r'''(?P<quote>['"])(?:exposure|selection|dispatch)(?P=quote)\s*\]''',
+    rf'''(?P<key_quote>['"])(?:authorization_)?(?P<term>{_AUTHORIZATION_TERM})'''
+    r'''(?P=key_quote)\s*:\s*'''
+    r'''(?P<quote>['"])(?:exposure|selection|dispatch)(?P=quote)''',
+    rf'''\(\s*(?P<key_quote>['"])(?:authorization_|result\.)(?P<term>{_AUTHORIZATION_TERM})'''
+    r'''(?P=key_quote)\s*,\s*(?P<quote>['"])(?:exposure|selection|dispatch)(?P=quote)\s*\)''',
+))
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -89,9 +102,13 @@ def detect_in_text(path: str, text: str, line: int | None) -> list[Finding]:
                 )
             )
 
-    for segment in re.split(r"[^A-Za-z0-9]+", text):
-        if not segment:
+    authorization_terms = {
+        match.span("term") for pattern in _AUTHORIZATION_FIELDS for match in pattern.finditer(text)
+    }
+    for match in re.finditer(r"[A-Za-z0-9]+", text):
+        if match.span() in authorization_terms:
             continue
+        segment = match.group(0)
         lowered = segment.lower()
         if _status_word_matches(text, lowered):
             findings.append(

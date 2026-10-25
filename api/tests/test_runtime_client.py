@@ -6,11 +6,79 @@ import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime
+from hashlib import sha256
 from typing import Any
 
 import httpx
 import pytest
 from clients.runtime import RuntimeClient
+
+
+def _exposure_candidate(**overrides):
+    return {
+        "request_id": "admitted-request", "owner_id": "owner", "conversation_id": "conv",
+        "surface": "dev", "runtime_session_id": "session", "runtime_turn_id": "turn",
+        "active_persona_id": "technical_architect", "authorization_phase": "exposure",
+        "capability_id": "runtime.world_state.read", "capability_domain": "software_architecture",
+        "operation_class": "read", **overrides,
+    }
+
+
+def _exposure_batch_response(candidates, authorizations=None):
+    """Independent CR wire fixture, including the producer's digest defaults."""
+    decisions = []
+    for index, candidate in enumerate(candidates):
+        canonical = {
+            "argument_digest": None, "supported_surfaces": [], "relationship_requirements": [],
+            "selected_relationship_ids": [], "world_state_requirements": [],
+            "selected_world_state_claim_ids": [], "confirmation_challenge_ref": None,
+            "persona_selection_mode": "legacy", "persona_selection_ref": None,
+            "expected_thread_revision": None, **deepcopy(candidate),
+        }
+        canonical["relationship_requirements"] = [
+            {"relationship_scope": None, "relationship_type": None, "selector_ref": None,
+             "authorization_required": False, **item}
+            for item in canonical["relationship_requirements"]
+        ]
+        canonical["world_state_requirements"] = [
+            {"domain": None, "attribute": None, "entity_id": None, "selector_ref": None,
+             "min_authority": None, "min_confidence": None, "max_freshness_state": None,
+             "revalidator_id": None, **item}
+            for item in canonical["world_state_requirements"]
+        ]
+        result = {
+            "phase": "exposure", "allowed": True, "decision_code": "allowed",
+            "reason_codes": ["allowed"], "confirmation_state": "not_required",
+            "challenge_ref": None, "challenge_expires_at": None, "revalidation_required": False,
+            "revalidation_selector": None, "relationship_ids_used": [],
+            "world_state_claim_ids_used": [],
+        }
+        if authorizations is not None:
+            result.update(authorizations[index]["result"])
+        authorization = {
+            key: canonical[key] for key in (
+                "request_id", "owner_id", "conversation_id", "runtime_session_id",
+                "runtime_turn_id", "capability_id", "persona_selection_ref",
+            )
+        }
+        authorization.update(
+            result=result, selection_contract=(
+                "strict_turn" if canonical["persona_selection_mode"] == "strict"
+                else "legacy_unbound"
+            ),
+        )
+        material = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        decisions.append({"input_digest": "sha256:" + sha256(material.encode()).hexdigest(),
+                          "event_ref": f"event-{index}", "authorization": authorization})
+    first = candidates[0]
+    return {
+        **{key: first[key] for key in ("request_id", "owner_id", "conversation_id", "surface",
+                                     "runtime_session_id", "runtime_turn_id")},
+        "schema_version": "capability-exposure-batch.v1", "producer": "/v1/capabilities/authorize",
+        "policy_version": "capability-authorization.v1",
+        "thread_revision": first.get("expected_thread_revision") or 1,
+        "context_digest": "sha256:" + "a" * 64, "decisions": decisions,
+    }
 
 
 @asynccontextmanager
@@ -2513,6 +2581,203 @@ async def test_authorize_capability_posts_expected_exposure_payload():
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["legacy", "strict"])
+async def test_exposure_batch_posts_once_with_exact_identity_and_nested_digest_defaults(mode):
+    selection = {} if mode == "legacy" else {
+        "persona_selection_mode": "strict", "persona_selection_ref": "psel_" + "a" * 32,
+        "expected_thread_revision": 7,
+    }
+    candidates = [
+        _exposure_candidate(**selection, relationship_requirements=[{
+            "relationship_scope": "project_context", "relationship_type": "works_on",
+        }]),
+        _exposure_candidate(**selection, capability_id="draft.local_message",
+                            operation_class="draft",
+                            world_state_requirements=[{"domain": "active_project"}]),
+    ]
+    expected = _exposure_batch_response(candidates)
+    expected["decisions"][1]["authorization"]["result"].update(
+        allowed=False, decision_code="authorization_denied",
+        reason_codes=["capability_domain_denied"],
+    )
+    transport = _FakeAsyncClient([expected])
+    client = RuntimeClient("http://runtime.local", None, client_factory=lambda **kwargs: transport)
+    await client.open()
+    try:
+        response = await client.authorize_capability_exposure_batch(candidates=candidates)
+    finally:
+        await client.close()
+    assert response == expected
+    assert len(transport.posts) == 1
+    path, payload = transport.posts[0]
+    assert path == "/v1/capabilities/exposure-batch"
+    assert all(item["request_id"] == "admitted-request" for item in payload["candidates"])
+    assert payload["candidates"][0]["relationship_requirements"] == [{
+        "relationship_scope": "project_context", "relationship_type": "works_on",
+        "selector_ref": None, "authorization_required": False,
+    }]
+    assert "argument_digest" not in candidates[0]  # No mutation of caller state.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [0, 17])
+async def test_exposure_batch_rejects_out_of_bound_candidate_count_without_transport(size):
+    client = RuntimeClient("http://runtime.local", None)
+    with pytest.raises(ValueError):
+        await client.authorize_capability_exposure_batch(candidates=[_exposure_candidate()] * size)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+    "runtime_turn_id", "active_persona_id", "expected_thread_revision",
+])
+async def test_exposure_batch_rejects_mixed_authority_before_transport(field):
+    candidates = [_exposure_candidate(), _exposure_candidate(capability_id="draft.local_message")]
+    candidates[1][field] = 2 if field == "expected_thread_revision" else "other"
+    client = RuntimeClient("http://runtime.local", None)
+    with pytest.raises(ValueError):
+        await client.authorize_capability_exposure_batch(candidates=candidates)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [
+    ("authorization_phase", "dispatch"), ("argument_digest", "capargs_digest"),
+    ("confirmation_challenge_ref", "challenge"), ("runtime_turn_id", None),
+    ("request_id", " admitted-request"), ("request_id", "x" * 121), ("surface", "x" * 65),
+    ("operation_class", "unknown"), ("supported_surfaces", ["dev"] * 17),
+    ("relationship_requirements", [{"required_status": "active"}]),
+    ("world_state_requirements", [{"unknown": True}]),
+    ("selected_relationship_ids", ["rel"] * 65), ("expected_thread_revision", True),
+    ("persona_selection_mode", "strict"), ("persona_selection_ref", "psel_" + "a" * 32),
+    ("unexpected", "field"),
+])
+async def test_exposure_batch_rejects_invalid_candidate_without_transport(field, value):
+    client = RuntimeClient("http://runtime.local", None)
+    with pytest.raises(ValueError):
+        await client.authorize_capability_exposure_batch(
+            candidates=[_exposure_candidate(**{field: value})],
+        )
+
+
+@pytest.mark.asyncio
+async def test_exposure_batch_rejects_duplicate_candidates_without_transport():
+    client = RuntimeClient("http://runtime.local", None)
+    with pytest.raises(ValueError):
+        await client.authorize_capability_exposure_batch(candidates=[_exposure_candidate()] * 2)
+
+
+@pytest.mark.asyncio
+async def test_exposure_batch_accepts_full_bound_and_revalidation_denial():
+    candidates = [_exposure_candidate(capability_id=f"fixture.read_{i}") for i in range(16)]
+    expected = _exposure_batch_response(candidates)
+    expected["decisions"][-1]["authorization"]["result"].update(
+        allowed=False, decision_code="revalidation_required",
+        reason_codes=["world_state_revalidation_required"], revalidation_required=True,
+        revalidation_selector={"world_state_claim_ids": ["claim"], "revalidator_id": "verifier"},
+    )
+    client = RuntimeClient("http://runtime.local", None)
+
+    async def post(path, *, json):
+        return expected
+
+    client._post = post
+    assert await client.authorize_capability_exposure_batch(candidates=candidates) == expected
+
+
+_EXPOSURE_BATCH_DEFECTS = [
+    *((field, "foreign") for field in (
+        "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+        "runtime_turn_id", "schema_version", "producer", "policy_version",
+    )),
+    ("context_digest", "invalid"), ("thread_revision", -1), ("thread_revision", True),
+    ("thread_revision", 99), ("extra", True), ("decisions", []), ("decisions", None),
+    ("member.input_digest", "sha256:" + "b" * 64), ("member.event_ref", ""),
+    ("member.event_ref", "event-0"), ("member.extra", True),
+    *((f"authorization.{field}", "foreign") for field in (
+        "request_id", "owner_id", "conversation_id", "runtime_session_id", "runtime_turn_id",
+        "capability_id", "selection_contract", "persona_selection_ref",
+    )),
+    ("authorization.extra", True), ("result.allowed", "true"), ("result.allowed", False),
+    ("result.decision_code", "confirmation_accepted"), ("result.phase", "dispatch"),
+    ("result.reason_codes", []), ("result.reason_codes", ["unknown"]),
+    ("result.reason_codes", ["capability_domain_denied"]),
+    ("result.confirmation_state", "issued"), ("result.challenge_ref", "challenge"),
+    ("result.challenge_expires_at", "2099-01-01"), ("result.revalidation_required", True),
+    ("result.revalidation_selector", {"world_state_claim_ids": [], "revalidator_id": "verifier"}),
+    ("result.relationship_ids_used", "rel"), ("result.world_state_claim_ids_used", [1]),
+    ("result.extra", True), ("missing_member", None), ("extra_member", None),
+    ("duplicate_member", None), ("reordered_members", None), ("missing_result_field", None),
+]
+
+
+def _corrupt_exposure_batch(response, field, value):
+    if field == "missing_member":
+        response["decisions"].pop()
+    elif field == "extra_member":
+        response["decisions"].append(deepcopy(response["decisions"][-1]))
+    elif field == "duplicate_member":
+        response["decisions"][-1] = deepcopy(response["decisions"][0])
+    elif field == "reordered_members":
+        response["decisions"].reverse()
+    elif field == "missing_result_field":
+        del response["decisions"][-1]["authorization"]["result"]["allowed"]
+    else:
+        parts = field.split(".")
+        target = response
+        if len(parts) > 1:
+            target = response["decisions"][-1]
+            if parts[0] == "authorization":
+                target = target["authorization"]
+            elif parts[0] == "result":
+                target = target["authorization"]["result"]
+        target[parts[-1]] = value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), _EXPOSURE_BATCH_DEFECTS)
+async def test_exposure_batch_rejects_entire_response_on_last_member_or_provenance_defect(
+    field, value,
+):
+    candidates = [_exposure_candidate(expected_thread_revision=1), _exposure_candidate(
+        capability_id="draft.local_message", expected_thread_revision=1,
+    )]
+    response = _exposure_batch_response(candidates)
+    _corrupt_exposure_batch(response, field, value)
+    transport = _FakeAsyncClient([response])
+    client = RuntimeClient("http://runtime.local", None, client_factory=lambda **kwargs: transport)
+    await client.open()
+    try:
+        with pytest.raises(ValueError):
+            await client.authorize_capability_exposure_batch(candidates=candidates)
+    finally:
+        await client.close()
+    assert len(transport.posts) == 1
+    assert transport.posts[0][0] == "/v1/capabilities/exposure-batch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    (404, {"detail": "Not Found"}), (405, {"detail": "Method Not Allowed"}),
+    (501, {"detail": "Not Implemented"}), (401, {}), (403, {}),
+    (409, {"detail": "capability_exposure_batch_rejected"}), (422, {}),
+    (500, {}), (503, {"detail": "capability_exposure_batch_unavailable"}),
+    httpx.ReadTimeout("timeout"), httpx.ConnectError("unavailable"), ValueError("malformed JSON"),
+])
+async def test_exposure_batch_errors_and_older_endpoints_never_fall_back(failure):
+    transport = _FakeAsyncClient([failure])
+    client = RuntimeClient("http://runtime.local", None, client_factory=lambda **kwargs: transport)
+    await client.open()
+    try:
+        with pytest.raises((httpx.HTTPError, ValueError)):
+            await client.authorize_capability_exposure_batch(candidates=[_exposure_candidate()])
+    finally:
+        await client.close()
+    assert len(transport.posts) == 1
+    assert transport.posts[0][0] == "/v1/capabilities/exposure-batch"
 
 
 @pytest.mark.asyncio

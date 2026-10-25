@@ -5,6 +5,7 @@ import json
 import math
 from collections.abc import Callable
 from datetime import datetime
+from hashlib import sha256
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -2189,6 +2190,202 @@ def validate_pause_completion_response(
         raise RuntimeError("pause_completion_context_mismatch")
 
 
+_ExposureIdentifier = Annotated[str, Field(min_length=1, max_length=120)]
+_ExposureLabel = Annotated[str, Field(min_length=1, max_length=64)]
+_ExposureDigest = Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
+
+
+class _ExposureWireModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _ExposureRelationshipRequirement(_ExposureWireModel):
+    relationship_scope: _ExposureLabel | None = None
+    relationship_type: _ExposureLabel | None = None
+    selector_ref: _ExposureIdentifier | None = None
+    authorization_required: bool = False
+
+
+class _ExposureWorldRequirement(_ExposureWireModel):
+    domain: _ExposureLabel | None = None
+    attribute: _ExposureLabel | None = None
+    entity_id: _ExposureIdentifier | None = None
+    selector_ref: _ExposureIdentifier | None = None
+    min_authority: Literal[
+        "observed_user_report", "verified_tool_output", "trusted_integration_event",
+        "derived_from_multiple_sources", "model_inferred", "unverified_assumption",
+    ] | None = None
+    min_confidence: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    max_freshness_state: Literal[
+        "fresh", "aging", "stale", "expired", "unknown", "superseded", "conflicted",
+    ] | None = None
+    revalidator_id: _ExposureIdentifier | None = None
+
+
+class _ExposureScope(_ExposureWireModel):
+    request_id: _ExposureIdentifier
+    owner_id: _ExposureIdentifier
+    conversation_id: _ExposureIdentifier
+    surface: _ExposureLabel
+    runtime_session_id: _ExposureIdentifier
+    runtime_turn_id: _ExposureIdentifier
+
+    @field_validator("request_id", "owner_id", "conversation_id", "surface",
+                     "runtime_session_id", "runtime_turn_id")
+    @classmethod
+    def exact_identifier(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("capability_exposure_binding_invalid")
+        return value
+
+
+class _ExposureCandidate(_ExposureScope):
+    active_persona_id: _ExposureIdentifier
+    authorization_phase: Literal["exposure"]
+    capability_id: _ExposureIdentifier
+    capability_domain: _ExposureLabel
+    operation_class: Literal["read", "draft", "external_write", "destructive", "high_impact"]
+    argument_digest: None = None
+    supported_surfaces: list[_ExposureLabel] = Field(default_factory=list, max_length=16)
+    relationship_requirements: list[_ExposureRelationshipRequirement] = Field(
+        default_factory=list, max_length=16,
+    )
+    selected_relationship_ids: list[_ExposureIdentifier] = Field(
+        default_factory=list, max_length=64,
+    )
+    world_state_requirements: list[_ExposureWorldRequirement] = Field(
+        default_factory=list, max_length=16,
+    )
+    selected_world_state_claim_ids: list[_ExposureIdentifier] = Field(
+        default_factory=list, max_length=64,
+    )
+    confirmation_challenge_ref: None = None
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: Annotated[str, Field(pattern=r"^psel_[0-9a-f]{32}$")] | None = None
+    expected_thread_revision: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def selection_binding(self):
+        if (self.persona_selection_mode == "strict") != (self.persona_selection_ref is not None):
+            raise ValueError("capability_exposure_selection_invalid")
+        if self.capability_id != self.capability_id.strip():
+            raise ValueError("capability_exposure_binding_invalid")
+        return self
+
+
+class _ExposureRevalidationSelector(_ExposureWireModel):
+    world_state_claim_ids: list[_ExposureIdentifier] = Field(max_length=64)
+    revalidator_id: _ExposureIdentifier
+
+
+class _ExposureResult(_ExposureWireModel):
+    phase: Literal["exposure"]
+    allowed: bool
+    decision_code: Literal[
+        "allowed", "authorization_denied", "confirmation_required", "revalidation_required",
+    ]
+    reason_codes: list[Literal[
+        "strict_consequential_action_unavailable", "strict_confirmation_unavailable", "allowed",
+        "registered_capability_domain_mismatch", "registered_operation_class_mismatch",
+        "registered_supported_surfaces_mismatch", "registered_surface_not_allowed",
+        "registered_persona_not_allowed", "runtime_session_mismatch", "runtime_turn_mismatch",
+        "unknown_persona", "unknown_surface", "persona_mismatch", "surface_mismatch",
+        "capability_domain_denied", "surface_unsupported", "argument_digest_required",
+        "argument_digest_mismatch", "relationship_required", "relationship_not_selected",
+        "relationship_not_authorized", "world_state_required", "world_state_not_selected",
+        "world_state_not_authorized", "world_state_revalidation_required",
+        "world_state_revalidator_required", "world_state_revalidator_not_configured",
+        "world_state_revalidator_not_authorized", "world_state_revalidation_inadequate",
+        "world_state_revalidator_conflict", "confirmation_required", "originating_turn_required",
+        "confirmation_turn_not_current", "dispatch_turn_required", "challenge_missing",
+        "challenge_expired", "challenge_mismatch", "challenge_turn_mismatch", "challenge_rejected",
+        "challenge_consumed", "challenge_not_confirmed",
+    ]] = Field(min_length=1, max_length=16)
+    confirmation_state: Literal["not_required", "required"]
+    challenge_ref: None
+    challenge_expires_at: None
+    revalidation_required: bool
+    revalidation_selector: _ExposureRevalidationSelector | None
+    relationship_ids_used: list[_ExposureIdentifier] = Field(max_length=64)
+    world_state_claim_ids_used: list[_ExposureIdentifier] = Field(max_length=64)
+
+    @model_validator(mode="after")
+    def consistent_decision(self):
+        if (self.allowed != (self.decision_code == "allowed")
+                or (self.allowed and (self.reason_codes != ["allowed"]
+                                     or self.revalidation_required))
+                or (not self.allowed and "allowed" in self.reason_codes)
+                or self.revalidation_required != (self.revalidation_selector is not None)
+                or self.revalidation_required != (self.decision_code == "revalidation_required")):
+            raise ValueError("capability_exposure_result_invalid")
+        return self
+
+
+class _ExposureAuthorization(_ExposureWireModel):
+    request_id: _ExposureIdentifier
+    owner_id: _ExposureIdentifier
+    conversation_id: _ExposureIdentifier
+    runtime_session_id: _ExposureIdentifier
+    runtime_turn_id: _ExposureIdentifier
+    capability_id: _ExposureIdentifier
+    result: _ExposureResult
+    selection_contract: Literal["legacy_unbound", "strict_turn"]
+    persona_selection_ref: Annotated[str, Field(pattern=r"^psel_[0-9a-f]{32}$")] | None
+
+
+class _ExposureDecision(_ExposureWireModel):
+    input_digest: _ExposureDigest
+    event_ref: _ExposureIdentifier
+    authorization: _ExposureAuthorization
+
+
+class _ExposureBatchResponse(_ExposureScope):
+    schema_version: Literal["capability-exposure-batch.v1"]
+    producer: Literal["/v1/capabilities/authorize"]
+    policy_version: Literal["capability-authorization.v1"]
+    thread_revision: int = Field(ge=0)
+    context_digest: _ExposureDigest
+    decisions: list[_ExposureDecision] = Field(min_length=1, max_length=16)
+
+
+def validate_capability_exposure_batch(
+    response: Any, *, candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate every association before the caller may publish any descriptor."""
+    requests = [_ExposureCandidate.model_validate(item) for item in candidates]
+    if not 1 <= len(requests) <= 16:
+        raise ValueError("capability_exposure_batch_size_invalid")
+    first = requests[0]
+    shared_fields = (*_ExposureScope.model_fields, "active_persona_id", "persona_selection_mode",
+                     "persona_selection_ref", "expected_thread_revision")
+    if (len({item.capability_id for item in requests}) != len(requests)
+            or any(getattr(item, key) != getattr(first, key)
+                   for item in requests for key in shared_fields)):
+        raise ValueError("capability_exposure_context_mismatch")
+    result = _ExposureBatchResponse.model_validate(response)
+    if (any(getattr(result, key) != getattr(first, key) for key in _ExposureScope.model_fields)
+            or (first.expected_thread_revision is not None
+                and result.thread_revision != first.expected_thread_revision)
+            or len(result.decisions) != len(requests)
+            or len({item.event_ref for item in result.decisions}) != len(requests)):
+        raise ValueError("capability_exposure_context_mismatch")
+    for request, decision in zip(requests, result.decisions):
+        material = json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True)
+        authorization = decision.authorization
+        if (decision.input_digest != "sha256:" + sha256(material.encode()).hexdigest()
+                or any(getattr(authorization, key) != getattr(request, key) for key in (
+                    "request_id", "owner_id", "conversation_id", "runtime_session_id",
+                    "runtime_turn_id", "capability_id", "persona_selection_ref",
+                ))
+                or authorization.selection_contract != (
+                    "strict_turn" if request.persona_selection_mode == "strict"
+                    else "legacy_unbound"
+                )):
+            raise ValueError("capability_exposure_decision_mismatch")
+    return result.model_dump()
+
+
 class RuntimeClient:
     async def publish_surface_presence(self, **binding: Any) -> dict[str, Any]:
         from models import PresenceProjection
@@ -3398,6 +3595,25 @@ class RuntimeClient:
         if persona_selection_mode == "strict":
             validate_strict_relationship_response(response, scope=payload)
         return response
+
+    async def authorize_capability_exposure_batch(
+        self, *, candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        # Validate and canonicalize before transport. The defaults are part of
+        # CR's input digest, including defaults on nested requirements.
+        if not isinstance(candidates, list) or not 1 <= len(candidates) <= 16:
+            raise ValueError("capability_exposure_batch_size_invalid")
+        payload = [_ExposureCandidate.model_validate(item).model_dump() for item in candidates]
+        first = payload[0]
+        shared = (*_ExposureScope.model_fields, "active_persona_id", "persona_selection_mode",
+                  "persona_selection_ref", "expected_thread_revision")
+        if (len({item["capability_id"] for item in payload}) != len(payload)
+                or any(item[key] != first[key] for item in payload for key in shared)):
+            raise ValueError("capability_exposure_context_mismatch")
+        # Older endpoints are explicitly unsupported. No HTTP/transport error
+        # may downgrade this all-or-nothing authorization to individual calls.
+        response = await self._post("/v1/capabilities/exposure-batch", json={"candidates": payload})
+        return validate_capability_exposure_batch(response, candidates=payload)
 
     async def authorize_capability(
         self,
