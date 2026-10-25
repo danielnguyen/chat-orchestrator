@@ -13171,7 +13171,10 @@ async def orchestrate_chat(
                         "render_mode": "not_applicable",
                     }
                 )
-            elif process_failure_diagnosis_eligible(evidence_acquisition):
+            elif (
+                process_failure_diagnosis_eligible(evidence_acquisition)
+                and (not terminal_decision or evidence_acquisition.next_step is not None)
+            ):
                 diagnostic_response = await _diagnose_process_failure(
                     request_id=request_id,
                     state=evidence_acquisition,

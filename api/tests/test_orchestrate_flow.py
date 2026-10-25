@@ -43512,3 +43512,47 @@ async def test_aggregate_terminal_failure_blocks_answer_without_downgrade(
     await test_deterministic_aggregate_flow_is_complete_provider_free_and_policy_gated(
         tmp_path, caplog, block_policy=True, initial_source_matched=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("presentation_enabled", [False, True])
+@pytest.mark.parametrize("failure", ["malformed", "timeout", "permission"])
+async def test_failed_aggregate_terminal_cannot_enter_diagnostic_or_reasoning_provider(
+    tmp_path, monkeypatch, presentation_enabled, failure,
+):
+    original = FakeRuntime.evaluate_evidence_terminal
+
+    async def fail_terminal(self, **kwargs):
+        response = await original(self, **kwargs)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout")
+        if failure == "malformed":
+            response.pop("next_step")
+        else:
+            response["next_step"]["result"]["provider_disposition"] = "allowed"
+        return response
+
+    monkeypatch.setattr(FakeRuntime, "evaluate_evidence_terminal", fail_terminal)
+    source = _aggregate_structured_response()
+    source["results"][0]["structured_data"]["values"][0] = "invalid-numeric"
+    out, runtime, dsa, litellm, memory = await _run_step13_aggregate_failure(
+        tmp_path=tmp_path, response=source, diagnostic_completion=_diagnostic_completion(),
+        reasoning_completion=_provider_completion("must not run"),
+        presentation_enabled=presentation_enabled, request_id="rid-terminal-source-failure",
+    )
+    assert out["status"] == "degraded"
+    assert out["answer"] == (WITHHELD_ANSWER if presentation_enabled
+                              else NEXT_STEP_DEPENDENCY_ANSWER)
+    assert len(runtime.evidence_terminal_calls) == 1
+    assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+    assert runtime.claim_support_calls == []
+    assert len(litellm.calls) == 1  # Initial source interpretation only.
+    assert len(dsa.context_calls) == 1
+    assert dsa.fetch_calls == []
+    trace = memory.trace_calls[-1]["payload"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["diagnostic"]["observation_count"] > 0
+    assert manifest["diagnostic"]["call_count"] == 0
+    assert manifest["next_steps"]["selection_count"] == 0
+    assert manifest["next_steps"]["additional_acquisition_count"] == 0
+    assert trace["prompt"]["general_evidence_reasoning"]["attempted"] is False
