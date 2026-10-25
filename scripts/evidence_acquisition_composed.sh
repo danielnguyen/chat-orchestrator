@@ -217,6 +217,31 @@ result_text:
 YAML
 }
 
+# Count real CR HTTP requests independently of decision/event projections.
+evidence_terminal_http_counts() {
+  docker compose -f "$COMPOSE" logs --no-color runtime | python3 -c '
+import json, re, sys
+text = sys.stdin.read()
+paths = {"terminal": "/v1/runtime/evidence-terminal/evaluate",
+         "sufficiency": "/v1/runtime/evidence-sufficiency/evaluate",
+         "next_step": "/v1/runtime/evidence-next-steps/select"}
+print(json.dumps({key: len(re.findall(r"\"POST " + re.escape(path) + r" HTTP/", text))
+                  for key, path in paths.items()}))'
+}
+
+assert_evidence_terminal_http_delta() {
+  local before="$1" terminal="$2" sufficiency="$3" next_step="$4" after
+  after="$(evidence_terminal_http_counts)"
+  jq -e --argjson before "$before" --argjson terminal "$terminal" \
+    --argjson sufficiency "$sufficiency" --argjson next_step "$next_step" '
+    .terminal - $before.terminal == $terminal
+    and .sufficiency - $before.sufficiency == $sufficiency
+    and .next_step - $before.next_step == $next_step
+  ' <<<"$after" >/dev/null
+  printf 'Evidence terminal HTTP requests: composite=%s sufficiency=%s next_step=%s\n' \
+    "$terminal" "$sufficiency" "$next_step"
+}
+
 run_evidence_chat() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
   local external_context model_override
@@ -1928,6 +1953,7 @@ run_evidence_clarification_scenario() {
 }
 
 run_evidence_changed_premise_scenarios() {
+  local terminal_http_before
   local owner client conversation_id question external response request_id trace
   local manifest provider_calls diagnostics audit source_calls answer
   owner="owner-evidence-followup"
@@ -1945,7 +1971,9 @@ run_evidence_changed_premise_scenarios() {
     "google_sheets:followup_records:Followup!A2:C2" \
     "Record: follow-up-1"
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-followup")"
+  terminal_http_before="$(evidence_terminal_http_counts)"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_voice_openai")"
+  assert_evidence_terminal_http_delta "$terminal_http_before" 0 2 2
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
@@ -6145,6 +6173,7 @@ except (AssertionError, KeyError, TypeError, ValueError, RuntimeError):
 }
 
 run_evidence_aggregate_scenario() {
+  local terminal_http_before
   local owner client conversation_id question external response request_id answer
   local trace manifest diagnostics provider_calls fixture_calls audit serialized
   owner="owner-evidence-aggregate"
@@ -6168,7 +6197,9 @@ run_evidence_aggregate_scenario() {
       aggregate_function:"median",
       aggregate_field_name:"Reading"
     }')"
+  terminal_http_before="$(evidence_terminal_http_counts)"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+  assert_evidence_terminal_http_delta "$terminal_http_before" 1 0 0
   request_id="$(jq -er '.request_id' <<<"$response")"
   answer="$(jq -er '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"

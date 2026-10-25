@@ -2754,6 +2754,44 @@ class RuntimeClient:
             raise RuntimeError("evidence_sufficiency_response_invalid")
         return response
 
+    async def evaluate_evidence_terminal(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        runtime_session_id: str, runtime_turn_id: str, evidence_plan_id: str,
+        acquisition_manifest_id: str, task_shape: str,
+        declared_requirements: list[dict[str, Any]], acquisition_facts: list[dict[str, Any]],
+        current_premise: dict[str, Any],
+        proposed_acquisition_premise: dict[str, Any] | None = None,
+        clarification_target: str | None = None,
+    ) -> dict[str, Any]:
+        from services.evidence_acquisition import (
+            EvidenceTerminalRequest,
+            validate_evidence_terminal_response,
+        )
+
+        try:
+            request = EvidenceTerminalRequest.model_validate({
+                "request_id": request_id, "owner_id": owner_id,
+                "conversation_id": conversation_id, "surface": surface,
+                "runtime_session_id": runtime_session_id, "runtime_turn_id": runtime_turn_id,
+                "evidence_plan_id": evidence_plan_id,
+                "acquisition_manifest_id": acquisition_manifest_id, "task_shape": task_shape,
+                "declared_requirements": declared_requirements,
+                "acquisition_facts": acquisition_facts,
+                "current_premise": current_premise,
+                "proposed_acquisition_premise": proposed_acquisition_premise,
+                "clarification_target": clarification_target,
+            }, strict=True)
+        except Exception as exc:
+            raise RuntimeError("evidence_terminal_request_invalid") from exc
+        # No compatibility downgrade or retry: sufficiency may already be durable.
+        response = await self._post(
+            "/v1/runtime/evidence-terminal/evaluate", json=request.model_dump(mode="json"),
+        )
+        try:
+            return validate_evidence_terminal_response(response, request).model_dump(mode="json")
+        except Exception as exc:
+            raise RuntimeError("evidence_terminal_response_invalid") from exc
+
     async def select_evidence_next_step(
         self,
         *,
