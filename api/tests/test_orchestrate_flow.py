@@ -650,6 +650,7 @@ class FakeRuntime:
         self.claim_support_calls = []
         self.evidence_shape_calls = []
         self.evidence_plan_calls = []
+        self.evidence_terminal_calls = []
         self.evidence_sufficiency_calls = []
         self.evidence_next_step_calls = []
         self.reset_calls = []
@@ -1536,6 +1537,25 @@ class FakeRuntime:
         }
         self._last_evidence_sufficiency_result = response["result"]
         return response
+
+    async def evaluate_evidence_terminal(self, **kwargs):
+        self.evidence_terminal_calls.append(kwargs)
+        self.call_order.append("evidence_terminal")
+        # Simulate CR's internal ordered evaluations on a separate producer.
+        # Only the composite crosses the orchestrator/client seam.
+        producer = copy.deepcopy(self)
+        sufficiency = await producer.evaluate_evidence_sufficiency(**kwargs)
+        selection = await producer.select_evidence_next_step(
+            **{key: kwargs[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id", "evidence_plan_id",
+                "acquisition_manifest_id", "current_premise",
+            )},
+            evaluation_id=sufficiency["result"]["evaluation_id"],
+            evaluated_requirements=sufficiency["result"]["evaluated_requirements"],
+        )
+        return {"schema_version": "evidence-terminal.v1",
+                "sufficiency": sufficiency, "next_step": selection}
 
     async def select_evidence_next_step(self, **kwargs):
         self.evidence_next_step_calls.append(kwargs)
@@ -19686,6 +19706,11 @@ async def test_evidence_next_step_executes_one_changed_premise_exact_fetch(
             "source_ref": "vehicle_log_primary:record_1",
         }
     ]
+    assert runtime.evidence_terminal_calls == []
+    assert [entry for entry in runtime.call_order if entry in {
+        "evidence_plan", "evidence_sufficiency", "evidence_next_step",
+    }] == ["evidence_plan", "evidence_sufficiency", "evidence_plan", "evidence_next_step",
+           "evidence_sufficiency", "evidence_next_step"]
     assert len(runtime.evidence_sufficiency_calls) == 2
     assert [
         call["current_premise"]["selected_strategies"]
@@ -24337,6 +24362,9 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
     assert ("Configured Weather Archive" not in semantic_messages) is (
         initial_source_matched
     )
+    assert len(runtime.evidence_terminal_calls) == 1
+    assert runtime.evidence_sufficiency_calls == []
+    assert runtime.evidence_next_step_calls == []
     assert len(runtime.evidence_plan_calls) == 1
     assert runtime.evidence_plan_calls[0]["aggregate_spec"] == {
         "function": "median",
@@ -24359,7 +24387,7 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
             },
         }
     ]
-    assert runtime.evidence_sufficiency_calls[0]["acquisition_facts"] == [
+    assert runtime.evidence_terminal_calls[0]["acquisition_facts"] == [
         {"requirement_id": "complete-scope", "outcome": "satisfied"},
         {"requirement_id": "context-delivery", "outcome": "satisfied"},
         {"requirement_id": "no-truncation", "outcome": "satisfied"},
@@ -24398,7 +24426,7 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
         "55.75",
     ):
         assert private_value not in checkpoint
-    premise = runtime.evidence_next_step_calls[0]["current_premise"]
+    premise = runtime.evidence_terminal_calls[0]["current_premise"]
     assert premise["aggregate_spec"] == {
         "function": "median",
         "field_name": "Reading",
@@ -24690,8 +24718,9 @@ async def test_generic_validation_failure_is_not_rescued_by_legacy_aggregate(
 
     assert out["answer"] == WITHHELD_ANSWER
     assert out["status"] == "degraded"
-    assert len(runtime.evidence_sufficiency_calls) == 1
-    assert len(runtime.evidence_next_step_calls) == 1
+    assert len(runtime.evidence_terminal_calls) == 1
+    assert runtime.evidence_sufficiency_calls == []
+    assert runtime.evidence_next_step_calls == []
     assert runtime.claim_support_calls == []
     assert len(litellm.calls) == 2
     trace = memory_store.trace_calls[-1]["payload"]
@@ -43441,3 +43470,45 @@ async def test_invalid_voice_projection_clarifies_without_provider(tmp_path, pro
     assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
         out["answer"]
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "http", "conflict", "unavailable",
+                                     "malformed", "partial", "identity", "permission"])
+async def test_aggregate_terminal_failure_blocks_answer_without_downgrade(
+    tmp_path, caplog, monkeypatch, failure,
+):
+    original = FakeRuntime.evaluate_evidence_terminal
+
+    async def fail_terminal(self, **kwargs):
+        self.evidence_next_step_error = None
+        response = await original(self, **kwargs)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout")
+        if failure in {"http", "conflict"}:
+            request = httpx.Request("POST", "http://runtime/v1/runtime/evidence-terminal/evaluate")
+            raise httpx.HTTPStatusError("failed", request=request, response=httpx.Response(
+                409 if failure == "conflict" else 503, request=request,
+            ))
+        if failure == "unavailable":
+            raise httpx.ConnectError("unavailable")
+        if failure == "malformed":
+            return {"schema_version": "wrong"}
+        if failure == "partial":
+            response.pop("next_step")
+        elif failure == "identity":
+            response["next_step"]["owner_id"] = "forged"
+        elif failure == "permission":
+            response["next_step"]["result"].update(
+                selected_next_step="perform_additional_acquisition",
+                reacquisition_guard="changed_premise_allowed",
+                proposed_premise_digest="sha256:" + "f" * 64,
+            )
+        return response
+
+    monkeypatch.setattr(FakeRuntime, "evaluate_evidence_terminal", fail_terminal)
+    # The complete aggregate scenario also checks exact safe answer, provider
+    # count, source selection, trace privacy and zero constituent/fallback calls.
+    await test_deterministic_aggregate_flow_is_complete_provider_free_and_policy_gated(
+        tmp_path, caplog, block_policy=True, initial_source_matched=True,
+    )

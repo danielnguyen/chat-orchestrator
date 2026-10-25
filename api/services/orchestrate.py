@@ -104,6 +104,7 @@ from services.evidence_acquisition import (
     EvidenceAcquisitionState,
     ProviderOutputValidationError,
     SemanticInterpreterFailure,
+    acquisition_terminal_eligible,
     advisory_provider_allowed,
     begin_evidence_acquisition,
     bind_evidence_reasoning_claim_scope,
@@ -12764,6 +12765,7 @@ async def orchestrate_chat(
         }
         if evidence_acquisition is not None:
             retained_external_refs = _retained_external_source_refs(prompt.trace)
+            terminal_decision = acquisition_terminal_eligible(evidence_acquisition)
             await evaluate_acquisition_sufficiency(
                 state=evidence_acquisition,
                 runtime=runtime,
@@ -12776,11 +12778,13 @@ async def orchestrate_chat(
                 context_pack=external_context_pack,
                 dsa_trace=dsa_trace,
                 retained_source_refs=retained_external_refs,
+                terminal_decision=terminal_decision,
             )
             exact_fetch_proposal = None
-            next_step = None
+            next_step = evidence_acquisition.next_step if terminal_decision else None
             if (
-                evidence_acquisition.supported_governed_path
+                not terminal_decision
+                and evidence_acquisition.supported_governed_path
                 and evidence_acquisition.sufficiency is not None
             ):
                 clarification_target = deterministic_clarification_target(

@@ -4051,6 +4051,239 @@ async def compile_safe_exact_fetch_proposal(
         return None
 
 
+def _validate_sufficiency_response(
+    response_raw: Any, *, scope: dict[str, str], evidence_plan_id: str,
+    acquisition_manifest_id: str, task_shape: TaskShape,
+    declared_requirements: list[Requirement], facts: list[dict[str, Any]],
+) -> SufficiencyResponse:
+    response = SufficiencyResponse.model_validate(response_raw)
+    _validate_scope_echo(response, scope)
+    if (
+        response.evidence_plan_id != evidence_plan_id
+        or response.acquisition_manifest_id != acquisition_manifest_id
+        or response.result.task_shape != task_shape
+    ):
+        raise ValueError("sufficiency_association_mismatch")
+    expected_requirements = {
+        requirement.requirement_id: (
+            requirement.requirement_kind,
+            requirement.criticality,
+        )
+        for requirement in declared_requirements
+    }
+    evaluated = {
+        item.requirement_id: (item.requirement_kind, item.criticality)
+        for item in response.result.evaluated_requirements
+    }
+    if evaluated != expected_requirements:
+        raise ValueError("sufficiency_requirement_mismatch")
+    facts_by_id = {fact["requirement_id"]: fact["outcome"] for fact in facts}
+    if any(
+        item.effective_outcome != facts_by_id[item.requirement_id]
+        for item in response.result.evaluated_requirements
+    ):
+        raise ValueError("sufficiency_fact_mismatch")
+    material_outcomes = [
+        item.effective_outcome
+        for item in response.result.evaluated_requirements
+        if item.criticality == "material"
+    ]
+    optional_outcomes = [
+        item.effective_outcome
+        for item in response.result.evaluated_requirements
+        if item.criticality == "optional"
+    ]
+    concrete_failures = {
+        "partial",
+        "not_attempted",
+        "unavailable",
+        "unsupported",
+        "failed",
+        "excluded",
+        "filtered",
+        "truncated",
+        "unresolved_contradiction",
+    }
+    expected_status = (
+        "insufficient"
+        if any(outcome in concrete_failures for outcome in material_outcomes)
+        else "unknown"
+        if any(outcome in {"missing", "unknown"} for outcome in material_outcomes)
+        else "sufficient_with_limitations"
+        if any(outcome != "satisfied" for outcome in optional_outcomes)
+        else "sufficient_for_declared_scope"
+    )
+    if response.result.sufficiency_status != expected_status:
+        raise ValueError("sufficiency_status_mismatch")
+    expected_constraints = _expected_sufficiency_constraints(
+        expected_status,
+        task_shape=task_shape,
+    )
+    if response.result.answer_constraints != expected_constraints:
+        raise ValueError("sufficiency_constraints_mismatch")
+    if len(response.result.evaluated_requirements) != len(declared_requirements):
+        raise ValueError("duplicate_sufficiency_requirement")
+    return response
+
+
+def _validate_next_step_response(
+    response_raw: Any, *, scope: dict[str, str], sufficiency: SufficiencyResult,
+    evidence_plan_id: str, acquisition_manifest_id: str,
+    current_premise: EvidenceAcquisitionPremise,
+    proposed_premise: EvidenceAcquisitionPremise | None,
+    clarification_target: ClarificationTarget | None,
+) -> NextStepResult:
+    response = NextStepResponse.model_validate(response_raw)
+    _validate_scope_echo(response, scope)
+    result = response.result
+    if (
+        result.evaluation_id != sufficiency.evaluation_id
+        or result.evidence_plan_id != evidence_plan_id
+        or result.acquisition_manifest_id != acquisition_manifest_id
+        or result.task_shape != current_premise.task_shape
+        or result.sufficiency_status != sufficiency.sufficiency_status
+        or result.current_premise_digest
+        != _acquisition_premise_digest(current_premise)
+    ):
+        raise ValueError("next_step_association_mismatch")
+    proposed_digest = (
+        _acquisition_premise_digest(proposed_premise)
+        if proposed_premise is not None
+        else None
+    )
+    if result.proposed_premise_digest != proposed_digest:
+        raise ValueError("next_step_proposed_premise_mismatch")
+    if (
+        result.selected_next_step == "ask_narrow_clarification"
+        and result.clarification_target != clarification_target
+    ):
+        raise ValueError("next_step_clarification_mismatch")
+    expected_unresolved = sorted(
+        evaluation.requirement_id
+        for evaluation in sufficiency.evaluated_requirements
+        if evaluation.criticality == "material"
+        and evaluation.effective_outcome != "satisfied"
+    )
+    if result.unresolved_material_requirement_ids != expected_unresolved:
+        raise ValueError("next_step_requirement_mismatch")
+    if (
+        result.selected_next_step == "perform_additional_acquisition"
+        and proposed_premise is None
+    ):
+        raise ValueError("next_step_proposal_missing")
+    return result
+
+
+def _publish_next_step(state: EvidenceAcquisitionState, result: NextStepResult) -> None:
+    state.next_step = result
+    state.next_step_history = [
+        *(state.next_step_history or []),
+        {
+            "selection_id": result.selection_id,
+            "evaluation_id": result.evaluation_id,
+            "evidence_plan_id": result.evidence_plan_id,
+            "acquisition_manifest_id": result.acquisition_manifest_id,
+            "selected_next_step": result.selected_next_step,
+            "conclusion_disposition": result.conclusion_disposition,
+            "provider_disposition": result.provider_disposition,
+            "reacquisition_guard": result.reacquisition_guard,
+            "clarification_target": result.clarification_target,
+            "reason_codes": list(result.reason_codes),
+            "additional_acquisition_executed": False,
+        },
+    ]
+    if _advisory_provider_allowed(state):
+        state.forced_answer = None
+
+
+class AcquisitionFact(StrictModel):
+    requirement_id: Identifier
+    outcome: Literal[
+        "satisfied", "partial", "not_attempted", "unavailable", "unsupported",
+        "failed", "excluded", "filtered", "truncated", "unresolved_contradiction", "unknown",
+    ]
+
+
+class EvidenceTerminalRequest(StrictModel):
+    request_id: Identifier
+    owner_id: Identifier
+    conversation_id: Identifier
+    surface: Surface
+    runtime_session_id: Identifier
+    runtime_turn_id: Identifier
+    evidence_plan_id: Identifier
+    acquisition_manifest_id: Identifier
+    task_shape: TaskShape
+    declared_requirements: list[Requirement] = Field(min_length=1, max_length=32)
+    acquisition_facts: list[AcquisitionFact] = Field(max_length=32)
+    current_premise: EvidenceAcquisitionPremise
+    proposed_acquisition_premise: EvidenceAcquisitionPremise | None = None
+    clarification_target: ClarificationTarget | None = None
+
+    @model_validator(mode="after")
+    def validate_associations(self) -> EvidenceTerminalRequest:
+        ids = [item.requirement_id for item in self.declared_requirements]
+        facts = [item.requirement_id for item in self.acquisition_facts]
+        if len(ids) != len(set(ids)) or len(facts) != len(set(facts)):
+            raise ValueError("duplicate_terminal_requirement_or_fact")
+        if not set(facts).issubset(ids):
+            raise ValueError("terminal_fact_requirement_mismatch")
+        if self.current_premise.task_shape != self.task_shape:
+            raise ValueError("terminal_premise_task_shape_mismatch")
+        if self.proposed_acquisition_premise is not None and self.clarification_target is not None:
+            raise ValueError("conflicting_terminal_hints")
+        return self
+
+    def authority_scope(self) -> dict[str, str]:
+        return {key: getattr(self, key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )}
+
+
+class EvidenceTerminalResponse(StrictModel):
+    schema_version: Literal["evidence-terminal.v1"]
+    sufficiency: SufficiencyResponse
+    next_step: NextStepResponse
+
+
+def validate_evidence_terminal_response(
+    response_raw: Any, request: EvidenceTerminalRequest,
+) -> EvidenceTerminalResponse:
+    response = EvidenceTerminalResponse.model_validate(response_raw, strict=True)
+    if set(response_raw["next_step"]["result"]) != set(NextStepResult.model_fields):
+        raise ValueError("incomplete_terminal_next_step")
+    scope = request.authority_scope()
+    facts = {item.requirement_id: item.outcome for item in request.acquisition_facts}
+    _validate_sufficiency_response(
+        response.sufficiency.model_dump(mode="json"), scope=scope,
+        evidence_plan_id=request.evidence_plan_id,
+        acquisition_manifest_id=request.acquisition_manifest_id, task_shape=request.task_shape,
+        declared_requirements=request.declared_requirements,
+        facts=[{"requirement_id": item.requirement_id,
+                "outcome": facts.get(item.requirement_id, "missing")}
+               for item in request.declared_requirements],
+    )
+    _validate_next_step_response(
+        response.next_step.model_dump(mode="json"), scope=scope,
+        sufficiency=response.sufficiency.result, evidence_plan_id=request.evidence_plan_id,
+        acquisition_manifest_id=request.acquisition_manifest_id,
+        current_premise=request.current_premise,
+        proposed_premise=(request.proposed_acquisition_premise
+                          if response.sufficiency.result.additional_acquisition_required else None),
+        clarification_target=request.clarification_target,
+    )
+    return response
+
+
+def acquisition_terminal_eligible(state: EvidenceAcquisitionState) -> bool:
+    # This is a dependency proof, not a sufficiency prediction. The supported
+    # aggregate contract fixes three requirement kinds and a nonempty source
+    # scope: none can yield a clarification hint. It also excludes exact-fetch
+    # proposal compilation. Every other branch keeps its authoritative ordering.
+    return bool(state.supported_aggregate_path and len(state.next_step_history or []) < 2)
+
+
 async def select_evidence_next_step(
     *,
     state: EvidenceAcquisitionState,
@@ -4104,63 +4337,14 @@ async def select_evidence_next_step(
             ),
             clarification_target=clarification_target,
         )
-        response = NextStepResponse.model_validate(response_raw)
-        _validate_scope_echo(response, scope)
-        result = response.result
-        if (
-            result.evaluation_id != state.sufficiency.evaluation_id
-            or result.evidence_plan_id != state.plan.plan_id
-            or result.acquisition_manifest_id != state.manifest_id
-            or result.task_shape != state.plan.task_shape
-            or result.sufficiency_status != state.sufficiency.sufficiency_status
-            or result.current_premise_digest
-            != _acquisition_premise_digest(current_premise)
-        ):
-            raise ValueError("next_step_association_mismatch")
-        proposed_digest = (
-            _acquisition_premise_digest(proposal.premise)
-            if proposal is not None
-            else None
+        result = _validate_next_step_response(
+            response_raw, scope=scope, sufficiency=state.sufficiency,
+            evidence_plan_id=state.plan.plan_id, acquisition_manifest_id=state.manifest_id,
+            current_premise=current_premise,
+            proposed_premise=proposal.premise if proposal is not None else None,
+            clarification_target=clarification_target,
         )
-        if result.proposed_premise_digest != proposed_digest:
-            raise ValueError("next_step_proposed_premise_mismatch")
-        if (
-            result.selected_next_step == "ask_narrow_clarification"
-            and result.clarification_target != clarification_target
-        ):
-            raise ValueError("next_step_clarification_mismatch")
-        expected_unresolved = sorted(
-            evaluation.requirement_id
-            for evaluation in state.sufficiency.evaluated_requirements
-            if evaluation.criticality == "material"
-            and evaluation.effective_outcome != "satisfied"
-        )
-        if result.unresolved_material_requirement_ids != expected_unresolved:
-            raise ValueError("next_step_requirement_mismatch")
-        if (
-            result.selected_next_step == "perform_additional_acquisition"
-            and proposal is None
-        ):
-            raise ValueError("next_step_proposal_missing")
-        state.next_step = result
-        state.next_step_history = [
-            *(state.next_step_history or []),
-            {
-                "selection_id": result.selection_id,
-                "evaluation_id": result.evaluation_id,
-                "evidence_plan_id": result.evidence_plan_id,
-                "acquisition_manifest_id": result.acquisition_manifest_id,
-                "selected_next_step": result.selected_next_step,
-                "conclusion_disposition": result.conclusion_disposition,
-                "provider_disposition": result.provider_disposition,
-                "reacquisition_guard": result.reacquisition_guard,
-                "clarification_target": result.clarification_target,
-                "reason_codes": list(result.reason_codes),
-                "additional_acquisition_executed": False,
-            },
-        ]
-        if _advisory_provider_allowed(state):
-            state.forced_answer = None
+        _publish_next_step(state, result)
         return result
     except Exception:
         state.next_step = None
@@ -6569,6 +6753,7 @@ async def evaluate_acquisition_sufficiency(
     context_pack: dict[str, Any] | None,
     dsa_trace: dict[str, Any],
     retained_source_refs: set[str] | None,
+    terminal_decision: bool = False,
 ) -> None:
     if not state.supported_governed_path or state.plan is None or state.manifest_id is None:
         return
@@ -6632,89 +6817,57 @@ async def evaluate_acquisition_sufficiency(
     )
     state.acquisition_facts = facts
     try:
-        response_raw = await runtime.evaluate_evidence_sufficiency(
-            **scope,
-            evidence_plan_id=state.plan.plan_id,
-            acquisition_manifest_id=state.manifest_id,
-            task_shape=state.plan.task_shape,
-            declared_requirements=[
-                requirement.model_dump(mode="json")
-                for requirement in state.plan.declared_requirements
-            ],
-            acquisition_facts=facts,
-        )
-        response = SufficiencyResponse.model_validate(response_raw)
-        _validate_scope_echo(response, scope)
-        if (
-            response.evidence_plan_id != state.plan.plan_id
-            or response.acquisition_manifest_id != state.manifest_id
-            or response.result.task_shape != state.plan.task_shape
-        ):
-            raise ValueError("sufficiency_association_mismatch")
-        expected_requirements = {
-            requirement.requirement_id: (
-                requirement.requirement_kind,
-                requirement.criticality,
+        if terminal_decision:
+            if not acquisition_terminal_eligible(state):
+                raise ValueError("terminal_inputs_not_fixed")
+            state.next_step_selection_attempted = True
+            state.next_step_failure = None
+            request = EvidenceTerminalRequest.model_validate({
+                **scope, "evidence_plan_id": state.plan.plan_id,
+                "acquisition_manifest_id": state.manifest_id,
+                "task_shape": state.plan.task_shape,
+                "declared_requirements": [item.model_dump(mode="json")
+                                          for item in state.plan.declared_requirements],
+                "acquisition_facts": facts,
+                "current_premise": build_current_acquisition_premise(state).model_dump(mode="json"),
+            }, strict=True)
+            raw = await runtime.evaluate_evidence_terminal(**request.model_dump(mode="json"))
+            terminal = validate_evidence_terminal_response(raw, request)
+            # Neither successful constituent enters CO state until both validate.
+            response_raw = terminal.sufficiency.model_dump(mode="json")
+        else:
+            response_raw = await runtime.evaluate_evidence_sufficiency(
+                **scope,
+                evidence_plan_id=state.plan.plan_id,
+                acquisition_manifest_id=state.manifest_id,
+                task_shape=state.plan.task_shape,
+                declared_requirements=[
+                    requirement.model_dump(mode="json")
+                    for requirement in state.plan.declared_requirements
+                ],
+                acquisition_facts=facts,
             )
-            for requirement in state.plan.declared_requirements
-        }
-        evaluated = {
-            item.requirement_id: (item.requirement_kind, item.criticality)
-            for item in response.result.evaluated_requirements
-        }
-        if evaluated != expected_requirements:
-            raise ValueError("sufficiency_requirement_mismatch")
-        facts_by_id = {fact["requirement_id"]: fact["outcome"] for fact in facts}
-        if any(
-            item.effective_outcome != facts_by_id[item.requirement_id]
-            for item in response.result.evaluated_requirements
-        ):
-            raise ValueError("sufficiency_fact_mismatch")
-        material_outcomes = [
-            item.effective_outcome
-            for item in response.result.evaluated_requirements
-            if item.criticality == "material"
-        ]
-        optional_outcomes = [
-            item.effective_outcome
-            for item in response.result.evaluated_requirements
-            if item.criticality == "optional"
-        ]
-        concrete_failures = {
-            "partial",
-            "not_attempted",
-            "unavailable",
-            "unsupported",
-            "failed",
-            "excluded",
-            "filtered",
-            "truncated",
-            "unresolved_contradiction",
-        }
-        expected_status = (
-            "insufficient"
-            if any(outcome in concrete_failures for outcome in material_outcomes)
-            else "unknown"
-            if any(outcome in {"missing", "unknown"} for outcome in material_outcomes)
-            else "sufficient_with_limitations"
-            if any(outcome != "satisfied" for outcome in optional_outcomes)
-            else "sufficient_for_declared_scope"
+        response = _validate_sufficiency_response(
+            response_raw, scope=scope, evidence_plan_id=state.plan.plan_id,
+            acquisition_manifest_id=state.manifest_id, task_shape=state.plan.task_shape,
+            declared_requirements=state.plan.declared_requirements, facts=facts,
         )
-        if response.result.sufficiency_status != expected_status:
-            raise ValueError("sufficiency_status_mismatch")
-        expected_constraints = _expected_sufficiency_constraints(
-            expected_status,
-            task_shape=state.plan.task_shape,
-        )
-        if response.result.answer_constraints != expected_constraints:
-            raise ValueError("sufficiency_constraints_mismatch")
         state.sufficiency = response.result
         state.status = response.result.sufficiency_status
         if response.result.sufficiency_status in {"insufficient", "unknown"}:
             state.forced_answer = WITHHELD_ANSWER
+        if terminal_decision:
+            _publish_next_step(state, terminal.next_step.result)
     except Exception:
-        state.status = "sufficiency_dependency_failed"
-        state.forced_answer = WITHHELD_ANSWER
+        if terminal_decision:
+            state.sufficiency = None
+            state.next_step = None
+            state.next_step_failure = "dependency_failure"
+            state.status = "next_step_dependency_failed"
+            state.forced_answer = NEXT_STEP_DEPENDENCY_ANSWER
+        else:
+            state.status = "sufficiency_dependency_failed"
+            state.forced_answer = WITHHELD_ANSWER
 
 
 def _process_failure_operation(state: EvidenceAcquisitionState) -> ProcessFailureOperation:

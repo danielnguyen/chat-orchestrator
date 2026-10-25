@@ -5855,3 +5855,328 @@ async def test_unsupplied_response_declaration_cannot_be_fabricated(declaration)
     with pytest.raises(RuntimeError, match="completion_association_mismatch"):
         await client.complete_turn(**request, **declaration)
     assert calls == [("/v1/runtime/turns/complete", request)]
+
+
+def _terminal_wire_fixture():
+    """Literal producer contract; the digest is calculated independently of CO."""
+    scope = dict(request_id="terminal-request", owner_id="owner", conversation_id="conversation",
+                 surface="chat", runtime_session_id="session", runtime_turn_id="turn")
+    premise = {
+        "question_anchor_digest": "sha256:" + "a" * 64, "task_shape": "targeted_lookup",
+        "declared_scope": {
+            "source_ids": ["records"], "source_categories": [], "exact_source_refs": [],
+            "inventory_status": "complete_for_declared_scope", "time_scope_ref": None,
+            "version_scope_ref": None, "domain_scope_ref": None, "project_scope_ref": None,
+        },
+        "source_inventory": [], "selected_strategies": ["targeted_retrieval"],
+    }
+    requirement = dict(requirement_id="evidence", requirement_kind="targeted_evidence",
+                       criticality="material")
+    request = {
+        **scope, "evidence_plan_id": "plan", "acquisition_manifest_id": "manifest",
+        "task_shape": "targeted_lookup", "declared_requirements": [requirement],
+        "acquisition_facts": [{"requirement_id": "evidence", "outcome": "satisfied"}],
+        "current_premise": premise,
+    }
+    digest = "sha256:" + sha256(json.dumps(
+        premise, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode()).hexdigest()
+    response = {
+        "schema_version": "evidence-terminal.v1",
+        "sufficiency": {
+            **scope, "evidence_plan_id": "plan", "acquisition_manifest_id": "manifest",
+            "result": {
+                "evaluation_id": "evaluation", "task_shape": "targeted_lookup",
+                "sufficiency_status": "sufficient_for_declared_scope",
+                "evaluated_requirements": [{**requirement, "effective_outcome": "satisfied"}],
+                "reason_codes": ["all_declared_requirements_satisfied"], "answer_constraints": [],
+                "qualification_required": False, "additional_acquisition_required": False,
+                "user_safe_summary": "The selected evidence is sufficient.",
+            },
+        },
+        "next_step": {
+            **scope, "result": {
+                "selection_id": "selection", "evaluation_id": "evaluation",
+                "evidence_plan_id": "plan", "acquisition_manifest_id": "manifest",
+                "task_shape": "targeted_lookup",
+                "sufficiency_status": "sufficient_for_declared_scope",
+                "selected_next_step": "answer_within_declared_scope",
+                "conclusion_disposition": "bounded_conclusion_allowed",
+                "provider_disposition": "allowed",
+                "current_premise_digest": digest, "proposed_premise_digest": None,
+                "reacquisition_guard": "not_applicable", "clarification_target": None,
+                "unresolved_material_requirement_ids": [],
+                "reason_codes": ["declared_scope_sufficient"],
+                "user_safe_summary": "Answer within the selected evidence.",
+            },
+        },
+    }
+    return request, response
+
+
+@pytest.mark.asyncio
+async def test_evidence_terminal_is_one_request_with_complete_validated_results():
+    request, response = _terminal_wire_fixture()
+    calls = []
+    client = RuntimeClient("http://runtime", "key")
+
+    async def post(path, *, json):
+        calls.append((path, json))
+        return response
+
+    client._post = post
+    assert await client.evaluate_evidence_terminal(**request) == response
+    assert len(calls) == 1
+    assert calls[0][0] == "/v1/runtime/evidence-terminal/evaluate"
+    assert calls[0][1] == {
+        **request, "proposed_acquisition_premise": None, "clarification_target": None,
+    }
+
+
+_TERMINAL_CORRUPTIONS = [
+    ("schema_version", "evidence-terminal.v2"), ("schema_version", None),
+    ("sufficiency", None), ("next_step", []), ("extra", {}),
+    *[(f"{member}.{field}", "forged") for member in ("sufficiency", "next_step")
+      for field in ("request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id")],
+    ("sufficiency.evidence_plan_id", "wrong"),
+    ("sufficiency.acquisition_manifest_id", "wrong"),
+    ("next_step.result.evidence_plan_id", "wrong"),
+    ("next_step.result.acquisition_manifest_id", "wrong"),
+    ("next_step.result.evaluation_id", "wrong"),
+    ("sufficiency.result.evaluation_id", "wrong"),
+    ("sufficiency.result.task_shape", "aggregate"),
+    ("next_step.result.task_shape", "aggregate"),
+    ("next_step.result.sufficiency_status", "unknown"),
+    ("next_step.result.current_premise_digest", "sha256:" + "b" * 64),
+    ("next_step.result.current_premise_digest", "malformed"),
+    ("next_step.result.proposed_premise_digest", "sha256:" + "b" * 64),
+    ("next_step.result.provider_disposition", "blocked"),
+    ("next_step.result.provider_disposition", "advisory_only"),
+    ("next_step.result.reacquisition_guard", "changed_premise_allowed"),
+    ("next_step.result.selected_next_step", "perform_additional_acquisition"),
+    ("next_step.result.unresolved_material_requirement_ids", ["forged"]),
+    ("sufficiency.result.evaluated_requirements", []),
+    ("sufficiency.result.answer_constraints", ["qualify_conclusion"]),
+    ("sufficiency.result.qualification_required", "false"),
+    ("sufficiency.result.extra", True), ("next_step.result.extra", True),
+]
+
+
+def _corrupt_terminal(response, path, value):
+    target = response
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "value"), _TERMINAL_CORRUPTIONS)
+async def test_evidence_terminal_rejects_forged_or_partial_nested_decisions(path, value):
+    request, response = _terminal_wire_fixture()
+    _corrupt_terminal(response, path, value)
+    client = RuntimeClient("http://runtime", "key")
+    calls = []
+
+    async def post(path, *, json):
+        calls.append(path)
+        return response
+
+    client._post = post
+    with pytest.raises(RuntimeError, match="evidence_terminal_response_invalid"):
+        await client.evaluate_evidence_terminal(**request)
+    assert calls == ["/v1/runtime/evidence-terminal/evaluate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["duplicate", "unknown", "fact", "criticality", "kind"])
+async def test_evidence_terminal_checks_every_requirement_and_fact(mutation):
+    request, response = _terminal_wire_fixture()
+    evaluations = response["sufficiency"]["result"]["evaluated_requirements"]
+    if mutation == "duplicate":
+        evaluations.append(deepcopy(evaluations[0]))
+    elif mutation == "unknown":
+        evaluations[0]["requirement_id"] = "forged"
+    elif mutation == "fact":
+        evaluations[0]["effective_outcome"] = "unknown"
+    else:
+        evaluations[0]["criticality" if mutation == "criticality" else "requirement_kind"] = (
+            "optional" if mutation == "criticality" else "context_delivery"
+        )
+    client = RuntimeClient("http://runtime", "key")
+
+    async def post(path, *, json):
+        return response
+
+    client._post = post
+    with pytest.raises(RuntimeError, match="evidence_terminal_response_invalid"):
+        await client.evaluate_evidence_terminal(**request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["identity", "duplicate_requirements", "duplicate_facts",
+                                     "extra_fact", "invalid_fact", "premise", "hints"])
+async def test_evidence_terminal_rejects_bad_requests_before_transport(mutation):
+    request, _ = _terminal_wire_fixture()
+    if mutation == "identity":
+        request["owner_id"] = 42
+    elif mutation == "duplicate_requirements":
+        request["declared_requirements"] *= 2
+    elif mutation == "duplicate_facts":
+        request["acquisition_facts"] *= 2
+    elif mutation == "extra_fact":
+        request["acquisition_facts"][0]["requirement_id"] = "forged"
+    elif mutation == "invalid_fact":
+        request["acquisition_facts"][0]["outcome"] = "invented"
+    elif mutation == "premise":
+        request["current_premise"]["task_shape"] = "contradiction_review"
+    else:
+        request["proposed_acquisition_premise"] = deepcopy(request["current_premise"])
+        request["clarification_target"] = "source_scope"
+    client = RuntimeClient("http://runtime", "key")
+
+    async def post(*args, **kwargs):
+        pytest.fail("Invalid terminal request reached transport")
+
+    client._post = post
+    with pytest.raises(RuntimeError, match="evidence_terminal_request_invalid"):
+        await client.evaluate_evidence_terminal(**request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "transport", "404", "409", "503", "malformed"])
+async def test_evidence_terminal_transport_failure_never_retries_or_downgrades(failure):
+    request, _ = _terminal_wire_fixture()
+    calls = []
+
+    async def handle(req):
+        calls.append(req.url.path)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout", request=req)
+        if failure == "transport":
+            raise httpx.ConnectError("unavailable", request=req)
+        if failure == "malformed":
+            return httpx.Response(200, content=b"{broken")
+        return httpx.Response(int(failure), json={"detail": "dependency failure"})
+
+    client = RuntimeClient(
+        "http://runtime", "key",
+        client_factory=lambda **kwargs: httpx.AsyncClient(
+            **kwargs, transport=httpx.MockTransport(handle),
+        ),
+    )
+    await client.open()
+    try:
+        with pytest.raises((httpx.HTTPError, ValueError)):
+            await client.evaluate_evidence_terminal(**request)
+    finally:
+        await client.close()
+    assert calls == ["/v1/runtime/evidence-terminal/evaluate"]
+
+
+@pytest.mark.asyncio
+async def test_evidence_terminal_preserves_qualified_partial_permission():
+    request, response = _terminal_wire_fixture()
+    optional = {"requirement_id": "optional", "requirement_kind": "selected_source_coverage",
+                "criticality": "optional"}
+    request["declared_requirements"].append(optional)
+    request["acquisition_facts"].append({"requirement_id": "optional", "outcome": "unavailable"})
+    sufficiency = response["sufficiency"]["result"]
+    sufficiency["evaluated_requirements"].append({**optional, "effective_outcome": "unavailable"})
+    sufficiency.update(
+        sufficiency_status="sufficient_with_limitations", qualification_required=True,
+        reason_codes=["optional_requirement_incomplete"],
+        answer_constraints=[
+            "qualify_conclusion", "disclose_limitations", "identify_unexamined_scope",
+        ],
+    )
+    response["next_step"]["result"].update(
+        sufficiency_status="sufficient_with_limitations",
+        selected_next_step="provide_qualified_partial_answer",
+        conclusion_disposition="qualified_partial_only",
+        reason_codes=["optional_limitations_remain"],
+    )
+    client = RuntimeClient("http://runtime", "key")
+
+    async def post(path, *, json):
+        return response
+
+    client._post = post
+    result = await client.evaluate_evidence_terminal(**request)
+    assert result["next_step"]["result"]["provider_disposition"] == "allowed"
+    assert result["sufficiency"]["result"]["qualification_required"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("member", ["sufficiency", "next_step"])
+async def test_evidence_terminal_requires_complete_nested_decisions(member):
+    request, response = _terminal_wire_fixture()
+    client = RuntimeClient("http://runtime", "key")
+    for field in response[member]["result"]:
+        malformed = deepcopy(response)
+        del malformed[member]["result"][field]
+
+        async def post(path, *, json):
+            return malformed
+
+        client._post = post
+        with pytest.raises(RuntimeError, match="evidence_terminal_response_invalid"):
+            await client.evaluate_evidence_terminal(**request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hint", ["clarification", "changed_premise"])
+async def test_evidence_terminal_binds_optional_hints_to_validated_decision(hint):
+    request, response = _terminal_wire_fixture()
+    outcome = "unknown" if hint == "clarification" else "filtered"
+    request["acquisition_facts"][0]["outcome"] = outcome
+    sufficiency = response["sufficiency"]["result"]
+    sufficiency["evaluated_requirements"][0]["effective_outcome"] = outcome
+    status = "unknown" if hint == "clarification" else "insufficient"
+    sufficiency.update(
+        sufficiency_status=status, qualification_required=True,
+        additional_acquisition_required=True,
+        reason_codes=["material_requirement_unknown" if hint == "clarification"
+                      else "material_requirement_not_satisfied"],
+        answer_constraints=[
+            "qualify_conclusion", "disclose_limitations", "identify_unexamined_scope",
+                            "additional_acquisition_or_clarification_required",
+                            "withhold_unqualified_conclusion"],
+    )
+    result = response["next_step"]["result"]
+    result.update(sufficiency_status=status, conclusion_disposition="requested_conclusion_withheld",
+                  provider_disposition="blocked", unresolved_material_requirement_ids=["evidence"])
+    if hint == "clarification":
+        for requirement in (request["declared_requirements"][0],
+                            sufficiency["evaluated_requirements"][0]):
+            requirement["requirement_kind"] = "exact_authoritative_fetch"
+        request["clarification_target"] = "exact_reference"
+        result.update(selected_next_step="ask_narrow_clarification",
+                      clarification_target="exact_reference",
+                      reason_codes=["material_uncertainty_requires_clarification"])
+    else:
+        proposed = deepcopy(request["current_premise"])
+        proposed["selected_strategies"] = ["exact_fetch"]
+        proposed["declared_scope"]["exact_source_refs"] = [
+            {"source_id": "records", "source_ref": "records:entry"},
+        ]
+        request["proposed_acquisition_premise"] = proposed
+        result.update(selected_next_step="perform_additional_acquisition",
+                      reacquisition_guard="changed_premise_allowed",
+                      proposed_premise_digest="sha256:" + sha256(json.dumps(
+                          proposed, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      ).encode()).hexdigest(),
+                      reason_codes=["changed_acquisition_premise_available"])
+    client = RuntimeClient("http://runtime", "key")
+    calls = []
+
+    async def post(path, *, json):
+        calls.append(json)
+        return response
+
+    client._post = post
+    assert await client.evaluate_evidence_terminal(**request) == response
+    assert len(calls) == 1
+    assert calls[0]["clarification_target"] == request.get("clarification_target")
+    assert calls[0]["proposed_acquisition_premise"] == request.get("proposed_acquisition_premise")

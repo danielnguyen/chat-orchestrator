@@ -12702,3 +12702,186 @@ def test_ambiguous_advisory_rendering_preserves_uncertainty():
     assert "possible explanations" in rendered.lower()
     assert "can't tell which" in rendered
     assert all(item.text.rstrip(".?!") in rendered for item in advisory.hypotheses)
+
+
+async def _terminal_aggregate_state(outcome="satisfied"):
+    runtime = FakeRuntime(shape=_future_aggregate_shape(), plan=_future_aggregate_plan(),
+                          auto_source_match=False)
+    state = await begin_evidence_acquisition(
+        runtime=runtime,
+        dsa=FakeDsa([_source("source_a", capabilities=["search", "context"],
+                            content_fields=["Fuel (L)"])],
+                    inventory_metadata={"inventory_scope": "configured_sources",
+                                        "inventory_status": "complete"}),
+        task_text=QUESTION, interaction_kind="question",
+        external_context={"source_ids": ["source_a"]}, **SCOPE,
+    )
+    state.aggregate_execution = {"outcome": outcome}
+    return state
+
+
+class TerminalProducerRuntime:
+    """Producer fixture with observable CO calls and independent literal decisions."""
+    def __init__(self, state, *, corrupt=None, failure=None):
+        self.state = state
+        self.calls = []
+        self.corrupt = corrupt
+        self.failure = failure
+        self.last_sufficiency = None
+
+    async def _sufficiency(self, kwargs):
+        producer = ProducerContractSufficiencyRuntime()
+        return await producer.evaluate_evidence_sufficiency(**kwargs)
+
+    def _selection(self, kwargs, sufficiency):
+        sufficient = sufficiency["result"]["sufficiency_status"] == "sufficient_for_declared_scope"
+        snapshot = copy.deepcopy(self.state)
+        snapshot.manifest_id = kwargs["acquisition_manifest_id"]
+        snapshot.sufficiency = SufficiencyResult.model_validate(sufficiency["result"])
+        result = _next_step_result_payload(
+            snapshot,
+            selected_next_step=("answer_within_declared_scope"
+                                if sufficient else "disclose_unexamined_scope"),
+            conclusion_disposition=("bounded_conclusion_allowed"
+                                    if sufficient else "requested_conclusion_withheld"),
+            provider_disposition="allowed" if sufficient else "blocked",
+        )
+        result["reason_codes"] = [
+            "declared_scope_sufficient" if sufficient else "unexamined_material_scope"
+        ]
+        return {**SCOPE, "result": result}
+
+    async def evaluate_evidence_sufficiency(self, **kwargs):
+        self.calls.append(("sufficiency", kwargs))
+        self.last_sufficiency = await self._sufficiency(kwargs)
+        return self.last_sufficiency
+
+    async def select_evidence_next_step(self, **kwargs):
+        self.calls.append(("next_step", kwargs))
+        return self._selection(kwargs, self.last_sufficiency)
+
+    async def evaluate_evidence_terminal(self, **kwargs):
+        self.calls.append(("terminal", kwargs))
+        # Manifest/facts may be materialized, but no successful decision may be
+        # visible to a provider or acquisition consumer during this request.
+        assert self.state.sufficiency is None
+        assert self.state.next_step is None
+        assert not provider_allowed(self.state)
+        if self.failure is not None:
+            raise self.failure
+        sufficiency = await self._sufficiency(kwargs)
+        response = {"schema_version": "evidence-terminal.v1", "sufficiency": sufficiency,
+                    "next_step": self._selection(kwargs, sufficiency)}
+        if self.corrupt is not None:
+            self.corrupt(response)
+        return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("outcome", "status", "step", "allowed"), [
+    ("satisfied", "sufficient_for_declared_scope", "answer_within_declared_scope", True),
+    ("partial", "insufficient", "disclose_unexamined_scope", False),
+    ("unavailable", "insufficient", "disclose_unexamined_scope", False),
+    ("failed", "insufficient", "disclose_unexamined_scope", False),
+    ("filtered", "insufficient", "disclose_unexamined_scope", False),
+    ("truncated", "insufficient", "disclose_unexamined_scope", False),
+    ("unknown", "unknown", "disclose_unexamined_scope", False),
+])
+async def test_aggregate_terminal_exact_sequential_parity(outcome, status, step, allowed):
+    from services.evidence_acquisition import acquisition_terminal_eligible
+
+    sequential = await _terminal_aggregate_state(outcome)
+    composite = copy.deepcopy(sequential)
+    assert acquisition_terminal_eligible(composite)
+    before_premise = build_current_acquisition_premise(composite)
+    sequential_runtime = TerminalProducerRuntime(sequential)
+    composite_runtime = TerminalProducerRuntime(composite)
+    common = dict(context_pack=None, dsa_trace={"called": True, "status": "success"},
+                  retained_source_refs=set(), **SCOPE)
+    await evaluate_acquisition_sufficiency(state=sequential, runtime=sequential_runtime, **common)
+    # Independently exercise the original intervening dependency.
+    assert deterministic_clarification_target(sequential) is None
+    await select_evidence_next_step(state=sequential, runtime=sequential_runtime, **SCOPE)
+    await evaluate_acquisition_sufficiency(state=composite, runtime=composite_runtime,
+                                         terminal_decision=True, **common)
+    assert [name for name, _ in composite_runtime.calls] == ["terminal"]
+    assert [name for name, _ in sequential_runtime.calls] == ["sufficiency", "next_step"]
+    assert composite.sufficiency.sufficiency_status == status
+    assert composite.next_step.selected_next_step == step
+    assert composite.next_step.provider_disposition == ("allowed" if allowed else "blocked")
+    assert provider_allowed(composite) is False  # Aggregates are server-rendered.
+    assert composite == sequential
+    assert build_current_acquisition_premise(composite) == before_premise
+    assert len(composite.next_step_history) == 1
+    assert composite.next_step_history[0]["additional_acquisition_executed"] is False
+    assert build_manifest_trace(state=composite, **{k: v for k, v in common.items()
+                                                 if k not in SCOPE}) == build_manifest_trace(
+        state=sequential, **{k: v for k, v in common.items() if k not in SCOPE})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption", ["selection", "sufficiency", "partial", "duplicate", "grant"],
+)
+async def test_terminal_validates_both_results_before_publishing_state(corruption):
+    state = await _terminal_aggregate_state()
+
+    def corrupt(response):
+        if corruption == "selection":
+            response["next_step"]["result"]["evaluation_id"] = "forged"
+        elif corruption == "sufficiency":
+            response["sufficiency"]["owner_id"] = "forged"
+        elif corruption == "partial":
+            response.pop("next_step")
+        elif corruption == "duplicate":
+            items = response["sufficiency"]["result"]["evaluated_requirements"]
+            items.append(copy.deepcopy(items[0]))
+        else:
+            response["next_step"]["result"].update(
+                selected_next_step="perform_additional_acquisition",
+                reacquisition_guard="changed_premise_allowed",
+            )
+
+    runtime = TerminalProducerRuntime(state, corrupt=corrupt)
+    await evaluate_acquisition_sufficiency(
+        state=state, runtime=runtime, terminal_decision=True, context_pack=None,
+        dsa_trace={"called": True, "status": "success"}, retained_source_refs=set(), **SCOPE,
+    )
+    assert [name for name, _ in runtime.calls] == ["terminal"]
+    assert state.sufficiency is None and state.next_step is None
+    assert not state.next_step_history
+    assert state.next_step_failure == "dependency_failure"
+    assert state.forced_answer == NEXT_STEP_DEPENDENCY_ANSWER
+    assert not provider_allowed(state)
+
+
+@pytest.mark.asyncio
+async def test_terminal_eligibility_rejects_hint_dependent_and_exhausted_paths():
+    from services.evidence_acquisition import acquisition_terminal_eligible
+
+    state = await _terminal_aggregate_state()
+    assert acquisition_terminal_eligible(state)
+    state.declared_scope["source_ids"] = []
+    assert not acquisition_terminal_eligible(state)
+    state.declared_scope["source_ids"] = ["source_a"]
+    state.next_step_history = [{}, {}]
+    assert not acquisition_terminal_eligible(state)
+    targeted = _next_step_test_state()
+    assert targeted.supported_targeted_path
+    assert not acquisition_terminal_eligible(targeted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("unavailable"), TimeoutError("timeout")])
+async def test_terminal_failure_keeps_no_success_history_or_permission(failure):
+    state = await _terminal_aggregate_state()
+    runtime = TerminalProducerRuntime(state, failure=failure)
+    await evaluate_acquisition_sufficiency(
+        state=state, runtime=runtime, terminal_decision=True, context_pack=None,
+        dsa_trace={"called": True, "status": "success"}, retained_source_refs=set(), **SCOPE,
+    )
+    assert [name for name, _ in runtime.calls] == ["terminal"]
+    assert state.sufficiency is None and state.next_step is None
+    assert not state.next_step_history
+    assert not provider_allowed(state)
+    assert state.forced_answer == NEXT_STEP_DEPENDENCY_ANSWER
