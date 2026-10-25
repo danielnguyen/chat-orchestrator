@@ -7214,6 +7214,8 @@ run_surface_lifecycle_scenario() {
 
 run_presence_event_scenario() {
   # Real API consumer; the existing disposable topology owns all service data.
+  docker compose -f "$COMPOSE" exec -T provider \
+    python -m unittest -v tools.composed_provider_stub.ProviderFixtureTests
   local owner=owner-presence-events conversation
   conversation="$(create_conversation "$owner" desktop_private:presence)"
   configure_surface_permission "$owner" desktop_private true true false
@@ -7325,15 +7327,68 @@ def wait(predicate):
     raise AssertionError("bounded presence wait expired")
 
 
+def queued_answer_failure(result, enqueue):
+    def identifier(value):
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", value) else None
+
+    request_id = identifier(result.get("request_id"))
+    report = {
+        "scenario": "queued_answer_mismatch", "request_id": request_id,
+        "conversation_id": identifier(result.get("conversation_id")),
+        "status_ok": result.get("status") == "ok",
+        "enqueue": {field: enqueue.get(field) for field in (
+            "status", "queued", "generation", "answer_ref",
+        )},
+    }
+    try:
+        report["provider"] = http(provider, "/fixture/diagnostics?" +
+            urllib.parse.urlencode({"request_id": request_id or "unscoped"}))
+    except Exception as error:
+        report["provider"] = {"diagnostic_error_type": type(error).__name__}
+    if request_id:
+        try:
+            retained = http(bms, "/v1/traces/" + urllib.parse.quote(request_id), headers=memory_key)
+            turn = retained.get("retrieval", {}).get("prompt_assembly", {}).get("turn_state", {})
+            report["trace"] = {
+                "requested_request_id": request_id,
+                "stored_request_id": identifier(retained.get("request_id")),
+                "stored_conversation_id": identifier(retained.get("conversation_id")),
+                "runtime_session_id": identifier(turn.get("runtime_session_id")),
+                "runtime_turn_id": identifier(turn.get("runtime_turn_id")),
+                "model_call_count": len(retained.get("model_calls", [])),
+            }
+        except Exception as error:
+            report["trace"] = {"diagnostic_error_type": type(error).__name__}
+    # Collection happens only after a mismatch and never fetches raw /calls prompts.
+    log_dir = os.environ.get("COMPOSED_SMOKE_LOG_DIR")
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "presence-queued-answer-failure.json"), "w") as output:
+            json.dump(report, output, sort_keys=True)
+    else:
+        print("Presence queued-answer diagnostics: " + json.dumps(report, sort_keys=True), file=sys.stderr)
+    print("Presence queued-answer mismatch: " + json.dumps({
+        "request_id": request_id, "enqueue": report["enqueue"],
+        "diagnostics_saved": bool(log_dir),
+    }, sort_keys=True), file=sys.stderr)
+
+
 def chat(answer="Save the backup first.", surface="desktop_private", text="What is the backup procedure?", scene=None):
+    enqueue = None
     if answer is not None:
-        http(provider, "/fixture/next-answer", {"answer": answer})
+        enqueue = http(provider, "/fixture/next-answer", {"answer": answer})
     result = http(co, "/v1/chat", {**scope, "surface": surface,
         "client_id": surface + ":presence", "sensitivity": "private",
         "messages": [{"role": "user", "content": text}],
         **({"requested_scene": scene} if scene else {})}, key)
     if answer is not None:
-        assert result["status"] == "ok" and result["answer"] == answer, result
+        matches = result["status"] == "ok" and result["answer"] == answer
+        if not matches:
+            try:
+                queued_answer_failure(result, enqueue)
+            except Exception as error:
+                print("Presence diagnostic collection failed: " + type(error).__name__, file=sys.stderr)
+        assert matches, {"request_id": result.get("request_id"), "queued_answer_mismatch": True}
     return result
 
 

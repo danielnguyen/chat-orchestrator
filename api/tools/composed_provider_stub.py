@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import json
 import re
-from collections import defaultdict
+import unittest
+from collections import defaultdict, deque
 from typing import Any
+from unittest.mock import patch
 
 from fastapi import FastAPI, Header, HTTPException
 
@@ -16,7 +18,11 @@ _primary_failed: set[str] = set()
 _fail_next_primary = False
 _next_primary_delay_ms = 0
 _watched_sentinels: dict[str, str] = {}
-_next_answers: list[str] = []
+_next_answers: list[dict[str, Any]] = []
+_fixture_generation = 0
+_fixture_sequence = 0
+_fixture_events: deque[dict[str, Any]] = deque(maxlen=256)
+_delayed_fixture_calls: dict[str, dict[str, Any]] = {}
 _next_semantic_interpretations: list[dict[str, Any]] = []
 _scene_policy_answers: list[dict[str, str]] = []
 _pending_scene_calls: dict[str, dict[str, Any]] = {}
@@ -48,6 +54,36 @@ _AGGREGATE_FUNCTIONS = {"median", "mean", "count", "sum", "minimum", "maximum"}
 _EXTERNAL_EVIDENCE_ITEM = re.compile(
     r"source_ref: (?P<source_ref>[^\n]+)\n(?P<text>[^\n]+)"
 )
+
+
+def _fixture_event(event: str, **details: Any) -> dict[str, Any]:
+    global _fixture_sequence
+    _fixture_sequence += 1
+    if "request_id" in details:
+        value = details["request_id"]
+        details["request_id"] = value if (
+            isinstance(value, str) and _FIXTURE_IDENTIFIER_RE.fullmatch(value)
+        ) else "unscoped"
+    observation = {
+        "sequence": _fixture_sequence, "event": event, "generation": _fixture_generation,
+        "queue_depth": len(_next_answers), **details,
+    }
+    _fixture_events.append(observation)
+    return observation
+
+
+@app.get("/fixture/diagnostics")
+async def fixture_diagnostics(request_id: str | None = None) -> dict[str, Any]:
+    # Only bounded associations; never prompts, answers, headers, or credentials.
+    events = list(_fixture_events)
+    return {
+        "generation": _fixture_generation, "sequence": _fixture_sequence,
+        "queue_depth": len(_next_answers),
+        "queued_answer_refs": [item["answer_ref"] for item in _next_answers[:16]],
+        "delayed_calls": list(_delayed_fixture_calls.values())[-64:],
+        "events": events,
+        "request_calls": [item for item in events if item.get("request_id") == request_id],
+    }
 
 
 def _bounded_excerpt(value: str) -> str:
@@ -257,6 +293,8 @@ async def chat_completions(
 ) -> dict[str, Any]:
     global _next_primary_delay_ms
     request_id = x_request_id or "unscoped"
+    generation = _fixture_generation
+    call_ref = f"call_{_fixture_sequence + 1}"
     messages = body.get("messages")
     messages = messages if isinstance(messages, list) else []
     model = body.get("model")
@@ -287,6 +325,9 @@ async def chat_completions(
         ),
         "max_completion_tokens": body.get("max_completion_tokens"),
     }
+    _fixture_event("request_started", request_id=request_id, call_ref=call_ref,
+                   request_generation=generation,
+                   call_kind="structured" if response_format is not None else "chat")
     if classifier_diagnostics["response_schema_name"] == (
         "evidence_source_interpretation"
     ):
@@ -306,6 +347,8 @@ async def chat_completions(
                 "status": "ok",
             }
         )
+        _fixture_event("completed", request_id=request_id, call_ref=call_ref,
+                       request_generation=generation, answer_source="semantic_interpreter")
         return {
             "id": "completion-smoke",
             "service_tier": "default",
@@ -353,15 +396,28 @@ async def chat_completions(
     delay_ms = _next_primary_delay_ms
     _next_primary_delay_ms = 0
     if delay_ms:
+        _delayed_fixture_calls[call_ref] = {
+            **_fixture_events[-1], "call_ref": call_ref,
+        }
+        pending_scene = None
         if scene_match is not None:
-            _pending_scene_calls[request_id] = {
+            pending_scene = {
                 "kind": "chat", "status": "pending", "request_id": request_id,
                 "scene_policy_match": scene_match,
             }
+            _pending_scene_calls[request_id] = pending_scene
         try:
             await asyncio.sleep(delay_ms / 1000)
         finally:
-            _pending_scene_calls.pop(request_id, None)
+            if _pending_scene_calls.get(request_id) is pending_scene:
+                _pending_scene_calls.pop(request_id, None)
+            _delayed_fixture_calls.pop(call_ref, None)
+    # There is no await between this check and queue/failure-state consumption.
+    # An older request cannot touch configuration installed by any reset.
+    if generation != _fixture_generation:
+        _fixture_event("rejected_reset", request_id=request_id, call_ref=call_ref,
+                       request_generation=generation)
+        raise HTTPException(status_code=409, detail="fixture_reset_during_request")
     latest_user_text = next(
         (
             message["content"]
@@ -423,12 +479,20 @@ async def chat_completions(
                 "status": "failed",
             }
         )
+        _fixture_event("failed_primary", request_id=request_id, call_ref=call_ref,
+                       request_generation=generation)
         raise HTTPException(status_code=503, detail="primary failure fixture")
     governed_candidate = _governed_evidence_candidate(prompt_text)
+    answer_source = "derived_fixture"
     if scene_answer is not None:
         answer = scene_answer
+        answer_source = "scene_policy"
     elif _next_answers:
-        answer = _next_answers.pop(0)
+        queued = _next_answers.pop(0)
+        answer = queued["answer"]
+        answer_source = "queue"
+        _fixture_event("consumed", request_id=request_id, call_ref=call_ref,
+                       request_generation=generation, answer_ref=queued["answer_ref"])
     elif governed_candidate is not None:
         answer = governed_candidate
     elif latest_user_text.strip() == "What does the retained file report about the setting?":
@@ -439,6 +503,9 @@ async def chat_completions(
         answer = "I only have historical or unverified memory context."
     else:
         answer = "neutral smoke response"
+        answer_source = "default"
+    _fixture_event("completed", request_id=request_id, call_ref=call_ref,
+                   request_generation=generation, answer_source=answer_source)
     _calls[request_id].append(
         {
             "kind": "chat",
@@ -507,8 +574,9 @@ async def calls(request_id: str) -> dict[str, Any]:
 
 
 @app.post("/fixture/reset")
-async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
-    global _fail_next_primary, _next_primary_delay_ms
+async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    global _fail_next_primary, _next_primary_delay_ms, _fixture_generation
+    _fixture_generation += 1
     _next_primary_delay_ms = 0
     _next_semantic_interpretations.clear()
     _scene_policy_answers.clear()
@@ -524,7 +592,8 @@ async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, str]:
         _watched_sentinels.clear()
         _next_answers.clear()
         _fail_next_primary = False
-    return {"status": "ok"}
+    _fixture_event("reset", request_id=request_id)
+    return {"status": "ok", "generation": _fixture_generation}
 
 
 @app.post("/fixture/fail-primary/{request_id}")
@@ -590,8 +659,11 @@ async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
     answer = body.get("answer")
     if not isinstance(answer, str) or not answer or len(answer) > 2_000:
         raise HTTPException(status_code=422, detail="invalid fixture answer")
-    _next_answers.append(answer)
-    return {"status": "ok", "queued": len(_next_answers)}
+    answer_ref = f"answer_{_fixture_sequence + 1}"
+    _next_answers.append({"answer": answer, "answer_ref": answer_ref})
+    _fixture_event("queued", answer_ref=answer_ref)
+    return {"status": "ok", "queued": len(_next_answers),
+            "generation": _fixture_generation, "answer_ref": answer_ref}
 
 
 @app.post("/fixture/next-semantic-interpretation")
@@ -613,3 +685,161 @@ def _embedding_vector(value: Any) -> list[float]:
         index = 1 + (int.from_bytes(digest[:2], "big") % 1535)
         vector[index] += 1.0
     return vector
+
+
+class ProviderFixtureTests(unittest.IsolatedAsyncioTestCase):
+    """Run explicitly here to keep regressions inside the fixture's approved scope."""
+
+    async def asyncSetUp(self):
+        await fixture_reset({})
+
+    async def asyncTearDown(self):
+        await fixture_reset({})
+
+    async def complete(self, request_id):
+        return await chat_completions(
+            {"model": "fixture-model", "messages": [{"role": "user", "content": "PRIVATE-PROMPT"}]},
+            x_request_id=request_id,
+        )
+
+    def answer(self, response):
+        return response["choices"][0]["message"]["content"]
+
+    async def test_delayed_request_cannot_consume_after_global_or_scoped_reset(self):
+        for reset in ({}, {"request_id": "old"}):
+            with self.subTest(reset=reset):
+                await fixture_reset({})
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def hold(delay):
+                    self.assertEqual(delay, .05)
+                    entered.set()
+                    await release.wait()
+
+                await fixture_next_answer({"answer": "old answer"})
+                await fixture_delay_next_primary({"delay_ms": 50})
+                with patch.object(asyncio, "sleep", hold):
+                    pending = asyncio.create_task(self.complete("old"))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        previous = (await fixture_diagnostics())["generation"]
+                        acknowledgment = await fixture_reset(reset)
+                        self.assertGreater(acknowledgment["generation"], previous)
+                        # Scoped resets keep the existing queue, as before.
+                        if reset:
+                            self.assertEqual(self.answer(await self.complete("retained")),
+                                             "old answer")
+                        queued = await fixture_next_answer({"answer": "7."})
+                    finally:
+                        release.set()
+                    with self.assertRaises(HTTPException) as error:
+                        await pending
+                    self.assertEqual(error.exception.status_code, 409)
+                self.assertEqual((await fixture_diagnostics())["queued_answer_refs"],
+                                 [queued["answer_ref"]])
+                self.assertEqual(self.answer(await self.complete("intended")), "7.")
+                events = (await fixture_diagnostics())["events"]
+                self.assertTrue(any(e["event"] == "rejected_reset" and
+                                    e.get("request_id") == "old" for e in events))
+                consumer = [e for e in events if e["event"] == "consumed"
+                            and e.get("answer_ref") == queued["answer_ref"]]
+                self.assertEqual([e["request_id"] for e in consumer], ["intended"])
+
+    async def test_concurrent_old_requests_cannot_cross_multiple_resets(self):
+        release = asyncio.Event()
+        entered = asyncio.Queue()
+
+        async def hold(delay):
+            entered.put_nowait(True)
+            await release.wait()
+
+        pending = []
+        with patch.object(asyncio, "sleep", hold):
+            try:
+                for index in range(8):
+                    await fixture_delay_next_primary({"delay_ms": 50})
+                    pending.append(asyncio.create_task(self.complete(f"old-{index}")))
+                    await asyncio.wait_for(entered.get(), 1)
+                await fixture_reset({})
+                await fixture_next_answer({"answer": "discarded"})
+                await fixture_reset({})
+                queued = await fixture_next_answer({"answer": "7."})
+            finally:
+                release.set()
+            results = await asyncio.gather(*pending, return_exceptions=True)
+        self.assertTrue(all(isinstance(result, HTTPException) and result.status_code == 409
+                            for result in results))
+        self.assertEqual((await fixture_diagnostics())["queued_answer_refs"],
+                         [queued["answer_ref"]])
+        self.assertEqual(self.answer(await self.complete("new")), "7.")
+
+    async def test_same_generation_keeps_completion_order_queue_selection(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(delay):
+            entered.set()
+            await release.wait()
+
+        await fixture_next_answer({"answer": "first"})
+        await fixture_next_answer({"answer": "second"})
+        await fixture_delay_next_primary({"delay_ms": 50})
+        with patch.object(asyncio, "sleep", hold):
+            pending = asyncio.create_task(self.complete("delayed"))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertEqual(self.answer(await self.complete("immediate")), "first")
+            finally:
+                release.set()
+            self.assertEqual(self.answer(await pending), "second")
+
+    async def test_primary_failure_preserves_answer_for_fallback(self):
+        queued = await fixture_next_answer({"answer": "7."})
+        await fixture_fail_next_primary()
+        with self.assertRaises(HTTPException) as error:
+            await self.complete("fallback")
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertEqual((await fixture_diagnostics())["queued_answer_refs"],
+                         [queued["answer_ref"]])
+        self.assertEqual(self.answer(await self.complete("fallback")), "7.")
+
+    async def test_stale_request_cannot_consume_new_failure_flag(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(delay):
+            entered.set()
+            await release.wait()
+
+        await fixture_delay_next_primary({"delay_ms": 50})
+        with patch.object(asyncio, "sleep", hold):
+            pending = asyncio.create_task(self.complete("old"))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                await fixture_reset({})
+                await fixture_fail_next_primary()
+                await fixture_next_answer({"answer": "7."})
+            finally:
+                release.set()
+            with self.assertRaises(HTTPException) as error:
+                await pending
+            self.assertEqual(error.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as error:
+            await self.complete("new")
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertEqual(self.answer(await self.complete("new")), "7.")
+
+    async def test_reset_discards_queue_and_diagnostics_are_bounded_and_read_only(self):
+        for _ in range(300):
+            await fixture_next_answer({"answer": "PRIVATE-ANSWER"})
+        before = await fixture_diagnostics()
+        self.assertEqual(len(before["events"]), 256)
+        self.assertEqual(len(before["queued_answer_refs"]), 16)
+        self.assertEqual(await fixture_diagnostics(), before)
+        self.assertNotIn("PRIVATE-ANSWER", json.dumps(before))
+        reset = await fixture_reset({})
+        self.assertEqual((await fixture_diagnostics())["queue_depth"], 0)
+        self.assertEqual(reset["generation"], before["generation"] + 1)
+        self.assertEqual(self.answer(await self.complete("empty")), "neutral smoke response")
+        report = await fixture_diagnostics("empty")
+        self.assertNotIn("PRIVATE-PROMPT", json.dumps(report))
+        self.assertEqual([e["event"] for e in report["request_calls"]],
+                         ["request_started", "completed"])
