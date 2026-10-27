@@ -6272,6 +6272,13 @@ run_evidence_aggregate_scenario() {
     ))
   ' --argjson diagnostics "$diagnostics"
   printf 'Evidence terminal persisted trace: %s\n' "$(jq -c '.terminal_provenance' <<<"$manifest")"
+  assert_jq "aggregate.no_action_or_confirmation" "$trace" '
+    .retrieval.prompt_assembly.capabilities.executor_call_count == 0
+    and .retrieval.prompt_assembly.capabilities.dispatch_completed == false
+    and .retrieval.prompt_assembly.capabilities.action_summary.attempted == false
+    and .retrieval.prompt_assembly.capability_registry.authority.attempted == false
+    and .retrieval.prompt_assembly.capability_registry.action_flow.attempted == false
+  '
   assert_jq "aggregate.semantic_trace" "$trace" '
     .prompt.semantic_interpreter == {
       called:true,
@@ -6338,7 +6345,7 @@ run_evidence_aggregate_scenario() {
       ;;
   esac
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
-  echo "Evidence aggregate: semantic=1 answer_provider=0 search=0 structured_context=1 records=5 non_empty=4 median=27.875"
+  echo "Evidence aggregate: semantic=1 answer_provider=0 search=0 structured_context=1 records=5 non_empty=4 median=27.875 actions=0 authority=0 confirmation_flow=0"
 
   owner="owner-evidence-aggregate-operation"
   client="client-evidence-aggregate-operation"
