@@ -618,11 +618,14 @@ async def test_runtime_client_rejects_start_response_context_mismatch(response):
 
 
 @pytest.mark.asyncio
-async def test_complete_persisted_orchestration_replay_corpus_passes_twice():
+async def test_complete_persisted_orchestration_replay_corpus_passes_twice(monkeypatch):
+    # Compare decision, trace and persistence determinism with a fixed clock;
+    # wall-clock model latency is measured by the actual-service harness.
+    monkeypatch.setattr("services.orchestrate.perf_counter", lambda: 0.0)
     for fixture in load_corpus():
         first = await run_scenario(fixture)
         second = await run_scenario(fixture)
-        assert first == second
+        compare_snapshot(first, second, fixture["scenario"])
         expected = fixture["expected"]
         compare_snapshot(
             expected,

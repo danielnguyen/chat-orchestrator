@@ -1948,6 +1948,7 @@ class EvidenceAcquisitionState:
     exact_attempts: list[dict[str, Any]] | None = None
     expansion_attempts: list[dict[str, Any]] | None = None
     next_step: NextStepResult | None = None
+    terminal_provenance: EvidenceTerminalProvenance | None = None
     next_step_selection_attempted: bool = False
     next_step_failure: str | None = None
     next_step_history: list[dict[str, Any]] | None = None
@@ -4241,10 +4242,76 @@ class EvidenceTerminalRequest(StrictModel):
         )}
 
 
-class EvidenceTerminalResponse(StrictModel):
-    schema_version: Literal["evidence-terminal.v1"]
+class EvidenceDecisionEventReference(StrictModel):
+    event_id: Identifier
+    request_id: Identifier
+    runtime_session_id: Identifier
+    runtime_turn_id: Identifier
+    evidence_plan_id: Identifier
+    acquisition_manifest_id: Identifier
+    evaluation_id: Identifier
+
+
+class EvidenceSufficiencyEventReference(EvidenceDecisionEventReference):
+    event_type: Literal["evidence_sufficiency_evaluated"]
+    policy_version: Literal["UNKNOWN", "evidence-sufficiency-policy.v1"]
+
+
+class EvidenceNextStepEventReference(EvidenceDecisionEventReference):
+    event_type: Literal["evidence_next_step_selected"]
+    selection_id: Identifier
+    policy_version: Literal["UNKNOWN", "evidence-next-step-policy.v1"]
+
+
+class EvidenceSufficiencyProvenance(StrictModel):
+    computation_policy_version: Literal["evidence-sufficiency-policy.v1"]
+    persistence: Literal["committed"]
+    persisted_event: EvidenceSufficiencyEventReference
+
+
+class EvidenceNextStepProvenance(StrictModel):
+    computation_policy_version: Literal["evidence-next-step-policy.v1"]
+    persistence: Literal["committed", "reused"]
+    persisted_event: EvidenceNextStepEventReference
+    consulted_sufficiency_event: EvidenceSufficiencyEventReference
+
+
+class EvidenceTerminalProvenance(StrictModel):
+    schema_version: Literal["evidence-terminal.v2"]
+    sufficiency_provenance: EvidenceSufficiencyProvenance
+    next_step_provenance: EvidenceNextStepProvenance
+
+
+class EvidenceTerminalResponse(EvidenceTerminalProvenance):
     sufficiency: SufficiencyResponse
     next_step: NextStepResponse
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> EvidenceTerminalResponse:
+        current = self.sufficiency_provenance.persisted_event
+        consulted = self.next_step_provenance.consulted_sufficiency_event
+        selected = self.next_step_provenance.persisted_event
+        for event in (current, consulted, selected):
+            for key in ("request_id", "runtime_session_id", "runtime_turn_id",
+                        "evidence_plan_id", "acquisition_manifest_id"):
+                if getattr(event, key) != getattr(self.sufficiency, key):
+                    raise ValueError("terminal_event_scope_mismatch")
+            if event.evaluation_id != self.sufficiency.result.evaluation_id:
+                raise ValueError("terminal_event_evaluation_mismatch")
+        if selected.selection_id != self.next_step.result.selection_id:
+            raise ValueError("terminal_event_selection_mismatch")
+        # Logical evaluation IDs can recur. Preserve each exact occurrence and
+        # allow the selector to consult a historical sufficiency event.
+        if (selected.event_id in {current.event_id, consulted.event_id}
+                or (current.event_id == consulted.event_id and current != consulted)):
+            raise ValueError("terminal_event_identity_mismatch")
+        if current.policy_version != self.sufficiency_provenance.computation_policy_version:
+            raise ValueError("terminal_committed_policy_mismatch")
+        if (self.next_step_provenance.persistence == "committed"
+                and selected.policy_version
+                != self.next_step_provenance.computation_policy_version):
+            raise ValueError("terminal_committed_policy_mismatch")
+        return self
 
 
 def validate_evidence_terminal_response(
@@ -6816,6 +6883,7 @@ async def evaluate_acquisition_sufficiency(
         declared_scope=state.declared_scope,
     )
     state.acquisition_facts = facts
+    state.terminal_provenance = None
     try:
         if terminal_decision:
             if not acquisition_terminal_eligible(state):
@@ -6858,8 +6926,14 @@ async def evaluate_acquisition_sufficiency(
             state.forced_answer = WITHHELD_ANSWER
         if terminal_decision:
             _publish_next_step(state, terminal.next_step.result)
+            state.terminal_provenance = EvidenceTerminalProvenance.model_validate(
+                terminal.model_dump(include=set(EvidenceTerminalProvenance.model_fields)),
+                strict=True,
+            )
     except Exception:
         if terminal_decision:
+            state.terminal_provenance = None
+            state.next_step_history = None
             state.sufficiency = None
             state.next_step = None
             state.next_step_failure = "dependency_failure"
@@ -8449,6 +8523,8 @@ def build_manifest_trace(
             ),
         },
     }
+    if state.terminal_provenance is not None:
+        manifest["terminal_provenance"] = state.terminal_provenance.model_dump(mode="json")
     if state.diagnostic_trace.get("observation_count", 0) > 0:
         manifest["diagnostic"] = {
             key: state.diagnostic_trace.get(key)

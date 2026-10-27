@@ -5911,6 +5911,30 @@ def _terminal_wire_fixture():
             },
         },
     }
+    event_scope = {key: request[key] for key in (
+        "request_id", "runtime_session_id", "runtime_turn_id",
+        "evidence_plan_id", "acquisition_manifest_id",
+    )}
+    event_scope["evaluation_id"] = "evaluation"
+    current = {**event_scope, "event_id": "event-sufficiency-current",
+               "event_type": "evidence_sufficiency_evaluated",
+               "policy_version": "evidence-sufficiency-policy.v1"}
+    response.update(
+        schema_version="evidence-terminal.v2",
+        sufficiency_provenance={
+            "computation_policy_version": "evidence-sufficiency-policy.v1",
+            "persistence": "committed", "persisted_event": current,
+        },
+        next_step_provenance={
+            "computation_policy_version": "evidence-next-step-policy.v1",
+            "persistence": "committed",
+            "persisted_event": {**event_scope, "event_id": "event-selection-current",
+                                "event_type": "evidence_next_step_selected",
+                                "selection_id": "selection",
+                                "policy_version": "evidence-next-step-policy.v1"},
+            "consulted_sufficiency_event": dict(current),
+        },
+    )
     return request, response
 
 
@@ -5927,14 +5951,14 @@ async def test_evidence_terminal_is_one_request_with_complete_validated_results(
     client._post = post
     assert await client.evaluate_evidence_terminal(**request) == response
     assert len(calls) == 1
-    assert calls[0][0] == "/v1/runtime/evidence-terminal/evaluate"
+    assert calls[0][0] == "/v2/runtime/evidence-terminal/evaluate"
     assert calls[0][1] == {
         **request, "proposed_acquisition_premise": None, "clarification_target": None,
     }
 
 
 _TERMINAL_CORRUPTIONS = [
-    ("schema_version", "evidence-terminal.v2"), ("schema_version", None),
+    ("schema_version", "evidence-terminal.v1"), ("schema_version", None),
     ("sufficiency", None), ("next_step", []), ("extra", {}),
     *[(f"{member}.{field}", "forged") for member in ("sufficiency", "next_step")
       for field in ("request_id", "owner_id", "conversation_id", "surface",
@@ -5986,7 +6010,7 @@ async def test_evidence_terminal_rejects_forged_or_partial_nested_decisions(path
     client._post = post
     with pytest.raises(RuntimeError, match="evidence_terminal_response_invalid"):
         await client.evaluate_evidence_terminal(**request)
-    assert calls == ["/v1/runtime/evidence-terminal/evaluate"]
+    assert calls == ["/v2/runtime/evidence-terminal/evaluate"]
 
 
 @pytest.mark.asyncio
@@ -6072,7 +6096,7 @@ async def test_evidence_terminal_transport_failure_never_retries_or_downgrades(f
             await client.evaluate_evidence_terminal(**request)
     finally:
         await client.close()
-    assert calls == ["/v1/runtime/evidence-terminal/evaluate"]
+    assert calls == ["/v2/runtime/evidence-terminal/evaluate"]
 
 
 @pytest.mark.asyncio
@@ -6180,3 +6204,144 @@ async def test_evidence_terminal_binds_optional_hints_to_validated_decision(hint
     assert len(calls) == 1
     assert calls[0]["clarification_target"] == request.get("clarification_target")
     assert calls[0]["proposed_acquisition_premise"] == request.get("proposed_acquisition_premise")
+
+
+_PROVENANCE_EVENTS = (
+    "sufficiency_provenance.persisted_event",
+    "next_step_provenance.persisted_event",
+    "next_step_provenance.consulted_sufficiency_event",
+)
+_PROVENANCE_CORRUPTIONS = [
+    (f"{path}.{field}", value)
+    for path in _PROVENANCE_EVENTS
+    for field, value in (
+        ("event_id", ""), ("event_id", []), ("event_id", "bad event"),
+        ("event_type", "turn_completed"), ("request_id", "other-request"),
+        ("runtime_session_id", "other-session"), ("runtime_turn_id", "other-turn"),
+        ("evidence_plan_id", "other-plan"), ("acquisition_manifest_id", "other-manifest"),
+        ("evaluation_id", "other-evaluation"), ("policy_version", "unsupported"),
+        ("policy_version", "evidence-sufficiency-policy.v2"),
+        ("provider_disposition", "allowed"), ("owner_id", "invented-field"),
+    )
+] + [
+    ("sufficiency_provenance.persistence", "reused"),
+    ("sufficiency_provenance.persisted_event.policy_version", "UNKNOWN"),
+    ("next_step_provenance.persistence", "unknown"),
+    ("next_step_provenance.persistence", True),
+    ("next_step_provenance.persisted_event.policy_version", "UNKNOWN"),
+    ("next_step_provenance.persisted_event.selection_id", "wrong-selection"),
+    ("next_step_provenance.persisted_event.event_id", "event-sufficiency-current"),
+    ("next_step_provenance.consulted_sufficiency_event.event_id", "event-selection-current"),
+    ("next_step_provenance.consulted_sufficiency_event.policy_version", "UNKNOWN"),
+    ("sufficiency_provenance.computation_policy_version", "evidence-sufficiency-policy.v2"),
+    ("next_step_provenance.computation_policy_version", "evidence-next-step-policy.v2"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "value"), _PROVENANCE_CORRUPTIONS)
+async def test_terminal_v2_rejects_invalid_provenance(path, value):
+    request, response = _terminal_wire_fixture()
+    _corrupt_terminal(response, path, value)
+    calls = []
+
+    async def post(path, *, json):
+        calls.append(path)
+        return response
+
+    client = RuntimeClient("http://runtime", "key")
+    client._post = post
+    with pytest.raises(RuntimeError, match="evidence_terminal_response_invalid"):
+        await client.evaluate_evidence_terminal(**request)
+    assert calls == ["/v2/runtime/evidence-terminal/evaluate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [
+    "sufficiency_provenance", "next_step_provenance", *_PROVENANCE_EVENTS,
+])
+async def test_terminal_v2_requires_exact_provenance_members(path):
+    request, response = _terminal_wire_fixture()
+    original = response
+    target = original
+    for part in path.split("."):
+        target = target[part]
+    # Every required field is checked, including both complete event references.
+    for field in [*target, "extra"]:
+        response = deepcopy(original)
+        target = response
+        for part in path.split("."):
+            target = target[part]
+        if field == "extra":
+            target[field] = {"provider_disposition": "allowed"}
+        else:
+            del target[field]
+
+        async def post(path, *, json):
+            return response
+
+        client = RuntimeClient("http://runtime", "key")
+        client._post = post
+        with pytest.raises(RuntimeError, match="evidence_terminal_response_invalid"):
+            await client.evaluate_evidence_terminal(**request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reused", [False, True])
+@pytest.mark.parametrize("historical_consulted", [False, True])
+@pytest.mark.parametrize("recorded_policy", ["UNKNOWN", "evidence-next-step-policy.v1"])
+async def test_terminal_v2_preserves_exact_historical_occurrences(
+    reused, historical_consulted, recorded_policy,
+):
+    request, first = _terminal_wire_fixture()
+    second = deepcopy(first)
+    # The logical evaluation ID repeats, while this invocation commits a new event.
+    current = second["sufficiency_provenance"]["persisted_event"]
+    current["event_id"] = "event-sufficiency-new-occurrence"
+    next_provenance = second["next_step_provenance"]
+    if not historical_consulted:
+        next_provenance["consulted_sufficiency_event"] = deepcopy(current)
+    else:
+        next_provenance["consulted_sufficiency_event"]["policy_version"] = "UNKNOWN"
+    if reused:
+        next_provenance["persistence"] = "reused"
+        next_provenance["persisted_event"]["policy_version"] = recorded_policy
+    else:
+        next_provenance["persisted_event"]["event_id"] = "event-selection-new-occurrence"
+    responses = [first, second]
+
+    async def post(path, *, json):
+        return responses.pop(0)
+
+    client = RuntimeClient("http://runtime", "key")
+    client._post = post
+    assert await client.evaluate_evidence_terminal(**request) == first
+    assert await client.evaluate_evidence_terminal(**request) == second
+    assert current["evaluation_id"] == first["sufficiency"]["result"]["evaluation_id"]
+    assert current["event_id"] != first["sufficiency_provenance"]["persisted_event"]["event_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate", ["schema_version", "event_id", "persistence"])
+async def test_terminal_v2_rejects_duplicate_json_members_without_replay(duplicate):
+    request, response = _terminal_wire_fixture()
+    wire = json.dumps(response)
+    value = {"schema_version": '"evidence-terminal.v2"',
+             "event_id": '"event-sufficiency-current"', "persistence": '"committed"'}[duplicate]
+    wire = wire.replace(f'"{duplicate}": {value}',
+                        f'"{duplicate}": {value}, "{duplicate}": {value}', 1)
+    calls = []
+
+    async def handle(req):
+        calls.append(req.url.path)
+        return httpx.Response(200, content=wire)
+
+    client = RuntimeClient("http://runtime", "key", client_factory=lambda **kwargs:
+                           httpx.AsyncClient(**kwargs, transport=httpx.MockTransport(handle)))
+    await client.open()
+    try:
+        with pytest.raises(ValueError, match="duplicate_member"):
+            await client.evaluate_evidence_terminal(**request)
+    finally:
+        await client.close()
+    assert calls == ["/v2/runtime/evidence-terminal/evaluate"]

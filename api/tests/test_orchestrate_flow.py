@@ -1554,8 +1554,32 @@ class FakeRuntime:
             evaluation_id=sufficiency["result"]["evaluation_id"],
             evaluated_requirements=sufficiency["result"]["evaluated_requirements"],
         )
-        return {"schema_version": "evidence-terminal.v1",
-                "sufficiency": sufficiency, "next_step": selection}
+        response = {"sufficiency": sufficiency, "next_step": selection}
+        event_scope = {key: kwargs[key] for key in (
+            "request_id", "runtime_session_id", "runtime_turn_id",
+            "evidence_plan_id", "acquisition_manifest_id",
+        )}
+        event_scope["evaluation_id"] = sufficiency["result"]["evaluation_id"]
+        current = {**event_scope, "event_id": "event-sufficiency-current",
+                   "event_type": "evidence_sufficiency_evaluated",
+                   "policy_version": "evidence-sufficiency-policy.v1"}
+        response.update(
+            schema_version="evidence-terminal.v2",
+            sufficiency_provenance={
+                "computation_policy_version": "evidence-sufficiency-policy.v1",
+                "persistence": "committed", "persisted_event": current,
+            },
+            next_step_provenance={
+                "computation_policy_version": "evidence-next-step-policy.v1",
+                "persistence": "committed",
+                "persisted_event": {**event_scope, "event_id": "event-selection-current",
+                                    "event_type": "evidence_next_step_selected",
+                                    "selection_id": selection["result"]["selection_id"],
+                                    "policy_version": "evidence-next-step-policy.v1"},
+                "consulted_sufficiency_event": dict(current),
+            },
+        )
+        return response
 
     async def select_evidence_next_step(self, **kwargs):
         self.evidence_next_step_calls.append(kwargs)
@@ -24432,6 +24456,25 @@ async def test_deterministic_aggregate_flow_is_complete_provider_free_and_policy
         "field_name": "Reading",
     }
     assert premise["source_inventory"][0]["content_fields"] == ["Entry", "Reading"]
+    persisted = memory_store.trace_calls[-1]["payload"]
+    manifest = persisted["prompt"]["evidence_acquisition"]
+    if block_policy:
+        assert "terminal_provenance" not in manifest
+        assert manifest["next_steps"]["selection_count"] == 0
+    else:
+        provenance = manifest["terminal_provenance"]
+        assert provenance["schema_version"] == "evidence-terminal.v2"
+        assert provenance["sufficiency_provenance"]["persisted_event"]["evaluation_id"] == (
+            manifest["sufficiency"]["evaluation_id"]
+        )
+        assert provenance["next_step_provenance"]["persisted_event"]["selection_id"] == (
+            manifest["next_steps"]["selections"][-1]["selection_id"]
+        )
+    assert "terminal_provenance" not in semantic_messages
+    assert "event-sufficiency-current" not in out["answer"]
+    assert [m["content"] for m in memory_store.added_messages if m["role"] == "assistant"] == [
+        out["answer"]
+    ]
     serialized_trace = json.dumps(memory_store.trace_calls[-1]["payload"], sort_keys=True)
     assert "55.75" not in serialized_trace
     assert "content_fields" not in serialized_trace
@@ -43474,7 +43517,8 @@ async def test_invalid_voice_projection_clarifies_without_provider(tmp_path, pro
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeout", "http", "conflict", "unavailable",
-                                     "malformed", "partial", "identity", "permission"])
+                                     "malformed", "partial", "identity", "permission",
+                                     "provenance"])
 async def test_aggregate_terminal_failure_blocks_answer_without_downgrade(
     tmp_path, caplog, monkeypatch, failure,
 ):
@@ -43486,7 +43530,7 @@ async def test_aggregate_terminal_failure_blocks_answer_without_downgrade(
         if failure == "timeout":
             raise httpx.ReadTimeout("timeout")
         if failure in {"http", "conflict"}:
-            request = httpx.Request("POST", "http://runtime/v1/runtime/evidence-terminal/evaluate")
+            request = httpx.Request("POST", "http://runtime/v2/runtime/evidence-terminal/evaluate")
             raise httpx.HTTPStatusError("failed", request=request, response=httpx.Response(
                 409 if failure == "conflict" else 503, request=request,
             ))
@@ -43498,6 +43542,8 @@ async def test_aggregate_terminal_failure_blocks_answer_without_downgrade(
             response.pop("next_step")
         elif failure == "identity":
             response["next_step"]["owner_id"] = "forged"
+        elif failure == "provenance":
+            response["next_step_provenance"]["persisted_event"]["selection_id"] = "forged"
         elif failure == "permission":
             response["next_step"]["result"].update(
                 selected_next_step="perform_additional_acquisition",
